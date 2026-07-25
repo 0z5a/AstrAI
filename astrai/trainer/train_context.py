@@ -1,3 +1,4 @@
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Self
@@ -40,6 +41,15 @@ class TrainContext:
     world_size: int = field(default=1)
     rank: int = field(default=0)
     kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    _stop_event: threading.Event = field(default_factory=threading.Event)
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_event.is_set()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
 
     @property
     def optimizer_step(self) -> int:

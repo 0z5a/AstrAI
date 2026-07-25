@@ -1,5 +1,8 @@
+import logging
 import os
+import signal
 import socket
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import wraps
@@ -8,6 +11,10 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from astrai.parallel.signal_handler import install_early_signal_handlers
+
+logger = logging.getLogger(__name__)
 
 
 def find_free_port() -> str:
@@ -115,6 +122,7 @@ def _run_single_rank(
     func: Callable,
     kwargs: dict,
 ):
+    install_early_signal_handlers()
     with setup_parallel(
         rank=rank,
         world_size=world_size,
@@ -155,6 +163,7 @@ class TorchrunStrategy(LaunchStrategy):
     """External orchestrator (torchrun, SLURM, K8s) — env vars pre-set."""
 
     def launch(self, func: Callable, **kwargs):
+        install_early_signal_handlers()
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -188,6 +197,7 @@ class LocalStrategy(LaunchStrategy):
             _run_single_rank(0, *args)
             return
 
+        install_early_signal_handlers()
         ctx = mp.start_processes(
             _run_single_rank,
             args=args,
@@ -195,14 +205,46 @@ class LocalStrategy(LaunchStrategy):
             start_method=self.start_method,
             join=False,
         )
+
+        parent_stop = threading.Event()
+        original_handlers = {}
+
+        def _parent_handler(signum, frame):
+            sig = signal.Signals(signum)
+            logger.warning(
+                "Parent (pid=%d) received %s, forwarding to children...",
+                os.getpid(),
+                sig.name,
+            )
+            parent_stop.set()
+            for p in ctx.processes:
+                if p.is_alive():
+                    p.terminate()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            prev = signal.signal(sig, _parent_handler)
+            if prev not in (signal.SIG_DFL, signal.SIG_IGN, None, _parent_handler):
+                original_handlers[sig] = prev
+
         try:
-            while not ctx.join():
+            while not ctx.join() and not parent_stop.is_set():
                 pass
         except BaseException:
+            logger.warning(
+                "Parent received unexpected exception, terminating children..."
+            )
             for p in ctx.processes:
-                p.terminate()
-            ctx.join()
+                if p.is_alive():
+                    p.terminate()
             raise
+        finally:
+            for sig, handler in original_handlers.items():
+                signal.signal(sig, handler)
+
+            for p in ctx.processes:
+                p.join()
+
+            ctx.join()
 
 
 def _detect_launcher() -> str:
