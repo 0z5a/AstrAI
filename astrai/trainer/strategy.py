@@ -1,7 +1,7 @@
 """Training strategy implementations with factory pattern."""
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Dict, Union
 
 import torch
 import torch.nn as nn

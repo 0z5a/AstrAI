@@ -215,7 +215,6 @@ def _permute_choices(item: dict, rng: random.Random) -> tuple[dict, str]:
     positional bias (e.g. always picking B).
     """
     letters = ("A", "B", "C", "D")
-    contents = [item[k] for k in letters]
     perm = list(letters)
     rng.shuffle(perm)
     permuted = {"question": item["question"]}

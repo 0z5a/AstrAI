@@ -824,7 +824,7 @@ def test_grpo_builder_preserves_response_boundaries(base_test_env):
     from tests.data.conftest import make_grpo_no_template_config
 
     tokenizer = base_test_env["tokenizer"]
-    tokenizer_path = _save_test_tokenizer(base_test_env["test_dir"], tokenizer)
+    _save_test_tokenizer(base_test_env["test_dir"], tokenizer)
 
     builder = SectionedMaskBuilder()
     config = make_grpo_no_template_config()

@@ -148,7 +148,7 @@ class LossAccumulator:
         self.total += sum(losses)
         self.count += len(losses)
         if self.stream:
-            clamped = [min(max(l, 0.0), self._HIST_MAX) for l in losses]
+            clamped = [min(max(v, 0.0), self._HIST_MAX) for v in losses]
             idx = torch.tensor(clamped) / self._HIST_MAX * (self._HIST_BINS - 1)
             self.hist += torch.bincount(
                 idx.long().clamp(0, self._HIST_BINS - 1),
@@ -315,7 +315,7 @@ def print_stats(label: str, stats: Dict):
             )
     by_type = stats.get("by_token_type", {})
     if by_type:
-        print(f"\n  by token type:")
+        print("\n  by token type:")
         print(f"  {'type':<12} {'count':>8} {'mean_loss':>10} {'ppl':>8}")
         print(f"  {'-' * 12} {'-' * 8} {'-' * 10} {'-' * 8}")
         for ttype, s in by_type.items():

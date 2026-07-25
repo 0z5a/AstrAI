@@ -24,6 +24,17 @@ def _early_handler(signum: int, frame):
 def install_early_signal_handlers():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _early_handler)
+    _unblock_signals()
+
+
+def _unblock_signals():
+    try:
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        blocked = {signal.SIGTERM, signal.SIGINT} & mask
+        if blocked:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
+    except (AttributeError, OSError):
+        pass
 
 
 def register_signal_handlers(context):
@@ -40,5 +51,3 @@ def unregister_signal_handlers():
     global _active_context
     _active_context = None
     _early_stop.clear()
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    signal.signal(signal.SIGINT, signal.SIG_DFL)

@@ -143,7 +143,7 @@ def print_layer_grid(results: dict[str, dict]):
     widths = [6] + [10] * len(comps)
     metric = "er_99_norm"
 
-    print(f"\n--- Per-Layer Effective Rank (99% energy) ---")
+    print("\n--- Per-Layer Effective Rank (99% energy) ---")
     print(format_header(["Layer"] + comps, widths))
     print("-" * sum(widths))
 
@@ -173,7 +173,7 @@ def print_layer_grid(results: dict[str, dict]):
 def print_weight_stats(results: dict[str, dict]):
     groups = group_by_component(results)
     widths = [20, 12, 12, 12, 12]
-    print(f"\n--- Weight Value Statistics ---")
+    print("\n--- Weight Value Statistics ---")
     print(format_header(["Component", "Mean", "Std", "Min", "Max"], widths))
     print("-" * sum(widths))
 
@@ -265,7 +265,7 @@ def main():
             )
         print(f"{'=' * 70}")
 
-        print(f"Loading weights...")
+        print("Loading weights...")
         sd = safetensors.torch.load_file(str(weights_path))
         print(f"  {len(sd)} keys loaded")
 
