@@ -1,11 +1,11 @@
-import argparse
 import os
+from collections.abc import Callable
 from functools import partial
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
+import click
 import torch
-import torch.optim as optim
-from torch import Tensor, nn
+from torch import Tensor, nn, optim
 
 from astrai.config import AutoRegressiveLMConfig, TrainConfig
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
@@ -28,14 +28,14 @@ class MuonMix(optim.Optimizer):
         ns_steps: int = 5,
         adjust_lr_fn: str = "match_rms_adamw",
     ):
-        defaults = dict(
-            lr=lr,
-            weight_decay=weight_decay,
-            momentum=momentum,
-            nesterov=nesterov,
-            ns_steps=ns_steps,
-            adjust_lr_fn=adjust_lr_fn,
-        )
+        defaults = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "momentum": momentum,
+            "nesterov": nesterov,
+            "ns_steps": ns_steps,
+            "adjust_lr_fn": adjust_lr_fn,
+        }
         params = [p for p in model.parameters() if p.requires_grad]
         super().__init__(params, defaults)
 
@@ -82,312 +82,252 @@ class MuonMix(optim.Optimizer):
         self.muon.zero_grad(set_to_none)
         self.adamw.zero_grad(set_to_none)
 
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self) -> dict[str, Any]:
         return {
             "muon": self.muon.state_dict(),
             "adamw": self.adamw.state_dict(),
         }
 
-    def load_state_dict(self, state_dict: Dict[str, Any]):
+    def load_state_dict(self, state_dict: dict[str, Any]):
         self.muon.load_state_dict(state_dict["muon"])
         self.adamw.load_state_dict(state_dict["adamw"])
         self.param_groups = [*self.muon.param_groups, *self.adamw.param_groups]
 
 
-def parse_args() -> argparse.Namespace:
+def _merge_yaml_into_kwargs(config_path: str, passed_kwargs: dict) -> dict:
+    """Load YAML config, then override with explicit CLI kwargs (None excluded)."""
+    import yaml
 
-    parser = argparse.ArgumentParser(description="Train the AutoRegressiveLM model.")
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
 
-    parser.add_argument(
-        "--train_type",
-        type=str,
-        required=True,
-        choices=["seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"],
-        help="Train type.",
-    )
-    parser.add_argument(
-        "--data_root_path",
-        type=str,
-        required=True,
-        help="Path to the root directory of the dataset.",
-    )
-    parser.add_argument(
-        "--param_path",
-        type=str,
-        required=True,
-        help="Path to the model parameters or resume checkpoint.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        default=False,
-        help="Resume training from checkpoint at --param_path "
-        "(restore epoch, consumed_samples, optimizer & scheduler state).",
-    )
+    merged = {}
+    for section in ("model", "data", "parallel", "training", "ckpt", "log"):
+        if section in cfg:
+            merged.update(cfg[section])
 
-    parser.add_argument(
-        "--n_epoch", type=int, default=1, help="Number of epochs to train."
-    )
-    parser.add_argument(
-        "--batch_per_device", type=int, default=1, help="Batch size per GPU."
-    )
-    parser.add_argument(
-        "--grad_accum_steps",
-        type=int,
-        default=1,
-        help="Number of iterations between each optimizer step.",
-    )
-    parser.add_argument(
-        "--warmup_ratio",
-        type=float,
-        default=0.05,
-        help="Fraction of total steps used for LR warmup.",
-    )
-    parser.add_argument(
-        "--max_lr", type=float, default=3e-4, help="Max learning rate for training."
-    )
-    parser.add_argument(
-        "--max_grad_norm",
-        type=float,
-        default=1.0,
-        help="Max gradient norm for clipping. None disables clipping.",
-    )
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.1,
-        help="Weight decay (applied to Muon matrix params; non-matrix use 0).",
-    )
-    parser.add_argument(
-        "--muon_momentum",
-        type=float,
-        default=0.95,
-        help="Momentum factor for Muon optimizer.",
-    )
-    parser.add_argument(
-        "--muon_nesterov",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable Nesterov momentum for Muon.",
-    )
-    parser.add_argument(
-        "--muon_ns_steps",
-        type=int,
-        default=5,
-        help="Newton-Schulz iteration steps for Muon.",
-    )
-    parser.add_argument(
-        "--muon_adjust_lr",
-        type=str,
-        default="match_rms_adamw",
-        choices=["original", "match_rms_adamw"],
-        help="Muon learning rate adjustment strategy.",
-    )
-    parser.add_argument(
-        "--random_seed", type=int, default=3407, help="Random seed for reproducibility."
-    )
-    parser.add_argument(
-        "--num_workers", type=int, default=4, help="Number of workers for data loading."
-    )
-    parser.add_argument(
-        "--no_pin_memory",
-        action="store_false",
-        dest="pin_memory",
-        help="Disable pin memory",
-    )
-    parser.add_argument(
-        "--window_size",
-        type=int,
-        default=None,
-        help="Max length of the input sequence.",
-    )
-    parser.add_argument(
-        "--stride", type=int, default=None, help="Step size of the input sequence."
-    )
-    parser.add_argument("--dpo_beta", type=float, default=0.1, help="DPO beta value.")
-    parser.add_argument("--group_size", type=int, default=4, help="GRPO group size.")
-    parser.add_argument(
-        "--grpo_clip_eps", type=float, default=0.2, help="GRPO clipping epsilon."
-    )
-    parser.add_argument(
-        "--grpo_kl_coef", type=float, default=0.01, help="GRPO KL penalty coefficient."
-    )
-    parser.add_argument(
-        "--label_smoothing",
-        type=float,
-        default=0.0,
-        help="cross_entropy function label smoothing parameter",
-    )
+    for key, value in passed_kwargs.items():
+        if value is not None:
+            merged[key] = value
 
-    # online rollout
-    parser.add_argument(
-        "--rollout_interval",
-        type=int,
-        default=512,
-        help="Number of optimizer steps between online rollouts.",
-    )
-    parser.add_argument(
-        "--rollout_temperature",
-        type=float,
-        default=0.7,
-        help="Sampling temperature for online rollout.",
-    )
-    parser.add_argument(
-        "--rollout_top_k",
-        type=int,
-        default=0,
-        help="Top-k filtering for online rollout (0=disable).",
-    )
-    parser.add_argument(
-        "--rollout_top_p",
-        type=float,
-        default=0.9,
-        help="Top-p (nucleus) filtering for online rollout.",
-    )
-    parser.add_argument(
-        "--rollout_max_tokens",
-        type=int,
-        default=1024,
-        help="Maximum generated tokens per response in rollout.",
-    )
+    return merged
 
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable activation checkpointing for DecoderBlock modules.",
-    )
 
-    parser.add_argument(
-        "--ckpt_interval",
-        type=int,
-        default=5000,
-        help="Number of iters between checkpoints.",
-    )
-    parser.add_argument(
-        "--ckpt_dir",
-        type=str,
-        default="checkpoint",
-        help="Directory to save checkpoints.",
-    )
-    parser.add_argument(
-        "--val_split",
-        type=float,
-        default=None,
-        help="Ratio to split from training dataset for validation (e.g. 0.05).",
-    )
-    parser.add_argument(
-        "--val_step",
-        type=int,
-        default=1000,
-        help="Number of optimizer steps between validation runs.",
-    )
-    parser.add_argument(
-        "--metrics",
-        nargs="*",
-        default=["loss", "lr", "grad_norm"],
-        help="Metrics to log (e.g. --metrics loss lr val_loss). Default: loss lr grad_norm.",
-    )
-    parser.add_argument(
-        "--log_dir",
-        type=str,
-        default="checkpoint/logs",
-        help="Directory for metric logs.",
-    )
-    parser.add_argument(
-        "--start_epoch", type=int, default=0, help="Start epoch for training."
-    )
-    parser.add_argument(
-        "--start_samples",
-        type=int,
-        default=0,
-        help="Start samples (per rank) for training.",
-    )
+_TRAIN_TYPE = ["seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"]
+_PARALLEL = ["none", "ddp", "fsdp", "fsdp2"]
+_SCHEDULES = ["cosine", "sgdr", "wsd"]
+_BACKENDS = ["nccl", "gloo"]
+_START_METHODS = ["spawn", "fork", "forkserver"]
 
-    parser.add_argument(
-        "--master_addr",
-        type=str,
-        default="localhost",
-        help="Master node address for distributed training.",
-    )
-    parser.add_argument(
-        "--master_port",
-        type=str,
-        default="29500",
-        help="Master node port for distributed training.",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default="nccl",
-        help="Distributed training backend.",
-    )
-    parser.add_argument("--nprocs", type=int, default=1, help="Number of GPUs to use.")
-    parser.add_argument(
-        "--parallel_mode",
-        type=str,
-        default="none",
-        choices=["none", "ddp", "fsdp", "fsdp2"],
-        help="Parallel training strategy (none, ddp, fsdp, fsdp2).",
-    )
-    parser.add_argument(
-        "--device_type", type=str, default="cuda", help="Device type to use."
-    )
-    parser.add_argument(
-        "--start_method",
-        type=str,
-        default="spawn",
-        choices=["spawn", "fork", "forkserver"],
-        help="Multiprocessing start method.",
-    )
-    parser.add_argument(
-        "--neftune_alpha",
-        type=float,
-        default=0.0,
-        help="NEFTune noise alpha (0=disabled, typical: 5.0).",
-    )
 
-    parser.add_argument(
-        "--schedule_type",
-        type=str,
-        default="cosine",
-        choices=["cosine", "sgdr", "wsd"],
-        help="Learning rate scheduler type.",
-    )
-    parser.add_argument(
-        "--min_rate",
-        type=float,
-        default=None,
-        help="Minimum LR as fraction of base LR. Uses scheduler default if not set (cosine/sgdr: 0.05, wsd: 0.0).",
-    )
-    parser.add_argument(
-        "--cycle_length",
-        type=int,
-        default=None,
-        help="SGDR first cycle length in steps. Defaults to total_steps - warmup_steps.",
-    )
-    parser.add_argument(
-        "--t_mult",
-        type=int,
-        default=2,
-        help="SGDR cycle length multiplier per restart.",
-    )
-    parser.add_argument(
-        "--stable_steps",
-        type=int,
-        default=None,
-        help="WSD stable plateau steps. Required when --schedule_type wsd.",
-    )
-    parser.add_argument(
-        "--decay_steps",
-        type=int,
-        default=None,
-        help="WSD decay steps. Defaults to total_steps - warmup_steps - stable_steps.",
-    )
+@click.command(
+    name="train",
+    help="Start model training (pretrain / SFT / DPO / GRPO).",
+    context_settings={"show_default": True},
+)
+@click.option(
+    "--config",
+    "-c",
+    "config_path",
+    type=click.Path(exists=True),
+    help="YAML config file. CLI flags override YAML values.",
+)
+@click.option(
+    "--train_type",
+    type=click.Choice(_TRAIN_TYPE),
+    required=False,
+    help="Training type.",
+)
+@click.option(
+    "--data_root_path",
+    type=click.Path(exists=True),
+    help="Root directory of the dataset.",
+)
+@click.option(
+    "--param_path",
+    type=click.Path(exists=True),
+    help="Path to model parameters or resume checkpoint.",
+)
+@click.option("--resume", is_flag=True, default=False, help="Resume from checkpoint.")
+@click.option("--n_epoch", type=int, default=1, help="Number of epochs.")
+@click.option("--batch_per_device", type=int, default=1, help="Batch size per GPU.")
+@click.option(
+    "--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps."
+)
+@click.option(
+    "--warmup_ratio",
+    type=float,
+    default=0.05,
+    help="Fraction of total steps for LR warmup.",
+)
+@click.option("--max_lr", type=float, default=3e-4, help="Max learning rate.")
+@click.option(
+    "--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping."
+)
+@click.option("--weight_decay", type=float, default=0.1, help="Weight decay.")
+@click.option("--muon_momentum", type=float, default=0.95, help="Muon momentum factor.")
+@click.option("--muon_nesterov/--no-muon_nesterov", default=True, help="Muon Nesterov.")
+@click.option("--muon_ns_steps", type=int, default=5, help="Muon Newton-Schulz steps.")
+@click.option(
+    "--muon_adjust_lr",
+    type=click.Choice(["original", "match_rms_adamw"]),
+    default="match_rms_adamw",
+    help="Muon LR adjustment strategy.",
+)
+@click.option("--random_seed", type=int, default=3407, help="Random seed.")
+@click.option("--num_workers", type=int, default=4, help="DataLoader workers.")
+@click.option("--pin_memory/--no-pin_memory", default=True, help="Pin memory.")
+@click.option(
+    "--window_size", type=int, default=None, help="Max input sequence length."
+)
+@click.option("--stride", type=int, default=None, help="Step size for sliding window.")
+@click.option("--dpo_beta", type=float, default=0.1, help="DPO beta.")
+@click.option("--group_size", type=int, default=4, help="GRPO group size.")
+@click.option("--grpo_clip_eps", type=float, default=0.2, help="GRPO clip epsilon.")
+@click.option(
+    "--grpo_kl_coef", type=float, default=0.01, help="GRPO KL penalty coefficient."
+)
+@click.option("--label_smoothing", type=float, default=0.0, help="Label smoothing.")
+@click.option(
+    "--rollout_interval", type=int, default=512, help="Steps between rollouts."
+)
+@click.option(
+    "--rollout_temperature", type=float, default=0.7, help="Rollout temperature."
+)
+@click.option("--rollout_top_k", type=int, default=0, help="Rollout top-k (0=disable).")
+@click.option("--rollout_top_p", type=float, default=0.9, help="Rollout top-p.")
+@click.option(
+    "--rollout_max_tokens",
+    type=int,
+    default=1024,
+    help="Max tokens per rollout response.",
+)
+@click.option(
+    "--gradient_checkpointing/--no-gradient_checkpointing",
+    default=False,
+    help="Enable activation checkpointing.",
+)
+@click.option(
+    "--ckpt_interval", type=int, default=5000, help="Steps between checkpoints."
+)
+@click.option(
+    "--ckpt_dir", type=click.Path(), default="checkpoint", help="Checkpoint directory."
+)
+@click.option("--val_split", type=float, default=None, help="Validation split ratio.")
+@click.option(
+    "--val_step", type=int, default=1000, help="Steps between validation runs."
+)
+@click.option(
+    "--metrics",
+    multiple=True,
+    default=("loss", "lr", "grad_norm"),
+    help="Metrics to log (repeatable).",
+)
+@click.option(
+    "--log_dir",
+    type=click.Path(),
+    default="checkpoint/logs",
+    help="Directory for metric logs.",
+)
+@click.option("--start_epoch", type=int, default=0, help="Start epoch.")
+@click.option("--start_samples", type=int, default=0, help="Start samples (per rank).")
+@click.option(
+    "--master_addr", type=str, default="localhost", help="Master node address."
+)
+@click.option("--master_port", type=str, default="29500", help="Master node port.")
+@click.option(
+    "--backend",
+    type=click.Choice(_BACKENDS),
+    default="nccl",
+    help="Distributed backend.",
+)
+@click.option("--nprocs", type=int, default=1, help="Number of GPUs.")
+@click.option(
+    "--parallel_mode",
+    type=click.Choice(_PARALLEL),
+    default="none",
+    help="Parallel strategy.",
+)
+@click.option("--device_type", type=str, default="cuda", help="Device type.")
+@click.option(
+    "--start_method",
+    type=click.Choice(_START_METHODS),
+    default="spawn",
+    help="Multiprocessing start method.",
+)
+@click.option("--neftune_alpha", type=float, default=0.0, help="NEFTune noise alpha.")
+@click.option(
+    "--schedule_type",
+    type=click.Choice(_SCHEDULES),
+    default="cosine",
+    help="LR scheduler.",
+)
+@click.option(
+    "--min_rate", type=float, default=None, help="Minimum LR as fraction of base LR."
+)
+@click.option("--cycle_length", type=int, default=None, help="SGDR first cycle length.")
+@click.option("--t_mult", type=int, default=2, help="SGDR cycle length multiplier.")
+@click.option(
+    "--stable_steps", type=int, default=None, help="WSD stable plateau steps."
+)
+@click.option("--decay_steps", type=int, default=None, help="WSD decay steps.")
+@click.option("--tp_size", type=int, default=None, help="Tensor parallelism (future).")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Validate config and print plan, do not train.",
+)
+@click.pass_context
+def train_command(ctx, config_path, dry_run, metrics, **kwargs):
+    """Start model training (pretrain / SFT / DPO / GRPO)."""
+    if config_path:
+        kwargs = _merge_yaml_into_kwargs(config_path, kwargs)
 
-    args = parser.parse_args()
+    required = ["train_type", "data_root_path", "param_path"]
+    missing = [k for k in required if kwargs.get(k) is None]
+    if missing:
+        raise click.UsageError(
+            f"Missing required options: {', '.join(missing)}. "
+            f"Use --config YAML or provide them directly."
+        )
 
-    return args
+    # Convert tuple back to list
+    kwargs["metrics"] = list(metrics)
+    # Remove tp_size (not yet wired)
+    kwargs.pop("tp_size", None)
+
+    if dry_run:
+        _print_dry_run(kwargs)
+        return
+
+    train(**kwargs)
+
+
+def _print_dry_run(kwargs: dict) -> None:
+    """Print training plan summary."""
+    rows = [
+        ("Train type", kwargs.get("train_type")),
+        ("Model path", kwargs.get("param_path")),
+        ("Data path", kwargs.get("data_root_path")),
+        ("Parallel mode", kwargs.get("parallel_mode", "none")),
+        ("GPUs", str(kwargs.get("nprocs", 1))),
+        ("Epochs", str(kwargs.get("n_epoch", 1))),
+        ("Batch/device", str(kwargs.get("batch_per_device", 1))),
+        ("Grad accum", str(kwargs.get("grad_accum_steps", 1))),
+        ("Max LR", str(kwargs.get("max_lr", "?"))),
+        ("Schedule", str(kwargs.get("schedule_type", "cosine"))),
+        ("Warmup ratio", str(kwargs.get("warmup_ratio", 0.05))),
+        ("Window size", str(kwargs.get("window_size", "config default"))),
+        ("Checkpoint dir", str(kwargs.get("ckpt_dir", "checkpoint"))),
+        ("Checkpoint interval", str(kwargs.get("ckpt_interval", 5000))),
+        ("Resume", str(kwargs.get("resume", False))),
+    ]
+    max_len = max(len(k) for k, _ in rows)
+    click.secho("\n=== Training Plan (dry-run) ===", fg="cyan", bold=True)
+    for key, val in rows:
+        click.echo(f"  {key:<{max_len}s} : {val}")
+    click.secho("=" * 40, fg="cyan")
 
 
 def create_model(config):
@@ -497,7 +437,7 @@ def train(
     rollout_top_k = kwargs.pop("rollout_top_k", 0)
     rollout_top_p = kwargs.pop("rollout_top_p", 0.9)
     rollout_max_tokens = kwargs.pop("rollout_max_tokens", 1024)
-    reward_model_fn: Optional[Callable[[], BaseRewardModel]] = None
+    reward_model_fn: Callable[[], BaseRewardModel] | None = None
 
     executor_kwargs = {}
     if parallel_mode == "ddp":
@@ -611,5 +551,4 @@ def train(
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    train(**vars(args))
+    train_command()

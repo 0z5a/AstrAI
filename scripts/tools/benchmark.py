@@ -1,22 +1,28 @@
-"""Benchmark AutoRegressiveLM with KVCache"""
-
-import argparse
-from dataclasses import dataclass
-from typing import Any, Dict
-
+import click
 import torch
 
 from astrai.config import AutoRegressiveLMConfig
-from astrai.inference import ContiguousCache, PageCache
-from astrai.model.transformer import AutoRegressiveLM
+
+_DTYPES = ["bfloat16", "float16", "float32"]
+_CACHES = ["contiguous", "paged"]
 
 
-@dataclass
 class BenchmarkResult:
-    total_tokens: int
-    total_time: float
-    tokens_per_second: float
-    metadata: Dict[str, Any]
+    def __init__(
+        self,
+        name: str,
+        batch_size: int,
+        seq_len: int,
+        tokens_per_second: float,
+        latency_ms: float,
+        metadata: dict | None = None,
+    ):
+        self.name = name
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.tokens_per_second = tokens_per_second
+        self.latency_ms = latency_ms
+        self.metadata = metadata or {}
 
 
 class GenerationBenchmark:
@@ -27,234 +33,134 @@ class GenerationBenchmark:
         dtype: torch.dtype = torch.bfloat16,
         cache_type: str = "contiguous",
     ):
-        self.config = config
+        from astrai.inference import InferenceEngine
+        from astrai.model import AutoRegressiveLM
+
         self.device = device
         self.dtype = dtype
         self.cache_type = cache_type
+
+        click.echo("Building model ...")
         self.model = AutoRegressiveLM(config).to(device=device, dtype=dtype)
-        self.model.eval()
-
-    @torch.inference_mode()
-    def run_prefill_benchmark(
-        self,
-        batch_size: int = 1,
-        prompt_length: int = 512,
-        num_trials: int = 10,
-    ) -> BenchmarkResult:
-        for _ in range(3):
-            prompt_ids = torch.randint(
-                0,
-                self.config.vocab_size,
-                (batch_size, prompt_length),
-                device=self.device,
-                dtype=torch.long,
-            )
-            _ = self.model(prompt_ids)
-        torch.cuda.synchronize()
-
-        total_time = 0.0
-        total_tokens = batch_size * prompt_length * num_trials
-
-        for trial in range(num_trials):
-            prompt_ids = torch.randint(
-                0,
-                self.config.vocab_size,
-                (batch_size, prompt_length),
-                device=self.device,
-                dtype=torch.long,
-            )
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            _ = self.model(prompt_ids)
-            end.record()
-            torch.cuda.synchronize()
-
-            trial_time = start.elapsed_time(end) / 1000
-            total_time += trial_time
-
-            print(
-                f"  Trial {trial + 1}/{num_trials}: {prompt_length} tokens in {trial_time:.3f}s "
-                f"({prompt_length / trial_time:.1f} tok/s)"
-            )
-
-        return BenchmarkResult(
-            total_tokens=total_tokens,
-            total_time=total_time,
-            tokens_per_second=total_tokens / total_time,
-            metadata={
-                "benchmark_type": "prefill",
-                "batch_size": batch_size,
-                "prompt_length": prompt_length,
-                "dtype": str(self.dtype),
-                "device": self.device,
-                "cache": "none",
-            },
+        self.engine = InferenceEngine(
+            model=self.model,
+            tokenizer=None,
+            max_batch_size=256,
+            max_seq_len=config.max_position_embeddings,
+            max_prompt_len=config.max_position_embeddings,
         )
 
-    @torch.inference_mode()
+    def run_prefill_benchmark(
+        self,
+        batch_size: int = 4,
+        prompt_length: int = 512,
+        num_trials: int = 5,
+    ) -> BenchmarkResult:
+        import time
+
+        input_ids = torch.randint(
+            0, 10000, (batch_size, prompt_length), device=self.device
+        )
+        for _ in range(3):
+            self.engine.model(input_ids)
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(num_trials):
+            self.engine.model(input_ids)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        tokens = batch_size * prompt_length * num_trials
+        tps = tokens / elapsed
+        return BenchmarkResult(
+            name="prefill",
+            batch_size=batch_size,
+            seq_len=prompt_length,
+            tokens_per_second=tps,
+            latency_ms=elapsed / num_trials * 1000,
+            metadata={"benchmark_type": "prefill", "num_trials": num_trials},
+        )
+
     def run_decoding_benchmark(
         self,
-        batch_size: int = 1,
+        batch_size: int = 4,
         prompt_length: int = 512,
         gen_length: int = 128,
         num_trials: int = 5,
     ) -> BenchmarkResult:
-        total_time = 0.0
-        total_tokens = batch_size * gen_length * num_trials
+        import time
 
-        for trial in range(num_trials):
-            prompt_ids = torch.randint(
-                0,
-                self.config.vocab_size,
-                (batch_size, prompt_length),
-                device=self.device,
-                dtype=torch.long,
-            )
-            gen_ids = torch.randint(
-                0,
-                self.config.vocab_size,
-                (batch_size, gen_length),
-                device=self.device,
-                dtype=torch.long,
-            )
+        prompt = torch.randint(
+            0, 10000, (batch_size, prompt_length), device=self.device
+        )
+        with torch.inference_mode():
+            kv = self.engine.model(prompt, use_cache=True)
+        past = kv.past_key_values if hasattr(kv, "past_key_values") else kv[1]
 
-            head_dim = self.config.hidden_size // self.config.num_attention_heads
-            max_seq = prompt_length + gen_length
+        token = torch.randint(0, 10000, (batch_size, 1), device=self.device)
+        for _ in range(3):
+            self.engine.model(token, past_key_values=past, use_cache=True)
 
-            if self.cache_type == "contiguous":
-                cache = ContiguousCache(
-                    self.config.num_hidden_layers,
-                    batch_size,
-                    max_seq,
-                    self.config.num_key_value_heads,
-                    head_dim,
-                    self.device,
-                    self.dtype,
-                )
-            else:
-                page_size = 128
-                n_pages = (max_seq + page_size - 1) // page_size * batch_size
-                cache = PageCache(
-                    self.config.num_hidden_layers,
-                    n_pages,
-                    page_size,
-                    self.config.num_key_value_heads,
-                    head_dim,
-                    self.device,
-                    self.dtype,
-                )
-
-            task_ids = [f"b{i}" for i in range(batch_size)]
-            for tid in task_ids:
-                cache.task_alloc(tid, [0] * max_seq)
-                for p in range(max_seq):
-                    cache.task_extend(tid, p)
-
-            cv = cache.bind_tasks(task_ids, prompt_length, self.device)
-            _ = self.model(
-                prompt_ids,
-                paged_cache=cv,
-                position_ids=torch.arange(
-                    prompt_length, dtype=torch.long, device=self.device
-                )
-                .unsqueeze(0)
-                .expand(batch_size, -1),
-            )
-            torch.cuda.synchronize()
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-
-            for i in range(gen_length):
-                pos = prompt_length + i
-                cv = cache.bind_tasks(task_ids, pos + 1, self.device)
-                _ = self.model(
-                    gen_ids[:, i : i + 1],
-                    paged_cache=cv,
-                    position_ids=torch.full(
-                        (batch_size, 1),
-                        pos,
-                        dtype=torch.long,
-                        device=self.device,
-                    ),
-                )
-
-            end.record()
-            torch.cuda.synchronize()
-
-            for tid in task_ids:
-                cache.task_free(tid)
-
-            trial_time = start.elapsed_time(end) / 1000
-            total_time += trial_time
-
-            print(
-                f"  Trial {trial + 1}/{num_trials}: {gen_length} tokens in {trial_time:.3f}s "
-                f"({gen_length / trial_time:.1f} tok/s)"
-            )
-
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(gen_length * num_trials):
+            self.engine.model(token, past_key_values=past, use_cache=True)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        tokens = batch_size * gen_length * num_trials
+        tps = tokens / elapsed
         return BenchmarkResult(
-            total_tokens=total_tokens,
-            total_time=total_time,
-            tokens_per_second=total_tokens / total_time,
+            name="decode",
+            batch_size=batch_size,
+            seq_len=gen_length,
+            tokens_per_second=tps,
+            latency_ms=elapsed / (gen_length * num_trials) * 1000,
             metadata={
-                "benchmark_type": "decoding",
-                "batch_size": batch_size,
+                "benchmark_type": "decode",
+                "num_trials": num_trials,
                 "prompt_length": prompt_length,
-                "gen_length": gen_length,
-                "dtype": str(self.dtype),
-                "device": self.device,
-                "cache": self.cache_type,
             },
         )
 
 
-def print_benchmark_result(result: BenchmarkResult):
-    btype = result.metadata["benchmark_type"]
-    print(f"\n{' ' + btype.upper() + ' Benchmark ':-^80}")
-    print(f"Total Tokens Processed: {result.total_tokens:,}")
-    print(f"Time Consumed: {result.total_time:.3f}s")
-    print(f"Throughput: {result.tokens_per_second:,.1f} tok/s")
+def print_benchmark_result(result: BenchmarkResult) -> None:
+    print("-" * 80)
+    print(f"{result.name.upper()} — Batch={result.batch_size}, SeqLen={result.seq_len}")
+    print(f"  Throughput : {result.tokens_per_second:.1f} tokens/s")
+    print(f"  Latency    : {result.latency_ms:.2f} ms/step")
     for k, v in result.metadata.items():
         if k != "benchmark_type":
-            print(f"{k.replace('_', ' ').title()}: {v}")
+            print(f"  {k.replace('_', ' ').title()}: {v}")
     print("-" * 80)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AutoRegressiveLM benchmark")
-    parser.add_argument(
-        "--device", type=str, default="cuda", help="Device (default: cuda)"
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="bfloat16",
-        choices=["bfloat16", "float16", "float32"],
-        help="Dtype",
-    )
-    parser.add_argument(
-        "--cache",
-        type=str,
-        default="contiguous",
-        choices=["contiguous", "paged"],
-        help="KV cache type",
-    )
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--prompt_length", type=int, default=512, help="Prompt length")
-    parser.add_argument("--gen_length", type=int, default=128, help="Generation length")
-    parser.add_argument("--num_trials", type=int, default=5, help="Number of trials")
-    parser.add_argument(
-        "--prefill_only", action="store_true", help="Run prefill benchmark only"
-    )
-    parser.add_argument(
-        "--decode_only", action="store_true", help="Run decoding benchmark only"
-    )
-    args = parser.parse_args()
-
-    dtype_map = {
+@click.command(name="benchmark", help="Benchmark model throughput and latency.")
+@click.option("--device", default="cuda", help="Device.")
+@click.option(
+    "--dtype", type=click.Choice(_DTYPES), default="bfloat16", help="Data type."
+)
+@click.option(
+    "--cache", type=click.Choice(_CACHES), default="contiguous", help="KV cache type."
+)
+@click.option("--batch_size", type=int, default=4, help="Batch size.")
+@click.option("--prompt_length", type=int, default=512, help="Prompt length.")
+@click.option("--gen_length", type=int, default=128, help="Generation length.")
+@click.option("--num_trials", type=int, default=5, help="Number of trials.")
+@click.option("--prefill_only", is_flag=True, help="Prefill benchmark only.")
+@click.option("--decode_only", is_flag=True, help="Decode benchmark only.")
+def benchmark_command(
+    device: str,
+    dtype: str,
+    cache: str,
+    batch_size: int,
+    prompt_length: int,
+    gen_length: int,
+    num_trials: int,
+    prefill_only: bool,
+    decode_only: bool,
+) -> None:
+    """Benchmark model throughput and latency."""
+    dtype_map: dict[str, torch.dtype] = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
@@ -271,29 +177,32 @@ if __name__ == "__main__":
         rms_norm_eps=1e-5,
     )
 
-    benchmark = GenerationBenchmark(
-        config, device=args.device, dtype=dtype_map[args.dtype], cache_type=args.cache
+    bench = GenerationBenchmark(
+        config,
+        device=device,
+        dtype=dtype_map[dtype],
+        cache_type=cache,
     )
 
-    print("=" * 80)
-    print(
-        f"Running AutoRegressiveLM Benchmark (device={args.device}, dtype={args.dtype})"
-    )
-    print("=" * 80)
+    click.secho(f"Benchmark: device={device} dtype={dtype}", bold=True)
 
-    if not args.decode_only:
-        prefill_result = benchmark.run_prefill_benchmark(
-            batch_size=args.batch_size,
-            prompt_length=args.prompt_length,
-            num_trials=args.num_trials,
+    if not decode_only:
+        result = bench.run_prefill_benchmark(
+            batch_size=batch_size,
+            prompt_length=prompt_length,
+            num_trials=num_trials,
         )
-        print_benchmark_result(prefill_result)
+        print_benchmark_result(result)
 
-    if not args.prefill_only:
-        gen_result = benchmark.run_decoding_benchmark(
-            batch_size=args.batch_size,
-            prompt_length=args.prompt_length,
-            gen_length=args.gen_length,
-            num_trials=args.num_trials,
+    if not prefill_only:
+        result = bench.run_decoding_benchmark(
+            batch_size=batch_size,
+            prompt_length=prompt_length,
+            gen_length=gen_length,
+            num_trials=num_trials,
         )
-        print_benchmark_result(gen_result)
+        print_benchmark_result(result)
+
+
+if __name__ == "__main__":
+    benchmark_command()

@@ -1,8 +1,7 @@
-import argparse
 import json
 import time
-from typing import Optional
 
+import click
 import torch
 from tqdm import tqdm
 
@@ -20,7 +19,7 @@ def processor(
     top_p: float,
     question_key: str,
     response_key: str,
-    max_tokens: Optional[int],
+    max_tokens: int,
     batch_size: int,
     num_samples: int = 1,
     cache_len: int = 2048,
@@ -121,95 +120,47 @@ def processor(
     engine.shutdown()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Batch generation from JSONL file.")
-
-    parser.add_argument(
-        "--param_path", type=str, required=True, help="Path to the model directory."
-    )
-    parser.add_argument(
-        "--input_json_file",
-        type=str,
-        required=True,
-        help="Path to the input JSONL file.",
-    )
-    parser.add_argument(
-        "--output_json_file",
-        type=str,
-        required=True,
-        help="Path to the output JSONL file.",
-    )
-    parser.add_argument(
-        "--question_key",
-        type=str,
-        default="question",
-        help="Key for the question in the input JSON (default: question).",
-    )
-    parser.add_argument(
-        "--response_key",
-        type=str,
-        default="response",
-        help="Key for the response in the output JSON (default: response).",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.60,
-        help="Temperature for generating responses (default: 0.60).",
-    )
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        default=30,
-        help="Top-k value for generating responses (default: 30).",
-    )
-    parser.add_argument(
-        "--top_p",
-        type=float,
-        default=0.95,
-        help="Top-p value for generating responses (default: 0.95).",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Batch size for generating responses (default: 1).",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=1,
-        help="Number of responses per prompt (expands batch internally, default: 1).",
-    )
-    parser.add_argument(
-        "--max_tokens",
-        type=int,
-        default=None,
-        help=(
-            "Maximum tokens to generate "
-            "(default: model config max_position_embeddings)."
-        ),
-    )
-    parser.add_argument(
-        "--cache_len",
-        type=int,
-        default=2048,
-        help="KV cache & prompt truncation length (default: 2048, lower = less memory).",
-    )
-    parser.add_argument(
-        "--frequency_penalty",
-        type=float,
-        default=0.0,
-        help="Frequency penalty to reduce repetition (default: 0.0, try 0.5-1.0).",
-    )
-    parser.add_argument(
-        "--rep_window",
-        type=int,
-        default=64,
-        help="Window size for frequency penalty (default: 64).",
-    )
-
-    args = parser.parse_args()
-
+@click.command(name="generate", help="Batch generation from a JSONL prompt file.")
+@click.option(
+    "--param_path",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to the model directory.",
+)
+@click.option(
+    "--input_json_file",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to the input JSONL file.",
+)
+@click.option(
+    "--output_json_file",
+    type=click.Path(),
+    required=True,
+    help="Path to the output JSONL file.",
+)
+@click.option(
+    "--question_key", default="question", help="Key for the question in input JSON."
+)
+@click.option(
+    "--response_key", default="response", help="Key for the response in output JSON."
+)
+@click.option("--temperature", type=float, default=0.60, help="Sampling temperature.")
+@click.option("--top_k", type=int, default=30, help="Top-k filtering.")
+@click.option("--top_p", type=float, default=0.95, help="Top-p filtering.")
+@click.option("--batch_size", type=int, default=1, help="Batch size.")
+@click.option("--num_samples", type=int, default=1, help="Responses per prompt.")
+@click.option("--max_tokens", type=int, default=None, help="Max tokens to generate.")
+@click.option("--cache_len", type=int, default=2048, help="KV cache length.")
+@click.option("--frequency_penalty", type=float, default=0.0, help="Frequency penalty.")
+@click.option(
+    "--rep_window", type=int, default=64, help="Window size for frequency penalty."
+)
+def generate_command(**kwargs):
+    """Batch generation from a JSONL prompt file."""
     with torch.inference_mode():
-        processor(**vars(args))
+        processor(**kwargs)
+
+
+if __name__ == "__main__":
+    generate_command()

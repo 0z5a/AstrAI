@@ -18,8 +18,8 @@ dependencies = [
     "jinja2>=3.0.0",
     "fastapi",
     "uvicorn[standard]",
-    "httpx",
-    "requests",
+    "click>=8.0",
+    "pyyaml>=6.0",
 ]
 keywords = ["nlp", "datasets", "language-models", "machine-learning"]
 license = { text = "GPL-3.0" }
@@ -31,7 +31,7 @@ classifiers = [
 urls = { Homepage = "https://github.com/ViperEkura/AstrAI" }
 
 [project.optional-dependencies]
-dev = ["pytest==9.0.2", "ruff"]
+dev = ["pytest==9.0.2", "ruff", "httpx2"]
 
 [tool.setuptools.packages.find]
 where = ["."]

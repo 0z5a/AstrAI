@@ -29,6 +29,7 @@
 !/LICENSE
 !/pyproject.toml
 !/README.md
+!/AGENTS.md
 # Allow extension modules (only source .py)
 !/astrai/extension/**/*.py
 
