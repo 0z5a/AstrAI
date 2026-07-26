@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include "attn_common.h"
 #include "attn_mma_utils.cuh"
+#include "attn_warp_utils.cuh"
 
 // Split-K (FlashDecoding) tensor-core decode via GQA head-packing.
 // Decode has q_len == 1, so we pack G = q_head/kv_head query heads into the
@@ -19,11 +20,16 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const int gid = lane >> 2;
     const int tid4 = lane & 3;
 
-    const int kv_head = blockIdx.x;
+    const int pass = blockIdx.x / p.kv_head;
+    const int kv_head = blockIdx.x % p.kv_head;
     const int batch = blockIdx.y;
     const int split = blockIdx.z;
-    const int G = p.q_head / p.kv_head;
-    const int q_head0 = kv_head * G;
+
+    constexpr int MAX_G = 16;
+    const int G_total = p.q_head / p.kv_head;
+    const int g_begin = pass * MAX_G;
+    const int G = min(MAX_G, G_total - g_begin);
+    const int q_head0 = kv_head * G_total + g_begin;
 
     // Double-buffered shared memory for K/V (no sQ needed)
     __shared__ __align__(16) bf16 sK[Traits::STAGES * Traits::BC * Traits::LD];
@@ -120,7 +126,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     // ---- write UN-normalised partials for this split ----
     auto split_slot = [&](int h) -> size_t {
         size_t bh = (size_t)batch * p.q_head + h;
-        return bh * p.num_splits + split;
+        return bh * MAX_SPLITS + split;
     };
     #pragma unroll
     for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {

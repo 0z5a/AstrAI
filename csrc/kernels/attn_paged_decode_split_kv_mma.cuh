@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include "attn_common.h"
 #include "attn_mma_utils.cuh"
+#include "attn_warp_utils.cuh"
 
 // Paged split-KV tensor-core decode via GQA head-packing.
 // Reads K/V directly from the page pool through a page table — one tile
@@ -16,11 +17,16 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     const int gid = lane >> 2;
     const int tid4 = lane & 3;
 
-    const int kv_head = blockIdx.x;
+    const int pass = blockIdx.x / p.kv_head;
+    const int kv_head = blockIdx.x % p.kv_head;
     const int batch = blockIdx.y;
     const int split = blockIdx.z;
-    const int G = p.q_head / p.kv_head;
-    const int q_head0 = kv_head * G;
+
+    constexpr int MAX_G = 16;
+    const int G_total = p.q_head / p.kv_head;
+    const int g_begin = pass * MAX_G;
+    const int G = min(MAX_G, G_total - g_begin);
+    const int q_head0 = kv_head * G_total + g_begin;
 
     __shared__ __align__(16) bf16 sK[Traits::STAGES * Traits::BC * Traits::LD];
     __shared__ __align__(16) bf16 sV[Traits::STAGES * Traits::BC * Traits::LD];
@@ -120,7 +126,7 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
 
     auto split_slot = [&](int h) -> size_t {
         size_t bh = (size_t)batch * p.q_head + h;
-        return bh * p.num_splits + split;
+        return bh * MAX_SPLITS + split;
     };
     #pragma unroll
     for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {

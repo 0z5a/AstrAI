@@ -2,6 +2,7 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include "attn_common.h"
+#include "attn_warp_utils.cuh"
 
 using bf16 = __nv_bfloat16;
 
@@ -22,8 +23,8 @@ using bf16 = __nv_bfloat16;
 template<typename P>
 inline void alloc_split_partials(P& p) {
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto o_part = torch::empty({p.batch, p.q_head, p.num_splits, p.head_dim}, fopt);
-    auto ml_part = torch::empty({p.batch, p.q_head, p.num_splits, 2}, fopt);
+    auto o_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, p.head_dim}, fopt);
+    auto ml_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, 2}, fopt);
     p.o_part = (float*)o_part.data_ptr();
     p.ml_part = (float*)ml_part.data_ptr();
 }

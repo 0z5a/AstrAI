@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include "attn_warp_utils.cuh"
 #include "attn_prefill_split_q.cuh"
 #include "attn_decode_split_kv.cuh"
 #include "attn_paged_decode_split_kv.cuh"
@@ -18,7 +19,7 @@ inline int compute_num_splits(int base_blocks, int tiles_total) {
     int sm_count = 0;
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
     int n = (2 * sm_count + base_blocks - 1) / base_blocks;
-    return std::max(1, std::min(n, std::min(tiles_total, 32)));
+    return std::max(1, std::min(n, std::min(tiles_total, MAX_SPLITS)));
 }
 
 // ======================================================================
@@ -77,21 +78,14 @@ static inline void dispatch_prefill(AttentionParams<bf16>& p) {
 template <int HEAD_DIM, bool IsCausal, bool HasMask>
 static inline void launch_decode_mma(AttentionParams<bf16>& p, int group_size) {
     int G = p.q_head / p.kv_head;
-    if (G >= 1 && G <= 16) {
-        int tiles_total = (p.kv_len + 32 - 1) / 32;
-        p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
-        constexpr int STAGES = (HEAD_DIM <= 128) ? 2 : 1;
-        using Traits = KernelTraits<HEAD_DIM, 32, 1, STAGES>;
-        dim3 grid(p.kv_head, p.batch, p.num_splits);
-        attn_decode_split_kv_mma_kernel<Traits, IsCausal, HasMask><<<grid, 32>>>(p);
-    } else {
-        int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
-        p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
-        size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
-        dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
-        dim3 block(32, group_size);
-        attn_decode_split_kv_kernel<HEAD_DIM, IsCausal, HasMask><<<grid, block, smem>>>(p);
-    }
+    constexpr int MAX_G = 16;
+    int num_passes = (G + MAX_G - 1) / MAX_G;
+    int tiles_total = (p.kv_len + 32 - 1) / 32;
+    p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
+    constexpr int STAGES = (HEAD_DIM <= 128) ? 2 : 1;
+    using Traits = KernelTraits<HEAD_DIM, 32, 1, STAGES>;
+    dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
+    attn_decode_split_kv_mma_kernel<Traits, IsCausal, HasMask><<<grid, 32>>>(p);
 }
 #endif
 
@@ -100,8 +94,9 @@ static inline void launch_decode_scalar(AttentionParams<bf16>& p, int group_size
     int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
     p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
     size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
+    int g = min(group_size, 32);  // cap at 32 to respect 1024-thread limit
     dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
-    dim3 block(32, group_size);
+    dim3 block(32, g);
     attn_decode_split_kv_kernel<HEAD_DIM, IsCausal, HasMask><<<grid, block, smem>>>(p);
 }
 
@@ -140,13 +135,16 @@ static inline void dispatch_decode(AttentionParams<bf16>& p) {
 template <int HEAD_DIM, bool IsCausal, bool HasMask>
 static inline void launch_paged_decode_mma(PagedAttentionParams<bf16>& p, int group_size) {
     int G = p.q_head / p.kv_head;
-    if (G >= 1 && G <= 16 && p.page_size >= 32) {
+    constexpr int MAX_G = 16;
+    bool page_ok = (p.page_size >= 32);
+    if (G >= 1 && page_ok) {
+        int num_passes = (G + MAX_G - 1) / MAX_G;
         int tiles_total = (p.kv_len + 32 - 1) / 32;
         p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
         constexpr int STAGES = (HEAD_DIM <= 128) ? 2 : 1;
         using Traits = KernelTraits<HEAD_DIM, 32, 1, STAGES>;
-        dim3 grid(p.kv_head, p.batch, p.num_splits);
-        paged_attn_decode_split_kv_mma_kernel<Traits, IsCausal, HasMask><<<grid, 32>>>(p);
+        dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
+        paged_attn_decode_split_kv_mma_kernel<Traits, IsCausal, HasMask> <<<grid, 32>>>(p);
     } else {
         int chunks_total = (p.kv_len + PDC_CHUNK - 1) / PDC_CHUNK;
         p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
@@ -163,8 +161,9 @@ static inline void launch_paged_decode_scalar(PagedAttentionParams<bf16>& p, int
     int chunks_total = (p.kv_len + PDC_CHUNK - 1) / PDC_CHUNK;
     p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
     size_t smem = PDC_CHUNK * p.head_dim * sizeof(bf16);
+    int g = min(group_size, 32);  // cap at 32 to respect 1024-thread limit
     dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
-    dim3 block(32, group_size);
+    dim3 block(32, g);
     paged_attn_decode_split_kv_kernel<HEAD_DIM, IsCausal, HasMask><<<grid, block, smem>>>(p);
 }
 

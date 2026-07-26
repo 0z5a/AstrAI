@@ -2,15 +2,8 @@
 #include <cuda_bf16.h>
 #include <float.h>
 #include "attn_common.h"
-
-using bf16 = __nv_bfloat16;
+#include "attn_warp_utils.cuh"
 constexpr int PDC_CHUNK = 64;
-
-__device__ inline float paged_warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
 
 template <int HEAD_DIM, bool IsCausal, bool HasMask>
 __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) {
@@ -71,7 +64,7 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
             for (int i = 0; i < hd_per_thread; i++)
                 partial += q_reg[i] * __bfloat162float(
                     k_smem[s * p.head_dim + lane * hd_per_thread + i]);
-            partial = paged_warp_reduce_sum(partial) * p.scale;
+            partial = warp_reduce_sum(partial) * p.scale;
 
             int kv_idx = chunk_start + s;
             if constexpr (HasMask) {
@@ -111,7 +104,7 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
     }
 
     size_t bh = (size_t)batch * p.q_head + q_head;
-    size_t slot = bh * p.num_splits + split;
+    size_t slot = bh * MAX_SPLITS + split;
     int d0 = lane * hd_per_thread;
     #pragma unroll
     for (int i = 0; i < hd_per_thread; i++)
@@ -130,7 +123,7 @@ __global__ void paged_attn_decode_combine_kernel(PagedAttentionParams<bf16> p) {
     int batch = bh / p.q_head;
     int q_head = bh % p.q_head;
 
-    size_t split_base = (size_t)bh * p.num_splits;
+    size_t split_base = (size_t)bh * MAX_SPLITS;
     const float* mlp = p.ml_part + split_base * 2;
     const float* op = p.o_part + split_base * p.head_dim;
 
