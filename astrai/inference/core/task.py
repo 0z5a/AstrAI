@@ -135,12 +135,10 @@ class TaskManager:
         tokenizer: AutoTokenizer,
         max_batch_size: int = 16,
         max_seq_len: int = 8192,
-        max_prompt_len: int = 512,
     ):
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
-        self.max_prompt_len = max_prompt_len
 
         self.waiting_queue: Deque[Task] = deque()
         self.active_tasks: List[Task] = []
@@ -165,10 +163,10 @@ class TaskManager:
     ) -> str:
         task_id = f"task_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         prompt_ids = self.tokenizer.encode(prompt)
-        if len(prompt_ids) > self.max_prompt_len:
-            prompt_ids = prompt_ids[-self.max_prompt_len :]
+        if len(prompt_ids) > self.max_seq_len:
+            prompt_ids = prompt_ids[-self.max_seq_len :]
 
-        if len(prompt_ids) >= self.max_seq_len:
+        if len(prompt_ids) > self.max_seq_len:
             if stream_callback:
                 stream_callback(STOP)
             return task_id

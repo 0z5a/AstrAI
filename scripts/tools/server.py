@@ -31,7 +31,15 @@ _DTYPES = ["bfloat16", "float16", "float32"]
     default=16,
     help="Maximum batch size for continuous batching.",
 )
-def server_command(host, port, reload, param_path, device, dtype, max_batch_size):
+@click.option(
+    "--max_seq_len",
+    type=int,
+    default=None,
+    help="Maximum sequence length (KV cache size + prompt truncation). Uses model config if not set.",
+)
+def server_command(
+    host, port, reload, param_path, device, dtype, max_batch_size, max_seq_len
+):
     """Launch inference server (OpenAI-compatible API)."""
     dtype_map = {
         "bfloat16": torch.bfloat16,
@@ -51,6 +59,7 @@ def server_command(host, port, reload, param_path, device, dtype, max_batch_size
         dtype=dtype_map[dtype],
         param_path=Path(param_path),
         max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
     )
 
 

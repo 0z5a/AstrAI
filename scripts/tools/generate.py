@@ -38,7 +38,6 @@ def processor(
         tokenizer=tokenizer,
         max_batch_size=batch_size * num_samples,
         max_seq_len=cache_len,
-        max_prompt_len=cache_len,
     )
 
     print(f"Reading {input_json_file} ...")

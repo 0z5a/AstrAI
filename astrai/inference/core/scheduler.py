@@ -23,7 +23,6 @@ class InferenceScheduler:
         tokenizer: AutoTokenizer,
         max_batch_size: int = 16,
         max_seq_len: Optional[int] = None,
-        max_prompt_len: int = 2048,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         cache: Optional[KVCache] = None,
@@ -61,7 +60,6 @@ class InferenceScheduler:
             tokenizer=tokenizer,
             max_batch_size=max_batch_size,
             max_seq_len=self.max_seq_len,
-            max_prompt_len=max_prompt_len,
         )
 
         self._executor = Executor(

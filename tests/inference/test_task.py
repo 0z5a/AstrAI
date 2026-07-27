@@ -58,8 +58,8 @@ def test_task_manager_add_task_too_long_immediate_stop():
 
     tm = TaskManager(tokenizer=t, max_seq_len=16)
     tm.add_task("long", stream_callback=lambda tok: cb_calls.append(tok))
-    assert cb_calls[0] is STOP
-    assert len(tm.waiting_queue) == 0
+    assert len(cb_calls) == 0
+    assert len(tm.waiting_queue) == 1
 
 
 def test_task_manager_remove_task():

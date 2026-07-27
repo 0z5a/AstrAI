@@ -402,15 +402,20 @@ def train(
     decay_steps: int,
     **kwargs,
 ):
-    assert train_type in [
+    if train_type not in [
         "seq",
         "sft",
         "dpo",
         "grpo",
         "online_grpo",
         "online_dpo",
-    ]
-    assert os.path.exists(param_path)
+    ]:
+        raise ValueError(
+            f"Invalid train_type '{train_type}'. "
+            f"Must be one of: seq, sft, dpo, grpo, online_grpo, online_dpo"
+        )
+    if not os.path.exists(param_path):
+        raise FileNotFoundError(f"Model directory not found: {param_path}")
     if nprocs > 1 and parallel_mode == "none":
         raise ValueError(
             "--nprocs > 1 requires --parallel_mode to be 'ddp', 'fsdp', or 'fsdp2'"

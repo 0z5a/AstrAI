@@ -47,7 +47,6 @@ class GenerationBenchmark:
             tokenizer=None,
             max_batch_size=256,
             max_seq_len=config.max_position_embeddings,
-            max_prompt_len=config.max_position_embeddings,
         )
 
     def run_prefill_benchmark(

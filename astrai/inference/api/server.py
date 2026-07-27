@@ -110,6 +110,7 @@ def _create_engine(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     max_batch_size: int = 16,
+    max_seq_len: Optional[int] = None,
 ) -> InferenceEngine:
     if not param_path.exists():
         raise FileNotFoundError(f"Parameter directory not found: {param_path}")
@@ -123,6 +124,7 @@ def _create_engine(
         model=model,
         tokenizer=tokenizer,
         max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
     )
     logger.info(f"Inference engine initialized with max_batch_size={max_batch_size}")
     return engine
@@ -186,6 +188,7 @@ def run_server(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     max_batch_size: int = 16,
+    max_seq_len: Optional[int] = None,
 ):
     app = get_app()
     app.state.server_config = {
@@ -193,6 +196,7 @@ def run_server(
         "dtype": dtype,
         "param_path": param_path,
         "max_batch_size": max_batch_size,
+        "max_seq_len": max_seq_len,
     }
     uvicorn.run(
         app,

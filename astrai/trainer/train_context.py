@@ -257,7 +257,6 @@ class TrainContextBuilder:
                 tokenizer=tokenizer,
                 max_batch_size=rollout_batch_size,
                 max_seq_len=max_seq_len,
-                max_prompt_len=max_seq_len or 4096,
             )
 
             generator = RolloutGenerator(

@@ -109,7 +109,6 @@ def _make_scheduler(model, tokenizer, max_batch_size=8, max_len=128):
         tokenizer=tokenizer,
         max_batch_size=max_batch_size,
         max_seq_len=max_len,
-        max_prompt_len=max_len,
     )
 
 

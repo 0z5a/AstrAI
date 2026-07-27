@@ -228,7 +228,6 @@ def _make_real_scheduler(device):
         tokenizer=tokenizer,
         max_batch_size=8,
         max_seq_len=64,
-        max_prompt_len=64,
     )
     return scheduler, tokenizer, model
 
