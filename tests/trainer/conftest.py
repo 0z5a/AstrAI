@@ -2,33 +2,15 @@ import os
 
 import pytest
 import torch
-from torch.utils.data import Dataset
 
 from astrai.config import TrainConfig
 from astrai.trainer.schedule import SchedulerFactory
-
-
-class TrainerDataset(Dataset):
-    """Base dataset for trainer tests with consistent interface."""
-
-    def __init__(self, length=100, max_length=64, vocab_size=1000):
-        self.length = length
-        self.max_length = max_length
-        self.vocab_size = vocab_size
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        return {
-            "input_ids": torch.randint(0, self.vocab_size, (self.max_length,)),
-            "target_ids": torch.randint(0, self.vocab_size, (self.max_length,)),
-        }
+from tests.helpers import RandomTokenDataset
 
 
 def create_train_config(
     model_fn,
-    dataset: Dataset,
+    dataset,
     test_dir: str,
     device: str,
     strategy: str = "seq",
@@ -40,25 +22,7 @@ def create_train_config(
     random_seed: int = 42,
     **kwargs,
 ):
-    """Factory function to create common TrainConfig for tests.
-
-    Args:
-        model_fn: Model factory (callable returning nn.Module)
-        dataset: Training dataset
-        test_dir: Checkpoint directory
-        device: Device type ("cuda" or "cpu")
-        strategy: Training strategy type (default: "seq")
-        n_epoch: Number of epochs (default: 1)
-        batch_per_device: Batch size per device (default: 2)
-        grad_accum_steps: Gradient accumulation steps (default: 1)
-        max_grad_norm: Maximum gradient norm for clipping (default: 1.0)
-        ckpt_interval: Checkpoint save interval in optimizer steps (default: 5)
-        random_seed: Random seed for reproducibility (default: 42)
-        **kwargs: Additional arguments passed to TrainConfig
-
-    Returns:
-        TrainConfig instance configured for testing
-    """
+    """Factory function to create common TrainConfig for tests."""
 
     def optimizer_fn(m):
         return torch.optim.AdamW(m.parameters(), lr=0.001)
@@ -89,16 +53,11 @@ def create_train_config(
 
 @pytest.fixture
 def train_config_factory():
-    """Fixture that provides the create_train_config factory function.
-
-    This fixture can be used by tests to create consistent TrainConfig
-    instances with sensible defaults for testing.
-    """
+    """Fixture providing the ``create_train_config`` factory function."""
     return create_train_config
 
 
 @pytest.fixture
 def trainer_dataset():
     """Fixture providing a dataset for trainer tests."""
-    dataset = TrainerDataset()
-    yield dataset
+    return RandomTokenDataset()

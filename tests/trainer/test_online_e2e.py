@@ -12,19 +12,7 @@ from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
-
-_CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{% if message['role'] == 'system' %}"
-    "SYSTEM: {{ message['content'] }}\n"
-    "{% elif message['role'] == 'user' %}"
-    "USER: {{ message['content'] }}\n"
-    "{% elif message['role'] == 'assistant' %}"
-    "ASSISTANT: {{ message['content'] }}\n"
-    "{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}ASSISTANT: {% endif %}"
-)
+from tests.helpers import CHAT_TEMPLATE
 
 
 class InstructionDataset(Dataset):
@@ -97,7 +85,7 @@ def test_online_dpo_end_to_end(base_test_env):
 
     # Equip tokenizer with a chat template so RolloutGenerator can
     # render instruction/input via apply_chat_template.
-    tokenizer.set_chat_template(_CHAT_TEMPLATE)
+    tokenizer.set_chat_template(CHAT_TEMPLATE)
     tokenizer.save_pretrained(test_dir)
 
     model_fn = partial(_model_fn, model_config)

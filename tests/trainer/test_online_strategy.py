@@ -9,7 +9,6 @@ the per-strategy ``prepare_from_rollout`` mappings for both
 import pytest
 import torch
 
-from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.rollout import RolloutResult
 from astrai.trainer.strategy import (
@@ -17,47 +16,7 @@ from astrai.trainer.strategy import (
     GRPOStrategy,
     StrategyFactory,
 )
-
-
-class _FakeExecutor:
-    """Executor stub tracking ``sync_gradients`` and providing unwrap_model."""
-
-    def __init__(self, sync_gradients=True):
-        self._sync_gradients = sync_gradients
-
-    @property
-    def sync_gradients(self):
-        return self._sync_gradients
-
-    def unwrap_model(self, model):
-        return model.state_dict()
-
-
-def _make_config(vocab_size=200, max_position_embeddings=64):
-    return AutoRegressiveLMConfig(
-        vocab_size=vocab_size,
-        hidden_size=16,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        intermediate_size=32,
-        max_position_embeddings=max_position_embeddings,
-        num_hidden_layers=2,
-        rms_norm_eps=1e-5,
-    )
-
-
-def _make_model(device):
-    cfg = _make_config()
-    return AutoRegressiveLM(cfg).to(device=device), cfg
-
-
-def _make_frozen(model, device):
-    cfg = _make_config()
-    copy = AutoRegressiveLM(cfg).to(device=device)
-    copy.load_state_dict(model.state_dict())
-    copy.requires_grad_(False)
-    copy.eval()
-    return copy
+from tests.helpers import FakeExecutor, make_frozen, make_model, make_rollout_config
 
 
 def _make_rollout_result(B=2, G=4, P=6, R=8, device="cpu"):
@@ -75,7 +34,7 @@ class _RecordingRunner:
     """Fake RolloutRunner returning a fixed result with freshness tracking.
 
     Freshness is ``True`` on the first call after construction or after
-    :meth:`swap_result`; ``False`` on subsequent cached calls — mirroring
+    :meth:`swap_result`; ``False`` on subsequent cached calls -- mirroring
     the real ``RolloutRunner`` contract without invoking generation.
     """
 
@@ -99,15 +58,10 @@ class _RecordingRunner:
         self._fresh = True
 
 
-@pytest.fixture
-def device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
 def _make_grpo(device, executor=None):
-    model, _ = _make_model(device)
-    old_model = _make_frozen(model, device)
-    ref_model = _make_frozen(model, device)
+    model, _ = make_model(device)
+    old_model = make_frozen(model, device)
+    ref_model = make_frozen(model, device)
     return GRPOStrategy(
         model=model,
         device=device,
@@ -116,22 +70,22 @@ def _make_grpo(device, executor=None):
         clip_eps=0.2,
         kl_coef=0.01,
         group_size=4,
-        model_fn=lambda c=_make_config(): AutoRegressiveLM(c).to(device=device),
-        executor=executor or _FakeExecutor(),
+        model_fn=lambda c=make_rollout_config(): AutoRegressiveLM(c).to(device=device),
+        executor=executor or FakeExecutor(),
     )
 
 
 def _make_dpo(device, executor=None):
-    model, _ = _make_model(device)
-    ref_model = _make_frozen(model, device)
+    model, _ = make_model(device)
+    ref_model = make_frozen(model, device)
     return DPOStrategy(
         model=model,
         device=device,
         ref_model=ref_model,
         beta=0.1,
         reduction="sum",
-        model_fn=lambda c=_make_config(): AutoRegressiveLM(c).to(device=device),
-        executor=executor or _FakeExecutor(),
+        model_fn=lambda c=make_rollout_config(): AutoRegressiveLM(c).to(device=device),
+        executor=executor or FakeExecutor(),
     )
 
 
@@ -295,7 +249,7 @@ def test_dpo_no_sync_hook_when_new_rollout_result(device):
 
 
 def test_step_not_called_when_sync_gradients_false(device):
-    executor = _FakeExecutor(sync_gradients=False)
+    executor = FakeExecutor(sync_gradients=False)
     strat = _make_grpo(device, executor=executor)
     runner = _RecordingRunner(_make_rollout_result(device=device))
     strat.set_rollout_runner(runner)
@@ -304,7 +258,7 @@ def test_step_not_called_when_sync_gradients_false(device):
 
 
 def test_step_called_when_sync_gradients_true(device):
-    executor = _FakeExecutor(sync_gradients=True)
+    executor = FakeExecutor(sync_gradients=True)
     strat = _make_grpo(device, executor=executor)
     runner = _RecordingRunner(_make_rollout_result(device=device))
     strat.set_rollout_runner(runner)

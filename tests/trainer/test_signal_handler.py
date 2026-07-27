@@ -1,4 +1,3 @@
-import json
 import multiprocessing as mp
 import os
 import signal
@@ -10,15 +9,15 @@ import torch.optim as optim
 from torch.utils.data import Dataset
 
 from astrai.config import TrainConfig
-from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.parallel.signal_handler import register_signal_handlers
 from astrai.trainer import Trainer
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.train_context import TrainContext
+from tests.helpers import load_checkpoint_meta, make_tiny_config
 
 
-class _PicklableDataset(Dataset):
+class PicklableDataset(Dataset):
     def __init__(self, length=200, max_length=64, vocab_size=1000):
         self.length = length
         self.max_length = max_length
@@ -35,16 +34,7 @@ class _PicklableDataset(Dataset):
 
 
 def _build_model():
-    config = AutoRegressiveLMConfig(
-        vocab_size=1000,
-        hidden_size=8,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        intermediate_size=16,
-        max_position_embeddings=64,
-        num_hidden_layers=2,
-        rms_norm_eps=1e-5,
-    )
+    config = make_tiny_config()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return AutoRegressiveLM(config).to(device=device)
 
@@ -61,7 +51,7 @@ class _ReadyCallback:
 
 
 def _inner_run(batch_per_device, ckpt_interval, ckpt_dir, log_dir, ready_file):
-    dataset = _PicklableDataset()
+    dataset = PicklableDataset()
 
     def model_fn():
         return _build_model()
@@ -147,17 +137,7 @@ def test_sigterm_triggers_checkpoint_save(base_test_env):
     exitcode = _spawn_train_and_signal(base_test_env["test_dir"], signal.SIGTERM)
     assert exitcode == 0, f"Training process exited with code {exitcode} (expected 0)"
 
-    ckpt_dir = base_test_env["test_dir"]
-    meta_files = []
-    for root, dirs, files in os.walk(ckpt_dir):
-        for f in files:
-            if f == "meta.json":
-                meta_files.append(os.path.join(root, f))
-
-    assert len(meta_files) > 0, f"No checkpoint meta.json found in {ckpt_dir}"
-
-    with open(meta_files[-1]) as f:
-        meta = json.load(f)
+    meta = load_checkpoint_meta(base_test_env["test_dir"])
     assert "consumed_samples" in meta
     assert meta["consumed_samples"] >= 0
 
@@ -167,11 +147,6 @@ def test_sigint_triggers_checkpoint_save(base_test_env):
     exitcode = _spawn_train_and_signal(base_test_env["test_dir"], signal.SIGINT)
     assert exitcode == 0, f"Training process exited with code {exitcode} (expected 0)"
 
-    ckpt_dir = base_test_env["test_dir"]
-    meta_files = []
-    for root, dirs, files in os.walk(ckpt_dir):
-        for f in files:
-            if f == "meta.json":
-                meta_files.append(os.path.join(root, f))
-
-    assert len(meta_files) > 0, f"No checkpoint meta.json found in {ckpt_dir}"
+    meta = load_checkpoint_meta(base_test_env["test_dir"])
+    assert "consumed_samples" in meta
+    assert meta["consumed_samples"] >= 0

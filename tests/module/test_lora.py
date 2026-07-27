@@ -249,17 +249,17 @@ def test_save_load_roundtrip():
     with torch.no_grad():
         out_src = model(x)["logits"].clone()
 
-    tmpdir = tempfile.mkdtemp()
-    save_lora(model, tmpdir, cfg)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        save_lora(model, tmpdir, cfg)
 
-    model2 = _make_model()
-    model2.load_state_dict(model.state_dict(), strict=False)
-    load_lora(model2, tmpdir)
+        model2 = _make_model()
+        model2.load_state_dict(model.state_dict(), strict=False)
+        load_lora(model2, tmpdir)
 
-    with torch.no_grad():
-        out_dst = model2(x)["logits"]
+        with torch.no_grad():
+            out_dst = model2(x)["logits"]
 
-    torch.testing.assert_close(out_src, out_dst)
+        torch.testing.assert_close(out_src, out_dst)
 
 
 def test_save_after_merge_raises():
@@ -271,13 +271,13 @@ def test_save_after_merge_raises():
             if isinstance(m, LoRALinear):
                 m.lora_B.fill_(0.5)
 
-    tmpdir = tempfile.mkdtemp()
-    save_lora(model, tmpdir, cfg)
-    merge_lora(model)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        save_lora(model, tmpdir, cfg)
+        merge_lora(model)
 
-    tmpdir2 = tempfile.mkdtemp()
-    with pytest.raises(RuntimeError, match="No LoRA parameters"):
-        save_lora(model, tmpdir2, cfg)
+        with tempfile.TemporaryDirectory() as tmpdir2:
+            with pytest.raises(RuntimeError, match="No LoRA parameters"):
+                save_lora(model, tmpdir2, cfg)
 
 
 def test_load_lora_on_already_injected():
@@ -289,16 +289,15 @@ def test_load_lora_on_already_injected():
             if isinstance(m, LoRALinear):
                 m.lora_B.fill_(0.5)
 
-    tmpdir = tempfile.mkdtemp()
-    save_lora(model, tmpdir, LoRAConfig(r=4, alpha=8, target_modules=("q_proj",)))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        save_lora(model, tmpdir, LoRAConfig(r=4, alpha=8, target_modules=("q_proj",)))
 
-    model2 = _make_model()
-    model2.load_state_dict(model.state_dict(), strict=False)
-    inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
+        model2 = _make_model()
+        model2.load_state_dict(model.state_dict(), strict=False)
+        inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
 
-    # load onto already-injected model
-    load_lora(model2, tmpdir)
-    assert _get_lora_count(model2) > 0
+        load_lora(model2, tmpdir)
+        assert _get_lora_count(model2) > 0
 
 
 def test_load_lora_mismatched_r_raises():
@@ -310,15 +309,15 @@ def test_load_lora_mismatched_r_raises():
             if isinstance(m, LoRALinear):
                 m.lora_B.fill_(0.5)
 
-    tmpdir = tempfile.mkdtemp()
-    save_lora(model, tmpdir, cfg)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        save_lora(model, tmpdir, cfg)
 
-    model2 = _make_model()
-    model2.load_state_dict(model.state_dict(), strict=False)
-    inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
+        model2 = _make_model()
+        model2.load_state_dict(model.state_dict(), strict=False)
+        inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
 
-    with pytest.raises(RuntimeError, match="size mismatch"):
-        load_lora(model2, tmpdir)  # strict=False, only lora keys
+        with pytest.raises(RuntimeError, match="size mismatch"):
+            load_lora(model2, tmpdir)
 
 
 def test_merge_preserves_output():

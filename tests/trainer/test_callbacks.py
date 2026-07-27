@@ -1,10 +1,6 @@
-import os
-
 import torch
 
-from astrai.config.train_config import TrainConfig
 from astrai.model.components.decoder_block import DecoderBlock
-from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.train_callback import GradientCheckpointingCallback, TrainCallback
 from astrai.trainer.trainer import Trainer
 
@@ -94,69 +90,35 @@ def test_gradient_checkpointing_backward(test_model):
         assert p.grad is None or p.grad.sum().item() == 0, f"{name} grad not zeroed"
 
 
-def test_gradient_checkpointing_trainer_integration(base_test_env, random_dataset):
+def test_gradient_checkpointing_trainer_integration(
+    base_test_env, random_dataset, train_config_factory, device
+):
     """Gradient checkpointing runs end-to-end via Trainer."""
-
-    def optimizer_fn(model):
-        return torch.optim.AdamW(model.parameters())
-
-    def scheduler_fn(optim):
-        return SchedulerFactory.create(
-            "cosine", optim, warmup_steps=10, lr_decay_steps=10, min_rate=0.05
-        )
-
-    train_config = TrainConfig(
+    train_config = train_config_factory(
         model_fn=lambda: base_test_env["model"],
-        strategy="seq",
         dataset=random_dataset,
-        optimizer_fn=optimizer_fn,
-        scheduler_fn=scheduler_fn,
-        ckpt_dir=base_test_env["test_dir"],
-        log_dir=os.path.join(base_test_env["test_dir"], "logs"),
-        n_epoch=1,
-        batch_per_device=2,
+        test_dir=base_test_env["test_dir"],
+        device=device,
         ckpt_interval=3,
-        grad_accum_steps=1,
-        max_grad_norm=1.0,
-        random_seed=42,
-        device_type=base_test_env["device"],
         gradient_checkpointing_modules=[DecoderBlock],
     )
 
     trainer = Trainer(train_config)
     trainer.train()
-    # no crash = callback correctly enabled/disabled
 
 
-def test_callback_integration(base_test_env, random_dataset):
+def test_callback_integration(
+    base_test_env, random_dataset, train_config_factory, device
+):
     """Test that all callbacks are properly integrated"""
-
-    def optimizer_fn(model):
-        return torch.optim.AdamW(model.parameters())
-
-    def scheduler_fn(optim):
-        return SchedulerFactory.create(
-            "cosine", optim, warmup_steps=10, lr_decay_steps=10, min_rate=0.05
-        )
-
-    train_config = TrainConfig(
+    train_config = train_config_factory(
         model_fn=lambda: base_test_env["model"],
-        strategy="seq",
         dataset=random_dataset,
-        optimizer_fn=optimizer_fn,
-        scheduler_fn=scheduler_fn,
-        ckpt_dir=base_test_env["test_dir"],
-        log_dir=os.path.join(base_test_env["test_dir"], "logs"),
-        n_epoch=1,
-        batch_per_device=2,
+        test_dir=base_test_env["test_dir"],
+        device=device,
         ckpt_interval=3,
-        grad_accum_steps=1,
-        max_grad_norm=1.0,
-        random_seed=42,
-        device_type=base_test_env["device"],
     )
 
-    # Create custom callbacks to track calls
     callback_calls = []
 
     class TrackingCallback(TrainCallback):
@@ -170,10 +132,8 @@ def test_callback_integration(base_test_env, random_dataset):
             callback_calls.append("on_epoch_end")
 
     trainer = Trainer(train_config, callbacks=[TrackingCallback()])
-
     trainer.train()
 
-    # Verify callbacks were called
     assert "on_train_begin" in callback_calls
     assert "on_batch_end" in callback_calls
     assert "on_epoch_end" in callback_calls

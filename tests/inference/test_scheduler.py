@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from astrai.inference import InferenceScheduler
+from astrai.model.transformer import AutoRegressiveLM
+from tests.helpers import FakeTokenizer, make_rollout_config
 
 
 @pytest.fixture
@@ -195,34 +197,9 @@ def test_prefill_skips_fully_cached_tasks(mock_model_and_tokenizer):
 
 def _make_real_scheduler(device):
     """Build a scheduler backed by a tiny real model for run_batch tests."""
-    from astrai.config.model_config import AutoRegressiveLMConfig
-    from astrai.model.transformer import AutoRegressiveLM
-
-    class _Tok:
-        stop_ids = [2]
-
-        def encode(self, texts, **_):
-            if isinstance(texts, str):
-                texts = [texts]
-            return [[b for b in t.encode("utf-8")] for t in texts]
-
-        def decode(self, ids, skip_special_tokens=True):
-            return bytes(b for b in ids if b > 2 or not skip_special_tokens).decode(
-                "utf-8", errors="ignore"
-            )
-
-    cfg = AutoRegressiveLMConfig(
-        vocab_size=200,
-        hidden_size=16,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        intermediate_size=32,
-        max_position_embeddings=64,
-        num_hidden_layers=2,
-        rms_norm_eps=1e-5,
-    )
+    cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device).eval()
-    tokenizer = _Tok()
+    tokenizer = FakeTokenizer()
     scheduler = InferenceScheduler(
         model=model,
         tokenizer=tokenizer,
@@ -232,8 +209,7 @@ def _make_real_scheduler(device):
     return scheduler, tokenizer, model
 
 
-def test_run_batch_returns_token_sequences():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def test_run_batch_returns_token_sequences(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30], [5, 6, 7, 8]]
@@ -247,9 +223,8 @@ def test_run_batch_returns_token_sequences():
         scheduler.stop()
 
 
-def test_run_batch_return_logprobs_aligned():
+def test_run_batch_return_logprobs_aligned(device):
     """return_logprobs=True gives (token_ids, logprobs) tuples with equal len."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30, 40]]
@@ -264,8 +239,7 @@ def test_run_batch_return_logprobs_aligned():
         scheduler.stop()
 
 
-def test_run_batch_respects_max_tokens():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def test_run_batch_respects_max_tokens(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30]]
@@ -275,9 +249,8 @@ def test_run_batch_respects_max_tokens():
         scheduler.stop()
 
 
-def test_run_batch_stop_id_terminates():
+def test_run_batch_stop_id_terminates(device):
     """A token matching stop_ids terminates generation for that prompt."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30]]
@@ -290,9 +263,8 @@ def test_run_batch_stop_id_terminates():
         scheduler.stop()
 
 
-def test_run_batch_empty_prompts():
+def test_run_batch_empty_prompts(device):
     """Empty prompt list yields empty result list."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         assert scheduler.run_batch([], max_tokens=4) == []
@@ -300,9 +272,8 @@ def test_run_batch_empty_prompts():
         scheduler.stop()
 
 
-def test_run_batch_too_long_prompt_skipped():
+def test_run_batch_too_long_prompt_skipped(device):
     """A prompt longer than max_seq_len yields an empty result slot."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         long = list(range(100))  # > max_seq_len=64

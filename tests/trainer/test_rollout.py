@@ -3,9 +3,7 @@
 import pytest
 import torch
 
-from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.inference.core.scheduler import InferenceScheduler
-from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.rollout import (
     BaseRewardModel,
     RawRollout,
@@ -13,50 +11,7 @@ from astrai.trainer.rollout import (
     RolloutResult,
     RolloutRunner,
 )
-
-_CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{% if message['role'] == 'system' %}SYSTEM: {{ message['content'] }}\n{% endif %}"
-    "{% if message['role'] == 'user' %}USER: {{ message['content'] }}\n{% endif %}"
-    "{% if message['role'] == 'assistant' %}ASSISTANT: {{ message['content'] }}\n{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}ASSISTANT: {% endif %}"
-)
-
-
-class FakeTokenizer:
-    """Minimal stub tokenizer with a chat template for rollout tests."""
-
-    stop_ids = [2]
-
-    def __init__(self):
-        from astrai.tokenize.chat_template import ChatTemplate
-
-        self._chat_template = ChatTemplate.from_string(_CHAT_TEMPLATE)
-
-    def encode(self, texts, **_):
-        if isinstance(texts, str):
-            texts = [texts]
-        return [[b for b in t.encode("utf-8")] for t in texts]
-
-    def decode(self, ids, skip_special_tokens=True):
-        if isinstance(ids, list):
-            return bytes(b for b in ids if b > 2).decode("utf-8", errors="ignore")
-        return str(ids)
-
-    def apply_chat_template(
-        self, messages, tokenize=True, add_generation_prompt=True, **_
-    ):
-        rendered = self._chat_template.render(
-            messages=messages, add_generation_prompt=add_generation_prompt
-        )
-        if tokenize:
-            return (
-                self.encode(rendered)[0]
-                if isinstance(rendered, str)
-                else [self.encode(t)[0] for t in rendered]
-            )
-        return rendered
+from tests.helpers import FakeTokenizer, make_model
 
 
 class ConstantRewardModel(BaseRewardModel):
@@ -81,26 +36,6 @@ class NonFiniteRewardModel(BaseRewardModel):
         B = len(prompts)
         G = len(responses[0]) if B else 0
         return torch.full((B, G), float("nan"))
-
-
-def _make_config(vocab_size=200, max_position_embeddings=128):
-    return AutoRegressiveLMConfig(
-        vocab_size=vocab_size,
-        hidden_size=16,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        intermediate_size=32,
-        max_position_embeddings=max_position_embeddings,
-        num_hidden_layers=2,
-        rms_norm_eps=1e-5,
-    )
-
-
-def _make_model(device):
-    cfg = _make_config()
-    m = AutoRegressiveLM(cfg).to(device=device)
-    m.eval()
-    return m, cfg
 
 
 def _make_scheduler(model, tokenizer, max_batch_size=8, max_len=128):
@@ -160,14 +95,9 @@ def test_constant_reward_model_shape():
     assert torch.all(out == 0.5)
 
 
-@pytest.fixture
-def device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
 def _make_generator(device, **kw):
-    model, _ = _make_model(device)
-    tokenizer = FakeTokenizer()
+    model, _ = make_model(device, max_position_embeddings=128)
+    tokenizer = FakeTokenizer(with_chat_template=True)
     scheduler = _make_scheduler(
         model,
         tokenizer,
@@ -229,7 +159,7 @@ def test_rollout_generator_mask_matches_responses(device):
 
 
 def test_rollout_generator_logprobs_are_nonpositive(device):
-    """Behaviour-policy logprobs of sampled tokens should be ≤ 0."""
+    """Behaviour-policy logprobs of sampled tokens should be <= 0."""
     gen, _ = _make_generator(device, group_size=2, max_tokens=4)
     batch = _make_instruction_batch(n=1)
     r = gen.generate(batch)
@@ -241,7 +171,7 @@ def test_rollout_generator_logprobs_are_nonpositive(device):
 
 
 def test_rollout_generator_instruction_role_mapping(device):
-    """instruction → system, input → user, output → assistant."""
+    """instruction -> system, input -> user, output -> assistant."""
     gen, _ = _make_generator(device, group_size=1, max_tokens=4)
     batch = {
         "instruction": ["Be helpful"],

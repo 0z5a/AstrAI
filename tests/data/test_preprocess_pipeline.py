@@ -16,6 +16,7 @@ from tests.data.conftest import (
     make_dpo_chat_config,
     make_grpo_no_template_config,
 )
+from tests.helpers import load_shard_meta
 
 
 def test_filter_by_length():
@@ -68,10 +69,7 @@ def test_full_chat_pipeline(temp_dir, chat_tokenizer_dir):
         tokenizer_path=chat_tokenizer_dir,
     ).run()
 
-    meta_path = os.path.join(out_dir, "__default__", "shard_0000", "meta.json")
-    assert os.path.exists(meta_path)
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
+    meta = load_shard_meta(out_dir)
     assert "sequence" in meta
     assert "loss_mask" in meta
     assert meta["sequence"]["dtype"] == "int32"
@@ -112,10 +110,7 @@ def test_full_text_pipeline(temp_dir, tokenizer_dir):
         tokenizer_path=tokenizer_dir,
     ).run()
 
-    meta_path = os.path.join(out_dir, "__default__", "shard_0000", "meta.json")
-    assert os.path.exists(meta_path)
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
+    meta = load_shard_meta(out_dir)
     assert "sequence" in meta
     assert "loss_mask" not in meta
 
@@ -158,10 +153,7 @@ def test_full_instruction_pipeline(temp_dir, tokenizer_dir):
         tokenizer_path=tokenizer_dir,
     ).run()
 
-    meta_path = os.path.join(out_dir, "__default__", "shard_0000", "meta.json")
-    assert os.path.exists(meta_path)
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
+    meta = load_shard_meta(out_dir)
     assert "sequence" in meta
     assert "loss_mask" in meta
 
@@ -187,9 +179,7 @@ def test_dtype_override(temp_dir, tokenizer_dir):
         tokenizer_path=tokenizer_dir,
     ).run()
 
-    meta_path = os.path.join(out_dir, "__default__", "shard_0000", "meta.json")
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
+    meta = load_shard_meta(out_dir)
     assert meta["sequence"]["dtype"] == "int32"
     assert meta["loss_mask"]["dtype"] == "bool"
 
@@ -221,10 +211,7 @@ def test_dpo_pipeline(temp_dir, chat_tokenizer_dir):
         tokenizer_path=chat_tokenizer_dir,
     ).run()
 
-    meta_path = os.path.join(out_dir, "__default__", "shard_0000", "meta.json")
-    assert os.path.exists(meta_path)
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
+    meta = load_shard_meta(out_dir)
     assert "chosen" in meta
     assert "rejected" in meta
     assert "chosen_mask" in meta
@@ -254,10 +241,7 @@ def test_grpo_pipeline(temp_dir, tokenizer_dir):
         tokenizer_path=tokenizer_dir,
     ).run()
 
-    meta_path = os.path.join(out_dir, "__default__", "shard_0000", "meta.json")
-    assert os.path.exists(meta_path)
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
+    meta = load_shard_meta(out_dir)
     assert "prompts" in meta
     assert "responses" in meta
     assert "masks" in meta
