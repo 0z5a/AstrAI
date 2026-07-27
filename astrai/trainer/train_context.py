@@ -101,18 +101,13 @@ class TrainContextBuilder:
                 if checkpoint.config:
                     model_config = checkpoint.config
                 if self._resume:
-                    preloaded_epoch = checkpoint.epoch or cfg.start_epoch
-                    if checkpoint.consumed_samples > 0:
-                        per_step = (
-                            cfg.batch_per_device
-                            * get_world_size()
-                            * cfg.grad_accum_steps
-                        )
-                        preloaded_consumed = (
-                            checkpoint.consumed_samples // per_step
-                        ) * per_step
-                    else:
-                        preloaded_consumed = cfg.start_samples * get_world_size()
+                    preloaded_epoch = checkpoint.epoch
+                    per_step = (
+                        cfg.batch_per_device * get_world_size() * cfg.grad_accum_steps
+                    )
+                    preloaded_consumed = (
+                        checkpoint.consumed_samples // per_step
+                    ) * per_step
                     preloaded_checkpoint = checkpoint
 
         if not model_config and hasattr(cfg.model_fn(), "config"):
@@ -162,6 +157,15 @@ class TrainContextBuilder:
             )
 
         sampler_offset = context.consumed_samples // context.world_size
+
+        if self._resume and sampler_offset > 0:
+            offset = context.world_size - 1
+            num_samples_per_replica = (
+                len(train_dataset) + offset
+            ) // context.world_size
+            if num_samples_per_replica > 0:
+                context.epoch = sampler_offset // num_samples_per_replica
+
         sampler = RDSampler(
             data_source=train_dataset,
             start_epoch=context.epoch,
