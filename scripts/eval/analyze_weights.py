@@ -8,11 +8,11 @@ import safetensors.torch
 import torch
 
 
-def effective_rank_metrics(w: torch.Tensor) -> dict:
+def effective_rank_metrics(w: torch.Tensor, device: str = "cpu") -> dict:
     if w.ndim == 1:
         return {"shape": tuple(w.shape), "is_1d": True}
 
-    w = w.float()
+    w = w.float().to(device)
     s = torch.linalg.svdvals(w)
     s_sq = s**2
     total = s_sq.sum()
@@ -238,6 +238,12 @@ def main():
         default=None,
         help="Save results as JSON to this path.",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device for SVD computation (e.g., 'cuda:0', 'cpu').",
+    )
     args = parser.parse_args()
 
     all_results = {}
@@ -277,10 +283,12 @@ def main():
 
         results = {}
         if not args.no_svd:
-            print(f"Computing SVD on {len(weight_keys)} tensors...")
+            print(
+                f"Computing SVD on {len(weight_keys)} tensors (device={args.device})..."
+            )
             for i, k in enumerate(sorted(weight_keys)):
                 print(f"  [{i + 1}/{len(weight_keys)}] {k:<60s}", end="\r")
-                results[k] = effective_rank_metrics(sd[k])
+                results[k] = effective_rank_metrics(sd[k], device=args.device)
             print()
         else:
             print(f"Computing stats on {len(weight_keys)} tensors (no SVD)...")
