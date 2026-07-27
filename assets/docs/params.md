@@ -84,7 +84,7 @@ Combined optimizer: matrix parameters via **Muon**, non-matrix via **AdamW** (`f
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--nprocs` | Number of GPUs / processes | 1 |
-| `--parallel_mode` | Parallel strategy (`none`, `ddp`, or `fsdp`) | none |
+| `--parallel_mode` | Parallel strategy (`none`, `ddp`, `fsdp`, or `fsdp2`) | none |
 | `--device_type` | Device type | cuda |
 | `--start_method` | Multiprocessing start method (`spawn`, `fork`, `forkserver`) | spawn |
 | `--backend` | Distributed training backend | nccl |
@@ -164,6 +164,7 @@ nohup python scripts/tools/train.py \
 | `--device` | str | `cuda` | Device to load model on |
 | `--dtype` | str | `bfloat16` | Model weights dtype (`bfloat16`, `float16`, `float32`) |
 | `--max_batch_size` | int | `16` | Maximum batch size for continuous batching |
+| `--max_seq_len` | int | model config `max_position_embeddings` | Maximum sequence length (KV cache size + prompt truncation) |
 | `--reload` | flag | `False` | Enable auto-reload for development |
 
 Usage:
@@ -186,7 +187,11 @@ See [Inference Guide](inference.md) for HTTP API documentation.
 | `--top_k` | int | `30` | Top-k filtering |
 | `--top_p` | float | `0.95` | Nucleus sampling threshold |
 | `--batch_size` | int | `1` | Batch size for generation |
+| `--num_samples` | int | `1` | Responses per prompt |
 | `--max_tokens` | int | model config `max_position_embeddings` | Maximum tokens to generate |
+| `--cache_len` | int | `2048` | KV cache length |
+| `--frequency_penalty` | float | `0.0` | Frequency penalty |
+| `--rep_window` | int | `64` | Window size for frequency penalty |
 
 Usage:
 ```bash

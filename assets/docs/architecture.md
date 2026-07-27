@@ -924,7 +924,6 @@ classDiagram
             +AutoTokenizer tokenizer
             +int max_batch_size
             +int max_seq_len
-            +int max_prompt_len
             +Deque waiting_queue
             +List active_tasks
             +add_task(prompt, max_tokens, temperature, top_p, top_k, stream_callback) str

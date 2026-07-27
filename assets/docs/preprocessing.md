@@ -256,6 +256,7 @@ When `sources` is set, `sections` is ignored.
 | `min_chars` | int | `50` | Skip text-mode items shorter than this |
 | `max_chars` | int | `2000000` | Skip text-mode items longer than this |
 | `max_items` | int or null | `null` | Stop after N documents |
+| `batch_size` | int | `256` | Records per tokenization batch |
 | `packing_strategy` | str | `"simple"` | Packing strategy: `"simple"`, `"bfd"`, `"bfd_split"` |
 | `max_packed_len` | int | `8192` | Maximum length of a packed bin |
 | `truncation_mode` | str | `"keep_start"` | How to truncate sequences: `"keep_start"` or `"keep_end"` |
