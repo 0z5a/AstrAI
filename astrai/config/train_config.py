@@ -69,9 +69,6 @@ class TrainConfig(BaseConfig):
     )
 
     # metric setting
-    log_dir: str = field(
-        default="./checkpoint/logs", metadata={"help": "Directory for metric logs."}
-    )
     metrics: List[str] = field(
         default_factory=lambda: ["loss", "lr", "grad_norm"],
         metadata={"help": "Metrics to record during training."},

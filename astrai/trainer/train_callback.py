@@ -235,7 +235,7 @@ class ProgressBarCallback(TrainCallback):
 class MetricCallback(TrainCallback):
     def __init__(
         self,
-        log_dir: str,
+        ckpt_dir: str,
         save_interval: int,
         metrics: List[str] = None,
         val_step: int = 0,
@@ -246,8 +246,7 @@ class MetricCallback(TrainCallback):
         self.val_step = val_step
         self._next_val_step = 0
 
-        self.log_dir = Path(log_dir) if log_dir else Path.cwd() / "logs"
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else Path.cwd() / "checkpoint"
 
         self.log_cache = []
 
@@ -306,11 +305,12 @@ class MetricCallback(TrainCallback):
 
     @only_on_rank(0)
     def _flush(self, epoch, step):
-        log_file = self.log_dir / f"epoch_{epoch}_step_{step}_metric.jsonl"
+        log_file = self.ckpt_dir / f"epoch_{epoch}_step_{step}" / "metric.jsonl"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(log_file, "w") as f:
             for log in self.log_cache:
                 f.write(json.dumps(log) + "\n")
+        self.log_cache.clear()
 
     def on_optimizer_step(self, context):
         if (

@@ -42,7 +42,7 @@ class Trainer:
             ),
             CallbackFactory.create(
                 "metric",
-                log_dir=cfg.log_dir,
+                ckpt_dir=cfg.ckpt_dir,
                 save_interval=cfg.ckpt_interval,
                 metrics=cfg.metrics,
                 val_step=cfg.val_step,

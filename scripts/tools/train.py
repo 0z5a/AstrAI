@@ -224,12 +224,6 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
     default=("loss", "lr", "grad_norm"),
     help="Metrics to log (repeatable).",
 )
-@click.option(
-    "--log_dir",
-    type=click.Path(),
-    default="checkpoint/logs",
-    help="Directory for metric logs.",
-)
 @click.option("--start_epoch", type=int, default=0, help="Start epoch.")
 @click.option("--start_samples", type=int, default=0, help="Start samples (per rank).")
 @click.option(
@@ -379,7 +373,6 @@ def train(
     val_split: float,
     val_step: int,
     metrics: list[str],
-    log_dir: str,
     max_grad_norm: float,
     random_seed: int,
     num_workers: int,
@@ -538,7 +531,6 @@ def train(
         val_split=val_split,
         val_step=val_step,
         metrics=metrics,
-        log_dir=log_dir,
         gradient_checkpointing_modules=grad_ckpt_modules,
         executor_kwargs=executor_kwargs,
         extra_kwargs=strategy_kwargs,

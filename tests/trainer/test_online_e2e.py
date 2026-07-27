@@ -101,7 +101,6 @@ def test_online_dpo_end_to_end(base_test_env):
         optimizer_fn=optimizer_fn,
         scheduler_fn=scheduler_fn,
         ckpt_dir=os.path.join(test_dir, "ckpt"),
-        log_dir=os.path.join(test_dir, "logs"),
         n_epoch=1,
         batch_per_device=2,
         ckpt_interval=100,

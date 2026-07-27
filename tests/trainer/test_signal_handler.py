@@ -50,7 +50,7 @@ class _ReadyCallback:
             os.fsync(f.fileno())
 
 
-def _inner_run(batch_per_device, ckpt_interval, ckpt_dir, log_dir, ready_file):
+def _inner_run(batch_per_device, ckpt_interval, ckpt_dir, ready_file):
     dataset = PicklableDataset()
 
     def model_fn():
@@ -71,7 +71,6 @@ def _inner_run(batch_per_device, ckpt_interval, ckpt_dir, log_dir, ready_file):
         optimizer_fn=optimizer_fn,
         scheduler_fn=scheduler_fn,
         ckpt_dir=ckpt_dir,
-        log_dir=log_dir,
         n_epoch=1,
         batch_per_device=batch_per_device,
         ckpt_interval=ckpt_interval,
@@ -86,13 +85,12 @@ def _inner_run(batch_per_device, ckpt_interval, ckpt_dir, log_dir, ready_file):
 
 
 def _spawn_train_and_signal(ckpt_dir, sig, timeout=120):
-    log_dir = os.path.join(ckpt_dir, "logs")
     ready_file = os.path.join(ckpt_dir, "ready.txt")
 
     ctx = mp.get_context("spawn")
     p = ctx.Process(
         target=_inner_run,
-        args=(2, 1000, ckpt_dir, log_dir, ready_file),
+        args=(2, 1000, ckpt_dir, ready_file),
     )
     p.start()
 
