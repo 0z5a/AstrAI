@@ -7,6 +7,7 @@ import click
 import torch
 from torch import Tensor, nn, optim
 
+from astrai import setup_logging
 from astrai.config import AutoRegressiveLMConfig, TrainConfig
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
 from astrai.model import AutoRegressiveLM
@@ -556,4 +557,5 @@ def train(
 
 
 if __name__ == "__main__":
+    setup_logging()
     train_command()

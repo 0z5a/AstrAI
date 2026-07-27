@@ -5,6 +5,7 @@ import click
 import torch
 from tqdm import tqdm
 
+from astrai import setup_logging
 from astrai.inference import InferenceEngine
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
@@ -162,4 +163,5 @@ def generate_command(**kwargs):
 
 
 if __name__ == "__main__":
+    setup_logging()
     generate_command()

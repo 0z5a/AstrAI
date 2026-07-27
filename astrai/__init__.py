@@ -1,6 +1,33 @@
 __version__ = "1.3.11"
 __author__ = "ViperEkura"
 
+import logging
+import os
+
+
+def setup_logging(level: str = "INFO"):
+    """Attach a handler to the ``astrai`` logger (only, not root).
+
+    Call once per process, e.g. at the top of CLI scripts.
+    Set ``ASTR_LOG_LEVEL`` to override the default ``INFO``.
+    """
+    _logger = logging.getLogger("astrai")
+    if _logger.handlers:
+        return
+    _level = getattr(
+        logging, os.environ.get("ASTR_LOG_LEVEL", level).upper(), logging.INFO
+    )
+    _logger.setLevel(_level)
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    _logger.addHandler(_handler)
+
+
 from astrai.config import (
     AutoRegressiveLMConfig,
     BaseModelConfig,
@@ -94,5 +121,6 @@ __all__ = [
     "only_on_rank",
     "run_server",
     "sample",
+    "setup_logging",
     "spawn_parallel_fn",
 ]

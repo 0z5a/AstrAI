@@ -1,6 +1,7 @@
 import click
 import torch
 
+from astrai import setup_logging
 from astrai.config import AutoRegressiveLMConfig
 
 _DTYPES = ["bfloat16", "float16", "float32"]
@@ -204,4 +205,5 @@ def benchmark_command(
 
 
 if __name__ == "__main__":
+    setup_logging()
     benchmark_command()
