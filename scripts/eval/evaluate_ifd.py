@@ -9,10 +9,16 @@ v2 changelog:
   - Same token set: unconditional pass prefixes resp with a plain-text sentinel
     (default ``\\n``; use ``--sentinel_text ""`` for bos/pad fallback).
     Both branches predict the identical N resp tokens.
-    Single-token answers (rl=1) are now supported.
+  - Single-token answers (rl=1) are now supported.
   - ctx_len tracked in output
   - skip_reason for None samples (no more silent None)
   - --per_token for per-token IFD breakdown
+
+v3 changelog:
+  - Append EOS at the end of response in both conditional and unconditional
+    passes (``--append_eos`` / ``--no-append_eos``, default: enabled).
+    The model now also predicts when the response should end, which is part
+    of instruction following. Falls back gracefully when tokenizer has no EOS.
 """
 
 import argparse
@@ -237,6 +243,7 @@ def process_file(
     sentinel_ids=None,
     per_token=False,
     max_samples=None,
+    eos_ids=None,
 ):
     """Score a single file, write per-sample JSONL, return summary stats."""
     if device is None:
@@ -244,6 +251,11 @@ def process_file(
 
     if sentinel_ids is None:
         sentinel_ids = _resolve_sentinel_ids(tokenizer, "\n")
+
+    if eos_ids is None:
+        eos_ids = []
+
+    eos_len = len(eos_ids)
 
     data = _load_items(input_file)
 
@@ -267,7 +279,9 @@ def process_file(
                 ctx_text = "\n\n".join(m["content"] for m in item["messages"][:i])
                 ctx_ids = tokenizer.encode(ctx_text)
                 resp_ids = tokenizer.encode(msg["content"], add_special_tokens=False)
-                ctx_ids, resp_ids = _trim(ctx_ids, resp_ids, max_len)
+                ctx_ids, resp_ids = _trim(ctx_ids, resp_ids, max_len - eos_len)
+                if eos_ids and resp_ids and resp_ids[-1:] != eos_ids:
+                    resp_ids = resp_ids + eos_ids
                 if ctx_ids and resp_ids:
                     turns.append((ctx_ids, resp_ids))
             if not turns:
@@ -284,7 +298,7 @@ def process_file(
         else:
             ctx_ids = tokenizer.encode(item[instr_key], add_special_tokens=False)
             resp_ids = tokenizer.encode(item[resp_key], add_special_tokens=False)
-            ctx_ids, resp_ids = _trim(ctx_ids, resp_ids, max_len)
+            ctx_ids, resp_ids = _trim(ctx_ids, resp_ids, max_len - eos_len)
             if not ctx_ids or not resp_ids:
                 results.append(
                     {
@@ -294,6 +308,8 @@ def process_file(
                     }
                 )
                 continue
+            if eos_ids and resp_ids[-1:] != eos_ids:
+                resp_ids = resp_ids + eos_ids
             buffer.append((item, [(ctx_ids, resp_ids)], "plain"))
 
         if len(buffer) >= batch_size:
@@ -452,6 +468,11 @@ def main():
         default=None,
         help="Maximum number of samples per file (random subsample). Default: all.",
     )
+    parser.add_argument(
+        "--append_eos/--no-append_eos",
+        default=True,
+        help="Append EOS token at the end of response in both passes (default: enabled).",
+    )
     args = parser.parse_args()
 
     if args.device is None:
@@ -465,6 +486,16 @@ def main():
     model.eval()
 
     sentinel_ids = _resolve_sentinel_ids(tokenizer, args.sentinel_text)
+
+    eos_ids = []
+    if args.append_eos:
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            eos_ids = [eos_token_id]
+        else:
+            print(
+                "Warning: --append_eos enabled but tokenizer has no EOS token; skipping."
+            )
 
     input_files = _collect_input_files(args.input_path)
     if not input_files:
@@ -493,6 +524,7 @@ def main():
             sentinel_ids=sentinel_ids,
             per_token=args.per_token,
             max_samples=args.max_samples,
+            eos_ids=eos_ids,
         )
         all_stats[label] = stats
 
