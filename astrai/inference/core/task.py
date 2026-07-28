@@ -6,6 +6,8 @@ from collections import deque
 from enum import Enum
 from typing import Any, Callable, Deque, Dict, List, Optional
 
+from tokenizers.decoders import DecodeStream
+
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 logger = logging.getLogger(__name__)
@@ -14,37 +16,30 @@ STOP = object()
 
 
 class StreamDecoder:
-    """Incremental decoder for byte-level BPE streaming.
+    """Incremental decoder backed by the tokenizers library's DecodeStream.
 
-    Byte-level BPE may split a single Unicode character (e.g. em-dash,
-    smart quotes) across multiple tokens. Decoding such a token in
-    isolation produces U+FFFD (replacement char). This decoder
-    accumulates token IDs and only emits text once the trailing
-    characters are complete, buffering incomplete multi-byte sequences
-    until the next token arrives.
+    Delegates to the Rust-native streaming decoder which maintains an
+    O(1) bounded token buffer internally (via prefix drain), avoiding
+    the O(n²) cost of re-decoding the full history on each step.
+
+    Multi-byte UTF-8 sequences split across token boundaries are
+    buffered until complete; ``push`` returns "" while the trailing
+    sequence is still incomplete.
     """
 
-    __slots__ = ("_tokenizer", "_ids", "_emitted")
+    __slots__ = ("_stream", "_tok")
 
     def __init__(self, tokenizer: AutoTokenizer):
-        self._tokenizer = tokenizer
-        self._ids: List[int] = []
-        self._emitted: str = ""
+        self._tok = tokenizer._tokenizer
+        self._stream = DecodeStream(skip_special_tokens=True)
 
     def push(self, token_id: int) -> str:
         """Append a token ID and return newly completed text.
 
         Returns "" while a multi-byte character is still incomplete.
         """
-        self._ids.append(token_id)
-        full = self._tokenizer.decode(self._ids, skip_special_tokens=True)
-        if full.endswith("\ufffd"):
-            return ""
-        if len(full) > len(self._emitted):
-            diff = full[len(self._emitted) :]
-            self._emitted = full
-            return diff
-        return ""
+        chunk = self._stream.step(self._tok, token_id)
+        return chunk or ""
 
 
 class TaskStatus(Enum):
@@ -101,18 +96,11 @@ class Task:
     def flush_remaining(self, tokenizer: AutoTokenizer) -> str:
         """Emit any text still buffered in the decoder.
 
-        Called when generation terminates (max_tokens reached, stop
-        sequence, or external removal) to avoid dropping a final
-        incomplete-looking fragment that is actually complete when
-        adjacent to the stop token.
+        With the Rust-native DecodeStream, the stream is always in a
+        correct state — any completed text was already emitted by the
+        last ``push``.  A trailing incomplete multi-byte sequence has no
+        valid text to emit, so this is a no-op.
         """
-        if self._decoder is None or not self.output_ids:
-            return ""
-        full = tokenizer.decode(self.output_ids, skip_special_tokens=True)
-        if len(full) > len(self._decoder._emitted):
-            diff = full[len(self._decoder._emitted) :]
-            self._decoder._emitted = full
-            return diff
         return ""
 
     @property
