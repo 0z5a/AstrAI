@@ -310,7 +310,6 @@ class MetricCallback(TrainCallback):
         with open(log_file, "w") as f:
             for log in self.log_cache:
                 f.write(json.dumps(log) + "\n")
-        self.log_cache.clear()
 
     def on_optimizer_step(self, context):
         if (
