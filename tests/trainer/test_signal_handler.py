@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 
 from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
-from astrai.parallel.signal_handler import register_signal_handlers
+from astrai.signal_handler import register_signal_handlers
 from astrai.trainer import Trainer
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.train_context import TrainContext

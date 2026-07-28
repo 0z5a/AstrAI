@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from astrai.parallel.signal_handler import install_early_signal_handlers
+from astrai.signal_handler import install_early_signal_handlers
 
 logger = logging.getLogger(__name__)
 

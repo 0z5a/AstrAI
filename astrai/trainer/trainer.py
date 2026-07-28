@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 from astrai.config import TrainConfig
 from astrai.parallel.setup import spawn_parallel_fn
-from astrai.parallel.signal_handler import (
+from astrai.signal_handler import (
     register_signal_handlers,
     unregister_signal_handlers,
 )
