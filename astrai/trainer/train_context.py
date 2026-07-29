@@ -127,6 +127,9 @@ class TrainContextBuilder:
                 )
             if preloaded_state_dict is not None:
                 m.load_state_dict(preloaded_state_dict, strict=False)
+            return m
+
+        def _after_wrap(m):
             if cfg.compile_mode is not None:
                 logger.info("torch.compile enabled (mode=%s)", cfg.compile_mode)
                 m = torch.compile(m, mode=cfg.compile_mode)
@@ -148,6 +151,7 @@ class TrainContextBuilder:
             cfg.optimizer_fn,
             cfg.scheduler_fn,
             before_wrap=_before_wrap,
+            after_wrap=_after_wrap,
         )
 
         train_dataset = cfg.dataset

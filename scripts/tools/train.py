@@ -115,7 +115,7 @@ def _merge_yaml_into_kwargs(config_path: str, passed_kwargs: dict) -> dict:
 
 
 _TRAIN_TYPE = ["seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"]
-_PARALLEL = ["none", "ddp", "fsdp", "fsdp2"]
+_PARALLEL = ["none", "ddp", "fsdp"]
 _SCHEDULES = ["cosine", "sgdr", "wsd"]
 _BACKENDS = ["nccl", "gloo"]
 _START_METHODS = ["spawn", "fork", "forkserver"]
@@ -247,7 +247,7 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
 @click.option(
     "--parallel_mode",
     type=click.Choice(_PARALLEL),
-    default="none",
+    default="fsdp",
     help="Parallel strategy.",
 )
 @click.option("--device_type", type=str, default="cuda", help="Device type.")
@@ -418,9 +418,7 @@ def train(
     if not os.path.exists(param_path):
         raise FileNotFoundError(f"Model directory not found: {param_path}")
     if nprocs > 1 and parallel_mode == "none":
-        raise ValueError(
-            "--nprocs > 1 requires --parallel_mode to be 'ddp', 'fsdp', or 'fsdp2'"
-        )
+        raise ValueError("--nprocs > 1 requires --parallel_mode to be 'ddp' or 'fsdp'")
 
     # Load config
     config_path = os.path.join(param_path, "config.json")

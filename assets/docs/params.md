@@ -84,7 +84,7 @@ Combined optimizer: matrix parameters via **Muon**, non-matrix via **AdamW** (`f
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--nprocs` | Number of GPUs / processes | 1 |
-| `--parallel_mode` | Parallel strategy (`none`, `ddp`, `fsdp`, or `fsdp2`) | none |
+| `--parallel_mode` | Parallel strategy (`none`, `ddp`, `fsdp`) | fsdp |
 | `--device_type` | Device type | cuda |
 | `--start_method` | Multiprocessing start method (`spawn`, `fork`, `forkserver`) | spawn |
 | `--backend` | Distributed training backend | nccl |

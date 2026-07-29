@@ -11,11 +11,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import (
     FSDPModule,
-    FullStateDictConfig,
-    StateDictType,
     fully_shard,
 )
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
@@ -95,11 +92,14 @@ class BaseExecutor:
         optimizer_fn: Optional[Callable[[nn.Module], Optimizer]] = None,
         scheduler_fn: Optional[Callable[[Optimizer], LRScheduler]] = None,
         before_wrap: Optional[Callable[[nn.Module], nn.Module]] = None,
+        after_wrap: Optional[Callable[[nn.Module], nn.Module]] = None,
     ) -> Tuple[nn.Module, Optional[Optimizer], Optional[LRScheduler]]:
         model = model_fn()
         if before_wrap is not None:
             model = before_wrap(model)
         model = self._prepare_model(model)
+        if after_wrap is not None:
+            model = after_wrap(model)
         optimizer = None
         scheduler = None
         if optimizer_fn is not None:
@@ -238,88 +238,11 @@ class DDPExecutor(BaseExecutor):
 
 @ExecutorFactory.register("fsdp")
 class FSDPExecutor(BaseExecutor):
-    def __init__(
-        self,
-        grad_accum_steps: int = 1,
-        process_group=None,
-        sharding_strategy=None,
-        cpu_offload=None,
-        auto_wrap_policy=None,
-        backward_prefetch=None,
-        mixed_precision=None,
-        ignored_modules=None,
-        param_init_fn=None,
-        sync_module_states: bool = False,
-        forward_prefetch: bool = False,
-        limit_all_gathers: bool = True,
-        ignored_states=None,
-        device_mesh=None,
-    ):
-        super().__init__(grad_accum_steps=grad_accum_steps)
-        self._fsdp_kwargs = {
-            k: v
-            for k, v in dict(
-                process_group=process_group,
-                sharding_strategy=sharding_strategy,
-                cpu_offload=cpu_offload,
-                auto_wrap_policy=auto_wrap_policy,
-                backward_prefetch=backward_prefetch,
-                mixed_precision=mixed_precision,
-                ignored_modules=ignored_modules,
-                param_init_fn=param_init_fn,
-                sync_module_states=sync_module_states,
-                forward_prefetch=forward_prefetch,
-                limit_all_gathers=limit_all_gathers,
-                use_orig_params=True,
-                ignored_states=ignored_states,
-                device_mesh=device_mesh,
-            ).items()
-            if v is not None
-        }
-        self._original_model: Optional[nn.Module] = None
-
-    def _prepare_model(self, model: nn.Module) -> nn.Module:
-        if not self.use_distributed:
-            logger.warning("FSDP backend selected but world_size=1, model not wrapped")
-            return model
-        self._original_model = model
-        device_id = torch.device("cuda", get_rank())
-        model = FSDP(model, device_id=device_id, **self._fsdp_kwargs)
-        logger.info("Model wrapped with FSDP (world_size=%d)", get_world_size())
-        return model
-
-    def _no_sync(self, model: nn.Module):
-        if isinstance(model, FSDP):
-            return model.no_sync()
-        return contextlib.nullcontext()
-
-    def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
-        if isinstance(model, FSDP) and self.use_distributed:
-            total_norm = model.clip_grad_norm_(max_norm)
-            if isinstance(total_norm, torch.Tensor):
-                return total_norm.item()
-            return total_norm
-        return super().clip_grad_norm(model, max_norm)
-
-    def unwrap_model(self, model: nn.Module):
-        if isinstance(model, FSDP) and self.use_distributed:
-            with FSDP.state_dict_type(
-                model,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-            ):
-                return model.state_dict()
-
-        return model.state_dict()
-
-
-@ExecutorFactory.register("fsdp2")
-class FSDP2Executor(BaseExecutor):
-    """FSDP2 executor using `torch.distributed.fsdp.fully_shard` (per-module API).
+    """FSDP executor using `torch.distributed.fsdp.fully_shard` (per-module API).
 
     Wraps each child module individually via ``fully_shard``.
     Skips the root model because ``ABC + Generic[T]`` in the MRO makes
-    FSDP2's dynamic ``__class__`` assignment fail at the CPython level.
+    ``fully_shard``'s dynamic ``__class__`` assignment fail at the CPython level.
     Original ``Parameter`` objects are preserved (as DTensors) — no
     ``FlatParameter``, no ``use_orig_params=True`` hack.
     """
@@ -338,7 +261,7 @@ class FSDP2Executor(BaseExecutor):
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
         if not self.use_distributed:
-            logger.warning("FSDP2 backend selected but world_size=1, model not wrapped")
+            logger.warning("FSDP backend selected but world_size=1, model not wrapped")
             return model
 
         kwargs = dict(
@@ -356,7 +279,7 @@ class FSDP2Executor(BaseExecutor):
                 fully_shard(child, **kwargs)
 
         logger.info(
-            "FSDP2 wrapping applied to %d direct children (root skipped for ABC compat)",
+            "FSDP wrapping applied to %d direct children (root skipped for ABC compat)",
             len(list(model.children())),
         )
         return model
