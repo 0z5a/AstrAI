@@ -17,6 +17,7 @@ from astrai.parallel.setup import (
     setup_parallel,
     spawn_parallel_fn,
 )
+from astrai.parallel.utils import create_ref_model
 
 __all__ = [
     "get_world_size",
@@ -35,4 +36,5 @@ __all__ = [
     "NoneExecutor",
     "DDPExecutor",
     "FSDPExecutor",
+    "create_ref_model",
 ]

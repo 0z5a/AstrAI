@@ -14,11 +14,12 @@ from astrai.inference.core.scheduler import InferenceScheduler
 from astrai.model.components.lora import inject_lora
 from astrai.parallel.executor import BaseExecutor, ExecutorFactory
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
+from astrai.parallel.utils import create_ref_model
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import Checkpoint, load_json
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
-from astrai.trainer.strategy import BaseStrategy, StrategyFactory, create_ref_model
+from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 
 logger = logging.getLogger(__name__)
 
@@ -229,17 +230,14 @@ class TrainContextBuilder:
         needs_old = cfg.strategy in ("grpo", "online_grpo")
 
         if needs_ref:
-            ref_model = create_ref_model(
-                cfg.model_fn, executor.unwrap_model(context.model)
-            ).to(device=device)
-            strategy_kwargs["ref_model"] = ref_model
+            strategy_kwargs["ref_model"] = create_ref_model(
+                cfg.model_fn, executor=executor, model=context.model, device=device
+            )
 
-        old_model = None
         if needs_old:
-            old_model = create_ref_model(
-                cfg.model_fn, executor.unwrap_model(context.model)
-            ).to(device=device)
-            strategy_kwargs["old_model"] = old_model
+            strategy_kwargs["old_model"] = create_ref_model(
+                cfg.model_fn, executor=executor, model=context.model, device=device
+            )
 
         context.strategy = StrategyFactory.create(
             cfg.strategy,

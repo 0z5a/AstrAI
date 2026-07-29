@@ -9,18 +9,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.factory import BaseFactory
+from astrai.parallel.utils import create_ref_model
 from astrai.trainer.rollout import RolloutResult
-
-
-def create_ref_model(
-    model_fn: Callable[[], nn.Module], state_dict: Dict[str, Tensor]
-) -> nn.Module:
-    """Create a frozen reference model from model_fn + full state dict."""
-    ref_model = model_fn()
-    ref_model.load_state_dict(state_dict)
-    ref_model.requires_grad_(False)
-    ref_model.eval()
-    return ref_model
 
 
 def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
@@ -401,7 +391,9 @@ class GRPOStrategy(BaseStrategy):
 
     def sync_old_model(self):
         """Copy current policy weights to old model."""
-        self.old_model.load_state_dict(self.executor.unwrap_model(self.model))
+        state_dict = self.executor.unwrap_model(self.model)
+        if state_dict is not None:
+            self.old_model.load_state_dict(state_dict)
 
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
         batch = move_to_device(batch, self.device)

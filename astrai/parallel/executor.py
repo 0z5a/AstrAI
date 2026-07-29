@@ -326,21 +326,27 @@ class FSDPExecutor(BaseExecutor):
         if not self.use_distributed:
             return model.state_dict()
 
-        if get_rank() != 0:
-            return None
-
+        # unshard() and full_tensor() are collective ops — all ranks must
+        # participate. Non-rank-0 ranks still call them but discard results.
         for module in model.modules():
             if isinstance(module, FSDPModule):
                 module.unshard()
 
         state_dict = model.state_dict()
-        result = {
-            k: (v.full_tensor() if isinstance(v, DTensor) else v)
-            for k, v in state_dict.items()
-        }
+        result = {}
+        for k, v in state_dict.items():
+            if isinstance(v, DTensor):
+                full = v.full_tensor()
+                if get_rank() == 0:
+                    result[k] = full
+            elif get_rank() == 0:
+                result[k] = v
 
         for module in model.modules():
             if isinstance(module, FSDPModule):
                 module.reshard()
+
+        if get_rank() != 0:
+            return None
 
         return result
