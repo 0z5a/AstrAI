@@ -252,7 +252,7 @@ class FSDPExecutor(BaseExecutor):
         grad_accum_steps: int = 1,
         mesh: Optional[Any] = None,
         mp_policy: Optional[Any] = None,
-        reshard_after_forward: bool = True,
+        reshard_after_forward: bool = False,
     ):
         super().__init__(grad_accum_steps=grad_accum_steps)
         self._mesh = mesh
@@ -299,12 +299,28 @@ class FSDPExecutor(BaseExecutor):
             yield
 
     def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
-        if self.use_distributed:
-            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            if isinstance(total_norm, torch.Tensor):
-                return total_norm.item()
-            return total_norm
-        return super().clip_grad_norm(model, max_norm)
+        if not self.use_distributed:
+            return super().clip_grad_norm(model, max_norm)
+
+        # FSDP params are DTensors (sharded across ranks).
+        # torch.nn.utils.clip_grad_norm_ computes LOCAL norm per rank,
+        # so we must all-reduce to get the global norm before clipping.
+        local_norm = torch.nn.utils.get_total_norm(
+            [p.grad for p in model.parameters() if p.grad is not None],
+        )
+        if isinstance(local_norm, DTensor):
+            local_norm = local_norm.to_local()
+        total_norm_sq = local_norm**2
+        dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM)
+        total_norm = total_norm_sq.sqrt()
+
+        clip_coef = max_norm / (total_norm + 1e-6)
+        clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(clip_coef_clamped)
+
+        return total_norm.item()
 
     def unwrap_model(self, model: nn.Module):
         if not self.use_distributed:
