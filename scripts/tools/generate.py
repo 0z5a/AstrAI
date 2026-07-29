@@ -1,5 +1,6 @@
 import json
 import time
+from typing import Optional
 
 import click
 import torch
@@ -20,10 +21,9 @@ def processor(
     top_p: float,
     question_key: str,
     response_key: str,
-    max_tokens: int,
     batch_size: int,
     num_samples: int = 1,
-    cache_len: int = 2048,
+    max_seq_len: Optional[int] = None,
     frequency_penalty: float = 0.0,
     rep_window: int = 64,
 ):
@@ -38,7 +38,7 @@ def processor(
         model=model,
         tokenizer=tokenizer,
         max_batch_size=batch_size * num_samples,
-        max_seq_len=cache_len,
+        max_seq_len=max_seq_len,
     )
 
     print(f"Reading {input_json_file} ...")
@@ -53,9 +53,6 @@ def processor(
     else:
         prompts = [item[question_key] for item in input_data]
     print(f"  {len(prompts)} prompts loaded\n")
-
-    if max_tokens is None:
-        max_tokens = model.config.max_position_embeddings
 
     chunk_size = max(1, batch_size)
 
@@ -73,7 +70,6 @@ def processor(
                 resp_chunk = engine.generate(
                     prompt=chunk_expanded,
                     stream=False,
-                    max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
@@ -88,7 +84,6 @@ def processor(
                 resp_chunk = engine.generate(
                     prompt=chunk,
                     stream=False,
-                    max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
@@ -145,13 +140,14 @@ def processor(
 @click.option(
     "--response_key", default="response", help="Key for the response in output JSON."
 )
-@click.option("--temperature", type=float, default=0.60, help="Sampling temperature.")
-@click.option("--top_k", type=int, default=30, help="Top-k filtering.")
+@click.option("--temperature", type=float, default=0.8, help="Sampling temperature.")
+@click.option("--top_k", type=int, default=50, help="Top-k filtering.")
 @click.option("--top_p", type=float, default=0.95, help="Top-p filtering.")
 @click.option("--batch_size", type=int, default=1, help="Batch size.")
 @click.option("--num_samples", type=int, default=1, help="Responses per prompt.")
-@click.option("--max_tokens", type=int, default=None, help="Max tokens to generate.")
-@click.option("--cache_len", type=int, default=2048, help="KV cache length.")
+@click.option(
+    "--max_seq_len", type=int, default=2048, help="KV cache length."
+)
 @click.option("--frequency_penalty", type=float, default=0.0, help="Frequency penalty.")
 @click.option(
     "--rep_window", type=int, default=64, help="Window size for frequency penalty."
