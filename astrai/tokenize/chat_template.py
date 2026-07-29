@@ -38,11 +38,26 @@ class ChatTemplate:
         The compiled :class:`~jinja2.Template` holds a dynamically-generated
         ``root`` render function whose ``__module__`` is ``None``; under
         ``pickle`` it falls back to ``__main__`` and breaks ``spawn``-based
-        multiprocessing.  By deferring compilation to first access, the
-        default pickle protocol serialises only ``template_str``; each
-        worker rebuilds the cache on first render.
+        multiprocessing.  :meth:`__getstate__` drops the cached template so
+        that pickle serialises only ``template_str``; each worker rebuilds
+        the cache on first render.
         """
         return Template(self.template_str)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Exclude the cached Jinja2 template from pickling.
+
+        ``Template.root_render_func`` is a dynamically generated closure
+        that cannot be pickled by reference.  Dropping ``_compiled`` here
+        lets :class:`cached_property` rebuild it on first access after
+        unpickle.
+        """
+        state = self.__dict__.copy()
+        state.pop("_compiled", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
 
     @classmethod
     def from_string(
