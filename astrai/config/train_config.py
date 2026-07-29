@@ -45,6 +45,12 @@ class TrainConfig(BaseConfig):
         default_factory=list,
         metadata={"help": "Module types to enable activation checkpointing for."},
     )
+    compile_mode: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "torch.compile mode: 'default', 'reduce-overhead', 'max-autotune', or None to disable."
+        },
+    )
 
     # checkpoint setting
     start_epoch: int = field(default=0, metadata={"help": "Start epoch for training."})

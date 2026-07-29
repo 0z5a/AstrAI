@@ -1,3 +1,4 @@
+import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,8 @@ from astrai.serialization import Checkpoint, load_json
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory, create_ref_model
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -124,6 +127,9 @@ class TrainContextBuilder:
                 )
             if preloaded_state_dict is not None:
                 m.load_state_dict(preloaded_state_dict, strict=False)
+            if cfg.compile_mode is not None:
+                logger.info("torch.compile enabled (mode=%s)", cfg.compile_mode)
+                m = torch.compile(m, mode=cfg.compile_mode)
             return m
 
         context = TrainContext(

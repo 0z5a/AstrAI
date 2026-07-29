@@ -209,6 +209,13 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
     help="Enable activation checkpointing.",
 )
 @click.option(
+    "--compile",
+    "compile_mode",
+    type=click.Choice(["default", "reduce-overhead", "max-autotune"]),
+    default=None,
+    help="torch.compile mode. Omit to disable.",
+)
+@click.option(
     "--ckpt_interval", type=int, default=5000, help="Steps between checkpoints."
 )
 @click.option(
@@ -495,6 +502,7 @@ def train(
     )
 
     grad_ckpt_modules = [DecoderBlock] if gradient_checkpointing else []
+    compile_mode = kwargs.pop("compile_mode", None)
 
     collate_fn = None
     if train_type == "dpo":
@@ -532,6 +540,7 @@ def train(
         val_step=val_step,
         metrics=metrics,
         gradient_checkpointing_modules=grad_ckpt_modules,
+        compile_mode=compile_mode,
         executor_kwargs=executor_kwargs,
         extra_kwargs=strategy_kwargs,
         neftune_alpha=neftune_alpha,
