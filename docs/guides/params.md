@@ -174,6 +174,14 @@ python scripts/tools/server.py --param_path ./params --device cuda --dtype bfloa
 
 See [Inference Guide](inference.md) for HTTP API documentation.
 
+# Preprocess
+
+```bash
+python scripts/tools/preprocess.py data/*.jsonl -o output/ -c config.json
+```
+
+See [Preprocessing Guide](preprocessing.md) for config file format and examples.
+
 ## Generate (`generate.py`)
 
 | Parameter | Type | Default | Description |

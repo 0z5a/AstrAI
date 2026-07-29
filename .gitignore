@@ -24,7 +24,7 @@
 !/.dockerignore
 !/Dockerfile
 !/docker-compose.yml
-!/assets/**
+!/docs/**
 !/CONTRIBUTING.md
 !/LICENSE
 !/pyproject.toml

@@ -1,9 +1,9 @@
 <div align="center">
   
-  <img src="../images/logo.png" width="auto" alt="Logo">
+  <img src="./images/logo.png" width="auto" alt="Logo">
   
   <div>
-    <a href="../../README.md">English</a> • 
+    <a href="../README.md">English</a> • 
     <a href="#chinese">中文</a>
   </div>
   
@@ -23,7 +23,7 @@
 <br>
 
 <div align="center">
-  <a href="../../README.md">English</a> •
+  <a href="../README.md">English</a> •
   <a href="#chinese">中文</a> •
   <a href="https://github.com/ViperEkura/AstrAI/issues">问题追踪</a> •
   <a href="https://github.com/ViperEkura/AstrAI/discussions">讨论区</a> •
@@ -219,18 +219,23 @@ curl -X POST http://localhost:8000/v1/messages \
 curl http://localhost:8000/health
 ```
 
-SSE 流式格式、错误码和统计端点详见[推理文档](./inference.md)。
+SSE 流式格式、错误码和统计端点详见[推理文档](guides/inference.md)。
 
 ### 文档
 
 | 文档 | 说明 |
 |------|------|
-| [CLI 参考](./params.md) | 所有 CLI 工具参数（训练、服务、生成、预处理） |
-| [架构文档](./architecture.md) | 系统架构、类图与设计模式 |
-| [训练文档](./training.md) | 训练循环、策略与公式 |
-| [推理文档](./inference.md) | KVCache、连续批处理、采样与 HTTP API |
-| [数据流程](./dataflow.md) | 数据管道、存储后端与数据集架构 |
-| [数据预处理](./preprocessing.md) | 声明式 JSON 驱动数据预处理 |
+| [快速上手](./get-started.md) | 安装与快速入门 |
+| [CLI 参考](./guides/params.md) | 所有 CLI 工具参数（训练、服务、生成、预处理） |
+| [数据预处理](./guides/preprocessing.md) | 声明式 JSON 驱动数据预处理 |
+| [训练文档](./guides/training.md) | 训练循环、策略与公式 |
+| [推理文档](./guides/inference.md) | KVCache、连续批处理、采样与 HTTP API |
+| [评估文档](./guides/evaluation.md) | HumanEval、MMLU、PPL、ROUGE、IFD、IFEval |
+| [分布式训练](./guides/distributed.md) | 多卡 DDP / FSDP 训练 |
+| [架构文档](./developer/architecture.md) | 系统架构、类图与设计模式 |
+| [数据流程](./developer/dataflow.md) | 数据管道、存储后端与数据集架构 |
+| [内部实现](./developer/internals.md) | 训练原理：损失公式、回调生命周期、KV Cache |
+| [CUDA 内核](./developer/cuda_kernels.md) | 自定义 CUDA 注意力内核与基准测试 |
 
 ### 贡献
 

@@ -43,7 +43,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy application code
 COPY astrai/ ./astrai/
 COPY scripts/ ./scripts/
-COPY assets/ ./assets/
+COPY docs/ ./docs/
 COPY pyproject.toml .
 COPY README.md .
 

@@ -266,7 +266,7 @@ When `sources` is set, `sections` is ignored.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `domain_key` | str or null | `null` | JSONL key for domain grouping |
-| `storage_format` | str | `"bin"` | `"bin"` (mmap) or `"h5"` |
+| `storage_format` | str | `"bin"` | `"bin"` (mmap). Reading also supports `"jsonl"` for on-the-fly tokenization |
 | `max_tokens_per_shard` | int | `100000000` | Flush threshold in cumulative tokens |
 | `dtype` | dict[str, str] | `{}` | Per-key tensor dtype override (e.g. `{"loss_mask": "bool"}`) |
 | `position_ids_mode` | str | `"doc_reset"` | How to compute position_ids: `"none"`, `"doc_reset"`, `"continuous"` |

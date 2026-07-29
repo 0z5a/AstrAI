@@ -1,6 +1,6 @@
 <div align="center">
   
-  <img src="assets/images/logo.png" width="auto" alt="Logo">
+  <img src="docs/images/logo.png" width="auto" alt="Logo">
   <p>
     <strong>A lightweight Transformer training & inference framework</strong>
   </p>
@@ -17,7 +17,7 @@
 
 <div align="center">
   <a href="#english">English</a> •
-  <a href="assets/docs/README-zh-CN.md">中文</a> •
+  <a href="docs/README-zh-CN.md">中文</a> •
   <a href="https://github.com/ViperEkura/AstrAI/issues">Issue Tracker</a> •
   <a href="https://github.com/ViperEkura/AstrAI/discussions">Discussions</a> •
   <a href="https://huggingface.co/ViperEkura">HuggingFace</a>
@@ -213,18 +213,23 @@ curl -X POST http://localhost:8000/v1/messages \
 curl http://localhost:8000/health
 ```
 
-See [Inference Guide](assets/docs/inference.md) for SSE streaming format, error codes, and stats endpoint.
+See [Inference Guide](docs/guides/inference.md) for SSE streaming format, error codes, and stats endpoint.
 
 ### Documentation
 
 | Document | Description |
 |----------|-------------|
-| [CLI Reference](./assets/docs/params.md) | Parameters for all CLI tools (train, server, generate, preprocess) |
-| [Architecture](./assets/docs/architecture.md) | System architecture, class diagram & design patterns |
-| [Training](./assets/docs/training.md) | Training loop, strategies & formulas |
-| [Inference](./assets/docs/inference.md) | KVCache, continuous batching, sampling & HTTP API |
-| [Data Flow](./assets/docs/dataflow.md) | Data pipeline, storage backends & dataset architecture |
-| [Preprocessing](./assets/docs/preprocessing.md) | Declarative JSON-driven data preprocessing |
+| [Get Started](./docs/get-started.md) | Installation and quickstart |
+| [CLI Reference](./docs/guides/params.md) | Parameters for all CLI tools (train, server, generate, preprocess) |
+| [Preprocessing](./docs/guides/preprocessing.md) | Declarative JSON-driven data preprocessing |
+| [Training](./docs/guides/training.md) | Training loop, strategies & formulas |
+| [Inference](./docs/guides/inference.md) | KVCache, continuous batching, sampling & HTTP API |
+| [Evaluation](./docs/guides/evaluation.md) | HumanEval, MMLU, PPL, ROUGE, IFD, IFEval |
+| [Distributed](./docs/guides/distributed.md) | Multi-GPU DDP / FSDP training |
+| [Architecture](./docs/developer/architecture.md) | System architecture, class diagram & design patterns |
+| [Data Flow](./docs/developer/dataflow.md) | Data pipeline, storage backends & dataset architecture |
+| [Internals](./docs/developer/internals.md) | Training internals: loss formulas, callback lifecycle, KV cache |
+| [CUDA Kernels](./docs/developer/cuda_kernels.md) | Custom CUDA attention kernels & benchmarks |
 
 ### Contributing
 

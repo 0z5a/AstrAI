@@ -4,6 +4,6 @@
 # Allow necessary files
 !astrai/
 !scripts/
-!assets/
+!docs/
 !pyproject.toml
 !README.md
