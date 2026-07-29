@@ -1,7 +1,7 @@
 """Config-driven JSONL preprocessing pipeline.
 
 Composes a :class:`BaseMaskBuilder` (selected by ``input.type``) with
-sharding and flush to ``.h5`` / ``.bin`` storage.  Packing, position-id
+sharding and flush to ``.bin`` storage.  Packing, position-id
 generation and storage writing are each delegated to pluggable strategies,
 dispatched by configuration keys.
 

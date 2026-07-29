@@ -314,7 +314,7 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
                 stream datasets (SEQ/SFT).  Record datasets ignore it.
             stride: Stride between consecutive stream samples
                 (default: same as *window_size*).
-            storage_type: Storage backend ("h5", "bin", "jsonl") or
+            storage_type: Storage backend ("bin", "jsonl") or
                 None for auto-detection.
             tokenizer_path: Path to tokenizer for lazy JSONL
                 tokenisation (record datasets only).
@@ -384,7 +384,7 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
         """Build an on-the-fly tokenisation processor if applicable.
 
         Only raw JSONL + record datasets (DPO/GRPO) need a processor;
-        pre-tokenised backends (H5/bin) and stream datasets (SEQ/SFT)
+        pre-tokenised backends (bin) and stream datasets (SEQ/SFT)
         return ``None`` so no tokenizer is loaded.
         """
         if tokenizer_path is None or storage_type != "jsonl":
@@ -451,7 +451,7 @@ class DPODataset(BaseDataset):
 
     Two loading paths (handled by :class:`DatasetFactory`):
 
-    - **Pre-tokenized** (H5/bin): ``store.load(path)`` reads per-record
+    - **Pre-tokenized** (bin): ``store.load(path)`` reads per-record
       tensors; ``__getitem__`` returns them directly.
     - **Raw JSONL** (``tokenizer_path=...``): builds a lazy processor
       via :func:`dpo_processor` that tokenises on the fly — no packing,

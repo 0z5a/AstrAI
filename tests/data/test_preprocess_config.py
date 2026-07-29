@@ -30,7 +30,7 @@ def test_from_dict_flat():
         "mask": {"system": "mask", "assistant": "train"},
         "mask_default": "mask",
         "preprocessing": {"max_seq_len": 1024},
-        "output": {"storage_format": "h5"},
+        "output": {"storage_format": "bin"},
     }
     config = PipelineConfig.from_dict(data)
     assert config.input.sections == [
@@ -38,7 +38,7 @@ def test_from_dict_flat():
     ]
     assert config.mask == {"system": "mask", "assistant": "train"}
     assert config.preprocessing.max_seq_len == 1024
-    assert config.output.storage_format == "h5"
+    assert config.output.storage_format == "bin"
 
 
 def test_to_dict_roundtrip():

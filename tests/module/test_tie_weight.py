@@ -1,7 +1,6 @@
 import json
 import os
 
-import pytest
 import safetensors.torch as st
 import torch
 

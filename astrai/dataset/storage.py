@@ -10,7 +10,6 @@ Architecture (composition over inheritance):
     Streamable (mixin)        — raw token slice  fetch(begin, end, keys)
     Recordable (mixin)        — raw record slice fetch_record(idx, keys)
 
-    H5Store(Store, Streamable, Recordable)
     MmapStore(Store, Streamable, Recordable)
     JsonlStore(Store, Streamable, Recordable)
 
@@ -36,9 +35,9 @@ control.  ``store.token_count`` is the total stream token count (what
 ``len(store)`` used to mean in the legacy stream-only API).
 
 ``segments_are_records`` (class attribute on each Store subclass)
-tells ``_normalize`` whether segments are inherently per-record (H5/
-JSONL) or opaque shards (bin).  Record access for bin relies on
-``_offsets`` instead.
+tells ``_normalize`` whether segments are inherently per-record (JSONL)
+or opaque shards (bin).  Record access for bin relies on ``_offsets``
+instead.
 
 :class:`JsonlStore` supports a lazy mode (``processor=fn``) that keeps
 raw records and defers tokenisation to ``fetch_record`` — used by DPO
@@ -62,7 +61,6 @@ from astrai.preprocessing.transform import TokenizeTransform
 from astrai.serialization import (
     load_bin,
     load_bin_offsets,
-    load_h5,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,19 +81,10 @@ def detect_format(load_path: str) -> str:
     root = Path(load_path)
     if root.is_file():
         suffix = root.suffix.lower()
-        if suffix in (".h5", ".hdf5"):
-            return "h5"
         if suffix == ".jsonl":
             return "jsonl"
         raise ValueError(f"Unsupported file format: {suffix}")
 
-    h5_files = [
-        Path(p)
-        for pattern in ("*.h5", "*.hdf5")
-        for p in glob.glob(str(root / "**" / pattern), recursive=True)
-    ]
-    if h5_files:
-        return "h5"
     bin_files = [Path(p) for p in glob.glob(str(root / "**" / "*.bin"), recursive=True)]
     if bin_files:
         has_meta = (root / "meta.json").exists() or len(
@@ -185,7 +174,7 @@ class Store(ABC):
         """Number of records available via :meth:`fetch_record`.
 
         Non-zero only when the backing layout provides per-record
-        indexing (H5/JSONL segments or bin ``_offsets``).
+        indexing (JSONL segments or bin ``_offsets``).
         """
         return self._num_records
 
@@ -269,7 +258,7 @@ class Store(ABC):
         Record mode: if *offsets* is provided (bin layout),
         ``_offsets[key]`` stores cumulative per-record offsets into the
         single concatenated segment.  Otherwise, when
-        ``segments_are_records`` is True (H5/JSONL), ``_data[key]`` is
+        ``segments_are_records`` is True (JSONL), ``_data[key]`` is
         a per-record list and ``fetch_record`` indexes it directly.
 
         Nested keys (GRPO ``responses``/``masks`` as
@@ -305,7 +294,7 @@ class Store(ABC):
                     logger.warning(
                         "Key '%s' has %d segments with offsets — record mode "
                         "disabled for this key (multi-shard bin+offsets not "
-                        "supported). Merge shards or use H5/JSONL.",
+                        "supported). Merge shards or use JSONL.",
                         key,
                         len(segs),
                     )
@@ -330,7 +319,7 @@ class Streamable:
     Stateless trait relying on ``self._data``, ``self._cum``,
     ``self._length`` maintained by :class:`Store`.  Stream mode is
     active when the owning store has ``window_size > 0``; for stores
-    that can also serve record access (H5/JSONL/bin+offsets), the
+    that can also serve record access (JSONL/bin+offsets), the
     ``fetch_record`` API from :class:`Recordable` is used instead.
     """
 
@@ -413,33 +402,6 @@ def _fetch_record_key(self, key: str, index: int):
 
 class StoreFactory(BaseFactory["Store"]):
     """Factory for creating Store instances by type name."""
-
-
-@StoreFactory.register("h5")
-class H5Store(Store, Streamable, Recordable):
-    """HDF5-based storage backend (pre-tokenized data).
-
-    Each key is stored as a group of per-record datasets (``data_0``,
-    ``data_1``, …).  Supports both access modes:
-
-    - **Stream**: ``fetch(begin, end, key)`` and ``store[i]`` slice
-      across concatenated records via ``_cum`` — used by SEQ/SFT.
-    - **Record**: ``fetch_record(i, key)`` and ``store[i]`` (when
-      ``window_size == 0``) index ``_data[key]`` directly — used by
-      DPO/GRPO.
-    """
-
-    segments_are_records = True
-
-    def __init__(
-        self,
-        window_size: int = 0,
-        stride: Optional[int] = None,
-    ):
-        super().__init__(window_size=window_size, stride=stride)
-
-    def load(self, path: str, **kwargs):
-        self._normalize(load_h5(path))
 
 
 @StoreFactory.register("bin")

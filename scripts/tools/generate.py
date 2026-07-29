@@ -145,9 +145,7 @@ def processor(
 @click.option("--top_p", type=float, default=0.95, help="Top-p filtering.")
 @click.option("--batch_size", type=int, default=1, help="Batch size.")
 @click.option("--num_samples", type=int, default=1, help="Responses per prompt.")
-@click.option(
-    "--max_seq_len", type=int, default=2048, help="KV cache length."
-)
+@click.option("--max_seq_len", type=int, default=2048, help="KV cache length.")
 @click.option("--frequency_penalty", type=float, default=0.0, help="Frequency penalty.")
 @click.option(
     "--rep_window", type=int, default=64, help="Window size for frequency penalty."

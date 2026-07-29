@@ -6,7 +6,6 @@ from astrai.dataset.dataset import (
 )
 from astrai.dataset.sampler import RDSampler
 from astrai.dataset.storage import (
-    H5Store,
     JsonlStore,
     MmapStore,
     Recordable,
@@ -17,9 +16,7 @@ from astrai.dataset.storage import (
 )
 from astrai.serialization import (
     load_bin,
-    load_h5,
     save_bin,
-    save_h5,
 )
 
 __all__ = [
@@ -31,12 +28,9 @@ __all__ = [
     "Streamable",
     "Recordable",
     "StoreFactory",
-    "H5Store",
     "MmapStore",
     "JsonlStore",
     "detect_format",
-    "save_h5",
-    "load_h5",
     "save_bin",
     "load_bin",
     "RDSampler",

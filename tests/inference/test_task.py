@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock
 
-from astrai.inference import STOP, Task, TaskManager, TaskStatus
+from astrai.inference import Task, TaskManager, TaskStatus
 
 
 def _make_mock_tokenizer():

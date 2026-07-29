@@ -20,9 +20,7 @@ from astrai.serialization.checkpoint import (
 from astrai.serialization.dataset import (
     load_bin,
     load_bin_offsets,
-    load_h5,
     save_bin,
-    save_h5,
 )
 
 __all__ = [
@@ -39,7 +37,5 @@ __all__ = [
     "save_torch",
     "load_bin",
     "load_bin_offsets",
-    "load_h5",
     "save_bin",
-    "save_h5",
 ]

@@ -1,4 +1,4 @@
-"""CLI: JSONL → tokenized .h5/.bin via config-driven Pipeline."""
+"""CLI: JSONL → tokenized .bin via config-driven Pipeline."""
 
 import click
 
@@ -8,7 +8,7 @@ from astrai.preprocessing.pipeline import Pipeline
 
 
 @click.command(
-    name="preprocess", help="Tokenize and pack raw JSONL data into .bin/.h5 format."
+    name="preprocess", help="Tokenize and pack raw JSONL data into .bin format."
 )
 @click.argument("inputs", nargs=-1, type=click.Path(exists=True), required=True)
 @click.option(
@@ -30,7 +30,7 @@ from astrai.preprocessing.pipeline import Pipeline
 )
 @click.option("--batch_size", type=int, default=None, help="Records per batch.")
 def preprocess_command(inputs, output_dir, pipeline_config, tokenizer_path, batch_size):
-    """Tokenize and pack raw JSONL data into .bin/.h5 format."""
+    """Tokenize and pack raw JSONL data into .bin format."""
     config = PipelineConfig.from_file(pipeline_config)
     if batch_size is not None:
         if batch_size < 1:

@@ -3,7 +3,7 @@ import torch
 
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.strategy import GRPOStrategy
-from tests.helpers import FakeExecutor, make_frozen, make_model, make_rollout_config
+from tests.helpers import FakeExecutor, make_frozen, make_model
 
 
 def _make_batch(

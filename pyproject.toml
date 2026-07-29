@@ -8,7 +8,6 @@ name = "astrai"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "h5py==3.15.1",
     "numpy==2.4.4",
     "torch==2.11.0",
     "tokenizers==0.21.4",
