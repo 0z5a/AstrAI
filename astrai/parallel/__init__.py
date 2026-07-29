@@ -7,8 +7,8 @@ from astrai.parallel.executor import (
     FSDPExecutor,
     GradientState,
     NoneExecutor,
+    create_ref_model,
 )
-from astrai.parallel.module import ColumnParallelLinear, RowParallelLinear
 from astrai.parallel.setup import (
     get_current_device,
     get_rank,
@@ -17,7 +17,6 @@ from astrai.parallel.setup import (
     setup_parallel,
     spawn_parallel_fn,
 )
-from astrai.parallel.utils import create_ref_model
 
 __all__ = [
     "get_world_size",
@@ -26,8 +25,6 @@ __all__ = [
     "only_on_rank",
     "setup_parallel",
     "spawn_parallel_fn",
-    "RowParallelLinear",
-    "ColumnParallelLinear",
     "ExecutorFactory",
     "BaseExecutor",
     "GradientState",

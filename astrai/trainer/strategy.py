@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.factory import BaseFactory
-from astrai.parallel.utils import create_ref_model
 from astrai.trainer.rollout import RolloutResult
 
 

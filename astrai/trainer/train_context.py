@@ -12,9 +12,8 @@ from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
 from astrai.inference.core.scheduler import InferenceScheduler
 from astrai.model.components.lora import inject_lora
-from astrai.parallel.executor import BaseExecutor, ExecutorFactory
+from astrai.parallel.executor import BaseExecutor, ExecutorFactory, create_ref_model
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
-from astrai.parallel.utils import create_ref_model
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import Checkpoint, load_json
 from astrai.tokenize import AutoTokenizer
