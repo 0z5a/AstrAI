@@ -6,7 +6,7 @@ from torch import Tensor
 
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.inference.core.cache import CacheView
-from astrai.model.automodel import AutoModel
+from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
 from astrai.model.components.linear import Linear
@@ -26,7 +26,7 @@ def process_attention_mask(
     return input_mask
 
 
-@AutoModel.register("autoregressive_lm")
+@ModelFactory.register("autoregressive_lm")
 class AutoRegressiveLM(AutoModel):
     """Autoregressive language model with paged KV cache."""
 

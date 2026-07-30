@@ -40,11 +40,12 @@ def _disable_random_init(enable: bool = True):
             setattr(nn.init, n, fn)
 
 
-class AutoModel(BaseFactory["AutoModel"], nn.Module):
-    """
-    Autoregressive language model base class.
-    Provides model loading/saving, registration, and generation.
-    """
+class ModelFactory(BaseFactory[nn.Module]):
+    """Pure factory for model dispatch, separated from nn.Module state."""
+
+
+class AutoModel(nn.Module):
+    """Model base class with loading/saving and generation."""
 
     def __init__(self, config: BaseModelConfig):
         super().__init__()
@@ -68,7 +69,7 @@ class AutoModel(BaseFactory["AutoModel"], nn.Module):
         config = ConfigFactory.load(raw)
         model_type = config.model_type or "autoregressive_lm"
 
-        actual_cls = AutoModel.get_component_class(model_type)
+        actual_cls = ModelFactory.get_component_class(model_type)
 
         with _disable_random_init(enable=disable_random_init):
             model = actual_cls(config)

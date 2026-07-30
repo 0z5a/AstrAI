@@ -7,7 +7,7 @@ import safetensors.torch as st
 import torch
 
 from astrai.config.model_config import EncoderConfig
-from astrai.model.automodel import AutoModel
+from astrai.model.automodel import ModelFactory
 from astrai.model.encoder import EmbeddingEncoder
 from tests.helpers import TINY_CONFIG, assert_state_dicts_equal
 
@@ -69,8 +69,8 @@ def test_encoder_normalize(device):
 
 
 def test_encoder_register():
-    assert AutoModel.is_registered("embedding")
-    cls = AutoModel.get_component_class("embedding")
+    assert ModelFactory.is_registered("embedding")
+    cls = ModelFactory.get_component_class("embedding")
     assert cls is EmbeddingEncoder
 
 

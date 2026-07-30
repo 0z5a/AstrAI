@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from astrai.config.model_config import EncoderConfig
-from astrai.model.automodel import AutoModel
+from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
 from astrai.model.components.norm import RMSNorm
@@ -13,7 +13,7 @@ from astrai.model.components.rope import RotaryEmbedding
 from astrai.model.transformer import process_attention_mask
 
 
-@AutoModel.register("embedding")
+@ModelFactory.register("embedding")
 class EmbeddingEncoder(AutoModel):
     def __init__(self, config: EncoderConfig):
         super().__init__(config)

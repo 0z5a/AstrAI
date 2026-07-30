@@ -92,8 +92,8 @@ def _make_dpo(device, executor=None):
 def test_factory_registers_online_aliases():
     assert StrategyFactory.is_registered("online_grpo")
     assert StrategyFactory.is_registered("online_dpo")
-    assert StrategyFactory._entries["online_grpo"] is GRPOStrategy
-    assert StrategyFactory._entries["online_dpo"] is DPOStrategy
+    assert StrategyFactory.get_component_class("online_grpo") is GRPOStrategy
+    assert StrategyFactory.get_component_class("online_dpo") is DPOStrategy
 
 
 def test_grpo_supports_online(device):

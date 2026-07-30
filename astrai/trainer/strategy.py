@@ -501,5 +501,5 @@ class GRPOStrategy(BaseStrategy):
 # Factory aliases: online variants use the same strategy class; the
 # ``RolloutRunner`` is injected by ``TrainContextBuilder`` to enable
 # online mode, so no separate subclass is needed.
-StrategyFactory._entries["online_grpo"] = GRPOStrategy
-StrategyFactory._entries["online_dpo"] = DPOStrategy
+StrategyFactory.register("online_grpo")(GRPOStrategy)
+StrategyFactory.register("online_dpo")(DPOStrategy)

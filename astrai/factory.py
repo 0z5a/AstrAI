@@ -13,40 +13,62 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    get_args,
+    get_origin,
 )
-from typing import get_args as _get_args
-from typing import get_origin as _get_origin
 
 T = TypeVar("T")
 
 
-def _resolve_type(
+def _resolve_base_type(
     arg: Union[Type, str, ForwardRef], factory_cls: type
 ) -> Optional[Type]:
-    """Resolve a generic type-arg (str forward-ref, ForwardRef, or class)."""
-    if not isinstance(arg, (str, ForwardRef)):
+    """Resolve the generic type-arg T to a concrete class.
+
+    - Concrete class (``BaseFactory[MyBase]``): returned directly.
+    - Forward reference (``BaseFactory["MyBase"]``): ``Base["X"]``
+      produces a ``ForwardRef("X")`` at class-creation time.  We
+      extract the name and evaluate it in the factory module's
+      global namespace — the same mechanism ``typing.get_type_hints``
+      uses internally.
+    """
+    if isinstance(arg, type):
         return arg
 
-    name = arg if isinstance(arg, str) else arg.__forward_arg__
-    if name == factory_cls.__name__:
-        return factory_cls
+    if isinstance(arg, str):
+        name = arg
+    elif isinstance(arg, ForwardRef):
+        name = arg.__forward_arg__
+    else:
+        return None
 
     mod = sys.modules.get(factory_cls.__module__)
     if mod is None:
         return None
-    ns = vars(mod)
+    try:
+        return eval(name, vars(mod))  # noqa: S307
+    except NameError:
+        return None
 
-    if isinstance(arg, ForwardRef):
-        return arg._evaluate(ns, None, recursive_guard=frozenset())
 
-    return ns.get(name)
+def _validate_component(component_cls: Type, base: Optional[Type]) -> None:
+    """Validate that *component_cls* inherits from *base*.
+
+    No-op when *base* is ``None`` (e.g. forward-ref resolution failed).
+    """
+    if base is not None and not issubclass(component_cls, base):
+        raise TypeError(f"{component_cls.__name__} must inherit from {base.__name__}")
 
 
 class BaseFactory(ABC, Generic[T]):
-    """Generic factory with decorator-based component registration.
+    """Generic factory with decorator-based registration.
+
+    Create a factory by subclassing with the desired base type::
 
         class MyFactory(BaseFactory[MyBase]):
             pass
+
+    Register components with the ``register`` decorator::
 
         @MyFactory.register("custom")
         class CustomComponent(MyBase):
@@ -64,13 +86,10 @@ class BaseFactory(ABC, Generic[T]):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         for orig_base in getattr(cls, "__orig_bases__", ()):
-            if _get_origin(orig_base) is BaseFactory:
-                (arg,) = _get_args(orig_base)
+            if get_origin(orig_base) is BaseFactory:
+                (arg,) = get_args(orig_base)
                 cls._entries = {}
-                try:
-                    cls._component_base = _resolve_type(arg, cls)
-                except Exception:
-                    cls._component_base = None
+                cls._component_base = _resolve_base_type(arg, cls)
                 return
 
     @classmethod
@@ -82,7 +101,7 @@ class BaseFactory(ABC, Generic[T]):
         """
 
         def decorator(component_cls: Type[T]) -> Type[T]:
-            cls._validate_component(component_cls)
+            _validate_component(component_cls, cls._component_base)
             if name in cls._entries:
                 raise ValueError(f"Component '{name}' is already registered")
             cls._entries[name] = component_cls
@@ -95,12 +114,11 @@ class BaseFactory(ABC, Generic[T]):
         """Create a component instance by name, filtering kwargs to match
         the component's ``__init__`` signature.
         """
-        entry = cls._entries.get(name)
-        if entry is None:
+        component_cls = cls._entries.get(name)
+        if component_cls is None:
             raise ValueError(
                 f"Unknown component: '{name}'. Supported types: {sorted(cls._entries)}"
             )
-        component_cls = entry
         sig = inspect.signature(component_cls.__init__)
         has_var_kwargs = any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
@@ -113,18 +131,6 @@ class BaseFactory(ABC, Generic[T]):
             }
             kwargs = {k: v for k, v in kwargs.items() if k in valid}
         return component_cls(*args, **kwargs)
-
-    @classmethod
-    def _validate_component(cls, component_cls: Type[T]):
-        """Validate the decorated class inherits from the factory's base type.
-
-        Override for custom validation beyond ``issubclass``.
-        """
-        base = cls._component_base
-        if base is not None and not issubclass(component_cls, base):
-            raise TypeError(
-                f"{component_cls.__name__} must inherit from {base.__name__}"
-            )
 
     @classmethod
     def get_component_class(cls, name: str) -> Type[T]:

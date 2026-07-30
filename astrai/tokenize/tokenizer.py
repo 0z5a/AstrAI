@@ -20,8 +20,6 @@ Messages = List[Message]
 class AutoTokenizer:
     """Base tokenizer class with automatic loading support"""
 
-    TOKENIZER_CLASSES = {}  # Registry for auto-loading
-
     def __init__(
         self,
         path: Optional[Union[str, Path]] = None,
@@ -107,17 +105,6 @@ class AutoTokenizer:
 
         with open(save_path / "tokenizer_config.json", "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def register_tokenizer(cls, name: str, tokenizer_class: type):
-        """
-        Register a new tokenizer class.
-
-        Args:
-            name: Name to register the tokenizer class under
-            tokenizer_class: The tokenizer class to register
-        """
-        cls.TOKENIZER_CLASSES[name] = tokenizer_class
 
     def encode(
         self,
