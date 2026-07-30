@@ -1,5 +1,6 @@
-from dataclasses import dataclass
 from typing import Any, Dict, Optional
+
+from pydantic.dataclasses import dataclass
 
 from astrai.config.base import BaseConfig
 from astrai.factory import BaseFactory
@@ -17,7 +18,12 @@ class ConfigFactory(BaseFactory[BaseConfig]):
 
 @dataclass
 class BaseModelConfig(BaseConfig):
-    """Base config with ``model_type`` dispatch and file I/O."""
+    """Base config with ``model_type`` dispatch and file I/O.
+
+    Args:
+        model_type (Optional[str]): Model type identifier for AutoModel dispatch. Defaults to None.
+        neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
+    """
 
     model_type: Optional[str] = None
     neftune_alpha: float = 0.0
@@ -26,7 +32,34 @@ class BaseModelConfig(BaseConfig):
 @dataclass
 @ConfigFactory.register("autoregressive_lm")
 class AutoRegressiveLMConfig(BaseModelConfig):
-    """Configuration for autoregressive language model."""
+    """Configuration for autoregressive language model.
+
+    Args:
+        model_type (Optional[str]): Model type identifier for AutoModel dispatch. Defaults to None.
+        neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
+        vocab_size (Optional[int]): Vocabulary size. Defaults to None.
+        hidden_size (Optional[int]): Hidden dimension size. Defaults to None.
+        num_hidden_layers (Optional[int]): Number of transformer layers. Defaults to None.
+        rms_norm_eps (Optional[float]): Epsilon for RMSNorm. Defaults to None.
+        intermediate_size (Optional[int]): Intermediate size in FFN. Defaults to None.
+        tie_word_embeddings (Optional[bool]): Whether to tie embedding and lm_head weights. Defaults to None.
+        max_position_embeddings (Optional[int]): Maximum sequence length the model was trained with. Defaults to None.
+        rope_theta (Optional[float]): Base frequency for RoPE. Defaults to None.
+        rope_scaling (Optional[dict]): RoPE scaling config, e.g. {"type": "linear", "factor": 4.0}. Defaults to None.
+        attn_type (str): Attention type: 'gqa' or 'mla'. Defaults to "gqa".
+        num_attention_heads (Optional[int]): Number of query attention heads. Defaults to None.
+        num_key_value_heads (Optional[int]): Number of key/value heads for GQA. Defaults to None.
+        use_qk_norm (Optional[bool]): Whether to apply RMSNorm to Q/K. Defaults to None.
+        use_gated_attention (Optional[bool]): Whether to use gated attention. Defaults to None.
+        kv_lora_rank (Optional[int]): KV compression rank, MLA only. Defaults to None.
+        qk_nope_head_dim (Optional[int]): Non-RoPE head dimension, MLA only. Defaults to None.
+        qk_rope_head_dim (Optional[int]): RoPE head dimension, MLA only. Defaults to None.
+        ffn_type (str): FFN type: 'mlp' or 'moe'. Defaults to "mlp".
+        n_routed_experts (Optional[int]): Number of routed experts, MoE only. Defaults to None.
+        n_shared_experts (Optional[int]): Number of shared experts, MoE only. Defaults to None.
+        n_activated_experts (Optional[int]): Number of activated experts per token, MoE only. Defaults to None.
+        topk_method (Optional[str]): Top-k routing method, MoE only. Defaults to None.
+    """
 
     vocab_size: Optional[int] = None
     hidden_size: Optional[int] = None
@@ -34,21 +67,17 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     rms_norm_eps: Optional[float] = None
     intermediate_size: Optional[int] = None
     tie_word_embeddings: Optional[bool] = None
-
     max_position_embeddings: Optional[int] = None
     rope_theta: Optional[float] = None
     rope_scaling: Optional[dict] = None
-
     attn_type: str = "gqa"
     num_attention_heads: Optional[int] = None
     num_key_value_heads: Optional[int] = None
     use_qk_norm: Optional[bool] = None
     use_gated_attention: Optional[bool] = None
-
     kv_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
-
     ffn_type: str = "mlp"
     n_routed_experts: Optional[int] = None
     n_shared_experts: Optional[int] = None
@@ -59,24 +88,42 @@ class AutoRegressiveLMConfig(BaseModelConfig):
 @dataclass
 @ConfigFactory.register("embedding")
 class EncoderConfig(BaseModelConfig):
-    """Configuration for embedding encoder model."""
+    """Configuration for embedding encoder model.
+
+    Args:
+        model_type (Optional[str]): Model type identifier for AutoModel dispatch. Defaults to None.
+        neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
+        vocab_size (Optional[int]): Vocabulary size. Defaults to None.
+        hidden_size (Optional[int]): Hidden dimension size. Defaults to None.
+        num_hidden_layers (Optional[int]): Number of transformer layers. Defaults to None.
+        rms_norm_eps (Optional[float]): Epsilon for RMSNorm. Defaults to None.
+        intermediate_size (Optional[int]): Intermediate size in FFN. Defaults to None.
+        max_position_embeddings (Optional[int]): Maximum sequence length the model was trained with. Defaults to None.
+        rope_theta (Optional[float]): Base frequency for RoPE. Defaults to None.
+        rope_scaling (Optional[dict]): RoPE scaling config, e.g. {"type": "linear", "factor": 4.0}. Defaults to None.
+        attn_type (str): Attention type: 'gqa' or 'mla'. Defaults to "gqa".
+        num_attention_heads (Optional[int]): Number of query attention heads. Defaults to None.
+        num_key_value_heads (Optional[int]): Number of key/value heads for GQA. Defaults to None.
+        use_qk_norm (Optional[bool]): Whether to apply RMSNorm to Q/K. Defaults to None.
+        use_gated_attention (Optional[bool]): Whether to use gated attention. Defaults to None.
+        ffn_type (str): FFN type: 'mlp' or 'moe'. Defaults to "mlp".
+        pooling_type (Optional[str]): Pooling strategy for embedding, e.g. 'mean', 'cls'. Defaults to None.
+        normalize_embeddings (Optional[bool]): Whether to L2-normalize output embeddings. Defaults to None.
+    """
 
     vocab_size: Optional[int] = None
     hidden_size: Optional[int] = None
     num_hidden_layers: Optional[int] = None
     rms_norm_eps: Optional[float] = None
     intermediate_size: Optional[int] = None
-
     max_position_embeddings: Optional[int] = None
     rope_theta: Optional[float] = None
     rope_scaling: Optional[dict] = None
-
     attn_type: str = "gqa"
     num_attention_heads: Optional[int] = None
     num_key_value_heads: Optional[int] = None
     use_qk_norm: Optional[bool] = None
     use_gated_attention: Optional[bool] = None
-
     ffn_type: str = "mlp"
     pooling_type: Optional[str] = None
     normalize_embeddings: Optional[bool] = None

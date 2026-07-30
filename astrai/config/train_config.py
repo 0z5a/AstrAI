@@ -1,7 +1,9 @@
-from dataclasses import dataclass, field, fields
+from dataclasses import field
 from typing import Any, Callable, Dict, List, Optional
 
 import torch.nn as nn
+from pydantic import ConfigDict
+from pydantic.dataclasses import dataclass
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Dataset
@@ -10,175 +12,103 @@ from astrai.config.base import BaseConfig
 from astrai.model.components.lora import LoRAConfig
 
 
-def required(**kw):
-    return {"required": True, **kw}
-
-
-@dataclass
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class TrainConfig(BaseConfig):
-    # basic setting
-    model_fn: Callable[[], nn.Module] = field(
-        default=None, metadata=required(help="Model factory for training.")
-    )
-    strategy: str = field(default=None, metadata=required(help="Training strategy."))
-    dataset: Dataset = field(
-        default=None, metadata=required(help="Dataset for training.")
-    )
-    optimizer_fn: Callable[[nn.Module], Optimizer] = field(
-        default=None, metadata=required(help="Optimizer factory for training.")
-    )
-    scheduler_fn: Callable[[Optimizer], LRScheduler] = field(
-        default=None, metadata=required(help="Scheduler factory for training.")
-    )
-    n_epoch: int = field(default=1, metadata={"help": "Number of epochs for training."})
-    batch_per_device: int = field(
-        default=4, metadata={"help": "Batch size per device."}
-    )
-    grad_accum_steps: int = field(
-        default=1, metadata={"help": "Number of iterations between steps."}
-    )
-    max_grad_norm: Optional[float] = field(
-        default=1.0,
-        metadata={"help": "Maximum gradient norm. None disables clipping."},
-    )
-    gradient_checkpointing_modules: List[str] = field(
-        default_factory=list,
-        metadata={"help": "Module types to enable activation checkpointing for."},
-    )
-    compile_mode: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "torch.compile mode: 'default', 'reduce-overhead', 'max-autotune', or None to disable."
-        },
-    )
+    """Training configuration.
 
-    # checkpoint setting
-    start_epoch: int = field(default=0, metadata={"help": "Start epoch for training."})
-    start_samples: int = field(
-        default=0,
-        metadata={
-            "help": "Start samples count (per rank). Superseded by checkpoint consumed_samples."
-        },
-    )
-    ckpt_dir: str = field(
-        default="./checkpoint", metadata={"help": "Checkpoint directory."}
-    )
-    ckpt_interval: int = field(
-        default=5000,
-        metadata={"help": "Number of optimizer steps between checkpoints."},
-    )
+    Combines hyperparameters with runtime objects (model_fn, dataset, etc.).
+    Only JSON-serializable fields are written to checkpoint meta via to_dict().
 
-    # lora setting
-    lora: Optional[LoRAConfig] = field(
-        default=None,
-        metadata={"help": "LoRA config. None means full fine-tuning."},
-    )
+    Args:
+        model_fn (Callable[[], nn.Module]): Model factory for training.
+        strategy (str): Training strategy (seq, sft, dpo, grpo, online_*).
+        dataset (Dataset): Dataset for training.
+        optimizer_fn (Callable[[nn.Module], Optimizer]): Optimizer factory for training.
+        scheduler_fn (Callable[[Optimizer], LRScheduler]): Scheduler factory for training.
+        n_epoch (int): Number of epochs for training. Defaults to 1.
+        batch_per_device (int): Batch size per device. Defaults to 4.
+        grad_accum_steps (int): Number of iterations between optimizer steps. Defaults to 1.
+        max_grad_norm (Optional[float]): Maximum gradient norm. None disables clipping. Defaults to 1.0.
+        gradient_checkpointing_modules (List[type]): Module types to enable activation checkpointing for. Defaults to [].
+        compile_mode (Optional[str]): torch.compile mode: 'default', 'reduce-overhead', 'max-autotune', or None. Defaults to None.
+        start_epoch (int): Start epoch for training. Defaults to 0.
+        start_samples (int): Start samples count (per rank). Superseded by checkpoint consumed_samples. Defaults to 0.
+        ckpt_dir (str): Checkpoint directory. Defaults to "./checkpoint".
+        ckpt_interval (int): Number of optimizer steps between checkpoints. Defaults to 5000.
+        lora (Optional[LoRAConfig]): LoRA config. None means full fine-tuning. Defaults to None.
+        metrics (List[str]): Metrics to record during training. Defaults to ["loss", "lr", "grad_norm"].
+        random_seed (int): Random seed. Defaults to 3407.
+        num_workers (int): Number of workers for dataloader. Defaults to 0.
+        prefetch_factor (Optional[int]): Prefetch factor for dataloader. Defaults to None.
+        pin_memory (bool): Pin memory for dataloader. Defaults to False.
+        collate_fn (Optional[Callable[[List[Any]], Any]]): Collate function for dataloader (e.g. dpo_collate_fn). Defaults to None.
+        nprocs (int): Number of processes for distributed training. Defaults to 1.
+        backend (str): Distributed training backend. Defaults to "nccl".
+        master_addr (str): Master address for distributed training. Defaults to "localhost".
+        master_port (str): Master port for distributed training. Defaults to "29500".
+        parallel_mode (str): Parallel strategy: none, ddp, fsdp. Defaults to "none".
+        start_method (str): Multiprocessing start method: spawn/fork/forkserver. Defaults to "spawn".
+        device_type (str): Device type for distributed training. Defaults to "cuda".
+        val_dataset (Optional[Dataset]): Dataset for validation. Defaults to None.
+        val_split (Optional[float]): Ratio to split from training dataset for validation, e.g. 0.05. Defaults to None.
+        val_step (int): Number of optimizer steps between validation runs. Defaults to 1000.
+        neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
+        rollout_interval (int): Number of optimizer steps between online rollouts. Defaults to 512.
+        rollout_temperature (float): Sampling temperature for online rollout. Defaults to 0.7.
+        rollout_top_k (int): Top-k filtering for online rollout, 0=disable. Defaults to 0.
+        rollout_top_p (float): Top-p (nucleus) filtering for online rollout. Defaults to 0.9.
+        rollout_max_tokens (int): Maximum generated tokens per response in rollout. Defaults to 1024.
+        reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
+        executor_kwargs (Dict[str, Any]): Extra kwargs passed to ExecutorFactory.create(). Defaults to {}.
+        extra_kwargs (Dict[str, Any]): Other arguments. Defaults to {}.
+    """
 
-    # metric setting
-    metrics: List[str] = field(
-        default_factory=lambda: ["loss", "lr", "grad_norm"],
-        metadata={"help": "Metrics to record during training."},
-    )
+    model_fn: Callable[[], nn.Module]
+    strategy: str
+    dataset: Dataset
+    optimizer_fn: Callable[[nn.Module], Optimizer]
+    scheduler_fn: Callable[[Optimizer], LRScheduler]
+    n_epoch: int = 1
+    batch_per_device: int = 4
+    grad_accum_steps: int = 1
+    max_grad_norm: Optional[float] = 1.0
+    gradient_checkpointing_modules: List[type] = field(default_factory=list)
+    compile_mode: Optional[str] = None
 
-    # dataloader setting
-    random_seed: int = field(default=3407, metadata={"help": "Random seed."})
-    num_workers: int = field(
-        default=0, metadata={"help": "Number of workers for dataloader."}
-    )
-    prefetch_factor: Optional[int] = field(
-        default=None, metadata={"help": "Prefetch factor for dataloader."}
-    )
-    pin_memory: bool = field(
-        default=False, metadata={"help": "Pin memory for dataloader."}
-    )
-    collate_fn: Optional[Callable[[List[Any]], Any]] = field(
-        default=None,
-        metadata={"help": "Collate function for dataloader (e.g. dpo_collate_fn)."},
-    )
+    start_epoch: int = 0
+    start_samples: int = 0
+    ckpt_dir: str = "./checkpoint"
+    ckpt_interval: int = 5000
 
-    # distributed training
-    nprocs: int = field(
-        default=1, metadata={"help": "Number of processes for distributed training."}
-    )
-    backend: str = field(
-        default="nccl", metadata={"help": "Distributed training backend."}
-    )
-    master_addr: str = field(
-        default="localhost",
-        metadata={"help": "Master address for distributed training."},
-    )
-    master_port: str = field(
-        default="29500", metadata={"help": "Master port for distributed training."}
-    )
-    parallel_mode: str = field(
-        default="none",
-        metadata={"help": "Parallel strategy: none, ddp, fsdp."},
-    )
-    start_method: str = field(
-        default="spawn",
-        metadata={"help": "Multiprocessing start method (spawn/fork/forkserver)."},
-    )
+    lora: Optional[LoRAConfig] = None
 
-    # others
-    device_type: str = field(
-        default="cuda", metadata={"help": "Device type for distributed training."}
-    )
-    val_dataset: Optional[Dataset] = field(
-        default=None, metadata={"help": "Dataset for validation."}
-    )
-    val_split: Optional[float] = field(
-        default=None,
-        metadata={
-            "help": "Ratio to split from training dataset for validation (e.g. 0.05). Ignored if val_dataset is set."
-        },
-    )
-    val_step: int = field(
-        default=1000,
-        metadata={"help": "Number of optimizer steps between validation runs."},
-    )
-    neftune_alpha: float = field(
-        default=0.0,
-        metadata={"help": "NEFTune noise alpha (0=disabled, typical: 5.0)."},
-    )
+    metrics: List[str] = field(default_factory=lambda: ["loss", "lr", "grad_norm"])
 
-    # online rollout
-    rollout_interval: int = field(
-        default=512,
-        metadata={"help": "Number of optimizer steps between online rollouts."},
-    )
-    rollout_temperature: float = field(
-        default=0.7, metadata={"help": "Sampling temperature for online rollout."}
-    )
-    rollout_top_k: int = field(
-        default=0, metadata={"help": "Top-k filtering for online rollout (0=disable)."}
-    )
-    rollout_top_p: float = field(
-        default=0.9,
-        metadata={"help": "Top-p (nucleus) filtering for online rollout."},
-    )
-    rollout_max_tokens: int = field(
-        default=1024,
-        metadata={"help": "Maximum generated tokens per response in rollout."},
-    )
-    reward_model_fn: Optional[Callable] = field(
-        default=None,
-        metadata={
-            "help": "Factory for reward model (required for online RL strategies)."
-        },
-    )
+    random_seed: int = 3407
+    num_workers: int = 0
+    prefetch_factor: Optional[int] = None
+    pin_memory: bool = False
+    collate_fn: Optional[Callable[[List[Any]], Any]] = None
 
-    executor_kwargs: Dict[str, Any] = field(
-        default_factory=dict,
-        metadata={"help": "Extra kwargs passed to ExecutorFactory.create()."},
-    )
-    extra_kwargs: Dict[str, Any] = field(
-        default_factory=dict, metadata={"help": "Other arguments."}
-    )
+    nprocs: int = 1
+    backend: str = "nccl"
+    master_addr: str = "localhost"
+    master_port: str = "29500"
+    parallel_mode: str = "none"
+    start_method: str = "spawn"
 
-    def __post_init__(self):
-        self.validate()
+    device_type: str = "cuda"
+    val_dataset: Optional[Dataset] = None
+    val_split: Optional[float] = None
+    val_step: int = 1000
+    neftune_alpha: float = 0.0
 
-    def validate(self):
-        for fld in fields(self):
-            if fld.metadata.get("required") and getattr(self, fld.name) is None:
-                raise ValueError(f"TrainConfig.{fld.name} is required but got None.")
+    rollout_interval: int = 512
+    rollout_temperature: float = 0.7
+    rollout_top_k: int = 0
+    rollout_top_p: float = 0.9
+    rollout_max_tokens: int = 1024
+    reward_model_fn: Optional[Callable] = None
+
+    executor_kwargs: Dict[str, Any] = field(default_factory=dict)
+    extra_kwargs: Dict[str, Any] = field(default_factory=dict)

@@ -1,11 +1,12 @@
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, Set
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pydantic.dataclasses import dataclass
 
 from astrai.model.components.linear import Linear
 from astrai.serialization import (

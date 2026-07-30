@@ -22,13 +22,10 @@ class BaseToolParser(ABC):
     Maintains streaming state internally so that each call to :meth:`feed`
     can diff against previously emitted content.
 
-    Parameters
-    ----------
-    tools : list of dict, optional
-        Tool definitions from the request.
-    tool_choice : str
-        ``"auto"`` / ``"required"`` / ``"none"`` or a named tool choice
-        dict.
+    Args:
+        tools (list of dict, optional): Tool definitions from the request.
+        tool_choice (str): ``"auto"`` / ``"required"`` / ``"none"`` or a named
+            tool choice dict.
     """
 
     def __init__(self, tools: Optional[List[Dict]] = None, tool_choice: str = "auto"):
@@ -51,14 +48,12 @@ class BaseToolParser(ABC):
 
         Returns an empty list when nothing new should be emitted.
 
-        Parameters
-        ----------
-        body : str
-            The complete accumulated generated text so far.
-        current_token_ids : list of int, optional
-            All token IDs decoded into *body* (cumulative).
-        delta_token_ids : list of int, optional
-            Only the token IDs for this chunk.
+        Args:
+            body (str): The complete accumulated generated text so far.
+            current_token_ids (list of int, optional): All token IDs decoded
+                into *body* (cumulative).
+            delta_token_ids (list of int, optional): Only the token IDs for
+                this chunk.
         """
 
     @abstractmethod
