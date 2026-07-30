@@ -1,11 +1,19 @@
+from pathlib import Path
+from typing import Optional
+
 import click
 import torch
 
 from astrai import setup_logging
 from astrai.config import AutoRegressiveLMConfig
+from astrai.extension import ATTN_BACKEND, attn_backend
+from astrai.inference.core.cache import PagePool
+from astrai.model import AutoModel
 
 _DTYPES = ["bfloat16", "float16", "float32"]
 _CACHES = ["contiguous", "paged"]
+DEFAULT_CKPT = str(Path(__file__).resolve().parents[2] / "ckpt_bucket" / "kami-15bt")
+CACHE_MAX_SEQ = 2048
 
 
 class BenchmarkResult:
@@ -16,7 +24,7 @@ class BenchmarkResult:
         seq_len: int,
         tokens_per_second: float,
         latency_ms: float,
-        metadata: dict | None = None,
+        metadata: Optional[dict] = None,
     ):
         self.name = name
         self.batch_size = batch_size
@@ -29,26 +37,81 @@ class BenchmarkResult:
 class GenerationBenchmark:
     def __init__(
         self,
+        model: AutoModel,
         config: AutoRegressiveLMConfig,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         cache_type: str = "contiguous",
     ):
-        from astrai.inference import InferenceEngine
-        from astrai.model import AutoRegressiveLM
-
         self.device = device
         self.dtype = dtype
         self.cache_type = cache_type
+        self.model = model
+        self.config = config
 
-        click.echo("Building model ...")
-        self.model = AutoRegressiveLM(config).to(device=device, dtype=dtype)
-        self.engine = InferenceEngine(
-            model=self.model,
-            tokenizer=None,
-            max_batch_size=256,
-            max_seq_len=config.max_position_embeddings,
+    def _make_pool(self, batch_size: int) -> PagePool:
+        return PagePool(
+            n_layers=self.config.num_hidden_layers,
+            n_kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.hidden_size // self.config.num_attention_heads,
+            max_batch_size=batch_size,
+            max_seq_len=CACHE_MAX_SEQ,
+            device=self.device,
+            dtype=self.dtype,
+            page_size=1,
+            n_tokens=None,
         )
+
+    def _run_prefill(self, pool: PagePool, batch_size: int, prompt_len: int) -> list:
+        input_ids = torch.randint(
+            0, self.config.vocab_size, (batch_size, prompt_len), device=self.device
+        )
+        position_ids = (
+            torch.arange(0, prompt_len, dtype=torch.long, device=self.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
+        input_mask = position_ids.unsqueeze(-1) >= torch.arange(
+            prompt_len, device=self.device
+        )
+
+        task_ids = [f"bench_{i}" for i in range(batch_size)]
+        for tid in task_ids:
+            pool.task_alloc(tid, list(range(prompt_len)))
+
+        kv_cache = pool.bind_tasks(
+            task_ids, [prompt_len] * batch_size, self.device, start_pos=0
+        )
+        with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
+            self.model(
+                input_ids,
+                input_mask=input_mask,
+                kv_cache=kv_cache,
+                position_ids=position_ids,
+            )
+        torch.cuda.synchronize()
+        return task_ids
+
+    def _run_decode_step(self, pool: PagePool, task_ids: list, seq_len: int):
+        batch_size = len(task_ids)
+        input_ids = torch.randint(
+            0, self.config.vocab_size, (batch_size, 1), device=self.device
+        )
+        position_ids = torch.tensor(
+            [[seq_len] for _ in range(batch_size)], dtype=torch.long, device=self.device
+        )
+        total_len = seq_len + 1
+        input_mask = position_ids[:, :, None] >= torch.arange(
+            total_len, device=self.device
+        )
+        kv_cache = pool.bind_tasks(task_ids, [seq_len + 1] * batch_size, self.device)
+        with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
+            self.model(
+                input_ids,
+                input_mask=input_mask,
+                kv_cache=kv_cache,
+                position_ids=position_ids,
+            )
 
     def run_prefill_benchmark(
         self,
@@ -59,15 +122,23 @@ class GenerationBenchmark:
         import time
 
         input_ids = torch.randint(
-            0, 10000, (batch_size, prompt_length), device=self.device
+            0, self.config.vocab_size, (batch_size, prompt_length), device=self.device
         )
+        position_ids = (
+            torch.arange(0, prompt_length, dtype=torch.long, device=self.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
+
         for _ in range(3):
-            self.engine.model(input_ids)
+            with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
+                self.model(input_ids, position_ids=position_ids)
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(num_trials):
-            self.engine.model(input_ids)
+            with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
+                self.model(input_ids, position_ids=position_ids)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
         tokens = batch_size * prompt_length * num_trials
@@ -90,21 +161,16 @@ class GenerationBenchmark:
     ) -> BenchmarkResult:
         import time
 
-        prompt = torch.randint(
-            0, 10000, (batch_size, prompt_length), device=self.device
-        )
-        with torch.inference_mode():
-            kv = self.engine.model(prompt, use_cache=True)
-        past = kv.past_key_values if hasattr(kv, "past_key_values") else kv[1]
+        pool = self._make_pool(batch_size)
+        task_ids = self._run_prefill(pool, batch_size, prompt_length)
 
-        token = torch.randint(0, 10000, (batch_size, 1), device=self.device)
-        for _ in range(3):
-            self.engine.model(token, past_key_values=past, use_cache=True)
-
+        for i in range(5):
+            self._run_decode_step(pool, task_ids, prompt_length + i)
         torch.cuda.synchronize()
+
         t0 = time.perf_counter()
-        for _ in range(gen_length * num_trials):
-            self.engine.model(token, past_key_values=past, use_cache=True)
+        for i in range(gen_length * num_trials):
+            self._run_decode_step(pool, task_ids, prompt_length + 5 + i)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
         tokens = batch_size * gen_length * num_trials
@@ -148,6 +214,11 @@ def print_benchmark_result(result: BenchmarkResult) -> None:
 @click.option("--num_trials", type=int, default=5, help="Number of trials.")
 @click.option("--prefill_only", is_flag=True, help="Prefill benchmark only.")
 @click.option("--decode_only", is_flag=True, help="Decode benchmark only.")
+@click.option(
+    "--ckpt",
+    default=DEFAULT_CKPT,
+    help="Checkpoint directory.",
+)
 def benchmark_command(
     device: str,
     dtype: str,
@@ -158,6 +229,7 @@ def benchmark_command(
     num_trials: int,
     prefill_only: bool,
     decode_only: bool,
+    ckpt: str,
 ) -> None:
     """Benchmark model throughput and latency."""
     dtype_map: dict[str, torch.dtype] = {
@@ -166,19 +238,15 @@ def benchmark_command(
         "float32": torch.float32,
     }
 
-    config = AutoRegressiveLMConfig(
-        vocab_size=10000,
-        hidden_size=1536,
-        num_attention_heads=24,
-        num_key_value_heads=4,
-        intermediate_size=6912,
-        max_position_embeddings=2048,
-        num_hidden_layers=24,
-        rms_norm_eps=1e-5,
-    )
+    click.echo(f"Loading model from {ckpt} ...")
+    config = AutoRegressiveLMConfig.from_file(str(Path(ckpt) / "config.json"))
+    model = AutoModel.from_pretrained(ckpt)
+    model.to(device=device, dtype=dtype_map[dtype])
+    model.eval()
 
     bench = GenerationBenchmark(
-        config,
+        model=model,
+        config=config,
         device=device,
         dtype=dtype_map[dtype],
         cache_type=cache,
