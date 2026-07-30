@@ -277,7 +277,7 @@ classDiagram
             +ModuleList layers
             +RMSNorm norm
             +Linear lm_head
-            +forward(input_ids, input_mask, paged_cache, position_ids) Dict[str, Tensor]
+            +forward(input_ids, input_mask, kv_cache, position_ids) Dict[str, Tensor]
             +load_state_dict(state_dict, strict, assign)
             +state_dict()
         }
@@ -299,7 +299,7 @@ classDiagram
             +RMSNorm input_norm
             +nn.Module mlp        # MLP or DeepSeekMoE via FFNFactory
             +RMSNorm post_attention_norm
-            +forward(x, rotary_emb, attention_mask, paged_cache) Tensor
+            +forward(x, rotary_emb, attention_mask, kv_cache) Tensor
         }
 
         class GQA {
@@ -314,7 +314,7 @@ classDiagram
             +Linear q_proj, k_proj, v_proj, o_proj
             +Linear gate  # only if use_gated_attention
             +RMSNorm q_norm, k_norm  # only if use_qk_norm
-            +forward(x, rotary_emb, attn_mask, paged_cache) Tensor
+            +forward(x, rotary_emb, attn_mask, kv_cache) Tensor
         }
 
         class MLA {
@@ -334,7 +334,7 @@ classDiagram
             +Linear gate  # only if use_gated_attention
             +RMSNorm kv_norm
             +RMSNorm q_norm, k_norm  # only if use_qk_norm
-            +forward(x, rotary_emb, attn_mask, paged_cache) Tensor
+            +forward(x, rotary_emb, attn_mask, kv_cache) Tensor
         }
 
         class MLP {
@@ -824,75 +824,46 @@ classDiagram
             +record(page_idx, token_ids, logical_page_idx)
         }
 
-        class Storage {
-            +int page_size
-            +Tensor k_cache
-            +Tensor v_cache
-            +write(layer_id, page_table, start_pos, k, v)
-            +gather(layer_id, page_table, total_len) Tuple[Tensor, Tensor]
+        class KVStorage {
+            +int size
+            +Tensor k_buffer
+            +Tensor v_buffer
+            +get_key_buffer(layer_id) Tensor
+            +get_value_buffer(layer_id) Tensor
+            +set_kv_buffer(layer_id, loc, k, v)
+        }
+
+        class ReqToTokenPool {
+            +int size
+            +int max_context_len
+            +Tensor req_to_token
+            +alloc(num_reqs) List[int]
+            +free(req_indices)
+            +write(indices, values)
         }
 
         class KVCache {
-            <<abstract>>
-            +task_alloc(task_id, prompt_ids) bool
-            +task_free(task_id)
-            +task_extend(task_id, pos) bool
-            +task_cached(task_id) int
-            +task_record_hashes(task_id, prompt_ids, start_logical_page)
-            +bind_tasks(task_ids, total_len, device) CacheView
+            +Tensor k_buffer
+            +Tensor v_buffer
+            +Tensor req_to_token
+            +Tensor req_pool_indices
+            +Tensor seq_lens
+            +Tensor out_cache_loc
         }
 
-        class PageCache {
+        class PagePool {
             +int page_size
-            -PagePool _pool
-            -Storage _storage
-            -TaskTable _table
+            +bool contiguous
+            -KVStorage _storage
+            -ReqToTokenPool _req_pool
+            -Allocator _alloc
+            -PrefixCache _prefix
             +task_alloc(task_id, prompt_ids) bool
             +task_free(task_id)
             +task_extend(task_id, pos) bool
             +task_cached(task_id) int
             +task_record_hashes(task_id, prompt_ids, start_logical_page)
-            +bind_tasks(task_ids, total_len, device) PageCacheView
-        }
-
-        class ContiguousCache {
-            +int max_seq_len
-            +Tensor k, v
-            +task_alloc(task_id, prompt_ids) bool
-            +task_free(task_id)
-            +task_extend(task_id, pos) bool
-            +bind_tasks(task_ids, total_len, device) ContiguousCacheView
-        }
-
-        class CacheView {
-            <<abstract>>
-            +write(layer_id, k, v)
-            +gather(layer_id) Tuple[Tensor, Tensor]
-        }
-
-        class PageCacheView {
-            -Storage _storage
-            +Tensor _page_table
-            +int _total_len
-            +write(layer_id, k, v)
-            +gather(layer_id) Tuple[Tensor, Tensor]
-        }
-
-        class ContiguousCacheView {
-            -ContiguousCache _cache
-            +Tensor _batch_indices
-            +int _total_len
-            +write(layer_id, k, v)
-            +gather(layer_id) Tuple[Tensor, Tensor]
-        }
-
-        class TaskTable {
-            +set(task_id, page_table, cached)
-            +get(task_id) List[int]
-            +get_cached(task_id) int
-            +get_ref(task_id) List[int]
-            +pop(task_id) Tuple[List[int], int]
-            +table_tensor(task_ids, device) Tensor
+            +bind_tasks(task_ids, seq_lens, device, start_pos) KVCache
         }
 
     class Task {
@@ -1314,17 +1285,13 @@ classDiagram
     RawRollout <|-- RolloutResult
     LaunchStrategy <|-- TorchrunStrategy
     LaunchStrategy <|-- LocalStrategy
-    KVCache <|-- PageCache
-    KVCache <|-- ContiguousCache
-    CacheView <|-- PageCacheView
-    CacheView <|-- ContiguousCacheView
-
     %% --- Composition (strong ownership, part destroyed with whole) ---
-    PageCache *-- PagePool
-    PageCache *-- Storage
-    PageCache *-- TaskTable
+    PagePool *-- KVStorage
+    PagePool *-- ReqToTokenPool
+    PagePool *-- Allocator
+    PagePool *-- PrefixCache
     InferenceEngine *-- InferenceScheduler
-    InferenceScheduler *-- KVCache
+    InferenceScheduler *-- PagePool
     InferenceScheduler *-- Executor
     InferenceScheduler *-- TaskManager
     AutoRegressiveLM *-- DecoderBlock
@@ -1352,8 +1319,6 @@ classDiagram
     TrainContext o-- BaseScheduler
     TrainContext o-- Checkpoint
     TrainContext o-- BaseExecutor
-    PageCacheView o-- Storage
-    ContiguousCacheView o-- ContiguousCache
     SamplingPipeline o-- BaseSamplingStrategy
     BaseDataset o-- Store
     Pipeline o-- PipelineConfig
@@ -1398,8 +1363,7 @@ classDiagram
     TrainContextBuilder ..> RDSampler : creates
     Checkpoint ..> Checkpoint : serializes
     CheckpointCallback ..> Checkpoint : creates
-    PageCache ..> PageCacheView : binds
-    ContiguousCache ..> ContiguousCacheView : binds
+    PagePool ..> KVCache : binds
     InferenceEngine ..> GenerationRequest : uses
     InferenceEngine ..> GenerateResult : creates
     OpenAIResponseBuilder ..> ChatCompletionRequest : receives
@@ -1436,7 +1400,7 @@ classDiagram
 | **astrai.model** | AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, RolloutGenerator, RolloutRunner | Training workflow |
-| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, KVCache–ContiguousCache/PageCache, CacheView–ContiguousCacheView/PageCacheView, Allocator–Storage, Task, TaskManager, TaskStatus, StreamDecoder, GenerationRequest, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
+| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, PagePool, KVStorage, ReqToTokenPool, KVCache, Allocator, PrefixCache, Task, TaskManager, TaskStatus, StreamDecoder, GenerationRequest, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, ParallelModel, RowParallelLinear, ColumnParallelLinear | Distributed parallel & gradient accumulation |
 | **astrai.factory** | BaseFactory | Component registration |
 | **astrai.protocols** | OptimizerProtocol, SchedulerProtocol | Structural subtyping for optimizer/scheduler wrappers |

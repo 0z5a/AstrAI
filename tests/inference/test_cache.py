@@ -239,12 +239,12 @@ def test_page_pool_contiguous_bind_roundtrip():
     kv = pool.bind_tasks(["t1"], [4], torch.device("cpu"), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
     v = torch.randn(1, 4, 2, 4)
-    kv.k_buffer[0][kv.out_cache_loc] = k
-    kv.v_buffer[0][kv.out_cache_loc] = v
+    kv.k_buffer[0, kv.out_cache_loc] = k
+    kv.v_buffer[0, kv.out_cache_loc] = v
 
     indices = kv.req_to_token[kv.req_pool_indices, :4]
-    gathered_k = kv.k_buffer[0][indices]
-    gathered_v = kv.v_buffer[0][indices]
+    gathered_k = kv.k_buffer[0, indices]
+    gathered_v = kv.v_buffer[0, indices]
     assert torch.allclose(gathered_k, k)
     assert torch.allclose(gathered_v, v)
 
@@ -301,11 +301,11 @@ def test_page_pool_paged_bind_roundtrip():
     kv = pool.bind_tasks(["t1"], [4], torch.device("cpu"), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
     v = torch.randn(1, 4, 2, 4)
-    kv.k_buffer[0][kv.out_cache_loc] = k
-    kv.v_buffer[0][kv.out_cache_loc] = v
+    kv.k_buffer[0, kv.out_cache_loc] = k
+    kv.v_buffer[0, kv.out_cache_loc] = v
 
     indices = kv.req_to_token[kv.req_pool_indices, :4]
-    gathered_k = kv.k_buffer[0][indices]
+    gathered_k = kv.k_buffer[0, indices]
     assert torch.allclose(gathered_k, k)
 
 
@@ -352,9 +352,9 @@ def test_page_pool_paged_ps64_bind_roundtrip():
     kv = pool.bind_tasks(["t1"], [128], torch.device("cpu"), start_pos=0)
     k = torch.randn(1, 128, 2, 4)
     v = torch.randn(1, 128, 2, 4)
-    kv.k_buffer[0][kv.out_cache_loc] = k
-    kv.v_buffer[0][kv.out_cache_loc] = v
+    kv.k_buffer[0, kv.out_cache_loc] = k
+    kv.v_buffer[0, kv.out_cache_loc] = v
 
     indices = kv.req_to_token[kv.req_pool_indices, :128]
-    gathered_k = kv.k_buffer[0][indices]
+    gathered_k = kv.k_buffer[0, indices]
     assert torch.allclose(gathered_k, k)

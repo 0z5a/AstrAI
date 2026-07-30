@@ -23,30 +23,33 @@ RoPE is applied **before** KV cache write, not after — otherwise position enco
 
 ## KVCache System
 
-Seven classes working together, with two concrete cache implementations:
-
-### ContiguousCache (default)
+Three-layer separation (SGLang-inspired): storage, index table, allocator.
 
 ```
-ContiguousCache (simple contiguous per-slot cache)
-  ├── ContiguousCacheView  bundles k/v tensors + slot indices for attention layers
+PagePool (top-level manager, orchestrates all layers)
+  ├── KVStorage              k_buffer / v_buffer [n_layers, size, n_kv_heads, head_dim]
+  ├── ReqToTokenPool         req_to_token [num_reqs, max_ctx_len] → physical token slot
+  ├── Allocator              bitmask-based page allocator + ref-count + LRU (paged mode only)
+  └── PrefixCache            hash-based prefix matching (paged mode only)
 ```
 
-Created by default when no cache is passed to `InferenceScheduler`. Each task occupies a fixed slot of `[max_seq_len, num_key_value_heads, head_dim]`. Simple and efficient for small-to-medium batch sizes.
+`PagePool` supports two modes:
 
-### PageCache (paged with prefix sharing)
+- **Contiguous (default)**: pre-allocates `max_batch_size * max_seq_len` token slots. `req_to_token` is a trivial linear mapping (`slot = req_idx * max_seq_len + pos`). No dynamic allocation.
+- **Paged** (`page_size=1` or `>1` with `n_tokens` set): shared token pool with on-demand allocation. Allocator + PrefixCache enable prefix sharing and LRU eviction.
+
+`bind_tasks()` returns a `KVCache` dataclass — pure data, no methods:
 
 ```
-PageCache (paged KV cache with prefix sharing, alternative)
-  ├── PagePool               orchestrates page allocation + prefix matching
-  │     ├── Allocator         bitmask-based page allocator + ref-count + LRU
-  │     └── PrefixCache       hash-based prefix matching (page_hash via polynomial hash)
-  ├── TaskTable              maps task_id → page_table + cached token count
-  ├── Storage                k_cache / v_cache tensors (num_hidden_layers × n_pages × page_size × num_key_value_heads × head_dim)
-  └── PageCacheView          bundles Storage + page_table + total_len for attention layers
+KVCache
+  ├── k_buffer, v_buffer     [n_layers, size, n_kv_heads, head_dim]
+  ├── req_to_token           [num_reqs, max_ctx_len]
+  ├── req_pool_indices       [batch_size]
+  ├── seq_lens               [batch_size]
+  └── out_cache_loc          [batch, seq_len] — write indices for this forward
 ```
 
-`isinstance(cache, KVCache)` checks dispatch to the correct view. Both implement the abstract `KVCache` interface used by `Executor` and `InferenceScheduler`.
+Attention layers do raw buffer indexing: `k_buffer[layer_id, out_cache_loc] = k` to write, `k_buffer[layer_id, indices]` to gather.
 
 ## Continuous Batching
 

@@ -143,10 +143,15 @@ The cache stores $k_j$ and $v_j$ for all previous positions. At each decode step
 
 If RoPE were applied after caching, the rotation factors would be inconsistent between cached and new tokens.
 
-### Cache Implementations
+### Cache Architecture
 
-- **ContiguousCache**: Each task gets a fixed slot of `[max_seq_len, num_key_value_heads, head_dim]`. Simple, efficient for small-to-medium batch sizes.
-- **PageCache**: Paged KV cache with prefix sharing. Uses `PagePool` (allocator + LRU + prefix matching) and `Storage` (page tensors). Enables sharing of common prompt prefixes across requests.
+Three-layer separation (SGLang-inspired):
+
+- **KVStorage**: Flat token-level buffers `[n_layers, size, n_kv_heads, head_dim]`.
+- **ReqToTokenPool**: Index table `[req_idx, pos] → physical token slot`, shared across all layers.
+- **Allocator + PrefixCache**: Paged-mode slot allocation with ref-counting, LRU eviction, and hash-based prefix sharing.
+
+`PagePool` orchestrates all three. In contiguous mode (default), `req_to_token` is a trivial linear mapping. In paged mode, slots are allocated on demand with prefix caching support. Attention layers access buffers directly via `KVCache` dataclass — no methods, no abstraction.
 
 ## Mask Algorithm Internals
 

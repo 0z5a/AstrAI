@@ -87,8 +87,8 @@ class GQA(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
 
         if kv_cache is not None:
-            kv_cache.k_buffer[self.layer_id][kv_cache.out_cache_loc] = k
-            kv_cache.v_buffer[self.layer_id][kv_cache.out_cache_loc] = v
+            kv_cache.k_buffer[self.layer_id, kv_cache.out_cache_loc] = k
+            kv_cache.v_buffer[self.layer_id, kv_cache.out_cache_loc] = v
 
             max_len = kv_cache.seq_lens.max()
             indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
@@ -97,8 +97,8 @@ class GQA(nn.Module):
                 < kv_cache.seq_lens[:, None]
             )
             indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
-            k = kv_cache.k_buffer[self.layer_id][indices]
-            v = kv_cache.v_buffer[self.layer_id][indices]
+            k = kv_cache.k_buffer[self.layer_id, indices]
+            v = kv_cache.v_buffer[self.layer_id, indices]
 
         k, v = repeat_kv(k, self.n_rep), repeat_kv(v, self.n_rep)
 
@@ -204,8 +204,8 @@ class MLA(nn.Module):
             k = self.k_norm(k)
 
         if kv_cache is not None:
-            kv_cache.k_buffer[self.layer_id][kv_cache.out_cache_loc] = k
-            kv_cache.v_buffer[self.layer_id][kv_cache.out_cache_loc] = v
+            kv_cache.k_buffer[self.layer_id, kv_cache.out_cache_loc] = k
+            kv_cache.v_buffer[self.layer_id, kv_cache.out_cache_loc] = v
 
             max_len = kv_cache.seq_lens.max()
             indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
@@ -214,8 +214,8 @@ class MLA(nn.Module):
                 < kv_cache.seq_lens[:, None]
             )
             indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
-            k = kv_cache.k_buffer[self.layer_id][indices]
-            v = kv_cache.v_buffer[self.layer_id][indices]
+            k = kv_cache.k_buffer[self.layer_id, indices]
+            v = kv_cache.v_buffer[self.layer_id, indices]
 
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)

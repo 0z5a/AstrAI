@@ -155,10 +155,10 @@ class ReqToTokenPool:
 
 
 class KVStorage:
-    """Token-level flat KV cache storage with NHD layout.
+    """Token-level KV cache storage.
 
     Buffers: [n_layers, size, n_kv_heads, head_dim]. Each token occupies
-    one contiguous row. Logical ordering is determined by ReqToTokenPool.
+    one slot indexed by ReqToTokenPool.
     """
 
     def __init__(
@@ -185,8 +185,8 @@ class KVStorage:
         return self.v_buffer[layer_id]
 
     def set_kv_buffer(self, layer_id: int, loc: Tensor, k: Tensor, v: Tensor) -> None:
-        self.k_buffer[layer_id][loc] = k
-        self.v_buffer[layer_id][loc] = v
+        self.k_buffer[layer_id, loc] = k
+        self.v_buffer[layer_id, loc] = v
 
 
 @dataclass
