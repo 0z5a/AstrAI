@@ -509,7 +509,10 @@ def main():
         help="Number of samples per problem (best-of-n scoring)",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=1, help="Inference batch size"
+        "--batch_size", type=int, default=64, help="Inference batch size"
+    )
+    parser.add_argument(
+        "--max_seq_len", type=int, default=4096, help="Max sequence length for KV cache"
     )
     parser.add_argument(
         "--limit",
@@ -542,6 +545,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         max_batch_size=args.batch_size,
+        max_seq_len=args.max_seq_len,
     )
 
     results = evaluate(

@@ -57,6 +57,7 @@ class EvalConfig:
     top_p: float = 0.95
     top_k: int = 50
     batch_size: int = 32
+    max_seq_len: int = 4096
     test_timeout: float = 3.0
     test_workers: int = 8
     k_values: Tuple[int, ...] = (1, 10, 100)
@@ -90,7 +91,9 @@ def save_json(path: str, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def create_engine(param_path: str, batch_size: int) -> InferenceEngine:
+def create_engine(
+    param_path: str, batch_size: int, max_seq_len: int
+) -> InferenceEngine:
     model = AutoModel.from_pretrained(param_path)
     tokenizer = AutoTokenizer.from_pretrained(param_path)
     model.to(device="cuda", dtype=torch.bfloat16)
@@ -98,6 +101,7 @@ def create_engine(param_path: str, batch_size: int) -> InferenceEngine:
         model=model,
         tokenizer=tokenizer,
         max_batch_size=batch_size,
+        max_seq_len=max_seq_len,
     )
 
 
@@ -318,7 +322,7 @@ def run_pipeline(cfg: EvalConfig) -> Dict:
         if cfg.problem_indices:
             problems = [problems[i] for i in cfg.problem_indices if i < len(problems)]
 
-        engine = create_engine(cfg.param_path, cfg.batch_size)
+        engine = create_engine(cfg.param_path, cfg.batch_size, cfg.max_seq_len)
 
         try:
             generated = generate_all(engine, problems, cfg)
@@ -357,7 +361,8 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--top_k", type=int, default=50)
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--max_seq_len", type=int, default=4096)
     p.add_argument("--test_workers", type=int, default=8)
     p.add_argument("--test_timeout", type=float, default=3.0)
     p.add_argument("--problems", type=int, nargs="+", default=None)
@@ -375,6 +380,7 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
         top_p=args.top_p,
         top_k=args.top_k,
         batch_size=args.batch_size,
+        max_seq_len=args.max_seq_len,
         test_workers=args.test_workers,
         test_timeout=args.test_timeout,
         problem_indices=args.problems,

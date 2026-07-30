@@ -415,7 +415,7 @@ if __name__ == "__main__":
         help="Key for the text field in the input data.",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=4, help="Batch size for evaluation."
+        "--batch_size", type=int, default=64, help="Batch size for evaluation."
     )
     parser.add_argument(
         "--max_length",

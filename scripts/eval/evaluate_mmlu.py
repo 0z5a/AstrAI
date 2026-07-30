@@ -179,31 +179,53 @@ def apply_chat(
     )
 
 
-def choice_logprob(
-    model, tokenizer, context_ids: list[int], choice_letter: str, device: str
-) -> float:
-    choice_text = choice_letter
-    choice_ids = tokenizer.encode(choice_text, add_special_tokens=False)
-    input_ids = context_ids + choice_ids
-    max_len = model.config.max_position_embeddings
-    if len(input_ids) > max_len:
-        overflow = len(input_ids) - max_len
-        input_ids = input_ids[overflow:]
-        ctx_len = len(input_ids) - len(choice_ids)
-    else:
-        ctx_len = len(context_ids)
+def choice_logprobs_batched(
+    model,
+    tokenizer,
+    context_ids_list: list[list[int]],
+    device: str,
+    max_model_len: int,
+) -> list[dict[str, float]]:
+    """Compute log-probs for multiple questions x 4 choices in batches.
 
-    input_tensor = torch.tensor([input_ids], device=device, dtype=torch.long)
+    Returns a list of dicts: [{A: score, B: score, C: score, D: score}, ...]
+    """
+    letters = ("A", "B", "C", "D")
+    choice_ids_list = [tokenizer.encode(c, add_special_tokens=False) for c in letters]
+
+    all_inputs: list[tuple[int, int, list[int], int, list[int]]] = []
+    for qi, context_ids in enumerate(context_ids_list):
+        for ci, choice_ids in enumerate(choice_ids_list):
+            input_ids = context_ids + choice_ids
+            if len(input_ids) > max_model_len:
+                overflow = len(input_ids) - max_model_len
+                input_ids = input_ids[overflow:]
+                ctx_len = len(input_ids) - len(choice_ids)
+            else:
+                ctx_len = len(context_ids)
+            all_inputs.append((qi, ci, input_ids, ctx_len, choice_ids))
+
+    n = len(all_inputs)
+    max_input_len = max(len(x[2]) for x in all_inputs)
+    padded = torch.zeros(n, max_input_len, dtype=torch.long, device=device)
+    mask = torch.zeros(n, max_input_len, dtype=torch.bool, device=device)
+    for i, (_, _, ids, _, _) in enumerate(all_inputs):
+        padded[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+        mask[i, : len(ids)] = True
+
     with torch.inference_mode():
-        logits = model(input_tensor)["logits"][0]
+        logits = model(padded, input_mask=mask)["logits"]
 
-    score = 0.0
-    for i, tid in enumerate(choice_ids):
-        pos = ctx_len - 1 + i
-        if pos >= len(logits):
-            break
-        score += F.log_softmax(logits[pos], dim=-1)[tid].item()
-    return score
+    results = [{} for _ in range(len(context_ids_list))]
+    for i, (qi, ci, _, ctx_len, choice_ids) in enumerate(all_inputs):
+        score = 0.0
+        for j, tid in enumerate(choice_ids):
+            pos = ctx_len - 1 + j
+            if pos >= logits.size(1):
+                break
+            score += F.log_softmax(logits[i, pos].float(), dim=-1)[tid].item()
+        results[qi][letters[ci]] = score
+    return results
 
 
 def _permute_choices(item: dict, rng: random.Random) -> tuple[dict, str]:
@@ -233,25 +255,42 @@ def evaluate_subject(
     device: str,
     n_shot: int,
     seed: int = 0,
+    batch_size: int = 16,
 ) -> tuple[float, int, int]:
     rng = random.Random(seed) if seed >= 0 else None
     correct = 0
     total = 0
-    for item in tqdm.tqdm(test_data, desc=f"{subject:40s}", leave=False):
+
+    context_ids_list = []
+    answers = []
+    for item in test_data:
         if rng is not None:
             permuted, answer = _permute_choices(item, rng)
         else:
             permuted, answer = item, item["answer"]
         raw_prompt = build_prompt(permuted["question"], permuted, subject)
         context = apply_chat(tokenizer, raw_prompt, n_shot, dev_data or [], subject)
-        context_ids = tokenizer.encode(context)
-        scores = {
-            c: choice_logprob(model, tokenizer, context_ids, c, device)
-            for c in ("A", "B", "C", "D")
-        }
-        if max(scores, key=scores.get) == answer:
-            correct += 1
-        total += 1
+        context_ids_list.append(tokenizer.encode(context))
+        answers.append(answer)
+
+    max_model_len = model.config.max_position_embeddings
+
+    num_batches = (len(context_ids_list) + batch_size - 1) // batch_size
+    for start in tqdm.tqdm(
+        range(0, len(context_ids_list), batch_size),
+        total=num_batches,
+        desc=f"{subject:40s}",
+        leave=False,
+    ):
+        batch = context_ids_list[start : start + batch_size]
+        batch_answers = answers[start : start + batch_size]
+        scores_list = choice_logprobs_batched(
+            model, tokenizer, batch, device, max_model_len
+        )
+        for scores, answer in zip(scores_list, batch_answers):
+            if max(scores, key=scores.get) == answer:
+                correct += 1
+            total += 1
     return correct / total, correct, total
 
 
@@ -289,6 +328,12 @@ def main():
         type=int,
         default=0,
         help="Seed for option permutation (0 to enable, -1 to disable)",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Number of questions per batch (4 choices each = 4*B rows)",
     )
     args = parser.parse_args()
 
@@ -329,6 +374,7 @@ def main():
             device,
             args.n_shot,
             seed=args.seed,
+            batch_size=args.batch_size,
         )
         results[subject] = {"accuracy": round(acc, 4), "correct": corr, "total": tot}
         total_correct += corr
