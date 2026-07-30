@@ -1,9 +1,13 @@
 from typing import Any, Dict, Optional
 
+from pydantic import field_validator
 from pydantic.dataclasses import dataclass
 
 from astrai.config.base import BaseConfig
 from astrai.factory import BaseFactory
+
+_ATTN_TYPES = frozenset({"gqa", "mla"})
+_FFN_TYPES = frozenset({"mlp", "moe"})
 
 
 class ConfigFactory(BaseFactory[BaseConfig]):
@@ -84,6 +88,20 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     n_activated_experts: Optional[int] = None
     topk_method: Optional[str] = None
 
+    @field_validator("attn_type")
+    def _validate_attn_type(cls, v: str) -> str:
+        if v not in _ATTN_TYPES:
+            raise ValueError(
+                f"attn_type must be one of {sorted(_ATTN_TYPES)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("ffn_type")
+    def _validate_ffn_type(cls, v: str) -> str:
+        if v not in _FFN_TYPES:
+            raise ValueError(f"ffn_type must be one of {sorted(_FFN_TYPES)}, got {v!r}")
+        return v
+
 
 @dataclass
 @ConfigFactory.register("embedding")
@@ -127,3 +145,17 @@ class EncoderConfig(BaseModelConfig):
     ffn_type: str = "mlp"
     pooling_type: Optional[str] = None
     normalize_embeddings: Optional[bool] = None
+
+    @field_validator("attn_type")
+    def _validate_attn_type(cls, v: str) -> str:
+        if v not in _ATTN_TYPES:
+            raise ValueError(
+                f"attn_type must be one of {sorted(_ATTN_TYPES)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("ffn_type")
+    def _validate_ffn_type(cls, v: str) -> str:
+        if v not in _FFN_TYPES:
+            raise ValueError(f"ffn_type must be one of {sorted(_FFN_TYPES)}, got {v!r}")
+        return v

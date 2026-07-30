@@ -8,9 +8,15 @@ modes, both driven declaratively through ``input.sections`` or
 from dataclasses import field
 from typing import Dict, List, Optional
 
+from pydantic import field_validator
 from pydantic.dataclasses import dataclass
 
 from astrai.config.base import BaseConfig
+
+_PACKING_STRATEGIES = frozenset({"simple", "bfd", "bfd_split"})
+_TRUNCATION_MODES = frozenset({"keep_start", "keep_end"})
+_STORAGE_FORMATS = frozenset({"bin", "jsonl"})
+_POSITION_IDS_MODES = frozenset({"none", "doc_reset", "continuous"})
 
 
 @dataclass
@@ -61,6 +67,34 @@ class ProcessingConfig(BaseConfig):
     max_packed_len: int = 8192
     truncation_mode: str = "keep_start"
 
+    @field_validator("packing_strategy")
+    def _validate_packing_strategy(cls, v: str) -> str:
+        if v not in _PACKING_STRATEGIES:
+            raise ValueError(
+                f"packing_strategy must be one of {sorted(_PACKING_STRATEGIES)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("truncation_mode")
+    def _validate_truncation_mode(cls, v: str) -> str:
+        if v not in _TRUNCATION_MODES:
+            raise ValueError(
+                f"truncation_mode must be one of {sorted(_TRUNCATION_MODES)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("max_seq_len", "batch_size", "max_packed_len")
+    def _validate_positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"must be positive, got {v}")
+        return v
+
+    @field_validator("min_chars")
+    def _validate_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"min_chars must be non-negative, got {v}")
+        return v
+
 
 @dataclass
 class OutputConfig(BaseConfig):
@@ -79,6 +113,22 @@ class OutputConfig(BaseConfig):
     max_tokens_per_shard: int = 100_000_000
     dtype: Dict[str, str] = field(default_factory=dict)
     position_ids_mode: str = "doc_reset"
+
+    @field_validator("storage_format")
+    def _validate_storage_format(cls, v: str) -> str:
+        if v not in _STORAGE_FORMATS:
+            raise ValueError(
+                f"storage_format must be one of {sorted(_STORAGE_FORMATS)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("position_ids_mode")
+    def _validate_position_ids_mode(cls, v: str) -> str:
+        if v not in _POSITION_IDS_MODES:
+            raise ValueError(
+                f"position_ids_mode must be one of {sorted(_POSITION_IDS_MODES)}, got {v!r}"
+            )
+        return v
 
 
 @dataclass

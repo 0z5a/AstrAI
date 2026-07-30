@@ -2,7 +2,7 @@ from dataclasses import field
 from typing import Any, Callable, Dict, List, Optional
 
 import torch.nn as nn
-from pydantic import ConfigDict
+from pydantic import ConfigDict, field_validator, model_validator
 from pydantic.dataclasses import dataclass
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -10,6 +10,12 @@ from torch.utils.data import Dataset
 
 from astrai.config.base import BaseConfig
 from astrai.model.components.lora import LoRAConfig
+
+_TRAIN_TYPES = frozenset({"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"})
+_PARALLEL_MODES = frozenset({"none", "ddp", "fsdp"})
+_BACKENDS = frozenset({"nccl", "gloo"})
+_START_METHODS = frozenset({"spawn", "fork", "forkserver"})
+_COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -112,3 +118,93 @@ class TrainConfig(BaseConfig):
 
     executor_kwargs: Dict[str, Any] = field(default_factory=dict)
     extra_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    @field_validator("strategy")
+    def _validate_strategy(cls, v: str) -> str:
+        if v not in _TRAIN_TYPES:
+            raise ValueError(
+                f"strategy must be one of {sorted(_TRAIN_TYPES)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("parallel_mode")
+    def _validate_parallel_mode(cls, v: str) -> str:
+        if v not in _PARALLEL_MODES:
+            raise ValueError(
+                f"parallel_mode must be one of {sorted(_PARALLEL_MODES)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("backend")
+    def _validate_backend(cls, v: str) -> str:
+        if v not in _BACKENDS:
+            raise ValueError(f"backend must be one of {sorted(_BACKENDS)}, got {v!r}")
+        return v
+
+    @field_validator("start_method")
+    def _validate_start_method(cls, v: str) -> str:
+        if v not in _START_METHODS:
+            raise ValueError(
+                f"start_method must be one of {sorted(_START_METHODS)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("compile_mode")
+    def _validate_compile_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _COMPILE_MODES:
+            raise ValueError(
+                f"compile_mode must be one of {sorted(_COMPILE_MODES)} or None, got {v!r}"
+            )
+        return v
+
+    @field_validator(
+        "n_epoch",
+        "batch_per_device",
+        "grad_accum_steps",
+        "ckpt_interval",
+        "val_step",
+        "rollout_interval",
+        "rollout_max_tokens",
+    )
+    def _validate_positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"must be positive, got {v}")
+        return v
+
+    @field_validator("rollout_temperature")
+    def _validate_positive_float(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"must be positive, got {v}")
+        return v
+
+    @field_validator("rollout_top_p")
+    def _validate_top_p(cls, v: float) -> float:
+        if not 0 < v <= 1:
+            raise ValueError(f"rollout_top_p must be in (0, 1], got {v}")
+        return v
+
+    @field_validator("rollout_top_k", "num_workers", "neftune_alpha")
+    def _validate_non_negative(cls, v):
+        if v < 0:
+            raise ValueError(f"must be non-negative, got {v}")
+        return v
+
+    @field_validator("max_grad_norm")
+    def _validate_max_grad_norm(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError(f"max_grad_norm must be positive or None, got {v}")
+        return v
+
+    @field_validator("val_split")
+    def _validate_val_split(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and not 0 < v < 1:
+            raise ValueError(f"val_split must be in (0, 1) or None, got {v}")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_online_strategy(self) -> "TrainConfig":
+        if self.strategy.startswith("online_") and self.reward_model_fn is None:
+            raise ValueError(
+                f"reward_model_fn is required for online RL strategy {self.strategy!r}"
+            )
+        return self
