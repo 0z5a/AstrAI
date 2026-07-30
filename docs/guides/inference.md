@@ -4,6 +4,7 @@
 
 - [KV Cache](#kv-cache)
 - [KVCache System](#kvcache-system)
+- [Attention Backend](#attention-backend)
 - [Continuous Batching](#continuous-batching)
 - [Sampling](#sampling-strategy-pattern)
 - [Protocol Handlers](#protocol-handlers-strategy-pattern)
@@ -50,6 +51,31 @@ KVCache
 ```
 
 Attention layers do raw buffer indexing: `k_buffer[layer_id, out_cache_loc] = k` to write, `k_buffer[layer_id, indices]` to gather.
+
+## Attention Backend
+
+Attention computation (cache I/O + SDPA/kernel dispatch) is decoupled from the model via `AttentionBackend` ABC:
+
+```
+AttentionBackend (ABC)
+  ├── TorchNativeBackend   SDPA + indirect KV cache gather (default)
+  └── CudaBackend          CUDA kernel dispatch (attn_paged_decode, attn_prefill)
+```
+
+Select via context manager (mirrors `torch.nn.attention.sdpa_kernel`):
+
+```python
+from astrai.extension import attn_backend, ATTN_BACKEND
+
+with attn_backend(ATTN_BACKEND.CUDA):
+    engine.generate("hello")
+```
+
+`CudaBackend` decode path: writes K/V to cache, then calls `attn_paged_decode` with `page_size=1` — the `req_to_token` table serves directly as the page table, each token slot is a single-token "page". No explicit K/V gather needed.
+
+`CudaBackend` prefill path: writes K/V, gathers full-sequence K/V via indirect indexing (same as `TorchNativeBackend`), then calls `attn_prefill`.
+
+Fallback: `CudaBackend` delegates to `TorchNativeBackend` when a CUDA kernel is not available.
 
 ## Continuous Batching
 
@@ -252,4 +278,4 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
     print(token)
 ```
 
-> Document Update Time: 2026-07-09
+> Document Update Time: 2026-07-30

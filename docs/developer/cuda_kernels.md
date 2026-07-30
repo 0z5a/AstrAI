@@ -1,21 +1,21 @@
 # CUDA Kernels
 
-AstrAI includes optional custom CUDA attention kernels for decode and prefill. These are **not built by default** and are **not yet wired into the model or inference path** — they are standalone kernels with benchmarks and tests.
+AstrAI includes optional custom CUDA attention kernels for decode and prefill. These are built when `nvcc` is available and CUDA is detected, and are dispatched via the `CudaBackend` attention backend.
 
 ## Overview
 
 | Kernel | File | Description |
 |--------|------|-------------|
-| `attn_decode` | `attn_decode.cu` | Basic GQA decode attention |
-| `attn_prefill` | `attn_prefill.cu` | Basic GQA prefill attention |
+| `attn_decode` | `attn_decode.cu` | GQA decode attention (split-KV) |
+| `attn_prefill` | `attn_prefill.cu` | GQA prefill attention (split-Q) |
 | `attn_paged_decode` | `attn_paged_decode.cu` | Paged KV cache decode attention |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
 | Variant | File | Optimization |
 |---------|------|--------------|
-| Split-KV MMA decode | `attn_decode_split_kv_mma.cuh` | Split KV across waraps + MMA (sm_80+) |
-| Split-Q MMA prefill | `attn_prefill_split_q_mma.cuh` | Split Q across waraps + MMA (sm_80+) |
+| Split-KV MMA decode | `attn_decode_split_kv_mma.cuh` | Split KV across warps + MMA (sm_80+) |
+| Split-Q MMA prefill | `attn_prefill_split_q_mma.cuh` | Split Q across warps + MMA (sm_80+) |
 | Paged split-KV MMA decode | `attn_paged_decode_split_kv_mma.cuh` | Paged cache + split-KV + MMA |
 
 ## Build System
@@ -55,19 +55,36 @@ NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
 
 The `REGISTRY` in `csrc/build.py` lists all registered kernels (currently 3). Each entry maps a kernel name to its source files and build flags.
 
+## Attention Backend
+
+`astrai/extension/attention_backend.py` provides the backend abstraction:
+
+- **`AttentionBackend`** (ABC): `fwd_decode` / `fwd_prefill` abstract methods, `forward` dispatches by q_len
+- **`TorchNativeBackend`**: SDPA with indirect KV cache gather (default)
+- **`CudaBackend`**: CUDA kernel dispatch — decode via `attn_paged_decode` (page_size=1), prefill via `attn_prefill`
+
+Select a backend via context manager (mirrors `torch.nn.attention.sdpa_kernel`):
+
+```python
+from astrai.extension import attn_backend, ATTN_BACKEND
+
+with attn_backend(ATTN_BACKEND.CUDA):
+    engine.generate("hello")
+```
+
+`CudaBackend` falls back to `TorchNativeBackend` when a kernel is not available.
+
 ## Python Wrappers
 
-`astrai/extension/ops.py` provides Python wrappers for each compiled kernel. When the `.so` is not available, wrappers **fall back to `torch.nn.functional.scaled_dot_product_attention`** (SDPA).
+`astrai/extension/attention_ops.py` provides Python wrappers for each compiled kernel. Each wrapper calls its CUDA kernel directly and raises `RuntimeError` if the `.so` is not available. Fallback to torch SDPA is handled by the attention backend, not the wrapper functions.
 
-Interface:
+Interface (all functions):
 ```
-causal_offset: -1 = non-causal; >=0 = absolute position of first Q token
-mask:          2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool)
-scale:         0.0 = auto (1/sqrt(head_dim)); >0 = explicit
-layout:        "bhld" (default) or "blhd"
+is_causal: True = causal mask; False = non-causal
+mask:      2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool, True=keep)
 ```
 
-> **Note**: Wrappers are not yet called from `model/transformer.py` or `inference/`. The model uses PyTorch's built attention. Integration is future work.
+Layout convention: all q/k/v are `[batch, seq_len, n_heads, head_dim]` (blhd). Scale is always `1/sqrt(head_dim)`.
 
 ## Standalone Testing
 

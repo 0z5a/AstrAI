@@ -24,7 +24,7 @@ pip install -e .
 # pip install -e ".[dev]"
 ```
 
-> **CUDA kernels** are opt-in. They are not built by default and are not yet wired into the model or inference path. You can skip them for normal usage.
+> **CUDA kernels** are opt-in. They are not built by default. When built, they can be activated via `with attn_backend(ATTN_BACKEND.CUDA):` for accelerated decode/prefill. You can skip them for normal usage.
 
 ## 2. Download Model Weights
 

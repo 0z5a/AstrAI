@@ -153,6 +153,24 @@ Three-layer separation (SGLang-inspired):
 
 `PagePool` orchestrates all three. In contiguous mode (default), `req_to_token` is a trivial linear mapping. In paged mode, slots are allocated on demand with prefix caching support. Attention layers access buffers directly via `KVCache` dataclass — no methods, no abstraction.
 
+### Attention Backend
+
+Attention computation is decoupled from the model via `AttentionBackend` ABC (`astrai/extension/attention_backend.py`):
+
+- **`TorchNativeBackend`** (default): writes K/V to cache, gathers via `req_to_token` indirect indexing, calls `F.scaled_dot_product_attention`.
+- **`CudaBackend`**: decode path uses `attn_paged_decode` with `page_size=1` (the `req_to_token` table serves as the page table, each token slot is a single-token "page"); prefill path gathers K/V then calls `attn_prefill`. Falls back to `TorchNativeBackend` when kernel unavailable.
+
+Backend selection is thread-safe via `contextvars`, mirroring `torch.nn.attention.sdpa_kernel`:
+
+```python
+from astrai.extension import attn_backend, ATTN_BACKEND
+
+with attn_backend(ATTN_BACKEND.CUDA):
+    engine.generate("hello")
+```
+
+Layout convention: all q/k/v are `[batch, seq_len, n_heads, head_dim]` (blhd). Scale is always `1/sqrt(head_dim)`.
+
 ## Mask Algorithm Internals
 
 ### Template mode (`template: true`)
