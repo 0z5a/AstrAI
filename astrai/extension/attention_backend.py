@@ -24,15 +24,13 @@ Thread-safe via ``contextvars`` — each scheduler thread gets its own
 active backend. ``get_backend()`` returns the active one, falling back
 to a process-wide ``TorchNativeBackend`` singleton.
 
-Contract (q/k/v are always ``[batch, seq_len, n_heads, head_dim]``):
-    q: [batch, q_len, n_heads, head_dim]
-    k: [batch, q_len, n_kv_heads, head_dim]
-    v: [batch, q_len, n_kv_heads, head_dim]
-    -> returns [batch, q_len, n_heads * head_dim]
+Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
+(blhd). The backend returns ``[batch, seq_len, n_heads * head_dim]``.
 """
 
 import contextvars
 import enum
+import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Optional, Union
@@ -143,10 +141,8 @@ class AttentionBackend(ABC):
         v: Tensor,
         kv_cache: Optional[KVCache],
         layer_id: int,
-        n_rep: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
-        scale: Optional[float] = None,
     ) -> Tensor:
         """Dispatch to decode or extend based on q_len.
 
@@ -156,21 +152,17 @@ class AttentionBackend(ABC):
             v: [batch, q_len, n_kv_heads, head_dim]
             kv_cache: cache dataclass, or None for training (no cache).
             layer_id: transformer layer index for buffer access.
-            n_rep: Q-heads // KV-heads (1 when heads match, e.g. MLA).
             attn_mask: pre-built attention mask compatible with SDPA.
             is_causal: whether to apply causal masking.
-            scale: explicit softmax scale; None = 1/sqrt(head_dim).
 
         Returns:
             [batch, q_len, n_heads * head_dim]
         """
         if kv_cache is not None and q.size(1) == 1:
             return self.forward_decode(
-                q, k, v, kv_cache, layer_id, n_rep, attn_mask, is_causal, scale
+                q, k, v, kv_cache, layer_id, attn_mask, is_causal
             )
-        return self.forward_extend(
-            q, k, v, kv_cache, layer_id, n_rep, attn_mask, is_causal, scale
-        )
+        return self.forward_extend(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
 
     @abstractmethod
     def forward_decode(
@@ -180,10 +172,8 @@ class AttentionBackend(ABC):
         v: Tensor,
         kv_cache: Optional[KVCache],
         layer_id: int,
-        n_rep: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
-        scale: Optional[float] = None,
     ) -> Tensor:
         """Single-token decode with KV cache."""
 
@@ -195,10 +185,8 @@ class AttentionBackend(ABC):
         v: Tensor,
         kv_cache: Optional[KVCache],
         layer_id: int,
-        n_rep: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
-        scale: Optional[float] = None,
     ) -> Tensor:
         """Multi-token prefill or training forward."""
 
@@ -221,14 +209,10 @@ class TorchNativeBackend(AttentionBackend):
         v: Tensor,
         kv_cache: Optional[KVCache],
         layer_id: int,
-        n_rep: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
-        scale: Optional[float] = None,
     ) -> Tensor:
-        return self._forward(
-            q, k, v, kv_cache, layer_id, n_rep, attn_mask, is_causal, scale
-        )
+        return self._forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
 
     def forward_extend(
         self,
@@ -237,14 +221,10 @@ class TorchNativeBackend(AttentionBackend):
         v: Tensor,
         kv_cache: Optional[KVCache],
         layer_id: int,
-        n_rep: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
-        scale: Optional[float] = None,
     ) -> Tensor:
-        return self._forward(
-            q, k, v, kv_cache, layer_id, n_rep, attn_mask, is_causal, scale
-        )
+        return self._forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
 
     def _forward(
         self,
@@ -253,10 +233,8 @@ class TorchNativeBackend(AttentionBackend):
         v: Tensor,
         kv_cache: Optional[KVCache],
         layer_id: int,
-        n_rep: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
-        scale: Optional[float] = None,
     ) -> Tensor:
         if kv_cache is not None:
             kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
@@ -272,6 +250,7 @@ class TorchNativeBackend(AttentionBackend):
             k = kv_cache.k_buffer[layer_id, indices]
             v = kv_cache.v_buffer[layer_id, indices]
 
+        n_rep = q.size(2) // k.size(2)
         if n_rep > 1:
             k = repeat_kv(k, n_rep)
             v = repeat_kv(v, n_rep)
@@ -280,11 +259,7 @@ class TorchNativeBackend(AttentionBackend):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        sdpa_kwargs: dict = {"is_causal": is_causal}
-        if scale is not None:
-            sdpa_kwargs["scale"] = scale
-
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask, **sdpa_kwargs)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask, is_causal=is_causal)
         out = out.permute(0, 2, 1, 3).contiguous().flatten(2)
         return out
 
