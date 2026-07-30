@@ -6,17 +6,19 @@ Public API:
     - ``attn_paged_decode`` — paged decode attention (direct page-table access)
     - ``AttentionBackend`` — ABC for attention computation strategies
     - ``TorchNativeBackend`` — default SDPA backend with KV cache I/O
+    - ``CudaBackend`` — CUDA kernel backend with paged decode + prefill
 
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 (blhd). Scale is always ``1/sqrt(head_dim)``.
 
-Each wrapper dispatches to its compiled CUDA kernel (``astrai.extension.attn_*``)
-when available, otherwise falls back to ``torch.nn.functional.scaled_dot_product_attention``.
+Each wrapper calls its compiled CUDA kernel directly. Fallback to torch
+SDPA is handled by the attention backend, not the wrapper functions.
 """
 
 from astrai.extension.attention_backend import (
     ATTN_BACKEND,
     AttentionBackend,
+    CudaBackend,
     TorchNativeBackend,
     attn_backend,
     get_backend,
@@ -31,6 +33,7 @@ from astrai.extension.loader import KERNEL_NAMES, is_available
 __all__ = [
     "ATTN_BACKEND",
     "AttentionBackend",
+    "CudaBackend",
     "TorchNativeBackend",
     "attn_backend",
     "get_backend",
