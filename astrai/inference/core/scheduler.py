@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from astrai.inference.core.cache import ContiguousCache, KVCache
+from astrai.inference.core.cache import PagePool
 from astrai.inference.core.executor import Executor
 from astrai.inference.core.task import STOP, Task, TaskManager, TaskStatus
 from astrai.model.automodel import AutoModel
@@ -25,7 +25,7 @@ class InferenceScheduler:
         max_seq_len: Optional[int] = None,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
-        cache: Optional[KVCache] = None,
+        cache: Optional[PagePool] = None,
     ):
         config = model.config
 
@@ -46,14 +46,14 @@ class InferenceScheduler:
         if cache is not None:
             self._cache = cache
         else:
-            self._cache = ContiguousCache(
-                config.num_hidden_layers,
-                max_batch_size,
-                self.max_seq_len,
-                config.num_key_value_heads,
-                head_dim,
-                self.device,
-                self.dtype,
+            self._cache = PagePool(
+                n_layers=config.num_hidden_layers,
+                n_kv_heads=config.num_key_value_heads,
+                head_dim=head_dim,
+                max_batch_size=max_batch_size,
+                max_seq_len=self.max_seq_len,
+                device=self.device,
+                dtype=self.dtype,
             )
 
         self._task_mgr = TaskManager(

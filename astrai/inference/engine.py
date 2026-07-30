@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Tuple, 
 import torch
 import torch.nn as nn
 
-from astrai.inference.core.cache import KVCache
+from astrai.inference.core.cache import PagePool
 from astrai.inference.core.scheduler import InferenceScheduler
 from astrai.inference.core.task import STOP
 from astrai.tokenize import AutoTokenizer
@@ -111,7 +111,7 @@ class InferenceEngine:
         tokenizer: AutoTokenizer,
         max_batch_size: int = 1,
         max_seq_len: Optional[int] = None,
-        cache: Optional[KVCache] = None,
+        cache: Optional[PagePool] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer

@@ -3,7 +3,7 @@ from typing import List, Optional
 
 import torch
 
-from astrai.inference.core.cache import KVCache
+from astrai.inference.core.cache import PagePool
 from astrai.inference.core.task import Task
 from astrai.inference.sample import sample
 from astrai.model.automodel import AutoModel
@@ -19,7 +19,7 @@ class Executor:
         self,
         model: AutoModel,
         tokenizer: AutoTokenizer,
-        kv_cache: KVCache,
+        kv_cache: PagePool,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -57,7 +57,9 @@ class Executor:
                 input_ids,
                 input_mask=input_mask,
                 position_ids=position_ids,
-                paged_cache=self.kv_cache.bind_tasks(task_ids, prompt_len, self.device),
+                kv_cache=self.kv_cache.bind_tasks(
+                    task_ids, [prompt_len] * batch_sz, self.device, start_pos=start_pos
+                ),
             )
 
     def execute_decode(
@@ -128,11 +130,10 @@ class Executor:
             outputs = self.model(
                 input_ids.unsqueeze(1),
                 input_mask=input_mask,
-                paged_cache=self.kv_cache.bind_tasks(
+                kv_cache=self.kv_cache.bind_tasks(
                     task_ids,
-                    total_len,
+                    [t.next_pos + 1 for t in tasks],
                     self.device,
-                    write_positions=position_ids,
                 ),
                 position_ids=position_ids.unsqueeze(1),
             )

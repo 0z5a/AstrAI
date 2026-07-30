@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.inference.core.cache import CacheView
+from astrai.inference.core.cache import KVCache
 from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
@@ -103,7 +103,7 @@ class AutoRegressiveLM(AutoModel):
         self,
         input_ids: Tensor,
         input_mask: Optional[Tensor] = None,
-        paged_cache: Optional[CacheView] = None,
+        kv_cache: Optional[KVCache] = None,
         position_ids: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         assert input_ids.ndim == 2
@@ -114,7 +114,7 @@ class AutoRegressiveLM(AutoModel):
         use_sdpa_causal_mask = attn_mask is None
 
         for layer in self.layers:
-            x = layer(x, rotary_emb, attn_mask, paged_cache, use_sdpa_causal_mask)
+            x = layer(x, rotary_emb, attn_mask, kv_cache, use_sdpa_causal_mask)
 
         hidden_states = self.norm(x)
         logits = self.lm_head(hidden_states)

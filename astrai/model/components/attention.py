@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.factory import BaseFactory
-from astrai.inference.core.cache import CacheView
+from astrai.inference.core.cache import KVCache
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import apply_rotary_emb
@@ -75,7 +75,7 @@ class GQA(nn.Module):
         x: Tensor,
         rotary_emb: Tensor,
         attn_mask: Tensor = None,
-        paged_cache: Optional[CacheView] = None,
+        kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,
     ) -> Tensor:
         q = self._split_heads(self.q_proj(x), self.n_heads)
@@ -86,9 +86,19 @@ class GQA(nn.Module):
         if self.use_qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-        if paged_cache is not None:
-            paged_cache.write(self.layer_id, k, v)
-            k, v = paged_cache.gather(self.layer_id)
+        if kv_cache is not None:
+            kv_cache.k_buffer[self.layer_id][kv_cache.out_cache_loc] = k
+            kv_cache.v_buffer[self.layer_id][kv_cache.out_cache_loc] = v
+
+            max_len = kv_cache.seq_lens.max()
+            indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
+            pos_mask = (
+                torch.arange(max_len, device=x.device)[None, :]
+                < kv_cache.seq_lens[:, None]
+            )
+            indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
+            k = kv_cache.k_buffer[self.layer_id][indices]
+            v = kv_cache.v_buffer[self.layer_id][indices]
 
         k, v = repeat_kv(k, self.n_rep), repeat_kv(v, self.n_rep)
 
@@ -161,7 +171,7 @@ class MLA(nn.Module):
         x: Tensor,
         rotary_emb: Tensor,
         attn_mask: Tensor = None,
-        paged_cache: Optional[CacheView] = None,
+        kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,
     ) -> Tensor:
         bsz, seq_len, _ = x.size()
@@ -193,9 +203,19 @@ class MLA(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        if paged_cache is not None:
-            paged_cache.write(self.layer_id, k, v)
-            k, v = paged_cache.gather(self.layer_id)
+        if kv_cache is not None:
+            kv_cache.k_buffer[self.layer_id][kv_cache.out_cache_loc] = k
+            kv_cache.v_buffer[self.layer_id][kv_cache.out_cache_loc] = v
+
+            max_len = kv_cache.seq_lens.max()
+            indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
+            pos_mask = (
+                torch.arange(max_len, device=x.device)[None, :]
+                < kv_cache.seq_lens[:, None]
+            )
+            indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
+            k = kv_cache.k_buffer[self.layer_id][indices]
+            v = kv_cache.v_buffer[self.layer_id][indices]
 
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)

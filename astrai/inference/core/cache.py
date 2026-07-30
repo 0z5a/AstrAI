@@ -1,7 +1,21 @@
+"""KV cache architecture: three-layer separation (SGLang-inspired).
+
+Layer 1 — KVStorage:      flat token-level K/V buffers [n_layers, size, H, D]
+Layer 2 — ReqToTokenPool:  index table [req_idx, pos] → physical token slot
+Layer 3 — Allocator:       slot/page allocation with ref-counting and LRU
+
+PagePool orchestrates all three plus PrefixCache (content addressing).
+KVCache is a pure dataclass passed to the model for direct buffer access.
+
+Two modes:
+  - contiguous (default): pre-allocated per-request blocks, no dynamic alloc
+  - paged: shared pool with on-demand allocation, prefix caching support
+"""
+
 import threading
-from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import Tensor
@@ -108,418 +122,359 @@ class PrefixCache:
             self._hash_to_page[h] = page_idx
 
 
-class PagePool:
-    """Orchestrates allocator (page management) and PrefixCache (content addressing)."""
+class ReqToTokenPool:
+    """Maps [req_idx, pos] -> physical token slot in KV storage.
 
-    def __init__(self, allocator: Allocator, prefix: PrefixCache):
-        self._alloc = allocator
-        self._prefix = prefix
-        self._alloc.on_evict = prefix.evict
+    Each row is one request; each column is a sequence position. The value
+    at [req_idx, pos] is the flat index into the KV storage buffers.
+    """
 
-    @property
-    def allocator(self) -> Allocator:
-        return self._alloc
-
-    @property
-    def prefix(self) -> PrefixCache:
-        return self._prefix
-
-    def alloc(self) -> int:
-        return self._alloc.alloc()
-
-    def free(self, idx: int):
-        keep = self._prefix.has_page(idx)
-        self._alloc.free(idx, keep_cached=keep)
-        if not keep:
-            self._prefix.evict(idx)
-
-    def inc_ref(self, idx: int):
-        self._alloc.inc_ref(idx)
-
-    def lookup(self, token_ids: List[int]) -> List[int]:
-        hits = self._prefix.lookup(token_ids)
-        for p in hits:
-            self._alloc.touch(p)
-        return hits
-
-    def record(self, page_idx: int, token_ids: List[int], logical_page_idx: int):
-        self._prefix.record(page_idx, token_ids, logical_page_idx)
-
-
-class TaskTable:
-    """Maps task_ids to page tables and cached token counts."""
-
-    def __init__(self, page_size: int):
-        self._page_size = page_size
-        self._pages: Dict[str, List[int]] = {}
-        self._cached: Dict[str, int] = {}
+    def __init__(self, size: int, max_context_len: int, device: torch.device):
+        self.size = size
+        self.max_context_len = max_context_len
+        self.req_to_token = torch.zeros(
+            (size, max_context_len), dtype=torch.long, device=device
+        )
+        self.free_slots = list(range(size))
         self._lock = threading.Lock()
 
-    def set(self, task_id: str, page_table: List[int], cached: int):
+    def alloc(self, num_reqs: int) -> Optional[List[int]]:
         with self._lock:
-            self._pages[task_id] = page_table
-            self._cached[task_id] = cached
+            if num_reqs > len(self.free_slots):
+                return None
+            slots = self.free_slots[:num_reqs]
+            self.free_slots = self.free_slots[num_reqs:]
+            return slots
 
-    def get(self, task_id: str) -> List[int]:
+    def free(self, req_indices: List[int]):
         with self._lock:
-            return self._pages.get(task_id, [])
+            self.free_slots.extend(req_indices)
 
-    def get_cached(self, task_id: str) -> int:
-        with self._lock:
-            return self._cached.get(task_id, 0)
-
-    def pop(self, task_id: str) -> Tuple[List[int], int]:
-        with self._lock:
-            pages = self._pages.pop(task_id, [])
-            cached = self._cached.pop(task_id, 0)
-            return pages, cached
-
-    def get_ref(self, task_id: str) -> List[int]:
-        with self._lock:
-            return self._pages.setdefault(task_id, [])
-
-    def table_tensor(self, task_ids: List[str], device: torch.device) -> Tensor:
-        with self._lock:
-            states = [self._pages.get(tid, []) for tid in task_ids]
-            max_pages = max((len(s) for s in states), default=0)
-            rows = [s + [-1] * (max_pages - len(s)) for s in states]
-            return torch.tensor(rows, dtype=torch.long, device=device)
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
 
 
-class Storage:
-    """KV-cache tensor storage with paged write/gather."""
+class KVStorage:
+    """Token-level flat KV cache storage with NHD layout.
+
+    Buffers: [n_layers, size, n_kv_heads, head_dim]. Each token occupies
+    one contiguous row. Logical ordering is determined by ReqToTokenPool.
+    """
 
     def __init__(
         self,
+        size: int,
         n_layers: int,
-        n_pages: int,
-        page_size: int,
         n_kv_heads: int,
         head_dim: int,
         device: torch.device,
         dtype: torch.dtype,
     ):
-        self.page_size = page_size
-        self.k_cache = torch.empty(
-            (n_layers, n_pages, page_size, n_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+        self.size = size
+        self.k_buffer = torch.empty(
+            (n_layers, size, n_kv_heads, head_dim), device=device, dtype=dtype
         )
-        self.v_cache = torch.empty(
-            (n_layers, n_pages, page_size, n_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+        self.v_buffer = torch.empty(
+            (n_layers, size, n_kv_heads, head_dim), device=device, dtype=dtype
         )
 
-    def write(
-        self,
-        layer_id: int,
-        page_table: Tensor,
-        start_pos: int,
-        k: Tensor,
-        v: Tensor,
-    ):
-        seq_len = k.size(1)
-        if seq_len == 0:
-            return
-        page_size = self.page_size
-        written = 0
-        first_page = start_pos // page_size
-        last_page = (start_pos + seq_len - 1) // page_size
-        for pi in range(first_page, last_page + 1):
-            phys_pages = page_table[:, pi]
-            page_start = pi * page_size
-            write_start = max(page_start, start_pos)
-            write_end = min(page_start + page_size, start_pos + seq_len)
-            offset = write_start - page_start
-            chunk = write_end - write_start
-            valid = phys_pages >= 0
-            if not valid.all():
-                if valid.any():
-                    valid_pages = phys_pages[valid]
-                    self.k_cache[layer_id, valid_pages, offset : offset + chunk] = k[
-                        valid, written : written + chunk
-                    ]
-                    self.v_cache[layer_id, valid_pages, offset : offset + chunk] = v[
-                        valid, written : written + chunk
-                    ]
-                written += chunk
-                continue
-            self.k_cache[layer_id, phys_pages, offset : offset + chunk] = k[
-                :, written : written + chunk
-            ]
-            self.v_cache[layer_id, phys_pages, offset : offset + chunk] = v[
-                :, written : written + chunk
-            ]
-            written += chunk
+    def get_key_buffer(self, layer_id: int) -> Tensor:
+        return self.k_buffer[layer_id]
 
-    def gather(
-        self, layer_id: int, page_table: Tensor, total_len: int
-    ) -> Tuple[Tensor, Tensor]:
-        safe = page_table.clamp(min=0)
-        k = self.k_cache[layer_id, safe]
-        v = self.v_cache[layer_id, safe]
-        k = k.flatten(1, 2)
-        v = v.flatten(1, 2)
-        if (page_table < 0).any():
-            invalid = (
-                (page_table < 0)
-                .unsqueeze(-1)
-                .expand(-1, -1, self.page_size)
-                .flatten(1, 2)
-            )
-            invalid = invalid[:, :, None, None].expand_as(k)
-            k = k.masked_fill(invalid, 0.0)
-            v = v.masked_fill(invalid, 0.0)
-        k = k[:, :total_len]
-        v = v[:, :total_len]
-        return k, v
+    def get_value_buffer(self, layer_id: int) -> Tensor:
+        return self.v_buffer[layer_id]
+
+    def set_kv_buffer(self, layer_id: int, loc: Tensor, k: Tensor, v: Tensor) -> None:
+        self.k_buffer[layer_id][loc] = k
+        self.v_buffer[layer_id][loc] = v
 
 
-class CacheView(ABC):
-    """Abstract view passed to attention layers for KV-cache I/O."""
+@dataclass
+class KVCache:
+    """Pure data struct passed to model for KV cache I/O.
 
-    @abstractmethod
-    def write(self, layer_id: int, k: Tensor, v: Tensor): ...
+    The attention layer does raw buffer indexing — no methods, no abstraction.
 
-    @abstractmethod
-    def gather(self, layer_id: int) -> Tuple[Tensor, Tensor]: ...
+    Attributes:
+        k_buffer: [n_layers, size, n_kv_heads, head_dim]
+        v_buffer: [n_layers, size, n_kv_heads, head_dim]
+        req_to_token: [num_reqs, max_ctx_len] — index table
+        req_pool_indices: [batch_size] — row indices into req_to_token
+        seq_lens: [batch_size] — per-request total sequence lengths
+        out_cache_loc: [batch, new_seq_len] or [batch, 1] — write indices
+    """
 
-
-class KVCache(ABC):
-    """Abstract KV-cache facade for scheduler/executor."""
-
-    @abstractmethod
-    def task_alloc(self, task_id: str, prompt_ids: List[int]) -> bool: ...
-
-    @abstractmethod
-    def task_free(self, task_id: str): ...
-
-    @abstractmethod
-    def task_extend(self, task_id: str, pos: int) -> bool: ...
-
-    @abstractmethod
-    def bind_tasks(
-        self,
-        task_ids: List[str],
-        total_len: int,
-        device: torch.device,
-        write_positions: Optional[Tensor] = None,
-    ) -> CacheView: ...
-
-    def task_cached(self, task_id: str) -> int:
-        return 0
-
-    def task_record_hashes(
-        self, task_id: str, prompt_ids: List[int], start_logical_page: int = 0
-    ): ...
+    k_buffer: Tensor
+    v_buffer: Tensor
+    req_to_token: Tensor
+    req_pool_indices: Tensor
+    seq_lens: Tensor
+    out_cache_loc: Tensor
 
 
-class PageCacheView(CacheView):
-    """Bundles Storage + page_table + total_len for attention layers."""
+class PagePool:
+    """Top-level KV cache manager.
 
-    def __init__(self, storage: Storage, page_table: Tensor, total_len: int = 0):
-        self._storage = storage
-        self._page_table = page_table
-        self._total_len = total_len
+    Combines KVStorage + ReqToTokenPool + Allocator + PrefixCache.
 
-    def write(self, layer_id: int, k: Tensor, v: Tensor):
-        start_pos = self._total_len - k.size(1)
-        self._storage.write(layer_id, self._page_table, start_pos, k, v)
-
-    def gather(self, layer_id: int) -> Tuple[Tensor, Tensor]:
-        return self._storage.gather(layer_id, self._page_table, self._total_len)
-
-
-class PageCache(KVCache):
-    """Paged KV-cache with prefix sharing."""
+    Args:
+        n_layers: Number of transformer layers.
+        n_kv_heads: Number of KV attention heads.
+        head_dim: Dimension per head.
+        max_batch_size: Maximum concurrent requests.
+        max_seq_len: Maximum sequence length per request.
+        device, dtype: Tensor device and dtype.
+        page_size: Page size for paged mode (1 = token-level).
+        n_tokens: Total token slots for paged mode. None = contiguous mode
+            (pre-allocates max_batch_size * max_seq_len).
+    """
 
     def __init__(
         self,
         n_layers: int,
-        n_pages: int,
-        page_size: int,
         n_kv_heads: int,
         head_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ):
-        self.page_size = page_size
-        self._pool = PagePool(Allocator(n_pages), PrefixCache(page_size))
-        self._table = TaskTable(page_size)
-        self._storage = Storage(
-            n_layers, n_pages, page_size, n_kv_heads, head_dim, device, dtype
-        )
-
-    def task_alloc(self, task_id: str, prompt_ids: List[int]) -> bool:
-        hits = self._pool.lookup(prompt_ids)
-        cached = len(hits) * self.page_size
-        for p in hits:
-            self._pool.inc_ref(p)
-
-        remaining = len(prompt_ids) - cached
-        n_new = (
-            (remaining + self.page_size - 1) // self.page_size if remaining > 0 else 0
-        )
-        new_pages: List[int] = []
-        if n_new > 0:
-            for _ in range(n_new):
-                p = self._pool.alloc()
-                if p < 0:
-                    for hp in hits:
-                        self._pool.free(hp)
-                    for np in new_pages:
-                        self._pool.free(np)
-                    return False
-                new_pages.append(p)
-
-        self._table.set(task_id, hits + new_pages, cached)
-        return True
-
-    def task_free(self, task_id: str):
-        page_table, _ = self._table.pop(task_id)
-        for idx in page_table:
-            self._pool.free(idx)
-
-    def task_extend(self, task_id: str, pos: int) -> bool:
-        page_table = self._table.get(task_id)
-        needed = (pos + 1 + self.page_size - 1) // self.page_size
-        while len(page_table) < needed:
-            p = self._pool.alloc()
-            if p < 0:
-                return False
-            page_table.append(p)
-        return True
-
-    def task_cached(self, task_id: str) -> int:
-        return self._table.get_cached(task_id)
-
-    def task_record_hashes(
-        self, task_id: str, prompt_ids: List[int], start_logical_page: int = 0
-    ):
-        page_table = self._table.get(task_id)
-        full_pages = len(prompt_ids) // self.page_size
-        for i in range(start_logical_page, full_pages):
-            self._pool.record(page_table[i], prompt_ids, i)
-
-    def bind_tasks(
-        self,
-        task_ids: List[str],
-        total_len: int,
-        device: torch.device,
-        write_positions: Optional[Tensor] = None,
-    ) -> PageCacheView:
-        page_table = self._table.table_tensor(task_ids, device)
-        return PageCacheView(self._storage, page_table, total_len)
-
-
-class ContiguousCacheView(CacheView):
-    """Contiguous KV-cache view for attention layers."""
-
-    def __init__(
-        self,
-        cache: "ContiguousCache",
-        batch_indices: Tensor,
-        total_len: int = 0,
-        write_positions: Optional[Tensor] = None,
-    ):
-        self._cache = cache
-        self._batch_indices = batch_indices
-        self._total_len = total_len
-        self._write_positions = write_positions
-
-    def write(self, layer_id: int, k: Tensor, v: Tensor):
-        seq_len = k.size(1)
-        indices = self._batch_indices
-        if self._write_positions is not None and seq_len == 1:
-            pos = self._write_positions
-            self._cache.k[layer_id, indices, pos] = k.squeeze(1)
-            self._cache.v[layer_id, indices, pos] = v.squeeze(1)
-        else:
-            start_pos = self._total_len - seq_len
-            self._cache.k[layer_id, indices, start_pos : start_pos + seq_len] = k
-            self._cache.v[layer_id, indices, start_pos : start_pos + seq_len] = v
-
-    def gather(self, layer_id: int) -> Tuple[Tensor, Tensor]:
-        max_len = self._total_len
-        indices = self._batch_indices
-        k = self._cache.k[layer_id, indices, :max_len]
-        v = self._cache.v[layer_id, indices, :max_len]
-        return k, v
-
-
-class ContiguousCache(KVCache):
-    """Contiguous per-slot KV cache (default implementation)."""
-
-    def __init__(
-        self,
-        n_layers: int,
         max_batch_size: int,
         max_seq_len: int,
-        n_kv_heads: int,
-        head_dim: int,
         device: torch.device,
         dtype: torch.dtype,
+        page_size: int = 1,
+        n_tokens: Optional[int] = None,
     ):
+        self.page_size = page_size
+        self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
-        self.k = torch.zeros(
-            n_layers,
-            max_batch_size,
-            max_seq_len,
-            n_kv_heads,
-            head_dim,
-            device=device,
-            dtype=dtype,
+        self.device = device
+        self.dtype = dtype
+        self.n_layers = n_layers
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+
+        self.contiguous = n_tokens is None
+        if self.contiguous:
+            self.n_tokens = max_batch_size * max_seq_len
+        else:
+            self.n_tokens = n_tokens
+
+        self._storage = KVStorage(
+            self.n_tokens, n_layers, n_kv_heads, head_dim, device, dtype
         )
-        self.v = torch.zeros(
-            n_layers,
-            max_batch_size,
-            max_seq_len,
-            n_kv_heads,
-            head_dim,
-            device=device,
-            dtype=dtype,
-        )
-        self._slot_len: Dict[int, int] = {}
-        self._task_slot: Dict[str, int] = {}
-        self._free_slots = list(range(max_batch_size))
-        self._device = device
+        self._req_pool = ReqToTokenPool(max_batch_size, max_seq_len, device)
+
+        if self.contiguous:
+            for i in range(max_batch_size):
+                self._req_pool.req_to_token[i] = torch.arange(
+                    i * max_seq_len, (i + 1) * max_seq_len, device=device
+                )
+            self._alloc: Optional[Allocator] = None
+            self._prefix: Optional[PrefixCache] = None
+        else:
+            n_pages = self.n_tokens // page_size
+            self._alloc = Allocator(n_pages)
+            self._prefix = PrefixCache(page_size) if page_size > 1 else None
+            if self._prefix is not None:
+                self._alloc.on_evict = self._prefix.evict
+
+        self._task_req: Dict[str, int] = {}
+        self._task_len: Dict[int, int] = {}
+        self._task_cached: Dict[str, int] = {}
+        self._task_slots: Dict[str, List[int]] = {}
+        self._task_pages: Dict[str, List[int]] = {}
+        self._lock = threading.Lock()
+
+    # ---- task lifecycle ----
 
     def task_alloc(self, task_id: str, prompt_ids: List[int]) -> bool:
-        if not self._free_slots:
+        req_slots = self._req_pool.alloc(1)
+        if req_slots is None:
             return False
-        slot = self._free_slots.pop(0)
-        self._task_slot[task_id] = slot
-        self._slot_len[slot] = 0
+        req_idx = req_slots[0]
+        self._task_req[task_id] = req_idx
+
+        if self.contiguous:
+            self._task_len[req_idx] = len(prompt_ids)
+            self._task_cached[task_id] = 0
+            return True
+
+        n_tokens_needed = len(prompt_ids)
+        cached = 0
+
+        if self._prefix is not None:
+            hits = self._prefix.lookup(prompt_ids)
+            cached = len(hits) * self.page_size
+            for p in hits:
+                self._alloc.inc_ref(p)
+            self._task_pages[task_id] = list(hits)
+            self._task_slots[task_id] = []
+        else:
+            self._task_pages[task_id] = []
+            self._task_slots[task_id] = []
+
+        remaining = n_tokens_needed - cached
+        if remaining > 0:
+            if self.page_size == 1:
+                slots = self._alloc_tokens(remaining)
+                if slots is None:
+                    for p in self._task_pages[task_id]:
+                        self._alloc.free(p)
+                    self._req_pool.free([req_idx])
+                    del self._task_req[task_id]
+                    return False
+                self._task_slots[task_id] = slots
+            else:
+                n_new_pages = (remaining + self.page_size - 1) // self.page_size
+                new_pages = []
+                for _ in range(n_new_pages):
+                    p = self._alloc.alloc()
+                    if p < 0:
+                        for hp in self._task_pages[task_id]:
+                            self._alloc.free(hp)
+                        for np_ in new_pages:
+                            self._alloc.free(np_)
+                        self._req_pool.free([req_idx])
+                        del self._task_req[task_id]
+                        return False
+                    new_pages.append(p)
+                self._task_pages[task_id].extend(new_pages)
+
+        self._write_req_to_token(task_id, prompt_ids, cached)
+        self._task_len[req_idx] = len(prompt_ids)
+        self._task_cached[task_id] = cached
         return True
 
     def task_free(self, task_id: str):
-        slot = self._task_slot.pop(task_id, None)
-        if slot is not None:
-            self._slot_len.pop(slot, None)
-            self._free_slots.append(slot)
+        req_idx = self._task_req.pop(task_id, None)
+        if req_idx is None:
+            return
+        self._task_len.pop(req_idx, None)
+        self._task_cached.pop(task_id, None)
+
+        if not self.contiguous:
+            if self._prefix is not None:
+                for p in self._task_pages.get(task_id, []):
+                    keep = self._prefix.has_page(p)
+                    self._alloc.free(p, keep_cached=keep)
+                    if not keep:
+                        self._prefix.evict(p)
+            else:
+                for p in self._task_pages.get(task_id, []):
+                    self._alloc.free(p)
+            self._task_pages.pop(task_id, None)
+            self._task_slots.pop(task_id, None)
+
+        self._req_pool.free([req_idx])
 
     def task_extend(self, task_id: str, pos: int) -> bool:
-        return pos < self.max_seq_len
+        req_idx = self._task_req.get(task_id)
+        if req_idx is None:
+            return False
+
+        if self.contiguous:
+            return pos < self.max_seq_len
+
+        if self.page_size == 1:
+            slots = self._alloc_tokens(1)
+            if slots is None:
+                return False
+            self._task_slots.setdefault(task_id, []).extend(slots)
+            self._req_pool.req_to_token[req_idx, pos] = slots[0]
+        else:
+            page_idx = pos // self.page_size
+            existing = self._task_pages.get(task_id, [])
+            if page_idx >= len(existing):
+                p = self._alloc.alloc()
+                if p < 0:
+                    return False
+                existing.append(p)
+                self._task_pages[task_id] = existing
+            page_offset = pos % self.page_size
+            page = existing[page_idx]
+            token_slot = page * self.page_size + page_offset
+            self._req_pool.req_to_token[req_idx, pos] = token_slot
+
+        self._task_len[req_idx] = pos + 1
+        return True
 
     def task_cached(self, task_id: str) -> int:
-        slot = self._task_slot.get(task_id)
-        if slot is None:
-            return 0
-        return self._slot_len.get(slot, 0)
+        return self._task_cached.get(task_id, 0)
+
+    def task_record_hashes(
+        self, task_id: str, prompt_ids: List[int], start_logical_page: int = 0
+    ):
+        if self._prefix is None or self.contiguous:
+            return
+        pages = self._task_pages.get(task_id, [])
+        full_pages = len(prompt_ids) // self.page_size
+        for i in range(start_logical_page, min(full_pages, len(pages))):
+            self._prefix.record(pages[i], prompt_ids, i)
+
+    # ---- bind for forward ----
 
     def bind_tasks(
         self,
         task_ids: List[str],
-        total_len: int,
+        seq_lens: List[int],
         device: torch.device,
-        write_positions: Optional[Tensor] = None,
-    ) -> ContiguousCacheView:
-        slots = [self._task_slot[tid] for tid in task_ids]
-        batch_indices = torch.tensor(slots, dtype=torch.long, device=device)
-        for slot in slots:
-            if total_len > self._slot_len.get(slot, 0):
-                self._slot_len[slot] = total_len
-        return ContiguousCacheView(
-            self, batch_indices, total_len, write_positions=write_positions
+        start_pos: Optional[int] = None,
+    ) -> KVCache:
+        req_indices = [self._task_req[tid] for tid in task_ids]
+        req_pool_indices = torch.tensor(req_indices, dtype=torch.long, device=device)
+        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=device)
+
+        if start_pos is not None:
+            seq_len = seq_lens[0]
+            out_cache_loc = self._req_pool.req_to_token[
+                req_pool_indices, start_pos:seq_len
+            ]
+        else:
+            write_pos = seq_lens_t - 1
+            out_cache_loc = self._req_pool.req_to_token[
+                req_pool_indices, write_pos
+            ].unsqueeze(-1)
+
+        return KVCache(
+            k_buffer=self._storage.k_buffer,
+            v_buffer=self._storage.v_buffer,
+            req_to_token=self._req_pool.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens_t,
+            out_cache_loc=out_cache_loc,
         )
+
+    # ---- internals ----
+
+    def _alloc_tokens(self, n: int) -> Optional[List[int]]:
+        if self.page_size != 1:
+            raise RuntimeError("_alloc_tokens is for page_size=1 only")
+        slots = []
+        for _ in range(n):
+            p = self._alloc.alloc()
+            if p < 0:
+                for s in slots:
+                    self._alloc.free(s)
+                return None
+            slots.append(p)
+        return slots
+
+    def _write_req_to_token(self, task_id: str, prompt_ids: List[int], cached: int):
+        req_idx = self._task_req[task_id]
+        total = len(prompt_ids)
+
+        if self.contiguous:
+            return
+
+        if self.page_size == 1:
+            slots = self._task_slots.get(task_id, [])
+            all_slots = slots[: total - cached]
+            if all_slots:
+                self._req_pool.req_to_token[req_idx, cached:total] = torch.tensor(
+                    all_slots, dtype=torch.long, device=self.device
+                )
+        else:
+            pages = self._task_pages.get(task_id, [])
+            for pos in range(cached, total):
+                page_idx = pos // self.page_size
+                page_offset = pos % self.page_size
+                if page_idx < len(pages):
+                    token_slot = pages[page_idx] * self.page_size + page_offset
+                    self._req_pool.req_to_token[req_idx, pos] = token_slot
