@@ -202,6 +202,7 @@ class KVCache:
         req_pool_indices: [batch_size] — row indices into req_to_token
         seq_lens: [batch_size] — per-request total sequence lengths
         out_cache_loc: [batch, new_seq_len] or [batch, 1] — write indices
+        max_len: max(seq_lens) as Python int — avoids GPU sync in decode
     """
 
     k_buffer: Tensor
@@ -210,6 +211,7 @@ class KVCache:
     req_pool_indices: Tensor
     seq_lens: Tensor
     out_cache_loc: Tensor
+    max_len: int = 0
 
 
 class PagePool:
@@ -439,6 +441,7 @@ class PagePool:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens_t,
             out_cache_loc=out_cache_loc,
+            max_len=max(seq_lens),
         )
 
     # ---- internals ----

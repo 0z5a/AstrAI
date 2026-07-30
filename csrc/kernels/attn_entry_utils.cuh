@@ -44,6 +44,9 @@ inline void extract_q_dims_and_strides(torch::Tensor& q, int64_t layout, P& p) {
 }
 
 // ---- Shared mask packing ----
+// Accepts 2D [batch, kv_len], 3D [batch, q_len, kv_len],
+// or 4D [batch, n_heads, q_len, kv_len].
+// Head/q dimensions with size 1 broadcast (stride set to 0).
 template <typename P>
 inline void pack_mask(const c10::optional<torch::Tensor>& mask, P& p) {
     if (p.use_mask) {
@@ -54,18 +57,26 @@ inline void pack_mask(const c10::optional<torch::Tensor>& mask, P& p) {
         TORCH_CHECK(m.size(m.dim() - 1) == p.kv_len, "mask kv_len mismatch");
         if (m.dim() == 2) {
             p.mask_b_stride = (int)m.stride(0);
+            p.mask_h_stride = 0;
             p.mask_q_stride = 0;
         } else if (m.dim() == 3) {
-            TORCH_CHECK(m.size(1) == p.q_len, "mask q_len mismatch");
+            TORCH_CHECK(m.size(1) == 1 || m.size(1) == p.q_len, "mask q_len mismatch");
             p.mask_b_stride = (int)m.stride(0);
-            p.mask_q_stride = (int)m.stride(1);
+            p.mask_h_stride = 0;
+            p.mask_q_stride = (m.size(1) == 1) ? 0 : (int)m.stride(1);
+        } else if (m.dim() == 4) {
+            TORCH_CHECK(m.size(2) == 1 || m.size(2) == p.q_len, "mask q_len mismatch");
+            p.mask_b_stride = (int)m.stride(0);
+            p.mask_h_stride = (m.size(1) == 1) ? 0 : (int)m.stride(1);
+            p.mask_q_stride = (m.size(2) == 1) ? 0 : (int)m.stride(2);
         } else {
-            TORCH_CHECK(false, "mask must be 2D [batch, kv_len] or 3D [batch, q_len, kv_len]");
+            TORCH_CHECK(false, "mask must be 2D, 3D, or 4D");
         }
         p.mask = m.data_ptr<bool>();
     } else {
         p.mask = nullptr;
         p.mask_b_stride = 0;
+        p.mask_h_stride = 0;
         p.mask_q_stride = 0;
     }
 }

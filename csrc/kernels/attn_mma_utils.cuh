@@ -192,8 +192,8 @@ __device__ inline void mma_softmax_tile(
     int kv0,
     int maxc0, int maxc1,
     int qrow0, int qrow1,
-    int mask_b_stride, int mask_q_stride,
-    int mask_batch,
+    int mask_b_stride, int mask_h_stride, int mask_q_stride,
+    int mask_batch, int mask_head,
     const bool* __restrict__ mask,
     float Sacc[Traits::NC8][4],
     float Oacc[Traits::DN8][4],
@@ -204,8 +204,8 @@ __device__ inline void mma_softmax_tile(
     int tid4 = lane & 3;
 
     float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
-    int mask_base0 = mask_batch * mask_b_stride + qrow0 * mask_q_stride;
-    int mask_base1 = mask_batch * mask_b_stride + qrow1 * mask_q_stride;
+    int mask_base0 = mask_batch * mask_b_stride + mask_head * mask_h_stride + qrow0 * mask_q_stride;
+    int mask_base1 = mask_batch * mask_b_stride + mask_head * mask_h_stride + qrow1 * mask_q_stride;
     #pragma unroll
     for (int n8 = 0; n8 < Traits::NC8; n8++) {
         int cc = kv0 + n8 * 8 + 2 * tid4;

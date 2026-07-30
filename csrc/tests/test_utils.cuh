@@ -103,6 +103,7 @@ inline void set_default_strides(P& p) {
     p.kv_stride_l = p.head_dim;
     p.kv_stride_d = 1;
     p.mask_b_stride = p.kv_len;
+    p.mask_h_stride = 0;
     p.mask_q_stride = 0;
 }
 
@@ -114,6 +115,7 @@ inline void set_default_paged_strides(P& p) {
     p.q_stride_l  = p.head_dim;
     p.q_stride_d  = 1;
     p.mask_b_stride = p.kv_len;
+    p.mask_h_stride = 0;
     p.mask_q_stride = 0;
 }
 

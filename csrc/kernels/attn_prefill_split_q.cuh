@@ -64,7 +64,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
 
     // KV: stride-based base
     int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
-    int mask_batch_base = batch * p.mask_b_stride;
+    int mask_batch_base = batch * p.mask_b_stride + q_head * p.mask_h_stride;
     int tiles   = (p.kv_len + P_BC - 1) / P_BC;
     int tt      = G * ROWS;
     int lid     = row * G + gpos;

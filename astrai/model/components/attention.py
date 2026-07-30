@@ -5,22 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from astrai.extension import attention
 from astrai.factory import BaseFactory
 from astrai.inference.core.cache import KVCache
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import apply_rotary_emb
-
-
-def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
-    bs, slen, n_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_heads * n_rep, head_dim)
-    )
 
 
 class AttnFactory(BaseFactory[nn.Module]):
@@ -86,29 +76,7 @@ class GQA(nn.Module):
         if self.use_qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-        if kv_cache is not None:
-            kv_cache.k_buffer[self.layer_id, kv_cache.out_cache_loc] = k
-            kv_cache.v_buffer[self.layer_id, kv_cache.out_cache_loc] = v
-
-            max_len = kv_cache.seq_lens.max()
-            indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
-            pos_mask = (
-                torch.arange(max_len, device=x.device)[None, :]
-                < kv_cache.seq_lens[:, None]
-            )
-            indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
-            k = kv_cache.k_buffer[self.layer_id, indices]
-            v = kv_cache.v_buffer[self.layer_id, indices]
-
-        k, v = repeat_kv(k, self.n_rep), repeat_kv(v, self.n_rep)
-
-        q, k, v = q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
-        sdqa_out = (
-            F.scaled_dot_product_attention(q, k, v, attn_mask, is_causal=is_causal)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-            .flatten(2)
-        )
+        sdqa_out = attention(q, k, v, kv_cache, self.layer_id, attn_mask, is_causal)
 
         if self.use_gated_attention:
             sdqa_out = sdqa_out * F.sigmoid(self.gate(x))
@@ -203,28 +171,7 @@ class MLA(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        if kv_cache is not None:
-            kv_cache.k_buffer[self.layer_id, kv_cache.out_cache_loc] = k
-            kv_cache.v_buffer[self.layer_id, kv_cache.out_cache_loc] = v
-
-            max_len = kv_cache.seq_lens.max()
-            indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
-            pos_mask = (
-                torch.arange(max_len, device=x.device)[None, :]
-                < kv_cache.seq_lens[:, None]
-            )
-            indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
-            k = kv_cache.k_buffer[self.layer_id, indices]
-            v = kv_cache.v_buffer[self.layer_id, indices]
-
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
-
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask, is_causal=is_causal
-        )
-        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().flatten(2)
+        attn_out = attention(q, k, v, kv_cache, self.layer_id, attn_mask, is_causal)
 
         if self.use_gated_attention:
             attn_out = attn_out * F.sigmoid(self.gate(x))

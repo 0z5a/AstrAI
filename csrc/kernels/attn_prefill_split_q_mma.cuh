@@ -114,8 +114,8 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
                                  : p.kv_len;
             mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1,
                                                qr0, qr1,
-                                               p.mask_b_stride, p.mask_q_stride,
-                                               batch,
+                                               p.mask_b_stride, p.mask_h_stride, p.mask_q_stride,
+                                               batch, q_head,
                                                p.mask,
                                                Sacc, Oacc, m0, m1, l0, l1, lane);
 

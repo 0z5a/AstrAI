@@ -19,9 +19,11 @@ struct AttentionParams {
     // KV strides (K and V share the same layout — only base pointers differ)
     int kv_stride_b, kv_stride_h, kv_stride_l, kv_stride_d;
 
-    // Mask: 2D [batch, kv_len] (mask_q_stride=0) or 3D [batch, q_len, kv_len]
-    int mask_b_stride;   // = kv_len (both 2D and 3D)
-    int mask_q_stride;   // 2D: 0 (all q rows share); 3D: kv_len
+    // Mask: 2D [batch, kv_len], 3D [batch, q_len, kv_len],
+    // or 4D [batch, n_heads, q_len, kv_len] (head dim broadcasts when stride=0)
+    int mask_b_stride;   // batch stride
+    int mask_h_stride;   // head stride (0 = broadcast across heads)
+    int mask_q_stride;   // q stride (0 = all q rows share)
 
     const T* __restrict__ q;
     const T* __restrict__ k;
@@ -52,8 +54,9 @@ struct PagedAttentionParams {
     // Q strides (layout-agnostic)
     int q_stride_b, q_stride_h, q_stride_l, q_stride_d;
 
-    // Mask strides (2D or 3D)
+    // Mask strides (2D, 3D, or 4D)
     int mask_b_stride;
+    int mask_h_stride;
     int mask_q_stride;
 
     const T* __restrict__ q;

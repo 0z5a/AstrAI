@@ -113,6 +113,37 @@ def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     )
 
 
+def attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    kv_cache: Optional[KVCache] = None,
+    layer_id: int = 0,
+    attn_mask: Optional[Tensor] = None,
+    is_causal: bool = False,
+) -> Tensor:
+    """Functional attention entry point — mirrors ``F.scaled_dot_product_attention``.
+
+    Delegates to the active backend (set via ``with attn_backend(...)``).
+    Handles KV cache I/O, GQA head expansion, and causal masking so the
+    caller only needs to provide projected q/k/v.
+
+    Args:
+        q: [batch, q_len, n_heads, head_dim] (blhd)
+        k: [batch, q_len, n_kv_heads, head_dim] (blhd)
+        v: [batch, q_len, n_kv_heads, head_dim] (blhd)
+        kv_cache: cache dataclass, or None for training (no cache).
+        layer_id: transformer layer index for buffer access.
+        attn_mask: pre-built attention mask (SDPA-compatible).
+        is_causal: whether to apply causal masking.
+
+    Returns:
+        [batch, q_len, n_heads * head_dim]
+    """
+    backend = get_backend()
+    return backend.forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
+
+
 class AttentionBackend(ABC):
     """Abstract base for attention computation strategies.
 
@@ -307,12 +338,18 @@ class CudaBackend(AttentionBackend):
         kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
         kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
 
-        max_len = kv_cache.seq_lens.max().item()
+        seq_lens = kv_cache.seq_lens
+        max_len = kv_cache.max_len
 
         page_table = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
 
         k_cache = kv_cache.k_buffer[layer_id].unsqueeze(1)
         v_cache = kv_cache.v_buffer[layer_id].unsqueeze(1)
+
+        if q.size(0) == 1:
+            mask = None
+        else:
+            mask = torch.arange(max_len, device=q.device)[None, :] < seq_lens[:, None]
 
         out = attn_paged_decode(
             q,
@@ -321,7 +358,7 @@ class CudaBackend(AttentionBackend):
             v_cache,
             page_size=1,
             kv_len=max_len,
-            mask=None,
+            mask=mask,
             is_causal=is_causal,
         )
 
@@ -354,7 +391,7 @@ class CudaBackend(AttentionBackend):
         kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
         kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
 
-        max_len = kv_cache.seq_lens.max()
+        max_len = kv_cache.max_len
         indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
         pos_mask = (
             torch.arange(max_len, device=q.device)[None, :] < kv_cache.seq_lens[:, None]

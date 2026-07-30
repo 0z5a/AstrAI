@@ -31,7 +31,7 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
     int ch_begin = split * chunks_per_split;
     int ch_end = min(chunks_total, ch_begin + chunks_per_split);
 
-    const int mask_base = batch * p.mask_b_stride;
+    const int mask_base = batch * p.mask_b_stride + q_head * p.mask_h_stride;
 
     for (int ci = ch_begin; ci < ch_end; ci++) {
         int chunk_start = ci * PDC_CHUNK;

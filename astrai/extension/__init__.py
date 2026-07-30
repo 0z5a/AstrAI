@@ -20,6 +20,7 @@ from astrai.extension.attention_backend import (
     AttentionBackend,
     CudaBackend,
     TorchNativeBackend,
+    attention,
     attn_backend,
     get_backend,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "AttentionBackend",
     "CudaBackend",
     "TorchNativeBackend",
+    "attention",
     "attn_backend",
     "get_backend",
     "attn_decode",

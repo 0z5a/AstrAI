@@ -1,4 +1,4 @@
-from astrai.model.components.attention import GQA, MLA, repeat_kv
+from astrai.model.components.attention import GQA, MLA
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
 from astrai.model.components.linear import Linear
@@ -21,5 +21,4 @@ __all__ = [
     "RotaryEmbedding",
     "apply_rotary_emb",
     "get_rotary_emb",
-    "repeat_kv",
 ]

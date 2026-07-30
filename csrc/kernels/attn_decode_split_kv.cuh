@@ -24,7 +24,7 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
 
     // KV: [batch, kv_head, kv_len, head_dim] — stride-based base
     int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
-    int mask_base = batch * p.mask_b_stride;
+    int mask_base = batch * p.mask_b_stride + q_head * p.mask_h_stride;
 
     float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
 
