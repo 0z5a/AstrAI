@@ -55,19 +55,21 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     const int64_t head_off    = (int64_t)kv_head * Traits::HEAD_DIM;
 
     // ---- Load tile lambda: paged addressing ----
+    // Unified per-element page-table lookup. When page_size >= BC, all
+    // elements in a tile share the same page, so the lookup is redundant
+    // but harmless (L1-cached). This avoids a branch on page_size.
     auto load_tile = [&](int ti, int buf) {
         int kv0 = ti * Traits::BC;
         bf16* dK = sK + buf * Traits::BC * Traits::LD;
         bf16* dV = sV + buf * Traits::BC * Traits::LD;
-        int logical_page = kv0 / p.page_size;
-        int phys_page = p.page_table[batch * p.max_pages + logical_page];
-        bool page_valid = (phys_page >= 0);
         #pragma unroll
         for (int i = lane * Traits::VEC; i < Traits::TOTAL;
              i += Traits::NUM_THREADS * Traits::VEC) {
             int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
             int kc = kv0 + r;
-            bool valid = (kc < p.kv_len) && page_valid;
+            bool valid = (kc < p.kv_len);
+            int phys_page = valid ? p.page_table[batch * p.max_pages + kc] : 0;
+            valid = valid && (phys_page >= 0);
             int page_off = kc % p.page_size;
             int64_t gmem_base = (int64_t)phys_page * page_stride
                               + (int64_t)page_off * pos_stride

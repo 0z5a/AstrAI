@@ -146,25 +146,13 @@ static inline void launch_paged_decode_mma(PagedAttentionParams<bf16>& p, int gr
     int G = p.q_head / p.kv_head;
     constexpr int MAX_G = 16;
     constexpr int BC = 16;
-    // page_size must be >= BC and a multiple of BC so a BC-wide tile never
-    // straddles two pages (the kernel does one page-table lookup per tile).
-    bool page_ok = (p.page_size >= BC) && (p.page_size % BC == 0);
-    if (G >= 1 && page_ok) {
-        int num_passes = (G + MAX_G - 1) / MAX_G;
-        int tiles_total = (p.kv_len + BC - 1) / BC;
-        p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total, 2);
-        constexpr int STAGES = 2;
-        using Traits = KernelTraits<HEAD_DIM, BC, 1, STAGES>;
-        dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
-        paged_attn_decode_split_kv_mma_kernel<Traits, IsCausal, HasMask> <<<grid, 32>>>(p);
-    } else {
-        int chunks_total = (p.kv_len + PDC_CHUNK - 1) / PDC_CHUNK;
-        p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
-        size_t smem = PDC_CHUNK * p.head_dim * sizeof(bf16);
-        dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
-        dim3 block(32, group_size);
-        paged_attn_decode_split_kv_kernel<HEAD_DIM, IsCausal, HasMask><<<grid, block, smem>>>(p);
-    }
+    int num_passes = (G + MAX_G - 1) / MAX_G;
+    int tiles_total = (p.kv_len + BC - 1) / BC;
+    p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total, 2);
+    constexpr int STAGES = 2;
+    using Traits = KernelTraits<HEAD_DIM, BC, 1, STAGES>;
+    dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
+    paged_attn_decode_split_kv_mma_kernel<Traits, IsCausal, HasMask> <<<grid, 32>>>(p);
 }
 #endif
 
