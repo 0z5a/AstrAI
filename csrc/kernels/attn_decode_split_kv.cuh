@@ -70,8 +70,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             }
 
             float new_m = fmaxf(m, partial);
-            float alpha = expf(m - new_m);
-            float beta  = expf(partial - new_m);
+            float alpha = __expf(m - new_m);
+            float beta  = __expf(partial - new_m);
             d = d * alpha + beta;
 
             int v_off = kv_base + kv_idx * p.kv_stride_l
@@ -116,8 +116,8 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
         if (mi <= -FLT_MAX) continue;
         float li = mlp[s * 2 + 1];
         float nm = fmaxf(m, mi);
-        float corr = expf(m - nm);
-        float e = expf(mi - nm);
+        float corr = __expf(m - nm);
+        float e = __expf(mi - nm);
         acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
         l = fmaf(l, corr, li * e);
         m = nm;
