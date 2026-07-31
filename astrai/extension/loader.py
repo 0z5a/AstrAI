@@ -18,7 +18,7 @@ _modules: dict[str, object] = {}
 
 for _name in KERNEL_NAMES:
     try:
-        _mod = importlib.import_module(f".{_name}", package=__package__)
+        _mod = importlib.import_module(f".lib.{_name}", package=__package__)
         _available[_name] = True
         _modules[_name] = _mod
     except ImportError:

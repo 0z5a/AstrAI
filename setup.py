@@ -7,7 +7,7 @@ from setuptools import setup
 from setuptools.command.build_ext import build_ext as _build_ext
 
 sys.path.insert(0, str(Path(__file__).parent))
-os.makedirs("astrai/extension", exist_ok=True)
+os.makedirs("astrai/extension/lib", exist_ok=True)
 
 
 def _should_build():
@@ -57,7 +57,7 @@ if _should_build():
     for name, info in REGISTRY.items():
         ext_modules.append(
             CUDAExtension(
-                f"astrai.extension.{name}",
+                f"astrai.extension.lib.{name}",
                 info["sources"],
                 extra_compile_args={
                     "cxx": info["cxx_flags"],
