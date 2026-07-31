@@ -30,7 +30,6 @@ Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 
 import contextvars
 import enum
-import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Optional, Union

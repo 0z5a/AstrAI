@@ -21,11 +21,15 @@ using bf16 = __nv_bfloat16;
                          " (supported: 32, 64, 128, 256)"); \
     }
 
+// The split kernel unconditionally writes every (batch, q_head, split) slot it
+// owns — including empty split ranges, which store m = -FLT_MAX so the combine
+// skips them. Allocators are therefore left uninitialized (torch::empty); the
+// per-call memset (torch::zeros / torch::full) was pure overhead.
 template<typename P>
 inline void alloc_split_partials(P& p) {
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto o_part = torch::zeros(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, p.head_dim}, fopt);
-    auto ml_part = torch::full(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, 2}, -FLT_MAX, fopt);
+    auto o_part = torch::empty(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, p.head_dim}, fopt);
+    auto ml_part = torch::empty(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, 2}, fopt);
     p.o_part = (float*)o_part.data_ptr();
     p.ml_part = (float*)ml_part.data_ptr();
 }

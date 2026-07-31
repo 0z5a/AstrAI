@@ -76,26 +76,17 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         cp_async_commit();
     };
 
-    constexpr int BUF_MASK = (Traits::STAGES > 1) ? (Traits::STAGES - 1) : 0;
+    // ---- Multi-stage cp.async pipeline ----
+    // Prologue loads STAGES tiles; each loop iteration waits only for the
+    // oldest outstanding group (wait_group<STAGES-1>) so the STAGES-1 newer
+    // tile loads stay in flight and overlap with the current tile's compute.
+    constexpr int STAGES = Traits::STAGES;
+    const int ntiles = ti_end - ti_begin;
 
-    // Prologue
-    if (ti_begin < ti_end) {
-        load_tile(ti_begin, 0);
-    }
-
-    for (int ti = ti_begin; ti < ti_end; ti++) {
-        int buf = (ti - ti_begin) & BUF_MASK;
-
-        cp_async_wait_group<0>();
-        __syncwarp();
-        if constexpr (Traits::STAGES > 1) {
-            if (ti + 1 < ti_end)
-                load_tile(ti + 1, (ti + 1 - ti_begin) & BUF_MASK);
-        }
-
+    auto process_tile = [&](int it, int buf) {
         const bf16* bK = sK + buf * Traits::BC * Traits::LD;
         const bf16* bV = sV + buf * Traits::BC * Traits::LD;
-        int kv0 = ti * Traits::BC;
+        int kv0 = (ti_begin + it) * Traits::BC;
 
         float Sacc[Traits::NC8][4];
         mma_compute_scores<Traits>(Qa, bK, lane, Sacc);
@@ -115,12 +106,29 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
                                            Sacc, Oacc, m0, m1, l0, l1, lane);
 
         mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
-        __syncwarp();
+    };
 
-        if constexpr (Traits::STAGES == 1) {
-            if (ti + 1 < ti_end)
-                load_tile(ti + 1, 0);
+    if (ntiles >= STAGES) {
+        #pragma unroll
+        for (int i = 0; i < STAGES; i++)
+            load_tile(ti_begin + i, i);
+
+        for (int it = 0; it < ntiles; it++) {
+            cp_async_wait_group<STAGES - 1>();
+            __syncwarp();
+            process_tile(it, it & (STAGES - 1));
+            __syncwarp();
+            if (it + STAGES < ntiles)
+                load_tile(ti_begin + it + STAGES, (it + STAGES) & (STAGES - 1));
         }
+    } else {
+        // Fewer tiles than stages: load all, wait for all, process.
+        for (int i = 0; i < ntiles; i++)
+            load_tile(ti_begin + i, i);
+        cp_async_wait_group<0>();
+        __syncwarp();
+        for (int it = 0; it < ntiles; it++)
+            process_tile(it, it);
     }
 
     // ---- write UN-normalised partials for this split ----
