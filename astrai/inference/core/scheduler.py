@@ -109,9 +109,11 @@ class InferenceScheduler:
                     self._task_mgr.wait_for_tasks(timeout=1.0)
                     continue
 
+                active = self._task_mgr.get_active_tasks()
+
                 to_prefill = [
                     t
-                    for t in self._task_mgr.get_active_tasks()
+                    for t in active
                     if t.output_tokens == 0
                     and cache.task_cached(t.task_id) < len(t.prompt_ids)
                 ]
@@ -137,10 +139,10 @@ class InferenceScheduler:
                                 t.task_id, t.prompt_ids, start_logical_page
                             )
 
-                decode_tasks = self._task_mgr.get_active_tasks()
+                decode_tasks = active
 
                 valid: List[Task] = []
-                for t in sorted(decode_tasks, key=lambda t: t.task_id):
+                for t in decode_tasks:
                     if cache.task_extend(t.task_id, t.next_pos):
                         valid.append(t)
                     else:

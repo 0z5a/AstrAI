@@ -343,6 +343,10 @@ def sample(
     When **temperature** is exactly 0 (scalar or single-element tensor)
     the function short-circuits to ``argmax`` for deterministic decode.
 
+    When **frequency_penalty** is 0 (the common decode case), the entire
+    frequency penalty computation — including the O(batch * vocab) count
+    tensor allocation — is skipped.
+
     Args:
         logits: Raw logits ``[batch, vocab_size]``.
         frequency_penalty: Penalty per occurrence for repeated tokens
@@ -359,14 +363,39 @@ def sample(
         ``True`` — a ``(token_ids, chosen_logprobs)`` tuple where
         ``chosen_logprobs`` has shape ``[batch]``.
     """
-    return SamplingPipeline(
-        [
-            TemperatureStrategy(temperature),
-            TopKStrategy(top_k),
-            TopPStrategy(top_p),
-            FrequencyPenaltyStrategy(frequency_penalty),
-        ]
-    ).sample(
+    greedy = (
+        (
+            isinstance(temperature, Tensor)
+            and temperature.numel() == 1
+            and temperature.item() == 0
+        )
+        if isinstance(temperature, Tensor)
+        else temperature == 0
+    )
+
+    if greedy:
+        tokens = logits.argmax(dim=-1)
+        if not return_logprobs:
+            return tokens
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+        return tokens, chosen
+
+    has_freq = (
+        (isinstance(frequency_penalty, Tensor) and (frequency_penalty != 0).any())
+        if isinstance(frequency_penalty, Tensor)
+        else frequency_penalty != 0
+    )
+
+    strategies: List[BaseSamplingStrategy] = [
+        TemperatureStrategy(temperature),
+        TopKStrategy(top_k),
+        TopPStrategy(top_p),
+    ]
+    if has_freq:
+        strategies.append(FrequencyPenaltyStrategy(frequency_penalty))
+
+    return SamplingPipeline(strategies).sample(
         logits,
         filter_value=filter_value,
         input_ids=input_ids,

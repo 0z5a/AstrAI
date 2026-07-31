@@ -105,26 +105,33 @@ class Executor:
             [t.frequency_penalty for t in tasks], device=self.device
         )
 
-        history_lists = []
-        history_lens = []
-        for t in tasks:
-            window = t.rep_window
-            prompt_part = t.prompt_ids[-window:]
-            ids = prompt_part + t.output_ids
-            history_lists.append(ids)
-            history_lens.append(len(ids))
+        has_freq = bool((freq_penalties != 0).any())
+        if has_freq:
+            history_lists = []
+            history_lens = []
+            for t in tasks:
+                window = t.rep_window
+                prompt_part = t.prompt_ids[-window:]
+                ids = prompt_part + t.output_ids
+                history_lists.append(ids)
+                history_lens.append(len(ids))
 
-        max_len = max(history_lens) if history_lens else 0
-        padded_ids = torch.zeros(
-            len(tasks), max_len, dtype=torch.long, device=self.device
-        )
-        padded_mask = torch.zeros(
-            len(tasks), max_len, dtype=torch.bool, device=self.device
-        )
-        for i, h in enumerate(history_lists):
-            L = history_lens[i]
-            padded_ids[i, :L] = torch.as_tensor(h, dtype=torch.long, device=self.device)
-            padded_mask[i, :L] = True
+            max_len = max(history_lens) if history_lens else 0
+            padded_ids = torch.zeros(
+                len(tasks), max_len, dtype=torch.long, device=self.device
+            )
+            padded_mask = torch.zeros(
+                len(tasks), max_len, dtype=torch.bool, device=self.device
+            )
+            for i, h in enumerate(history_lists):
+                L = history_lens[i]
+                padded_ids[i, :L] = torch.as_tensor(
+                    h, dtype=torch.long, device=self.device
+                )
+                padded_mask[i, :L] = True
+        else:
+            padded_ids = None
+            padded_mask = None
 
         with torch.inference_mode():
             outputs = self.model(

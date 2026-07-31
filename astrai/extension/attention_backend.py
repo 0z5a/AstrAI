@@ -272,12 +272,18 @@ class TorchNativeBackend(AttentionBackend):
             kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
             kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
 
-            max_len = kv_cache.seq_lens.max()
-            indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
-            pos_mask = (
-                torch.arange(max_len, device=q.device)[None, :]
-                < kv_cache.seq_lens[:, None]
-            )
+            max_len = kv_cache.max_len
+            if kv_cache.page_table is not None:
+                indices = kv_cache.page_table
+            else:
+                indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
+            if kv_cache.decode_mask is not None:
+                pos_mask = kv_cache.decode_mask
+            else:
+                pos_mask = (
+                    torch.arange(max_len, device=q.device)[None, :]
+                    < kv_cache.seq_lens[:, None]
+                )
             indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
             k = kv_cache.k_buffer[layer_id, indices]
             v = kv_cache.v_buffer[layer_id, indices]
@@ -338,18 +344,25 @@ class CudaBackend(AttentionBackend):
         kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
         kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
 
-        seq_lens = kv_cache.seq_lens
         max_len = kv_cache.max_len
 
-        page_table = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
+        if kv_cache.page_table is not None:
+            page_table = kv_cache.page_table
+        else:
+            page_table = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
 
         k_cache = kv_cache.k_buffer[layer_id].unsqueeze(1)
         v_cache = kv_cache.v_buffer[layer_id].unsqueeze(1)
 
         if q.size(0) == 1:
             mask = None
+        elif kv_cache.decode_mask is not None:
+            mask = kv_cache.decode_mask
         else:
-            mask = torch.arange(max_len, device=q.device)[None, :] < seq_lens[:, None]
+            mask = (
+                torch.arange(max_len, device=q.device)[None, :]
+                < kv_cache.seq_lens[:, None]
+            )
 
         out = attn_paged_decode(
             q,

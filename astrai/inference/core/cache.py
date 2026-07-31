@@ -203,6 +203,10 @@ class KVCache:
         seq_lens: [batch_size] — per-request total sequence lengths
         out_cache_loc: [batch, new_seq_len] or [batch, 1] — write indices
         max_len: max(seq_lens) as Python int — avoids GPU sync in decode
+        page_table: [batch, max_len] — precomputed gather indices for decode;
+            None for prefill or when not yet computed.
+        decode_mask: [batch, max_len] bool — precomputed position validity
+            mask for decode; None for prefill or single-batch decode.
     """
 
     k_buffer: Tensor
@@ -212,6 +216,8 @@ class KVCache:
     seq_lens: Tensor
     out_cache_loc: Tensor
     max_len: int = 0
+    page_table: Optional[Tensor] = None
+    decode_mask: Optional[Tensor] = None
 
 
 class PagePool:
@@ -428,11 +434,21 @@ class PagePool:
             out_cache_loc = self._req_pool.req_to_token[
                 req_pool_indices, start_pos:seq_len
             ]
+            page_table = None
+            decode_mask = None
         else:
             write_pos = seq_lens_t - 1
             out_cache_loc = self._req_pool.req_to_token[
                 req_pool_indices, write_pos
             ].unsqueeze(-1)
+            ml = max(seq_lens)
+            page_table = self._req_pool.req_to_token[req_pool_indices, :ml]
+            if len(task_ids) > 1:
+                decode_mask = (
+                    torch.arange(ml, device=device)[None, :] < seq_lens_t[:, None]
+                )
+            else:
+                decode_mask = None
 
         return KVCache(
             k_buffer=self._storage.k_buffer,
@@ -442,6 +458,8 @@ class PagePool:
             seq_lens=seq_lens_t,
             out_cache_loc=out_cache_loc,
             max_len=max(seq_lens),
+            page_table=page_table,
+            decode_mask=decode_mask,
         )
 
     # ---- internals ----
