@@ -6,11 +6,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.extension import attention
+from astrai.extension.rotary_backend import apply_rotary_emb
 from astrai.factory import BaseFactory
 from astrai.inference.core.cache import KVCache
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
-from astrai.model.components.rope import apply_rotary_emb
 
 
 class AttnFactory(BaseFactory[nn.Module]):

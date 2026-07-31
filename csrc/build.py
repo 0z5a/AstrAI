@@ -72,3 +72,4 @@ def register(name: str, sources: list[str] | None = None, **kwargs):
 register("attn_decode")
 register("attn_prefill")
 register("attn_paged_decode")
+register("rotary_emb")

@@ -30,6 +30,7 @@ from astrai.extension.attention_ops import (
     attn_prefill,
 )
 from astrai.extension.loader import KERNEL_NAMES, is_available
+from astrai.extension.rotary_backend import apply_rotary_emb
 
 __all__ = [
     "ATTN_BACKEND",
@@ -44,4 +45,5 @@ __all__ = [
     "attn_prefill",
     "is_available",
     "KERNEL_NAMES",
+    "apply_rotary_emb",
 ]
