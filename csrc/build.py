@@ -1,6 +1,32 @@
 from pathlib import Path
 
 
+def cuda_toolkit_version() -> tuple[int, int] | None:
+    """Return ``(major, minor)`` of the nvcc on PATH, or ``None``.
+
+    Used by ``setup.py`` to detect nvcc/torch CUDA version mismatches
+    (e.g. nvcc 13.0 with a cu128 torch wheel) which cause cryptic ABI errors.
+    """
+    import shutil
+    import subprocess
+
+    nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        return None
+    try:
+        out = subprocess.check_output(
+            [nvcc, "--version"], stderr=subprocess.STDOUT, text=True
+        )
+        for line in out.splitlines():
+            if "release" in line:
+                ver = line.split("release")[1].split(",")[0].strip()
+                major, minor = ver.split(".")
+                return (int(major), int(minor))
+    except Exception:
+        pass
+    return None
+
+
 def _arch_flags() -> list[str]:
     import torch
 

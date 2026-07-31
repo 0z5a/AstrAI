@@ -1,7 +1,15 @@
 # AstrAI Dockerfile - Multi-stage Build (Optimized)
+#
+# CUDA version selection:
+#   docker build -t astrai .
+#   docker build -t astrai --build-arg CUDA_TAG=cu128 .
+#   docker build -t astrai --build-arg CUDA_TAG=cu130 .
+# Default: cu128
 
 # Build stage - use base image with minimal build tools
 FROM ubuntu:24.04 AS builder
+
+ARG CUDA_TAG=cu128
 
 WORKDIR /app
 
@@ -20,10 +28,12 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy source code and install (deps read from pyproject.toml)
 COPY astrai/ ./astrai/
+COPY csrc/ ./csrc/
+COPY setup.py .
 COPY pyproject.toml .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir . \
-    --extra-index-url https://download.pytorch.org/whl/cu128
+    --extra-index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
 
 # Production stage
 FROM ubuntu:24.04 AS production

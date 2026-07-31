@@ -3,6 +3,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+// Predicated cp.async (4-operand form) requires CUDA 11.2+.
+// bf16 mma.sync requires sm_80+ (guarded at build time by ASTRAI_NO_MMA).
+#if CUDART_VERSION < 11020
+#error "AstrAI CUDA kernels require CUDA 11.2 or later (CUDART_VERSION >= 11020)."
+#endif
+
 // ============================================================================
 // KernelTraits — FlashAttention-v2 style compile-time configuration bundle.
 //

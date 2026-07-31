@@ -36,9 +36,6 @@ dev = ["pytest==9.0.2", "ruff", "httpx2"]
 [tool.setuptools.packages.find]
 where = ["."]
 
-[tool.pip]
-extra-index-url = "https://download.pytorch.org/whl/cu128"
-
 [tool.setuptools.dynamic]
 version = { attr = "astrai.__version__" }
 

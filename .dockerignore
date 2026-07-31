@@ -5,5 +5,7 @@
 !astrai/
 !scripts/
 !docs/
+!csrc/
+!setup.py
 !pyproject.toml
 !README.md

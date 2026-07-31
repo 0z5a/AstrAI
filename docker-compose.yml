@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        CUDA_TAG: ${CUDA_TAG:-cu128}
     user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8000:8000"
@@ -29,6 +31,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        CUDA_TAG: ${CUDA_TAG:-cu128}
     user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8000:8000"

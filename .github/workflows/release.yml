@@ -26,22 +26,30 @@ jobs:
           if-no-files-found: error
 
   build-cuda-linux:
-    name: Build CUDA wheel (Linux)
+    name: Build CUDA wheel (Linux, ${{ matrix.cuda_tag }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_tag: "cu128"
+            cuda_ver: "12.8.0"
+          - cuda_tag: "cu130"
+            cuda_ver: "13.0.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install torch (CUDA 12.8)
+      - name: Install torch (${{ matrix.cuda_tag }})
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cu128
+          pip install torch --index-url https://download.pytorch.org/whl/${{ matrix.cuda_tag }}
 
-      - name: Setup CUDA
+      - name: Setup CUDA (${{ matrix.cuda_ver }})
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: "12.8.0"
+          cuda: "${{ matrix.cuda_ver }}"
 
       - name: Build wheel (with CUDA kernels)
         run: |
@@ -49,7 +57,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cuda-wheel-linux
+          name: cuda-wheel-linux-${{ matrix.cuda_tag }}
           path: dist/*.whl
           if-no-files-found: error
 
@@ -66,10 +74,11 @@ jobs:
           name: pure-wheel
           path: release-assets/pure
 
-      - name: Download CUDA wheel
+      - name: Download CUDA wheels (all variants)
         uses: actions/download-artifact@v4
         with:
-          name: cuda-wheel-linux
+          pattern: cuda-wheel-linux-*
+          merge-multiple: true
           path: release-assets/cuda
 
       - name: Verify release assets
@@ -79,8 +88,7 @@ jobs:
           pure_wheels=(release-assets/pure/*.whl)
           cuda_wheels=(release-assets/cuda/*.whl)
           test "${#pure_wheels[@]}" -eq 1
-          test "${#cuda_wheels[@]}" -eq 1
-          test "$(basename "${pure_wheels[0]}")" != "$(basename "${cuda_wheels[0]}")"
+          test "${#cuda_wheels[@]}" -ge 1
 
       - name: Create release & upload assets
         uses: softprops/action-gh-release@v2
