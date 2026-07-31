@@ -41,7 +41,7 @@ RoPE embeds position into Q/K vectors via complex rotation:
 
 $$ q_i = R_i W_q x_i, \quad k_j = R_j W_k x_j, \quad q_i^T k_j = x_i^T W_q^T R_{i-j} W_k x_j $$
 
-The complex rotation `freqs_cis` is pre-computed once (`cos, sin` pairs per position). `apply_rotary_emb` multiplies Q/K as complex numbers. The key property is that the dot product $q_i^T k_j$ depends only on the relative position $i - j$, not the absolute positions.
+`RotaryEmbedding` pre-computes `cos_table` and `sin_table` (f32, `[max_len, dim/2]`). `forward()` returns a `(cos, sin)` tuple indexed by `position_ids`. `apply_rotary_emb` applies the rotation: during training it uses torch complex multiply (autograd-compatible); during inference it auto-dispatches to a fused CUDA kernel when available. The key property is that the dot product $q_i^T k_j$ depends only on the relative position $i - j$, not the absolute positions.
 
 **Critical for inference**: RoPE is applied **before** KV cache write, not after. If applied after caching, position encoding drift occurs because cached K/V would have stale rotation factors.
 
@@ -151,7 +151,7 @@ Three-layer separation (SGLang-inspired):
 - **ReqToTokenPool**: Index table `[req_idx, pos] → physical token slot`, shared across all layers.
 - **Allocator + PrefixCache**: Paged-mode slot allocation with ref-counting, LRU eviction, and hash-based prefix sharing.
 
-`PagePool` orchestrates all three. In contiguous mode (default), `req_to_token` is a trivial linear mapping. In paged mode, slots are allocated on demand with prefix caching support. Attention layers access buffers directly via `KVCache` dataclass — no methods, no abstraction.
+`PagePool` orchestrates all three. In contiguous mode (default), `req_to_token` is a trivial linear mapping. In paged mode, slots are allocated on demand with prefix caching support. `bind_tasks()` returns a `KVCache` dataclass with precomputed `page_table` and `decode_mask` fields (computed once per decode step, shared across all layers). Attention layers access buffers directly — no methods, no abstraction.
 
 ### Attention Backend
 
@@ -159,6 +159,8 @@ Attention computation is decoupled from the model via `AttentionBackend` ABC (`a
 
 - **`TorchNativeBackend`** (default): writes K/V to cache, gathers via `req_to_token` indirect indexing, calls `F.scaled_dot_product_attention`.
 - **`CudaBackend`**: decode path uses `attn_paged_decode` with `page_size=1` (the `req_to_token` table serves as the page table, each token slot is a single-token "page"); prefill path gathers K/V then calls `attn_prefill`. Falls back to `TorchNativeBackend` when kernel unavailable.
+
+Rotary embedding is applied via `apply_rotary_emb` in `astrai/extension/rotary_backend.py`, which auto-dispatches to the fused CUDA kernel (`rotary_emb.cu`) during inference or torch complex multiply during training (for autograd compatibility). Both attention backends share the same rotary dispatch.
 
 Backend selection is thread-safe via `contextvars`, mirroring `torch.nn.attention.sdpa_kernel`:
 
@@ -228,4 +230,4 @@ total_steps          = (batches_per_replica // grad_accum_steps) * n_epoch
 
 This accounts for data-parallel sharding — each rank processes `1/nprocs` of the dataset.
 
-> Document Update Time: 2026-07-30
+> Document Update Time: 2026-07-31

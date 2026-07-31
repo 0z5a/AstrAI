@@ -17,14 +17,14 @@ cd AstrAI
 # Basic install (pure PyTorch, no custom CUDA kernels)
 pip install -e .
 
-# With CUDA kernels (optional, for fused attention)
+# With CUDA kernels (optional, for fused attention and rotary embedding)
 # CSRC_KERNELS=true pip install -e . --no-build-isolation
 
 # With dev dependencies (pytest, ruff)
 # pip install -e ".[dev]"
 ```
 
-> **CUDA kernels** are opt-in. They are not built by default. When built, they can be activated via `with attn_backend(ATTN_BACKEND.CUDA):` for accelerated decode/prefill. You can skip them for normal usage.
+> **CUDA kernels** are opt-in. They are not built by default. When built, they can be activated via `with attn_backend(ATTN_BACKEND.CUDA):` for accelerated decode/prefill, and the fused rotary embedding kernel is auto-dispatched when available. You can skip them for normal usage.
 
 ## 2. Download Model Weights
 
@@ -232,4 +232,4 @@ docker compose up -d
 | System architecture | [Architecture](developer/architecture.md) |
 | Data pipeline internals | [Data Flow](developer/dataflow.md) |
 
-> Document Update Time: 2026-07-30
+> Document Update Time: 2026-07-31

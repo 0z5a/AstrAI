@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -10,16 +10,18 @@ def get_rotary_emb(
     max_len: int,
     base: float = 10000,
     device: Optional[torch.device] = None,
-) -> Tuple[Tensor, Tensor]:
+) -> Tensor:
     """Precompute cos/sin tables for rotary embedding.
 
     Returns:
-        (cos, sin) each of shape [max_len, dim/2] (f32)
+        [max_len, dim/2, 2] (f32) — [cos, sin] pairs.
     """
     theta = base ** (-torch.arange(0, dim, 2, dtype=torch.float64, device=device) / dim)
     t = torch.arange(0, max_len, dtype=torch.float64, device=device)
     freqs = torch.outer(t, theta).float()
-    return torch.cos(freqs), torch.sin(freqs)
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+    return torch.stack([cos, sin], dim=-1)
 
 
 def ntk_base(base: float, dim: int, factor: float) -> float:
@@ -49,13 +51,10 @@ class RotaryEmbedding(nn.Module):
         self._set_rotary_buffer(self.max_len)
 
     def _set_rotary_buffer(self, max_len: int):
-        cos, sin = get_rotary_emb(self.dim, max_len, self.base)
-        self.register_buffer("cos_table", cos, persistent=False)
-        self.register_buffer("sin_table", sin, persistent=False)
+        freqs_cis = get_rotary_emb(self.dim, max_len, self.base)
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def forward(
-        self, x: Tensor, position_ids: Optional[Tensor] = None
-    ) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, position_ids: Optional[Tensor] = None) -> Tensor:
         """Lookup cos/sin for the given positions.
 
         Args:
@@ -63,7 +62,7 @@ class RotaryEmbedding(nn.Module):
             position_ids: [batch, seq_len] optional position indices.
 
         Returns:
-            (cos, sin) each of shape [batch, seq_len, dim/2] (f32)
+            [batch, seq_len, dim/2, 2] (f32) — [cos, sin] pairs.
         """
         if position_ids is None:
             position_ids = (
@@ -71,6 +70,4 @@ class RotaryEmbedding(nn.Module):
                 .unsqueeze(0)
                 .expand(x.size(0), -1)
             )
-        cos = self.cos_table[position_ids].float()
-        sin = self.sin_table[position_ids].float()
-        return cos, sin
+        return self.freqs_cis[position_ids].float()

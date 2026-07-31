@@ -47,7 +47,10 @@ KVCache
   ├── req_to_token           [num_reqs, max_ctx_len]
   ├── req_pool_indices       [batch_size]
   ├── seq_lens               [batch_size]
-  └── out_cache_loc          [batch, seq_len] — write indices for this forward
+  ├── out_cache_loc          [batch, seq_len] — write indices for this forward
+  ├── max_len                int — max(seq_lens), avoids GPU sync in decode
+  ├── page_table             [batch, max_len] — precomputed gather indices for decode (None for prefill)
+  └── decode_mask            [batch, max_len] bool — precomputed position validity mask (None for single-batch decode)
 ```
 
 Attention layers do raw buffer indexing: `k_buffer[layer_id, out_cache_loc] = k` to write, `k_buffer[layer_id, indices]` to gather.
@@ -76,6 +79,15 @@ with attn_backend(ATTN_BACKEND.CUDA):
 `CudaBackend` prefill path: writes K/V, gathers full-sequence K/V via indirect indexing (same as `TorchNativeBackend`), then calls `attn_prefill`.
 
 Fallback: `CudaBackend` delegates to `TorchNativeBackend` when a CUDA kernel is not available.
+
+### Rotary Embedding Backend
+
+Rotary embedding is applied via `apply_rotary_emb` in `astrai/extension/rotary_backend.py`, which auto-dispatches:
+
+- **CUDA kernel** (`rotary_emb.cu`): fused cos/sin lookup + rotation in a single kernel, used when the kernel is available, input is on CUDA, and `torch.is_grad_enabled()` is `False` (inference mode)
+- **Torch fallback**: complex multiply path (`torch.view_as_complex` → `torch.complex` multiply → `torch.view_as_real`), used during training (supports autograd backward) or when the CUDA kernel is not available
+
+`RotaryEmbedding` stores `cos_table`/`sin_table` as f32 buffers and returns a `(cos, sin)` tuple from `forward()`. Both attention backends share the same rotary dispatch — it is backend-agnostic.
 
 ## Continuous Batching
 
@@ -183,6 +195,10 @@ Supports `stop_sequences` and streaming via `event: content_block_delta`.
 | `temperature` | float | 1.0 | Sampling temperature (> 0.0) |
 | `max_tokens` | Optional[int] | None | Max generation length |
 | `stream` | bool | False | Stream output |
+| `stop` | Optional[Union[str, List[str]]] | None | Stop sequences |
+| `frequency_penalty` | float | 0.0 | Frequency penalty |
+| `tools` | Optional[List[dict]] | None | Tool definitions for function calling |
+| `tool_choice` | Optional[str] | None | Tool selection mode |
 
 ### SSE Streaming Format
 
@@ -278,4 +294,4 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
     print(token)
 ```
 
-> Document Update Time: 2026-07-30
+> Document Update Time: 2026-07-31

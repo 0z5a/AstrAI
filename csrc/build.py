@@ -53,7 +53,7 @@ NVCC_FLAGS = [
     "--use_fast_math",
     "--ptxas-options=-O3,-v",
     "--extra-device-vectorization",
-    "--threads=8",
+    "--threads=16",
 ]
 
 
