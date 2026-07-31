@@ -43,6 +43,11 @@ def apply_rotary_emb(x: Tensor, rotary_emb: tuple[Tensor, Tensor]) -> Tensor:
         [batch, seq_len, n_heads, head_dim] (bf16)
     """
     cos, sin = rotary_emb
-    if _cuda_available() and x.is_cuda and x.dtype == torch.bfloat16:
+    if (
+        _cuda_available()
+        and not torch.is_grad_enabled()
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+    ):
         return _cuda_rotary(x, cos, sin)
     return _torch_apply(x, cos, sin)
