@@ -25,34 +25,35 @@
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--warmup_ratio` | Fraction of total steps used for LR warmup | 0.05 |
-| `--max_lr` | NAdamW learning rate; schedulers scale every optimizer group proportionally | 3e-4 |
+| `--max_lr` | Maximum learning rate (cosine decay after warmup) | 3e-4 |
 | `--max_grad_norm` | Maximum gradient norm for clipping (None disables) | 1.0 |
 
 ### Optimizer
 
-The default `nora_nadamw` optimizer sends internal `Linear.weight` matrices to
-**Nora** and embeddings, the LM head, norms, biases, LoRA factors, and fallback
-parameters to **NAdamW**. Parameters are classified by module role and identity,
-so tied embedding/head weights occur in exactly one group. Nora requires complete
-rows under DTensor sharding and rejects layouts sharded along the last dimension.
+The default `muon_adamw` optimizer sends matrix parameters through **Muon** and
+non-matrix parameters through **AdamW** (`fused=True`).
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--optimizer` | Built-in optimizer (`nora_nadamw`, `muon_adamw`) | `nora_nadamw` |
-| `--weight_decay` | NAdamW decay for eligible fallback parameters; known embeddings, heads, norms, biases, and LoRA factors use 0 | 0.1 |
-| `--nora_lr` | Nora learning rate | 5e-3 |
-| `--nora_beta` | Nora momentum-buffer EMA factor | 0.95 |
-| `--nora_momentum` | Nora Nesterov interpolation factor | 0.95 |
-| `--nora_weight_decay` | Nora matrix weight decay | 0.0 |
-
-`muon_adamw` preserves the previous MuonMix behavior and the following options:
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
+| `--optimizer` | Built-in optimizer (`muon_adamw`, `nora_nadamw`) | `muon_adamw` |
+| `--weight_decay` | Weight decay (applied to Muon matrix params; non-matrix use 0) | 0.1 |
 | `--muon_momentum` | Muon momentum factor | 0.95 |
 | `--muon_nesterov` | Enable Nesterov momentum for Muon | True |
 | `--muon_ns_steps` | Newton-Schulz iteration steps for Muon | 5 |
 | `--muon_adjust_lr` | Muon LR adjustment strategy (`original`, `match_rms_adamw`) | `match_rms_adamw` |
+
+`nora_nadamw` routes internal `Linear.weight` matrices to **Nora** and
+embeddings, the LM head, norms, biases, LoRA factors, and fallback parameters to
+**NAdamW**. Parameters are classified by module role and identity, so tied
+embedding/head weights occur in exactly one group. Nora requires complete rows
+under DTensor sharding and rejects layouts sharded along the last dimension.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--nora_lr` | Nora learning rate | 5e-3 |
+| `--nora_beta` | Nora momentum-buffer EMA factor | 0.95 |
+| `--nora_momentum` | Nora Nesterov interpolation factor | 0.95 |
+| `--nora_weight_decay` | Nora matrix weight decay | 0.0 |
 
 Optimizer identity and hyperparameters are saved in checkpoint metadata. Optimizer
 states are intentionally not interchangeable: resume older MuonMix checkpoints
@@ -159,9 +160,7 @@ nohup python scripts/tools/train.py \
     --batch_per_device=4 \
     --grad_accum_steps=8 \
     --warmup_ratio=0.05 \
-    --optimizer=nora_nadamw \
     --max_lr=1e-4 \
-    --nora_lr=5e-3 \
     --max_grad_norm=1.0 \
     --weight_decay=0.1 \
     --window_size=2048 \

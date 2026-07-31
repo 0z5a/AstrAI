@@ -94,7 +94,7 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
 @click.option(
     "--optimizer",
     type=click.Choice(_OPTIMIZERS),
-    default="nora_nadamw",
+    default="muon_adamw",
     help="Built-in optimizer.",
 )
 @click.option(
@@ -267,7 +267,7 @@ def _print_dry_run(kwargs: dict) -> None:
         ("Epochs", str(kwargs.get("n_epoch", 1))),
         ("Batch/device", str(kwargs.get("batch_per_device", 1))),
         ("Grad accum", str(kwargs.get("grad_accum_steps", 1))),
-        ("Optimizer", str(kwargs.get("optimizer", "nora_nadamw"))),
+        ("Optimizer", str(kwargs.get("optimizer", "muon_adamw"))),
         ("Max LR", str(kwargs.get("max_lr", "?"))),
         ("Schedule", str(kwargs.get("schedule_type", "cosine"))),
         ("Warmup ratio", str(kwargs.get("warmup_ratio", 0.05))),
@@ -288,7 +288,7 @@ def create_model(config):
 
 
 def create_optimizer(
-    model, optimizer_name: str = "nora_nadamw", **kwargs
+    model, optimizer_name: str = "muon_adamw", **kwargs
 ) -> optim.Optimizer:
     return OptimizerFactory.create(optimizer_name, model, **kwargs)
 
@@ -412,7 +412,7 @@ def train(
         tokenizer_path=param_path,
     )
 
-    optimizer_name = kwargs.pop("optimizer", "nora_nadamw")
+    optimizer_name = kwargs.pop("optimizer", "muon_adamw")
     optimizer_kwargs = {
         "lr": kwargs.pop("max_lr"),
         "weight_decay": kwargs.pop("weight_decay"),
