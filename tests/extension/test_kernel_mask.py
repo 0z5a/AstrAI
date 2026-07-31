@@ -2,10 +2,10 @@
 
 import torch
 
-from tests.extension.conftest import D, skip_no_cuda
+from tests.extension.conftest import D, skip_no_kernel
 
 
-@skip_no_cuda
+@skip_no_kernel
 def test_kernel_accepts_2d_mask():
     """Kernel should accept 2D mask [batch, kv_len]."""
     from astrai.extension.attention_ops import attn_prefill
@@ -22,7 +22,7 @@ def test_kernel_accepts_2d_mask():
     assert out.shape == (batch, q_len, n_heads, D)
 
 
-@skip_no_cuda
+@skip_no_kernel
 def test_kernel_accepts_3d_mask():
     """Kernel should accept 3D mask [batch, q_len, kv_len]."""
     from astrai.extension.attention_ops import attn_prefill
@@ -38,7 +38,7 @@ def test_kernel_accepts_3d_mask():
     assert out.shape == (batch, q_len, n_heads, D)
 
 
-@skip_no_cuda
+@skip_no_kernel
 def test_kernel_accepts_4d_mask():
     """Kernel should accept 4D mask [batch, n_heads, q_len, kv_len]."""
     from astrai.extension.attention_ops import attn_prefill
@@ -55,7 +55,7 @@ def test_kernel_accepts_4d_mask():
     assert out.shape == (batch, q_len, n_heads, D)
 
 
-@skip_no_cuda
+@skip_no_kernel
 def test_4d_mask_matches_no_mask_when_all_true():
     """A 4D all-True mask should produce the same output as no mask."""
     from astrai.extension.attention_ops import attn_prefill

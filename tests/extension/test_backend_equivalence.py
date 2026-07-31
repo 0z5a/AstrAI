@@ -8,10 +8,10 @@ import torch
 
 from astrai.extension import ATTN_BACKEND, attn_backend
 from astrai.inference.core.cache import PagePool
-from tests.extension.conftest import D, skip_no_cuda
+from tests.extension.conftest import D, skip_no_kernel
 
 
-@skip_no_cuda
+@skip_no_kernel
 def test_training_forward_matches_torch(cuda_model):
     """Training forward (kv_cache=None) should produce identical logits."""
     model, _ = cuda_model
@@ -27,7 +27,7 @@ def test_training_forward_matches_torch(cuda_model):
     assert diff == 0.0, f"Training forward diff {diff} should be 0"
 
 
-@skip_no_cuda
+@skip_no_kernel
 def test_prefill_with_kv_cache_matches_torch(cuda_model):
     """Inference prefill with KV cache should match torch backend."""
     model, _ = cuda_model
@@ -93,7 +93,7 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
         assert d == 0.0, f"Prefill diff for sample {i}: {d}"
 
 
-@skip_no_cuda
+@skip_no_kernel
 def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     """Decode with mixed seq_lens in batch — padding mask must produce correct output."""
     model, _ = cuda_model
@@ -152,7 +152,7 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     assert diff < 0.05, f"Decode diff (mixed seq_lens): {diff}"
 
 
-@skip_no_cuda
+@skip_no_kernel
 def test_run_batch_cuda_matches_torch_greedy(cuda_model):
     """Greedy decode (temperature=0) should produce identical tokens."""
     from astrai.inference.core.scheduler import InferenceScheduler

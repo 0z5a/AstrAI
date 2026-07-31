@@ -4,13 +4,8 @@ import pytest
 import torch
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.extension import is_available
 from astrai.model.transformer import AutoRegressiveLM
-
-CUDA_AVAILABLE = torch.cuda.is_available() and is_available("attn_paged_decode")
-skip_no_cuda = pytest.mark.skipif(
-    not CUDA_AVAILABLE, reason="CUDA not available or kernels not built"
-)
+from tests.conftest import skip_no_kernel
 
 D = 64
 CFG = dict(

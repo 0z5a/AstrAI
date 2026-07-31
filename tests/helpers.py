@@ -165,6 +165,8 @@ class FakeTokenizer:
 class FakeExecutor:
     """Executor stub tracking ``sync_gradients`` and providing ``unwrap_model``."""
 
+    use_distributed = False
+
     def __init__(self, sync_gradients=True):
         self._sync_gradients = sync_gradients
 

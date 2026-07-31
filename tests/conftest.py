@@ -7,9 +7,15 @@ import pytest
 import torch
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers
 
+from astrai.extension import KERNEL_NAMES, is_available
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.tokenize import AutoTokenizer
 from tests.helpers import TINY_CONFIG, RandomTokenDataset, make_tiny_config
+
+CUDA_AVAIL = torch.cuda.is_available()
+KERNEL_AVAIL = CUDA_AVAIL and all(is_available(k) for k in KERNEL_NAMES)
+skip_no_cuda = pytest.mark.skipif(not CUDA_AVAIL, reason="CUDA not available")
+skip_no_kernel = pytest.mark.skipif(not KERNEL_AVAIL, reason="CUDA kernels not built")
 
 
 def pytest_configure(config):

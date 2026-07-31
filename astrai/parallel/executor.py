@@ -24,6 +24,49 @@ from astrai.parallel.setup import get_rank, get_world_size
 logger = logging.getLogger(__name__)
 
 
+def broadcast_state_dict(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+    src: int = 0,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Broadcast a state_dict from *src* rank to all ranks.
+
+    Tensors stay on their original device (GPU) for the broadcast.
+    All ranks must call this collectively.
+
+    On non-distributed runs, returns *state_dict* unchanged.
+    """
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return state_dict
+
+    rank = dist.get_rank()
+
+    # Broadcast metadata (keys, shapes, dtypes, device) so non-src ranks
+    # can allocate matching empty tensors on the correct device.
+    if rank == src:
+        device = next(iter(state_dict.values())).device
+        metadata = [
+            (k, tuple(v.shape), v.dtype, str(device)) for k, v in state_dict.items()
+        ]
+    else:
+        metadata = None
+    metadata_list = [metadata]
+    dist.broadcast_object_list(metadata_list, src=src)
+    metadata = metadata_list[0]
+
+    # Non-src ranks allocate empty tensors with the broadcasted metadata.
+    if rank != src:
+        state_dict = {
+            k: torch.empty(s, dtype=d, device=torch.device(dev))
+            for k, s, d, dev in metadata
+        }
+
+    # Broadcast each tensor in-place.
+    for tensor in state_dict.values():
+        dist.broadcast(tensor, src=src)
+
+    return state_dict
+
+
 def create_ref_model(
     model_fn: Callable[[], nn.Module],
     executor: Optional["BaseExecutor"] = None,
@@ -33,10 +76,18 @@ def create_ref_model(
 ) -> Optional[nn.Module]:
     """Create a frozen reference model from executor or state dict.
 
-    On non-rank-0, returns None (executor.unwrap_model returns None).
+    In distributed mode (FSDP), ``unwrap_model`` returns ``None`` on
+    non-rank-0.  The state_dict is broadcast from rank-0 to all ranks
+    so every rank gets a complete copy.
     """
     if state_dict is None and executor is not None and model is not None:
         state_dict = executor.unwrap_model(model)
+
+    # FSDP's unwrap_model returns None on non-rank-0. Broadcast from
+    # rank-0 so every rank receives a complete state_dict.
+    if executor is not None and executor.use_distributed:
+        state_dict = broadcast_state_dict(state_dict)
+
     if state_dict is None:
         return None
 

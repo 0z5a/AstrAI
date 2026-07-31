@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.factory import BaseFactory
+from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.rollout import RolloutResult
 
 
@@ -391,6 +392,8 @@ class GRPOStrategy(BaseStrategy):
     def sync_old_model(self):
         """Copy current policy weights to old model."""
         state_dict = self.executor.unwrap_model(self.model)
+        if self.executor.use_distributed:
+            state_dict = broadcast_state_dict(state_dict)
         if state_dict is not None:
             self.old_model.load_state_dict(state_dict)
 
