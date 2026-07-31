@@ -30,6 +30,8 @@ class TrainConfig(BaseConfig):
         strategy (str): Training strategy (seq, sft, dpo, grpo, online_*).
         dataset (Dataset): Dataset for training.
         optimizer_fn (Callable[[nn.Module], Optimizer]): Optimizer factory for training.
+        optimizer_name (Optional[str]): Serializable built-in optimizer identifier. Defaults to None.
+        optimizer_hyperparameters (Dict[str, Any]): Serializable optimizer settings. Defaults to {}.
         scheduler_fn (Callable[[Optimizer], LRScheduler]): Scheduler factory for training.
         n_epoch (int): Number of epochs for training. Defaults to 1.
         batch_per_device (int): Batch size per device. Defaults to 4.
@@ -74,6 +76,8 @@ class TrainConfig(BaseConfig):
     dataset: Dataset
     optimizer_fn: Callable[[nn.Module], Optimizer]
     scheduler_fn: Callable[[Optimizer], LRScheduler]
+    optimizer_name: Optional[str] = None
+    optimizer_hyperparameters: Dict[str, Any] = field(default_factory=dict)
     n_epoch: int = 1
     batch_per_device: int = 4
     grad_accum_steps: int = 1

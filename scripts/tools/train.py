@@ -1,115 +1,43 @@
 import os
 from collections.abc import Callable
 from functools import partial
-from typing import Any
 
 import click
 import torch
-from torch import Tensor, nn, optim
+from click.core import ParameterSource
+from torch import optim
 
 from astrai import setup_logging
 from astrai.config import AutoRegressiveLMConfig, TrainConfig
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
 from astrai.model import AutoRegressiveLM
 from astrai.model.components.decoder_block import DecoderBlock
+from astrai.optim import OptimizerFactory
 from astrai.trainer import SchedulerFactory, Trainer
 from astrai.trainer.rollout import BaseRewardModel
 
 
-class MuonMix(optim.Optimizer):
-    """Combined Muon (matrix) + AdamW (non-matrix) optimizer."""
-
-    def __init__(
-        self,
-        model: nn.Module,
-        lr: float = 3e-4,
-        weight_decay: float = 0.1,
-        momentum: float = 0.95,
-        nesterov: bool = True,
-        ns_steps: int = 5,
-        adjust_lr_fn: str = "match_rms_adamw",
-    ):
-        defaults = {
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "momentum": momentum,
-            "nesterov": nesterov,
-            "ns_steps": ns_steps,
-            "adjust_lr_fn": adjust_lr_fn,
-        }
-        params = [p for p in model.parameters() if p.requires_grad]
-        super().__init__(params, defaults)
-
-        matrix_params: list[Tensor] = []
-        other_params: list[Tensor] = []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if (
-                param.dim() >= 2
-                and "norm" not in name
-                and "bias" not in name
-                and "embed" not in name
-                and "lm_head" not in name
-            ):
-                matrix_params.append(param)
-            else:
-                other_params.append(param)
-
-        self.muon = optim.Muon(
-            matrix_params,
-            lr=lr,
-            weight_decay=weight_decay,
-            momentum=momentum,
-            nesterov=nesterov,
-            ns_steps=ns_steps,
-            adjust_lr_fn=adjust_lr_fn,
-        )
-        self.adamw = optim.AdamW(
-            [{"params": other_params, "weight_decay": 0.0}],
-            lr=lr,
-            betas=(0.9, 0.95),
-            fused=True,
-        )
-
-        self.param_groups = [*self.muon.param_groups, *self.adamw.param_groups]
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        self.muon.step(closure)
-        self.adamw.step(closure)
-
-    def zero_grad(self, set_to_none: bool = True):
-        self.muon.zero_grad(set_to_none)
-        self.adamw.zero_grad(set_to_none)
-
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "muon": self.muon.state_dict(),
-            "adamw": self.adamw.state_dict(),
-        }
-
-    def load_state_dict(self, state_dict: dict[str, Any]):
-        self.muon.load_state_dict(state_dict["muon"])
-        self.adamw.load_state_dict(state_dict["adamw"])
-        self.param_groups = [*self.muon.param_groups, *self.adamw.param_groups]
-
-
-def _merge_yaml_into_kwargs(config_path: str, passed_kwargs: dict) -> dict:
-    """Load YAML config, then override with explicit CLI kwargs (None excluded)."""
+def _merge_yaml_into_kwargs(
+    config_path: str,
+    passed_kwargs: dict,
+    explicit_keys: set[str] | None = None,
+) -> dict:
+    """Merge Click defaults, YAML values, then explicit CLI values."""
     import yaml
 
     with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 
-    merged = {}
+    merged = dict(passed_kwargs)
     for section in ("model", "data", "parallel", "training", "ckpt", "log"):
         if section in cfg:
             merged.update(cfg[section])
 
-    for key, value in passed_kwargs.items():
-        if value is not None:
-            merged[key] = value
+    if explicit_keys is None:
+        explicit_keys = set(passed_kwargs)
+    for key in explicit_keys:
+        if key in passed_kwargs:
+            merged[key] = passed_kwargs[key]
 
     return merged
 
@@ -117,6 +45,7 @@ def _merge_yaml_into_kwargs(config_path: str, passed_kwargs: dict) -> dict:
 _TRAIN_TYPE = ["seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"]
 _PARALLEL = ["none", "ddp", "fsdp"]
 _SCHEDULES = ["cosine", "sgdr", "wsd"]
+_OPTIMIZERS = OptimizerFactory.list_registered()
 _BACKENDS = ["nccl", "gloo"]
 _START_METHODS = ["spawn", "fork", "forkserver"]
 
@@ -163,9 +92,24 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
 )
 @click.option("--max_lr", type=float, default=3e-4, help="Max learning rate.")
 @click.option(
+    "--optimizer",
+    type=click.Choice(_OPTIMIZERS),
+    default="nora_nadamw",
+    help="Built-in optimizer.",
+)
+@click.option(
     "--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping."
 )
-@click.option("--weight_decay", type=float, default=0.1, help="Weight decay.")
+@click.option(
+    "--weight_decay",
+    type=float,
+    default=0.1,
+    help="Weight decay for eligible optimizer parameters.",
+)
+@click.option("--nora_lr", type=float, default=5e-3, help="Nora learning rate.")
+@click.option("--nora_beta", type=float, default=0.95, help="Nora EMA factor.")
+@click.option("--nora_momentum", type=float, default=0.95, help="Nora update momentum.")
+@click.option("--nora_weight_decay", type=float, default=0.0, help="Nora weight decay.")
 @click.option("--muon_momentum", type=float, default=0.95, help="Muon momentum factor.")
 @click.option("--muon_nesterov/--no-muon_nesterov", default=True, help="Muon Nesterov.")
 @click.option("--muon_ns_steps", type=int, default=5, help="Muon Newton-Schulz steps.")
@@ -283,8 +227,14 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
 @click.pass_context
 def train_command(ctx, config_path, dry_run, metrics, **kwargs):
     """Start model training (pretrain / SFT / DPO / GRPO)."""
+    kwargs["metrics"] = metrics
     if config_path:
-        kwargs = _merge_yaml_into_kwargs(config_path, kwargs)
+        explicit_keys = {
+            key
+            for key in kwargs
+            if ctx.get_parameter_source(key) is ParameterSource.COMMANDLINE
+        }
+        kwargs = _merge_yaml_into_kwargs(config_path, kwargs, explicit_keys)
 
     required = ["train_type", "data_root_path", "param_path"]
     missing = [k for k in required if kwargs.get(k) is None]
@@ -295,7 +245,7 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
         )
 
     # Convert tuple back to list
-    kwargs["metrics"] = list(metrics)
+    kwargs["metrics"] = list(kwargs["metrics"])
     # Remove tp_size (not yet wired)
     kwargs.pop("tp_size", None)
 
@@ -317,6 +267,7 @@ def _print_dry_run(kwargs: dict) -> None:
         ("Epochs", str(kwargs.get("n_epoch", 1))),
         ("Batch/device", str(kwargs.get("batch_per_device", 1))),
         ("Grad accum", str(kwargs.get("grad_accum_steps", 1))),
+        ("Optimizer", str(kwargs.get("optimizer", "nora_nadamw"))),
         ("Max LR", str(kwargs.get("max_lr", "?"))),
         ("Schedule", str(kwargs.get("schedule_type", "cosine"))),
         ("Warmup ratio", str(kwargs.get("warmup_ratio", 0.05))),
@@ -336,8 +287,10 @@ def create_model(config):
     return AutoRegressiveLM(config).to(dtype=torch.bfloat16)
 
 
-def create_optimizer(model, **kwargs) -> MuonMix:
-    return MuonMix(model, **kwargs)
+def create_optimizer(
+    model, optimizer_name: str = "nora_nadamw", **kwargs
+) -> optim.Optimizer:
+    return OptimizerFactory.create(optimizer_name, model, **kwargs)
 
 
 def create_scheduler(
@@ -459,15 +412,51 @@ def train(
         tokenizer_path=param_path,
     )
 
+    optimizer_name = kwargs.pop("optimizer", "nora_nadamw")
+    optimizer_kwargs = {
+        "lr": kwargs.pop("max_lr"),
+        "weight_decay": kwargs.pop("weight_decay"),
+        "nora_lr": kwargs.pop("nora_lr", 5e-3),
+        "nora_beta": kwargs.pop("nora_beta", 0.95),
+        "nora_momentum": kwargs.pop("nora_momentum", 0.95),
+        "nora_weight_decay": kwargs.pop("nora_weight_decay", 0.0),
+        "momentum": kwargs.pop("muon_momentum", 0.95),
+        "nesterov": kwargs.pop("muon_nesterov", True),
+        "ns_steps": kwargs.pop("muon_ns_steps", 5),
+        "adjust_lr_fn": kwargs.pop("muon_adjust_lr", "match_rms_adamw"),
+    }
     optimizer_fn = partial(
         create_optimizer,
-        lr=kwargs.pop("max_lr"),
-        weight_decay=kwargs.pop("weight_decay"),
-        momentum=kwargs.pop("muon_momentum"),
-        nesterov=kwargs.pop("muon_nesterov"),
-        ns_steps=kwargs.pop("muon_ns_steps"),
-        adjust_lr_fn=kwargs.pop("muon_adjust_lr"),
+        optimizer_name=optimizer_name,
+        **optimizer_kwargs,
     )
+    if optimizer_name == "nora_nadamw":
+        optimizer_hyperparameters = {
+            key: optimizer_kwargs[key]
+            for key in (
+                "lr",
+                "weight_decay",
+                "nora_lr",
+                "nora_beta",
+                "nora_momentum",
+                "nora_weight_decay",
+            )
+        }
+        optimizer_hyperparameters.update(
+            {"nadamw_betas": [0.9, 0.999], "nadamw_eps": 1e-8, "nora_eps": 1e-10}
+        )
+    else:
+        optimizer_hyperparameters = {
+            key: optimizer_kwargs[key]
+            for key in (
+                "lr",
+                "weight_decay",
+                "momentum",
+                "nesterov",
+                "ns_steps",
+                "adjust_lr_fn",
+            )
+        }
 
     total_steps = compute_total_steps(
         len(dataset), n_epoch, batch_per_device, nprocs, grad_accum_steps
@@ -516,6 +505,8 @@ def train(
         dataset=dataset,
         optimizer_fn=optimizer_fn,
         scheduler_fn=scheduler_fn,
+        optimizer_name=optimizer_name,
+        optimizer_hyperparameters=optimizer_hyperparameters,
         ckpt_dir=ckpt_dir,
         n_epoch=n_epoch,
         batch_per_device=batch_per_device,

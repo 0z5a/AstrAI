@@ -107,7 +107,9 @@ nohup python scripts/tools/train.py \
     --batch_per_device=4 \
     --grad_accum_steps=8 \
     --warmup_ratio=0.05 \
+    --optimizer=nora_nadamw \
     --max_lr=1e-4 \
+    --nora_lr=5e-3 \
     --max_grad_norm=1.0 \
     --weight_decay=0.1 \
     --window_size=2048 \
