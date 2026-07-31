@@ -67,14 +67,17 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
             partial = warp_reduce_sum(partial) * p.scale;
 
             int kv_idx = chunk_start + s;
+            bool masked = false;
             if constexpr (HasMask) {
                 if (!p.mask[mask_base + kv_idx])
-                    partial = -FLT_MAX;
+                    masked = true;
             }
             if constexpr (IsCausal) {
                 if (kv_idx > p.causal_offset)
-                    partial = -FLT_MAX;
+                    masked = true;
             }
+            if (masked)
+                partial = -FLT_MAX;
 
             float new_m = fmaxf(m, partial);
             float alpha = __expf(m - new_m);
@@ -85,7 +88,11 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
             int logical_page = pos / p.page_size;
             int page_offset = pos % p.page_size;
             int phys_page = p.page_table[batch * p.max_pages + logical_page];
-            if (phys_page >= 0) {
+            if (masked) {
+                #pragma unroll
+                for (int i = 0; i < hd_per_thread; i++)
+                    acc_reg[i] = fmaf(acc_reg[i], alpha, 0.0f);
+            } else if (phys_page >= 0) {
                 int64_t v_base = (int64_t)phys_page * p.page_size * p.kv_head * p.head_dim
                                + (int64_t)page_offset * p.kv_head * p.head_dim
                                + (int64_t)kv_head * p.head_dim;
