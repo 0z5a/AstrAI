@@ -5,6 +5,8 @@
 #include "attn_warp_utils.cuh"
 constexpr int PDC_CHUNK = 64;
 
+// Scalar paged decode (fallback for sm < 80, no tensor cores).
+// Reads K/V from flat pool via req_to_token indexing.
 template <int HEAD_DIM, bool IsCausal, bool HasMask>
 __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) {
     int batch = blockIdx.x / p.kv_head;
@@ -15,8 +17,11 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
     int lane = threadIdx.x;
     int hd_per_thread = p.head_dim / 32;
 
+    const int seq_len = p.kv_indptr[batch + 1] - p.kv_indptr[batch];
+    const int64_t req_idx = p.req_pool_indices[batch];
+
     float q_reg[8];
-    int q_off = batch * p.q_stride_b + q_head * p.q_stride_h
+    int q_off = batch * p.q_stride_l + q_head * p.q_stride_h
               + lane * hd_per_thread * p.q_stride_d;
     #pragma unroll
     for (int i = 0; i < hd_per_thread; i++)
@@ -26,16 +31,19 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
 
     extern __shared__ __align__(16) bf16 k_smem[];
 
-    int chunks_total = (p.kv_len + PDC_CHUNK - 1) / PDC_CHUNK;
+    int chunks_total = (seq_len + PDC_CHUNK - 1) / PDC_CHUNK;
     int chunks_per_split = (chunks_total + p.num_splits - 1) / p.num_splits;
     int ch_begin = split * chunks_per_split;
     int ch_end = min(chunks_total, ch_begin + chunks_per_split);
 
-    const int mask_base = batch * p.mask_b_stride + q_head * p.mask_h_stride;
+    const int mask_base = batch * p.mask_b_stride;
+    const int64_t pool_stride = (int64_t)p.kv_head * p.head_dim;
+    const int64_t head_off = (int64_t)kv_head * p.head_dim;
+    const int64_t rtt_stride = (int64_t)p.max_context_len;
 
     for (int ci = ch_begin; ci < ch_end; ci++) {
         int chunk_start = ci * PDC_CHUNK;
-        int this_chunk = min(PDC_CHUNK, p.kv_len - chunk_start);
+        int this_chunk = min(PDC_CHUNK, seq_len - chunk_start);
 
         int total = this_chunk * p.head_dim;
         for (int i = threadIdx.y * 32 + lane; i < total;
@@ -43,14 +51,9 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
             int s = i / p.head_dim;
             int d_dim = i % p.head_dim;
             int pos = chunk_start + s;
-            int logical_page = pos / p.page_size;
-            int page_offset = pos % p.page_size;
-            int phys_page = p.page_table[batch * p.max_pages + logical_page];
-            if (phys_page >= 0) {
-                int64_t off = (int64_t)phys_page * p.page_size * p.kv_head * p.head_dim
-                            + (int64_t)page_offset * p.kv_head * p.head_dim
-                            + (int64_t)kv_head * p.head_dim
-                            + d_dim;
+            int64_t slot = p.req_to_token[req_idx * rtt_stride + pos];
+            if (slot >= 0) {
+                int64_t off = slot * pool_stride + head_off + d_dim;
                 k_smem[i] = p.k_cache[off];
             } else {
                 k_smem[i] = __float2bfloat16(0.0f);
@@ -85,17 +88,13 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
             d = d * alpha + beta;
 
             int pos = chunk_start + s;
-            int logical_page = pos / p.page_size;
-            int page_offset = pos % p.page_size;
-            int phys_page = p.page_table[batch * p.max_pages + logical_page];
+            int64_t slot = p.req_to_token[req_idx * rtt_stride + pos];
             if (masked) {
                 #pragma unroll
                 for (int i = 0; i < hd_per_thread; i++)
                     acc_reg[i] = fmaf(acc_reg[i], alpha, 0.0f);
-            } else if (phys_page >= 0) {
-                int64_t v_base = (int64_t)phys_page * p.page_size * p.kv_head * p.head_dim
-                               + (int64_t)page_offset * p.kv_head * p.head_dim
-                               + (int64_t)kv_head * p.head_dim;
+            } else if (slot >= 0) {
+                int64_t v_base = slot * pool_stride + head_off;
                 #pragma unroll
                 for (int i = 0; i < hd_per_thread; i++)
                     acc_reg[i] = fmaf(acc_reg[i], alpha,
@@ -148,6 +147,6 @@ __global__ void paged_attn_decode_combine_kernel(PagedAttentionParams<bf16> p) {
     }
 
     float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
-    int o_off = batch * p.q_stride_b + q_head * p.q_stride_h + d * p.q_stride_d;
+    int o_off = batch * p.q_stride_l + q_head * p.q_stride_h + d * p.q_stride_d;
     p.o[o_off] = __float2bfloat16(acc * inv);
 }

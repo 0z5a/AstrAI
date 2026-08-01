@@ -13,18 +13,26 @@ from tests.extension.conftest import D, skip_no_kernel
 
 @skip_no_kernel
 def test_training_forward_matches_torch(cuda_model):
-    """Training forward (kv_cache=None) should produce identical logits."""
+    """Training forward (kv_cache=None) should produce identical logits.
+
+    CudaBackend is inference-only: it raises when kv_cache is None.  Training
+    must use TorchNativeBackend (the default).  Verify the torch path is
+    stable and that CudaBackend rejects the training path explicitly.
+    """
+    import pytest
+
     model, _ = cuda_model
     input_ids = torch.randint(0, 1000, (2, 16), device="cuda")
 
     with torch.no_grad():
         out_torch = model(input_ids)
-    with attn_backend(ATTN_BACKEND.CUDA):
-        with torch.no_grad():
-            out_cuda = model(input_ids)
 
-    diff = (out_torch["logits"].float() - out_cuda["logits"].float()).abs().max().item()
-    assert diff == 0.0, f"Training forward diff {diff} should be 0"
+    with pytest.raises(RuntimeError, match="does not support training"):
+        with attn_backend(ATTN_BACKEND.CUDA):
+            with torch.no_grad():
+                model(input_ids)
+
+    assert out_torch["logits"].shape[0] == 2
 
 
 @skip_no_kernel

@@ -12,8 +12,13 @@ from astrai.model import AutoModel
 
 _DTYPES = ["bfloat16", "float16", "float32"]
 _CACHES = ["contiguous", "paged"]
-DEFAULT_CKPT = str(Path(__file__).resolve().parents[2] / "ckpt_bucket" / "kami-15bt")
+_BACKENDS = ["cuda", "torch_native"]
 CACHE_MAX_SEQ = 2048
+
+_BACKEND_MAP = {
+    "cuda": ATTN_BACKEND.CUDA,
+    "torch_native": ATTN_BACKEND.TORCH_NATIVE,
+}
 
 
 class BenchmarkResult:
@@ -42,12 +47,14 @@ class GenerationBenchmark:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         cache_type: str = "contiguous",
+        backend: ATTN_BACKEND = ATTN_BACKEND.CUDA,
     ):
         self.device = device
         self.dtype = dtype
         self.cache_type = cache_type
         self.model = model
         self.config = config
+        self.backend = backend
 
     def _make_pool(self, batch_size: int) -> PagePool:
         return PagePool(
@@ -82,7 +89,7 @@ class GenerationBenchmark:
         kv_cache = pool.bind_tasks(
             task_ids, [prompt_len] * batch_size, self.device, start_pos=0
         )
-        with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
+        with torch.inference_mode(), attn_backend(self.backend):
             self.model(
                 input_ids,
                 input_mask=input_mask,
@@ -105,7 +112,7 @@ class GenerationBenchmark:
             total_len, device=self.device
         )
         kv_cache = pool.bind_tasks(task_ids, [seq_len + 1] * batch_size, self.device)
-        with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
+        with torch.inference_mode(), attn_backend(self.backend):
             self.model(
                 input_ids,
                 input_mask=input_mask,
@@ -121,6 +128,11 @@ class GenerationBenchmark:
     ) -> BenchmarkResult:
         import time
 
+        pool = self._make_pool(batch_size)
+        task_ids = [f"bench_prefill_{i}" for i in range(batch_size)]
+        for tid in task_ids:
+            pool.task_alloc(tid, list(range(prompt_length)))
+
         input_ids = torch.randint(
             0, self.config.vocab_size, (batch_size, prompt_length), device=self.device
         )
@@ -129,16 +141,32 @@ class GenerationBenchmark:
             .unsqueeze(0)
             .expand(batch_size, -1)
         )
+        input_mask = position_ids.unsqueeze(-1) >= torch.arange(
+            prompt_length, device=self.device
+        )
+        kv_cache = pool.bind_tasks(
+            task_ids, [prompt_length] * batch_size, self.device, start_pos=0
+        )
 
         for _ in range(3):
-            with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
-                self.model(input_ids, position_ids=position_ids)
+            with torch.inference_mode(), attn_backend(self.backend):
+                self.model(
+                    input_ids,
+                    input_mask=input_mask,
+                    kv_cache=kv_cache,
+                    position_ids=position_ids,
+                )
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(num_trials):
-            with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
-                self.model(input_ids, position_ids=position_ids)
+            with torch.inference_mode(), attn_backend(self.backend):
+                self.model(
+                    input_ids,
+                    input_mask=input_mask,
+                    kv_cache=kv_cache,
+                    position_ids=position_ids,
+                )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
         tokens = batch_size * prompt_length * num_trials
@@ -208,6 +236,17 @@ def print_benchmark_result(result: BenchmarkResult) -> None:
 @click.option(
     "--cache", type=click.Choice(_CACHES), default="contiguous", help="KV cache type."
 )
+@click.option(
+    "--backend",
+    type=click.Choice(_BACKENDS),
+    default="cuda",
+    help="Attention backend.",
+)
+@click.option(
+    "--compare",
+    is_flag=True,
+    help="Run both backends and print side-by-side speed comparison.",
+)
 @click.option("--batch_size", type=int, default=4, help="Batch size.")
 @click.option("--prompt_length", type=int, default=512, help="Prompt length.")
 @click.option("--gen_length", type=int, default=128, help="Generation length.")
@@ -216,13 +255,16 @@ def print_benchmark_result(result: BenchmarkResult) -> None:
 @click.option("--decode_only", is_flag=True, help="Decode benchmark only.")
 @click.option(
     "--ckpt",
-    default=DEFAULT_CKPT,
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
     help="Checkpoint directory.",
 )
 def benchmark_command(
     device: str,
     dtype: str,
     cache: str,
+    backend: str,
+    compare: bool,
     batch_size: int,
     prompt_length: int,
     gen_length: int,
@@ -244,32 +286,38 @@ def benchmark_command(
     model.to(device=device, dtype=dtype_map[dtype])
     model.eval()
 
-    bench = GenerationBenchmark(
-        model=model,
-        config=config,
-        device=device,
-        dtype=dtype_map[dtype],
-        cache_type=cache,
-    )
+    backends = _BACKENDS if compare else [backend]
 
-    click.secho(f"Benchmark: device={device} dtype={dtype}", bold=True)
-
-    if not decode_only:
-        result = bench.run_prefill_benchmark(
-            batch_size=batch_size,
-            prompt_length=prompt_length,
-            num_trials=num_trials,
+    for name in backends:
+        bench = GenerationBenchmark(
+            model=model,
+            config=config,
+            device=device,
+            dtype=dtype_map[dtype],
+            cache_type=cache,
+            backend=_BACKEND_MAP[name],
         )
-        print_benchmark_result(result)
 
-    if not prefill_only:
-        result = bench.run_decoding_benchmark(
-            batch_size=batch_size,
-            prompt_length=prompt_length,
-            gen_length=gen_length,
-            num_trials=num_trials,
+        click.secho(
+            f"Benchmark: device={device} dtype={dtype} backend={name}", bold=True
         )
-        print_benchmark_result(result)
+
+        if not decode_only:
+            result = bench.run_prefill_benchmark(
+                batch_size=batch_size,
+                prompt_length=prompt_length,
+                num_trials=num_trials,
+            )
+            print_benchmark_result(result)
+
+        if not prefill_only:
+            result = bench.run_decoding_benchmark(
+                batch_size=batch_size,
+                prompt_length=prompt_length,
+                gen_length=gen_length,
+                num_trials=num_trials,
+            )
+            print_benchmark_result(result)
 
 
 if __name__ == "__main__":

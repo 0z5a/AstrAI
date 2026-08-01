@@ -134,54 +134,178 @@ inline void attn_pack_params(
     pack_mask(mask, p);
 }
 
-// ---- attn_pack_paged_params ----
+// ---- attn_pack_paged_decode_params ----
+// SGLang-style: flat KV pool + req_to_token indexing + variable
+// seq_lens via kv_indptr.  Q is [batch, q_head, head_dim] (q_len=1 per req).
 template<typename T>
-inline void attn_pack_paged_params(
+inline void attn_pack_paged_decode_params(
     torch::Tensor q,
-    torch::Tensor page_table,
     torch::Tensor k_cache,
     torch::Tensor v_cache,
-    int64_t page_size,
-    int64_t kv_len,
+    torch::Tensor req_to_token,
+    torch::Tensor req_pool_indices,
+    torch::Tensor kv_indptr,
+    int64_t max_seq_len,
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
-    int64_t layout,
     PagedAttentionParams<T>& p
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
 
-    TORCH_CHECK(q.is_cuda() && page_table.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda());
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda());
+    TORCH_CHECK(req_to_token.is_cuda() && req_pool_indices.is_cuda() && kv_indptr.is_cuda());
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bf16");
     TORCH_CHECK(k_cache.dtype() == torch::kBFloat16, "k_cache must be bf16");
     TORCH_CHECK(v_cache.dtype() == torch::kBFloat16, "v_cache must be bf16");
-    TORCH_CHECK(page_table.dtype() == torch::kLong, "page_table must be int64");
-    TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "k_cache and v_cache must have identical shapes");
+    TORCH_CHECK(req_to_token.dtype() == torch::kLong, "req_to_token must be int64");
+    TORCH_CHECK(req_pool_indices.dtype() == torch::kLong, "req_pool_indices must be int64");
+    TORCH_CHECK(kv_indptr.dtype() == torch::kInt32, "kv_indptr must be int32");
+    TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "k_cache and v_cache must match");
+    TORCH_CHECK(k_cache.dim() == 3, "k_cache must be 3D [size, kv_head, head_dim]");
+    TORCH_CHECK(q.dim() == 3, "q must be 3D [batch, q_head, head_dim]");
 
-    extract_q_dims_and_strides(q, layout, p);
-
-    p.kv_head = (int)k_cache.size(2);
-    p.kv_len = (int)kv_len;
-    p.page_size = (int)page_size;
-    p.max_pages = (int)page_table.size(1);
-
-    TORCH_CHECK(q.size(2) == 1, "Q seq_len must be 1 (decode)");
+    p.batch = (int)q.size(0);
+    p.q_head = (int)q.size(1);
+    p.head_dim = (int)q.size(2);
+    p.kv_head = (int)k_cache.size(1);
+    TORCH_CHECK(k_cache.size(2) == p.head_dim, "k_cache head_dim mismatch");
     TORCH_CHECK(p.head_dim % 32 == 0, "head_dim must be multiple of 32");
-    TORCH_CHECK(k_cache.size(1) == page_size,
-                "k_cache dim 1 must equal page_size, got ",
-                k_cache.size(1), " vs ", page_size);
+    TORCH_CHECK(p.q_head % p.kv_head == 0, "q_head must be divisible by kv_head");
+
+    p.q_stride_l = (int)q.stride(0);
+    p.q_stride_h = (int)q.stride(1);
+    p.q_stride_d = (int)q.stride(2);
+
+    p.k_cache = (const T*)k_cache.data_ptr();
+    p.v_cache = (const T*)v_cache.data_ptr();
+    p.q = (const T*)q.data_ptr();
+    p.req_to_token = req_to_token.data_ptr<int64_t>();
+    p.req_pool_indices = req_pool_indices.data_ptr<int64_t>();
+    p.kv_indptr = kv_indptr.data_ptr<int>();
+    p.qo_indptr = nullptr;
+    p.max_context_len = (int)req_to_token.size(1);
+    p.max_seq_len = (int)max_seq_len;
+    p.total_q = p.batch;  // decode: 1 Q token per request
+    p.max_q_len = 1;
 
     p.causal_offset = (int)causal_offset;
     p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
     p.scale = (scale > 0.0) ? (float)scale : 1.0f / sqrtf((float)p.head_dim);
 
-    p.page_table = page_table.data_ptr<int64_t>();
-    p.k_cache = (const T*)k_cache.data_ptr();
-    p.v_cache = (const T*)v_cache.data_ptr();
-    p.q = (const T*)q.data_ptr();
+    if (p.use_mask) {
+        auto m = mask.value();
+        TORCH_CHECK(m.is_cuda() && m.dtype() == torch::kBool, "mask must be bool CUDA");
+        TORCH_CHECK(m.size(0) == p.batch, "mask batch mismatch");
+        p.mask_b_stride = (int)m.stride(0);
+        p.mask_h_stride = 0;
+        p.mask_q_stride = 0;
+        p.mask = m.data_ptr<bool>();
+    } else {
+        p.mask = nullptr;
+        p.mask_b_stride = 0;
+        p.mask_h_stride = 0;
+        p.mask_q_stride = 0;
+    }
+
     p.o = nullptr;
     p.o_part = nullptr;
     p.ml_part = nullptr;
+}
 
-    pack_mask(mask, p);
+// ---- attn_pack_paged_prefill_params ----
+// SGLang-style: flat KV pool + req_to_token + ragged batch via qo_indptr.
+// Q is [total_q, q_head, head_dim] (flattened across all requests).
+template<typename T>
+inline void attn_pack_paged_prefill_params(
+    torch::Tensor q,
+    torch::Tensor k_cache,
+    torch::Tensor v_cache,
+    torch::Tensor req_to_token,
+    torch::Tensor req_pool_indices,
+    torch::Tensor kv_indptr,
+    torch::Tensor qo_indptr,
+    c10::optional<torch::Tensor> mask,
+    int64_t max_q_len,
+    int64_t causal_offset,
+    double scale,
+    PagedAttentionParams<T>& p
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda());
+    TORCH_CHECK(req_to_token.is_cuda() && req_pool_indices.is_cuda());
+    TORCH_CHECK(kv_indptr.is_cuda() && qo_indptr.is_cuda());
+    TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bf16");
+    TORCH_CHECK(k_cache.dtype() == torch::kBFloat16, "k_cache must be bf16");
+    TORCH_CHECK(v_cache.dtype() == torch::kBFloat16, "v_cache must be bf16");
+    TORCH_CHECK(req_to_token.dtype() == torch::kLong, "req_to_token must be int64");
+    TORCH_CHECK(req_pool_indices.dtype() == torch::kLong, "req_pool_indices must be int64");
+    TORCH_CHECK(kv_indptr.dtype() == torch::kInt32, "kv_indptr must be int32");
+    TORCH_CHECK(qo_indptr.dtype() == torch::kInt32, "qo_indptr must be int32");
+    TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "k_cache and v_cache must match");
+    TORCH_CHECK(k_cache.dim() == 3, "k_cache must be 3D [size, kv_head, head_dim]");
+    TORCH_CHECK(q.dim() == 3, "q must be 3D [total_q, q_head, head_dim]");
+
+    p.q_head = (int)q.size(1);
+    p.head_dim = (int)q.size(2);
+    p.kv_head = (int)k_cache.size(1);
+    p.batch = (int)req_pool_indices.size(0);
+    TORCH_CHECK(k_cache.size(2) == p.head_dim, "k_cache head_dim mismatch");
+    TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
+    TORCH_CHECK(p.q_head % p.kv_head == 0, "q_head must be divisible by kv_head");
+    TORCH_CHECK(kv_indptr.size(0) == p.batch + 1, "kv_indptr must be [batch+1]");
+    TORCH_CHECK(qo_indptr.size(0) == p.batch + 1, "qo_indptr must be [batch+1]");
+
+    p.q_stride_l = (int)q.stride(0);
+    p.q_stride_h = (int)q.stride(1);
+    p.q_stride_d = (int)q.stride(2);
+
+    p.k_cache = (const T*)k_cache.data_ptr();
+    p.v_cache = (const T*)v_cache.data_ptr();
+    p.q = (const T*)q.data_ptr();
+    p.req_to_token = req_to_token.data_ptr<int64_t>();
+    p.req_pool_indices = req_pool_indices.data_ptr<int64_t>();
+    p.kv_indptr = kv_indptr.data_ptr<int>();
+    p.qo_indptr = qo_indptr.data_ptr<int>();
+    p.max_context_len = (int)req_to_token.size(1);
+    p.total_q = (int)q.size(0);  // prefill: flattened Q across all requests
+    p.max_q_len = (int)max_q_len;
+    // max_seq_len is unused by the prefill path (decode uses it for split
+    // computation); fill with max_q_len only to keep the POD struct defined.
+    p.max_seq_len = p.max_q_len;
+
+    p.causal_offset = (int)causal_offset;
+    p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
+    if (p.use_mask) {
+        auto m = mask.value();
+        TORCH_CHECK(m.is_cuda() && m.dtype() == torch::kBool, "mask must be bool CUDA");
+        TORCH_CHECK(m.size(0) == p.batch, "mask batch mismatch");
+        if (m.dim() == 2) {
+            TORCH_CHECK(m.size(1) <= p.max_context_len, "mask kv_len mismatch");
+            p.mask_b_stride = (int)m.stride(0);
+            p.mask_h_stride = 0;
+            p.mask_q_stride = 0;
+        } else if (m.dim() == 4) {
+            TORCH_CHECK(m.size(1) == 1 || m.size(1) == p.q_head, "mask head mismatch");
+            TORCH_CHECK(m.size(2) == 1 || m.size(2) == p.max_q_len, "mask q_len mismatch");
+            TORCH_CHECK(m.size(3) <= p.max_context_len, "mask kv_len mismatch");
+            p.mask_b_stride = (int)m.stride(0);
+            p.mask_h_stride = (m.size(1) == 1) ? 0 : (int)m.stride(1);
+            p.mask_q_stride = (m.size(2) == 1) ? 0 : (int)m.stride(2);
+        } else {
+            TORCH_CHECK(false, "mask must be 2D or 4D");
+        }
+        p.mask = m.data_ptr<bool>();
+    } else {
+        p.mask = nullptr;
+        p.mask_b_stride = 0;
+        p.mask_h_stride = 0;
+        p.mask_q_stride = 0;
+    }
+    p.scale = (scale > 0.0) ? (float)scale : 1.0f / sqrtf((float)p.head_dim);
+
+    p.o = nullptr;
+    p.o_part = nullptr;
+    p.ml_part = nullptr;
 }

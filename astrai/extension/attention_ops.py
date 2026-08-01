@@ -92,39 +92,94 @@ def attn_prefill(
 
 def attn_paged_decode(
     q: torch.Tensor,
-    page_table: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    page_size: int,
-    kv_len: int,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    max_seq_len: int,
     mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
 ) -> torch.Tensor:
-    """Paged GQA decode attention (q_len == 1, direct page-table access).
+    """SGLang-style paged decode (q_len == 1, flat KV pool).
+
+    Reads K/V directly from a flat pool [size, kv_head, head_dim] via
+    req_to_token indirect indexing.  Each request has its own seq_len
+    (from kv_indptr), eliminating padding waste.
 
     Args:
-        q: [batch, 1, n_heads, head_dim] (blhd, bf16)
-        page_table: [batch, max_pages] (int64)
-        k_cache: [n_pages, page_size, n_kv_heads, head_dim] (bf16)
+        q: [batch, n_heads, head_dim] (bf16, 3D — no seq dim)
+        k_cache: [pool_size, n_kv_heads, head_dim] (bf16, flat)
         v_cache: same as k_cache
-        page_size: tokens per page
-        kv_len: actual sequence length per request
-        mask: 2D [batch, kv_len] or 3D [batch, 1, kv_len] (bool, True=keep)
+        req_to_token: [num_reqs, max_context_len] (int64) — token -> slot
+        req_pool_indices: [batch] (int64) — rows into req_to_token
+        kv_indptr: [batch+1] (int32) — prefix sum of per-request seq_lens
+        max_seq_len: max per-request seq_len (Python int, for split computation)
+        mask: 2D [batch, max_seq_len] (bool, True=keep) or None
         is_causal: apply causal mask
 
     Returns:
-        [batch, 1, n_heads, head_dim] (blhd, bf16)
+        [batch, n_heads, head_dim] (bf16, 3D)
     """
     _check_available("attn_paged_decode")
-    causal_offset = (kv_len - 1) if is_causal else -1
+    causal_offset = 0 if is_causal else -1
     return _modules["attn_paged_decode"].attn_paged_decode(
         q,
-        page_table,
         k_cache,
         v_cache,
-        page_size,
-        kv_len,
+        req_to_token,
+        req_pool_indices,
+        kv_indptr,
+        max_seq_len,
         mask=mask,
         causal_offset=causal_offset,
-        layout=TensorLayout.BLHD,
+    )
+
+
+def attn_paged_prefill(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    max_q_len: int = 0,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    """SGLang-style paged prefill (ragged batch, flat KV pool).
+
+    Reads K/V directly from a flat pool [size, kv_head, head_dim] via
+    req_to_token.  Supports ragged batches: each request has its own
+    q_len and kv_len, addressed via qo_indptr and kv_indptr.
+
+    Args:
+        q: [total_q, n_heads, head_dim] (bf16, 3D — flattened across requests)
+        k_cache: [pool_size, n_kv_heads, head_dim] (bf16, flat)
+        v_cache: same as k_cache
+        req_to_token: [num_reqs, max_context_len] (int64)
+        req_pool_indices: [batch] (int64)
+        kv_indptr: [batch+1] (int32) — prefix sum of per-request kv_lens
+        qo_indptr: [batch+1] (int32) — prefix sum of per-request q_lens
+        mask: 4D [batch, 1, q_len, kv_len] (bool, True=keep) or None
+        max_q_len: max per-request q_len (Python int, for grid computation)
+        is_causal: apply causal mask
+
+    Returns:
+        [total_q, n_heads, head_dim] (bf16, 3D)
+    """
+    _check_available("attn_paged_prefill")
+    causal_offset = 0 if is_causal else -1
+    return _modules["attn_paged_prefill"].attn_paged_prefill(
+        q,
+        k_cache,
+        v_cache,
+        req_to_token,
+        req_pool_indices,
+        kv_indptr,
+        qo_indptr,
+        mask,
+        max_q_len,
+        causal_offset=causal_offset,
     )

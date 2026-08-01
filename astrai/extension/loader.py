@@ -11,7 +11,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-KERNEL_NAMES = ["attn_decode", "attn_prefill", "attn_paged_decode", "rotary_emb"]
+KERNEL_NAMES = [
+    "attn_decode",
+    "attn_prefill",
+    "attn_paged_decode",
+    "attn_paged_prefill",
+    "rotary_emb",
+]
 
 _available: dict[str, bool] = {}
 _modules: dict[str, object] = {}

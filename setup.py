@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 import warnings
@@ -89,14 +90,30 @@ if _should_build():
                 super().build_extensions()
                 return
 
+            # Each subprocess gets its own build-temp / build-lib so the
+            # ninja files (build.ninja, .ninja_log) never race.  The built
+            # .so files are then collected into the parent's build_lib so the
+            # normal setuptools copy steps (inplace / editable wheel) work.
             names = [e.name for e in self.extensions]
             env = {**os.environ, "BUILD_PARALLEL": "1"}
+            base = os.path.join("build", "parallel")
+            os.makedirs(base, exist_ok=True)
             procs = {}
             for i in range(0, len(names), max_workers):
                 batch = names[i : i + max_workers]
                 for name in batch:
                     e = {**env, "ASTRAI_BUILD_SINGLE_EXT": name}
-                    cmd = [sys.executable, __file__, "build_ext", "--inplace"]
+                    tag = name.replace(".", "_")
+                    subdir = os.path.join(base, tag)
+                    cmd = [
+                        sys.executable,
+                        __file__,
+                        "build_ext",
+                        "--build-temp",
+                        os.path.join(subdir, "temp"),
+                        "--build-lib",
+                        os.path.join(subdir, "lib"),
+                    ]
                     procs[name] = subprocess.Popen(
                         cmd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
                     )
@@ -108,6 +125,19 @@ if _should_build():
                             f"parallel build failed for {name} "
                             f"(exit {procs[name].returncode})"
                         )
+                    self._collect_extensions(
+                        os.path.join(base, name.replace(".", "_"), "lib")
+                    )
+
+        def _collect_extensions(self, sub_lib):
+            src = os.path.join(sub_lib, "astrai", "extension", "lib")
+            if not os.path.isdir(src):
+                return
+            dst = os.path.join(self.build_lib, "astrai", "extension", "lib")
+            os.makedirs(dst, exist_ok=True)
+            for f in os.listdir(src):
+                if f.endswith(".so"):
+                    shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
 
     cmdclass["build_ext"] = ParallelBuildExtension
 

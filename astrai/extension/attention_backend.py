@@ -38,8 +38,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.extension.attention_ops import attn_paged_decode, attn_prefill
-from astrai.extension.loader import is_available
+from astrai.extension.attention_ops import (
+    attn_paged_decode,
+    attn_paged_prefill,
+)
 from astrai.inference.core.cache import KVCache
 
 _current_backend: contextvars.ContextVar["AttentionBackend"] = contextvars.ContextVar(
@@ -307,23 +309,18 @@ _default_backend = TorchNativeBackend()
 class CudaBackend(AttentionBackend):
     """CUDA kernel backend with direct KV cache access.
 
-    Decode path: writes K/V to cache, then calls ``attn_paged_decode``
-    with ``page_size=1`` (each token slot is a single-token "page").
-    The ``req_to_token`` table serves directly as the page table.
+    Decode path: writes K/V to the flat pool, then calls
+    ``attn_paged_decode`` with req_to_token + kv_indptr.
 
-    Prefill path: writes K/V to cache, gathers full-sequence K/V via
-    indirect indexing (same as TorchNativeBackend), then calls
-    ``attn_prefill``.
+    Prefill path: writes K/V to the flat pool, then calls
+    ``attn_paged_prefill`` with ragged-batch support via qo_indptr +
+    kv_indptr.
 
-    Training path (``kv_cache is None``): calls ``attn_prefill`` directly
-    on the projected q/k/v.
+    ``kv_cache is None`` (training) is not handled — use
+    ``TorchNativeBackend`` for training.
 
-    Falls back to ``TorchNativeBackend`` for any path where the
-    corresponding CUDA kernel is not available.
+    Raises ``RuntimeError`` if the required kernel is not available.
     """
-
-    def __init__(self):
-        self._fallback = TorchNativeBackend()
 
     def fwd_decode(
         self,
@@ -335,47 +332,34 @@ class CudaBackend(AttentionBackend):
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
     ) -> Tensor:
-        if kv_cache is None or not is_available("attn_paged_decode"):
-            return self._fallback.fwd_decode(
-                q, k, v, kv_cache, layer_id, attn_mask, is_causal
-            )
+        if kv_cache is None:
+            raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
         kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
         kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
 
-        max_len = kv_cache.max_len
+        b = q.size(0)
+        q_3d = q.squeeze(1)
 
-        if kv_cache.page_table is not None:
-            page_table = kv_cache.page_table
-        else:
-            page_table = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
+        kv_indptr = torch.zeros(b + 1, dtype=torch.int32, device=q.device)
+        kv_indptr[1:] = kv_cache.seq_lens.cumsum(0).to(torch.int32)
 
-        k_cache = kv_cache.k_buffer[layer_id].unsqueeze(1)
-        v_cache = kv_cache.v_buffer[layer_id].unsqueeze(1)
-
-        if q.size(0) == 1:
-            mask = None
-        elif kv_cache.decode_mask is not None:
+        mask = None
+        if b > 1 and kv_cache.decode_mask is not None:
             mask = kv_cache.decode_mask
-        else:
-            mask = (
-                torch.arange(max_len, device=q.device)[None, :]
-                < kv_cache.seq_lens[:, None]
-            )
 
         out = attn_paged_decode(
-            q,
-            page_table,
-            k_cache,
-            v_cache,
-            page_size=1,
-            kv_len=max_len,
+            q_3d,
+            kv_cache.k_buffer[layer_id],
+            kv_cache.v_buffer[layer_id],
+            kv_cache.req_to_token,
+            kv_cache.req_pool_indices,
+            kv_indptr,
+            kv_cache.max_len,
             mask=mask,
             is_causal=is_causal,
         )
-
-        out = out.flatten(2)
-        return out
+        return out.unsqueeze(1).flatten(2)
 
     def fwd_prefill(
         self,
@@ -388,32 +372,34 @@ class CudaBackend(AttentionBackend):
         is_causal: bool = False,
     ) -> Tensor:
         if kv_cache is None:
-            if is_available("attn_prefill"):
-                out = attn_prefill(q, k, v, mask=attn_mask, is_causal=is_causal)
-                return out.flatten(2)
-            return self._fallback.fwd_prefill(
-                q, k, v, kv_cache, layer_id, attn_mask, is_causal
-            )
-
-        if not is_available("attn_prefill"):
-            return self._fallback.fwd_prefill(
-                q, k, v, kv_cache, layer_id, attn_mask, is_causal
-            )
+            raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
         kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
         kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
 
-        max_len = kv_cache.max_len
-        indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
-        pos_mask = (
-            torch.arange(max_len, device=q.device)[None, :] < kv_cache.seq_lens[:, None]
-        )
-        indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
-        k_full = kv_cache.k_buffer[layer_id, indices]
-        v_full = kv_cache.v_buffer[layer_id, indices]
+        b = q.size(0)
+        q_len = q.size(1)
 
-        out = attn_prefill(q, k_full, v_full, mask=attn_mask, is_causal=is_causal)
-        return out.flatten(2)
+        kv_indptr = torch.zeros(b + 1, dtype=torch.int32, device=q.device)
+        kv_indptr[1:] = kv_cache.seq_lens.cumsum(0).to(torch.int32)
+
+        qo_indptr = torch.arange(b + 1, dtype=torch.int32, device=q.device) * q_len
+
+        q_flat = q.reshape(b * q_len, q.size(2), q.size(3))
+
+        out = attn_paged_prefill(
+            q_flat,
+            kv_cache.k_buffer[layer_id],
+            kv_cache.v_buffer[layer_id],
+            kv_cache.req_to_token,
+            kv_cache.req_pool_indices,
+            kv_indptr,
+            qo_indptr,
+            attn_mask,
+            q_len,
+            is_causal=is_causal,
+        )
+        return out.reshape(b, q_len, q.size(2), q.size(3)).flatten(2)
 
 
 _BACKEND_REGISTRY: dict[ATTN_BACKEND, type[AttentionBackend]] = {

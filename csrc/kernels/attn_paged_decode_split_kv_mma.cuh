@@ -5,12 +5,16 @@
 #include "attn_mma_utils.cuh"
 #include "attn_warp_utils.cuh"
 
-// Paged split-KV tensor-core decode via GQA head-packing.
-// Reads K/V directly from the page pool through a page table — one tile
-// (BC=32) fits within a single page (page_size >= 32), so the page-table
-// lookup happens once per tile for cp.async.
+// SGLang-style split-KV tensor-core decode.
 //
-// IsCausal and HasMask are compile-time bools.
+// Reads K/V directly from a flat pool [size, kv_head, head_dim] via
+// req_to_token indexing — no gather, no page-table dimension.
+// Each batch element has its own seq_len (from kv_indptr), eliminating
+// padding waste: short sequences only process the tiles they own.
+//
+// For decode (q_len=1), causal masking is implicit — each request attends
+// to [0, seq_len) which is exactly its valid range.  The IsCausal flag
+// is accepted for dispatch uniformity but does not change maxc.
 template <typename Traits, bool IsCausal, bool HasMask>
 __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16> p) {
     const int lane = threadIdx.x;
@@ -21,6 +25,10 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     const int kv_head = blockIdx.x % p.kv_head;
     const int batch = blockIdx.y;
     const int split = blockIdx.z;
+
+    // Per-request seq_len from device-side kv_indptr — no padding.
+    const int seq_len = p.kv_indptr[batch + 1] - p.kv_indptr[batch];
+    const int64_t req_idx = p.req_pool_indices[batch];
 
     constexpr int MAX_G = 16;
     const int G_total = p.q_head / p.kv_head;
@@ -38,13 +46,14 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     }
     __syncwarp();
 
-    const int q_base = batch * p.q_stride_b + q_head0 * p.q_stride_h;
+    const int q_base = batch * p.q_stride_l + q_head0 * p.q_stride_h;
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(p.q + q_base, p.q_stride_h, p.q_stride_d,
-                                  qra, qrb, va, vb, tid4, Qa);
+    load_q_mma_frags<Traits::KD>(p.q + q_base,
+                                   p.q_stride_h, p.q_stride_d,
+                                   qra, qrb, va, vb, tid4, Qa);
 
     float Oacc[Traits::DN8][4];
     #pragma unroll
@@ -52,19 +61,19 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
         Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
 
-    const int tiles_total = (p.kv_len + Traits::BC - 1) / Traits::BC;
+    const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
     const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
     const int ti_begin = split * tiles_per_split;
     const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
 
-    const int64_t page_stride = (int64_t)p.page_size * p.kv_head * Traits::HEAD_DIM;
-    const int64_t pos_stride  = (int64_t)p.kv_head * Traits::HEAD_DIM;
+    // Flat pool stride: [size, kv_head, head_dim] — contiguous.
+    const int64_t pool_stride = (int64_t)p.kv_head * Traits::HEAD_DIM;
     const int64_t head_off    = (int64_t)kv_head * Traits::HEAD_DIM;
+    const int64_t rtt_stride  = (int64_t)p.max_context_len;
 
-    // ---- Load tile lambda: paged addressing ----
-    // Unified per-element page-table lookup. When page_size >= BC, all
-    // elements in a tile share the same page, so the lookup is redundant
-    // but harmless (L1-cached). This avoids a branch on page_size.
+    // ---- Load tile lambda: SGLang addressing ----
+    // slot = req_to_token[req_idx * max_context_len + kc]
+    // gmem = k_cache[slot * pool_stride + head_off + d]
     auto load_tile = [&](int ti, int buf) {
         int kv0 = ti * Traits::BC;
         bf16* dK = sK + buf * Traits::BC * Traits::LD;
@@ -74,16 +83,13 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
              i += Traits::NUM_THREADS * Traits::VEC) {
             int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
             int kc = kv0 + r;
-            bool valid = (kc < p.kv_len);
+            bool valid = (kc < seq_len);
             if constexpr (HasMask) {
                 valid = valid && p.mask[batch * p.mask_b_stride + kc];
             }
-            int phys_page = valid ? p.page_table[batch * p.max_pages + kc] : 0;
-            valid = valid && (phys_page >= 0);
-            int page_off = kc % p.page_size;
-            int64_t gmem_base = (int64_t)phys_page * page_stride
-                              + (int64_t)page_off * pos_stride
-                              + head_off;
+            int64_t slot = valid ? p.req_to_token[req_idx * rtt_stride + kc] : 0;
+            valid = valid && (slot >= 0);
+            int64_t gmem_base = slot * pool_stride + head_off;
             int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
             cp_async_16_pred(&dK[off], &p.k_cache[gmem_base + d], valid);
             cp_async_16_pred(&dV[off], &p.v_cache[gmem_base + d], valid);
@@ -91,10 +97,6 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
         cp_async_commit();
     };
 
-    // ---- Multi-stage cp.async pipeline ----
-    // Prologue loads STAGES tiles; each loop iteration waits only for the
-    // oldest outstanding group (wait_group<STAGES-1>) so the STAGES-1 newer
-    // tile loads stay in flight and overlap with the current tile's compute.
     constexpr int STAGES = Traits::STAGES;
     const int ntiles = ti_end - ti_begin;
 
@@ -111,8 +113,9 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
             Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
             Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
 
-        int maxc = IsCausal ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
-        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc,
+        // For decode, maxc = seq_len regardless of IsCausal — the valid
+        // range [0, seq_len) IS the causal range (query is the last token).
+        mma_softmax_tile<Traits, HasMask>(kv0, seq_len, seq_len,
                                            0, 0,
                                            p.mask_b_stride, 0, 0,
                                            batch, 0,
@@ -136,7 +139,6 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
                 load_tile(ti_begin + it + STAGES, (it + STAGES) & (STAGES - 1));
         }
     } else {
-        // Fewer tiles than stages: load all, wait for all, process.
         for (int i = 0; i < ntiles; i++)
             load_tile(ti_begin + i, i);
         cp_async_wait_group<0>();
@@ -145,6 +147,7 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
             process_tile(it, it);
     }
 
+    // ---- write partials ----
     auto split_slot = [&](int h) -> size_t {
         size_t bh = (size_t)batch * p.q_head + h;
         return bh * MAX_SPLITS + split;
