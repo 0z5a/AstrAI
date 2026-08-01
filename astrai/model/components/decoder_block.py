@@ -26,7 +26,20 @@ class DecoderBlock(nn.Module):
         self.attention = AttnFactory.create(config.attn_type, **cfg, layer_id=layer_id)
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.mlp = FFNFactory.create(config.ffn_type, **cfg)
+        ffn_type = self._resolve_ffn_type(config, layer_id)
+        self.mlp = FFNFactory.create(ffn_type, **cfg)
+
+    @staticmethod
+    def _resolve_ffn_type(config, layer_id: int) -> str:
+        if config.ffn_type != "moe":
+            return config.ffn_type
+        mlp_only = config.mlp_only_layers or []
+        if layer_id in mlp_only:
+            return "mlp"
+        if config.decoder_sparse_step > 1:
+            if (layer_id + 1) % config.decoder_sparse_step != 0:
+                return "mlp"
+        return "moe"
 
     def forward(
         self,
