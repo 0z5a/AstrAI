@@ -369,7 +369,7 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
 @opt(
     "--metrics",
     multiple=True,
-    default=("loss", "lr", "grad_norm"),
+    default=("loss", "lr", "grad_norm", "grad_snr"),
     group="Validation",
     help="Metrics to log (repeatable).",
 )

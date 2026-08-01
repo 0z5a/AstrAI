@@ -17,6 +17,7 @@ from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import Checkpoint, load_json
 from astrai.tokenize import AutoTokenizer
+from astrai.trainer.metric_util import GradSNRTracker
 from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 
@@ -38,6 +39,7 @@ class TrainContext:
     consumed_samples: int = field(default=0)
     loss: float = field(default=0.0)
     grad_norm: Optional[float] = field(default=None)
+    grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
     val_dataloader: Optional[DataLoader] = field(default=None)
     val_loss: Optional[float] = field(default=None)
 

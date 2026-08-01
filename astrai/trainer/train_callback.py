@@ -18,6 +18,7 @@ from astrai.parallel.setup import get_current_device
 from astrai.serialization import Checkpoint
 from astrai.trainer.metric_util import (
     ctx_get_grad_norm,
+    ctx_get_grad_snr,
     ctx_get_loss,
     ctx_get_lr,
     ctx_get_val_loss,
@@ -255,6 +256,7 @@ class MetricCallback(TrainCallback):
             "lr": ctx_get_lr,
             "val_loss": ctx_get_val_loss,
             "grad_norm": ctx_get_grad_norm,
+            "grad_snr": ctx_get_grad_snr,
         }
 
     def _metrics(self, context: TrainContext, names):
@@ -312,6 +314,8 @@ class MetricCallback(TrainCallback):
                 f.write(json.dumps(log) + "\n")
 
     def on_optimizer_step(self, context):
+        context.grad_snr_tracker.update(context.model)
+
         if (
             context.val_dataloader is not None
             and self.val_step > 0

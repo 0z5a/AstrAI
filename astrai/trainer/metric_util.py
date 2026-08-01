@@ -22,6 +22,51 @@ def grad_norm(model: nn.Module, per_param: bool = False) -> float | Dict[str, fl
     return total_sq.sqrt().item()
 
 
+class GradSNRTracker:
+    """Track gradient signal-to-noise ratio via EMA of first/second moments.
+
+    SNR = E[g]^2 / Var(g) = E[g]^2 / (E[g^2] - E[g]^2)
+
+    The tracker accumulates per-parameter EMA moments across optimizer steps.
+    Call ``update`` after backward (before ``optimizer.step``) and read
+    ``snr`` to get the aggregate SNR across all parameters.
+    """
+
+    def __init__(self, beta: float = 0.999, eps: float = 1e-8):
+        self.beta = beta
+        self.eps = eps
+        self._first: Dict[int, torch.Tensor] = {}
+        self._second: Dict[int, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        beta = self.beta
+        for param in model.parameters():
+            if param.grad is None:
+                continue
+            pid = id(param)
+            g = param.grad.detach()
+            if pid not in self._first:
+                self._first[pid] = g.clone()
+                self._second[pid] = g.pow(2).clone()
+            else:
+                self._first[pid].mul_(beta).add_(g, alpha=1 - beta)
+                self._second[pid].mul_(beta).addcmul_(g, g, value=1 - beta)
+
+    @property
+    def snr(self) -> float:
+        if not self._first:
+            return 0.0
+        total_signal = 0.0
+        total_noise = 0.0
+        for m, v in zip(self._first.values(), self._second.values()):
+            signal = m.pow(2).sum().item()
+            noise = (v - m.pow(2)).clamp(min=0).sum().item()
+            total_signal += signal
+            total_noise += noise
+        return total_signal / (total_noise + self.eps)
+
+
 def ctx_get_loss(ctx):
     return ctx.loss
 
@@ -36,3 +81,10 @@ def ctx_get_val_loss(ctx):
 
 def ctx_get_grad_norm(ctx):
     return ctx.grad_norm
+
+
+def ctx_get_grad_snr(ctx):
+    tracker = getattr(ctx, "grad_snr_tracker", None)
+    if tracker is None:
+        return None
+    return tracker.snr
