@@ -10,7 +10,7 @@ Reference: https://arxiv.org/abs/2601.23000
 import math
 
 import torch
-from torch import nn
+from torch import nn, optim
 from torch.optim import Optimizer
 
 from astrai.optim.composite import (
@@ -20,7 +20,7 @@ from astrai.optim.composite import (
     composite_zero_grad,
     refresh_param_groups,
 )
-from astrai.optim.nora_nadamw import NAdamW, partition_optimizer_parameters
+from astrai.optim.nora_nadamw import partition_optimizer_parameters
 
 
 class Mano(Optimizer):
@@ -162,7 +162,16 @@ class ManoAdamW(Optimizer):
             )
         if groups.nadamw_no_decay:
             adamw_groups.append({"params": groups.nadamw_no_decay, "weight_decay": 0.0})
-        self.adamw = NAdamW(adamw_groups, lr=lr) if adamw_groups else None
+        self.adamw = (
+            optim.AdamW(
+                adamw_groups,
+                lr=lr,
+                betas=(0.9, 0.95),
+                fused=True,
+            )
+            if adamw_groups
+            else None
+        )
         self.param_groups = refresh_param_groups([self.mano, self.adamw])
 
     @torch.no_grad()
