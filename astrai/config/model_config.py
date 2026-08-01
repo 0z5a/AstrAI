@@ -63,6 +63,11 @@ class AutoRegressiveLMConfig(BaseModelConfig):
         n_shared_experts (Optional[int]): Number of shared experts, MoE only. Defaults to None.
         n_activated_experts (Optional[int]): Number of activated experts per token, MoE only. Defaults to None.
         topk_method (Optional[str]): Top-k routing method, MoE only. Defaults to None.
+        moe_intermediate_size (Optional[int]): Expert hidden dim, defaults to intermediate_size if None. MoE only.
+        shared_expert_intermediate_size (Optional[int]): Shared expert hidden dim, defaults to intermediate_size if None. MoE only.
+        norm_topk_prob (bool): Normalize top-k routing probabilities. Defaults to False.
+        decoder_sparse_step (int): Frequency of MoE layers, 1=every layer. Defaults to 1.
+        mlp_only_layers (Optional[list[int]]): Layer indices using dense MLP instead of MoE. Defaults to None.
     """
 
     vocab_size: Optional[int] = None
@@ -87,6 +92,11 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     n_shared_experts: Optional[int] = None
     n_activated_experts: Optional[int] = None
     topk_method: Optional[str] = None
+    moe_intermediate_size: Optional[int] = None
+    shared_expert_intermediate_size: Optional[int] = None
+    norm_topk_prob: bool = False
+    decoder_sparse_step: int = 1
+    mlp_only_layers: Optional[list[int]] = None
 
     @field_validator("attn_type")
     def _validate_attn_type(cls, v: str) -> str:

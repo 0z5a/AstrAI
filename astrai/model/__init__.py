@@ -9,7 +9,7 @@ from astrai.model.components.lora import (
     merge_lora,
     save_lora,
 )
-from astrai.model.components.mlp import MLP
+from astrai.model.components.mlp import MLP, DeepSeekMoE
 from astrai.model.components.norm import RMSNorm
 from astrai.model.encoder import EmbeddingEncoder
 from astrai.model.transformer import AutoRegressiveLM
@@ -19,6 +19,7 @@ __all__ = [
     "Linear",
     "RMSNorm",
     "MLP",
+    "DeepSeekMoE",
     "GQA",
     "DecoderBlock",
     # Models

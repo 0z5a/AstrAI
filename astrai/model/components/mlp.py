@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,6 +38,9 @@ class DeepSeekMoE(nn.Module):
         n_activated_experts: int = 2,
         topk_method: str = "greedy",
         n_layers: int = 1,
+        moe_intermediate_size: Optional[int] = None,
+        shared_expert_intermediate_size: Optional[int] = None,
+        norm_topk_prob: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -43,6 +48,10 @@ class DeepSeekMoE(nn.Module):
         self.n_shared_experts = n_shared_experts
         self.n_activated_experts = n_activated_experts
         self.topk_method = topk_method
+        self.norm_topk_prob = norm_topk_prob
+
+        expert_dim_ffn = moe_intermediate_size if moe_intermediate_size is not None else dim_ffn
+        shared_dim_ffn = shared_expert_intermediate_size if shared_expert_intermediate_size is not None else dim_ffn
 
         self.router = Linear(dim, n_routed_experts, bias=False)
         moe_scale = 1 / max(n_shared_experts, 1) + 1 / n_activated_experts
@@ -50,13 +59,13 @@ class DeepSeekMoE(nn.Module):
 
         self.shared_experts = nn.ModuleList(
             [
-                MLP(dim, dim_ffn, down_init_std=down_init_std)
+                MLP(dim, shared_dim_ffn, down_init_std=down_init_std)
                 for _ in range(n_shared_experts)
             ]
         )
         self.routed_experts = nn.ModuleList(
             [
-                MLP(dim, dim_ffn, down_init_std=down_init_std)
+                MLP(dim, expert_dim_ffn, down_init_std=down_init_std)
                 for _ in range(n_routed_experts)
             ]
         )
@@ -84,7 +93,8 @@ class DeepSeekMoE(nn.Module):
         router_probs = torch.softmax(router_logits.float(), dim=-1).to(x.dtype)
 
         topk_weights, topk_indices = torch.topk(router_probs, K, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
         output = torch.zeros(N, D, device=x.device, dtype=x.dtype)
         for expert_idx in range(self.n_routed_experts):

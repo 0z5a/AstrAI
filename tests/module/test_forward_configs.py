@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from astrai.model.components.mlp import MLP, DeepSeekMoE
 from astrai.model.transformer import AutoRegressiveLM
 from tests.helpers import TINY_CONFIG
 
@@ -31,6 +32,59 @@ CONFIGS = [
             "topk_method": "greedy",
         },
         id="gqa_moe",
+    ),
+    pytest.param(
+        {
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "moe",
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "n_activated_experts": 2,
+            "topk_method": "greedy",
+            "mlp_only_layers": [0],
+        },
+        id="gqa_moe_dense_first",
+    ),
+    pytest.param(
+        {
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "moe",
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "n_activated_experts": 2,
+            "topk_method": "greedy",
+            "decoder_sparse_step": 2,
+        },
+        id="gqa_moe_sparse_step",
+    ),
+    pytest.param(
+        {
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "moe",
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "n_activated_experts": 2,
+            "topk_method": "greedy",
+            "norm_topk_prob": True,
+        },
+        id="gqa_moe_norm_topk",
+    ),
+    pytest.param(
+        {
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "moe",
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "n_activated_experts": 2,
+            "topk_method": "greedy",
+            "moe_intermediate_size": 24,
+            "shared_expert_intermediate_size": 20,
+        },
+        id="gqa_moe_custom_intermediate",
     ),
     pytest.param(
         {
@@ -105,3 +159,90 @@ def test_model_forward_with_padding(config_kwargs, device):
 
     assert output["logits"].shape == (batch_size, seq_len, config.vocab_size)
     assert not torch.isnan(output["logits"]).any()
+
+
+def test_moe_per_layer_ffn_resolution():
+    """Verify that mlp_only_layers and decoder_sparse_step resolve FFN types correctly."""
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    # mlp_only_layers: first layer dense, rest MoE
+    config = AutoRegressiveLMConfig(
+        **{
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "moe",
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "n_activated_experts": 2,
+            "mlp_only_layers": [0],
+        }
+    )
+    model = AutoRegressiveLM(config)
+    assert isinstance(model.layers[0].mlp, MLP)
+    assert not isinstance(model.layers[0].mlp, DeepSeekMoE)
+    assert isinstance(model.layers[1].mlp, DeepSeekMoE)
+
+    # decoder_sparse_step=2: every other layer is MoE
+    config2 = AutoRegressiveLMConfig(
+        **{
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "moe",
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "n_activated_experts": 2,
+            "decoder_sparse_step": 2,
+        }
+    )
+    model2 = AutoRegressiveLM(config2)
+    # layer 0 (id=0): (0+1)%2=1 != 0 -> MLP
+    assert isinstance(model2.layers[0].mlp, MLP)
+    assert not isinstance(model2.layers[0].mlp, DeepSeekMoE)
+    # layer 1 (id=1): (1+1)%2=0 -> MoE
+    assert isinstance(model2.layers[1].mlp, DeepSeekMoE)
+
+    # decoder_sparse_step=1 (default): all layers MoE
+    config3 = AutoRegressiveLMConfig(
+        **{
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "moe",
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "n_activated_experts": 2,
+        }
+    )
+    model3 = AutoRegressiveLM(config3)
+    for layer in model3.layers:
+        assert isinstance(layer.mlp, DeepSeekMoE)
+
+
+def test_moe_custom_intermediate_shape():
+    """Verify MoE uses custom intermediate sizes when specified."""
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    config = AutoRegressiveLMConfig(
+        **{
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "moe",
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "n_activated_experts": 2,
+            "moe_intermediate_size": 24,
+            "shared_expert_intermediate_size": 20,
+        }
+    )
+    model = AutoRegressiveLM(config)
+    moe_layer = model.layers[0].mlp
+    assert isinstance(moe_layer, DeepSeekMoE)
+    # routed experts use moe_intermediate_size
+    for expert in moe_layer.routed_experts:
+        assert expert.up.weight.shape[0] == 24
+        assert expert.gate.weight.shape[0] == 24
+        assert expert.down.weight.shape[1] == 24
+    # shared experts use shared_expert_intermediate_size
+    for expert in moe_layer.shared_experts:
+        assert expert.up.weight.shape[0] == 20
+        assert expert.gate.weight.shape[0] == 20
+        assert expert.down.weight.shape[1] == 20
