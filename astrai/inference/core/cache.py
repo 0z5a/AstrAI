@@ -203,6 +203,8 @@ class KVCache:
         seq_lens: [batch_size] — per-request total sequence lengths
         out_cache_loc: [batch, new_seq_len] or [batch, 1] — write indices
         max_len: max(seq_lens) as Python int — avoids GPU sync in decode
+        kv_indptr: [batch+1] int32 — prefix sum of seq_lens, precomputed once
+            per step so the attention backend avoids rebuilding it per layer.
     """
 
     k_buffer: Tensor
@@ -212,6 +214,7 @@ class KVCache:
     seq_lens: Tensor
     out_cache_loc: Tensor
     max_len: int = 0
+    kv_indptr: Optional[Tensor] = None
 
 
 class PagePool:
@@ -434,6 +437,9 @@ class PagePool:
                 req_pool_indices, write_pos
             ].unsqueeze(-1)
 
+        kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+        kv_indptr[1:] = seq_lens_t.cumsum(0).to(torch.int32)
+
         return KVCache(
             k_buffer=self._storage.k_buffer,
             v_buffer=self._storage.v_buffer,
@@ -442,6 +448,7 @@ class PagePool:
             seq_lens=seq_lens_t,
             out_cache_loc=out_cache_loc,
             max_len=max(seq_lens),
+            kv_indptr=kv_indptr,
         )
 
     # ---- internals ----

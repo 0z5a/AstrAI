@@ -341,8 +341,7 @@ class CudaBackend(AttentionBackend):
         b = q.size(0)
         q_3d = q.squeeze(1)
 
-        kv_indptr = torch.zeros(b + 1, dtype=torch.int32, device=q.device)
-        kv_indptr[1:] = kv_cache.seq_lens.cumsum(0).to(torch.int32)
+        kv_indptr = kv_cache.kv_indptr
 
         out = attn_paged_decode(
             q_3d,
@@ -376,9 +375,7 @@ class CudaBackend(AttentionBackend):
         b = q.size(0)
         q_len = q.size(1)
 
-        kv_indptr = torch.zeros(b + 1, dtype=torch.int32, device=q.device)
-        kv_indptr[1:] = kv_cache.seq_lens.cumsum(0).to(torch.int32)
-
+        kv_indptr = kv_cache.kv_indptr
         qo_indptr = torch.arange(b + 1, dtype=torch.int32, device=q.device) * q_len
 
         q_flat = q.reshape(b * q_len, q.size(2), q.size(3))
