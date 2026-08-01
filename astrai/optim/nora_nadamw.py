@@ -13,6 +13,13 @@ from astrai.model.components.embedding import Embedding
 from astrai.model.components.linear import Linear
 from astrai.model.components.lora import LoRALinear
 from astrai.model.components.norm import RMSNorm
+from astrai.optim.composite import (
+    OptimizerFactory,
+    composite_state_dict,
+    composite_step,
+    composite_zero_grad,
+    refresh_param_groups,
+)
 
 NORA_EPS = 1e-10
 
@@ -271,6 +278,7 @@ def partition_optimizer_parameters(model: nn.Module) -> OptimizerParameterGroups
     return OptimizerParameterGroups(nora, nadamw_decay, nadamw_no_decay)
 
 
+@OptimizerFactory.register("nora_nadamw")
 class NoraNAdamW(Optimizer):
     """Nora for internal linear weights and NAdamW for remaining parameters."""
 
@@ -320,38 +328,23 @@ class NoraNAdamW(Optimizer):
                 {"params": groups.nadamw_no_decay, "weight_decay": 0.0}
             )
         self.nadamw = NAdamW(nadamw_groups, lr=lr) if nadamw_groups else None
-        self._refresh_param_groups()
-
-    def _refresh_param_groups(self) -> None:
-        self.param_groups = []
-        if self.nora is not None:
-            self.param_groups.extend(self.nora.param_groups)
-        if self.nadamw is not None:
-            self.param_groups.extend(self.nadamw.param_groups)
+        self.param_groups = refresh_param_groups([self.nora, self.nadamw])
 
     @torch.no_grad()
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        if self.nora is not None:
-            self.nora.step()
-        if self.nadamw is not None:
-            self.nadamw.step()
-        return loss
+        return composite_step(
+            [opt for opt in (self.nora, self.nadamw) if opt is not None],
+            closure,
+        )
 
     def zero_grad(self, set_to_none: bool = True):
-        if self.nora is not None:
-            self.nora.zero_grad(set_to_none=set_to_none)
-        if self.nadamw is not None:
-            self.nadamw.zero_grad(set_to_none=set_to_none)
+        composite_zero_grad(
+            [opt for opt in (self.nora, self.nadamw) if opt is not None],
+            set_to_none,
+        )
 
     def state_dict(self) -> dict[str, Any]:
-        return {
-            "nora": self.nora.state_dict() if self.nora is not None else None,
-            "nadamw": self.nadamw.state_dict() if self.nadamw is not None else None,
-        }
+        return composite_state_dict({"nora": self.nora, "nadamw": self.nadamw})
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         if "muon" in state_dict or "adamw" in state_dict:
@@ -376,4 +369,4 @@ class NoraNAdamW(Optimizer):
             self.nora.load_state_dict(saved_nora)
         if self.nadamw is not None:
             self.nadamw.load_state_dict(saved_nadamw)
-        self._refresh_param_groups()
+        self.param_groups = refresh_param_groups([self.nora, self.nadamw])

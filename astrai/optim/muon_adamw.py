@@ -5,8 +5,17 @@ from typing import Any
 import torch
 from torch import Tensor, nn, optim
 
+from astrai.optim.composite import (
+    OptimizerFactory,
+    composite_state_dict,
+    composite_step,
+    composite_zero_grad,
+    refresh_param_groups,
+)
 
-class MuonMix(optim.Optimizer):
+
+@OptimizerFactory.register("muon_adamw")
+class MuonAdamW(optim.Optimizer):
     """Combined Muon (matrix) + AdamW (non-matrix) optimizer."""
 
     optimizer_name = "muon_adamw"
@@ -64,22 +73,17 @@ class MuonMix(optim.Optimizer):
             fused=True,
         )
 
-        self.param_groups = [*self.muon.param_groups, *self.adamw.param_groups]
+        self.param_groups = refresh_param_groups([self.muon, self.adamw])
 
     @torch.no_grad()
     def step(self, closure=None):
-        self.muon.step(closure)
-        self.adamw.step(closure)
+        return composite_step([self.muon, self.adamw], closure)
 
     def zero_grad(self, set_to_none: bool = True):
-        self.muon.zero_grad(set_to_none=set_to_none)
-        self.adamw.zero_grad(set_to_none=set_to_none)
+        composite_zero_grad([self.muon, self.adamw], set_to_none)
 
     def state_dict(self) -> dict[str, Any]:
-        return {
-            "muon": self.muon.state_dict(),
-            "adamw": self.adamw.state_dict(),
-        }
+        return composite_state_dict({"muon": self.muon, "adamw": self.adamw})
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         if "muon" not in state_dict or "adamw" not in state_dict:
@@ -88,4 +92,4 @@ class MuonMix(optim.Optimizer):
             )
         self.muon.load_state_dict(state_dict["muon"])
         self.adamw.load_state_dict(state_dict["adamw"])
-        self.param_groups = [*self.muon.param_groups, *self.adamw.param_groups]
+        self.param_groups = refresh_param_groups([self.muon, self.adamw])

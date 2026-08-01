@@ -56,7 +56,7 @@ under DTensor sharding and rejects layouts sharded along the last dimension.
 | `--nora_weight_decay` | Nora matrix weight decay | 0.0 |
 
 Optimizer identity and hyperparameters are saved in checkpoint metadata. Optimizer
-states are intentionally not interchangeable: resume older MuonMix checkpoints
+states are intentionally not interchangeable: resume older MuonAdamW checkpoints
 with `--optimizer=muon_adamw`.
 
 ### Data Loading
