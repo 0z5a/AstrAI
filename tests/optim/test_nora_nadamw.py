@@ -148,7 +148,11 @@ def test_parameter_partition_covers_all_model_structures(model_overrides):
 
 
 def test_factory_registers_nora_default_and_legacy_muon():
-    assert OptimizerFactory.list_registered() == ["muon_adamw", "nora_nadamw"]
+    assert OptimizerFactory.list_registered() == [
+        "mano_adamw",
+        "muon_adamw",
+        "nora_nadamw",
+    ]
     model = AutoRegressiveLM(make_tiny_config())
     optimizer = OptimizerFactory.create("nora_nadamw", model, lr=3e-4)
     assert isinstance(optimizer, NoraNAdamW)

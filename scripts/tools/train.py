@@ -220,6 +220,19 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
     help="Muon LR adjustment strategy.",
 )
 @opt(
+    "--mano_momentum",
+    type=float,
+    default=0.95,
+    group="Optimizer",
+    help="Mano momentum factor.",
+)
+@opt(
+    "--mano_nesterov/--no-mano_nesterov",
+    default=True,
+    group="Optimizer",
+    help="Mano Nesterov momentum.",
+)
+@opt(
     "--random_seed",
     type=int,
     default=3407,
@@ -674,6 +687,8 @@ def train(
         "nesterov": kwargs.pop("muon_nesterov", True),
         "ns_steps": kwargs.pop("muon_ns_steps", 5),
         "adjust_lr_fn": kwargs.pop("muon_adjust_lr", "match_rms_adamw"),
+        "mano_momentum": kwargs.pop("mano_momentum", 0.95),
+        "mano_nesterov": kwargs.pop("mano_nesterov", True),
     }
     optimizer_fn = partial(
         create_optimizer,
@@ -694,6 +709,14 @@ def train(
         }
         optimizer_hyperparameters.update(
             {"nadamw_betas": [0.9, 0.999], "nadamw_eps": 1e-8, "nora_eps": 1e-10}
+        )
+    elif optimizer_name == "mano_adamw":
+        optimizer_hyperparameters = {
+            key: optimizer_kwargs[key]
+            for key in ("lr", "weight_decay", "mano_momentum", "mano_nesterov")
+        }
+        optimizer_hyperparameters.update(
+            {"adamw_betas": [0.9, 0.95], "adamw_eps": 1e-8}
         )
     else:
         optimizer_hyperparameters = {

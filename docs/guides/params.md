@@ -35,7 +35,7 @@ non-matrix parameters through **AdamW** (`fused=True`).
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--optimizer` | Built-in optimizer (`muon_adamw`, `nora_nadamw`) | `muon_adamw` |
+| `--optimizer` | Built-in optimizer (`muon_adamw`, `nora_nadamw`, `mano_adamw`) | `muon_adamw` |
 | `--weight_decay` | Weight decay (applied to Muon matrix params; non-matrix use 0) | 0.1 |
 | `--muon_momentum` | Muon momentum factor | 0.95 |
 | `--muon_nesterov` | Enable Nesterov momentum for Muon | True |
@@ -54,6 +54,17 @@ under DTensor sharding and rejects layouts sharded along the last dimension.
 | `--nora_beta` | Nora momentum-buffer EMA factor | 0.95 |
 | `--nora_momentum` | Nora Nesterov interpolation factor | 0.95 |
 | `--nora_weight_decay` | Nora matrix weight decay | 0.0 |
+
+`mano_adamw` routes internal `Linear.weight` matrices to **Mano** (manifold
+normalized optimizer) and the remaining parameters to **NAdamW**. Mano projects
+the momentum onto the tangent space of the Oblique manifold and normalizes it,
+alternating the projection axis (row/column) each step — replacing Muon's
+Newton-Schulz iteration with a cheaper normalization.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--mano_momentum` | Mano momentum factor | 0.95 |
+| `--mano_nesterov` | Enable Nesterov momentum for Mano | True |
 
 Optimizer identity and hyperparameters are saved in checkpoint metadata. Optimizer
 states are intentionally not interchangeable: resume older MuonAdamW checkpoints
