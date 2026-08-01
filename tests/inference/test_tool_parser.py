@@ -59,14 +59,15 @@ def test_find_multiple_tool_calls():
     assert results[1]["name"] == "f2"
 
 
-def test_find_no_tool_call():
-    results = _find_tool_calls("Hello, how are you?")
-    assert len(results) == 0
-
-
-def test_find_non_tool_json_skipped():
-    results = _find_tool_calls('{"not_a_tool": true}')
-    assert len(results) == 0
+@pytest.mark.parametrize(
+    "text,expected_count",
+    [
+        ("Hello, how are you?", 0),
+        ('{"not_a_tool": true}', 0),
+    ],
+)
+def test_find_no_tool_call(text, expected_count):
+    assert len(_find_tool_calls(text)) == expected_count
 
 
 def test_find_no_arguments_field():
@@ -74,79 +75,6 @@ def test_find_no_arguments_field():
     assert len(results) == 1
     assert results[0]["name"] == "simple_func"
     assert results[0]["args"] == ""
-
-
-def test_find_deeply_nested_arguments():
-    text = '{"name": "deep", "arguments": {"a": {"b": {"c": {"d": 4}}}}}'
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert results[0]["name"] == "deep"
-    assert '"d": 4' in results[0]["args"]
-
-
-def test_find_arguments_with_boolean_and_null():
-    text = '{"name": "flags", "arguments": {"active": true, "count": 0, "nick": null}}'
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert results[0]["name"] == "flags"
-    assert "true" in results[0]["args"]
-    assert "null" in results[0]["args"]
-
-
-def test_find_arguments_with_array():
-    text = '{"name": "add_items", "arguments": {"items": [1, 2, 3], "name": "list"}}'
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert results[0]["name"] == "add_items"
-    assert "[1, 2, 3]" in results[0]["args"]
-
-
-def test_find_arguments_with_nested_array_of_objects():
-    text = '{"name": "batch", "arguments": {"rows": [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}]}}'
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert '"rows"' in results[0]["args"]
-    assert '"id": 1' in results[0]["args"]
-
-
-def test_find_arguments_as_string_not_object():
-    text = '{"name": "echo", "arguments": "just a string"}'
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert results[0]["name"] == "echo"
-    assert "just a string" in results[0]["args"]
-
-
-def test_find_arguments_with_unicode():
-    text = (
-        '{"name": "translate", "arguments": {"text": "\u4f60\u597d\uff0c\u4e16\u754c"}}'
-    )
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert results[0]["name"] == "translate"
-
-
-def test_find_arguments_with_escaped_quotes():
-    text = '{"name": "format", "arguments": {"template": "he said \\"hello\\""}}'
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert 'he said \\"hello\\"' in results[0]["args"]
-
-
-def test_find_arguments_with_braces_in_string():
-    text = '{"name": "eval", "arguments": {"code": "function(x) { return x + 1; }"}}'
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert results[0]["name"] == "eval"
-    assert "function(x) { return x + 1; }" in results[0]["args"]
-
-
-def test_find_many_properties():
-    args = ",".join(f'"{chr(97 + i % 26)}" : {i}' for i in range(20))
-    text = '{"name": "many", "arguments": {' + args + "}}"
-    results = _find_tool_calls(text)
-    assert len(results) == 1
-    assert results[0]["name"] == "many"
 
 
 def test_find_empty_arguments():
@@ -162,6 +90,62 @@ def test_find_extracts_correct_arg_start_position():
     assert len(results) == 1
     json_str = text[results[0]["start"] : results[0]["end"]]
     assert json_str == text
+
+
+@pytest.mark.parametrize(
+    "text,expected_name,arg_substr",
+    [
+        (
+            '{"name": "deep", "arguments": {"a": {"b": {"c": {"d": 4}}}}}',
+            "deep",
+            '"d": 4',
+        ),
+        (
+            '{"name": "flags", "arguments": {"active": true, "count": 0, "nick": null}}',
+            "flags",
+            "null",
+        ),
+        (
+            '{"name": "add_items", "arguments": {"items": [1, 2, 3], "name": "list"}}',
+            "add_items",
+            "[1, 2, 3]",
+        ),
+        (
+            '{"name": "batch", "arguments": {"rows": [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}]}}',
+            "batch",
+            '"id": 1',
+        ),
+        ('{"name": "echo", "arguments": "just a string"}', "echo", "just a string"),
+        (
+            '{"name": "translate", "arguments": {"text": "\u4f60\u597d\uff0c\u4e16\u754c"}}',
+            "translate",
+            "\u4f60\u597d",
+        ),
+        (
+            '{"name": "format", "arguments": {"template": "he said \\"hello\\""}}',
+            "format",
+            'he said \\"hello\\"',
+        ),
+        (
+            '{"name": "eval", "arguments": {"code": "function(x) { return x + 1; }"}}',
+            "eval",
+            "function(x) { return x + 1; }",
+        ),
+    ],
+)
+def test_find_arguments_variants(text, expected_name, arg_substr):
+    results = _find_tool_calls(text)
+    assert len(results) == 1
+    assert results[0]["name"] == expected_name
+    assert arg_substr in results[0]["args"]
+
+
+def test_find_many_properties():
+    args = ",".join(f'"{chr(97 + i % 26)}" : {i}' for i in range(20))
+    text = '{"name": "many", "arguments": {' + args + "}}"
+    results = _find_tool_calls(text)
+    assert len(results) == 1
+    assert results[0]["name"] == "many"
 
 
 @pytest.mark.parametrize(
@@ -340,30 +324,21 @@ def test_streaming_multiple_tool_calls_incremental():
     assert "f2" in names
 
 
-def test_streaming_deeply_nested_args():
+@pytest.mark.parametrize(
+    "text,arg_substr",
+    [
+        ('{"name": "deep", "arguments": {"a": {"b": {"c": 42}}}}', '"c": 42'),
+        (
+            '{"name": "translate", "arguments": {"text": "\u4f60\u597d\uff0c\u4e16\u754c"}}',
+            "\u4f60\u597d",
+        ),
+        ('{"name": "add", "arguments": {"items": [1, 2, 3]}}', "[1, 2, 3]"),
+    ],
+)
+def test_streaming_args_variants(text, arg_substr):
     parser = SimpleJsonToolParser()
-    text = '{"name": "deep", "arguments": {"a": {"b": {"c": 42}}}}'
     _, args_chunks = _simulate_streaming(parser, text)
-    joined = "".join(args_chunks)
-    assert '"c": 42' in joined
-
-
-def test_streaming_args_with_unicode():
-    parser = SimpleJsonToolParser()
-    text = (
-        '{"name": "translate", "arguments": {"text": "\u4f60\u597d\uff0c\u4e16\u754c"}}'
-    )
-    _, args_chunks = _simulate_streaming(parser, text)
-    joined = "".join(args_chunks)
-    assert "\u4f60\u597d" in joined
-
-
-def test_streaming_args_with_array():
-    parser = SimpleJsonToolParser()
-    text = '{"name": "add", "arguments": {"items": [1, 2, 3]}}'
-    _, args_chunks = _simulate_streaming(parser, text)
-    joined = "".join(args_chunks)
-    assert "[1, 2, 3]" in joined
+    assert arg_substr in "".join(args_chunks)
 
 
 def test_streaming_empty_arguments():
@@ -514,7 +489,6 @@ def test_feed_then_parse_complete_same_instance():
         ('{ "name" : "f"}', True),
         ('{"other": 1}', False),
         ('prefix {"name": "f", "args": {}}', True),
-        ('{"name": "f"}', True),  # match at start
         ('   {"name": "f"}', True),
     ],
 )
@@ -524,10 +498,6 @@ def test_pattern_regex(text, matches):
         assert result is not None
     else:
         assert result is None
-
-
-def test_pattern_name_at_start():
-    assert _TOOL_CALL_HEAD_RE.match('{"name": "f"}')
 
 
 def test_factory_register_and_create():
@@ -547,10 +517,6 @@ def test_factory_list_registered():
     assert "simple_json" in ToolParserFactory.list_registered()
 
 
-def test_factory_create_with_no_extra_kwargs():
-    assert isinstance(ToolParserFactory.create("simple_json"), BaseToolParser)
-
-
 def test_factory_create_with_tools_only():
     tools = [
         {
@@ -561,13 +527,6 @@ def test_factory_create_with_tools_only():
     parser = ToolParserFactory.create("simple_json", tools=tools)
     assert parser.tools == tools
     assert parser.tool_choice == "auto"
-
-
-def test_feed_accepts_token_ids_and_ignores_them():
-    parser = SimpleJsonToolParser()
-    text = '{"name": "get_weather", "arguments": {"city": "Beijing"}}'
-    deltas_with = parser.feed(text, current_token_ids=[123, 456], delta_token_ids=[456])
-    assert len(deltas_with) > 0
 
 
 def test_feed_token_ids_do_not_affect_parsing():

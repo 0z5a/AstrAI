@@ -96,12 +96,10 @@ def test_factory_registers_online_aliases():
     assert StrategyFactory.get_component_class("online_dpo") is DPOStrategy
 
 
-def test_grpo_supports_online(device):
-    assert _make_grpo(device).supports_online() is True
-
-
-def test_dpo_supports_online(device):
-    assert _make_dpo(device).supports_online() is True
+@pytest.mark.parametrize("make_fn", ["_make_grpo", "_make_dpo"])
+def test_online_strategies_support_online(device, make_fn):
+    maker = {"_make_grpo": _make_grpo, "_make_dpo": _make_dpo}[make_fn]
+    assert maker(device).supports_online() is True
 
 
 def test_base_strategy_prepare_from_rollout_raises_by_default(device):
@@ -267,17 +265,6 @@ def test_step_called_when_sync_gradients_true(device):
     assert runner.step_calls == 1
 
 
-def test_loss_is_differentiable_grpo(device):
-    strat = _make_grpo(device)
-    strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    loss.backward()
-    has_grad = any(
-        p.grad is not None and p.grad.abs().sum() > 0 for p in strat.model.parameters()
-    )
-    assert has_grad
-
-
 def test_loss_is_differentiable_dpo(device):
     strat = _make_dpo(device)
     strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
@@ -287,17 +274,6 @@ def test_loss_is_differentiable_dpo(device):
         p.grad is not None and p.grad.abs().sum() > 0 for p in strat.model.parameters()
     )
     assert has_grad
-
-
-def test_ref_and_old_model_not_updated_by_backward_grpo(device):
-    strat = _make_grpo(device)
-    strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    loss.backward()
-    for p in strat.ref_model.parameters():
-        assert p.grad is None
-    for p in strat.old_model.parameters():
-        assert p.grad is None
 
 
 def test_ref_model_not_updated_by_backward_dpo(device):

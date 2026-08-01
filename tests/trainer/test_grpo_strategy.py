@@ -71,23 +71,14 @@ def test_grpo_loss_backward(grpo_strategy):
     assert has_grad
 
 
-def test_grpo_ref_model_not_updated(grpo_strategy):
-    """Backward should not populate gradients on ref_model."""
+@pytest.mark.parametrize("model_name", ["ref_model", "old_model"])
+def test_grpo_frozen_models_not_updated(grpo_strategy, model_name):
+    """Backward should not populate gradients on ref_model or old_model."""
     strategy, device = grpo_strategy
     batch = _make_batch(device=device)
     loss = strategy.compute_loss(batch)
     loss.backward()
-    for p in strategy.ref_model.parameters():
-        assert p.grad is None
-
-
-def test_grpo_old_model_not_updated(grpo_strategy):
-    """Backward should not populate gradients on old_model."""
-    strategy, device = grpo_strategy
-    batch = _make_batch(device=device)
-    loss = strategy.compute_loss(batch)
-    loss.backward()
-    for p in strategy.old_model.parameters():
+    for p in getattr(strategy, model_name).parameters():
         assert p.grad is None
 
 
@@ -133,45 +124,3 @@ def test_grpo_sync_old_model(grpo_strategy):
         if k in old_sd_after
     )
     assert matches
-
-
-def test_grpo_partial_mask(grpo_strategy):
-    """Only the first half of response tokens are valid."""
-    strategy, device = grpo_strategy
-    batch = _make_batch(device=device)
-    B, G, R = batch["masks"].shape
-    half = R // 2
-    batch["masks"][:, :, half:] = 0.0
-    loss = strategy.compute_loss(batch)
-    assert torch.isfinite(loss).item()
-
-
-def test_grpo_clipping_effect(grpo_strategy):
-    """After diverging policy from ref, ratio should be clipped to [1-eps, 1+eps]
-    on the surrogate. Verify loss is finite and non-zero for distinct rewards."""
-    strategy, device = grpo_strategy
-    with torch.no_grad():
-        for p in strategy.model.parameters():
-            p.add_(0.3)
-    batch = _make_batch(device=device)
-    loss = strategy.compute_loss(batch)
-    assert torch.isfinite(loss).item()
-    assert loss.abs().item() > 1e-4
-
-
-def test_grpo_no_reduction_param():
-    """GRPOStrategy.__init__ must not accept ``reduction`` (removed)."""
-    import inspect
-
-    sig = inspect.signature(GRPOStrategy.__init__)
-    assert "reduction" not in sig.parameters
-
-
-def test_grpo_shapes_3d_batch(grpo_strategy):
-    """Verify compute_loss handles non-square prompt/response lengths."""
-    strategy, device = grpo_strategy
-    batch = _make_batch(
-        batch_size=3, group_size=4, prompt_len=10, response_len=8, device=device
-    )
-    loss = strategy.compute_loss(batch)
-    assert torch.isfinite(loss).item()

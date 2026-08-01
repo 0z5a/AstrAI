@@ -51,7 +51,7 @@ def test_task_manager_add_task():
     assert len(tm.waiting_queue) == 1
 
 
-def test_task_manager_add_task_too_long_immediate_stop():
+def test_task_manager_long_prompt_truncated_not_stopped():
     t = _make_mock_tokenizer()
     t.encode.return_value = list(range(9000))
     cb_calls = []
@@ -60,6 +60,7 @@ def test_task_manager_add_task_too_long_immediate_stop():
     tm.add_task("long", stream_callback=lambda tok: cb_calls.append(tok))
     assert len(cb_calls) == 0
     assert len(tm.waiting_queue) == 1
+    assert len(tm.waiting_queue[0].prompt_ids) == 16
 
 
 def test_task_manager_remove_task():

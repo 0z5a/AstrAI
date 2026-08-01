@@ -81,6 +81,9 @@ def test_rollout_result_inherits_raw_rollout_fields():
     assert r.prompts.shape == (2, 4)
     assert r.responses.shape == (2, 3, 5)
     assert r.prompt_mask.shape == (2, 4)
+    # RolloutResult must carry every RawRollout field.
+    raw_fields = {f for f in RawRollout.__dataclass_fields__}
+    assert raw_fields.issubset(set(RolloutResult.__dataclass_fields__))
 
 
 def test_base_reward_model_is_abstract():

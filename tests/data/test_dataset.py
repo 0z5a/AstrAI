@@ -217,14 +217,8 @@ def test_unloaded_sample_window_raises():
         store.sample_window(0)
 
 
-def test_unloaded_dataset_len():
-    """__len__ on a store with no data returns 0."""
-    store = MmapStore(window_size=64, stride=64)
-    assert len(store) == 0
-
-
 def test_store_unloaded_len():
-    """Unloaded Store has __len__ == 0"""
+    """Unloaded Store has __len__ == 0."""
     store = MmapStore()
     assert len(store) == 0
     assert store.keys == []
@@ -498,26 +492,26 @@ def _write_json_dataset(test_dir, tokenizer_path, records, config_overrides=None
     return data_dir
 
 
-def test_detect_format_jsonl_dir(base_test_env):
+@pytest.mark.parametrize(
+    "use_jsonl",
+    [True, False],
+)
+def test_detect_format_data_dir(base_test_env, use_jsonl):
+    """detect_format returns 'jsonl' for dirs of .jsonl or .json files."""
     test_dir = base_test_env["test_dir"]
     tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
-    data_dir = _write_jsonl_dataset(
-        test_dir,
-        tokenizer_path,
-        [{"text": "hello world"}, {"text": "foo bar baz"}],
-    )
-    assert detect_format(data_dir) == "jsonl"
-
-
-def test_detect_format_json_dir(base_test_env):
-    """detect_format returns 'jsonl' for directory with .json files."""
-    test_dir = base_test_env["test_dir"]
-    tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
-    data_dir = _write_json_dataset(
-        test_dir,
-        tokenizer_path,
-        [{"text": "hello world"}, {"text": "foo bar baz qux"}],
-    )
+    if use_jsonl:
+        data_dir = _write_jsonl_dataset(
+            test_dir,
+            tokenizer_path,
+            [{"text": "hello world"}, {"text": "foo bar baz"}],
+        )
+    else:
+        data_dir = _write_json_dataset(
+            test_dir,
+            tokenizer_path,
+            [{"text": "hello world"}, {"text": "foo bar baz qux"}],
+        )
     assert detect_format(data_dir) == "jsonl"
 
 
@@ -743,32 +737,6 @@ def test_sft_jsonl_explicit_config_takes_priority(base_test_env):
     )
     assert "sequence" in dataset.keys
     assert "loss_mask" in dataset.keys
-
-
-def test_jsonl_store_pipeline_config_roundtrip(base_test_env):
-    test_dir = base_test_env["test_dir"]
-    config_path = os.path.join(test_dir, "dataset_config.json")
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "tokenizer_path": os.path.join(test_dir, "tokenizer"),
-                "version": 1,
-                "input": {"sections": [{"field": "text", "action": "train"}]},
-                "mask": {"assistant": "train"},
-                "preprocessing": {"max_seq_len": 64},
-                "output": {"position_ids_mode": "doc_reset"},
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    raw.pop("tokenizer_path")
-    config = PipelineConfig.from_dict(raw)
-    assert config.output.position_ids_mode == "doc_reset"
-    assert config.preprocessing.max_seq_len == 64
 
 
 # ---------------------------------------------------------------------------

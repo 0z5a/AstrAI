@@ -98,18 +98,9 @@ def test_loralinear_merge():
     assert lora._merged
     assert not hasattr(lora, "lora_A")
 
-
-def test_loralinear_merge_is_idempotent():
-    base = Linear(4, 4)
-    with torch.no_grad():
-        base.weight.zero_()
-
-    lora = LoRALinear(base, r=2, alpha=2)
-    with torch.no_grad():
-        lora.lora_B.fill_(1.0)
-
+    # merge is guarded by _merged — a second call is a no-op.
     lora.merge()
-    lora.merge()
+    assert lora._merged
 
 
 def test_inject_lora_default_target():

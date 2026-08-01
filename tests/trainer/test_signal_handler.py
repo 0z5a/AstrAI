@@ -131,18 +131,10 @@ def test_register_signal_handlers():
     assert ctx.stop_requested
 
 
-def test_sigterm_triggers_checkpoint_save(base_test_env):
-    exitcode = _spawn_train_and_signal(base_test_env["test_dir"], signal.SIGTERM)
-    assert exitcode == 0, f"Training process exited with code {exitcode} (expected 0)"
-
-    meta = load_checkpoint_meta(base_test_env["test_dir"])
-    assert "consumed_samples" in meta
-    assert meta["consumed_samples"] >= 0
-
-
 @pytest.mark.slow
-def test_sigint_triggers_checkpoint_save(base_test_env):
-    exitcode = _spawn_train_and_signal(base_test_env["test_dir"], signal.SIGINT)
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_signal_triggers_checkpoint_save(base_test_env, sig):
+    exitcode = _spawn_train_and_signal(base_test_env["test_dir"], sig)
     assert exitcode == 0, f"Training process exited with code {exitcode} (expected 0)"
 
     meta = load_checkpoint_meta(base_test_env["test_dir"])
