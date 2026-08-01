@@ -113,10 +113,23 @@ class AutoRegressiveLM(AutoModel):
         attn_mask = process_attention_mask(input_mask)
         use_sdpa_causal_mask = attn_mask is None
 
+        aux_losses = []
         for layer in self.layers:
-            x = layer(x, rotary_emb, attn_mask, kv_cache, use_sdpa_causal_mask)
+            layer_output = layer(
+                x,
+                rotary_emb,
+                attn_mask,
+                kv_cache,
+                use_sdpa_causal_mask,
+            )
+            x = layer_output["hidden_states"]
+            if layer_output["aux_loss"] is not None:
+                aux_losses.append(layer_output["aux_loss"])
 
         hidden_states = self.norm(x)
         logits = self.lm_head(hidden_states)
 
-        return {"logits": logits, "hidden_states": hidden_states}
+        output = {"logits": logits, "hidden_states": hidden_states}
+        if aux_losses:
+            output["aux_loss"] = torch.stack(aux_losses).mean()
+        return output

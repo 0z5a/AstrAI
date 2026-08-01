@@ -159,21 +159,21 @@ def test_call_without_runner_falls_back_to_compute_loss_grpo(device):
         "masks": torch.ones(2, 4, 6, device=device),
         "rewards": torch.randn(2, 4, device=device),
     }
-    loss = strat(batch)
+    loss = strat(batch)["loss"]
     assert torch.isfinite(loss).item()
 
 
 def test_call_with_runner_returns_finite_loss_grpo(device):
     strat = _make_grpo(device)
     strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
     assert torch.isfinite(loss).item()
 
 
 def test_call_with_runner_returns_finite_loss_dpo(device):
     strat = _make_dpo(device)
     strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
     assert torch.isfinite(loss).item()
 
 
@@ -268,7 +268,7 @@ def test_step_called_when_sync_gradients_true(device):
 def test_loss_is_differentiable_dpo(device):
     strat = _make_dpo(device)
     strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
     loss.backward()
     has_grad = any(
         p.grad is not None and p.grad.abs().sum() > 0 for p in strat.model.parameters()
@@ -279,7 +279,7 @@ def test_loss_is_differentiable_dpo(device):
 def test_ref_model_not_updated_by_backward_dpo(device):
     strat = _make_dpo(device)
     strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
     loss.backward()
     for p in strat.ref_model.parameters():
         assert p.grad is None

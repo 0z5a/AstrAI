@@ -70,7 +70,7 @@ class EmbeddingEncoder(AutoModel):
         attn_mask = process_attention_mask(input_mask)
 
         for layer in self.layers:
-            x = layer(x, rotary_emb, attn_mask)
+            x = layer(x, rotary_emb, attn_mask)["hidden_states"]
 
         hidden_states = self.norm(x)
 

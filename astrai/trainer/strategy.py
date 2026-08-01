@@ -1,7 +1,7 @@
 """Training strategy implementations with factory pattern."""
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Union
+from typing import Callable, Dict, Optional, TypedDict, Union
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,16 @@ from torch import Tensor
 from astrai.factory import BaseFactory
 from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.rollout import RolloutResult
+
+
+class LossOutput(TypedDict):
+    loss: Tensor
+    metrics: Dict[str, Tensor]
+
+
+class LogprobsOutput(TypedDict):
+    logprobs: Tensor
+    aux_loss: Optional[Tensor]
 
 
 def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
@@ -24,7 +34,7 @@ def get_logprobs(
     attn_mask: Tensor,
     loss_mask: Tensor,
     reduction: str,
-) -> Tensor:
+) -> LogprobsOutput:
     """Compute token-wise log probabilities from model outputs.
 
     Args:
@@ -46,10 +56,11 @@ def get_logprobs(
     shifted_input_ids = input_ids[:, 1:]
     shifted_loss_mask = loss_mask[:, 1:]
 
-    logits = model(
+    outputs = model(
         input_ids[:, :-1],
         attn_mask[:, :, :-1, :-1] if attn_mask.dim() == 4 else attn_mask[:, :-1],
-    )["logits"]
+    )
+    logits = outputs["logits"]
     log_probs = torch.log_softmax(logits.float(), dim=-1)
 
     token_logprobs = torch.gather(
@@ -57,13 +68,14 @@ def get_logprobs(
     ).squeeze(-1)
 
     if reduction == "mean":
-        return (token_logprobs * shifted_loss_mask).sum(dim=-1) / shifted_loss_mask.sum(
+        logprobs = (token_logprobs * shifted_loss_mask).sum(
             dim=-1
-        ).clamp(min=1.0)
+        ) / shifted_loss_mask.sum(dim=-1).clamp(min=1.0)
     elif reduction == "sum":
-        return (token_logprobs * shifted_loss_mask).sum(dim=-1)
+        logprobs = (token_logprobs * shifted_loss_mask).sum(dim=-1)
     else:
-        return token_logprobs * shifted_loss_mask
+        logprobs = token_logprobs * shifted_loss_mask
+    return {"logprobs": logprobs, "aux_loss": outputs.get("aux_loss")}
 
 
 def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
@@ -102,6 +114,7 @@ class BaseStrategy(ABC):
         self.model = model
         self.device = device
         self.executor = kwargs.pop("executor", None)
+        self.moe_aux_loss_coef = kwargs.pop("moe_aux_loss_coef", 0.01)
         self.extra_kwargs = kwargs
         self._rollout_runner = None
 
@@ -116,6 +129,33 @@ class BaseStrategy(ABC):
             Computed loss tensor
         """
         raise NotImplementedError
+
+    def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
+        return self._normalize_output(self.compute_loss(batch))
+
+    def _loss_output(
+        self,
+        task_loss: Tensor,
+        metrics: Dict[str, Tensor],
+        aux_loss: Optional[Tensor] = None,
+    ) -> LossOutput:
+        total_loss = task_loss
+        if aux_loss is not None:
+            weighted_aux_loss = self.moe_aux_loss_coef * aux_loss
+            total_loss = total_loss + weighted_aux_loss
+            metrics["moe_aux_loss"] = aux_loss
+            metrics["moe_aux_loss_weighted"] = weighted_aux_loss
+        metrics["loss"] = total_loss
+        return {
+            "loss": total_loss,
+            "metrics": {name: value.detach() for name, value in metrics.items()},
+        }
+
+    @staticmethod
+    def _normalize_output(output: Union[LossOutput, Tensor]) -> LossOutput:
+        if isinstance(output, dict):
+            return output
+        return {"loss": output, "metrics": {"loss": output.detach()}}
 
     def supports_online(self) -> bool:
         """Whether this strategy can operate with a rollout runner.
@@ -153,17 +193,17 @@ class BaseStrategy(ABC):
         if self._rollout_runner is not None:
             self._rollout_runner.step()
 
-    def __call__(self, batch: Dict[str, Tensor]) -> Tensor:
+    def __call__(self, batch: Dict[str, Tensor]) -> LossOutput:
         """Run offline or online forward depending on runner injection."""
         if self._rollout_runner is None:
-            return self.compute_loss(batch)
+            return self.compute_loss_output(batch)
 
         result, is_fresh = self._rollout_runner(batch)
         if is_fresh:
             self._on_rollout_refresh()
 
         train_batch = self.prepare_from_rollout(result)
-        return self.compute_loss(train_batch)
+        return self.compute_loss_output(train_batch)
 
 
 class StrategyFactory(BaseFactory["BaseStrategy"]):
@@ -203,9 +243,13 @@ class SEQStrategy(BaseStrategy):
         self.label_smoothing = label_smoothing
 
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
+        return self.compute_loss_output(batch)["loss"]
+
+    def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
         input_ids, target_ids = batch["input_ids"], batch["target_ids"]
-        logits = self.model(input_ids=input_ids)["logits"]
+        outputs = self.model(input_ids=input_ids)
+        logits = outputs["logits"]
 
         loss = F.cross_entropy(
             input=logits.flatten(0, 1).float(),
@@ -213,7 +257,7 @@ class SEQStrategy(BaseStrategy):
             label_smoothing=self.label_smoothing,
         )
 
-        return loss
+        return self._loss_output(loss, {"task_loss": loss}, outputs.get("aux_loss"))
 
 
 @StrategyFactory.register("sft")
@@ -234,6 +278,9 @@ class SFTStrategy(BaseStrategy):
         self.label_smoothing = label_smoothing
 
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
+        return self.compute_loss_output(batch)["loss"]
+
+    def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
         input_ids, target_ids, position_ids, loss_mask = (
             batch["input_ids"],
@@ -245,9 +292,10 @@ class SFTStrategy(BaseStrategy):
         ignore_index = -100
         input_mask = make_doc_boundary_mask(position_ids)
         target_ids = target_ids.masked_fill(~loss_mask, ignore_index)
-        logits = self.model(
+        outputs = self.model(
             input_ids=input_ids, position_ids=position_ids, input_mask=input_mask
-        )["logits"]
+        )
+        logits = outputs["logits"]
 
         loss = F.cross_entropy(
             input=logits.flatten(0, 1).float(),
@@ -256,7 +304,7 @@ class SFTStrategy(BaseStrategy):
             label_smoothing=self.label_smoothing,
         )
 
-        return loss
+        return self._loss_output(loss, {"task_loss": loss}, outputs.get("aux_loss"))
 
 
 @StrategyFactory.register("dpo")
@@ -282,6 +330,9 @@ class DPOStrategy(BaseStrategy):
         self.reduction = reduction
 
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
+        return self.compute_loss_output(batch)["loss"]
+
+    def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
         chosen_ids, rejected_ids = batch["chosen"], batch["rejected"]
         chosen_mask, rejected_mask = batch["chosen_mask"], batch["rejected_mask"]
@@ -297,22 +348,25 @@ class DPOStrategy(BaseStrategy):
         )[None, None, :, :]  # [1, 1, S, S]
         full_mask = key_pad & causal  # [B*2, 1, S, S] — composed
 
-        log_pi = get_logprobs(
+        policy_output = get_logprobs(
             self.model,
             concat_ids,
             full_mask,
             concat_loss_mask,
             self.reduction,
         )
+        log_pi = policy_output["logprobs"]
+        aux_loss = policy_output["aux_loss"]
 
         with torch.no_grad():
-            log_ref = get_logprobs(
+            ref_output = get_logprobs(
                 self.ref_model,
                 concat_ids,
                 full_mask,
                 concat_loss_mask,
                 self.reduction,
             )
+            log_ref = ref_output["logprobs"]
 
         log_pi_chosen = log_pi[: chosen_ids.shape[0]]
         log_pi_rejected = log_pi[chosen_ids.shape[0] :]
@@ -325,7 +379,7 @@ class DPOStrategy(BaseStrategy):
         ratio_diff = pi_log_ratio - ref_log_ratio
         dpo_loss = -F.logsigmoid(self.beta * ratio_diff).mean()
 
-        return dpo_loss
+        return self._loss_output(dpo_loss, {"dpo_loss": dpo_loss}, aux_loss)
 
     def supports_online(self) -> bool:
         return True
@@ -398,6 +452,9 @@ class GRPOStrategy(BaseStrategy):
             self.old_model.load_state_dict(state_dict)
 
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
+        return self.compute_loss_output(batch)["loss"]
+
+    def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
         prompts = batch["prompts"]
         responses = batch["responses"]
@@ -438,16 +495,23 @@ class GRPOStrategy(BaseStrategy):
         # get_logprobs returns [B*G, S-1] (S = prompt_len + response_len).
         # Response token logprobs occupy the last ``response_len`` positions
         # (the first response token is predicted from the last prompt token).
-        token_log_probs_policy = get_logprobs(
+        policy_output = get_logprobs(
             self.model, full_sequences, attn_mask, full_masks, "none"
-        )[:, prompt_len - 1 :]
+        )
+        token_log_probs_policy = policy_output["logprobs"]
+        aux_loss = policy_output["aux_loss"]
+        token_log_probs_policy = token_log_probs_policy[:, prompt_len - 1 :]
         with torch.no_grad():
-            token_log_probs_old = get_logprobs(
+            old_output = get_logprobs(
                 self.old_model, full_sequences, attn_mask, full_masks, "none"
-            )[:, prompt_len - 1 :]
-            token_log_probs_ref = get_logprobs(
+            )
+            token_log_probs_old = old_output["logprobs"]
+            token_log_probs_old = token_log_probs_old[:, prompt_len - 1 :]
+            ref_output = get_logprobs(
                 self.ref_model, full_sequences, attn_mask, full_masks, "none"
-            )[:, prompt_len - 1 :]
+            )
+            token_log_probs_ref = ref_output["logprobs"]
+            token_log_probs_ref = token_log_probs_ref[:, prompt_len - 1 :]
 
         # Reshape to [B, G, response_len]
         token_log_probs_policy = token_log_probs_policy.view(batch_size, group_size, -1)
@@ -480,9 +544,12 @@ class GRPOStrategy(BaseStrategy):
         kl_per_token = r - torch.log(r + eps) - 1.0
         kl_penalty = self.kl_coef * (kl_per_token * token_masks).sum() / token_count
 
-        total_loss = policy_loss + kl_penalty
-
-        return total_loss
+        task_loss = policy_loss + kl_penalty
+        return self._loss_output(
+            task_loss,
+            {"policy_loss": policy_loss, "kl_loss": kl_penalty},
+            aux_loss,
+        )
 
     def supports_online(self) -> bool:
         return True

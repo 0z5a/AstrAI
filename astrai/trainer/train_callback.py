@@ -260,11 +260,28 @@ class MetricCallback(TrainCallback):
         }
 
     def _metrics(self, context: TrainContext, names):
-        return {
-            m: self._metric_funcs[m](context)
-            for m in names
-            if self._metric_funcs[m](context) is not None
-        }
+        metrics = dict(context.metrics)
+        for name in names:
+            metric_fn = self._metric_funcs.get(name)
+            if metric_fn is None:
+                continue
+            value = metric_fn(context)
+            if value is not None:
+                metrics[name] = value
+        selected = set(context.metrics) | set(names)
+        selected.discard("*")
+        result = {name: metrics[name] for name in selected if name in metrics}
+        if context.world_size > 1 and dist.is_initialized() and result:
+            metric_names = sorted(result)
+            values = torch.tensor(
+                [result[name] for name in metric_names],
+                dtype=torch.float32,
+                device=get_current_device(),
+            )
+            dist.all_reduce(values, op=dist.ReduceOp.SUM)
+            values /= context.world_size
+            result.update(zip(metric_names, values.tolist()))
+        return result
 
     @only_on_rank(0)
     def _append(self, event_type: str, context: TrainContext, **extra):
@@ -286,8 +303,8 @@ class MetricCallback(TrainCallback):
 
         with torch.no_grad():
             for batch in context.val_dataloader:
-                loss = context.strategy(batch)
-                total_loss += loss.item()
+                loss_output = context.strategy(batch)
+                total_loss += loss_output["loss"].item()
                 num_batches += 1
 
         if context.world_size > 1 and dist.is_initialized():

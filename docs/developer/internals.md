@@ -81,6 +81,14 @@ Where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the per-toke
 
 Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`.
 
+### MoE Load Balancing
+
+MoE layers add a differentiable load-balancing term based on mean router probabilities and top-k expert assignment frequency. The training objective is:
+
+$$ L = L_{\text{task}} + \lambda_{\text{MoE}} L_{\text{aux}} $$
+
+`TrainConfig.moe_aux_loss_coef` controls $\lambda_{\text{MoE}}$ (default `0.01`). The unweighted and weighted auxiliary losses are logged separately.
+
 ## Training Loop Internals
 
 Two-level loop: **epoch** → **batch**. Optimizer step fires every `grad_accum_steps` batches.
@@ -92,9 +100,10 @@ on_train_begin
     for batch in dataloader:
       on_batch_begin
       with executor.accumulate(model):
-        loss = strategy.compute_loss(batch)
-        context.loss = loss.item()
-        stand_loss = loss / executor.grad_accum_steps
+        loss_output = strategy(batch)
+        context.loss = loss_output["loss"].item()
+        context.metrics = loss_output["metrics"]
+        stand_loss = loss_output["loss"] / executor.grad_accum_steps
         executor.backward(stand_loss)
         context.consumed_samples += (
             context.config.batch_per_device * context.world_size

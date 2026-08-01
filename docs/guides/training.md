@@ -54,9 +54,10 @@ on_train_begin
     for batch in dataloader:
       on_batch_begin
       with executor.accumulate(model):
-        loss = strategy.compute_loss(batch)
-        context.loss = loss.item()
-        stand_loss = loss / executor.grad_accum_steps
+        loss_output = strategy(batch)
+        context.loss = loss_output["loss"].item()
+        context.metrics = loss_output["metrics"]
+        stand_loss = loss_output["loss"] / executor.grad_accum_steps
         executor.backward(stand_loss)
         context.consumed_samples += (
             context.config.batch_per_device * context.world_size
@@ -87,6 +88,8 @@ on_train_end
 | `on_train_end` | Training ends (always via finally) | `CheckpointCallback`, `MetricCallback`, `GradientCheckpointingCallback` |
 
 Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm), `gradient_clipping` (always registered; computes grad norm, clips only when `max_grad_norm` is not `None`).
+
+Strategies return `{"loss": Tensor, "metrics": Dict[str, Tensor]}` when called by the trainer. Built-in metrics include the task-specific loss and, for MoE models, `moe_aux_loss` plus `moe_aux_loss_weighted`. Direct `compute_loss(batch)` calls continue to return a single loss tensor.
 
 ## Strategies
 

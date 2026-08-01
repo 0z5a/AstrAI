@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, TypedDict
 
 import torch
 import torch.nn as nn
@@ -13,6 +13,16 @@ class FFNFactory(BaseFactory[nn.Module]):
     pass
 
 
+class FFNOutput(TypedDict):
+    hidden_states: Tensor
+    aux_loss: Optional[Tensor]
+
+
+class RoutedOutput(TypedDict):
+    hidden_states: Tensor
+    aux_loss: Optional[Tensor]
+
+
 @FFNFactory.register("mlp")
 class MLP(nn.Module):
     def __init__(self, dim: int, dim_ffn: int, down_init_std: float = 0.02):
@@ -21,10 +31,10 @@ class MLP(nn.Module):
         self.gate = Linear(dim, dim_ffn)
         self.down = Linear(dim_ffn, dim, init_std=down_init_std)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> FFNOutput:
         gated = self.up(x) * F.silu(self.gate(x))
         out = self.down(gated)
-        return out
+        return {"hidden_states": out, "aux_loss": None}
 
 
 @FFNFactory.register("moe")
@@ -76,22 +86,26 @@ class DeepSeekMoE(nn.Module):
             ]
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> FFNOutput:
+        include_aux_loss = self.training and torch.is_grad_enabled()
         bsz, seq_len, dim = x.shape
         x_flat = x.view(-1, dim)
 
         shared_out = self._shared_forward(x_flat)
-        routed_out = self._routed_forward(x_flat)
+        routed_output = self._routed_forward(x_flat, include_aux_loss)
 
-        out = (shared_out + routed_out).view(bsz, seq_len, dim)
-        return out
+        out = (shared_out + routed_output["hidden_states"]).view(bsz, seq_len, dim)
+        return {"hidden_states": out, "aux_loss": routed_output["aux_loss"]}
 
     def _shared_forward(self, x: Tensor) -> Tensor:
         if self.n_shared_experts == 0:
             return torch.zeros_like(x)
-        return sum(e(x) for e in self.shared_experts) / self.n_shared_experts
+        return (
+            sum(e(x)["hidden_states"] for e in self.shared_experts)
+            / self.n_shared_experts
+        )
 
-    def _routed_forward(self, x: Tensor) -> Tensor:
+    def _routed_forward(self, x: Tensor, include_aux_loss: bool) -> RoutedOutput:
         N, D = x.shape
         K = self.n_activated_experts
 
@@ -102,15 +116,26 @@ class DeepSeekMoE(nn.Module):
         if self.norm_topk_prob:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
+        aux_loss = None
+        if include_aux_loss:
+            expert_load = F.one_hot(
+                topk_indices, num_classes=self.n_routed_experts
+            ).float()
+            expert_load = expert_load.mean(dim=(0, 1))
+            router_prob = router_probs.float().mean(dim=0)
+            aux_loss = self.n_routed_experts * (expert_load * router_prob).sum()
+
         output = torch.zeros(N, D, device=x.device, dtype=x.dtype)
         for expert_idx in range(self.n_routed_experts):
             expert_mask = topk_indices == expert_idx
             token_idx, k_idx = expert_mask.nonzero(as_tuple=True)
             if token_idx.numel() == 0:
                 continue
+            expert = self.routed_experts[expert_idx]
             expert_input = x[token_idx]
-            expert_output = self.routed_experts[expert_idx](expert_input)
+            expert_output = expert(expert_input)["hidden_states"]
+
             weights = topk_weights[token_idx, k_idx].unsqueeze(-1)
             output.index_add_(0, token_idx, expert_output * weights)
 
-        return output
+        return {"hidden_states": output, "aux_loss": aux_loss}

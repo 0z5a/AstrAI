@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from typing import Optional
+from typing import Optional, TypedDict
 
 import torch.nn as nn
 from torch import Tensor
@@ -8,6 +8,11 @@ from astrai.inference.core.cache import KVCache
 from astrai.model.components.attention import AttnFactory
 from astrai.model.components.mlp import FFNFactory
 from astrai.model.components.norm import RMSNorm
+
+
+class DecoderOutput(TypedDict):
+    hidden_states: Tensor
+    aux_loss: Optional[Tensor]
 
 
 class DecoderBlock(nn.Module):
@@ -48,7 +53,7 @@ class DecoderBlock(nn.Module):
         attention_mask: Optional[Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,
-    ) -> Tensor:
+    ) -> DecoderOutput:
         attn_output = self.attention(
             self.input_norm(x),
             rotary_emb,
@@ -57,6 +62,8 @@ class DecoderBlock(nn.Module):
             is_causal,
         )
         x = attn_output + x
-        x = self.mlp(self.post_attention_norm(x)) + x
+        normalized = self.post_attention_norm(x)
+        mlp_output = self.mlp(normalized)
+        x = mlp_output["hidden_states"] + x
 
-        return x
+        return {"hidden_states": x, "aux_loss": mlp_output["aux_loss"]}

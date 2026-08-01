@@ -82,9 +82,13 @@ class Trainer:
                         break
                     with executor.accumulate(context.model):
                         self._call_callbacks("on_batch_begin", context)
-                        loss = context.strategy(batch)
-                        context.loss = loss.item()
-                        stand_loss = loss / executor.grad_accum_steps
+                        loss_output = context.strategy(batch)
+                        context.loss = loss_output["loss"].item()
+                        context.metrics = {
+                            name: value.item()
+                            for name, value in loss_output["metrics"].items()
+                        }
+                        stand_loss = loss_output["loss"] / executor.grad_accum_steps
                         executor.backward(stand_loss)
                         context.consumed_samples += (
                             context.config.batch_per_device * context.world_size

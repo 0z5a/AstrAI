@@ -61,6 +61,7 @@ class TrainConfig(BaseConfig):
         val_split (Optional[float]): Ratio to split from training dataset for validation, e.g. 0.05. Defaults to None.
         val_step (int): Number of optimizer steps between validation runs. Defaults to 1000.
         neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
+        moe_aux_loss_coef (float): Weight applied to the MoE load-balancing loss. Defaults to 0.01.
         rollout_interval (int): Number of optimizer steps between online rollouts. Defaults to 512.
         rollout_temperature (float): Sampling temperature for online rollout. Defaults to 0.7.
         rollout_top_k (int): Top-k filtering for online rollout, 0=disable. Defaults to 0.
@@ -112,6 +113,7 @@ class TrainConfig(BaseConfig):
     val_split: Optional[float] = None
     val_step: int = 1000
     neftune_alpha: float = 0.0
+    moe_aux_loss_coef: float = 0.01
 
     rollout_interval: int = 512
     rollout_temperature: float = 0.7
@@ -187,7 +189,9 @@ class TrainConfig(BaseConfig):
             raise ValueError(f"rollout_top_p must be in (0, 1], got {v}")
         return v
 
-    @field_validator("rollout_top_k", "num_workers", "neftune_alpha")
+    @field_validator(
+        "rollout_top_k", "num_workers", "neftune_alpha", "moe_aux_loss_coef"
+    )
     def _validate_non_negative(cls, v):
         if v < 0:
             raise ValueError(f"must be non-negative, got {v}")

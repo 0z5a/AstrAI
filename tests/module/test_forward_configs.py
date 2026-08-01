@@ -265,6 +265,51 @@ def test_moe_defaults_preserve_normalized_routing():
     assert model.layers[0].mlp.norm_topk_prob is True
 
 
+def test_moe_aux_loss_only_emitted_during_training():
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        ffn_type="moe",
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_activated_experts=2,
+        topk_method="greedy",
+    )
+    model = AutoRegressiveLM(config)
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+    outputs = model(input_ids)
+    assert outputs["aux_loss"].ndim == 0
+    assert outputs["aux_loss"].requires_grad
+    assert torch.isfinite(outputs["aux_loss"])
+
+    with torch.no_grad():
+        outputs = model(input_ids)
+    assert "aux_loss" not in outputs
+
+    model.eval()
+    outputs = model(input_ids)
+    assert "aux_loss" not in outputs
+
+
+def test_moe_component_forward_returns_ffn_output():
+    from astrai.model.components.mlp import DeepSeekMoE
+
+    moe = DeepSeekMoE(
+        dim=8,
+        dim_ffn=16,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_activated_experts=2,
+    )
+
+    output = moe(torch.randn(2, 8, 8))
+
+    assert output["hidden_states"].shape == (2, 8, 8)
+    assert output["aux_loss"] is not None
+
+
 @pytest.mark.parametrize("decoder_sparse_step", [0, -1])
 def test_moe_rejects_invalid_decoder_sparse_step(decoder_sparse_step):
     from pydantic import ValidationError
