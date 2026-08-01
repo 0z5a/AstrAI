@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from astrai.model.transformer import AutoRegressiveLM
@@ -33,16 +34,14 @@ def test_seq_strategy_combines_and_reports_moe_aux_loss(device):
         "moe_aux_loss",
         "moe_aux_loss_weighted",
     }
-    torch.testing.assert_close(
-        output["loss"],
+    assert output["loss"].item() == pytest.approx(
         output["metrics"]["task_loss"] + output["metrics"]["moe_aux_loss_weighted"],
     )
-    torch.testing.assert_close(
-        output["metrics"]["moe_aux_loss_weighted"],
+    assert output["metrics"]["moe_aux_loss_weighted"] == pytest.approx(
         0.25 * output["metrics"]["moe_aux_loss"],
     )
     assert output["loss"].requires_grad
-    assert all(not metric.requires_grad for metric in output["metrics"].values())
+    assert all(isinstance(metric, float) for metric in output["metrics"].values())
 
 
 def test_metric_callback_includes_dynamic_strategy_metrics(tmp_path):
@@ -103,4 +102,4 @@ def test_legacy_strategy_tensor_loss_is_normalized():
     output = strategy({})
 
     assert output["loss"].item() == 2.0
-    assert output["metrics"]["loss"].item() == 2.0
+    assert output["metrics"]["loss"] == 2.0

@@ -15,7 +15,7 @@ from astrai.trainer.rollout import RolloutResult
 
 class LossOutput(TypedDict):
     loss: Tensor
-    metrics: Dict[str, Tensor]
+    metrics: Dict[str, float]
 
 
 class LogprobsOutput(TypedDict):
@@ -148,14 +148,14 @@ class BaseStrategy(ABC):
         metrics["loss"] = total_loss
         return {
             "loss": total_loss,
-            "metrics": {name: value.detach() for name, value in metrics.items()},
+            "metrics": {name: value.detach().item() for name, value in metrics.items()},
         }
 
     @staticmethod
     def _normalize_output(output: Union[LossOutput, Tensor]) -> LossOutput:
         if isinstance(output, dict):
             return output
-        return {"loss": output, "metrics": {"loss": output.detach()}}
+        return {"loss": output, "metrics": {"loss": output.detach().item()}}
 
     def supports_online(self) -> bool:
         """Whether this strategy can operate with a rollout runner.

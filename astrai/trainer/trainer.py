@@ -84,10 +84,7 @@ class Trainer:
                         self._call_callbacks("on_batch_begin", context)
                         loss_output = context.strategy(batch)
                         context.loss = loss_output["loss"].item()
-                        context.metrics = {
-                            name: value.item()
-                            for name, value in loss_output["metrics"].items()
-                        }
+                        context.metrics = loss_output["metrics"]
                         stand_loss = loss_output["loss"] / executor.grad_accum_steps
                         executor.backward(stand_loss)
                         context.consumed_samples += (
