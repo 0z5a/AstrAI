@@ -65,7 +65,7 @@ class AutoRegressiveLMConfig(BaseModelConfig):
         topk_method (Optional[str]): Top-k routing method, MoE only. Defaults to None.
         moe_intermediate_size (Optional[int]): Expert hidden dim, defaults to intermediate_size if None. MoE only.
         shared_expert_intermediate_size (Optional[int]): Shared expert hidden dim, defaults to intermediate_size if None. MoE only.
-        norm_topk_prob (bool): Normalize top-k routing probabilities. Defaults to False.
+        norm_topk_prob (bool): Normalize top-k routing probabilities. Defaults to True.
         decoder_sparse_step (int): Frequency of MoE layers, 1=every layer. Defaults to 1.
         mlp_only_layers (Optional[list[int]]): Layer indices using dense MLP instead of MoE. Defaults to None.
     """
@@ -94,7 +94,7 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     topk_method: Optional[str] = None
     moe_intermediate_size: Optional[int] = None
     shared_expert_intermediate_size: Optional[int] = None
-    norm_topk_prob: bool = False
+    norm_topk_prob: bool = True
     decoder_sparse_step: int = 1
     mlp_only_layers: Optional[list[int]] = None
 
@@ -110,6 +110,12 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     def _validate_ffn_type(cls, v: str) -> str:
         if v not in _FFN_TYPES:
             raise ValueError(f"ffn_type must be one of {sorted(_FFN_TYPES)}, got {v!r}")
+        return v
+
+    @field_validator("decoder_sparse_step")
+    def _validate_decoder_sparse_step(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"decoder_sparse_step must be at least 1, got {v}")
         return v
 
 

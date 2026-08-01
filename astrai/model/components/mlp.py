@@ -40,7 +40,7 @@ class DeepSeekMoE(nn.Module):
         n_layers: int = 1,
         moe_intermediate_size: Optional[int] = None,
         shared_expert_intermediate_size: Optional[int] = None,
-        norm_topk_prob: bool = False,
+        norm_topk_prob: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -50,8 +50,14 @@ class DeepSeekMoE(nn.Module):
         self.topk_method = topk_method
         self.norm_topk_prob = norm_topk_prob
 
-        expert_dim_ffn = moe_intermediate_size if moe_intermediate_size is not None else dim_ffn
-        shared_dim_ffn = shared_expert_intermediate_size if shared_expert_intermediate_size is not None else dim_ffn
+        expert_dim_ffn = (
+            moe_intermediate_size if moe_intermediate_size is not None else dim_ffn
+        )
+        shared_dim_ffn = (
+            shared_expert_intermediate_size
+            if shared_expert_intermediate_size is not None
+            else dim_ffn
+        )
 
         self.router = Linear(dim, n_routed_experts, bias=False)
         moe_scale = 1 / max(n_shared_experts, 1) + 1 / n_activated_experts

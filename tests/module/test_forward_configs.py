@@ -246,3 +246,36 @@ def test_moe_custom_intermediate_shape():
         assert expert.up.weight.shape[0] == 20
         assert expert.gate.weight.shape[0] == 20
         assert expert.down.weight.shape[1] == 20
+
+
+def test_moe_defaults_preserve_normalized_routing():
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        ffn_type="moe",
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_activated_experts=2,
+        topk_method="greedy",
+    )
+    model = AutoRegressiveLM(config)
+
+    assert config.norm_topk_prob is True
+    assert model.layers[0].mlp.norm_topk_prob is True
+
+
+@pytest.mark.parametrize("decoder_sparse_step", [0, -1])
+def test_moe_rejects_invalid_decoder_sparse_step(decoder_sparse_step):
+    from pydantic import ValidationError
+
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    with pytest.raises(ValidationError, match="decoder_sparse_step must be at least 1"):
+        AutoRegressiveLMConfig(
+            **TINY_CONFIG,
+            ffn_type="moe",
+            n_routed_experts=4,
+            n_activated_experts=2,
+            decoder_sparse_step=decoder_sparse_step,
+        )
