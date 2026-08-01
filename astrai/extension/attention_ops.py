@@ -12,9 +12,22 @@ Interface (all functions):
     mask:      2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool, True=keep)
 """
 
+import enum
+from typing import Optional
+
 import torch
 
 from astrai.extension.loader import _available, _modules
+
+
+class TensorLayout(enum.IntEnum):
+    """Q/K/V tensor layout, mirrors the C++ ``TensorLayout`` enum in ``attn_common.h``.
+
+    Kernels internally operate on BHLD; BLHD inputs are transposed at entry.
+    """
+
+    BHLD = 0  # [batch, n_heads, seq_len, head_dim]
+    BLHD = 1  # [batch, seq_len, n_heads, head_dim]
 
 
 def _check_available(name: str):
@@ -29,7 +42,7 @@ def attn_decode(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    mask: torch.Tensor | None = None,
+    mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
 ) -> torch.Tensor:
     """GQA decode attention (q_len == 1).
@@ -47,7 +60,7 @@ def attn_decode(
     _check_available("attn_decode")
     causal_offset = (k.size(1) - 1) if is_causal else -1
     return _modules["attn_decode"].attn_decode(
-        q, k, v, mask=mask, causal_offset=causal_offset, layout=1
+        q, k, v, mask=mask, causal_offset=causal_offset, layout=TensorLayout.BLHD
     )
 
 
@@ -55,7 +68,7 @@ def attn_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    mask: torch.Tensor | None = None,
+    mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
 ) -> torch.Tensor:
     """GQA prefill attention (q_len > 1).
@@ -73,7 +86,7 @@ def attn_prefill(
     _check_available("attn_prefill")
     causal_offset = (k.size(1) - q.size(1)) if is_causal else -1
     return _modules["attn_prefill"].attn_prefill(
-        q, k, v, mask=mask, causal_offset=causal_offset, layout=1
+        q, k, v, mask=mask, causal_offset=causal_offset, layout=TensorLayout.BLHD
     )
 
 
@@ -84,7 +97,7 @@ def attn_paged_decode(
     v_cache: torch.Tensor,
     page_size: int,
     kv_len: int,
-    mask: torch.Tensor | None = None,
+    mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
 ) -> torch.Tensor:
     """Paged GQA decode attention (q_len == 1, direct page-table access).
@@ -113,5 +126,5 @@ def attn_paged_decode(
         kv_len,
         mask=mask,
         causal_offset=causal_offset,
-        layout=1,
+        layout=TensorLayout.BLHD,
     )

@@ -37,7 +37,7 @@ inline void alloc_split_partials(P& p) {
 // ---- Shared Q-dims + strides extraction ----
 template <typename P>
 inline void extract_q_dims_and_strides(torch::Tensor& q, int64_t layout, P& p) {
-    if (layout == 1) q = q.transpose(1, 2);
+    if (layout == BLHD) q = q.transpose(1, 2);
     p.batch = (int)q.size(0);
     p.q_head = (int)q.size(1);
     p.q_len = (int)q.size(2);
@@ -109,7 +109,7 @@ inline void attn_pack_params(
 
     extract_q_dims_and_strides(q, layout, p);
 
-    if (layout == 1) k = k.transpose(1, 2), v = v.transpose(1, 2);
+    if (layout == BLHD) k = k.transpose(1, 2), v = v.transpose(1, 2);
 
     p.kv_head = (int)k.size(1);
     p.kv_len = (int)k.size(2);

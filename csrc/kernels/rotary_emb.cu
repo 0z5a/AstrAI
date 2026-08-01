@@ -1,4 +1,6 @@
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 
 __global__ void rotary_emb_kernel(
@@ -46,6 +48,8 @@ torch::Tensor rotary_emb(
     torch::Tensor x,
     torch::Tensor freqs_cis
 ) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+
     TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
     TORCH_CHECK(freqs_cis.is_cuda(), "freqs_cis must be on CUDA");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bf16");
@@ -53,6 +57,7 @@ torch::Tensor rotary_emb(
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(freqs_cis.dim() == 4, "freqs_cis must be 4D [batch, seq_len, dim/2, 2]");
     TORCH_CHECK(freqs_cis.is_contiguous(), "freqs_cis must be contiguous");
+    TORCH_CHECK(freqs_cis.scalar_type() == torch::kFloat32, "freqs_cis must be f32");
 
     int batch = x.size(0);
     int seq_len = x.size(1);
@@ -60,6 +65,10 @@ torch::Tensor rotary_emb(
     int head_dim = x.size(3);
 
     TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even");
+    TORCH_CHECK(freqs_cis.size(0) == batch, "freqs_cis batch mismatch");
+    TORCH_CHECK(freqs_cis.size(1) == seq_len, "freqs_cis seq_len mismatch");
+    TORCH_CHECK(freqs_cis.size(2) == head_dim / 2, "freqs_cis dim/2 mismatch");
+    TORCH_CHECK(freqs_cis.size(3) == 2, "freqs_cis last dim must be 2 [cos, sin]");
 
     auto out = torch::empty_like(x);
 
@@ -74,6 +83,7 @@ torch::Tensor rotary_emb(
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
         batch, seq_len, n_heads, head_dim
     );
+    C10_CUDA_CHECK(cudaGetLastError());
 
     return out;
 }

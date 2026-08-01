@@ -14,17 +14,49 @@
 #include "attn_paged_decode_split_kv_mma.cuh"
 #endif
 
+// Cached SM count — cudaDeviceGetAttribute is a host-side call that was
+// invoked on every decode/paged-decode launch.  Cache per-device so multi-GPU
+// setups with heterogeneous GPUs still get the right count, while the common
+// single-GPU path hits the cache after the first call.
+inline int get_sm_count() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    static int cached_dev = -1;
+    static int cached_count = 0;
+    if (dev != cached_dev) {
+        cudaDeviceGetAttribute(&cached_count, cudaDevAttrMultiProcessorCount, dev);
+        cached_dev = dev;
+    }
+    return cached_count;
+}
+
 // Split-KV: compute number of splits to fill all SMs for small-batch decode.
 // Caps splits so each split processes at least `min_tiles_per_split` tiles,
 // avoiding excessive loop/prologue overhead when tiles are small.
 inline int compute_num_splits(int base_blocks, int tiles_total,
-                              int min_tiles_per_split = 1) {
-    int sm_count = 0;
-    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+                               int min_tiles_per_split = 1) {
+    int sm_count = get_sm_count();
     int n = (2 * sm_count + base_blocks - 1) / base_blocks;
     int max_by_work = tiles_total / min_tiles_per_split;
     return std::max(1, std::min(n, std::min(max_by_work, MAX_SPLITS)));
 }
+
+// Dispatch IsCausal × HasMask — eliminates the duplicated 4-way if/else
+// ladder that appeared in each dispatch_* function.  FN must be a function
+// template <int HEAD_DIM, bool IsCausal, bool HasMask>; HEAD_DIM is forwarded
+// as the first template argument so callers only spell it once.
+//
+// Usage:  DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_decode_mma, HEAD_DIM, p, group_size);
+#define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...) \
+    do { \
+        if (is_causal) { \
+            if (has_mask) FN<HEAD_DIM, true,  true>(__VA_ARGS__); \
+            else          FN<HEAD_DIM, true,  false>(__VA_ARGS__); \
+        } else { \
+            if (has_mask) FN<HEAD_DIM, false, true>(__VA_ARGS__); \
+            else          FN<HEAD_DIM, false, false>(__VA_ARGS__); \
+        } \
+    } while (0)
 
 // ======================================================================
 // Prefill
@@ -56,21 +88,9 @@ static inline void dispatch_prefill(AttentionParams<bf16>& p) {
     bool has_mask = (p.use_mask && p.mask);
 
 #ifndef ASTRAI_NO_MMA
-    if (is_causal) {
-        if (has_mask)      launch_prefill_mma<HEAD_DIM, true, true>(p);
-        else               launch_prefill_mma<HEAD_DIM, true, false>(p);
-    } else {
-        if (has_mask)      launch_prefill_mma<HEAD_DIM, false, true>(p);
-        else               launch_prefill_mma<HEAD_DIM, false, false>(p);
-    }
+    DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_prefill_mma, HEAD_DIM, p);
 #else
-    if (is_causal) {
-        if (has_mask)      launch_prefill_scalar<HEAD_DIM, true, true>(p);
-        else               launch_prefill_scalar<HEAD_DIM, true, false>(p);
-    } else {
-        if (has_mask)      launch_prefill_scalar<HEAD_DIM, false, true>(p);
-        else               launch_prefill_scalar<HEAD_DIM, false, false>(p);
-    }
+    DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_prefill_scalar, HEAD_DIM, p);
 #endif
 }
 
@@ -116,21 +136,9 @@ static inline void dispatch_decode(AttentionParams<bf16>& p) {
     int group_size = p.q_head / p.kv_head;
 
 #ifndef ASTRAI_NO_MMA
-    if (is_causal) {
-        if (has_mask)      launch_decode_mma<HEAD_DIM, true, true>(p, group_size);
-        else               launch_decode_mma<HEAD_DIM, true, false>(p, group_size);
-    } else {
-        if (has_mask)      launch_decode_mma<HEAD_DIM, false, true>(p, group_size);
-        else               launch_decode_mma<HEAD_DIM, false, false>(p, group_size);
-    }
+    DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_decode_mma, HEAD_DIM, p, group_size);
 #else
-    if (is_causal) {
-        if (has_mask)      launch_decode_scalar<HEAD_DIM, true, true>(p, group_size);
-        else               launch_decode_scalar<HEAD_DIM, true, false>(p, group_size);
-    } else {
-        if (has_mask)      launch_decode_scalar<HEAD_DIM, false, true>(p, group_size);
-        else               launch_decode_scalar<HEAD_DIM, false, false>(p, group_size);
-    }
+    DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_decode_scalar, HEAD_DIM, p, group_size);
 #endif
 
     attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
@@ -174,21 +182,9 @@ static inline void dispatch_paged_decode(PagedAttentionParams<bf16>& p) {
     int group_size = p.q_head / p.kv_head;
 
 #ifndef ASTRAI_NO_MMA
-    if (is_causal) {
-        if (has_mask)      launch_paged_decode_mma<HEAD_DIM, true, true>(p, group_size);
-        else               launch_paged_decode_mma<HEAD_DIM, true, false>(p, group_size);
-    } else {
-        if (has_mask)      launch_paged_decode_mma<HEAD_DIM, false, true>(p, group_size);
-        else               launch_paged_decode_mma<HEAD_DIM, false, false>(p, group_size);
-    }
+    DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_paged_decode_mma, HEAD_DIM, p, group_size);
 #else
-    if (is_causal) {
-        if (has_mask)      launch_paged_decode_scalar<HEAD_DIM, true, true>(p, group_size);
-        else               launch_paged_decode_scalar<HEAD_DIM, true, false>(p, group_size);
-    } else {
-        if (has_mask)      launch_paged_decode_scalar<HEAD_DIM, false, true>(p, group_size);
-        else               launch_paged_decode_scalar<HEAD_DIM, false, false>(p, group_size);
-    }
+    DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_paged_decode_scalar, HEAD_DIM, p, group_size);
 #endif
 
     paged_attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);

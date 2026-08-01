@@ -1,5 +1,13 @@
 #pragma once
 
+// Tensor layout for Q/K/V tensors passed to attention kernels.
+// Internally, kernels always operate on BHLD [batch, n_heads, seq_len, head_dim].
+// When the caller passes BLHD, dims 1 and 2 are transposed at entry.
+enum TensorLayout : int {
+    BHLD = 0,  // [batch, n_heads, seq_len, head_dim]
+    BLHD = 1,  // [batch, seq_len, n_heads, head_dim]
+};
+
 
 template<typename T, typename AT = float>
 struct AttentionParams {

@@ -25,6 +25,7 @@ from astrai.extension.attention_backend import (
     get_backend,
 )
 from astrai.extension.attention_ops import (
+    TensorLayout,
     attn_decode,
     attn_paged_decode,
     attn_prefill,
@@ -37,6 +38,7 @@ __all__ = [
     "AttentionBackend",
     "CudaBackend",
     "TorchNativeBackend",
+    "TensorLayout",
     "attention",
     "attn_backend",
     "get_backend",

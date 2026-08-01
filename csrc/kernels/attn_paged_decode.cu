@@ -18,11 +18,12 @@ torch::Tensor attn_paged_decode(
                            page_size, kv_len, mask, causal_offset, scale, layout, p);
 
     auto O = torch::empty_strided(q.sizes(), q.strides(), q.options());
-    auto O_view = (layout == 1) ? O.transpose(1, 2) : O;
+    auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
     p.o = (bf16*)O_view.data_ptr();
 
     alloc_split_partials(p);
     DISPATCH_HEAD_DIM(p.head_dim, dispatch_paged_decode, p);
+    C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }
 
@@ -37,6 +38,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("mask") = py::none(),
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,
-        py::arg("layout") = 0,
+        py::arg("layout") = (int64_t)BHLD,
         "Paged GQA decode — split-KV with direct page-table access.");
 }
