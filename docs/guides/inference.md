@@ -49,8 +49,7 @@ KVCache
   ├── seq_lens               [batch_size]
   ├── out_cache_loc          [batch, seq_len] — write indices for this forward
   ├── max_len                int — max(seq_lens), avoids GPU sync in decode
-  ├── page_table             [batch, max_len] — precomputed gather indices for decode (None for prefill)
-  └── decode_mask            [batch, max_len] bool — precomputed position validity mask (None for single-batch decode)
+  └── kv_indptr              [batch + 1] int32 — prefix sum of seq_lens, precomputed once per step
 ```
 
 Attention layers do raw buffer indexing: `k_buffer[layer_id, out_cache_loc] = k` to write, `k_buffer[layer_id, indices]` to gather.
@@ -87,7 +86,9 @@ Rotary embedding is applied via `apply_rotary_emb` in `astrai/extension/rotary_b
 - **CUDA kernel** (`rotary_emb.cu`): fused cos/sin lookup + rotation in a single kernel, used when the kernel is available, input is on CUDA, and `torch.is_grad_enabled()` is `False` (inference mode)
 - **Torch fallback**: complex multiply path (`torch.view_as_complex` → `torch.complex` multiply → `torch.view_as_real`), used during training (supports autograd backward) or when the CUDA kernel is not available
 
-`RotaryEmbedding` stores `cos_table`/`sin_table` as f32 buffers and returns a `(cos, sin)` tuple from `forward()`. Both attention backends share the same rotary dispatch — it is backend-agnostic.
+`RotaryEmbedding` stores a complex `freqs_cis` buffer and returns a tensor
+from `forward()`. Both attention backends share the same rotary dispatch — it
+is backend-agnostic.
 
 ## Continuous Batching
 
@@ -183,22 +184,58 @@ curl -X POST http://localhost:8000/v1/messages \
   -d '{"model":"astrai","system":"You are helpful.","messages":[{"role":"user","content":"Hello"}],"max_tokens":512}'
 ```
 
-Supports `stop_sequences` and streaming via `event: content_block_delta`.
+Supports `stop_sequences` and streaming via `event: content_block_delta`. Anthropic streams also end with the shared `data: [DONE]` sentinel after `event: message_stop`.
 
-### GenerationRequest Parameters
+### Request Parameters
+
+The HTTP protocols and direct engine API have distinct request models and defaults.
+
+**OpenAI** (`ChatCompletionRequest`):
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
+| `model` | str | `"astrai"` | Model name returned in responses |
 | `messages` | List[dict] | required | Chat messages (role, content) |
-| `top_k` | int | 50 | Top-k count |
-| `top_p` | float | 1.0 | Nucleus threshold |
-| `temperature` | float | 1.0 | Sampling temperature (> 0.0) |
-| `max_tokens` | Optional[int] | None | Max generation length |
-| `stream` | bool | False | Stream output |
+| `temperature` | Optional[float] | 1.0 | Sampling temperature (0.0-2.0) |
+| `top_p` | Optional[float] | 1.0 | Nucleus threshold (0.0-1.0) |
+| `top_k` | Optional[int] | 50 | Top-k count |
+| `max_tokens` | Optional[int] | 2048 | Max generation length |
+| `stream` | Optional[bool] | False | Stream output |
 | `stop` | Optional[Union[str, List[str]]] | None | Stop sequences |
-| `frequency_penalty` | float | 0.0 | Frequency penalty |
-| `tools` | Optional[List[dict]] | None | Tool definitions for function calling |
-| `tool_choice` | Optional[str] | None | Tool selection mode |
+| `n` | Optional[int] | 1 | Number of choices requested |
+| `presence_penalty` | Optional[float] | 0.0 | Presence penalty (-2.0 to 2.0) |
+| `frequency_penalty` | Optional[float] | 0.0 | Frequency penalty (-2.0 to 2.0) |
+| `logit_bias` | Optional[Dict[int, float]] | None | Per-token logit bias |
+| `user` | Optional[str] | None | End-user identifier |
+| `tools` | Optional[List[ToolDef]] | None | Tool definitions for function calling |
+| `tool_choice` | Optional[Union[str, Dict[str, Any]]] | `"auto"` | Tool selection mode or explicit tool choice |
+
+**Anthropic** (`MessagesRequest`):
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | str | `"astrai"` | Model name returned in responses |
+| `messages` | List[AnthropicMessage] | required | User/assistant messages |
+| `system` | Optional[str] | None | System prompt |
+| `max_tokens` | int | 1024 | Max generation length |
+| `temperature` | Optional[float] | 1.0 | Sampling temperature (0.0-2.0) |
+| `top_p` | Optional[float] | 1.0 | Nucleus threshold (0.0-1.0) |
+| `top_k` | Optional[int] | 50 | Top-k count |
+| `stream` | Optional[bool] | False | Stream output |
+| `stop_sequences` | Optional[List[str]] | None | Stop sequences |
+
+**Engine** (`GenerationRequest`):
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `messages` | List[Dict[str, str]] | required | Messages to format before generation |
+| `top_k` | int | 50 | Top-k count; 0 disables filtering |
+| `top_p` | float | 1.0 | Nucleus threshold |
+| `temperature` | float | 1.0 | Sampling temperature; 0 enables greedy decoding |
+| `max_tokens` | Optional[int] | None | Max generation length |
+| `frequency_penalty` | float | 0.0 | Frequency penalty (-2.0 to 2.0) |
+| `rep_window` | int | 64 | Recent-token window used by the frequency penalty |
+| `stream` | bool | False | Stream output |
 
 ### SSE Streaming Format
 
@@ -240,6 +277,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":
 
 event: message_stop
 data: {"type":"message_stop"}
+
+data: [DONE]
 ```
 
 ### Error Responses

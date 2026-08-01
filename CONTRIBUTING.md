@@ -20,9 +20,6 @@ Run the following checks **in order** — CI will reject if any fail.
 ruff format .
 ```
 
-> **Note**: `ruff format` may rename parameters (e.g. `mask` → `attn_mask`).  
-> Always review the diff after formatting.
-
 ### 2. Import sorting
 
 ```bash
@@ -44,7 +41,7 @@ python -u -m pytest tests/ -v
 
 > Failed tests may leave orphan tempdirs under `%TEMP%`. Clean them manually if needed.
 
-### 4. (Optional) Full pre-commit check
+### 4. (Optional) Full pre-commit check script
 
 If you have Git Bash available:
 
@@ -52,12 +49,17 @@ If you have Git Bash available:
 bash scripts/pre_commit.sh
 ```
 
-This runs format check, import sort check, and tests in one go.
+The script installs development dependencies by default, then runs the format
+check, import sort check, and tests. If dependencies are already installed, use:
+
+```bash
+bash scripts/pre_commit.sh --skip-deps
+```
 
 ## Commit Style
 
 ```
-fix/feat/chore/docs/refactor/perf/test/style/ci/build/revert : short description (~50 chars)
+type: short description (~50 chars)
 
 - bullet point body (each ~60 chars)
 ```
@@ -73,7 +75,7 @@ fix/feat/chore/docs/refactor/perf/test/style/ci/build/revert : short description
 |---------|-------|-----|
 | `ruff check --select I` fails | Wrong import order | `ruff check . --select I --fix .` then `ruff format .` |
 | `ruff format` changed many files | Not formatted before commit | Review diff carefully before staging |
-| Pre-commit hook rejects | Tests or lint failed | Fix individually, do not `--no-verify` |
+| Pre-commit check script fails | Dependency install, tests, or lint failed | Fix the failing step; use `--skip-deps` only when dependencies are already installed |
 | Tests fail with tempdir left | Test crash | Clean `%TEMP%` manually |
 
 ## Submitting Changes

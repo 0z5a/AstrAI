@@ -2,6 +2,18 @@
 
 AstrAI supports three parallel modes: **single GPU** (`none`), **Data Parallel** (`ddp`), and **Fully Sharded Data Parallel** (`fsdp`). This guide covers when to use each, how to launch multi-GPU training, and how gradient accumulation works.
 
+## Contents
+
+- [Quick Start](#quick-start)
+- [Parallel Modes](#parallel-modes)
+- [Gradient Accumulation](#gradient-accumulation)
+- [Process Launching](#process-launching)
+- [NCCL Troubleshooting](#nccl-troubleshooting)
+- [Checkpoint Saving](#checkpoint-saving)
+- [Total Steps Calculation](#total-steps-calculation)
+- [Real Examples](#real-examples)
+- [CLI Parameters](#cli-parameters)
+
 ## Quick Start
 
 ### Single GPU
@@ -21,9 +33,6 @@ python scripts/tools/train.py \
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_P2P_DISABLE=1
-export NCCL_NET_GDR_LEVEL=0
-
 python scripts/tools/train.py \
     --train_type=sft \
     --param_path ./params \
@@ -38,9 +47,6 @@ python scripts/tools/train.py \
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_P2P_DISABLE=1
-export NCCL_NET_GDR_LEVEL=0
-
 python scripts/tools/train.py \
     --train_type=sft \
     --param_path ./params \
@@ -110,7 +116,7 @@ AstrAI auto-detects the launch method:
 
 | Detection | Strategy | Use Case |
 |-----------|----------|----------|
-| `torchelastic` / `torchrun` env vars | `TorchrunStrategy` | External orchestrator (torchrun, SLURM, K8s) |
+| `torchelastic` / `torchrun` env vars | `TorchrunStrategy` | External orchestrator (`torchrun`, K8s) |
 | `RANK` + `WORLD_SIZE` env vars | `TorchrunStrategy` | External launch |
 | Neither | `LocalStrategy` | `python scripts/tools/train.py` (in-process spawn) |
 
@@ -126,23 +132,28 @@ For multi-node or SLURM environments:
 torchrun --nproc_per_node=4 scripts/tools/train.py \
     --train_type=sft \
     --parallel_mode=ddp \
+    --nprocs=4 \
     --param_path ./params \
     --data_root_path ./dataset \
     --batch_per_device=4
 ```
 
-When launched via torchrun, AstrAI reads `RANK`, `WORLD_SIZE`, `LOCAL_RANK` from the environment and uses `TorchrunStrategy`. The `--nprocs` flag is ignored (the orchestrator controls process count).
+When launched via `torchrun`, the launcher creates the worker processes. AstrAI reads `RANK`, `WORLD_SIZE`, and `LOCAL_RANK` from the environment and uses `TorchrunStrategy`; `--nprocs` does not control process creation in this mode.
 
-## NCCL Environment Variables
+The current training CLI still uses `--nprocs` when calculating scheduler `total_steps`. Set it to the global `WORLD_SIZE` so the step count reflects data-parallel sharding, including multi-node runs.
 
-For multi-GPU training, you **must** set these environment variables:
+Raw Slurm variables such as `SLURM_PROCID`, `SLURM_NTASKS`, and `SLURM_LOCALID` are not recognized automatically. Launch through `torchrun`, or map the scheduler's variables to `RANK`, `WORLD_SIZE`, `LOCAL_RANK`, `MASTER_ADDR`, and `MASTER_PORT` before starting AstrAI. The same requirement applies to launchers that expose only OpenMPI-specific variables.
+
+## NCCL Troubleshooting
+
+The following variables are troubleshooting options for hardware or network configurations where NCCL hangs or fails. They are not general requirements and can reduce performance by disabling peer-to-peer or GPUDirect RDMA paths:
 
 ```bash
 export NCCL_P2P_DISABLE=1
 export NCCL_NET_GDR_LEVEL=0
 ```
 
-These are required on certain hardware configurations (see `AGENTS.md`). Without them, NCCL may hang or crash during collective operations. These are set in the training shell scripts (`train-seq.sh`, `train-sft.sh`, `train-dpo.sh`) but not in Python code — you must export them before launching.
+Apply them only after confirming the relevant NCCL transport is the source of the failure. AstrAI does not set them in Python.
 
 ## Checkpoint Saving
 
@@ -176,9 +187,6 @@ This ensures the LR schedule is correctly scaled regardless of the number of GPU
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_P2P_DISABLE=1
-export NCCL_NET_GDR_LEVEL=0
-
 python scripts/tools/train.py \
     --train_type=seq \
     --param_path ./params \
@@ -240,7 +248,7 @@ python scripts/tools/train.py \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--nprocs` | 1 | Number of GPUs / processes |
+| `--nprocs` | 1 | Local process count for AstrAI's launcher; under `torchrun`, set it to global `WORLD_SIZE` for total-step calculation |
 | `--parallel_mode` | `fsdp` | `none`, `ddp`, or `fsdp` |
 | `--start_method` | `spawn` | Multiprocessing start method (`spawn`, `fork`, `forkserver`) |
 | `--backend` | `nccl` | Distributed backend (`nccl`, `gloo`) |
@@ -248,8 +256,8 @@ python scripts/tools/train.py \
 | `--master_port` | `29500` | Master node port |
 | `--device_type` | `cuda` | Device type |
 
-> `--tp_size` is parsed but **not yet wired** — tensor parallelism is future work. `ColumnParallelLinear` / `RowParallelLinear` exist in `astrai/parallel/module.py` but are not used by the model.
+> `--tp_size` is accepted by the CLI but discarded before configuration. Tensor parallelism is not implemented, and there is no tensor-parallel module or model integration.
 
 Full parameter reference: [CLI Reference](params.md). Training loop and strategies: [Training Guide](training.md).
 
-> Document Update Time: 2026-07-30
+> Document Update Time: 2026-08-02

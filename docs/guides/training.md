@@ -41,7 +41,10 @@ RoPE embeds position into Q/K vectors via complex rotation:
 
 $$ q_i = R_i W_q x_i, \quad k_j = R_j W_k x_j, \quad q_i^T k_j = x_i^T W_q^T R_{i-j} W_k x_j $$
 
-`RotaryEmbedding` pre-computes `cos_table` and `sin_table` (f32, `[max_len, dim/2]`). `forward()` returns a `(cos, sin)` tuple indexed by `position_ids`. `apply_rotary_emb` applies the rotation: during training it uses torch complex multiply (autograd-compatible); during inference it auto-dispatches to a fused CUDA kernel when available.
+`RotaryEmbedding` pre-computes a complex `freqs_cis` buffer. `forward()` returns
+a tensor indexed by `position_ids`. `apply_rotary_emb` applies the rotation:
+during training it uses torch complex multiply (autograd-compatible); during
+inference it auto-dispatches to a fused CUDA kernel when available.
 
 ## Training Loop
 
@@ -52,8 +55,8 @@ on_train_begin
   model.train()
   on_epoch_begin
     for batch in dataloader:
-      on_batch_begin
       with executor.accumulate(model):
+        on_batch_begin
         loss_output = strategy(batch)
         context.loss = loss_output["loss"].item()
         context.metrics = loss_output["metrics"]
@@ -67,6 +70,7 @@ on_train_begin
         if executor.sync_gradients:
           on_optimizer_step
           optimizer.step()
+          strategy.on_optimizer_step()
           optimizer.zero_grad()
           if scheduler:
             scheduler.step()
@@ -78,16 +82,16 @@ on_train_end
 
 | Hook | Fires | Default callback |
 |------|-------|-----------------|
-| `on_train_begin` | Before training starts | `GradientCheckpointingCallback` |
+| `on_train_begin` | Before training starts | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 | `on_epoch_begin` | Start of each epoch | `ProgressBarCallback` |
 | `on_batch_begin` | Every batch | — |
-| `on_optimizer_step` | Every accumulation window | `GradientClippingCallback`, `MetricCallback`, `ProgressBarCallback` |
+| `on_optimizer_step` | Every accumulation window | `MetricCallback`, `ProgressBarCallback`, `GradientClippingCallback` |
 | `on_batch_end` | Every batch | `CheckpointCallback` |
 | `on_epoch_end` | End of each epoch | `MetricCallback`, `ProgressBarCallback` |
 | `on_error` | On exception during training | `CheckpointCallback`, `MetricCallback` |
-| `on_train_end` | Training ends (always via finally) | `CheckpointCallback`, `MetricCallback`, `GradientCheckpointingCallback` |
+| `on_train_end` | Training exits after `on_train_begin` completes (via `finally`) | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 
-Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm), `gradient_clipping` (always registered; computes grad norm, clips only when `max_grad_norm` is not `None`).
+Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm, rank-0), `gradient_clipping`. The gradient-clipping callback is always registered and always calls `executor.clip_grad_norm()` with the numeric `max_grad_norm` value.
 
 Strategies return `{"loss": Tensor, "metrics": Dict[str, float]}` when called by the trainer. Built-in metrics include the task-specific loss and, for MoE models, `moe_aux_loss` plus `moe_aux_loss_weighted`. Direct `compute_loss(batch)` calls continue to return a single loss tensor.
 
@@ -98,7 +102,7 @@ Strategies return `{"loss": Tensor, "metrics": Dict[str, float]}` when called by
 Next-token cross-entropy with optional label smoothing:
 
 $$
-L_{\text{PT}} = -\sum_{t=1}^{T} \log P(x_t \mid x_{\lt t}; \theta)
+L_{\text{PT}} = -\frac{1}{T}\sum_{t=1}^{T} \log P(x_t \mid x_{\lt t}; \theta)
 $$
 
 Keys: `input_ids`, `target_ids`. Optional: `label_smoothing`.
@@ -108,7 +112,7 @@ Keys: `input_ids`, `target_ids`. Optional: `label_smoothing`.
 Masked cross-entropy (`ignore_index=-100`) over response tokens:
 
 $$
-L_{\text{SFT}} = -\sum_{t=P+1}^{P+L} \log P(s_t \mid s_{\lt t}; \theta)
+L_{\text{SFT}} = -\frac{1}{L}\sum_{t=P+1}^{P+L} \log P(s_t \mid s_{\lt t}; \theta)
 $$
 
 Keys: `input_ids`, `target_ids`, `loss_mask`, `position_ids`. Optional: `label_smoothing`.
@@ -168,9 +172,9 @@ model factory.
 |------|-------|-------------|
 | Cosine | `CosineScheduler` | Linear warmup → cosine decay to `min_rate` |
 | SGDR | `SGDRScheduler` | Cosine annealing with warm restarts (`t_mult=2`) |
-| WSD | `WSDScheduler` | Warmup-Stable-Decay with sqrt cooldown |
+| WSD | `WSDScheduler` | Warmup-Stable-Decay with quadratic decay |
 
-Created by `SchedulerFactory.create(schedule_type, optimizer, **kwargs)`. Valid types: `"cosine"`, `"sgdr"`, `"wsd"`. Omit to use no scheduler.
+Created by `SchedulerFactory.create(schedule_type, optimizer, **kwargs)`. Valid types: `"cosine"`, `"sgdr"`, `"wsd"`. The training CLI always creates a scheduler and defaults `--schedule_type` to `"cosine"`.
 
 ## Gradient Checkpointing
 
@@ -188,9 +192,11 @@ Callback wraps each `DecoderBlock.forward` with `torch.utils.checkpoint.checkpoi
 
 ```
 Checkpoint(state_dict, epoch, consumed_samples, extra, meta, config)
-  ├── save(save_dir)    rank-0 only: meta.json (epoch/consumed_samples/timestamp) + config.json (model config) + model.safetensors + optional {key}.pt (optimizer.pt, scheduler.pt)
+  ├── save(save_dir)    meta.json (epoch/consumed_samples/timestamp) + config.json (model config) + model.safetensors + optional {key}.pt (optimizer.pt, scheduler.pt)
   └── load(save_dir, broadcast=False)    loads from local disk; set broadcast=True to broadcast metadata from rank-0
 ```
+
+`Checkpoint.save()` writes whenever it is called. During training, `CheckpointCallback` uses the executor checkpoint context so only rank 0 receives a state dict and calls `save()`.
 
 Optimizer/scheduler state persisted by default via `Checkpoint.extra`.  
 Model config (`context.model_config`) saved into `config.json` during training via `CheckpointCallback`.
@@ -235,4 +241,4 @@ nohup python scripts/tools/train.py \
 
 Full parameter reference at [params.md](params.md).
 
-> Document Update Time: 2026-07-31
+> Document Update Time: 2026-08-02

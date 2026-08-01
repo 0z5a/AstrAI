@@ -56,6 +56,8 @@ End-to-end walkthrough in 5 steps:
 
 **1. Install**
 
+AstrAI requires Python 3.12+ and pins PyTorch exactly to `2.11.0`. Training, `scripts/tools/generate.py`, generation evaluations, and the generation demos require CUDA; CPU support is limited to components with an explicit CPU device path, such as the HTTP server and direct-scoring evaluations.
+
 ```bash
 git clone https://github.com/ViperEkura/AstrAI.git
 cd AstrAI
@@ -132,7 +134,7 @@ Check out the demos in the `scripts/demo/` folder:
 # Download model weights (required before running demos)
 python scripts/demo/download.py                      # model → params/
 
-# Interactive streaming chat (multi-turn, maintains history)
+# Single-turn interactive streaming prompt loop (no conversation history)
 python scripts/demo/stream_chat.py
 # Type your message after >>, type !exit to quit
 
@@ -183,7 +185,7 @@ docker run --gpus all -v /path/to/data:/data -it astrai:latest
 # Docker Compose (GPU, default)
 docker compose up -d
 
-# Docker Compose (CPU only)
+# Docker Compose CPU server profile (CUDA-only generation scripts/demos are unavailable)
 docker compose --profile cpu up -d
 ```
 

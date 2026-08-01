@@ -14,26 +14,30 @@ This document describes the data pipeline: from raw text to model input tensors.
 ## Overview
 
 ```
-JSONL Lines → Pipeline (mask builder) → Tokenized Tensors
-                                              ↓
-                                      .h5 or .bin storage
-                                              ↓
-                                      Store.load()
+JSON / JSONL Records → Pipeline (mask builder) → Tokenized Tensors
+                                               ↓
+                                           .bin storage
+                                               ↓
+                                       Store.load()
                                               ↓
                                       Store.fetch(begin, end, keys)
                                               ↓
-                                      BaseDataset.__getitem__(idx)
-                                              ↓
-                                      Sampler → DataLoader → Training / Inference
+                                       Dataset.__getitem__(idx)
+                                               ↓
+                                       RDSampler → DataLoader → Training
 ```
 
 ## Data Preparation
 
-Raw text is tokenized via `AutoTokenizer.encode()` and saved as HDF5 (`.h5`) or binary (`.bin` + `meta.json`) files with keyed tensor groups.
+The offline `Pipeline` accepts `.jsonl` records and `.json` files containing one
+object or a list of objects. It tokenizes them and writes binary shards (`.bin`
+plus `meta.json`) with keyed tensor groups. Binary is the only registered output
+writer; the pipeline cannot emit JSONL.
 
 ### Tokenization
 
-The `Pipeline` reads JSONL lines, applies the mask builder (see [Preprocessing](../guides/preprocessing.md)), and produces flat token sequences:
+The `Pipeline` reads JSON/JSONL records, applies the mask builder (see
+[Preprocessing](../guides/preprocessing.md)), and produces token sequences:
 
 ```python
 # Per JSONL line: messages → chat template → token IDs + loss mask
@@ -42,84 +46,114 @@ loss_mask = [0, 0, 0, 1, 1, 1, 1, 1, 1]        # 0=masked, 1=train
 # Stored as flat tensors, packed with other lines by packing strategy
 ```
 
-The output `meta.json` records the storage format, key names, dtype, total token count, and tensor shapes for each shard.
+For default single-output preprocessing, the stored keys are `sequence` and
+`position_ids`, plus `loss_mask` when masking is required. Packing is supported
+for single-output data with a `sequence` key. Shard flushing counts the primary
+flat sequence for each record: `sequence` in single-output mode, otherwise the
+first flat source output.
+
+The exact shard `meta.json` schema is a top-level mapping from key to tensor
+metadata. It does not contain a storage-format or total-token field:
+
+```json
+{
+  "sequence": {"shape": [123456], "dtype": "int32"},
+  "loss_mask": {"shape": [123456], "dtype": "bool"},
+  "position_ids": {"shape": [123456], "dtype": "int32"}
+}
+```
+
+Record-aware binary data may also include `"offsets": [0, ...]` inside a key's
+metadata, but the preprocessing `BinWriter` currently does not write offsets.
 
 ### Format Detection
 
 `detect_format(load_path)` inspects the path:
 
-- If `load_path` is a file: checks suffix — `.h5`/`.hdf5` → `"h5"`, `.jsonl` → `"jsonl"`, unknown suffix raises `ValueError`
-- If `load_path` is a directory: recursively globs for `*.h5`/`*.hdf5` files → `"h5"`, `*.bin` + `**/meta.json` → `"bin"`, or `*.jsonl` + `dataset_config.json` → `"jsonl"`
+- If `load_path` is a file: `.jsonl` selects `"jsonl"`; other suffixes raise `ValueError`.
+- If `load_path` is a directory: any recursive `*.bin` plus a `meta.json` selects `"bin"`; otherwise any recursive `*.jsonl` selects `"jsonl"`.
+- Detection does not require `dataset_config.json`; configuration is selected later when `JsonlStore.load()` chooses a transform.
 
 ### Store Backends
 
 Storage format is auto-detected by `detect_format()`; backends are dispatched via registry:
 
 ```
-StoreFactory.create("h5")    → H5Store
 StoreFactory.create("bin")   → MmapStore
 StoreFactory.create("jsonl") → JsonlStore
 ```
 
-All three inherit `Store` (base, owns `_data`/`_cum`/`_offsets`/`_normalize`) plus the `Streamable` and `Recordable` mixins, so every backend supports both `fetch(begin, end, keys)` (stream) and `fetch_record(index, keys)` (record) APIs.
-
-**H5Store**: Reads HDF5 files. Tensors are loaded into host memory and normalized into segmented storage. `segments_are_records=True` — each `data_i` dataset is one record.
+Both stores inherit `Store` and compose the `Streamable` and `Recordable`
+access methods.
 
 **MmapStore**: Memory-maps `.bin` files. OS page cache sharing is native — no explicit `share_memory_()` needed. Uses `torch.from_numpy(np.memmap(...))`. `segments_are_records=False` — bin segments are contiguous streams; record access is driven by `_offsets` (written when `save_bin(..., record_keys=...)` was used at preprocessing time).
 
-**JsonlStore**: On-the-fly tokenization of raw JSONL files at load time. Requires a `dataset_config.json` alongside the `.jsonl` files following the same `PipelineConfig` schema with an additional `tokenizer_path` field. Two modes: eager (default, applies `TokenizeTransform` to all records at load) and lazy (`processor=fn` given, defers tokenisation to `fetch_record` — used by DPO/GRPO).
+**JsonlStore**: Reads a `.jsonl` file or the sorted top-level `*.jsonl` files in
+a directory. Eager transform selection uses the first available route:
 
-All backends normalise tensors into `Store._data[Dict[str, List[Tensor]]]` + `Store._cum[Dict[str, List[int]]]` (cumulative lengths for bisect-based stream indexing) + `Store._offsets[Dict[str, List[int]]]` (per-record offsets for record-mode indexing). Nested keys (GRPO `responses`/`masks` as `List[List[Tensor]]`) are stored as-is and excluded from both bookkeepings — they are only accessed record-by-record.
+1. An explicit `transform=` argument.
+2. `dataset_config.json` in the JSONL directory. It follows `PipelineConfig` and may add `tokenizer_path`; when omitted, the config directory is used.
+3. The built-in `messages` transform when `tokenizer_path=` is supplied. It masks system/user turns, trains assistant turns, and emits document-reset position IDs.
+
+Only DPO gets an automatic lazy route from `DatasetFactory`: raw JSONL plus
+`tokenizer_path` installs `dpo_processor` and tokenizes each record in
+`fetch_record`. GRPO does not currently have an automatic lazy processor.
+
+Eager-loaded stores normalize tensors into `Store._data[Dict[str, List[Tensor]]]` + `Store._cum[Dict[str, List[int]]]` (cumulative lengths for stream indexing) + `Store._offsets[Dict[str, List[int]]]` (per-record offsets for record indexing). Nested JSONL keys such as GRPO `responses`/`masks` are kept as record values and excluded from stream bookkeeping. Lazy DPO instead retains raw records and processes them in `fetch_record`.
 
 ## Data Keys by Training Type
 
 | Type | Storage Keys | Access Mode |
 |------|-------------|-------------|
-| `seq` | `sequence` (→ input_ids, target_ids via offset-by-1) | stream (`fetch`) |
+| `seq` | `sequence`, `position_ids` by default (`SEQDataset` consumes only `sequence`) | stream (`fetch`) |
 | `sft` | `sequence`, `loss_mask`, `position_ids` | stream (`fetch`) |
 | `dpo` | `chosen`, `rejected`, `chosen_mask`, `rejected_mask` | record (`fetch_record`) |
 | `grpo` | `prompts`, `responses`, `masks`, `rewards` | record (`fetch_record`) |
 
+Offline `.bin` output from DPO/GRPO preprocessing is not currently loadable for
+training. DPO shards are written without record offsets, while GRPO response
+groups are flattened without preserving record/group boundaries. Supported raw
+routes are eager JSONL for SEQ/SFT and automatic lazy JSONL for DPO. GRPO
+requires a caller-built, already-loaded record store.
+
 ## Dataset Architecture
 
 ```
-DatasetFactory.load(
-    train_type, load_path=None, window_size=0, stride=None,
-    storage_type=None, tokenizer_path=None,
-    max_len=2048, store=None
-)
-  → BaseDataset.load(load_path, storage_type=None)
-    → detect_format(load_path)
-    → StoreFactory.create(storage_type)
-    → Store.load(load_path)
-      → _normalize(raw)  # base Store, shared by both backends
-        → Store._data[Dict[str, List[Tensor]]]
-          + _cum[Dict[str, List[int]]]   (stream mode)
-          + _offsets[Dict[str, List[int]]]  (record mode)
+DatasetFactory.load(...)
+  → detect_format(load_path)
+  → optionally build dpo_processor for raw JSONL
+  → StoreFactory.create(storage_type, window_size, stride)
+  → Store.load(load_path, transform=... or processor=...)
+  → DatasetFactory.create(train_type, store=store)
 
 Stream datasets (SEQ/SFT):
   BaseDataset.__getitem__(idx)
-    → get_index(idx) → [begin, end)
+    → Store.sample_window(idx) → [begin, end)
     → Store.fetch(begin, end, keys) → Tensor / Dict[str, Tensor]
 
-Record datasets (DPO/GRPO via RecordDataset):
-  RecordDataset.__getitem__(idx)
+Record datasets (DPO/GRPO):
+  DPODataset/GRPODataset.__getitem__(idx)
     → Store.fetch_record(idx, keys) → Tensor / Dict[str, Tensor]
 ```
 
-Class hierarchy: `BaseDataset` ← `SEQDataset` / `SFTDataset` (stream); `BaseDataset` ← `RecordDataset` ← `DPODataset` / `GRPODataset` (record).
+Class hierarchy: `BaseDataset` is the direct base of `SEQDataset`, `SFTDataset`,
+`DPODataset`, and `GRPODataset`. There is no `RecordDataset` class.
 
 `window_size` = max input length, `stride` = step between consecutive samples (defaults to `window_size`, optional). Only meaningful for stream datasets — record datasets ignore both. `storage_type` defaults to `None` (auto-detect via `detect_format`).
 
-`tokenizer_path` triggers lazy on-the-fly tokenisation for record datasets on raw JSONL (DPO builds a `dpo_processor`; SEQ/SFT/pre-tokenised backends ignore it). `store` (pre-built `Store`) bypasses `load_path`/`storage_type`/`tokenizer_path` entirely — the caller controls Store construction.
+For raw JSONL, `tokenizer_path` builds the lazy processor only for DPO. For
+SEQ/SFT it is forwarded to `JsonlStore` so the built-in eager `messages`
+transform can be selected when no `dataset_config.json` exists. GRPO receives no
+automatic processor. A pre-built `store` bypasses path, format, tokenizer,
+window, and stride setup entirely.
 
 `Store.fetch(begin, end, keys)` (stream mode, on `Streamable`): accepts a single key (`str`) returning a `Tensor`, or a list of keys returning `Dict[str, Tensor]`. Internally uses `bisect` across multi-segment tensors. Raises `RuntimeError("Store not loaded")` if called before `load()`.
 
-`Store.fetch_record(index, keys)` (record mode, on `Recordable`): same key API. Uses `_offsets[key]` when present (bin layout with per-record offsets), otherwise indexes `_data[key]` directly (H5/JSONL where each segment is one record).
+`Store.fetch_record(index, keys)` (record mode, on `Recordable`): same key API. Uses `_offsets[key]` when present for binary record layouts; otherwise it indexes per-record JSONL tensors directly.
 
 ## Sampler
 
-`ResumableDistributedSampler` supports checkpoint-aware distributed sampling:
+`RDSampler` supports checkpoint-aware distributed sampling:
 
 - Tracks `start_epoch` / `start_iter` for resume
 - Shuffle via `torch.Generator(seed + epoch)`

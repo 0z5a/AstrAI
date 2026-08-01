@@ -13,9 +13,11 @@
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
+| `--config`, `-c` | YAML config file; explicit CLI options override YAML values | None |
 | `--train_type` | Training type (`seq`, `sft`, `dpo`, `grpo`, `online_grpo`, `online_dpo`) | required |
 | `--data_root_path` | Dataset root directory | required |
 | `--param_path` | Model parameters or checkpoint path | required |
+| `--resume` | Resume training from `--param_path` | False |
 | `--n_epoch` | Total training epochs | 1 |
 | `--batch_per_device` | Batch size per device | 1 |
 | `--grad_accum_steps` | Gradient accumulation steps between optimizer steps | 1 |
@@ -26,7 +28,7 @@
 |-----------|-------------|---------|
 | `--warmup_ratio` | Fraction of total steps used for LR warmup | 0.05 |
 | `--max_lr` | Maximum learning rate (cosine decay after warmup) | 3e-4 |
-| `--max_grad_norm` | Maximum gradient norm for clipping (None disables) | 1.0 |
+| `--max_grad_norm` | Maximum gradient norm for clipping; the current CLI requires a positive number | 1.0 |
 
 ### Optimizer
 
@@ -36,9 +38,9 @@ non-matrix parameters through **AdamW** (`fused=True`).
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--optimizer` | Built-in optimizer (`muon_adamw`, `nora_nadamw`, `mano_adamw`) | `muon_adamw` |
-| `--weight_decay` | Weight decay (applied to Muon matrix params; non-matrix use 0) | 0.1 |
+| `--weight_decay` | Weight decay for optimizer parameter groups that are eligible for decay | 0.1 |
 | `--muon_momentum` | Muon momentum factor | 0.95 |
-| `--muon_nesterov` | Enable Nesterov momentum for Muon | True |
+| `--muon_nesterov`, `--no-muon_nesterov` | Enable or disable Nesterov momentum for Muon | enabled |
 | `--muon_ns_steps` | Newton-Schulz iteration steps for Muon | 5 |
 | `--muon_adjust_lr` | Muon LR adjustment strategy (`original`, `match_rms_adamw`) | `match_rms_adamw` |
 
@@ -56,15 +58,18 @@ under DTensor sharding and rejects layouts sharded along the last dimension.
 | `--nora_weight_decay` | Nora matrix weight decay | 0.0 |
 
 `mano_adamw` routes internal `Linear.weight` matrices to **Mano** (manifold
-normalized optimizer) and the remaining parameters to **NAdamW**. Mano projects
+normalized optimizer) and the remaining parameters to **AdamW**. Mano projects
 the momentum onto the tangent space of the Oblique manifold and normalizes it,
 alternating the projection axis (row/column) each step — replacing Muon's
 Newton-Schulz iteration with a cheaper normalization.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--mano_momentum` | Mano momentum factor | 0.95 |
-| `--mano_nesterov` | Enable Nesterov momentum for Mano | True |
+| `--mano_momentum` | Accepted by the CLI but currently ignored by optimizer construction | 0.95 |
+| `--mano_nesterov`, `--no-mano_nesterov` | Accepted by the CLI but currently ignored by optimizer construction | enabled |
+
+The two Mano-specific flags are reserved for future wiring; do not rely on them
+to change optimizer behavior in the current release.
 
 Optimizer identity and hyperparameters are saved in checkpoint metadata. Optimizer
 states are intentionally not interchangeable: resume older MuonAdamW checkpoints
@@ -78,7 +83,7 @@ with `--optimizer=muon_adamw`.
 | `--stride` | Stride for sliding window over sequences | None |
 | `--random_seed` | Random seed for reproducibility | 3407 |
 | `--num_workers` | DataLoader worker processes | 4 |
-| `--no_pin_memory` | Disable pin_memory (enabled by default) | (flag) |
+| `--pin_memory`, `--no-pin_memory` | Enable or disable DataLoader pinned memory | enabled |
 
 ### Checkpoint & Resume
 
@@ -100,14 +105,20 @@ with `--optimizer=muon_adamw`.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--log_dir` | Directory for metric logs | checkpoint/logs |
-| `--metrics` | Metrics to log (e.g. --metrics loss lr val_loss) | ["loss", "lr", "grad_norm"] |
+| `--metrics` | Repeatable metric option (for example, `--metrics loss --metrics lr --metrics val_loss`) | `loss`, `lr`, `grad_norm`, `grad_snr` |
 
 ### Gradient Checkpointing
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--gradient_checkpointing` | Enable activation checkpointing for DecoderBlock modules | False |
+| `--gradient_checkpointing`, `--no-gradient_checkpointing` | Enable or disable activation checkpointing for DecoderBlock modules | disabled |
+
+### Miscellaneous
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--compile` | Enable `torch.compile` with mode `default`, `reduce-overhead`, or `max-autotune`; omit to disable | None |
+| `--dry-run` | Validate the merged configuration and print the training plan without training | False |
 
 ### Distributed Training
 
@@ -120,21 +131,25 @@ with `--optimizer=muon_adamw`.
 | `--backend` | Distributed training backend | nccl |
 | `--master_addr` | Master node address | localhost |
 | `--master_port` | Master node port | 29500 |
+| `--tp_size` | Reserved tensor-parallel size; accepted but currently ignored | None |
 
 ### Strategy-specific
 
 | Parameter | Description | Default | Used by |
 |-----------|-------------|---------|---------|
-| `--dpo_beta` | DPO beta value | 0.1 | `dpo` |
+| `--dpo_beta` | DPO beta value | 0.1 | `dpo`, `online_dpo` |
 | `--label_smoothing` | Label smoothing for cross-entropy loss | 0.0 | `seq`, `sft` |
-| `--group_size` | GRPO group size | 4 | `grpo` |
-| `--grpo_clip_eps` | GRPO clipping epsilon | 0.2 | `grpo` |
-| `--grpo_kl_coef` | GRPO KL penalty coefficient | 0.01 | `grpo` |
+| `--group_size` | GRPO/rollout group size | 4 | `grpo`, `online_grpo`, `online_dpo` |
+| `--grpo_clip_eps` | GRPO clipping epsilon | 0.2 | `grpo`, `online_grpo` |
+| `--grpo_kl_coef` | GRPO KL penalty coefficient | 0.01 | `grpo`, `online_grpo` |
 | `--neftune_alpha` | NEFTune noise alpha (0=disabled, typical: 5.0) | 0.0 | `sft` |
 
 ### Online Rollout
 
-These options apply to `online_grpo` and `online_dpo`. Online strategies require
+`online_grpo` and `online_dpo` are factory aliases for the existing `grpo` and
+`dpo` strategy classes; online behavior is enabled by rollout components rather
+than separate strategy subclasses. These options apply to the online aliases.
+Online strategies require
 a `BaseRewardModel` factory in `TrainConfig`; `train.py` does not currently
 provide a command-line option for configuring one.
 
@@ -151,7 +166,7 @@ provide a command-line option for configuring one.
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--schedule_type` | LR scheduler type (`cosine`, `sgdr`, `wsd`) | cosine |
-| `--min_rate` | Minimum LR as fraction of base LR | None (scheduler default: 0.05 for cosine/SGDR, 0.0 for WSD) |
+| `--min_rate` | Minimum LR as fraction of base LR | None (all current schedulers use their effective default of 0.01) |
 | `--cycle_length` | SGDR first cycle length in steps | None (total_steps - warmup_steps) |
 | `--t_mult` | SGDR cycle length multiplier per restart | 2 |
 | `--stable_steps` | WSD stable plateau steps | None (80% of post-warmup steps) |
@@ -204,14 +219,6 @@ python scripts/tools/server.py --param_path ./params --device cuda --dtype bfloa
 
 See [Inference Guide](inference.md) for HTTP API documentation.
 
-# Preprocess
-
-```bash
-python scripts/tools/preprocess.py data/*.jsonl -o output/ -c config.json
-```
-
-See [Preprocessing Guide](preprocessing.md) for config file format and examples.
-
 ## Generate (`generate.py`)
 
 | Parameter | Type | Default | Description |
@@ -221,13 +228,12 @@ See [Preprocessing Guide](preprocessing.md) for config file format and examples.
 | `--output_json_file` | str | required | Path to the output JSONL file |
 | `--question_key` | str | `question` | Key for the question in input JSON |
 | `--response_key` | str | `response` | Key for the response in output JSON |
-| `--temperature` | float | `0.60` | Sampling temperature |
-| `--top_k` | int | `30` | Top-k filtering |
+| `--temperature` | float | `0.8` | Sampling temperature |
+| `--top_k` | int | `50` | Top-k filtering |
 | `--top_p` | float | `0.95` | Nucleus sampling threshold |
 | `--batch_size` | int | `1` | Batch size for generation |
 | `--num_samples` | int | `1` | Responses per prompt |
-| `--max_tokens` | int | model config `max_position_embeddings` | Maximum tokens to generate |
-| `--cache_len` | int | `2048` | KV cache length |
+| `--max_seq_len` | int | `2048` | KV cache sequence length |
 | `--frequency_penalty` | float | `0.0` | Frequency penalty |
 | `--rep_window` | int | `64` | Window size for frequency penalty |
 
@@ -243,14 +249,15 @@ python scripts/tools/generate.py \
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `input_files` | path(s) | required | Input JSONL file(s), supports glob (`data/*.jsonl`) |
+| `input_files` | path(s) | required | One or more existing `.jsonl` or `.json` paths. Wildcards work only when expanded by the invoking shell; the CLI does not expand globs itself. |
 | `--output_dir`, `-o` | path | required | Output directory for processed data |
 | `--config`, `-c` | path | required | Preprocessing pipeline config (JSON) |
 | `--tokenizer_path` | str | `params` | Path to tokenizer directory |
+| `--batch_size` | int | config value (`256` by default) | Override records processed per batch; must be at least 1 |
 
 Usage:
 ```bash
-python scripts/tools/preprocess.py data/*.jsonl -o output/ -c sft.json
+python scripts/tools/preprocess.py data/part-000.jsonl data/part-001.jsonl -o output/ -c sft.json
 ```
 
 See [Preprocessing Guide](preprocessing.md) for config file format and examples.

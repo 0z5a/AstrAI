@@ -41,7 +41,12 @@ RoPE embeds position into Q/K vectors via complex rotation:
 
 $$ q_i = R_i W_q x_i, \quad k_j = R_j W_k x_j, \quad q_i^T k_j = x_i^T W_q^T R_{i-j} W_k x_j $$
 
-`RotaryEmbedding` pre-computes `cos_table` and `sin_table` (f32, `[max_len, dim/2]`). `forward()` returns a `(cos, sin)` tuple indexed by `position_ids`. `apply_rotary_emb` applies the rotation: during training it uses torch complex multiply (autograd-compatible); during inference it auto-dispatches to a fused CUDA kernel when available. The key property is that the dot product $q_i^T k_j$ depends only on the relative position $i - j$, not the absolute positions.
+`RotaryEmbedding` pre-computes a complex `freqs_cis` buffer. `forward()` returns
+a tensor indexed by `position_ids`. `apply_rotary_emb` applies the rotation:
+during training it uses torch complex multiply (autograd-compatible); during
+inference it auto-dispatches to a fused CUDA kernel when available. The key
+property is that the dot product $q_i^T k_j$ depends only on the relative
+position $i - j$, not the absolute positions.
 
 **Critical for inference**: RoPE is applied **before** KV cache write, not after. If applied after caching, position encoding drift occurs because cached K/V would have stale rotation factors.
 
@@ -51,13 +56,13 @@ $$ q_i = R_i W_q x_i, \quad k_j = R_j W_k x_j, \quad q_i^T k_j = x_i^T W_q^T R_{
 
 Next-token cross-entropy with optional label smoothing:
 
-$$ L_{\text{PT}} = -\sum_{t=1}^{T} \log P(x_t \mid x_{\lt t}; \theta) $$
+$$ L_{\text{PT}} = -\frac{1}{T}\sum_{t=1}^{T} \log P(x_t \mid x_{\lt t}; \theta) $$
 
 ### SFT (Supervised Fine-Tuning)
 
 Masked cross-entropy (`ignore_index=-100`) over response tokens only:
 
-$$ L_{\text{SFT}} = -\sum_{t=P+1}^{P+L} \log P(s_t \mid s_{\lt t}; \theta) $$
+$$ L_{\text{SFT}} = -\frac{1}{L}\sum_{t=P+1}^{P+L} \log P(s_t \mid s_{\lt t}; \theta) $$
 
 Prompt tokens are masked out via `loss_mask`; only response tokens contribute to the loss.
 
@@ -98,8 +103,8 @@ on_train_begin
   model.train()
   on_epoch_begin
     for batch in dataloader:
-      on_batch_begin
       with executor.accumulate(model):
+        on_batch_begin
         loss_output = strategy(batch)
         context.loss = loss_output["loss"].item()
         context.metrics = loss_output["metrics"]
@@ -113,6 +118,7 @@ on_train_begin
         if executor.sync_gradients:
           on_optimizer_step
           optimizer.step()
+          strategy.on_optimizer_step()
           optimizer.zero_grad()
           if scheduler:
             scheduler.step()
@@ -121,21 +127,23 @@ on_train_end
 ```
 
 The loss is divided by `grad_accum_steps` before `backward()`, so accumulated gradients sum to the correct mean.
+Strategy metrics are detached and converted to Python `float` values before the
+`LossOutput` is returned; only `LossOutput.loss` remains a differentiable tensor.
 
 ## Callback Lifecycle
 
 | Hook | Fires | Default callback |
 |------|-------|-----------------|
-| `on_train_begin` | Before training starts | `GradientCheckpointingCallback` |
+| `on_train_begin` | Before training starts | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 | `on_epoch_begin` | Start of each epoch | `ProgressBarCallback` |
 | `on_batch_begin` | Every batch | — |
-| `on_optimizer_step` | Every accumulation window | `GradientClippingCallback`, `MetricCallback`, `ProgressBarCallback` |
+| `on_optimizer_step` | Every accumulation window | `MetricCallback`, `ProgressBarCallback`, `GradientClippingCallback` |
 | `on_batch_end` | Every batch | `CheckpointCallback` |
 | `on_epoch_end` | End of each epoch | `MetricCallback`, `ProgressBarCallback` |
 | `on_error` | On exception during training | `CheckpointCallback`, `MetricCallback` |
-| `on_train_end` | Training ends (always via finally) | `CheckpointCallback`, `MetricCallback`, `GradientCheckpointingCallback` |
+| `on_train_end` | Training exits after `on_train_begin` completes (via `finally`) | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 
-Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm), `gradient_clipping` (always registered; computes grad norm, clips only when `max_grad_norm` is not `None`).
+Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm, rank-0), `gradient_clipping`. The gradient-clipping callback is always registered and always calls `executor.clip_grad_norm()` with the numeric `max_grad_norm` value.
 
 ## KV Cache Mathematics
 
@@ -160,7 +168,7 @@ Three-layer separation (SGLang-inspired):
 - **ReqToTokenPool**: Index table `[req_idx, pos] → physical token slot`, shared across all layers.
 - **Allocator + PrefixCache**: Paged-mode slot allocation with ref-counting, LRU eviction, and hash-based prefix sharing.
 
-`PagePool` orchestrates all three. In contiguous mode (default), `req_to_token` is a trivial linear mapping. In paged mode, slots are allocated on demand with prefix caching support. `bind_tasks()` returns a `KVCache` dataclass with precomputed `page_table` and `decode_mask` fields (computed once per decode step, shared across all layers). Attention layers access buffers directly — no methods, no abstraction.
+`PagePool` orchestrates all three. In contiguous mode (default), `req_to_token` is a trivial linear mapping. In paged mode, slots are allocated on demand with prefix caching support. `bind_tasks()` returns a `KVCache` dataclass with `kv_indptr`, a prefix-sum index over sequence lengths computed once per step and shared across layers. Attention layers access buffers directly — no methods, no abstraction.
 
 ### Attention Backend
 
@@ -239,4 +247,4 @@ total_steps          = (batches_per_replica // grad_accum_steps) * n_epoch
 
 This accounts for data-parallel sharding — each rank processes `1/nprocs` of the dataset.
 
-> Document Update Time: 2026-07-31
+> Document Update Time: 2026-08-02

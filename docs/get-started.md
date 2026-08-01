@@ -2,11 +2,23 @@
 
 This guide walks you through installing AstrAI, downloading a model, running inference, preprocessing data, and launching your first training job.
 
+## Contents
+
+- [Prerequisites](#prerequisites)
+- [1. Install](#1-install)
+- [2. Download Model Weights](#2-download-model-weights)
+- [3. Run Inference](#3-run-inference)
+- [4. Preprocess Data](#4-preprocess-data)
+- [5. Train](#5-train)
+- [6. Evaluate](#6-evaluate)
+- [7. Docker](#7-docker)
+- [Next Steps](#next-steps)
+
 ## Prerequisites
 
 - **Python 3.12+**
-- **PyTorch 2.11+** (CUDA 12.8 recommended for GPU support)
-- NVIDIA GPU with CUDA (optional but recommended; CPU works for inference)
+- **PyTorch 2.11.0** (the exact version pinned by AstrAI; CUDA 12.8 build recommended for GPU support)
+- NVIDIA GPU with CUDA for training, `scripts/tools/generate.py`, generation evaluations, and demos. The HTTP server and direct-scoring evaluations can run on CPU where their CLI exposes a CPU device.
 
 ## 1. Install
 
@@ -55,7 +67,7 @@ python scripts/demo/stream_chat.py
 # Type your message after >>, type !exit to quit
 ```
 
-This starts a multi-turn interactive chat session with streaming output.
+This starts a single-turn interactive prompt loop with streaming output. Each prompt is independent; conversation history is not retained.
 
 ### Start an HTTP Server
 
@@ -191,6 +203,13 @@ python scripts/tools/train.py \
 See [Training Guide](guides/training.md) for loss formulas and strategies. See [Distributed Guide](guides/distributed.md) for DDP/FSDP details.
 
 ## 6. Evaluate
+
+HumanEval and MMLU download their benchmark data through HuggingFace
+`datasets`, which is not part of the base install:
+
+```bash
+pip install datasets
+```
 
 ```bash
 # HumanEval (code generation, auto-downloads dataset)

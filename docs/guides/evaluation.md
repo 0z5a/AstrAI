@@ -2,6 +2,29 @@
 
 AstrAI provides 7 evaluation scripts in `scripts/eval/` covering code generation, knowledge QA, perplexity, summarization, data quality, instruction following, and weight analysis.
 
+## Contents
+
+- [Prerequisites](#prerequisites)
+- [Overview](#overview)
+- [HumanEval](#humaneval-code-generation)
+- [MMLU](#mmlu-knowledge-qa)
+- [Perplexity](#perplexity-ppl)
+- [ROUGE](#rouge)
+- [IFD](#ifd-instruction-following-difficulty)
+- [IFEval](#ifeval-instruction-following)
+- [Weight Analysis](#weight-analysis)
+- [Tips](#tips)
+
+## Prerequisites
+
+HumanEval, MMLU, and IFEval import HuggingFace `datasets` to download their benchmark data. This package is not installed by AstrAI's base dependencies, so install it before running those scripts:
+
+```bash
+pip install datasets
+```
+
+The generation-based scripts require CUDA because they load the model on `cuda` with `bfloat16`. Direct-scoring and metric scripts support the devices shown below.
+
 ## Overview
 
 | Script | Metric | Model Invocation | External Dataset |
@@ -18,7 +41,15 @@ Two invocation patterns exist:
 - **Generation benchmarks** (HumanEval, IFEval): use `InferenceEngine` to generate responses, then score them.
 - **Scoring benchmarks** (MMLU, PPL, IFD): call `model()` directly under `torch.inference_mode()` for log-likelihood computation.
 
-Common defaults: `--param_path` defaults to `./params`; dtype defaults to `bfloat16` on CUDA, `float32` on CPU.
+| Script | Device support |
+|--------|----------------|
+| HumanEval | CUDA for generation; `--test_only` can score existing completions without loading a model |
+| IFEval | CUDA only |
+| MMLU | CUDA or CPU via `--device`; auto-selects CUDA when available |
+| PPL | CUDA or CPU via `--device`; auto-selects CUDA when available |
+| IFD | CUDA or CPU via `--device`; auto-selects CUDA when available |
+| ROUGE | CPU-only metric computation; no model is loaded |
+| Weight analysis | CUDA by default; CPU supported via `--device cpu` |
 
 ---
 
@@ -30,7 +61,7 @@ Generates completions for 164 programming problems, executes them against hidden
 python scripts/eval/evaluate_humaneval.py \
     --param_path ./params \
     --num_samples 20 \
-    --batch_size 32 \
+    --batch_size 64 \
     --max_tokens 512 \
     --output results/humaneval.json
 ```
@@ -47,7 +78,8 @@ python scripts/eval/evaluate_humaneval.py \
 | `--temperature` | 0.8 | Sampling temperature |
 | `--top_p` | 0.95 | Nucleus sampling threshold |
 | `--top_k` | 50 | Top-k sampling |
-| `--batch_size` | 32 | Generation batch size |
+| `--batch_size` | 64 | Generation batch size |
+| `--max_seq_len` | 4096 | KV cache sequence length |
 | `--test_workers` | 8 | ProcessPoolExecutor workers for test execution |
 | `--test_timeout` | 3.0 | Per-subprocess timeout (seconds) |
 | `--problems` | None | Restrict to specific problem indices |
@@ -66,7 +98,7 @@ python scripts/eval/evaluate_humaneval.py \
 python scripts/eval/evaluate_mmlu.py \
     --param_path ./params \
     --n_shot 5 \
-    --subjects math_algebra history_us \
+    --subjects abstract_algebra high_school_us_history \
     --output results/mmlu.json
 ```
 
@@ -82,12 +114,13 @@ python scripts/eval/evaluate_mmlu.py \
 | `--device` | auto | Device (`cuda` / `cpu`) |
 | `--dtype` | auto | `bfloat16` on CUDA, `float32` on CPU |
 | `--seed` | 0 | Seed for option permutation (0 = enabled, -1 = disabled) |
+| `--batch_size` | 4 | Questions per batch; each question produces four choice rows |
 
 **How it works**: For each question, builds a prompt with n-shot examples, then scores each choice (A/B/C/D) by computing the summed log-likelihood of the choice token given the context. The choice with the highest log-prob is the prediction.
 
 **Output**: stdout prints per-subject accuracy and overall. With `--output`, writes per-subject `{accuracy, correct, total}` + `_overall` aggregate.
 
-**Data**: Auto-downloads `cais/mmlu` from HuggingFace. Stored as per-subject CSVs in `<data_dir>/<split>/` and `<data_dir>/dev/` (for few-shot).
+**Data**: Auto-downloads `cais/mmlu` from HuggingFace. Stored as per-subject CSVs in `<data_dir>/<split>/` and `<data_dir>/dev/` (for few-shot). `--subjects` accepts canonical MMLU names such as `abstract_algebra`, `college_computer_science`, `high_school_us_history`, and `world_religions`.
 
 ---
 
@@ -100,7 +133,7 @@ python scripts/eval/evaluate_ppl.py \
     --param_path ./params \
     --input_path data.jsonl \
     --output_dir ppl_results/ \
-    --batch_size 4 \
+    --batch_size 64 \
     --max_length 2048
 ```
 
@@ -110,7 +143,7 @@ python scripts/eval/evaluate_ppl.py \
 | `--input_path` | required | Input file, glob, or directory |
 | `--output_dir` | required | Output directory for `summary.json` + token JSONL |
 | `--text_key` | `text` | Key for the text field in input data |
-| `--batch_size` | 4 | Batch size |
+| `--batch_size` | 64 | Batch size |
 | `--max_length` | 2048 | Max sequence length (tokens) |
 | `--token_level` | False | Store per-token log_probs + token-type analysis |
 | `--max_samples` | None | Random subsample per file |
@@ -119,7 +152,7 @@ python scripts/eval/evaluate_ppl.py \
 
 **Input**: JSONL or JSON files. Each item must have a field named by `--text_key` (default `text`). If `--input_path` is a directory, recursively collects `*.jsonl` and `*.json`.
 
-**Output**: `summary.json` with per-file stats (tokens, mean/median loss, perplexity, p50/p90/p95/p99). With `--token_level`, also writes per-token JSONL with token IDs and log-probs.
+**Output**: `summary.json` with per-file token count, mean loss, perplexity, and p50/p90/p95/p99 loss. Median loss is included only with `--token_level`; that mode also writes per-token JSONL with token IDs and log-probs.
 
 ---
 
@@ -210,7 +243,8 @@ python scripts/eval/evaluate_ifeval.py \
 | `--top_p` | 0.95 | Top-p sampling |
 | `--top_k` | 50 | Top-k sampling |
 | `--num_samples` | 1 | Samples per problem (best-of-n scoring) |
-| `--batch_size` | 1 | Inference batch size |
+| `--batch_size` | 64 | Inference batch size |
+| `--max_seq_len` | 4096 | KV cache sequence length |
 | `--limit` | None | Limit to first N problems (quick testing) |
 | `--dump_responses` | None | Path to dump raw responses as JSONL |
 
@@ -232,7 +266,7 @@ python scripts/eval/analyze_weights.py \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--ckpt_dir` | required | Checkpoint dir with `model.safetensors` + `config.json` |
+| `--ckpt_dir` | required | Checkpoint directory containing `model.safetensors` |
 | `--compare` | None | Additional checkpoint dirs to compare |
 | `--no_svd` | False | Skip SVD; show only weight stats (faster) |
 | `--output` | None | Save results as JSON |
@@ -245,8 +279,8 @@ python scripts/eval/analyze_weights.py \
 ## Tips
 
 - **Quick test**: Use `--limit` (IFEval) or `--problems` (HumanEval) to run on a small subset first.
-- **Auto-download**: HumanEval, MMLU, and IFEval auto-download their datasets on first run. The other scripts expect user-provided data.
+- **Auto-download**: After installing `datasets`, HumanEval, MMLU, and IFEval auto-download their datasets on first run. The other scripts expect user-provided data.
 - **Output formats**: `--output` writes a single JSON for most scripts. PPL and IFD write an `--output_dir` containing `summary.json` plus per-file artifacts.
-- **CPU mode**: All scripts auto-detect CUDA. To force CPU, use `--device cpu --dtype float32`.
+- **CPU mode**: MMLU, PPL, and IFD support `--device cpu --dtype float32`; weight analysis supports `--device cpu`. HumanEval generation and IFEval are CUDA-only.
 
 > Document Update Time: 2026-07-30

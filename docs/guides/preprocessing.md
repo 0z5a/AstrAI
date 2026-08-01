@@ -10,6 +10,7 @@ Declarative JSON-driven data preprocessing. `MaskBuilderFactory` supports three 
 - [Configuration Reference](#configuration-reference) — all fields
 - [Mask Algorithm](#mask-algorithm)
 - [Output Layout](#output-layout)
+- [Training Compatibility](#training-compatibility)
 - [CLI](#cli)
 - [Python API](#python-api)
 
@@ -40,7 +41,7 @@ A single config file captures the entire pipeline, reusable and version-controll
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `field` | str | -- | JSONL key to read |
-| `action` | str | -- | `"train"` / `"mask"` / `"$role"` |
+| `action` | str | -- | `"train"` / `"mask"` / `"$role"` / `"value"`; `"value"` copies raw values without tokenization |
 | `template` | bool | `false` | Apply `chat_template` per message |
 | `add_special_tokens` | bool | `true` for first non-template section | Add special tokens during encode |
 
@@ -89,7 +90,7 @@ Config:
 }
 ```
 
-Output keys: `sequence` (int32), `loss_mask` (bool)
+Output keys: `sequence` (int32), `loss_mask` (bool), `position_ids` (int32)
 
 ### SFT Instruction
 
@@ -116,7 +117,7 @@ Config:
 }
 ```
 
-Output keys: `sequence`, `loss_mask`
+Output keys: `sequence`, `loss_mask`, `position_ids`
 
 ### Pretrain
 
@@ -142,7 +143,7 @@ Config:
 }
 ```
 
-Output keys: `sequence` (no `loss_mask` — all tokens trained)
+Output keys: `sequence`, `position_ids` (no `loss_mask` — all tokens trained)
 
 ### DPO
 
@@ -179,6 +180,11 @@ Config:
 ```
 
 Output keys: `chosen`, `chosen_mask`, `rejected`, `rejected_mask`
+
+The offline `Pipeline` can construct these keys, but its `.bin` output is not
+currently loadable for DPO training because the writer does not preserve
+per-record offsets. Train DPO directly from raw JSONL instead; see
+[Training Compatibility](#training-compatibility).
 
 ### GRPO
 
@@ -228,6 +234,11 @@ Output keys: `prompts`, `prompts_mask`, `responses`, `masks`, `rewards` (float32
 - `mask_key: "masks"` — rename the auto-generated mask key (default: `responses_mask`)
 - `prompts_mask` is auto-generated (all masked) and unused by GRPOStrategy
 
+The offline `Pipeline` flattens GRPO response groups for `.bin` output without
+preserving their boundaries, and there is no automatic raw-JSONL GRPO processor
+in `DatasetFactory`. See
+[Training Compatibility](#training-compatibility) for the supported routes.
+
 ---
 
 ## Configuration Reference
@@ -257,7 +268,7 @@ When `sources` is set, `sections` is ignored.
 | `max_chars` | int | `2000000` | Skip text-mode items longer than this |
 | `max_items` | int or null | `null` | Stop after N documents |
 | `batch_size` | int | `256` | Records per tokenization batch |
-| `packing_strategy` | str | `"simple"` | Packing strategy: `"simple"`, `"bfd"`, `"bfd_split"` |
+| `packing_strategy` | str | `"simple"` | Packing is supported for single-output data with a `sequence` key: `"simple"`, `"bfd"`, or `"bfd_split"`. Multi-output DPO/GRPO data is not record-preserving packed output. |
 | `max_packed_len` | int | `8192` | Maximum length of a packed bin |
 | `truncation_mode` | str | `"keep_start"` | How to truncate sequences: `"keep_start"` or `"keep_end"` |
 
@@ -266,8 +277,8 @@ When `sources` is set, `sections` is ignored.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `domain_key` | str or null | `null` | JSONL key for domain grouping |
-| `storage_format` | str | `"bin"` | `"bin"` (mmap). Reading also supports `"jsonl"` for on-the-fly tokenization |
-| `max_tokens_per_shard` | int | `100000000` | Flush threshold in cumulative tokens |
+| `storage_format` | str | `"bin"` | Pipeline output format. Only `"bin"` has a registered writer; `"jsonl"` is accepted by config validation but cannot be emitted by `Pipeline`. |
+| `max_tokens_per_shard` | int | `100000000` | Flush threshold counted from each record's primary flat sequence: `sequence` for single-output data, otherwise the first flat source output |
 | `dtype` | dict[str, str] | `{}` | Per-key tensor dtype override (e.g. `{"loss_mask": "bool"}`) |
 | `position_ids_mode` | str | `"doc_reset"` | How to compute position_ids: `"none"`, `"doc_reset"`, `"continuous"` |
 
@@ -304,11 +315,13 @@ output/
       meta.json
       sequence.bin
       loss_mask.bin
+      position_ids.bin
   wiki/
     shard_0000/
       meta.json
       sequence.bin
       loss_mask.bin
+      position_ids.bin
 ```
 
 ### Multi-Shard (`bin`)
@@ -322,13 +335,44 @@ output/
       meta.json
       sequence.bin
       loss_mask.bin
+      position_ids.bin
     shard_0001/
       meta.json
       sequence.bin
       loss_mask.bin
+      position_ids.bin
 ```
 
-For `bin` format, `MmapStore` discovers all shards under the domain directory via `rglob("meta.json")`. For `h5` format, `H5Store` discovers `.h5`/`.hdf5` files via recursive glob.
+`MmapStore` discovers binary shards recursively through their `meta.json` files.
+Each shard's metadata is a top-level object keyed by tensor name:
+
+```json
+{
+  "sequence": {"shape": [123456], "dtype": "int32"},
+  "loss_mask": {"shape": [123456], "dtype": "bool"},
+  "position_ids": {"shape": [123456], "dtype": "int32"}
+}
+```
+
+An optional `offsets` array may appear for record-oriented binary data written
+through `save_bin(..., record_keys=...)`; the preprocessing `BinWriter` does not
+currently request those offsets.
+
+---
+
+## Training Compatibility
+
+| Training type | Supported input route |
+|---------------|-----------------------|
+| `seq` | Offline preprocessed `.bin`, or raw `.jsonl` eagerly transformed by `JsonlStore` using `dataset_config.json` or the built-in `messages` config |
+| `sft` | Offline preprocessed `.bin`, or raw `.jsonl` through the same eager transform routes |
+| `dpo` | Raw `.jsonl` through the automatic lazy DPO processor selected by `DatasetFactory` when `tokenizer_path` is supplied, or a caller-provided record store |
+| `grpo` | A caller-provided, already-loaded `Store` with record-shaped `prompts`, `responses`, `masks`, and `rewards`; no automatic raw-JSONL processor is currently wired |
+
+Offline DPO and GRPO preprocessing configs describe the intended token fields,
+but their `.bin` output is not currently loadable for training. DPO binary
+shards lack per-record offsets. GRPO response groups are flattened before the
+binary writer and their record/group boundaries are not preserved.
 
 ---
 
@@ -336,14 +380,19 @@ For `bin` format, `MmapStore` discovers all shards under the domain directory vi
 
 ```bash
 # SFT
-python scripts/tools/preprocess.py data/sft/*.jsonl -o output/sft/ -c configs/sft_chat.json
+python scripts/tools/preprocess.py data/sft/part-000.jsonl -o output/sft/ -c configs/sft_chat.json --batch_size 128
 
 # DPO
-python scripts/tools/preprocess.py data/dpo/*.jsonl -o output/dpo/ -c configs/dpo.json --tokenizer_path params
+python scripts/tools/preprocess.py data/dpo/part-000.jsonl -o output/dpo/ -c configs/dpo.json --tokenizer_path params
 
 # GRPO
-python scripts/tools/preprocess.py data/grpo/*.jsonl -o output/grpo/ -c configs/grpo.json
+python scripts/tools/preprocess.py data/grpo/part-000.jsonl -o output/grpo/ -c configs/grpo.json
 ```
+
+Inputs may be `.jsonl` files or `.json` files containing one object or a list of
+objects. Each positional path must exist. A wildcard such as `data/*.jsonl`
+works only when the invoking shell expands it before Click receives the
+arguments; otherwise pass the files explicitly.
 
 ---
 

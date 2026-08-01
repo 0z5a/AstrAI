@@ -62,6 +62,8 @@
 
 **1. 安装**
 
+AstrAI 需要 Python 3.12+，并精确固定 PyTorch 版本为 `2.11.0`。训练、`scripts/tools/generate.py`、生成式评估和生成演示需要 CUDA；CPU 支持仅适用于提供明确 CPU 设备路径的组件，例如 HTTP 服务和直接打分评估。
+
 ```bash
 git clone https://github.com/ViperEkura/AstrAI.git
 cd AstrAI
@@ -138,7 +140,7 @@ curl http://localhost:8000/v1/chat/completions \
 # 下载模型权重（运行演示前必需）
 python scripts/demo/download.py                      # model → params/
 
-# 交互式流式聊天（多轮对话，保持历史记录）
+# 单轮交互式流式提示循环（不保留对话历史）
 python scripts/demo/stream_chat.py
 # 在 >> 后输入消息，输入 !exit 退出
 
@@ -189,7 +191,7 @@ docker run --gpus all -v /path/to/data:/data -it astrai:latest
 # Docker Compose（GPU，默认）
 docker compose up -d
 
-# Docker Compose（仅 CPU）
+# Docker Compose CPU 服务配置（不支持仅限 CUDA 的生成脚本和演示）
 docker compose --profile cpu up -d
 ```
 
@@ -239,7 +241,7 @@ SSE 流式格式、错误码和统计端点详见[推理文档](guides/inference
 
 ### 贡献
 
-我们欢迎贡献！请参阅[贡献指南](../../CONTRIBUTING.md)了解详情。
+我们欢迎贡献！请参阅[贡献指南](../CONTRIBUTING.md)了解详情。
 
 1. Fork 本仓库。
 2. 创建功能分支。
@@ -256,7 +258,7 @@ SSE 流式格式、错误码和统计端点详见[推理文档](guides/inference
 
 ### 许可证
 
-本项目采用 [GPL-3.0 许可证](../../LICENSE)。
+本项目采用 [GPL-3.0 许可证](../LICENSE)。
 
 ---
 
