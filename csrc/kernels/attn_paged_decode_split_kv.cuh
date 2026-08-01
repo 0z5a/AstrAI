@@ -75,10 +75,9 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
                 if (!p.mask[mask_base + kv_idx])
                     masked = true;
             }
-            if constexpr (IsCausal) {
-                if (kv_idx > p.causal_offset)
-                    masked = true;
-            }
+            // Decode: the query is the last token, so its valid range [0,
+            // seq_len) IS the causal range.  IsCausal is accepted for dispatch
+            // uniformity but must not apply causal_offset masking here.
             if (masked)
                 partial = -FLT_MAX;
 

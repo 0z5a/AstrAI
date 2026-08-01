@@ -8,6 +8,7 @@
 #include "attn_prefill_split_q.cuh"
 #include "attn_decode_split_kv.cuh"
 #include "attn_paged_decode_split_kv.cuh"
+#include "attn_paged_prefill_split_q.cuh"
 #ifndef ASTRAI_NO_MMA
 #include "attn_prefill_split_q_mma.cuh"
 #include "attn_decode_split_kv_mma.cuh"
@@ -208,6 +209,16 @@ static inline void launch_paged_prefill_mma(PagedAttentionParams<bf16>& p) {
 }
 #endif
 
+template <int HEAD_DIM, bool IsCausal, bool HasMask>
+static inline void launch_paged_prefill_scalar(PagedAttentionParams<bf16>& p) {
+    constexpr int G = 8, ROWS = 32, P_BC = 32;
+    int max_q_tiles = (p.max_q_len + ROWS - 1) / ROWS;
+    dim3 grid(max_q_tiles, p.q_head, p.batch);
+    dim3 block(G, ROWS);
+    paged_attn_prefill_split_q_kernel<HEAD_DIM, G, ROWS, P_BC, IsCausal, HasMask>
+        <<<grid, block>>>(p);
+}
+
 template <int HEAD_DIM>
 static inline void dispatch_paged_prefill(PagedAttentionParams<bf16>& p) {
     bool is_causal = (p.causal_offset >= 0);
@@ -215,5 +226,7 @@ static inline void dispatch_paged_prefill(PagedAttentionParams<bf16>& p) {
 
 #ifndef ASTRAI_NO_MMA
     DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_paged_prefill_mma, HEAD_DIM, p);
+#else
+    DISPATCH_CAUSAL_MASK(is_causal, has_mask, launch_paged_prefill_scalar, HEAD_DIM, p);
 #endif
 }
