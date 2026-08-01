@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import warnings
 from pathlib import Path
@@ -66,7 +67,49 @@ if _should_build():
                 extra_link_args=[f"-Wl,-rpath,{_torch_lib}"],
             )
         )
-    cmdclass["build_ext"] = BuildExtension
+
+    # Parallel build — each extension is an independent ninja project, so we
+    # can compile them concurrently.  BuildExtension compiles them serially by
+    # default; this subclass dispatches each extension to a subprocess.
+    # Set BUILD_PARALLEL=N to override (default: min(n_exts, 4)).
+    _single_ext = os.environ.get("ASTRAI_BUILD_SINGLE_EXT", "")
+
+    class ParallelBuildExtension(BuildExtension):
+        def build_extensions(self):
+            if _single_ext:
+                self.extensions = [e for e in self.extensions if e.name == _single_ext]
+                if not self.extensions:
+                    return
+                super().build_extensions()
+                return
+
+            n = len(self.extensions)
+            max_workers = int(os.environ.get("BUILD_PARALLEL", 8))
+            if max_workers <= 1 or n <= 1:
+                super().build_extensions()
+                return
+
+            names = [e.name for e in self.extensions]
+            env = {**os.environ, "BUILD_PARALLEL": "1"}
+            procs = {}
+            for i in range(0, len(names), max_workers):
+                batch = names[i : i + max_workers]
+                for name in batch:
+                    e = {**env, "ASTRAI_BUILD_SINGLE_EXT": name}
+                    cmd = [sys.executable, __file__, "build_ext", "--inplace"]
+                    procs[name] = subprocess.Popen(
+                        cmd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                    )
+                for name in batch:
+                    out, _ = procs[name].communicate()
+                    if procs[name].returncode != 0:
+                        sys.stdout.write(out.decode())
+                        raise RuntimeError(
+                            f"parallel build failed for {name} "
+                            f"(exit {procs[name].returncode})"
+                        )
+
+    cmdclass["build_ext"] = ParallelBuildExtension
 
 if not cmdclass:
 
