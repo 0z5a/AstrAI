@@ -274,12 +274,12 @@ class TorchNativeBackend(AttentionBackend):
             kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
 
             max_len = kv_cache.max_len
-            if kv_cache.page_table is not None:
-                indices = kv_cache.page_table
-            else:
-                indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
-            if kv_cache.decode_mask is not None:
-                pos_mask = kv_cache.decode_mask
+            indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
+            # Zero out padding positions so gather never touches invalid slots.
+            # Decode: attn_mask[:,0,0] is exactly the per-position validity
+            # mask ([B, max_len], True=keep).  Prefill: fall back to seq_lens.
+            if q.size(1) == 1 and attn_mask is not None and attn_mask.dim() == 4:
+                pos_mask = attn_mask[:, 0, 0]
             else:
                 pos_mask = (
                     torch.arange(max_len, device=q.device)[None, :]
@@ -344,10 +344,6 @@ class CudaBackend(AttentionBackend):
         kv_indptr = torch.zeros(b + 1, dtype=torch.int32, device=q.device)
         kv_indptr[1:] = kv_cache.seq_lens.cumsum(0).to(torch.int32)
 
-        mask = None
-        if b > 1 and kv_cache.decode_mask is not None:
-            mask = kv_cache.decode_mask
-
         out = attn_paged_decode(
             q_3d,
             kv_cache.k_buffer[layer_id],
@@ -356,7 +352,7 @@ class CudaBackend(AttentionBackend):
             kv_cache.req_pool_indices,
             kv_indptr,
             kv_cache.max_len,
-            mask=mask,
+            mask=attn_mask,
             is_causal=is_causal,
         )
         return out.unsqueeze(1).flatten(2)
