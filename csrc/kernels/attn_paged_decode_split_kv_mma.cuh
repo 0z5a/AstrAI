@@ -39,13 +39,6 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     __shared__ __align__(16) bf16 sK[Traits::STAGES * Traits::BC * Traits::LD];
     __shared__ __align__(16) bf16 sV[Traits::STAGES * Traits::BC * Traits::LD];
 
-    #pragma unroll
-    for (int i = lane; i < Traits::STAGES * Traits::BC * Traits::LD; i += 32) {
-        sK[i] = __float2bfloat16(0.0f);
-        sV[i] = __float2bfloat16(0.0f);
-    }
-    __syncwarp();
-
     const int q_base = batch * p.q_stride_l + q_head0 * p.q_stride_h;
     const int qra = gid;
     const int qrb = gid + 8;
