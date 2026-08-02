@@ -8,7 +8,14 @@ import torch
 
 from astrai.extension import ATTN_BACKEND, attn_backend
 from astrai.inference.core.cache import PagePool
+from astrai.inference.core.workspace import InferenceWorkspace
 from tests.extension.conftest import D, skip_no_kernel
+
+
+def _ws(pool: PagePool) -> InferenceWorkspace:
+    return InferenceWorkspace(
+        pool.max_batch_size, pool.max_seq_len, pool.device, pool.dtype
+    )
 
 
 @skip_no_kernel
@@ -62,11 +69,10 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
         dtype=torch.bfloat16,
     )
 
+    ws = _ws(cache)
     cache.task_alloc("t1", prompt_ids[0])
     cache.task_alloc("t2", prompt_ids[1])
-    kv1 = cache.bind_tasks(
-        ["t1", "t2"], [len(prompt_ids[0]), len(prompt_ids[1])], device, start_pos=0
-    )
+    kv1 = cache.bind_tasks(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
         out_torch = model(
             input_ids, input_mask=input_mask, kv_cache=kv1, position_ids=position_ids
@@ -76,9 +82,7 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
     cache.task_free("t2")
     cache.task_alloc("t1", prompt_ids[0])
     cache.task_alloc("t2", prompt_ids[1])
-    kv2 = cache.bind_tasks(
-        ["t1", "t2"], [len(prompt_ids[0]), len(prompt_ids[1])], device, start_pos=0
-    )
+    kv2 = cache.bind_tasks(["t1", "t2"], ws, start_pos=0)
     with attn_backend(ATTN_BACKEND.CUDA):
         with torch.inference_mode():
             out_cuda = model(
@@ -129,11 +133,10 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
         input_mask[i, : len(p)] = True
         position_ids[i, : len(p)] = torch.arange(len(p), device=device)
 
+    ws = _ws(cache)
     cache.task_alloc("t1", prompt_ids[0])
     cache.task_alloc("t2", prompt_ids[1])
-    kv = cache.bind_tasks(
-        ["t1", "t2"], [len(prompt_ids[0]), len(prompt_ids[1])], device, start_pos=0
-    )
+    kv = cache.bind_tasks(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
         model(input_ids, input_mask=input_mask, kv_cache=kv, position_ids=position_ids)
 
@@ -143,13 +146,15 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     total_len = 9
     dec_mask = dec_pos[:, None, None] >= torch.arange(total_len, device=device)
 
-    kv_t = cache.bind_tasks(["t1", "t2"], [9, 7], device)
+    cache.task_extend("t1", 8)
+    cache.task_extend("t2", 6)
+    kv_t = cache.bind_tasks(["t1", "t2"], ws)
     with torch.inference_mode():
         out_torch = model(
             dec_ids, input_mask=dec_mask, kv_cache=kv_t, position_ids=dec_pos
         )
 
-    kv_c = cache.bind_tasks(["t1", "t2"], [9, 7], device)
+    kv_c = cache.bind_tasks(["t1", "t2"], ws)
     with attn_backend(ATTN_BACKEND.CUDA):
         with torch.inference_mode():
             out_cuda = model(

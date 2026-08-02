@@ -7,6 +7,7 @@ from torch import Tensor
 
 from astrai.inference.core.cache import PagePool
 from astrai.inference.core.task import Task
+from astrai.inference.core.workspace import InferenceWorkspace
 from astrai.inference.sample import sample
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
@@ -70,6 +71,17 @@ class Executor:
         # any task-set change is a cache miss.
         self._decode_cache: Optional[tuple] = None
 
+        # Pre-allocated fixed-shape buffers for the decode hot path
+        # (input_ids, decode mask, KV bind metadata).  Eagerly sized at init
+        # so the workspace is CUDA-graph-capture friendly — no allocation
+        # during capture.
+        self._workspace = InferenceWorkspace(
+            max_batch_size=kv_cache.max_batch_size,
+            max_seq_len=kv_cache.max_seq_len,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
     def execute_prefill(self, tasks: List[Task], prompt_len: int, start_pos: int = 0):
         if start_pos >= prompt_len:
             return
@@ -99,7 +111,9 @@ class Executor:
                 input_mask=input_mask,
                 position_ids=position_ids,
                 kv_cache=self.kv_cache.bind_tasks(
-                    task_ids, [prompt_len] * batch_sz, self.device, start_pos=start_pos
+                    task_ids,
+                    self._workspace,
+                    start_pos=start_pos,
                 ),
             )
 
@@ -123,11 +137,9 @@ class Executor:
         if not tasks:
             return []
 
-        input_ids = torch.tensor(
-            [t.output_ids[-1] if t.output_ids else t.prompt_ids[-1] for t in tasks],
-            dtype=torch.long,
-            device=self.device,
-        )
+        input_ids = self._workspace.fill_input_ids(
+            [t.output_ids[-1] if t.output_ids else t.prompt_ids[-1] for t in tasks]
+        ).unsqueeze(1)
 
         task_ids = [t.task_id for t in tasks]
 
@@ -140,7 +152,7 @@ class Executor:
             and cur_positions == [p + 1 for p in cached[1]]
         ):
             _, _, info, position_ids = cached
-            position_ids = position_ids + 1
+            position_ids += 1
             self._decode_cache = (sig, cur_positions, info, position_ids)
         else:
             info = _build_sampling_batch_info(tasks, self.device)
@@ -150,9 +162,7 @@ class Executor:
             self._decode_cache = (sig, cur_positions, info, position_ids)
 
         total_len = max(t.next_pos for t in tasks) + 1
-        input_mask = position_ids[:, None, None] >= torch.arange(
-            total_len, device=self.device
-        )
+        input_mask = self._workspace.decode_mask(position_ids, total_len)
 
         has_freq = bool((info.freq_penalties != 0).any())
         if has_freq:
@@ -184,12 +194,11 @@ class Executor:
 
         with torch.inference_mode():
             outputs = self.model(
-                input_ids.unsqueeze(1),
+                input_ids,
                 input_mask=input_mask,
                 kv_cache=self.kv_cache.bind_tasks(
                     task_ids,
-                    [t.next_pos + 1 for t in tasks],
-                    self.device,
+                    self._workspace,
                 ),
                 position_ids=position_ids.unsqueeze(1),
             )

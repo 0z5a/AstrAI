@@ -10,6 +10,15 @@ from astrai.inference import (
     ReqToTokenPool,
     page_hash,
 )
+from astrai.inference.core.workspace import InferenceWorkspace
+
+
+def _ws(pool: PagePool) -> InferenceWorkspace:
+    """Workspace sized to the pool (bind_tasks requires it)."""
+    return InferenceWorkspace(
+        pool.max_batch_size, pool.max_seq_len, pool.device, pool.dtype
+    )
+
 
 # ---- page_hash ----
 
@@ -216,7 +225,7 @@ def test_page_pool_contiguous_bind_tasks_prefill():
     pool = _make_contiguous_pool()
     pool.task_alloc("t1", list(range(10)))
     pool.task_alloc("t2", list(range(10)))
-    kv = pool.bind_tasks(["t1", "t2"], [10, 10], torch.device("cpu"), start_pos=0)
+    kv = pool.bind_tasks(["t1", "t2"], _ws(pool), start_pos=0)
     assert kv.out_cache_loc.shape == (2, 10)
     assert kv.seq_lens.tolist() == [10, 10]
     assert kv.req_pool_indices.shape == (2,)
@@ -226,7 +235,10 @@ def test_page_pool_contiguous_bind_tasks_decode():
     pool = _make_contiguous_pool()
     pool.task_alloc("t1", list(range(10)))
     pool.task_alloc("t2", list(range(8)))
-    kv = pool.bind_tasks(["t1", "t2"], [11, 9], torch.device("cpu"))
+    # Simulate one decode extension so seq_lens advance to 11 and 9.
+    assert pool.task_extend("t1", 10)
+    assert pool.task_extend("t2", 8)
+    kv = pool.bind_tasks(["t1", "t2"], _ws(pool))
     assert kv.out_cache_loc.shape == (2, 1)
     assert kv.seq_lens.tolist() == [11, 9]
 
@@ -236,7 +248,7 @@ def test_page_pool_contiguous_bind_roundtrip():
     pool = _make_contiguous_pool(n_layers=1, n_kv_heads=2, head_dim=4)
     pool.task_alloc("t1", list(range(4)))
 
-    kv = pool.bind_tasks(["t1"], [4], torch.device("cpu"), start_pos=0)
+    kv = pool.bind_tasks(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
     v = torch.randn(1, 4, 2, 4)
     kv.k_buffer[0, kv.out_cache_loc] = k
@@ -298,7 +310,7 @@ def test_page_pool_paged_bind_roundtrip():
     pool = _make_paged_pool(n_layers=1, n_kv_heads=2, head_dim=4)
     pool.task_alloc("t1", list(range(4)))
 
-    kv = pool.bind_tasks(["t1"], [4], torch.device("cpu"), start_pos=0)
+    kv = pool.bind_tasks(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
     v = torch.randn(1, 4, 2, 4)
     kv.k_buffer[0, kv.out_cache_loc] = k
@@ -349,7 +361,7 @@ def test_page_pool_paged_ps64_bind_roundtrip():
     prompt = list(range(128))
     pool.task_alloc("t1", prompt)
 
-    kv = pool.bind_tasks(["t1"], [128], torch.device("cpu"), start_pos=0)
+    kv = pool.bind_tasks(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 128, 2, 4)
     v = torch.randn(1, 128, 2, 4)
     kv.k_buffer[0, kv.out_cache_loc] = k

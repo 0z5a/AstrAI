@@ -20,6 +20,8 @@ from typing import Callable, Dict, List, Optional
 import torch
 from torch import Tensor
 
+from astrai.inference.core.workspace import InferenceWorkspace
+
 
 def page_hash(token_ids: List[int], page_idx: int, page_size: int) -> int:
     start = page_idx * page_size
@@ -217,24 +219,6 @@ class KVCache:
     kv_indptr: Optional[Tensor] = None
 
 
-@dataclass
-class DecodeBindCache:
-    """Cached KV-addressing state for steady-state decode.
-
-    Valid for one ordered task set advancing every sequence by exactly one
-    token per step.  ``seq_lens`` is the Python mirror used to validate the
-    +1 progression without a GPU round-trip; on any task-set change or
-    non-monotonic seq_lens the whole entry is rebuilt.
-    """
-
-    sig: tuple
-    seq_lens: List[int]
-    req_pool_indices: Tensor
-    seq_lens_t: Tensor
-    kv_indptr: Tensor
-    inc: Tensor
-
-
 class PagePool:
     """Top-level KV cache manager.
 
@@ -305,11 +289,13 @@ class PagePool:
         self._task_pages: Dict[str, List[int]] = {}
         self._lock = threading.Lock()
 
-        # Single-slot incremental cache for steady-state decode: the same
-        # ordered task set advances every sequence by exactly one token per
-        # step, so seq_lens_t and kv_indptr can be updated in-place instead
-        # of re-allocating + re-cumsumming.  Any task-set change is a miss.
-        self._bind_cache: Optional[DecodeBindCache] = None
+        # Steady-state decode validation state: the ordered task set and its
+        # Python seq_lens mirror.  When the same set advances every sequence
+        # by exactly one token per step, bind_tasks updates the stable
+        # buffers in-place (+=1 / +=inc) instead of re-cumsumming.  Any
+        # task-set change is a miss and rebuilds.
+        self._bind_sig: Optional[tuple] = None
+        self._bind_seq_lens: Optional[List[int]] = None
 
     # ---- task lifecycle ----
 
@@ -395,33 +381,39 @@ class PagePool:
 
     def task_extend(self, task_id: str, pos: int) -> bool:
         req_idx = self._task_req.get(task_id)
-        if req_idx is None:
+        if req_idx is None or pos >= self.max_seq_len:
             return False
 
-        if self.contiguous:
-            return pos < self.max_seq_len
+        # Paged mode must also claim a physical slot for the new token;
+        # contiguous mode's block is pre-allocated so this is a no-op.
+        if not self.contiguous and not self._extend_slot(task_id, req_idx, pos):
+            return False
 
+        self._task_len[req_idx] = pos + 1
+        return True
+
+    def _extend_slot(self, task_id: str, req_idx: int, pos: int) -> bool:
+        """Allocate the physical slot for one extended token (paged mode)."""
         if self.page_size == 1:
             slots = self._alloc_tokens(1)
             if slots is None:
                 return False
             self._task_slots.setdefault(task_id, []).extend(slots)
             self._req_pool.req_to_token[req_idx, pos] = slots[0]
-        else:
-            page_idx = pos // self.page_size
-            existing = self._task_pages.get(task_id, [])
-            if page_idx >= len(existing):
-                p = self._alloc.alloc()
-                if p < 0:
-                    return False
-                existing.append(p)
-                self._task_pages[task_id] = existing
-            page_offset = pos % self.page_size
-            page = existing[page_idx]
-            token_slot = page * self.page_size + page_offset
-            self._req_pool.req_to_token[req_idx, pos] = token_slot
+            return True
 
-        self._task_len[req_idx] = pos + 1
+        page_idx = pos // self.page_size
+        existing = self._task_pages.get(task_id, [])
+        if page_idx >= len(existing):
+            p = self._alloc.alloc()
+            if p < 0:
+                return False
+            existing.append(p)
+            self._task_pages[task_id] = existing
+        page_offset = pos % self.page_size
+        page = existing[page_idx]
+        token_slot = page * self.page_size + page_offset
+        self._req_pool.req_to_token[req_idx, pos] = token_slot
         return True
 
     def task_cached(self, task_id: str) -> int:
@@ -442,43 +434,59 @@ class PagePool:
     def bind_tasks(
         self,
         task_ids: List[str],
-        seq_lens: List[int],
-        device: torch.device,
+        workspace: InferenceWorkspace,
+        device: Optional[torch.device] = None,
         start_pos: Optional[int] = None,
     ) -> KVCache:
+        if device is None:
+            device = workspace.device
         req_indices = [self._task_req[tid] for tid in task_ids]
+        # Per-request lengths come from the pool's own tracking (task_alloc
+        # sets len(prompt_ids); task_extend sets pos+1), so callers need not
+        # pass them.
+        seq_lens = [self._task_len[req_idx] for req_idx in req_indices]
+        b = len(task_ids)
         sig = tuple(task_ids)
 
-        cache = self._bind_cache
+        # Write into the caller's workspace buffers (fixed addresses, sized
+        # to max_batch/max_seq at init) — the sole owner of the per-step
+        # KV bind tensors.
+        rpi_buf = workspace.req_pool_indices
+        sl_buf = workspace.seq_lens
+        kvp_buf = workspace.kv_indptr
+        inc_buf = workspace.inc
+        ocl_buf = workspace.out_cache_loc
+
         incremental = (
             start_pos is None
-            and cache is not None
-            and cache.sig == sig
-            and len(cache.seq_lens) == len(seq_lens)
-            and all(s == p + 1 for s, p in zip(seq_lens, cache.seq_lens))
+            and self._bind_sig is not None
+            and self._bind_sig == sig
+            and self._bind_seq_lens is not None
+            and len(self._bind_seq_lens) == b
+            and all(s == p + 1 for s, p in zip(seq_lens, self._bind_seq_lens))
         )
         if incremental:
-            req_pool_indices = cache.req_pool_indices
-            seq_lens_t = cache.seq_lens_t + 1
-            kv_indptr = cache.kv_indptr + cache.inc
-            inc = cache.inc
+            # Steady-state decode: advance the stable buffers in-place.
+            # Normal-mode buffers keep ``+=`` legal regardless of whether
+            # this runs inside ``torch.inference_mode()``.
+            sl_buf[:b] += 1
+            kvp_buf[: b + 1] += inc_buf[: b + 1]
+            req_pool_indices = rpi_buf[:b]
+            seq_lens_t = sl_buf[:b]
+            kv_indptr = kvp_buf[: b + 1]
         else:
-            req_pool_indices = torch.tensor(
-                req_indices, dtype=torch.long, device=device
+            # Cold path: fill the stable buffers from fresh host tensors.
+            rpi_buf[:b].copy_(
+                torch.tensor(req_indices, dtype=torch.long, device=device)
             )
-            seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=device)
-            kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
-            kv_indptr[1:] = seq_lens_t.cumsum(0).to(torch.int32)
-            inc = torch.arange(len(seq_lens) + 1, dtype=torch.int32, device=device)
-
-        self._bind_cache = DecodeBindCache(
-            sig=sig,
-            seq_lens=list(seq_lens),
-            req_pool_indices=req_pool_indices,
-            seq_lens_t=seq_lens_t,
-            kv_indptr=kv_indptr,
-            inc=inc,
-        )
+            sl_buf[:b].copy_(torch.tensor(seq_lens, dtype=torch.long, device=device))
+            kvp_buf[: b + 1].zero_()
+            kvp_buf[1 : b + 1] = sl_buf[:b].cumsum(0).to(torch.int32)
+            req_pool_indices = rpi_buf[:b]
+            seq_lens_t = sl_buf[:b]
+            kv_indptr = kvp_buf[: b + 1]
+        self._bind_sig = sig
+        self._bind_seq_lens = list(seq_lens)
 
         if start_pos is not None:
             seq_len = seq_lens[0]
@@ -487,9 +495,9 @@ class PagePool:
             ]
         else:
             write_pos = seq_lens_t - 1
-            out_cache_loc = self._req_pool.req_to_token[
-                req_pool_indices, write_pos
-            ].unsqueeze(-1)
+            loc = self._req_pool.req_to_token[req_pool_indices, write_pos].unsqueeze(-1)
+            ocl_buf[:b].copy_(loc)
+            out_cache_loc = ocl_buf[:b]
 
         return KVCache(
             k_buffer=self._storage.k_buffer,

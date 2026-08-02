@@ -305,12 +305,12 @@ class SamplingPipeline(BaseSamplingStrategy):
             return tokens, chosen
 
         transformed = self.apply(logits, filter_value, input_ids, input_mask)
-        log_probs = torch.log_softmax(transformed.float(), dim=-1)
         tokens = torch.multinomial(
             torch.softmax(transformed, dim=-1), num_samples=1
         ).squeeze(-1)
         if not return_logprobs:
             return tokens
+        log_probs = torch.log_softmax(transformed.float(), dim=-1)
         chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
         return tokens, chosen
 
