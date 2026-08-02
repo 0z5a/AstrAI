@@ -8,14 +8,14 @@
 using bf16 = __nv_bfloat16;
 
 // Dispatch head_dim: shared macro — avoids C++20 lambda template syntax.
-// Usage: DISPATCH_HEAD_DIM(hd, fn, arg)
-//   Expands to: fn<32>(arg); fn<64>(arg); etc.
-#define DISPATCH_HEAD_DIM(hd, fn, arg) \
+// Usage: DISPATCH_HEAD_DIM(hd, fn, args...)
+//   Expands to: fn<32>(args...); fn<64>(args...); etc.
+#define DISPATCH_HEAD_DIM(hd, fn, ...) \
     switch (hd) { \
-        case 32:  fn<32>(arg); break; \
-        case 64:  fn<64>(arg); break; \
-        case 128: fn<128>(arg); break; \
-        case 256: fn<256>(arg); break; \
+        case 32:  fn<32>(__VA_ARGS__); break; \
+        case 64:  fn<64>(__VA_ARGS__); break; \
+        case 128: fn<128>(__VA_ARGS__); break; \
+        case 256: fn<256>(__VA_ARGS__); break; \
         default: \
             TORCH_CHECK(false, "unsupported head_dim ", hd, \
                          " (supported: 32, 64, 128, 256)"); \

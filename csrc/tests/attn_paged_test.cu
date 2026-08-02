@@ -1,6 +1,7 @@
 // Compile:
 //   nvcc -I csrc -arch=sm_89 -O3 --use_fast_math --ptxas-options=-O3 \
-//        --extra-device-vectorization csrc/tests/attn_paged_test.cu \
+//        --extra-device-vectorization -Xcompiler -fopenmp \
+//        csrc/tests/attn_paged_test.cu \
 //        -o /tmp/test_paged && /tmp/test_paged
 
 #include <cstring>
@@ -24,6 +25,7 @@ static void cpu_paged_decode_ref(
     for (int b = 0; b < B; b++) {
         int seq_len = kv_indptr[b + 1] - kv_indptr[b];
         int64_t req_idx = req_pool_indices[b];
+        #pragma omp parallel for schedule(dynamic)
         for (int h = 0; h < Hq; h++) {
             int kv_h = h / n_rep;
             float mv = -INFINITY, sv = 0.0f;
@@ -74,9 +76,10 @@ static void cpu_paged_prefill_ref(
         int q_len = qo_indptr[b + 1] - qo_indptr[b];
         int causal_off = seq_len - q_len;
         int64_t req_idx = req_pool_indices[b];
+        #pragma omp parallel for collapse(2) schedule(dynamic)
         for (int h = 0; h < Hq; h++) {
-            int kv_h = h / n_rep;
             for (int qi = 0; qi < q_len; qi++) {
+                int kv_h = h / n_rep;
                 float mv = -INFINITY, sv = 0.0f;
                 float accum[256] = {0.0f};
                 int lim = causal ? min(seq_len, causal_off + qi + 1) : seq_len;
@@ -106,6 +109,19 @@ static void cpu_paged_prefill_ref(
     }
 }
 
+// ---- paged validation table (kernel vs CPU ref, abs error only) ----
+inline void print_paged_header() {
+    printf("%-58s | %11s | %6s\n",
+           "config", "max_err", "result");
+    printf("----------------------------------------------------------------"
+           "--------------------------------\n");
+}
+
+inline void print_paged_row(const char* cfg, float max_err, bool pass) {
+    printf("%-58s | %11.3e | %s\n",
+           cfg, max_err, pass ? "PASS" : "FAIL");
+}
+
 // ======================================================================
 // DECODE TEST
 // ======================================================================
@@ -123,10 +139,9 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
     int pool_size = B * max_ctx;
     int num_reqs = B + 4;
 
-    printf("DECODE B=%d Hq=%d Hkv=%d D=%d seqs=[", B, Hq, Hkv, HEAD_DIM);
-    for (int b = 0; b < B; b++) printf("%d%s", seq_lens[b], b < B-1 ? "," : "");
-    printf("] causal=%d ... ", causal);
-    fflush(stdout);
+    char cfg[80];
+    snprintf(cfg, sizeof(cfg), "DECODE B=%d Hq=%d Hkv=%d D=%d max_sl=%d causal=%d",
+             B, Hq, Hkv, HEAD_DIM, max_sl, causal);
 
     size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
@@ -211,7 +226,7 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
     p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
     p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
 
-    dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_decode<H>(p); });
+    dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_decode<H>(p, 0); });
     cudaDeviceSynchronize();
 
     bf16* h_o_bf = (bf16*)malloc(sz_q);
@@ -228,8 +243,7 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
         if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
     }
 
-    if (pass) printf("PASS (max_err=%.4e)\n", max_err);
-    else      printf("FAIL (max_err=%.4e)\n", max_err);
+    print_paged_row(cfg, max_err, pass);
 
     free(h_q); free(h_k_pool); free(h_v_pool); free(h_rtt); free(h_rpi);
     free(h_kvi); free(h_q_f); free(h_k_f); free(h_v_f);
@@ -254,8 +268,9 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
     int pool_size = B * max_ctx;
     int num_reqs = B + 4;
 
-    printf("DECODE-MASK B=%d Hq=%d Hkv=%d D=%d max_sl=%d ... ", B, Hq, Hkv, HEAD_DIM, max_sl);
-    fflush(stdout);
+    char cfg[80];
+    snprintf(cfg, sizeof(cfg), "DECODE-MASK B=%d Hq=%d Hkv=%d D=%d max_sl=%d",
+             B, Hq, Hkv, HEAD_DIM, max_sl);
 
     size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
@@ -346,7 +361,7 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
     p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
     p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
 
-    dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_decode<H>(p); });
+    dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_decode<H>(p, 0); });
     cudaDeviceSynchronize();
 
     bf16* h_o_bf = (bf16*)malloc(sz_q);
@@ -363,8 +378,7 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
         if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
     }
 
-    if (pass) printf("PASS (max_err=%.4e)\n", max_err);
-    else      printf("FAIL (max_err=%.4e)\n", max_err);
+    print_paged_row(cfg, max_err, pass);
 
     free(h_q); free(h_k_pool); free(h_v_pool); free(h_rtt); free(h_rpi);
     free(h_kvi); free(h_mask); free(h_q_f); free(h_k_f); free(h_v_f);
@@ -393,12 +407,9 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     int pool_size = B * max_ctx;
     int num_reqs = B + 4;
 
-    printf("PREFILL B=%d Hq=%d Hkv=%d D=%d q_lens=[", B, Hq, Hkv, HEAD_DIM);
-    for (int b = 0; b < B; b++) printf("%d%s", q_lens[b], b < B-1 ? "," : "");
-    printf("] kv_lens=[");
-    for (int b = 0; b < B; b++) printf("%d%s", kv_lens[b], b < B-1 ? "," : "");
-    printf("] causal=%d ... ", causal);
-    fflush(stdout);
+    char cfg[80];
+    snprintf(cfg, sizeof(cfg), "PREFILL B=%d Hq=%d Hkv=%d D=%d max_sl=%d causal=%d",
+             B, Hq, Hkv, HEAD_DIM, max_sl, causal);
 
     size_t sz_q  = (size_t)total_q * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
@@ -486,7 +497,7 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
     p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
-    dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_prefill<H>(p); });
+    dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_prefill<H>(p, 0); });
     cudaDeviceSynchronize();
 
     bf16* h_o_bf = (bf16*)malloc(sz_q);
@@ -503,8 +514,7 @@ static int run_prefill_test(int B, int Hq, int Hkv,
         if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
     }
 
-    if (pass) printf("PASS (max_err=%.4e)\n", max_err);
-    else      printf("FAIL (max_err=%.4e)\n", max_err);
+    print_paged_row(cfg, max_err, pass);
 
     free(h_q); free(h_k_pool); free(h_v_pool); free(h_rtt); free(h_rpi);
     free(h_kvi); free(h_qoi); free(h_q_f); free(h_k_f); free(h_v_f);
@@ -527,7 +537,9 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     int pool_size = B * max_ctx;
     int num_reqs = B + 4;
 
-    printf("PREFILL-MASK Hq=%d Hkv=%d D=%d q_len=%d ... ", Hq, Hkv, HEAD_DIM, q_len);
+    char cfg[80];
+    snprintf(cfg, sizeof(cfg), "PREFILL-MASK Hq=%d Hkv=%d D=%d q_len=%d",
+             Hq, Hkv, HEAD_DIM, q_len);
     fflush(stdout);
 
     size_t sz_q  = (size_t)total_q * Hq * HEAD_DIM * sizeof(bf16);
@@ -620,7 +632,7 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
     p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
-    dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_prefill<H>(p); });
+    dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_prefill<H>(p, 0); });
     cudaDeviceSynchronize();
 
     bf16* h_o_bf = (bf16*)malloc(sz_q);
@@ -637,8 +649,7 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
         if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
     }
 
-    if (pass) printf("PASS (max_err=%.4e)\n", max_err);
-    else      printf("FAIL (max_err=%.4e)\n", max_err);
+    print_paged_row(cfg, max_err, pass);
 
     free(h_q); free(h_k_pool); free(h_v_pool); free(h_rtt); free(h_rpi);
     free(h_kvi); free(h_qoi); free(h_mask); free(h_q_f); free(h_k_f); free(h_v_f);
@@ -710,15 +721,12 @@ static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
     p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
 
     auto launch = [&]() {
-        dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_decode<H>(p); });
+        dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_decode<H>(p, 0); });
     };
     // Decode: q_len=1, query is the last token → attends to all [0, seq_len).
     // FLOPs = 2 * (QK^T + PV) = 4 * B * Hq * seq_len * D.
     double flops = 4.0 * B * Hq * (double)seq_len * HEAD_DIM;
-    // HBM: K+V read (Q/O negligible for decode).
-    size_t nKV = (size_t)B * Hkv * seq_len * HEAD_DIM;
-    double bytes = 2.0 * nKV * sizeof(bf16);
-    BenchResult r = bench_kernel(launch, 10, 100, flops, bytes);
+    BenchResult r = bench_kernel(launch, 3, 10, flops);
 
     char cfg[64];
     snprintf(cfg, sizeof(cfg), "DEC B=%2d Hq=%2d Hk=%d kv=%4d D=%3d",
@@ -791,7 +799,7 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
     auto launch = [&]() {
-        dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_prefill<H>(p); });
+        dispatch_by_head_dim(HEAD_DIM, [&]<int H>() { dispatch_paged_prefill<H>(p, 0); });
     };
     // FLOPs = 2 * (QK^T + PV) = 4 * effective_qk_pairs * Hq * D.
     // Non-causal: effective = q_len * kv_len.
@@ -807,11 +815,7 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
         eff_kv = (double)q_len * kv_len;
     }
     double flops = 4.0 * B * Hq * eff_kv * HEAD_DIM;
-    // HBM: Q read + K read + V read + O write.
-    size_t nKV = (size_t)B * Hkv * kv_len * HEAD_DIM;
-    size_t nQ  = (size_t)total_q * Hq * HEAD_DIM;
-    double bytes = (2.0 * nQ + 2.0 * nKV) * sizeof(bf16);
-    BenchResult r = bench_kernel(launch, 10, 100, flops, bytes);
+    BenchResult r = bench_kernel(launch, 3, 10, flops);
 
     char cfg[80];
     snprintf(cfg, sizeof(cfg), "PRE B=%d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d c=%d",
@@ -827,7 +831,8 @@ int main() {
     int fail = 0;
 
     // ===== DECODE TESTS =====
-    printf("=== Paged Decode Tests ===\n\n");
+    printf("=== Paged Decode Tests ===\n");
+    print_paged_header();
     fail += run_decode_test<128>(1, 32, 4, 512, 0, 1);
     fail += run_decode_test<128>(1, 32, 4, 1024, 0, 2);
     fail += run_decode_test<128>(4, 32, 4, 512, 0, 3);
@@ -848,7 +853,8 @@ int main() {
     if (fail) { printf("\nFAILED decode tests\n"); return fail; }
 
     // ===== PREFILL TESTS =====
-    printf("\n=== Paged Prefill Tests ===\n\n");
+    printf("\n=== Paged Prefill Tests ===\n");
+    print_paged_header();
     // Single request, pure prefill (q_len == kv_len)
     {
         std::vector<int> ql = {512};

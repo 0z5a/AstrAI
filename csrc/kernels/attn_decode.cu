@@ -10,6 +10,9 @@ torch::Tensor attn_decode(
     double scale,
     int64_t layout
 ) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
     AttentionParams<bf16> p;
     attn_pack_params(q, k, v, mask, causal_offset, scale, layout, p);
     TORCH_CHECK(p.q_len == 1, "Q seq_len must be 1");
@@ -20,7 +23,7 @@ torch::Tensor attn_decode(
     p.o = (bf16*)O_view.data_ptr();
 
     alloc_split_partials(p);
-    DISPATCH_HEAD_DIM(p.head_dim, dispatch_decode, p);
+    DISPATCH_HEAD_DIM(p.head_dim, dispatch_decode, p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }

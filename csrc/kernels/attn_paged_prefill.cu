@@ -14,6 +14,9 @@ torch::Tensor attn_paged_prefill(
     int64_t causal_offset,
     double scale
 ) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
     PagedAttentionParams<bf16> p;
     attn_pack_paged_prefill_params(q, k_cache, v_cache,
                                     req_to_token, req_pool_indices,
@@ -23,7 +26,7 @@ torch::Tensor attn_paged_prefill(
     auto O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
     p.o = (bf16*)O.data_ptr();
 
-    DISPATCH_HEAD_DIM(p.head_dim, dispatch_paged_prefill, p);
+    DISPATCH_HEAD_DIM(p.head_dim, dispatch_paged_prefill, p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }

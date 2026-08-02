@@ -49,6 +49,7 @@ torch::Tensor rotary_emb(
     torch::Tensor freqs_cis
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    auto stream = at::cuda::getCurrentCUDAStream();
 
     TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
     TORCH_CHECK(freqs_cis.is_cuda(), "freqs_cis must be on CUDA");
@@ -77,7 +78,7 @@ torch::Tensor rotary_emb(
     int block = 256;
     int grid = std::min((total + block - 1) / block, 1024);
 
-    rotary_emb_kernel<<<grid, block>>>(
+    rotary_emb_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         freqs_cis.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),

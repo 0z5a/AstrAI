@@ -29,19 +29,18 @@ inline double now_ms() {
 
 struct BenchResult {
     float ms;
-    double gbps;
     double tflops;
 };
 
 template <typename Fn>
 BenchResult bench_kernel(Fn launch, int warmup, int iters,
-                         double flops, double bytes) {
+                         double flops) {
     for (int i = 0; i < warmup; i++) launch();
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA error before bench: %s\n", cudaGetErrorString(err));
-        return {0, 0, 0};
+        return {0, 0};
     }
 
     cudaEvent_t s, e;
@@ -52,19 +51,33 @@ BenchResult bench_kernel(Fn launch, int warmup, int iters,
     float ms = 0; cudaEventElapsedTime(&ms, s, e); ms /= iters;
     cudaEventDestroy(s); cudaEventDestroy(e);
 
-    return {ms, bytes / (ms * 1e-3) / 1e9, flops / (ms * 1e-3) / 1e12};
+    return {ms, flops / (ms * 1e-3) / 1e12};
 }
 
 inline void print_bench_header() {
-    printf("%-46s | %10s | %10s | %10s\n",
-           "config", "latency", "bandwidth", "throughput");
+    printf("%-46s | %10s | %10s\n",
+           "config", "latency", "TFLOP/s");
     printf("---------------------------------------------------------------"
            "----------------------------\n");
 }
 
 inline void print_bench_row(const char* cfg, const BenchResult& r) {
-    printf("%-46s | %7.4f ms | %7.1f GB/s | %6.2f TFLOP/s\n",
-           cfg, r.ms, r.gbps, r.tflops);
+    printf("%-46s | %7.4f ms | %6.2f\n",
+           cfg, r.ms, r.tflops);
+}
+
+// ---- validation table (kernel vs CPU reference) ----
+inline void print_test_header() {
+    printf("%-46s | %11s | %11s | %6s\n",
+           "config", "max_abs_err", "max_rel_err", "result");
+    printf("----------------------------------------------------------------"
+           "----------------------------\n");
+}
+
+inline void print_test_row(const char* cfg, float max_abs_err,
+                           float max_rel_err, bool pass) {
+    printf("%-46s | %11.3e | %11.3e | %s\n",
+           cfg, max_abs_err, max_rel_err, pass ? "PASS" : "FAIL");
 }
 
 template <int... Ds>
@@ -135,9 +148,10 @@ static void cpu_attention_ref(
     float scale = 1.0f / sqrtf((float)D);
     int n_rep = Hq / Hk;
     for (int b = 0; b < B; b++) {
+        #pragma omp parallel for collapse(2) schedule(dynamic)
         for (int h = 0; h < Hq; h++) {
-            int kv_h = h / n_rep;
             for (int qi = 0; qi < q_len; qi++) {
+                int kv_h = h / n_rep;
                 float mv = -INFINITY, sv = 0.0f;
                 float accum[256] = {0.0f};
                 int lim = kv_len;

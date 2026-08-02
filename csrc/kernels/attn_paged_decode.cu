@@ -13,6 +13,9 @@ torch::Tensor attn_paged_decode(
     int64_t causal_offset,
     double scale
 ) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
     PagedAttentionParams<bf16> p;
     attn_pack_paged_decode_params(q, k_cache, v_cache,
                                    req_to_token, req_pool_indices, kv_indptr,
@@ -22,7 +25,7 @@ torch::Tensor attn_paged_decode(
     p.o = (bf16*)O.data_ptr();
 
     alloc_split_partials(p);
-    DISPATCH_HEAD_DIM(p.head_dim, dispatch_paged_decode, p);
+    DISPATCH_HEAD_DIM(p.head_dim, dispatch_paged_decode, p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }

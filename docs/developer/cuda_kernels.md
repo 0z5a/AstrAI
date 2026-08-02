@@ -117,23 +117,22 @@ Each `csrc/tests/*.cu` file has the `nvcc` compile command in its header comment
 ```bash
 nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
      --ptxas-options=-O3,-v --extra-device-vectorization \
-     csrc/tests/attn_decode_test.cu -o /tmp/test && /tmp/test
+     -Xcompiler -fopenmp csrc/tests/attn_test.cu -o /tmp/test && /tmp/test
 ```
 
 Test files:
-- `attn_decode_test.cu` — basic decode kernel
-- `attn_paged_decode_test.cu` — paged decode kernel
-- `attn_prefill_test.cu` — prefill kernel
+- `attn_test.cu` — decode + prefill kernels (correctness tables + benchmarks)
+- `attn_paged_test.cu` — paged decode/prefill kernels
 
 ## Benchmarks
 
 Hardware: NVIDIA L20 (sm_89, 46 GB), CUDA 12.8, driver 570.86.
 
-Reproduce:
+Reproduce (decode + prefill in `attn_test.cu`, paged in `attn_paged_test.cu`):
 ```bash
 nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
      --ptxas-options=-O3,-v --extra-device-vectorization \
-     csrc/tests/attn_<name>_test.cu -o /tmp/test && /tmp/test
+     -Xcompiler -fopenmp csrc/tests/attn_test.cu -o /tmp/test && /tmp/test
 ```
 
 ## Known Optimization Targets
@@ -165,9 +164,8 @@ csrc/
 │   └── attn_warp_utils.cuh              # Warp-level utilities
 └── tests/
     ├── test_utils.cuh           # Shared test utilities
-    ├── attn_decode_test.cu      # Decode kernel test
-    ├── attn_paged_decode_test.cu # Paged decode test
-    └── attn_prefill_test.cu     # Prefill kernel test
+    ├── attn_test.cu             # Decode + prefill kernels
+    └── attn_paged_test.cu       # Paged decode/prefill kernels
 ```
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
