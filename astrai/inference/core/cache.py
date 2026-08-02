@@ -217,6 +217,7 @@ class KVCache:
     out_cache_loc: Tensor
     max_len: int = 0
     kv_indptr: Optional[Tensor] = None
+    qo_indptr: Optional[Tensor] = None
 
 
 class PagePool:
@@ -493,11 +494,19 @@ class PagePool:
             out_cache_loc = self._req_pool.req_to_token[
                 req_pool_indices, start_pos:seq_len
             ]
+            # Ragged query segmentation for the prefill kernel, computed once
+            # (was rebuilt per layer in CudaBackend.fwd_prefill).
+            q_len = seq_len - start_pos
+            workspace.qo_indptr[: b + 1].copy_(
+                torch.arange(b + 1, dtype=torch.int32, device=device) * q_len
+            )
+            qo_indptr = workspace.qo_indptr[: b + 1]
         else:
             write_pos = seq_lens_t - 1
             loc = self._req_pool.req_to_token[req_pool_indices, write_pos].unsqueeze(-1)
             ocl_buf[:b].copy_(loc)
             out_cache_loc = ocl_buf[:b]
+            qo_indptr = None
 
         return KVCache(
             k_buffer=self._storage.k_buffer,
@@ -508,6 +517,7 @@ class PagePool:
             out_cache_loc=out_cache_loc,
             max_len=max(seq_lens),
             kv_indptr=kv_indptr,
+            qo_indptr=qo_indptr,
         )
 
     # ---- internals ----

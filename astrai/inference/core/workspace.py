@@ -54,14 +54,14 @@ class InferenceWorkspace:
         )
 
         # Per-step token IDs.  Values come from host Python lists every
-        # step, so the device buffer is pre-allocated and filled via an
-        # async copy from a double-buffered pinned host buffer (stable
-        # address for CUDA-graph capture; alternating buffers keep an
-        # in-flight copy from being overwritten by the next fill).
+        # step, so the device buffer is pre-allocated (stable address for
+        # CUDA-graph capture) and filled via a host staging buffer.  A
+        # double buffer keeps a copy in flight from being overwritten by
+        # the next fill.
         self.input_ids = torch.empty((max_batch_size,), dtype=torch.long, device=device)
         self._pin = [
-            torch.empty((max_batch_size,), dtype=torch.long, pin_memory=True),
-            torch.empty((max_batch_size,), dtype=torch.long, pin_memory=True),
+            torch.empty((max_batch_size,), dtype=torch.long),
+            torch.empty((max_batch_size,), dtype=torch.long),
         ]
         self._pin_idx = 0
 
@@ -75,6 +75,9 @@ class InferenceWorkspace:
         self.kv_indptr = torch.empty(
             (max_batch_size + 1,), dtype=torch.int32, device=device
         )
+        self.qo_indptr = torch.empty(
+            (max_batch_size + 1,), dtype=torch.int32, device=device
+        )
         self.inc = torch.arange(max_batch_size + 1, dtype=torch.int32, device=device)
         self.out_cache_loc = torch.empty(
             (max_batch_size, 1), dtype=torch.long, device=device
@@ -83,15 +86,16 @@ class InferenceWorkspace:
     def fill_input_ids(self, ids: "list[int]") -> Tensor:
         """Write ``ids`` into the device buffer and return ``[B]``.
 
-        Pinned host values are copied asynchronously; the double buffer
-        guarantees the copy never races the next call's host writes.
+        Host values are staged through the double buffer and copied into the
+        stable device buffer (``copy_`` without pinning is synchronous, so
+        the alternating buffers guard against an in-flight transfer).
         """
         b = len(ids)
         pin = self._pin[self._pin_idx]
         self._pin_idx ^= 1
         for i, v in enumerate(ids):
             pin[i] = v
-        self.input_ids[:b].copy_(pin[:b], non_blocking=True)
+        self.input_ids[:b].copy_(pin[:b])
         return self.input_ids[:b]
 
     def decode_mask(self, position_ids: Tensor, total_len: int) -> Tensor:

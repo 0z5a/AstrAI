@@ -376,7 +376,7 @@ class CudaBackend(AttentionBackend):
         q_len = q.size(1)
 
         kv_indptr = kv_cache.kv_indptr
-        qo_indptr = torch.arange(b + 1, dtype=torch.int32, device=q.device) * q_len
+        qo_indptr = kv_cache.qo_indptr
 
         q_flat = q.reshape(b * q_len, q.size(2), q.size(3))
 

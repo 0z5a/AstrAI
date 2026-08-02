@@ -28,10 +28,14 @@ class SamplingBatchInfo:
     top_ks: Tensor  # int32  [B]
     top_ps: Tensor  # float32 [B]
     freq_penalties: Tensor  # float32 [B]
+    has_freq: bool  # any frequency_penalty != 0 (avoids per-step GPU .any())
 
 
 def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
     pin = str(device).startswith("cuda")
+    freq_penalties = torch.tensor(
+        [t.frequency_penalty for t in tasks], dtype=torch.float32, pin_memory=pin
+    ).to(device, non_blocking=True)
     return SamplingBatchInfo(
         temperatures=torch.tensor(
             [t.temperature for t in tasks], dtype=torch.float32, pin_memory=pin
@@ -42,9 +46,8 @@ def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
         top_ps=torch.tensor(
             [t.top_p for t in tasks], dtype=torch.float32, pin_memory=pin
         ).to(device, non_blocking=True),
-        freq_penalties=torch.tensor(
-            [t.frequency_penalty for t in tasks], dtype=torch.float32, pin_memory=pin
-        ).to(device, non_blocking=True),
+        freq_penalties=freq_penalties,
+        has_freq=bool((freq_penalties != 0).any()),
     )
 
 
@@ -164,7 +167,7 @@ class Executor:
         total_len = max(t.next_pos for t in tasks) + 1
         input_mask = self._workspace.decode_mask(position_ids, total_len)
 
-        has_freq = bool((info.freq_penalties != 0).any())
+        has_freq = info.has_freq
         if has_freq:
             history_lists = []
             history_lens = []
