@@ -13,7 +13,6 @@ from astrai.model import AutoModel
 _DTYPES = ["bfloat16", "float16", "float32"]
 _CACHES = ["contiguous", "paged"]
 _BACKENDS = ["cuda", "torch_native"]
-CACHE_MAX_SEQ = 2048
 
 _BACKEND_MAP = {
     "cuda": ATTN_BACKEND.CUDA,
@@ -56,13 +55,13 @@ class GenerationBenchmark:
         self.config = config
         self.backend = backend
 
-    def _make_pool(self, batch_size: int) -> PagePool:
+    def _make_pool(self, batch_size: int, max_seq_len: int) -> PagePool:
         return PagePool(
             n_layers=self.config.num_hidden_layers,
             n_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
             max_batch_size=batch_size,
-            max_seq_len=CACHE_MAX_SEQ,
+            max_seq_len=max_seq_len,
             device=self.device,
             dtype=self.dtype,
             page_size=1,
@@ -128,7 +127,7 @@ class GenerationBenchmark:
     ) -> BenchmarkResult:
         import time
 
-        pool = self._make_pool(batch_size)
+        pool = self._make_pool(batch_size, prompt_length)
         task_ids = [f"bench_prefill_{i}" for i in range(batch_size)]
         for tid in task_ids:
             pool.task_alloc(tid, list(range(prompt_length)))
@@ -189,7 +188,10 @@ class GenerationBenchmark:
     ) -> BenchmarkResult:
         import time
 
-        pool = self._make_pool(batch_size)
+        # Decode grows seq_len monotonically up to prompt + 5 + gen*num_trials
+        # (warmup 5 steps, then one step per trial), so size the pool to cover it.
+        max_seq_len = prompt_length + 5 + gen_length * num_trials
+        pool = self._make_pool(batch_size, max_seq_len)
         task_ids = self._run_prefill(pool, batch_size, prompt_length)
 
         for i in range(5):
