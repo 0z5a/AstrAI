@@ -16,29 +16,20 @@
 #include "attn_paged_prefill_split_q_mma.cuh"
 #endif
 
-// Cached SM count — cudaDeviceGetAttribute is a host-side call that was
-// invoked on every decode/paged-decode launch.  Cache per-device so multi-GPU
-// setups with heterogeneous GPUs still get the right count, while the common
-// single-GPU path hits the cache after the first call.
-inline int get_sm_count() {
-    int dev = 0;
-    cudaGetDevice(&dev);
-    static int cached_dev = -1;
-    static int cached_count = 0;
-    if (dev != cached_dev) {
-        cudaDeviceGetAttribute(&cached_count, cudaDevAttrMultiProcessorCount, dev);
-        cached_dev = dev;
-    }
-    return cached_count;
-}
-
 // Split-KV: compute number of splits to fill all SMs for small-batch decode.
 // Caps splits so each split processes at least `min_tiles_per_split` tiles,
 // avoiding excessive loop/prologue overhead when tiles are small.
+//
+// Target total grid blocks (`TARGET_BLOCKS`) rather than scaling splits by SM
+// count.  Decode blocks are single-warp (32 threads) and a SM hosts ~11 of
+// them, so the old `2*sm/base` cap badly undersplit at large batch (B=16 got
+// 3 splits, optimal ~8).  Measured (L20, grid search): bandwidth saturates
+// near 256-512 total blocks; 512 minimizes worst-case latency across the
+// B x kv grid; more is pure oversplit overhead.
+constexpr int DECODE_TARGET_BLOCKS = 512;
 inline int compute_num_splits(int base_blocks, int tiles_total,
                                int min_tiles_per_split = 1) {
-    int sm_count = get_sm_count();
-    int n = (2 * sm_count + base_blocks - 1) / base_blocks;
+    int n = (DECODE_TARGET_BLOCKS + base_blocks - 1) / base_blocks;
     int max_by_work = tiles_total / min_tiles_per_split;
     return std::max(1, std::min(n, std::min(max_by_work, MAX_SPLITS)));
 }
@@ -112,7 +103,7 @@ static inline void launch_decode_mma(AttentionParams<bf16>& p, int group_size, c
     int num_passes = (G + MAX_G - 1) / MAX_G;
     constexpr int BC = 16;
     int tiles_total = (p.kv_len + BC - 1) / BC;
-    p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total, 2);
+    p.num_splits = compute_num_splits(p.batch * p.kv_head * num_passes, tiles_total, 2);
     constexpr int STAGES = 2;
     using Traits = KernelTraits<HEAD_DIM, BC, 1, STAGES>;
     dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
