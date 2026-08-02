@@ -217,6 +217,24 @@ class KVCache:
     kv_indptr: Optional[Tensor] = None
 
 
+@dataclass
+class DecodeBindCache:
+    """Cached KV-addressing state for steady-state decode.
+
+    Valid for one ordered task set advancing every sequence by exactly one
+    token per step.  ``seq_lens`` is the Python mirror used to validate the
+    +1 progression without a GPU round-trip; on any task-set change or
+    non-monotonic seq_lens the whole entry is rebuilt.
+    """
+
+    sig: tuple
+    seq_lens: List[int]
+    req_pool_indices: Tensor
+    seq_lens_t: Tensor
+    kv_indptr: Tensor
+    inc: Tensor
+
+
 class PagePool:
     """Top-level KV cache manager.
 
@@ -286,6 +304,12 @@ class PagePool:
         self._task_slots: Dict[str, List[int]] = {}
         self._task_pages: Dict[str, List[int]] = {}
         self._lock = threading.Lock()
+
+        # Single-slot incremental cache for steady-state decode: the same
+        # ordered task set advances every sequence by exactly one token per
+        # step, so seq_lens_t and kv_indptr can be updated in-place instead
+        # of re-allocating + re-cumsumming.  Any task-set change is a miss.
+        self._bind_cache: Optional[DecodeBindCache] = None
 
     # ---- task lifecycle ----
 
@@ -423,8 +447,38 @@ class PagePool:
         start_pos: Optional[int] = None,
     ) -> KVCache:
         req_indices = [self._task_req[tid] for tid in task_ids]
-        req_pool_indices = torch.tensor(req_indices, dtype=torch.long, device=device)
-        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=device)
+        sig = tuple(task_ids)
+
+        cache = self._bind_cache
+        incremental = (
+            start_pos is None
+            and cache is not None
+            and cache.sig == sig
+            and len(cache.seq_lens) == len(seq_lens)
+            and all(s == p + 1 for s, p in zip(seq_lens, cache.seq_lens))
+        )
+        if incremental:
+            req_pool_indices = cache.req_pool_indices
+            seq_lens_t = cache.seq_lens_t + 1
+            kv_indptr = cache.kv_indptr + cache.inc
+            inc = cache.inc
+        else:
+            req_pool_indices = torch.tensor(
+                req_indices, dtype=torch.long, device=device
+            )
+            seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=device)
+            kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+            kv_indptr[1:] = seq_lens_t.cumsum(0).to(torch.int32)
+            inc = torch.arange(len(seq_lens) + 1, dtype=torch.int32, device=device)
+
+        self._bind_cache = DecodeBindCache(
+            sig=sig,
+            seq_lens=list(seq_lens),
+            req_pool_indices=req_pool_indices,
+            seq_lens_t=seq_lens_t,
+            kv_indptr=kv_indptr,
+            inc=inc,
+        )
 
         if start_pos is not None:
             seq_len = seq_lens[0]
@@ -436,9 +490,6 @@ class PagePool:
             out_cache_loc = self._req_pool.req_to_token[
                 req_pool_indices, write_pos
             ].unsqueeze(-1)
-
-        kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
-        kv_indptr[1:] = seq_lens_t.cumsum(0).to(torch.int32)
 
         return KVCache(
             k_buffer=self._storage.k_buffer,

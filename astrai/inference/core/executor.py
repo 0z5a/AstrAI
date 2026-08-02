@@ -1,7 +1,9 @@
 import logging
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+from torch import Tensor
 
 from astrai.inference.core.cache import PagePool
 from astrai.inference.core.task import Task
@@ -10,6 +12,39 @@ from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SamplingBatchInfo:
+    """Per-batch sampling parameters, cached across decode steps.
+
+    Sampling params are constant for a given ordered task set, so they are
+    built once (pinned-memory async H2D) and reused until the task set
+    changes.  ``top_ks`` is int32 to match the native consumers.
+    """
+
+    temperatures: Tensor  # float32 [B]
+    top_ks: Tensor  # int32  [B]
+    top_ps: Tensor  # float32 [B]
+    freq_penalties: Tensor  # float32 [B]
+
+
+def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
+    pin = str(device).startswith("cuda")
+    return SamplingBatchInfo(
+        temperatures=torch.tensor(
+            [t.temperature for t in tasks], dtype=torch.float32, pin_memory=pin
+        ).to(device, non_blocking=True),
+        top_ks=torch.tensor(
+            [t.top_k for t in tasks], dtype=torch.int32, pin_memory=pin
+        ).to(device, non_blocking=True),
+        top_ps=torch.tensor(
+            [t.top_p for t in tasks], dtype=torch.float32, pin_memory=pin
+        ).to(device, non_blocking=True),
+        freq_penalties=torch.tensor(
+            [t.frequency_penalty for t in tasks], dtype=torch.float32, pin_memory=pin
+        ).to(device, non_blocking=True),
+    )
 
 
 class Executor:
@@ -28,6 +63,12 @@ class Executor:
         self.kv_cache = kv_cache
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
+
+        # Per-step decode cache for the steady-state case where the same
+        # ordered task set decodes one token per step.  Sampling params are
+        # constant across steps; position_ids grows by exactly 1.  Single-slot:
+        # any task-set change is a cache miss.
+        self._decode_cache: Optional[tuple] = None
 
     def execute_prefill(self, tasks: List[Task], prompt_len: int, start_pos: int = 0):
         if start_pos >= prompt_len:
@@ -88,24 +129,32 @@ class Executor:
             device=self.device,
         )
 
-        position_ids = torch.tensor(
-            [t.next_pos for t in tasks], dtype=torch.long, device=self.device
-        )
+        task_ids = [t.task_id for t in tasks]
+
+        sig = tuple(task_ids)
+        cur_positions = [t.next_pos for t in tasks]
+        cached = self._decode_cache
+        if (
+            cached is not None
+            and cached[0] == sig
+            and cur_positions == [p + 1 for p in cached[1]]
+        ):
+            _, _, info, position_ids = cached
+            position_ids = position_ids + 1
+            self._decode_cache = (sig, cur_positions, info, position_ids)
+        else:
+            info = _build_sampling_batch_info(tasks, self.device)
+            position_ids = torch.tensor(
+                cur_positions, dtype=torch.long, device=self.device
+            )
+            self._decode_cache = (sig, cur_positions, info, position_ids)
+
         total_len = max(t.next_pos for t in tasks) + 1
         input_mask = position_ids[:, None, None] >= torch.arange(
             total_len, device=self.device
         )
 
-        task_ids = [t.task_id for t in tasks]
-
-        temperatures = torch.tensor([t.temperature for t in tasks], device=self.device)
-        top_ks = torch.tensor([t.top_k for t in tasks], device=self.device)
-        top_ps = torch.tensor([t.top_p for t in tasks], device=self.device)
-        freq_penalties = torch.tensor(
-            [t.frequency_penalty for t in tasks], device=self.device
-        )
-
-        has_freq = bool((freq_penalties != 0).any())
+        has_freq = bool((info.freq_penalties != 0).any())
         if has_freq:
             history_lists = []
             history_lens = []
@@ -149,10 +198,10 @@ class Executor:
         if return_logprobs:
             tokens, logprobs = sample(
                 logits,
-                temperature=temperatures,
-                top_k=top_ks,
-                top_p=top_ps,
-                frequency_penalty=freq_penalties,
+                temperature=info.temperatures,
+                top_k=info.top_ks,
+                top_p=info.top_ps,
+                frequency_penalty=info.freq_penalties,
                 input_ids=padded_ids,
                 input_mask=padded_mask,
                 return_logprobs=True,
@@ -165,10 +214,10 @@ class Executor:
 
         return sample(
             logits,
-            temperature=temperatures,
-            top_k=top_ks,
-            top_p=top_ps,
-            frequency_penalty=freq_penalties,
+            temperature=info.temperatures,
+            top_k=info.top_ks,
+            top_p=info.top_ps,
+            frequency_penalty=info.freq_penalties,
             input_ids=padded_ids,
             input_mask=padded_mask,
         ).tolist()
