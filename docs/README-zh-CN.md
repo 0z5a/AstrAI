@@ -14,7 +14,7 @@
 
 <div align="center">
   <img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="python">
-  <img src="https://img.shields.io/badge/license-GPL--3.0-blue.svg" alt="license">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="license">
   <img src="https://img.shields.io/github/v/tag/ViperEkura/AstrAI?label=Release&color=76bad9" alt="release">
   <img src="https://img.shields.io/github/stars/ViperEkura/AstrAI?style=flat&label=Stars&color=76bad9" alt="stars">
   <img src="https://img.shields.io/github/forks/ViperEkura/AstrAI?style=flat&label=Forks&color=76bad9" alt="forks">
@@ -258,7 +258,7 @@ SSE 流式格式、错误码和统计端点详见[推理文档](guides/inference
 
 ### 许可证
 
-本项目采用 [GPL-3.0 许可证](../LICENSE)。
+本项目采用 [Apache-2.0 许可证](../LICENSE)。
 
 ---
 
