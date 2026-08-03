@@ -9,6 +9,7 @@ AstrAI includes optional custom CUDA kernels for attention and rotary embedding.
 | `attn_decode` | `attn_decode.cu` | GQA decode attention (split-KV) |
 | `attn_prefill` | `attn_prefill.cu` | GQA prefill attention (split-Q) |
 | `attn_paged_decode` | `attn_paged_decode.cu` | Paged KV cache decode attention |
+| `attn_paged_prefill` | `attn_paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
@@ -66,7 +67,7 @@ NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
              --ptxas-options=-O3,-v --extra-device-vectorization --threads=8
 ```
 
-The `REGISTRY` in `csrc/build.py` lists all registered kernels (currently 4). Each entry maps a kernel name to its source files and build flags.
+The `REGISTRY` in `csrc/build.py` lists all registered kernels (currently 5). Each entry maps a kernel name to its source files and build flags.
 
 ## Attention Backend
 
@@ -74,7 +75,7 @@ The `REGISTRY` in `csrc/build.py` lists all registered kernels (currently 4). Ea
 
 - **`AttentionBackend`** (ABC): `fwd_decode` / `fwd_prefill` abstract methods, `forward` dispatches by q_len
 - **`TorchNativeBackend`**: SDPA with indirect KV cache gather (default)
-- **`CudaBackend`**: CUDA kernel dispatch — decode via `attn_paged_decode` (page_size=1), prefill via `attn_prefill`
+- **`CudaBackend`**: CUDA kernel dispatch — decode via `attn_paged_decode` (page_size=1), prefill via `attn_paged_prefill` (ragged batch, `qo_indptr` + `kv_indptr`)
 
 Select a backend via context manager (mirrors `torch.nn.attention.sdpa_kernel`):
 
@@ -151,6 +152,7 @@ csrc/
 │   ├── attn_decode.cu    # Basic decode kernel (registered)
 │   ├── attn_prefill.cu   # Basic prefill kernel (registered)
 │   ├── attn_paged_decode.cu             # Paged decode kernel (registered)
+│   ├── attn_paged_prefill.cu            # Paged prefill kernel (registered)
 │   ├── rotary_emb.cu                    # Fused rotary embedding kernel (registered)
 │   ├── attn_decode_split_kv.cuh         # Split-KV variant
 │   ├── attn_decode_split_kv_mma.cuh     # Split-KV + MMA variant
@@ -158,6 +160,8 @@ csrc/
 │   ├── attn_prefill_split_q_mma.cuh     # Split-Q + MMA variant
 │   ├── attn_paged_decode_split_kv.cuh   # Paged + split-KV variant
 │   ├── attn_paged_decode_split_kv_mma.cuh  # Paged + split-KV + MMA variant
+│   ├── attn_paged_prefill_split_q.cuh   # Paged + split-Q variant
+│   ├── attn_paged_prefill_split_q_mma.cuh  # Paged + split-Q + MMA variant
 │   ├── attn_dispatchers.cuh             # Kernel dispatch macros
 │   ├── attn_entry_utils.cuh             # Entry point helpers
 │   ├── attn_mma_utils.cuh               # MMA utilities

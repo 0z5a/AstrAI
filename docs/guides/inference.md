@@ -49,7 +49,8 @@ KVCache
   ├── seq_lens               [batch_size]
   ├── out_cache_loc          [batch, seq_len] — write indices for this forward
   ├── max_len                int — max(seq_lens), avoids GPU sync in decode
-  └── kv_indptr              [batch + 1] int32 — prefix sum of seq_lens, precomputed once per step
+  ├── kv_indptr              [batch + 1] int32 — prefix sum of seq_lens, precomputed once per step
+  └── qo_indptr              [batch + 1] int32 — prefix sum of per-request q_lens (prefill), precomputed once per step
 ```
 
 Attention layers do raw buffer indexing: `k_buffer[layer_id, out_cache_loc] = k` to write, `k_buffer[layer_id, indices]` to gather.
@@ -61,7 +62,7 @@ Attention computation (cache I/O + SDPA/kernel dispatch) is decoupled from the m
 ```
 AttentionBackend (ABC)
   ├── TorchNativeBackend   SDPA + indirect KV cache gather (default)
-  └── CudaBackend          CUDA kernel dispatch (attn_paged_decode, attn_prefill)
+  └── CudaBackend          CUDA kernel dispatch (attn_paged_decode, attn_paged_prefill)
 ```
 
 Select via context manager (mirrors `torch.nn.attention.sdpa_kernel`):
@@ -75,7 +76,7 @@ with attn_backend(ATTN_BACKEND.CUDA):
 
 `CudaBackend` decode path: writes K/V to cache, then calls `attn_paged_decode` with `page_size=1` — the `req_to_token` table serves directly as the page table, each token slot is a single-token "page". No explicit K/V gather needed.
 
-`CudaBackend` prefill path: writes K/V, gathers full-sequence K/V via indirect indexing (same as `TorchNativeBackend`), then calls `attn_prefill`.
+`CudaBackend` prefill path: writes K/V, then calls `attn_paged_prefill` — a ragged-batch (paged) prefill kernel that reads K/V directly from the flat pool via `req_to_token`, addressing each request's `q_len`/`kv_len` through `qo_indptr` and `kv_indptr`. No explicit K/V gather needed.
 
 Fallback: `CudaBackend` delegates to `TorchNativeBackend` when a CUDA kernel is not available.
 
@@ -83,12 +84,13 @@ Fallback: `CudaBackend` delegates to `TorchNativeBackend` when a CUDA kernel is 
 
 Rotary embedding is applied via `apply_rotary_emb` in `astrai/extension/rotary_backend.py`, which auto-dispatches:
 
-- **CUDA kernel** (`rotary_emb.cu`): fused cos/sin lookup + rotation in a single kernel, used when the kernel is available, input is on CUDA, and `torch.is_grad_enabled()` is `False` (inference mode)
+- **CUDA kernel** (`rotary_emb.cu`): fused cos/sin lookup + rotation in a single kernel, used when the kernel is available, the input is bf16 on CUDA, and `torch.is_grad_enabled()` is `False` (inference mode)
 - **Torch fallback**: complex multiply path (`torch.view_as_complex` → `torch.complex` multiply → `torch.view_as_real`), used during training (supports autograd backward) or when the CUDA kernel is not available
 
-`RotaryEmbedding` stores a complex `freqs_cis` buffer and returns a tensor
-from `forward()`. Both attention backends share the same rotary dispatch — it
-is backend-agnostic.
+`RotaryEmbedding` stores a cos/sin table `freqs_cis` of shape
+`[max_len, dim/2, 2]` (f32 — `[cos, sin]` pairs) and `forward()` returns
+a `[batch, seq_len, dim/2, 2]` slice indexed by `position_ids`. Both
+attention backends share the same rotary dispatch — it is backend-agnostic.
 
 ## Continuous Batching
 

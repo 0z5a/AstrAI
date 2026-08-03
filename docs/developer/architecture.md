@@ -817,10 +817,29 @@ classDiagram
             +AutoModel model
             +AutoTokenizer tokenizer
             +PagePool kv_cache
+            +InferenceWorkspace _workspace
             +Optional[str] device
             +Optional[torch.dtype] dtype
-            +execute_prefill(tasks, prompt_len, start_pos)
+            +execute_prefill(tasks, prompt_len, start_pos=0)
             +execute_decode(tasks, return_logprobs=False) Union[List[int], List[Tuple[int, float]]]
+        }
+
+        class InferenceWorkspace {
+            +int max_batch_size
+            +int max_seq_len
+            +torch.device device
+            +torch.dtype dtype
+            +Tensor arange
+            +Tensor input_mask
+            +Tensor input_ids
+            +Tensor req_pool_indices
+            +Tensor seq_lens
+            +Tensor kv_indptr
+            +Tensor qo_indptr
+            +Tensor inc
+            +Tensor out_cache_loc
+            +fill_input_ids(ids) Tensor
+            +decode_mask(position_ids, total_len) Tensor
         }
 
         class InferenceScheduler {
@@ -886,6 +905,7 @@ classDiagram
             +Tensor out_cache_loc
             +int max_len
             +Optional[Tensor] kv_indptr
+            +Optional[Tensor] qo_indptr
         }
 
         class PagePool {
@@ -900,7 +920,7 @@ classDiagram
             +task_extend(task_id, pos) bool
             +task_cached(task_id) int
             +task_record_hashes(task_id, prompt_ids, start_logical_page)
-            +bind_tasks(task_ids, seq_lens, device, start_pos) KVCache
+            +bind_tasks(task_ids, workspace, device, start_pos) KVCache
         }
 
     class Task {
@@ -1305,6 +1325,7 @@ classDiagram
     InferenceEngine *-- InferenceScheduler
     InferenceScheduler *-- PagePool
     InferenceScheduler *-- Executor
+    Executor *-- InferenceWorkspace
     InferenceScheduler *-- TaskManager
     AutoRegressiveLM *-- DecoderBlock
     AutoRegressiveLM *-- RotaryEmbedding
@@ -1375,6 +1396,7 @@ classDiagram
     Checkpoint ..> Checkpoint : serializes
     CheckpointCallback ..> Checkpoint : creates
     PagePool ..> KVCache : binds
+    PagePool ..> InferenceWorkspace : fills
     InferenceEngine ..> GenerationRequest : uses
     InferenceEngine ..> GenerateResult : creates
     OpenAIResponseBuilder ..> ChatCompletionRequest : receives
@@ -1411,8 +1433,8 @@ classDiagram
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, RolloutGenerator, RolloutRunner | Training workflow |
-| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, PagePool, KVStorage, ReqToTokenPool, KVCache, Allocator, PrefixCache, Task, TaskManager, TaskStatus, StreamDecoder, GenerationRequest, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
-| **astrai.extension** | AttentionBackend, TorchNativeBackend, CudaBackend, attn_backend, ATTN_BACKEND, attn_decode, attn_prefill, attn_paged_decode, rotary_emb, apply_rotary_emb, rotary_backend, is_available | CUDA attention + rotary kernels, backend abstraction, auto-dispatch |
+| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, InferenceWorkspace, PagePool, KVStorage, ReqToTokenPool, KVCache, Allocator, PrefixCache, Task, TaskManager, TaskStatus, StreamDecoder, GenerationRequest, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
+| **astrai.extension** | AttentionBackend, TorchNativeBackend, CudaBackend, attn_backend, ATTN_BACKEND, attn_decode, attn_prefill, attn_paged_decode, attn_paged_prefill, rotary_emb, apply_rotary_emb, rotary_backend, is_available | CUDA attention + rotary kernels, backend abstraction, auto-dispatch |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler | Distributed parallel & gradient accumulation |
 | **astrai.factory** | BaseFactory | Component registration |
 | **astrai.protocols** | OptimizerProtocol, SchedulerProtocol | Structural subtyping for optimizer/scheduler wrappers |
@@ -1424,7 +1446,7 @@ classDiagram
 | **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `CallbackFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory`, `MaskBuilderFactory`, `StoreWriterFactory`, `PackingStrategyFactory`, `PositionIdStrategyFactory`, `ToolParserFactory` | Decorator-based component creation |
 | **Registry** | `BaseFactory` | Component registration |
 | **Strategy** | `SEQStrategy`, `SFTStrategy`, `DPOStrategy`, `GRPOStrategy` | Training strategy switching |
-| **Strategy (Sampling)** | `TemperatureStrategy`, `TopKStrategy`, `TopPStrategy`, `SamplingPipeline` | Composable logit transformations |
+| **Strategy (Sampling)** | `TemperatureStrategy`, `TopKStrategy`, `TopPStrategy`, `FrequencyPenaltyStrategy`, `SamplingPipeline` | Composable logit transformations |
 | **Strategy (API)** | `ResponseBuilder`, `OpenAIResponseBuilder`, `AnthropicResponseBuilder` | HTTP API handler with format hooks |
 | **Builder** | `TrainContextBuilder` | Chain-building training context |
 | **Observer** | `TrainCallback`, callback implementations | Training process monitoring |

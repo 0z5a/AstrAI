@@ -41,10 +41,12 @@ RoPE embeds position into Q/K vectors via complex rotation:
 
 $$ q_i = R_i W_q x_i, \quad k_j = R_j W_k x_j, \quad q_i^T k_j = x_i^T W_q^T R_{i-j} W_k x_j $$
 
-`RotaryEmbedding` pre-computes a complex `freqs_cis` buffer. `forward()` returns
-a tensor indexed by `position_ids`. `apply_rotary_emb` applies the rotation:
-during training it uses torch complex multiply (autograd-compatible); during
-inference it auto-dispatches to a fused CUDA kernel when available.
+`RotaryEmbedding` pre-computes a cos/sin table `freqs_cis` of shape
+`[max_len, dim/2, 2]` (f32 — `[cos, sin]` pairs). `forward()` returns
+a `[batch, seq_len, dim/2, 2]` slice indexed by `position_ids`.
+`apply_rotary_emb` applies the rotation: during training it uses torch
+complex multiply (autograd-compatible); during inference it auto-dispatches
+to a fused CUDA kernel when available.
 
 ## Training Loop
 
