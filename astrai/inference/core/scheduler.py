@@ -83,6 +83,74 @@ class InferenceScheduler:
     def get_stats(self) -> Dict[str, Any]:
         return self._task_mgr.get_stats()
 
+    def _step(
+        self, tasks: List[Task], return_logprobs: bool = False
+    ) -> Tuple[List[Task], List[Task]]:
+        """Advance every active task by one token (prefill + decode).
+
+        Single shared primitive for both the continuous-batching loop and
+        the synchronous ``run_batch`` path, so the two cannot drift.
+
+        Tasks must already be allocated in the KV cache. Any task that still
+        needs prefill (``output_tokens == 0`` and fewer cached pages than
+        prompt tokens) is prefilled first, grouped by ``(prompt_len, cached)``
+        so a ragged batch is padded into equal-length groups. Every task is
+        then extended by one token and decoded.
+
+        Args:
+            tasks: Active tasks to advance by one token.
+            return_logprobs: Forwarded to ``execute_decode``; per-token
+                logprobs are recorded on each task's ``output_logprobs``.
+
+        Returns:
+            ``(decoded, aborted)``: tasks that produced a new token (its ID
+            already appended to ``output_ids``) and tasks that hit the
+            sequence cap and were marked ``ABORTED``.
+        """
+        cache = self._cache
+
+        to_prefill = [
+            t
+            for t in tasks
+            if t.output_tokens == 0 and cache.task_cached(t.task_id) < len(t.prompt_ids)
+        ]
+        if to_prefill:
+            for t in to_prefill:
+                t.input_tokens = len(t.prompt_ids)
+
+            groups: Dict[Tuple[int, int], List[Task]] = {}
+            for t in to_prefill:
+                groups.setdefault(
+                    (len(t.prompt_ids), cache.task_cached(t.task_id)), []
+                ).append(t)
+
+            for (prompt_len, start_pos), group in groups.items():
+                self._executor.execute_prefill(group, prompt_len, start_pos)
+                start_logical_page = start_pos // getattr(cache, "page_size", 64)
+                for t in group:
+                    cache.task_record_hashes(
+                        t.task_id, t.prompt_ids, start_logical_page
+                    )
+
+        decoded: List[Task] = []
+        aborted: List[Task] = []
+        for t in tasks:
+            if cache.task_extend(t.task_id, t.next_pos):
+                decoded.append(t)
+            else:
+                t.status = TaskStatus.ABORTED
+                aborted.append(t)
+
+        if decoded:
+            step_out = self._executor.execute_decode(
+                decoded, return_logprobs=return_logprobs
+            )
+            for t, out in zip(decoded, step_out):
+                t.output_ids.append(out[0] if return_logprobs else out)
+                t.output_tokens += 1
+
+        return decoded, aborted
+
     def _run_generation_loop(self):
         stop_ids = self._task_mgr.tokenizer.stop_ids
         cache = self._cache
@@ -111,60 +179,20 @@ class InferenceScheduler:
 
                 active = self._task_mgr.get_active_tasks()
 
-                to_prefill = [
-                    t
-                    for t in active
-                    if t.output_tokens == 0
-                    and cache.task_cached(t.task_id) < len(t.prompt_ids)
-                ]
-                if to_prefill:
-                    for t in to_prefill:
-                        t.input_tokens = len(t.prompt_ids)
+                decoded, aborted = self._step(active)
 
-                    groups: Dict[Tuple[int, int], List[Task]] = {}
-                    for t in to_prefill:
-                        key = (
-                            len(t.prompt_ids),
-                            cache.task_cached(t.task_id),
-                        )
-                        groups.setdefault(key, []).append(t)
+                for t in aborted:
+                    self._task_mgr.invoke_callback(t.task_id, STOP)
 
-                    for (prompt_len, start_pos), group in groups.items():
-                        self._executor.execute_prefill(group, prompt_len, start_pos)
-                        start_logical_page = start_pos // getattr(
-                            cache, "page_size", 64
-                        )
-                        for t in group:
-                            cache.task_record_hashes(
-                                t.task_id, t.prompt_ids, start_logical_page
-                            )
-
-                decode_tasks = active
-
-                valid: List[Task] = []
-                for t in decode_tasks:
-                    if cache.task_extend(t.task_id, t.next_pos):
-                        valid.append(t)
-                    else:
-                        t.status = TaskStatus.ABORTED
+                for t in decoded:
+                    new_text = t.decode_new_token(self._task_mgr.tokenizer)
+                    if new_text:
+                        self._task_mgr.invoke_callback(t.task_id, new_text)
+                    if t.is_finished(stop_ids):
+                        remaining = t.flush_remaining(self._task_mgr.tokenizer)
+                        if remaining:
+                            self._task_mgr.invoke_callback(t.task_id, remaining)
                         self._task_mgr.invoke_callback(t.task_id, STOP)
-
-                if valid:
-                    next_tokens = self._executor.execute_decode(valid)
-
-                    for t, ntok in zip(valid, next_tokens):
-                        t.output_ids.append(ntok)
-                        t.output_tokens += 1
-                        new_text = t.decode_new_token(self._task_mgr.tokenizer)
-                        if new_text:
-                            self._task_mgr.invoke_callback(t.task_id, new_text)
-
-                    for t in valid:
-                        if t.is_finished(stop_ids):
-                            remaining = t.flush_remaining(self._task_mgr.tokenizer)
-                            if remaining:
-                                self._task_mgr.invoke_callback(t.task_id, remaining)
-                            self._task_mgr.invoke_callback(t.task_id, STOP)
 
         except Exception as e:
             self._stop_event.set()
@@ -265,36 +293,10 @@ class InferenceScheduler:
 
         try:
             live = [t for t in tasks if t is not None]
-            prefill_groups: Dict[Tuple[int, int], List[Task]] = {}
-            for t in live:
-                key = (len(t.prompt_ids), cache.task_cached(t.task_id))
-                prefill_groups.setdefault(key, []).append(t)
-            for (prompt_len, start_pos), group in prefill_groups.items():
-                self._executor.execute_prefill(group, prompt_len, start_pos)
 
             while live:
-                valid: List[Task] = []
-                for t in sorted(live, key=lambda x: x.task_id):
-                    if cache.task_extend(t.task_id, t.next_pos):
-                        valid.append(t)
-                    else:
-                        t.status = TaskStatus.ABORTED
-                if not valid:
-                    break
-
-                step_out = self._executor.execute_decode(
-                    valid, return_logprobs=return_logprobs
-                )
-                if return_logprobs:
-                    for t, (ntok, _lp) in zip(valid, step_out):
-                        t.output_ids.append(ntok)
-                        t.output_tokens += 1
-                else:
-                    for t, ntok in zip(valid, step_out):
-                        t.output_ids.append(ntok)
-                        t.output_tokens += 1
-
-                live = [t for t in valid if not t.is_finished(stop_ids)]
+                decoded, _ = self._step(live, return_logprobs=return_logprobs)
+                live = [t for t in decoded if not t.is_finished(stop_ids)]
         finally:
             for t in tasks:
                 if t is not None:
