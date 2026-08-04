@@ -62,14 +62,17 @@ class _CMakeBuildExt(_build_ext):
 
         nvcc_ver = _cuda_toolkit_version()
         torch_cuda = _torch_cuda_version()
-        if nvcc_ver is not None and torch_cuda is not None:
-            if nvcc_ver[0] != int(torch_cuda.split(".")[0]):
-                warnings.warn(
-                    f"CUDA version mismatch: nvcc is {nvcc_ver[0]}.{nvcc_ver[1]} "
-                    f"but torch was built with CUDA {torch_cuda}. "
-                    f"Install a matching torch wheel.",
-                    stacklevel=2,
-                )
+        if (
+            nvcc_ver is not None
+            and torch_cuda is not None
+            and nvcc_ver[0] != int(torch_cuda.split(".")[0])
+        ):
+            warnings.warn(
+                f"CUDA version mismatch: nvcc is {nvcc_ver[0]}.{nvcc_ver[1]} "
+                f"but torch was built with CUDA {torch_cuda}. "
+                f"Install a matching torch wheel.",
+                stacklevel=2,
+            )
 
         cmake = shutil.which("cmake")
         if cmake is None:
@@ -92,9 +95,7 @@ class _CMakeBuildExt(_build_ext):
         if arch:
             cfg.append(f"-DASTRAI_CUDA_ARCH={arch}")
         subprocess.run(cfg, check=True)
-        subprocess.run(
-            [cmake, "--build", str(build_dir), "-j", parallel], check=True
-        )
+        subprocess.run([cmake, "--build", str(build_dir), "-j", parallel], check=True)
 
 
 def _cuda_toolkit_version():
