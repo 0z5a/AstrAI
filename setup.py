@@ -19,8 +19,6 @@ def _should_build():
     if force == "false":
         return False
     try:
-        import shutil
-
         import torch
 
         return shutil.which("nvcc") is not None and torch.cuda.is_available()
@@ -28,125 +26,132 @@ def _should_build():
         return False
 
 
-ext_modules = []
+def _torch_prefix():
+    """Return the torch install dir (site-packages/torch) used for headers/libs."""
+    try:
+        import torch
+
+        return str(Path(torch.__file__).parent.resolve())
+    except Exception:
+        return os.environ.get("TORCH_HOME", "")
+
+
+def _python_include():
+    import sysconfig
+
+    return sysconfig.get_path("include")
+
+
+def _python_soabi():
+    import sysconfig
+
+    ext = sysconfig.get_config_var("EXT_SUFFIX").lstrip(".")
+    return ext[: -len(".so")]
+
+
+class _CMakeBuildExt(_build_ext):
+    def run(self):
+        src = Path(__file__).parent
+        build_dir = src / "build" / "cmake"
+        torch_home = _torch_prefix()
+        if not torch_home:
+            raise RuntimeError(
+                "torch not found; cannot build kernels. "
+                "Activate the environment or set TORCH_HOME."
+            )
+
+        nvcc_ver = _cuda_toolkit_version()
+        torch_cuda = _torch_cuda_version()
+        if nvcc_ver is not None and torch_cuda is not None:
+            if nvcc_ver[0] != int(torch_cuda.split(".")[0]):
+                warnings.warn(
+                    f"CUDA version mismatch: nvcc is {nvcc_ver[0]}.{nvcc_ver[1]} "
+                    f"but torch was built with CUDA {torch_cuda}. "
+                    f"Install a matching torch wheel.",
+                    stacklevel=2,
+                )
+
+        cmake = shutil.which("cmake")
+        if cmake is None:
+            raise RuntimeError("cmake not found on PATH; install it to build kernels")
+
+        parallel = os.environ.get("BUILD_PARALLEL", "16")
+        cfg = [
+            cmake,
+            "-S",
+            str(src / "csrc"),
+            "-B",
+            str(build_dir),
+            f"-DTORCH_HOME={torch_home}",
+            f"-DPYTHON_INCLUDE_DIR={_python_include()}",
+            f"-DPY_SOABI={_python_soabi()}",
+        ]
+        arch = os.environ.get("ASTRAI_CUDA_ARCH")
+        if not arch:
+            arch = _detect_cuda_arch()
+        if arch:
+            cfg.append(f"-DASTRAI_CUDA_ARCH={arch}")
+        subprocess.run(cfg, check=True)
+        subprocess.run(
+            [cmake, "--build", str(build_dir), "-j", parallel], check=True
+        )
+
+
+def _cuda_toolkit_version():
+    import shutil
+    import subprocess
+
+    nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        return None
+    try:
+        out = subprocess.check_output(
+            [nvcc, "--version"], stderr=subprocess.STDOUT, text=True
+        )
+        for line in out.splitlines():
+            if "release" in line:
+                ver = line.split("release")[1].split(",")[0].strip()
+                return tuple(int(x) for x in ver.split("."))
+    except Exception:
+        pass
+    return None
+
+
+def _detect_cuda_arch():
+    """Detect real GPU compute capability via torch (nvidia-smi may be spoofed).
+
+    Returns something like ``"89"`` or ``"103"``, or ``None`` if unavailable.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            return f"{major}{minor}"
+    except Exception:
+        pass
+    return None
+
+
+def _torch_cuda_version():
+    try:
+        import torch
+
+        return torch.version.cuda
+    except Exception:
+        return None
+
+
+class _NullBuildExt(_build_ext):
+    def build_extensions(self):
+        pass
+
+
 cmdclass = {}
 
 if _should_build():
-    import torch
-    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
-    from csrc.build import REGISTRY, cuda_toolkit_version
-
-    # Preflight: warn if nvcc major version != torch's bundled CUDA major version.
-    # A mismatch (e.g. nvcc 13.0 + cu128 torch) causes cryptic ABI/header errors.
-    nvcc_ver = cuda_toolkit_version()
-    torch_cuda = torch.version.cuda
-    if nvcc_ver is not None and torch_cuda is not None:
-        torch_major = int(torch_cuda.split(".")[0])
-        if nvcc_ver[0] != torch_major:
-            warnings.warn(
-                f"CUDA version mismatch: nvcc is {nvcc_ver[0]}.{nvcc_ver[1]} "
-                f"but torch was built with CUDA {torch_cuda}. "
-                f"This may cause compilation errors. "
-                f"Install a matching torch wheel: "
-                f"pip install torch --index-url "
-                f"https://download.pytorch.org/whl/cu{nvcc_ver[0]}{nvcc_ver[1]}",
-                stacklevel=2,
-            )
-
-    _torch_lib = torch.utils.cpp_extension.library_paths()[0]
-
-    for name, info in REGISTRY.items():
-        ext_modules.append(
-            CUDAExtension(
-                f"astrai.extension.lib.{name}",
-                info["sources"],
-                extra_compile_args={
-                    "cxx": info["cxx_flags"],
-                    "nvcc": info["nvcc_flags"],
-                },
-                extra_link_args=[f"-Wl,-rpath,{_torch_lib}"],
-            )
-        )
-
-    # Parallel build — each extension is an independent ninja project, so we
-    # can compile them concurrently.  BuildExtension compiles them serially by
-    # default; this subclass dispatches each extension to a subprocess.
-    # Set BUILD_PARALLEL=N to override (default: min(n_exts, 4)).
-    _single_ext = os.environ.get("ASTRAI_BUILD_SINGLE_EXT", "")
-
-    class ParallelBuildExtension(BuildExtension):
-        def build_extensions(self):
-            if _single_ext:
-                self.extensions = [e for e in self.extensions if e.name == _single_ext]
-                if not self.extensions:
-                    return
-                super().build_extensions()
-                return
-
-            n = len(self.extensions)
-            max_workers = int(os.environ.get("BUILD_PARALLEL", 8))
-            if max_workers <= 1 or n <= 1:
-                super().build_extensions()
-                return
-
-            # Each subprocess gets its own build-temp / build-lib so the
-            # ninja files (build.ninja, .ninja_log) never race.  The built
-            # .so files are then collected into the parent's build_lib so the
-            # normal setuptools copy steps (inplace / editable wheel) work.
-            names = [e.name for e in self.extensions]
-            env = {**os.environ, "BUILD_PARALLEL": "1"}
-            base = os.path.join("build", "parallel")
-            os.makedirs(base, exist_ok=True)
-            procs = {}
-            for i in range(0, len(names), max_workers):
-                batch = names[i : i + max_workers]
-                for name in batch:
-                    e = {**env, "ASTRAI_BUILD_SINGLE_EXT": name}
-                    tag = name.replace(".", "_")
-                    subdir = os.path.join(base, tag)
-                    cmd = [
-                        sys.executable,
-                        __file__,
-                        "build_ext",
-                        "--build-temp",
-                        os.path.join(subdir, "temp"),
-                        "--build-lib",
-                        os.path.join(subdir, "lib"),
-                    ]
-                    procs[name] = subprocess.Popen(
-                        cmd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-                    )
-                for name in batch:
-                    out, _ = procs[name].communicate()
-                    if procs[name].returncode != 0:
-                        sys.stdout.write(out.decode())
-                        raise RuntimeError(
-                            f"parallel build failed for {name} "
-                            f"(exit {procs[name].returncode})"
-                        )
-                    self._collect_extensions(
-                        os.path.join(base, name.replace(".", "_"), "lib")
-                    )
-
-        def _collect_extensions(self, sub_lib):
-            src = os.path.join(sub_lib, "astrai", "extension", "lib")
-            if not os.path.isdir(src):
-                return
-            dst = os.path.join(self.build_lib, "astrai", "extension", "lib")
-            os.makedirs(dst, exist_ok=True)
-            for f in os.listdir(src):
-                if f.endswith(".so"):
-                    shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
-
-    cmdclass["build_ext"] = ParallelBuildExtension
-
-if not cmdclass:
-
-    class _NullBuildExt(_build_ext):
-        def build_extensions(self):
-            pass
-
+    cmdclass["build_ext"] = _CMakeBuildExt
+else:
     cmdclass["build_ext"] = _NullBuildExt
 
-setup(ext_modules=ext_modules, cmdclass=cmdclass)
+setup(ext_modules=[], cmdclass=cmdclass)

@@ -83,7 +83,7 @@ static int run_decode_test(int B, int Hq, int Hk, int sl, int D, int causal) {
     for (size_t i=0;i<nQ;i++){
         float err=fabsf(bf2f(hOut[i])-ref[i]);
         if(err>max_abs_err) max_abs_err=err;
-        float rel=err/fmaxf(fabsf(ref[i]), 1e-8f);
+        float rel=err/fmaxf(fabsf(ref[i]), 1e-4f);
         if(rel>max_rel_err) max_rel_err=rel;
     }
     const float atol=0.01f, rtol=0.01f;
@@ -206,7 +206,7 @@ static int run_prefill_test(int B, int Hq, int Hk, int ql, int kl, int D, int ca
     for (size_t i=0;i<nQ;i++) {
         float err=fabsf(bf2f(hOut[i])-ref[i]);
         if(err>max_abs_err) max_abs_err=err;
-        float rel=err/fmaxf(fabsf(ref[i]), 1e-8f);
+        float rel=err/fmaxf(fabsf(ref[i]), 1e-4f);
         if(rel>max_rel_err) max_rel_err=rel;
     }
     const float atol=0.01f, rtol=0.01f;

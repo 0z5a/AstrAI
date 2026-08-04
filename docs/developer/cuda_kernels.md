@@ -51,23 +51,32 @@ CSRC_KERNELS=true pip install -e . --no-build-isolation
 # Rebuild after editing .cu/.cuh files
 CSRC_KERNELS=true python setup.py build_ext --inplace
 # Output: astrai/extension/lib/*.so
+
+# Or invoke CMake directly
+cmake -S csrc -B build/cmake \
+  -DTORCH_HOME=<site-packages>/torch \
+  -DPYTHON_INCLUDE_DIR=<python include> \
+  -DPY_SOABI=cpython-312-x86_64-linux-gnu
+cmake --build build/cmake -j 16
 ```
 
 ### Architecture flags
 
-`csrc/build.py` auto-detects the GPU compute capability and generates the appropriate `nvcc` gencode flag:
+`setup.py` passes the GPU compute capability to CMake via `ASTRAI_CUDA_ARCH` (default `89`, i.e. sm_89 / L20):
 
 - **sm_80+** (Ampere and later): enables tensor-core MMA path (`mma.sync.m16n8k16.bf16`)
 - **Below sm_80**: adds `-DASTRAI_NO_MMA` to disable the MMA path at compile time
 
 ### Build configuration
 
+`csrc/CMakeLists.txt` defines the CUDA extension build:
+
 ```
 NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
-             --ptxas-options=-O3,-v --extra-device-vectorization --threads=8
+             --ptxas-options=-O3,-v --extra-device-vectorization --threads=16
 ```
 
-The `REGISTRY` in `csrc/build.py` lists all registered kernels (currently 5). Each entry maps a kernel name to its source files and build flags.
+Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all five kernel targets in parallel via `cmake --build -j N`.
 
 ## Attention Backend
 
@@ -146,7 +155,7 @@ nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
 
 ```
 csrc/
-├── build.py              # Build system: REGISTRY, _arch_flags, nvcc flags
+├── CMakeLists.txt        # CMake build: 5 kernel targets, torch/pybind11 linking
 ├── kernels/
 │   ├── attn_common.h     # Shared attention params (AttentionParams, PagedAttentionParams)
 │   ├── attn_decode.cu    # Basic decode kernel (registered)

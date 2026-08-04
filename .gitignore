@@ -9,6 +9,7 @@
 !scripts/**/*.py
 !tests/**/*.py
 !csrc/**/*.py
+!csrc/CMakeLists.txt
 
 !csrc/**/*.cu
 !csrc/**/*.h
