@@ -1,23 +1,18 @@
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import click
 import torch
 
 from astrai import setup_logging
 from astrai.config import AutoRegressiveLMConfig
-from astrai.extension import ATTN_BACKEND, attn_backend
+from astrai.extension import ATTN_BACKEND, AttentionBackendFactory, attn_backend
 from astrai.inference.core.cache import PagePool
 from astrai.model import AutoModel
 
 _DTYPES = ["bfloat16", "float16", "float32"]
 _CACHES = ["contiguous", "paged"]
-_BACKENDS = ["cuda", "torch_native"]
-
-_BACKEND_MAP = {
-    "cuda": ATTN_BACKEND.CUDA,
-    "torch_native": ATTN_BACKEND.TORCH_NATIVE,
-}
+_BACKENDS = AttentionBackendFactory.list_registered()
 
 
 class BenchmarkResult:
@@ -46,7 +41,7 @@ class GenerationBenchmark:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         cache_type: str = "contiguous",
-        backend: ATTN_BACKEND = ATTN_BACKEND.CUDA,
+        backend: Union[str, ATTN_BACKEND] = ATTN_BACKEND.CUDA,
     ):
         self.device = device
         self.dtype = dtype
@@ -297,7 +292,7 @@ def benchmark_command(
             device=device,
             dtype=dtype_map[dtype],
             cache_type=cache,
-            backend=_BACKEND_MAP[name],
+            backend=name,
         )
 
         click.secho(

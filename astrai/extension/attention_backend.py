@@ -44,6 +44,7 @@ from astrai.extension.attention_ops import (
     attn_paged_decode,
     attn_paged_prefill,
 )
+from astrai.factory import BaseFactory
 from astrai.inference.core.cache import KVCache
 
 _current_backend: contextvars.ContextVar["AttentionBackend"] = contextvars.ContextVar(
@@ -146,11 +147,11 @@ def get_backend() -> "AttentionBackend":
 
 
 @contextmanager
-def attn_backend(backend: Union[ATTN_BACKEND, "AttentionBackend", type]):
+def attn_backend(backend: Union[str, ATTN_BACKEND, "AttentionBackend", type]):
     """Context manager to select an attention backend.
 
     Mirrors ``torch.nn.attention.sdpa_kernel``. Accepts an
-    ``ATTN_BACKEND`` enum value, a backend class, or a backend instance.
+    registered name, ``ATTN_BACKEND`` enum value, backend class, or instance.
 
     Examples::
 
@@ -162,14 +163,17 @@ def attn_backend(backend: Union[ATTN_BACKEND, "AttentionBackend", type]):
             ...
     """
     if isinstance(backend, ATTN_BACKEND):
-        instance = _BACKEND_REGISTRY[backend]()
+        instance = AttentionBackendFactory.create(backend.value)
+    elif isinstance(backend, str):
+        instance = AttentionBackendFactory.create(backend)
     elif isinstance(backend, type) and issubclass(backend, AttentionBackend):
         instance = backend()
     elif isinstance(backend, AttentionBackend):
         instance = backend
     else:
         raise TypeError(
-            f"expected ATTN_BACKEND, AttentionBackend type, or instance, "
+            f"expected a registered name, ATTN_BACKEND, AttentionBackend type, "
+            f"or instance, "
             f"got {type(backend).__name__}"
         )
     token = _current_backend.set(instance)
@@ -301,6 +305,11 @@ class AttentionBackend(ABC):
         """Multi-token prefill or training forward."""
 
 
+class AttentionBackendFactory(BaseFactory[AttentionBackend]):
+    """Factory for registered attention backends."""
+
+
+@AttentionBackendFactory.register(ATTN_BACKEND.TORCH_NATIVE.value)
 class TorchNativeBackend(AttentionBackend):
     """Reference backend using torch SDPA with indirect KV cache indexing.
 
@@ -385,6 +394,7 @@ class TorchNativeBackend(AttentionBackend):
 _default_backend = TorchNativeBackend()
 
 
+@AttentionBackendFactory.register(ATTN_BACKEND.CUDA.value)
 class CudaBackend(AttentionBackend):
     """CUDA kernel backend with direct KV cache access.
 
@@ -474,6 +484,7 @@ class CudaBackend(AttentionBackend):
         return out.reshape(b, q_len, q.size(2), q.size(3)).flatten(2)
 
 
+@AttentionBackendFactory.register(ATTN_BACKEND.FLASH.value)
 class FlashAttnBackend(AttentionBackend):
     """FlashAttention (FA2/FA3) backend via the optional ``flash-attn`` package.
 
@@ -557,10 +568,3 @@ class FlashAttnBackend(AttentionBackend):
             q.contiguous(), k.contiguous(), v.contiguous(), causal=is_causal
         )
         return out.contiguous().flatten(2)
-
-
-_BACKEND_REGISTRY: dict[ATTN_BACKEND, type[AttentionBackend]] = {
-    ATTN_BACKEND.TORCH_NATIVE: TorchNativeBackend,
-    ATTN_BACKEND.CUDA: CudaBackend,
-    ATTN_BACKEND.FLASH: FlashAttnBackend,
-}

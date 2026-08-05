@@ -18,6 +18,7 @@ SDPA is handled by the attention backend, not the wrapper functions.
 from astrai.extension.attention_backend import (
     ATTN_BACKEND,
     AttentionBackend,
+    AttentionBackendFactory,
     CudaBackend,
     FlashAttnBackend,
     TorchNativeBackend,
@@ -37,6 +38,7 @@ from astrai.extension.rotary_backend import apply_rotary_emb
 __all__ = [
     "ATTN_BACKEND",
     "AttentionBackend",
+    "AttentionBackendFactory",
     "CudaBackend",
     "TorchNativeBackend",
     "FlashAttnBackend",
