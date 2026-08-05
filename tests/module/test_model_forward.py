@@ -9,18 +9,14 @@ import pytest
 import torch
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.model.components.mlp import DeepSeekMoE
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.strategy import (
     SEQStrategy,
     SFTStrategy,
     StrategyFactory,
     _collect_moe_diagnostics,
-    _load_balancing_loss,
 )
 from tests.helpers import TINY_CONFIG
-
-# ── helpers ──────────────────────────────────────────────────────────
 
 
 def _make_tiny_moe_config(**overrides) -> AutoRegressiveLMConfig:
@@ -43,14 +39,16 @@ def _make_model(config=None) -> AutoRegressiveLM:
     return AutoRegressiveLM(config)
 
 
-# ── _collect_moe_diagnostics unit tests ─────────────────────────────
+def _router_stats(probs, topk_indices):
+    return {"probs": probs, "topk_indices": topk_indices}
 
 
 def test_collect_moe_diagnostics_returns_all_keys():
     """_collect_moe_diagnostics should return the four expected keys."""
     # Simulate two MoE layers with uniform routing probabilities
     probs = torch.ones(128, 4) / 4.0
-    diag = _collect_moe_diagnostics([probs, probs], top_k=2)
+    topk = torch.zeros(128, 2, dtype=torch.long)
+    diag = _collect_moe_diagnostics([_router_stats(probs, topk)] * 2)
 
     assert set(diag.keys()) == {
         "router_entropy",
@@ -64,11 +62,11 @@ def test_collect_moe_diagnostics_returns_all_keys():
 
 def test_collect_moe_diagnostics_empty_list():
     """Empty list returns empty dict."""
-    assert _collect_moe_diagnostics([], top_k=2) == {}
+    assert _collect_moe_diagnostics([]) == {}
 
 
 def test_collect_moe_diagnostics_uniform_routing():
-    """Uniform routing probabilities with top_k=2 → tie-breaking by index.
+    """Uniform routing with top_k=2 → tie-breaking by index.
 
     torch.topk breaks ties by index, so with equal probabilities
     experts 0 and 1 always win over experts 2 and 3:
@@ -77,7 +75,8 @@ def test_collect_moe_diagnostics_uniform_routing():
       - load_imbalance_max = 2.0
     """
     probs = torch.ones(128, 4) / 4.0
-    diag = _collect_moe_diagnostics([probs], top_k=2)
+    topk = torch.tensor([[0, 1]] * 128)
+    diag = _collect_moe_diagnostics([_router_stats(probs, topk)])
 
     assert diag["dead_expert_fraction"] == pytest.approx(0.5, abs=1e-6)
     assert diag["load_imbalance_mean"] == pytest.approx(1.0, abs=1e-6)
@@ -88,38 +87,41 @@ def test_collect_moe_diagnostics_max_entropy():
     """Uniform probabilities should give log(num_experts) entropy."""
     num_experts = 4
     probs = torch.ones(128, num_experts) / num_experts
-    diag = _collect_moe_diagnostics([probs], top_k=2)
+    topk = torch.zeros(128, 2, dtype=torch.long)
+    diag = _collect_moe_diagnostics([_router_stats(probs, topk)])
     expected_entropy = float(torch.log(torch.tensor(num_experts, dtype=torch.float32)))
     assert diag["router_entropy"] == pytest.approx(expected_entropy, abs=1e-5)
 
 
-# ── _load_balancing_loss unit tests ──────────────────────────────────
+def test_moe_metrics_flow_through_wrapped_model(device):
+    """DDP-like wrappers (no .config / get_moe_router_probs) still collect MoE metrics."""
+    import torch.nn as nn
 
+    from astrai.trainer.strategy import SEQStrategy
 
-def test_load_balancing_loss_shape_and_range():
-    """Verify _load_balancing_loss returns a non-negative scalar tensor."""
-    probs = torch.randn(64, 8).softmax(dim=-1)
-    loss = _load_balancing_loss(probs)
-    assert loss.ndim == 0
-    assert loss.item() >= 0
+    class ForwardOnlyWrapper(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.module = model
 
+        def forward(self, *args, **kwargs):
+            return self.module(*args, **kwargs)
 
-def test_load_balancing_loss_uniform_minimum():
-    """Uniform routing gives the lowest possible load balancing loss."""
-    probs = torch.ones(64, 8) / 8.0
-    loss = _load_balancing_loss(probs).item()
+    config = _make_tiny_moe_config()
+    model = AutoRegressiveLM(config).to(device)
+    wrapped = ForwardOnlyWrapper(model)
+    wrapped.train()
 
-    # Very skewed routing should give higher loss
-    skewed = torch.zeros(64, 8)
-    skewed[:, 0] = 1.0
-    skewed[:, 1] = 1.0
-    skewed = skewed / skewed.sum(dim=-1, keepdim=True)
-    skewed_loss = _load_balancing_loss(skewed).item()
+    strategy = SEQStrategy(wrapped, device, moe_aux_loss_coef=0.01)
+    output = strategy.compute_loss_output(
+        {
+            "input_ids": torch.randint(0, config.vocab_size, (2, 8)),
+            "target_ids": torch.randint(0, config.vocab_size, (2, 8)),
+        }
+    )
 
-    assert loss < skewed_loss
-
-
-# ── SEQStrategy integration tests ────────────────────────────────────
+    assert "moe_aux_loss" in output["metrics"]
+    assert "router_entropy" in strategy._moe_metrics
 
 
 class TestSEQStrategyMoE:
@@ -253,9 +255,6 @@ class TestSEQStrategyMoE:
         assert "moe_aux_loss_weighted" not in metrics
         assert metrics["loss"] == pytest.approx(metrics["task_loss"], abs=1e-6)
         assert strategy._moe_metrics == {}
-
-
-# ── SFTStrategy integration tests ────────────────────────────────────
 
 
 class TestSFTStrategyMoE:

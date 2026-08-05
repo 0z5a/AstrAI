@@ -6,13 +6,14 @@ from torch import Tensor
 
 from astrai.inference.core.cache import KVCache
 from astrai.model.components.attention import AttnFactory
-from astrai.model.components.mlp import FFNFactory
+from astrai.model.components.mlp import FFNFactory, RouterStats
 from astrai.model.components.norm import RMSNorm
 
 
 class DecoderOutput(TypedDict):
     hidden_states: Tensor
     aux_loss: Optional[Tensor]
+    router_stats: Optional[RouterStats]
 
 
 class DecoderBlock(nn.Module):
@@ -66,4 +67,8 @@ class DecoderBlock(nn.Module):
         mlp_output = self.mlp(normalized)
         x = mlp_output["hidden_states"] + x
 
-        return {"hidden_states": x, "aux_loss": mlp_output["aux_loss"]}
+        return {
+            "hidden_states": x,
+            "aux_loss": mlp_output["aux_loss"],
+            "router_stats": mlp_output.get("router_stats"),
+        }

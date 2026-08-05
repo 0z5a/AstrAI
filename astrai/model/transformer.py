@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -10,7 +10,6 @@ from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
 from astrai.model.components.linear import Linear
-from astrai.model.components.mlp import DeepSeekMoE
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import RotaryEmbedding
 
@@ -115,6 +114,7 @@ class AutoRegressiveLM(AutoModel):
         use_sdpa_causal_mask = attn_mask is None
 
         aux_losses = []
+        router_stats_list = []
         for layer in self.layers:
             layer_output = layer(
                 x,
@@ -124,8 +124,10 @@ class AutoRegressiveLM(AutoModel):
                 use_sdpa_causal_mask,
             )
             x = layer_output["hidden_states"]
-            if layer_output["aux_loss"] is not None:
+            stats = layer_output.get("router_stats")
+            if stats is not None:
                 aux_losses.append(layer_output["aux_loss"])
+                router_stats_list.append(stats)
 
         hidden_states = self.norm(x)
         logits = self.lm_head(hidden_states)
@@ -133,8 +135,5 @@ class AutoRegressiveLM(AutoModel):
         output = {"logits": logits, "hidden_states": hidden_states}
         if aux_losses:
             output["aux_loss"] = torch.stack(aux_losses).mean()
+            output["router_stats"] = router_stats_list
         return output
-
-    def get_moe_router_probs(self) -> List[Tensor]:
-        """Return router_probs from all MoE layers for strategy-side aux loss."""
-        return DeepSeekMoE.collect_router_probs(self)

@@ -1,4 +1,4 @@
-from typing import List, Optional, TypedDict
+from typing import Optional, TypedDict
 
 import torch
 import torch.nn as nn
@@ -13,14 +13,26 @@ class FFNFactory(BaseFactory[nn.Module]):
     pass
 
 
+class RouterStats(TypedDict):
+    """Per-layer MoE routing statistics for training diagnostics.
+
+    Both tensors are detached monitoring data produced during forward.
+    """
+
+    probs: Tensor
+    topk_indices: Tensor
+
+
 class FFNOutput(TypedDict):
     hidden_states: Tensor
     aux_loss: Optional[Tensor]
+    router_stats: Optional[RouterStats]
 
 
 class RoutedOutput(TypedDict):
     hidden_states: Tensor
     aux_loss: Optional[Tensor]
+    router_stats: Optional[RouterStats]
 
 
 @FFNFactory.register("mlp")
@@ -34,7 +46,7 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> FFNOutput:
         gated = self.up(x) * F.silu(self.gate(x))
         out = self.down(gated)
-        return {"hidden_states": out, "aux_loss": None}
+        return {"hidden_states": out, "aux_loss": None, "router_stats": None}
 
 
 @FFNFactory.register("moe")
@@ -70,7 +82,6 @@ class DeepSeekMoE(nn.Module):
         )
 
         self.router = Linear(dim, n_routed_experts, bias=False)
-        self._router_probs: Optional[Tensor] = None
         moe_scale = 1 / max(n_shared_experts, 1) + 1 / n_activated_experts
         down_init_std = 0.02 / (2 * n_layers * moe_scale) ** 0.5
 
@@ -96,7 +107,11 @@ class DeepSeekMoE(nn.Module):
         routed_output = self._routed_forward(x_flat, include_aux_loss)
 
         out = (shared_out + routed_output["hidden_states"]).view(bsz, seq_len, dim)
-        return {"hidden_states": out, "aux_loss": routed_output["aux_loss"]}
+        return {
+            "hidden_states": out,
+            "aux_loss": routed_output["aux_loss"],
+            "router_stats": routed_output["router_stats"],
+        }
 
     def _shared_forward(self, x: Tensor) -> Tensor:
         if self.n_shared_experts == 0:
@@ -109,44 +124,54 @@ class DeepSeekMoE(nn.Module):
     def _routed_forward(self, x: Tensor, include_aux_loss: bool) -> RoutedOutput:
         N, D = x.shape
         K = self.n_activated_experts
+        E = self.n_routed_experts
 
         router_logits = self.router(x)
         router_probs = torch.softmax(router_logits.float(), dim=-1).to(x.dtype)
-        self._router_probs = router_probs.detach()
 
-        topk_weights, topk_indices = torch.topk(router_probs, K, dim=-1)
+        topk_weights, topk_indices = torch.topk(router_probs, K, dim=-1, sorted=False)
         if self.norm_topk_prob:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
         aux_loss = None
+        router_stats = None
         if include_aux_loss:
-            expert_load = F.one_hot(
-                topk_indices, num_classes=self.n_routed_experts
-            ).float()
+            expert_load = F.one_hot(topk_indices, num_classes=E).float()
             expert_load = expert_load.mean(dim=(0, 1))
             router_prob = router_probs.float().mean(dim=0)
-            aux_loss = self.n_routed_experts * (expert_load * router_prob).sum()
+            aux_loss = E * (expert_load * router_prob).sum()
+            router_stats = {
+                "probs": router_probs.detach(),
+                "topk_indices": topk_indices,
+            }
+
+        # Grouped dispatch: sort (token, slot) pairs by expert so each expert
+        # consumes one contiguous slice instead of a per-expert mask scan.
+        flat_experts = topk_indices.reshape(-1)
+        sorted_experts, order = torch.sort(flat_experts)
+        flat_tokens = x.repeat_interleave(K, dim=0)[order]
+        flat_weights = topk_weights.reshape(-1, 1)[order]
+        boundaries = torch.cumsum(
+            torch.bincount(sorted_experts, minlength=E), dim=0
+        ).tolist()
 
         output = torch.zeros(N, D, device=x.device, dtype=x.dtype)
-        for expert_idx in range(self.n_routed_experts):
-            expert_mask = topk_indices == expert_idx
-            token_idx, k_idx = expert_mask.nonzero(as_tuple=True)
-            if token_idx.numel() == 0:
+        start = 0
+        for expert_idx, end in enumerate(boundaries):
+            if end == start:
                 continue
-            expert = self.routed_experts[expert_idx]
-            expert_input = x[token_idx]
-            expert_output = expert(expert_input)["hidden_states"]
+            expert_output = self.routed_experts[expert_idx](flat_tokens[start:end])[
+                "hidden_states"
+            ]
+            output.index_add_(
+                0,
+                order[start:end] // K,
+                expert_output * flat_weights[start:end],
+            )
+            start = end
 
-            weights = topk_weights[token_idx, k_idx].unsqueeze(-1)
-            output.index_add_(0, token_idx, expert_output * weights)
-
-        return {"hidden_states": output, "aux_loss": aux_loss}
-
-    @staticmethod
-    def collect_router_probs(module: nn.Module) -> List[Tensor]:
-        """Recursively collect router_probs from all DeepSeekMoE submodules."""
-        probs: List[Tensor] = []
-        for m in module.modules():
-            if isinstance(m, DeepSeekMoE) and m._router_probs is not None:
-                probs.append(m._router_probs)
-        return probs
+        return {
+            "hidden_states": output,
+            "aux_loss": aux_loss,
+            "router_stats": router_stats,
+        }

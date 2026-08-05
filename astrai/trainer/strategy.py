@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.factory import BaseFactory
+from astrai.model.components.mlp import RouterStats
 from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.rollout import RolloutResult
 
@@ -21,6 +22,7 @@ class LossOutput(TypedDict):
 class LogprobsOutput(TypedDict):
     logprobs: Tensor
     aux_loss: Optional[Tensor]
+    router_stats: Optional[List[RouterStats]]
 
 
 def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
@@ -75,7 +77,11 @@ def get_logprobs(
         logprobs = (token_logprobs * shifted_loss_mask).sum(dim=-1)
     else:
         logprobs = token_logprobs * shifted_loss_mask
-    return {"logprobs": logprobs, "aux_loss": outputs.get("aux_loss")}
+    return {
+        "logprobs": logprobs,
+        "aux_loss": outputs.get("aux_loss"),
+        "router_stats": outputs.get("router_stats"),
+    }
 
 
 def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
@@ -94,36 +100,14 @@ def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
     return (same_doc & causal).unsqueeze(1)
 
 
-def _load_balancing_loss(router_probs: Tensor) -> Tensor:
-    """Compute MoE load balancing auxiliary loss from router probabilities.
-
-    Implements the Switch Transformer load balancing loss (eq. 4-6).
-    Encourages tokens to be uniformly distributed across experts.
-
-    Args:
-        router_probs: (N, num_experts) tensor of softmax router probabilities.
-
-    Returns:
-        Scalar aux loss = num_experts * sum(f_i * P_i).
-    """
-    num_experts = router_probs.size(-1)
-    # f_i: fraction of tokens dispatched to expert i (soft mean)
-    f_i = router_probs.mean(dim=0)
-    # P_i: average routing probability for expert i
-    P_i = router_probs.mean(dim=0)
-    return num_experts * torch.sum(f_i * P_i)
-
-
 def _collect_moe_diagnostics(
-    router_probs_list: List[Tensor],
-    top_k: int,
+    router_stats_list: List[RouterStats],
 ) -> Dict[str, float]:
-    """Collect MoE routing diagnostic metrics from router probabilities.
+    """Collect MoE routing diagnostic metrics from per-layer router stats.
 
     Args:
-        router_probs_list: List of (N, num_experts) router probability tensors,
-            one per MoE layer.
-        top_k: Number of top experts selected per token.
+        router_stats_list: One :class:`RouterStats` dict per MoE layer with
+            keys ``probs`` (N, E) and ``topk_indices`` (N, K), both detached.
 
     Returns:
         Dict with keys: router_entropy, dead_expert_fraction,
@@ -135,33 +119,26 @@ def _collect_moe_diagnostics(
     layer_imbalance_means: List[Tensor] = []
     layer_imbalance_maxs: List[Tensor] = []
 
-    for probs in router_probs_list:
-        probs = probs.detach().to(dtype=torch.float32)
-        if probs.ndim == 0 or probs.shape[-1] == 0:
+    for stats in router_stats_list:
+        probs = stats["probs"].float()
+        topk_indices = stats["topk_indices"]
+        num_experts = probs.shape[-1]
+        if num_experts == 0:
             continue
-        probs = probs.reshape(-1, probs.shape[-1])
+        probs = probs.reshape(-1, num_experts)
         if probs.numel() == 0:
             continue
-
-        num_experts = probs.shape[-1]
-        num_tokens = probs.shape[0]
 
         # Router entropy
         entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1).mean()
 
-        # Top-k expert selection
-        selected_experts = torch.topk(probs, top_k, dim=-1).indices  # [tokens, top_k]
-        expert_mask = F.one_hot(selected_experts, num_experts)  # [tokens, top_k, E]
-        expert_counts = expert_mask.sum(dim=(0, 1)).to(dtype=torch.float32)  # [E]
-
-        # Ideal load: tokens * top_k / num_experts
-        ideal_load = (num_tokens * top_k) / max(num_experts, 1)
-
-        # Load imbalance ratios
-        load_ratios = expert_counts / max(ideal_load, 1.0)
+        # Load from the actual dispatch: one-hot sum of top-k assignments.
+        expert_counts = F.one_hot(topk_indices, num_experts).sum(dim=(0, 1)).float()
+        ideal_load = expert_counts.mean()  # N*K / E
+        load_ratios = expert_counts / max(float(ideal_load), 1.0)
         imbalance_mean = (load_ratios - 1.0).abs().mean()
         imbalance_max = load_ratios.max()
-        dead_fraction = (expert_counts == 0).to(dtype=torch.float32).mean()
+        dead_fraction = (expert_counts == 0).float().mean()
 
         layer_entropies.append(entropy)
         layer_dead_fractions.append(dead_fraction)
@@ -230,6 +207,7 @@ class BaseStrategy(ABC):
         task_loss: Tensor,
         metrics: Dict[str, Tensor],
         aux_loss: Optional[Tensor] = None,
+        router_stats: Optional[List[RouterStats]] = None,
     ) -> LossOutput:
         total_loss = task_loss
         if aux_loss is not None:
@@ -237,7 +215,7 @@ class BaseStrategy(ABC):
             total_loss = total_loss + weighted_aux_loss
             metrics["moe_aux_loss"] = aux_loss
             metrics["moe_aux_loss_weighted"] = weighted_aux_loss
-            self._refresh_moe_diagnostics(aux_loss)
+            self._refresh_moe_diagnostics(aux_loss, router_stats)
         metrics["loss"] = total_loss
         return {
             "loss": total_loss,
@@ -281,21 +259,18 @@ class BaseStrategy(ABC):
         """
         pass
 
-    def _refresh_moe_diagnostics(self, aux_loss: Tensor) -> None:
-        """Collect MoE routing diagnostics from model router probs.
+    def _refresh_moe_diagnostics(
+        self,
+        aux_loss: Tensor,
+        router_stats: Optional[List[RouterStats]] = None,
+    ) -> None:
+        """Collect MoE routing diagnostics from the latest forward pass.
 
         Populates ``self._moe_metrics`` with router entropy, dead expert
         fraction, load imbalance, and aux_loss.  Called from
         :meth:`_loss_output` when an MoE aux loss is present.
         """
-        router_probs_list: List[Tensor] = self.model.get_moe_router_probs()
-        if not router_probs_list:
-            self._moe_metrics = {}
-            return
-        self._moe_metrics = _collect_moe_diagnostics(
-            router_probs_list,
-            self.model.config.n_activated_experts,
-        )
+        self._moe_metrics = _collect_moe_diagnostics(router_stats or [])
         self._moe_metrics["aux_loss"] = float(aux_loss.detach().cpu().item())
 
     def on_optimizer_step(self):
@@ -368,7 +343,12 @@ class SEQStrategy(BaseStrategy):
             label_smoothing=self.label_smoothing,
         )
 
-        return self._loss_output(loss, {"task_loss": loss}, outputs.get("aux_loss"))
+        return self._loss_output(
+            loss,
+            {"task_loss": loss},
+            outputs.get("aux_loss"),
+            outputs.get("router_stats"),
+        )
 
 
 @StrategyFactory.register("sft")
@@ -416,7 +396,12 @@ class SFTStrategy(BaseStrategy):
             label_smoothing=self.label_smoothing,
         )
 
-        return self._loss_output(loss, {"task_loss": loss}, outputs.get("aux_loss"))
+        return self._loss_output(
+            loss,
+            {"task_loss": loss},
+            outputs.get("aux_loss"),
+            outputs.get("router_stats"),
+        )
 
 
 @StrategyFactory.register("dpo")
@@ -491,7 +476,12 @@ class DPOStrategy(BaseStrategy):
         ratio_diff = pi_log_ratio - ref_log_ratio
         dpo_loss = -F.logsigmoid(self.beta * ratio_diff).mean()
 
-        return self._loss_output(dpo_loss, {"dpo_loss": dpo_loss}, aux_loss)
+        return self._loss_output(
+            dpo_loss,
+            {"dpo_loss": dpo_loss},
+            aux_loss,
+            policy_output.get("router_stats"),
+        )
 
     def supports_online(self) -> bool:
         return True
@@ -661,6 +651,7 @@ class GRPOStrategy(BaseStrategy):
             task_loss,
             {"policy_loss": policy_loss, "kl_loss": kl_penalty},
             aux_loss,
+            policy_output.get("router_stats"),
         )
 
     def supports_online(self) -> bool:
