@@ -2,19 +2,22 @@
 #include <cfloat>
 #include <cuda_bf16.h>
 #include "attn_common.h"
+#include "attn_kv_source.cuh"
 #include "attn_mma_utils.cuh"
 #include "attn_warp_utils.cuh"
 
-// Split-K (FlashDecoding) tensor-core decode via GQA head-packing.
-// Decode has q_len == 1, so we pack G = q_head/kv_head query heads into the
-// M=16 rows of mma.sync.m16n8k16, turning G independent GEMVs into a single
-// GEMM that reuses each loaded K/V tile across all G heads.
+// Split-K (FlashDecoding) tensor-core decode via GQA head-packing, unified
+// across contiguous and paged (SGLang flat-pool) K/V via the KV template
+// parameter.  Decode has q_len == 1, so we pack G = q_head/kv_head query
+// heads into the M=16 rows of mma.sync.m16n8k16, turning G independent GEMVs
+// into a single GEMM that reuses each loaded K/V tile across all G heads.
 //
+// KV = ContigKV (dense tensors) or PagedKV (flat pool + req_to_token).
 // IsCausal and HasMask are compile-time bools — no runtime branch in the
 // inner compute loop.
 //
-// Traits = KernelTraits<HEAD_DIM, BC=32, WARPS=1, STAGES=<2 or 1>>.
-template <typename Traits, bool IsCausal, bool HasMask>
+// Traits = KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2>.
+template <typename Traits, typename KV, bool IsCausal, bool HasMask>
 __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const int lane = threadIdx.x;
     const int gid = lane >> 2;
@@ -31,13 +34,16 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const int G = min(MAX_G, G_total - g_begin);
     const int q_head0 = kv_head * G_total + g_begin;
 
+    // Per-request seq_len (paged reads kv_indptr; contig uses p.kv_len).
+    const int seq_len = KV::kv_len(p, batch);
+    const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
+
     // Double-buffered shared memory for K/V (no sQ needed)
     __shared__ __align__(16) bf16 sK[Traits::STAGES * Traits::BC * Traits::LD];
     __shared__ __align__(16) bf16 sV[Traits::STAGES * Traits::BC * Traits::LD];
 
     // Load Q directly from global into mma A-operand registers.
-    // stride_row = p.q_stride_h for decode (q_len=1).
-    const int q_base = batch * p.q_stride_b + q_head0 * p.q_stride_h;
+    const int q_base = KV::q_decode_base(p, batch, q_head0);
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
@@ -51,13 +57,12 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
 
-    const int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
-    const int tiles_total = (p.kv_len + Traits::BC - 1) / Traits::BC;
+    const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
     const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
     const int ti_begin = split * tiles_per_split;
     const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
 
-    // ---- Load tile lambda: predicated cp.async ----
+    // ---- Load tile lambda: predicated cp.async (addressing via KV policy) ----
     auto load_tile = [&](int ti, int buf) {
         int kv0 = ti * Traits::BC;
         bf16* dK = sK + buf * Traits::BC * Traits::LD;
@@ -67,11 +72,11 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
              i += Traits::NUM_THREADS * Traits::VEC) {
             int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
             int kc = kv0 + r;
-            bool valid = kc < p.kv_len;
+            bool valid = kc < seq_len;
+            KVAddr a = KV::kv_addr(p, kctx, kc, d, valid);
             int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
-            int g_off = kv_base + kc * p.kv_stride_l + d * p.kv_stride_d;
-            cp_async_16_pred(&dK[off], &p.k[g_off], valid);
-            cp_async_16_pred(&dV[off], &p.v[g_off], valid);
+            cp_async_16_pred(&dK[off], a.k, a.valid);
+            cp_async_16_pred(&dV[off], a.v, a.valid);
         }
         cp_async_commit();
     };
@@ -96,8 +101,10 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
             Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
             Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
 
-        // Decode: q_len=1, so qrow0=qrow1=0
-        int maxc = IsCausal ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
+        // Decode: q_len=1, so qrow0=qrow1=0.  Paged treats [0, seq_len) as
+        // the causal range (query is the last token); contig clips to the
+        // causal_offset bound.  Dead code eliminated when IsCausal == false.
+        int maxc = IsCausal ? KV::decode_attend_len(p, batch) : seq_len;
         mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc,
                                            0, 0,
                                            p.mask_b_stride, 0, 0,

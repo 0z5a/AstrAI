@@ -212,7 +212,7 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
                             B, Hq, Hkv, HEAD_DIM, max_ctx, h_o_ref);
 
     // Kernel launch
-    PagedAttentionParams<bf16> p;
+    AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = B;
     p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
@@ -347,7 +347,7 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
                             h_mask, max_sl,
                             B, Hq, Hkv, HEAD_DIM, max_ctx, h_o_ref);
 
-    PagedAttentionParams<bf16> p;
+    AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = B;
     p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
@@ -480,7 +480,7 @@ static int run_prefill_test(int B, int Hq, int Hkv,
                              B, Hq, Hkv, HEAD_DIM, max_ctx, causal, h_o_ref);
 
     // Kernel launch
-    PagedAttentionParams<bf16> p;
+    AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = total_q;
     p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
@@ -617,7 +617,7 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
                              h_mask, q_len, q_len,
                              B, Hq, Hkv, HEAD_DIM, max_ctx, 0, h_o_ref);
 
-    PagedAttentionParams<bf16> p;
+    AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = total_q;
     p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
@@ -707,7 +707,7 @@ static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
     for (int b = 0; b < B; b++) h_kvi[b + 1] = h_kvi[b] + seq_len;
     cudaMemcpy(d_kvi, h_kvi, sz_kvi, cudaMemcpyHostToDevice);
 
-    PagedAttentionParams<bf16> p;
+    AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = B;
     p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
@@ -784,7 +784,7 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     for (int b = 0; b < B; b++) h_qoi[b + 1] = h_qoi[b] + q_len;
     cudaMemcpy(d_qoi, h_qoi, sz_qoi, cudaMemcpyHostToDevice);
 
-    PagedAttentionParams<bf16> p;
+    AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = total_q;
     p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;

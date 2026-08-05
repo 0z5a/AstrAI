@@ -120,7 +120,7 @@ inline void set_default_strides(P& p) {
     p.mask_q_stride = 0;
 }
 
-// Set default Q strides for contiguous b h l d layout on PagedAttentionParams.
+// Set default Q strides for a paged decode params struct.
 template<typename P>
 inline void set_default_paged_strides(P& p) {
     p.q_stride_b  = p.q_head * p.q_len * p.head_dim;

@@ -2,13 +2,15 @@
 #include <cfloat>
 #include <cuda_bf16.h>
 #include "attn_common.h"
+#include "attn_kv_source.cuh"
 
 using bf16 = __nv_bfloat16;
 
 // v9: group-split register blocking. G threads cooperate on one query row,
 // each owning HEAD_DIM/G dims of qreg[]/acc[]. IsCausal and HasMask are
 // compile-time bools — the compiler eliminates dead branches.
-// Templated on <HEAD_DIM, G, ROWS, P_BC, IsCausal, HasMask>.
+// Unified across contiguous and paged (SGLang flat-pool) K/V via KV.
+// Templated on <HEAD_DIM, KV, G, ROWS, P_BC, IsCausal, HasMask>.
 
 template <int G>
 __device__ __forceinline__ float group_reduce_sum(float v, unsigned mask) {
@@ -30,7 +32,7 @@ __device__ __forceinline__ void ld8(const bf16* p, float* o) {
     }
 }
 
-template <int HEAD_DIM, int G, int ROWS, int P_BC, bool IsCausal, bool HasMask>
+template <int HEAD_DIM, typename KV, int G, int ROWS, int P_BC, bool IsCausal, bool HasMask>
 __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     constexpr int DPT = HEAD_DIM / G;
 
@@ -41,16 +43,21 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     int row    = threadIdx.y;  // 0..ROWS-1
     int q_row  = q_tile * ROWS + row;
 
-    int kv_head = q_head / (p.q_head / p.kv_head);
+    // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
+    const int seq_len    = KV::kv_len(p, batch);
+    const int q_len      = KV::q_len(p, batch);
+    const int causal_off = KV::causal_offset(p, batch);
+    const int kv_head = q_head / (p.q_head / p.kv_head);
+    const KVContext kctx = KV::template make_ctx<HEAD_DIM>(p, batch, kv_head);
 
     __shared__ __align__(16) bf16 sK[P_BC * HEAD_DIM];
     __shared__ __align__(16) bf16 sV[P_BC * HEAD_DIM];
 
     // Q: stride-based load [batch, q_head, q_len, head_dim]
+    const int q_base = KV::q_base(p, batch, q_head);
     float qreg[DPT];
-    if (q_row < p.q_len) {
-        int q_off = batch * p.q_stride_b + q_head * p.q_stride_h
-                  + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
+    if (q_row < q_len) {
+        int q_off = q_base + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
             qreg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]);
@@ -62,10 +69,8 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     for (int i = 0; i < DPT; i++)
         acc[i] = 0.0f;
 
-    // KV: stride-based base
-    int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
     int mask_batch_base = batch * p.mask_b_stride + q_head * p.mask_h_stride;
-    int tiles   = (p.kv_len + P_BC - 1) / P_BC;
+    int tiles   = (seq_len + P_BC - 1) / P_BC;
     int tt      = G * ROWS;
     int lid     = row * G + gpos;
 
@@ -75,23 +80,24 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
 
     for (int ti = 0; ti < tiles; ti++) {
         int kv0  = ti * P_BC;
-        int tlen = min(P_BC, p.kv_len - kv0);
+        int tlen = min(P_BC, seq_len - kv0);
 
-        // Load K/V into shared memory from strided global
+        // Load K/V into shared memory (addressing via KV policy; paged
+        // guards empty slots with zero-fill).
         for (int i = lid; i < tlen * HEAD_DIM; i += tt) {
             int s = i / HEAD_DIM;
             int d_dim = i % HEAD_DIM;
-            int kv_idx = kv0 + s;
-            int g_off = kv_base + kv_idx * p.kv_stride_l + d_dim * p.kv_stride_d;
-            sK[i] = p.k[g_off];
-            sV[i] = p.v[g_off];
+            int kc = kv0 + s;
+            KVAddr a = KV::kv_addr(p, kctx, kc, d_dim, true);
+            sK[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
+            sV[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
         }
         __syncthreads();
 
         int lim = tlen;
         if constexpr (IsCausal) {
-            if (q_row < p.q_len) {
-                int ep = q_row + p.causal_offset + 1;
+            if (q_row < q_len) {
+                int ep = causal_off + q_row + 1;
                 if (kv0 >= ep)
                     lim = 0;
                 else if (kv0 + tlen > ep)
@@ -138,9 +144,8 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
         __syncthreads();
     }
 
-    if (q_row < p.q_len) {
-        int o_off = batch * p.q_stride_b + q_head * p.q_stride_h
-                  + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
+    if (q_row < q_len) {
+        int o_off = q_base + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
         float rl = (l > 1e-20f) ? (1.0f / l) : 0.0f;
 #pragma unroll
         for (int i = 0; i < DPT; i++)

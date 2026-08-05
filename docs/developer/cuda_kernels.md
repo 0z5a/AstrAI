@@ -18,7 +18,10 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 |---------|------|--------------|
 | Split-KV MMA decode | `attn_decode_split_kv_mma.cuh` | Split KV across warps + MMA (sm_80+) |
 | Split-Q MMA prefill | `attn_prefill_split_q_mma.cuh` | Split Q across warps + MMA (sm_80+) |
-| Paged split-KV MMA decode | `attn_paged_decode_split_kv_mma.cuh` | Paged cache + split-KV + MMA |
+
+> The paged and non-paged paths are ONE kernel templated on a `KVSource`
+> policy (`ContigKV` / `PagedKV` in `attn_kv_source.cuh`); there are no
+> separate `attn_paged_*.cuh` files anymore.
 
 ### Rotary Embedding Kernel
 
@@ -157,21 +160,18 @@ nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
 csrc/
 ├── CMakeLists.txt        # CMake build: 5 kernel targets, torch/pybind11 linking
 ├── kernels/
-│   ├── attn_common.h     # Shared attention params (AttentionParams, PagedAttentionParams)
+│   ├── attn_common.h     # Unified attention params (contig + paged modes)
 │   ├── attn_decode.cu    # Basic decode kernel (registered)
 │   ├── attn_prefill.cu   # Basic prefill kernel (registered)
 │   ├── attn_paged_decode.cu             # Paged decode kernel (registered)
 │   ├── attn_paged_prefill.cu            # Paged prefill kernel (registered)
 │   ├── rotary_emb.cu                    # Fused rotary embedding kernel (registered)
-│   ├── attn_decode_split_kv.cuh         # Split-KV variant
-│   ├── attn_decode_split_kv_mma.cuh     # Split-KV + MMA variant
-│   ├── attn_prefill_split_q.cuh         # Split-Q variant
-│   ├── attn_prefill_split_q_mma.cuh     # Split-Q + MMA variant
-│   ├── attn_paged_decode_split_kv.cuh   # Paged + split-KV variant
-│   ├── attn_paged_decode_split_kv_mma.cuh  # Paged + split-KV + MMA variant
-│   ├── attn_paged_prefill_split_q.cuh   # Paged + split-Q variant
-│   ├── attn_paged_prefill_split_q_mma.cuh  # Paged + split-Q + MMA variant
-│   ├── attn_dispatchers.cuh             # Kernel dispatch macros
+│   ├── attn_decode_split_kv.cuh         # Split-KV variant (contig + paged via KVSource)
+│   ├── attn_decode_split_kv_mma.cuh     # Split-KV + MMA variant (contig + paged)
+│   ├── attn_prefill_split_q.cuh         # Split-Q variant (contig + paged via KVSource)
+│   ├── attn_prefill_split_q_mma.cuh     # Split-Q + MMA variant (contig + paged)
+│   ├── attn_kv_source.cuh               # KVSource policies (ContigKV / PagedKV)
+│   ├── attn_dispatchers.cuh             # Kernel dispatch macros + KV-templated launchers
 │   ├── attn_entry_utils.cuh             # Entry point helpers
 │   ├── attn_mma_utils.cuh               # MMA utilities
 │   └── attn_warp_utils.cuh              # Warp-level utilities

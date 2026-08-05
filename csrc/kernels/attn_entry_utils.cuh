@@ -149,7 +149,7 @@ inline void attn_pack_paged_decode_params(
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
-    PagedAttentionParams<T>& p
+    AttentionParams<T>& p
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
 
@@ -229,7 +229,7 @@ inline void attn_pack_paged_prefill_params(
     int64_t max_q_len,
     int64_t causal_offset,
     double scale,
-    PagedAttentionParams<T>& p
+    AttentionParams<T>& p
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
 

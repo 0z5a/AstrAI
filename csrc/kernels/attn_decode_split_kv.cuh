@@ -2,10 +2,16 @@
 #include <cuda_bf16.h>
 #include <float.h>
 #include "attn_common.h"
+#include "attn_kv_source.cuh"
 #include "attn_warp_utils.cuh"
 constexpr int DC_CHUNK = 64;
 
-template <int HEAD_DIM, bool IsCausal, bool HasMask>
+// Scalar split-KV decode (fallback for sm < 80, no tensor cores), unified
+// across contiguous and paged (SGLang flat-pool) K/V via the KV template
+// parameter.  For decode the query is the last token, so its valid range
+// [0, seq_len) IS the causal range; KV::decode_attend_len expresses that
+// bound per addressing mode (contig clips to causal_offset, paged = seq_len).
+template <int HEAD_DIM, typename KV, bool IsCausal, bool HasMask>
 __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     int batch = blockIdx.x / p.kv_head;
     int kv_head = blockIdx.x % p.kv_head;
@@ -15,15 +21,16 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     int lane = threadIdx.x;
     int hd_per_thread = p.head_dim / 32;
 
+    const int seq_len = KV::kv_len(p, batch);
+    const KVContext kctx = KV::template make_ctx<HEAD_DIM>(p, batch, kv_head);
+
     // Q: [batch, q_head, q_len=1, head_dim] — stride-based
     float q_reg[8];
-    int q_off = batch * p.q_stride_b + q_head * p.q_stride_h
+    int q_off = KV::q_decode_base(p, batch, q_head)
               + lane * hd_per_thread * p.q_stride_d;
     for (int i = 0; i < hd_per_thread; i++)
         q_reg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]);
 
-    // KV: [batch, kv_head, kv_len, head_dim] — stride-based base
-    int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
     int mask_base = batch * p.mask_b_stride + q_head * p.mask_h_stride;
 
     float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
@@ -31,24 +38,25 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     extern __shared__ __align__(16) bf16 k_smem[];
 
     // Split-KV: each split processes a contiguous subset of chunks
-    int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
+    int chunks_total = (seq_len + DC_CHUNK - 1) / DC_CHUNK;
     int chunks_per_split = (chunks_total + p.num_splits - 1) / p.num_splits;
     int ch_begin = split * chunks_per_split;
     int ch_end = min(chunks_total, ch_begin + chunks_per_split);
 
     for (int ci = ch_begin; ci < ch_end; ci++) {
         int chunk_start = ci * DC_CHUNK;
-        int this_chunk = min(DC_CHUNK, p.kv_len - chunk_start);
+        int this_chunk = min(DC_CHUNK, seq_len - chunk_start);
 
-        // Load K into shared memory (gather from strided global)
+        // Load K into shared memory (addressing via KV policy; paged guards
+        // empty slots with zero-fill).
         int total = this_chunk * p.head_dim;
         for (int i = threadIdx.y * 32 + lane; i < total;
              i += blockDim.x * blockDim.y) {
             int s = i / p.head_dim;
             int d_dim = i % p.head_dim;
-            int kv_idx = chunk_start + s;
-            int g_off = kv_base + kv_idx * p.kv_stride_l + d_dim * p.kv_stride_d;
-            k_smem[i] = p.k[g_off];
+            int kc = chunk_start + s;
+            KVAddr a = KV::kv_addr(p, kctx, kc, d_dim, true);
+            k_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
         }
         __syncthreads();
 
@@ -65,7 +73,7 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
                     partial = -FLT_MAX;
             }
             if constexpr (IsCausal) {
-                if (kv_idx > p.causal_offset)
+                if (kv_idx >= KV::decode_attend_len(p, batch))
                     partial = -FLT_MAX;
             }
 
@@ -74,11 +82,15 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             float beta  = __expf(partial - new_m);
             d = d * alpha + beta;
 
-            int v_off = kv_base + kv_idx * p.kv_stride_l
-                        + lane * hd_per_thread * p.kv_stride_d;
-            for (int i = 0; i < hd_per_thread; i++)
-                acc_reg[i] = fmaf(acc_reg[i], alpha,
-                                  __bfloat162float(p.v[v_off + i * p.kv_stride_d]) * beta);
+            // V read via KV policy; when masked (beta == 0) or the slot is
+            // empty the term vanishes, so no extra branches are needed.
+            for (int i = 0; i < hd_per_thread; i++) {
+                KVAddr a = KV::kv_addr(p, kctx, kv_idx, lane * hd_per_thread + i, true);
+                float vv = a.valid
+                    ? __bfloat162float(*reinterpret_cast<const bf16*>(a.v))
+                    : 0.0f;
+                acc_reg[i] = fmaf(acc_reg[i], alpha, vv * beta);
+            }
             m = new_m;
         }
         __syncthreads();
@@ -98,6 +110,10 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     }
 }
 
+// Split-combine: merges the per-split partials (o_part/ml_part) into the
+// final normalised O.  KV selects the O addressing (contig batch stride vs
+// paged row stride).
+template <typename KV>
 __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     int bh = blockIdx.x;
     int d = threadIdx.x;
@@ -124,6 +140,6 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     }
 
     float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
-    int o_off = batch * p.q_stride_b + q_head * p.q_stride_h + d * p.q_stride_d;
+    int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_stride_d;
     p.o[o_off] = __float2bfloat16(acc * inv);
 }

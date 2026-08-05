@@ -16,7 +16,7 @@ torch::Tensor attn_paged_decode(
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    PagedAttentionParams<bf16> p;
+    AttentionParams<bf16> p;
     attn_pack_paged_decode_params(q, k_cache, v_cache,
                                    req_to_token, req_pool_indices, kv_indptr,
                                    max_seq_len, mask, causal_offset, scale, p);
