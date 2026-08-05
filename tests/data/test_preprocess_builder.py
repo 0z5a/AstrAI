@@ -369,6 +369,19 @@ def test_dpo_missing_field_is_none(chat_tokenizer, builder):
     assert builder.build({"chosen": [], "rejected": []}, config, chat_tokenizer) is None
 
 
+@pytest.mark.parametrize("missing", ["chosen", "rejected"])
+def test_dpo_partial_record_is_none(chat_tokenizer, builder, missing):
+    config = make_dpo_chat_config()
+    item = {
+        "chosen": [{"role": "assistant", "content": "Good"}],
+        "rejected": [{"role": "assistant", "content": "Bad"}],
+    }
+    item.pop(missing)
+
+    assert builder.build(item, config, chat_tokenizer) is None
+    assert builder.build_batch([item], config, chat_tokenizer) == [None]
+
+
 def test_grpo_basic(chat_tokenizer, builder):
     config = make_grpo_config()
     item = {

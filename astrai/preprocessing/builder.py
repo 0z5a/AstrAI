@@ -416,7 +416,11 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
             return None
 
         result: dict = {}
-        any_output = False
+        required_outputs = {
+            output_key
+            for output_key, spec in sources_spec.items()
+            if spec.get("sections")
+        }
 
         for output_key, spec in sources_spec.items():
             sections = spec.get("sections", [])
@@ -428,7 +432,6 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
                 if ids is None:
                     continue
                 result[output_key] = ids
-                any_output = True
                 continue
 
             list_field = spec.get("list_field", False)
@@ -444,7 +447,6 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
                 result[output_key] = ids
                 if mask is not None:
                     result[mask_key] = mask
-                any_output = True
                 continue
 
             ids, mask = self.renderer.process_sections(
@@ -460,9 +462,7 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
             elif "mask_key" in spec:
                 result[mask_key] = mask
 
-            any_output = True
-
-        if not any_output:
+        if not required_outputs or not required_outputs.issubset(result):
             return None
 
         result["domain"] = _extract_domain(item, config.output.domain_key)
@@ -474,6 +474,11 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
             return [None] * len(items)
 
         results = [{} for _ in items]
+        required_outputs = {
+            output_key
+            for output_key, spec in sources_spec.items()
+            if spec.get("sections")
+        }
         for output_key, spec in sources_spec.items():
             sections = spec.get("sections", [])
             if not sections:
@@ -506,7 +511,7 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
 
         return [
             ({**result, "domain": _extract_domain(item, config.output.domain_key)})
-            if result
+            if required_outputs and required_outputs.issubset(result)
             else None
             for item, result in zip(items, results)
         ]

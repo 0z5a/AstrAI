@@ -85,9 +85,65 @@ class Executor:
             dtype=self.dtype,
         )
 
-    def execute_prefill(self, tasks: List[Task], prompt_len: int, start_pos: int = 0):
+    def _sample_logits(
+        self,
+        logits: Tensor,
+        tasks: List[Task],
+        return_logprobs: bool = False,
+        info: Optional[SamplingBatchInfo] = None,
+    ):
+        info = info or _build_sampling_batch_info(tasks, self.device)
+        if info.has_freq:
+            history_lists = [
+                t.prompt_ids[-t.rep_window :] + t.output_ids for t in tasks
+            ]
+            history_lens = [len(ids) for ids in history_lists]
+            max_len = max(history_lens, default=0)
+            padded_ids = torch.zeros(
+                len(tasks), max_len, dtype=torch.long, device=self.device
+            )
+            padded_mask = torch.zeros(
+                len(tasks), max_len, dtype=torch.bool, device=self.device
+            )
+            for i, ids in enumerate(history_lists):
+                length = len(ids)
+                padded_ids[i, :length] = torch.as_tensor(
+                    ids, dtype=torch.long, device=self.device
+                )
+                padded_mask[i, :length] = True
+        else:
+            padded_ids = None
+            padded_mask = None
+
+        result = sample(
+            logits,
+            temperature=info.temperatures,
+            top_k=info.top_ks,
+            top_p=info.top_ps,
+            frequency_penalty=info.freq_penalties,
+            input_ids=padded_ids,
+            input_mask=padded_mask,
+            return_logprobs=return_logprobs,
+        )
+        if not return_logprobs:
+            return result.tolist()
+
+        tokens, logprobs = result
+        tokens_list = tokens.tolist()
+        logprobs_list = logprobs.tolist()
+        for task, logprob in zip(tasks, logprobs_list):
+            task.output_logprobs.append(float(logprob))
+        return list(zip(tokens_list, logprobs_list))
+
+    def execute_prefill(
+        self,
+        tasks: List[Task],
+        prompt_len: int,
+        start_pos: int = 0,
+        return_logprobs: bool = False,
+    ):
         if start_pos >= prompt_len:
-            return
+            return []
 
         tasks = sorted(tasks, key=lambda t: t.task_id)
         batch_sz = len(tasks)
@@ -109,7 +165,7 @@ class Executor:
         )
 
         with torch.inference_mode():
-            self.model(
+            outputs = self.model(
                 input_ids,
                 input_mask=input_mask,
                 position_ids=position_ids,
@@ -119,6 +175,9 @@ class Executor:
                     start_pos=start_pos,
                 ),
             )
+            logits = outputs["logits"][:, -1, :]
+
+        return tasks, self._sample_logits(logits, tasks, return_logprobs)
 
     def execute_decode(
         self, tasks: List[Task], return_logprobs: bool = False
@@ -167,34 +226,6 @@ class Executor:
         total_len = max(t.next_pos for t in tasks) + 1
         input_mask = self._workspace.decode_mask(position_ids, total_len)
 
-        has_freq = info.has_freq
-        if has_freq:
-            history_lists = []
-            history_lens = []
-            for t in tasks:
-                window = t.rep_window
-                prompt_part = t.prompt_ids[-window:]
-                ids = prompt_part + t.output_ids
-                history_lists.append(ids)
-                history_lens.append(len(ids))
-
-            max_len = max(history_lens) if history_lens else 0
-            padded_ids = torch.zeros(
-                len(tasks), max_len, dtype=torch.long, device=self.device
-            )
-            padded_mask = torch.zeros(
-                len(tasks), max_len, dtype=torch.bool, device=self.device
-            )
-            for i, h in enumerate(history_lists):
-                L = history_lens[i]
-                padded_ids[i, :L] = torch.as_tensor(
-                    h, dtype=torch.long, device=self.device
-                )
-                padded_mask[i, :L] = True
-        else:
-            padded_ids = None
-            padded_mask = None
-
         with torch.inference_mode():
             outputs = self.model(
                 input_ids,
@@ -207,29 +238,4 @@ class Executor:
             )
             logits = outputs["logits"][:, -1, :]
 
-        if return_logprobs:
-            tokens, logprobs = sample(
-                logits,
-                temperature=info.temperatures,
-                top_k=info.top_ks,
-                top_p=info.top_ps,
-                frequency_penalty=info.freq_penalties,
-                input_ids=padded_ids,
-                input_mask=padded_mask,
-                return_logprobs=True,
-            )
-            tokens_list = tokens.tolist()
-            logprobs_list = logprobs.tolist()
-            for t, lp in zip(tasks, logprobs_list):
-                t.output_logprobs.append(float(lp))
-            return list(zip(tokens_list, logprobs_list))
-
-        return sample(
-            logits,
-            temperature=info.temperatures,
-            top_k=info.top_ks,
-            top_p=info.top_ps,
-            frequency_penalty=info.freq_penalties,
-            input_ids=padded_ids,
-            input_mask=padded_mask,
-        ).tolist()
+        return self._sample_logits(logits, tasks, return_logprobs, info=info)

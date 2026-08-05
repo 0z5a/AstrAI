@@ -105,7 +105,8 @@ class Task:
 
     @property
     def next_pos(self) -> int:
-        return self.input_tokens + len(self.output_ids)
+        # The first output is sampled from prefill and enters KV on the next step.
+        return self.input_tokens + max(0, len(self.output_ids) - 1)
 
     def is_finished(self, stop_ids: List[int]) -> bool:
         if self.max_tokens is not None and self.output_tokens >= self.max_tokens:

@@ -22,6 +22,8 @@ def test_task_next_pos():
     task.input_tokens = 5
     assert task.next_pos == 5
     task.output_ids.append(4)
+    assert task.next_pos == 5
+    task.output_ids.append(5)
     assert task.next_pos == 6
 
 

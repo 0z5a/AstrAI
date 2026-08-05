@@ -91,11 +91,10 @@ class InferenceScheduler:
         Single shared primitive for both the continuous-batching loop and
         the synchronous ``run_batch`` path, so the two cannot drift.
 
-        Tasks must already be allocated in the KV cache. Any task that still
-        needs prefill (``output_tokens == 0`` and fewer cached pages than
-        prompt tokens) is prefilled first, grouped by ``(prompt_len, cached)``
-        so a ragged batch is padded into equal-length groups. Every task is
-        then extended by one token and decoded.
+        Tasks must already be allocated in the KV cache. Tasks without output
+        are prefilled first and sample their first token from the final prompt
+        position. Tasks with output extend the cache by one position and decode
+        from their latest generated token.
 
         Args:
             tasks: Active tasks to advance by one token.
@@ -109,23 +108,27 @@ class InferenceScheduler:
         """
         cache = self._cache
 
-        to_prefill = [
-            t
-            for t in tasks
-            if t.output_tokens == 0 and cache.task_cached(t.task_id) < len(t.prompt_ids)
-        ]
+        to_prefill = [t for t in tasks if t.output_tokens == 0 and t.prompt_ids]
+        prefilled_ids = set()
+        produced: List[Task] = []
         if to_prefill:
             for t in to_prefill:
                 t.input_tokens = len(t.prompt_ids)
 
             groups: Dict[Tuple[int, int], List[Task]] = {}
             for t in to_prefill:
-                groups.setdefault(
-                    (len(t.prompt_ids), cache.task_cached(t.task_id)), []
-                ).append(t)
+                start_pos = min(cache.task_cached(t.task_id), len(t.prompt_ids) - 1)
+                groups.setdefault((len(t.prompt_ids), start_pos), []).append(t)
 
             for (prompt_len, start_pos), group in groups.items():
-                self._executor.execute_prefill(group, prompt_len, start_pos)
+                prefilled, step_out = self._executor.execute_prefill(
+                    group, prompt_len, start_pos, return_logprobs=return_logprobs
+                )
+                for t, out in zip(prefilled, step_out):
+                    t.output_ids.append(out[0] if return_logprobs else out)
+                    t.output_tokens += 1
+                    prefilled_ids.add(t.task_id)
+                    produced.append(t)
                 start_logical_page = start_pos // getattr(cache, "page_size", 64)
                 for t in group:
                     cache.task_record_hashes(
@@ -135,6 +138,8 @@ class InferenceScheduler:
         decoded: List[Task] = []
         aborted: List[Task] = []
         for t in tasks:
+            if t.task_id in prefilled_ids:
+                continue
             if cache.task_extend(t.task_id, t.next_pos):
                 decoded.append(t)
             else:
@@ -148,8 +153,9 @@ class InferenceScheduler:
             for t, out in zip(decoded, step_out):
                 t.output_ids.append(out[0] if return_logprobs else out)
                 t.output_tokens += 1
+                produced.append(t)
 
-        return decoded, aborted
+        return produced, aborted
 
     def _run_generation_loop(self):
         stop_ids = self._task_mgr.tokenizer.stop_ids

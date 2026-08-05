@@ -205,6 +205,36 @@ def test_run_batch_returns_token_sequences(device):
         scheduler.stop()
 
 
+def test_run_batch_tokens_match_full_sequence_forward(device):
+    scheduler, _tok, model = _make_real_scheduler(device)
+    prompt = [10, 20, 30, 40]
+    try:
+        expected = []
+        sequence = list(prompt)
+        for _ in range(2):
+            input_ids = torch.tensor([sequence], dtype=torch.long, device=device)
+            position_ids = torch.arange(len(sequence), device=device).unsqueeze(0)
+            input_mask = torch.ones(
+                1, len(sequence), len(sequence), dtype=torch.bool, device=device
+            ).tril()
+            with torch.inference_mode():
+                logits = model(
+                    input_ids,
+                    input_mask=input_mask,
+                    position_ids=position_ids,
+                )["logits"][:, -1, :]
+            token = logits.argmax(dim=-1).item()
+            expected.append(token)
+            sequence.append(token)
+
+        result = scheduler.run_batch(
+            prompt_ids_list=[prompt], max_tokens=2, temperature=0
+        )
+        assert result == [expected]
+    finally:
+        scheduler.stop()
+
+
 def test_run_batch_return_logprobs_aligned(device):
     """return_logprobs=True gives (token_ids, logprobs) tuples with equal len."""
     scheduler, _tok, _model = _make_real_scheduler(device)
