@@ -266,7 +266,7 @@ class SamplingPipeline(BaseSamplingStrategy):
     @staticmethod
     def _is_greedy(temperature: Union[float, Tensor]) -> bool:
         if isinstance(temperature, Tensor):
-            return temperature.numel() == 1 and temperature.item() == 0
+            return bool((temperature == 0).all())
         return temperature == 0
 
     @torch.inference_mode()
@@ -364,11 +364,7 @@ def sample(
         ``chosen_logprobs`` has shape ``[batch]``.
     """
     greedy = (
-        (
-            isinstance(temperature, Tensor)
-            and temperature.numel() == 1
-            and temperature.item() == 0
-        )
+        bool((temperature == 0).all())
         if isinstance(temperature, Tensor)
         else temperature == 0
     )
