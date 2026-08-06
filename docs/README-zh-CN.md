@@ -48,14 +48,14 @@
 
 ### 项目概览
 
-AstrAI 是一个面向中英双语 Transformer 模型的端到端框架，覆盖模型构建、训练、评测与部署。项目以精简的 PyTorch 代码实现完整模型生命周期，包括声明式数据预处理、分布式训练、连续批处理推理，以及兼容 OpenAI 和 Anthropic 的服务接口。
+AstrAI 是一个覆盖模型构建、训练、评测与部署的端到端 Transformer 框架。项目以精简的 PyTorch 代码实现完整模型生命周期，包括声明式数据预处理、分布式训练、连续批处理推理，以及兼容 OpenAI 和 Anthropic 的服务接口。
 
 | 领域 | 能力 |
 |---|---|
 | **模型** | 自回归语言模型与嵌入模型，支持 GQA、MLA、MoE、RoPE，以及可扩展的 Attention/FFN 组件 |
 | **训练** | 预训练（`seq`）、监督微调（`sft`）、DPO 和 GRPO，支持梯度累积、检查点、DDP 与 FSDP |
 | **数据** | 声明式 JSON 预处理、可配置掩码与样本打包、二进制/JSONL 存储和流式数据集 |
-| **推理** | 连续批处理、分页 KV Cache、前缀缓存、流式生成，以及 Torch/CUDA/FlashAttention 后端 |
+| **推理** | 连续批处理、分页 KV Cache、Radix 前缀缓存、流式生成，以及 Torch/CUDA/FlashAttention 后端 |
 | **服务** | 基于 FastAPI 的 OpenAI 与 Anthropic 聊天补全协议，支持 SSE 流式输出和工具调用 |
 | **评测** | Perplexity、MMLU、HumanEval、IFEval、IFD 和 ROUGE 评测工具 |
 | **扩展** | 基于工厂与注册表扩展模型、数据集、训练策略、回调、内核和协议组件 |

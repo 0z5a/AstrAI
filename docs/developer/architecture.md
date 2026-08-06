@@ -870,12 +870,21 @@ classDiagram
             +ref_count(idx) int
         }
 
-        class PrefixCache {
+        class RadixNode {
+            +RadixNode parent
+            +Dict children
+            +Optional[int] page_idx
+            +Tuple tokens
+            +int lock_ref
+        }
+
+        class RadixCache {
             +int _page_size
             +evict(page_idx)
             +has_page(idx) bool
             +lookup(token_ids) List[int]
             +record(page_idx, token_ids, logical_page_idx)
+            +release(pages)
         }
 
         class KVStorage {
@@ -914,7 +923,7 @@ classDiagram
             -KVStorage _storage
             -ReqToTokenPool _req_pool
             -Allocator _alloc
-            -PrefixCache _prefix
+            -RadixCache _prefix
             +task_alloc(task_id, prompt_ids) bool
             +task_free(task_id)
             +task_extend(task_id, pos) bool
@@ -1321,7 +1330,8 @@ classDiagram
     PagePool *-- KVStorage
     PagePool *-- ReqToTokenPool
     PagePool *-- Allocator
-    PagePool *-- PrefixCache
+    PagePool *-- RadixCache
+    RadixCache *-- RadixNode
     InferenceEngine *-- InferenceScheduler
     InferenceScheduler *-- PagePool
     InferenceScheduler *-- Executor
@@ -1433,7 +1443,7 @@ classDiagram
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, RolloutGenerator, RolloutRunner | Training workflow |
-| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, InferenceWorkspace, PagePool, KVStorage, ReqToTokenPool, KVCache, Allocator, PrefixCache, Task, TaskManager, TaskStatus, StreamDecoder, GenerationRequest, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
+| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, InferenceWorkspace, PagePool, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, Task, TaskManager, TaskStatus, StreamDecoder, GenerationRequest, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
 | **astrai.extension** | AttentionBackend, TorchNativeBackend, CudaBackend, attn_backend, ATTN_BACKEND, attn_decode, attn_prefill, attn_paged_decode, attn_paged_prefill, rotary_emb, apply_rotary_emb, rotary_backend, is_available | CUDA attention + rotary kernels, backend abstraction, auto-dispatch |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler | Distributed parallel & gradient accumulation |
 | **astrai.factory** | BaseFactory | Component registration |

@@ -31,13 +31,17 @@ PagePool (top-level manager, orchestrates all layers)
   ├── KVStorage              k_buffer / v_buffer [n_layers, size, n_kv_heads, head_dim]
   ├── ReqToTokenPool         req_to_token [num_reqs, max_ctx_len] → physical token slot
   ├── Allocator              bitmask-based page allocator + ref-count + LRU (paged mode only)
-  └── PrefixCache            hash-based prefix matching (paged mode only)
+  └── RadixCache             exact, page-aligned prefix matching (paged mode, page_size > 1)
 ```
 
 `PagePool` supports two modes:
 
 - **Contiguous (default)**: pre-allocates `max_batch_size * max_seq_len` token slots. `req_to_token` is a trivial linear mapping (`slot = req_idx * max_seq_len + pos`). No dynamic allocation.
-- **Paged** (`page_size=1` or `>1` with `n_tokens` set): shared token pool with on-demand allocation. Allocator + PrefixCache enable prefix sharing and LRU eviction.
+- **Paged** (`page_size=1` or `>1` with `n_tokens` set): shared token pool with on-demand allocation. `Allocator` provides ref-counted allocation and LRU eviction. When `page_size > 1`, `RadixCache` also enables prefix sharing.
+
+`RadixCache` indexes complete token pages as parent-linked radix edges. Lookup walks from the root and compares each page's exact token tuple, so an identical page can only be reused under the same parent prefix. Hash values are retained for introspection, but never determine a match.
+
+Only fully materialized KV pages enter the radix. A partial final page remains private to its request and is released when the request ends. On completion, the scheduler records the prompt plus generated tokens already decoded into KV; it excludes the final sampled token because that token has not yet passed through the model. A later request resumes prefill immediately after the longest complete-page hit.
 
 `bind_tasks()` returns a `KVCache` dataclass — pure data, no methods:
 
@@ -97,7 +101,7 @@ attention backends share the same rotary dispatch — it is backend-agnostic.
 `InferenceScheduler` runs a daemon thread with a 4-phase loop:
 
 ```
-1. Cleanup → Remove finished tasks, free KV cache slots/pages
+1. Cleanup → Record complete materialized pages, then release task-owned KV resources
 2. Refill  → Pop from waiting_queue, task_alloc resources, activate
 3. Prefill → Group by (prompt_len, start_pos), run full forward
 4. Decode  → Run single-token forward for each same-position group
