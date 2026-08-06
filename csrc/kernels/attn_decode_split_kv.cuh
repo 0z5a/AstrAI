@@ -35,7 +35,9 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
 
     float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
 
-    extern __shared__ __align__(16) bf16 k_smem[];
+    extern __shared__ __align__(16) bf16 smem[];
+    bf16* k_smem = smem;
+    bf16* v_smem = smem + DC_CHUNK * p.head_dim;
 
     // Split-KV: each split processes a contiguous subset of chunks
     int chunks_total = (seq_len + DC_CHUNK - 1) / DC_CHUNK;
@@ -47,8 +49,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
         int chunk_start = ci * DC_CHUNK;
         int this_chunk = min(DC_CHUNK, seq_len - chunk_start);
 
-        // Load K into shared memory (addressing via KV policy; paged guards
-        // empty slots with zero-fill).
+        // Load K and V into shared memory (addressing via KV policy;
+        // paged guards empty slots with zero-fill).
         int total = this_chunk * p.head_dim;
         for (int i = threadIdx.y * 32 + lane; i < total;
              i += blockDim.x * blockDim.y) {
@@ -57,6 +59,7 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             int kc = chunk_start + s;
             KVAddr a = KV::kv_addr(p, kctx, kc, d_dim, true);
             k_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
+            v_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
         }
         __syncthreads();
 
@@ -82,13 +85,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             float beta  = __expf(partial - new_m);
             d = d * alpha + beta;
 
-            // V read via KV policy; when masked (beta == 0) or the slot is
-            // empty the term vanishes, so no extra branches are needed.
             for (int i = 0; i < hd_per_thread; i++) {
-                KVAddr a = KV::kv_addr(p, kctx, kv_idx, lane * hd_per_thread + i, true);
-                float vv = a.valid
-                    ? __bfloat162float(*reinterpret_cast<const bf16*>(a.v))
-                    : 0.0f;
+                float vv = __bfloat162float(v_smem[s * p.head_dim + lane * hd_per_thread + i]);
                 acc_reg[i] = fmaf(acc_reg[i], alpha, vv * beta);
             }
             m = new_m;

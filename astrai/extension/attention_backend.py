@@ -440,8 +440,7 @@ class CudaBackend(AttentionBackend):
             kv_cache.req_pool_indices,
             kv_indptr,
             kv_cache.max_len,
-            mask=attn_mask,
-            is_causal=is_causal,
+            is_causal=True,
         )
         return out.unsqueeze(1).flatten(2)
 

@@ -157,7 +157,7 @@ struct DecodeLauncherScalar {
         int kv_len = KV::host_kv_len(p);
         int chunks_total = (kv_len + DC_CHUNK - 1) / DC_CHUNK;
         p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
-        size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
+        size_t smem = 2 * DC_CHUNK * p.head_dim * sizeof(bf16);
         int g = min(group_size, 32);  // cap at 32 to respect 1024-thread limit
         dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
         dim3 block(32, g);

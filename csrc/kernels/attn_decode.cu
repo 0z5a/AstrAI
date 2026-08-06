@@ -22,7 +22,17 @@ torch::Tensor attn_decode(
     auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
     p.o = (bf16*)O_view.data_ptr();
 
-    alloc_split_partials(p);
+    {
+        static torch::Tensor s_o_part, s_ml_part;
+        int64_t o_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * p.head_dim;
+        auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+        if (!s_o_part.defined() || s_o_part.numel() < o_needed) {
+            s_o_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, p.head_dim}, fopt);
+            s_ml_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, 2}, fopt);
+        }
+        p.o_part = (float*)s_o_part.data_ptr();
+        p.ml_part = (float*)s_ml_part.data_ptr();
+    }
     DISPATCH_HEAD_DIM(p.head_dim, dispatch_decode, p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
