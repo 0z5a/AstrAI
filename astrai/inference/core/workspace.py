@@ -1,19 +1,15 @@
 """Pre-allocated buffers for the inference decode hot path.
 
-Mirrors SGLang's pre-allocated input buffers (``input_buffers.py``): tensors
-are sized once to the server's maximum dimensions and sliced to the live
-batch each step, so the per-token decode loop never calls
-``torch.empty``/``torch.zeros``/``torch.arange`` for the hot shapes.  Fills
-go through ``out=`` variants (``torch.ge``) which write into the stable
-buffers instead of allocating fresh results.
-
-All buffers are allocated eagerly at init (nothing is lazy), so the
-workspace is CUDA-graph-capture friendly: the decode step reads/writes
-fixed-address tensors with no allocation during capture.
+Mirrors FlashInfer / SGLang's global workspace pattern: all per-step tensors
+are allocated eagerly at init (nothing is lazy), so the decode step
+reads/writes fixed-address tensors with zero ``torch.empty`` calls during
+the hot loop — a prerequisite for CUDA-graph capture.
 """
 
 import torch
 from torch import Tensor
+
+_MAX_SPLITS = 32
 
 
 class InferenceWorkspace:
@@ -30,6 +26,11 @@ class InferenceWorkspace:
     - KV-cache bind metadata (``req_pool_indices``, ``seq_lens``,
       ``kv_indptr``, ``inc``, ``out_cache_loc``), written by
       ``PagePool.bind_tasks`` when the Executor passes this workspace.
+    - ``decode_o_part`` / ``decode_ml_part``: split-KV partial result buffers
+      (mirrors FlashInfer's workspace).  One global alloc, reused by every
+      decode step across all layers.  Sliced views are passed to the CUDA
+      attention kernel so its internal ``torch.empty`` hot-path alloc goes
+      through a stable address (CUDA-graph capturable).
 
     No re-allocation while the server's bounds are respected.
     """
@@ -38,11 +39,15 @@ class InferenceWorkspace:
         self,
         max_batch_size: int,
         max_seq_len: int,
+        max_q_heads: int,
+        head_dim: int,
         device: torch.device,
         dtype: torch.dtype,
     ):
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
+        self.max_q_heads = max_q_heads
+        self.head_dim = head_dim
         self.device = device
         self.dtype = dtype
 
@@ -81,6 +86,28 @@ class InferenceWorkspace:
         self.inc = torch.arange(max_batch_size + 1, dtype=torch.int32, device=device)
         self.out_cache_loc = torch.empty(
             (max_batch_size, 1), dtype=torch.long, device=device
+        )
+
+        # Split-KV partial-result buffers for decode (persistent, one global
+        # alloc per process — mirrors FlashInfer's workspace pattern).
+        # Shape: [max_batch_size, max_q_heads, _MAX_SPLITS, head_dim] (o_part)
+        #        [max_batch_size, max_q_heads, _MAX_SPLITS, 2]     (ml_part)
+        self.decode_o_part = torch.empty(
+            (max_batch_size, max_q_heads, _MAX_SPLITS, head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.decode_ml_part = torch.empty(
+            (max_batch_size, max_q_heads, _MAX_SPLITS, 2),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    def decode_buffers(self, batch: int, q_heads: int):
+        """Return ``(o_part, ml_part)`` view sliced to live dimensions."""
+        return (
+            self.decode_o_part[:batch, :q_heads],
+            self.decode_ml_part[:batch, :q_heads],
         )
 
     def fill_input_ids(self, ids: "list[int]") -> Tensor:

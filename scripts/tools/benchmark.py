@@ -79,9 +79,14 @@ class GenerationBenchmark:
         )
 
     @staticmethod
-    def _make_workspace(pool: PagePool) -> InferenceWorkspace:
+    def _make_workspace(pool: PagePool, config: BaseModelConfig) -> InferenceWorkspace:
         return InferenceWorkspace(
-            pool.max_batch_size, pool.max_seq_len, pool.device, pool.dtype
+            pool.max_batch_size,
+            pool.max_seq_len,
+            max_q_heads=config.num_attention_heads,
+            head_dim=config.hidden_size // config.num_attention_heads,
+            device=pool.device,
+            dtype=pool.dtype,
         )
 
     def _run_prefill(
@@ -156,7 +161,7 @@ class GenerationBenchmark:
         import time
 
         pool = self._make_pool(batch_size, prompt_length)
-        workspace = self._make_workspace(pool)
+        workspace = self._make_workspace(pool, self.config)
         task_ids = [f"bench_prefill_{i}" for i in range(batch_size)]
         for tid in task_ids:
             pool.task_alloc(tid, list(range(prompt_length)))
@@ -219,7 +224,7 @@ class GenerationBenchmark:
         # (warmup 5 steps, then one step per trial), so size the pool to cover it.
         max_seq_len = prompt_length + 5 + gen_length * num_trials
         pool = self._make_pool(batch_size, max_seq_len)
-        workspace = self._make_workspace(pool)
+        workspace = self._make_workspace(pool, self.config)
         task_ids = self._run_prefill(pool, batch_size, prompt_length, workspace)
 
         for i in range(5):

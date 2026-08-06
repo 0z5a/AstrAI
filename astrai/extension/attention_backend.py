@@ -441,6 +441,8 @@ class CudaBackend(AttentionBackend):
             kv_indptr,
             kv_cache.max_len,
             is_causal=True,
+            o_part_buf=kv_cache.decode_o_part,
+            ml_part_buf=kv_cache.decode_ml_part,
         )
         return out.unsqueeze(1).flatten(2)
 

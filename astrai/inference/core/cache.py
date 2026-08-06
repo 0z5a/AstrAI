@@ -260,6 +260,9 @@ class KVCache:
         max_len: max(seq_lens) as Python int — avoids GPU sync in decode
         kv_indptr: [batch+1] int32 — prefix sum of seq_lens, precomputed once
             per step so the attention backend avoids rebuilding it per layer.
+        qo_indptr: [batch+1] int32 — prefill qo prefix-sum (None in decode)
+        decode_o_part: split-KV o partial workspace (mirrors FlashInfer)
+        decode_ml_part: split-KV m/l partial workspace (mirrors FlashInfer)
     """
 
     k_buffer: Tensor
@@ -271,6 +274,8 @@ class KVCache:
     max_len: int = 0
     kv_indptr: Optional[Tensor] = None
     qo_indptr: Optional[Tensor] = None
+    decode_o_part: Optional[Tensor] = None
+    decode_ml_part: Optional[Tensor] = None
 
 
 class PagePool:
@@ -565,12 +570,15 @@ class PagePool:
                 torch.arange(b + 1, dtype=torch.int32, device=device) * q_len
             )
             qo_indptr = workspace.qo_indptr[: b + 1]
+            decode_o_part, decode_ml_part = None, None
         else:
             write_pos = seq_lens_t - 1
             loc = self._req_pool.req_to_token[req_pool_indices, write_pos].unsqueeze(-1)
             ocl_buf[:b].copy_(loc)
             out_cache_loc = ocl_buf[:b]
             qo_indptr = None
+            decode_o_part = getattr(workspace, "decode_o_part", None)
+            decode_ml_part = getattr(workspace, "decode_ml_part", None)
 
         return KVCache(
             k_buffer=self._storage.k_buffer,
@@ -582,6 +590,8 @@ class PagePool:
             max_len=max(seq_lens),
             kv_indptr=kv_indptr,
             qo_indptr=qo_indptr,
+            decode_o_part=decode_o_part,
+            decode_ml_part=decode_ml_part,
         )
 
     # ---- internals ----

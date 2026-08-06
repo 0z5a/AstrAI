@@ -8,7 +8,9 @@ torch::Tensor attn_decode(
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
-    int64_t layout
+    int64_t layout,
+    torch::Tensor o_part_buf,
+    torch::Tensor ml_part_buf
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -22,16 +24,16 @@ torch::Tensor attn_decode(
     auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
     p.o = (bf16*)O_view.data_ptr();
 
-    {
-        static torch::Tensor s_o_part, s_ml_part;
+    if (o_part_buf.defined() && ml_part_buf.defined()) {
+        TORCH_CHECK(o_part_buf.scalar_type() == torch::kFloat32, "o_part_buf must be f32");
+        TORCH_CHECK(ml_part_buf.scalar_type() == torch::kFloat32, "ml_part_buf must be f32");
         int64_t o_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * p.head_dim;
-        auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-        if (!s_o_part.defined() || s_o_part.numel() < o_needed) {
-            s_o_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, p.head_dim}, fopt);
-            s_ml_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, 2}, fopt);
-        }
-        p.o_part = (float*)s_o_part.data_ptr();
-        p.ml_part = (float*)s_ml_part.data_ptr();
+        TORCH_CHECK(o_part_buf.numel() >= o_needed,
+                     "o_part_buf too small: need ", o_needed, " got ", o_part_buf.numel());
+        p.o_part = (float*)o_part_buf.data_ptr();
+        p.ml_part = (float*)ml_part_buf.data_ptr();
+    } else {
+        alloc_split_partials(p);
     }
     DISPATCH_HEAD_DIM(p.head_dim, dispatch_decode, p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
@@ -47,5 +49,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,
         py::arg("layout") = (int64_t)BHLD,
+        py::arg("o_part_buf") = py::none(),
+        py::arg("ml_part_buf") = py::none(),
         "GQA decode (tensor-core head-packing on sm_80+, scalar fallback)");
 }

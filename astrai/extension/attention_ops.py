@@ -100,6 +100,8 @@ def attn_paged_decode(
     max_seq_len: int,
     mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
+    o_part_buf: Optional[torch.Tensor] = None,
+    ml_part_buf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """SGLang-style paged decode (q_len == 1, flat KV pool).
 
@@ -117,6 +119,8 @@ def attn_paged_decode(
         max_seq_len: max per-request seq_len (Python int, for split computation)
         mask: 2D [batch, max_seq_len] (bool, True=keep) or None
         is_causal: apply causal mask
+        o_part_buf: pre-allocated split-KV o partial buffer (workflow bypass)
+        ml_part_buf: pre-allocated split-KV m/l buffer (workflow bypass)
 
     Returns:
         [batch, n_heads, head_dim] (bf16, 3D)
@@ -133,6 +137,8 @@ def attn_paged_decode(
         max_seq_len,
         mask=mask,
         causal_offset=causal_offset,
+        o_part_buf=o_part_buf,
+        ml_part_buf=ml_part_buf,
     )
 
 

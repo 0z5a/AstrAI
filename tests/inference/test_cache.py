@@ -16,7 +16,12 @@ from astrai.inference.core.workspace import InferenceWorkspace
 def _ws(pool: PagePool) -> InferenceWorkspace:
     """Workspace sized to the pool (bind_tasks requires it)."""
     return InferenceWorkspace(
-        pool.max_batch_size, pool.max_seq_len, pool.device, pool.dtype
+        pool.max_batch_size,
+        pool.max_seq_len,
+        max_q_heads=2,
+        head_dim=4,
+        device=pool.device,
+        dtype=pool.dtype,
     )
 
 

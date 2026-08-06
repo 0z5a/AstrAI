@@ -14,7 +14,12 @@ from tests.extension.conftest import D, skip_no_kernel
 
 def _ws(pool: PagePool) -> InferenceWorkspace:
     return InferenceWorkspace(
-        pool.max_batch_size, pool.max_seq_len, pool.device, pool.dtype
+        pool.max_batch_size,
+        pool.max_seq_len,
+        max_q_heads=2,
+        head_dim=64,
+        device=pool.device,
+        dtype=pool.dtype,
     )
 
 

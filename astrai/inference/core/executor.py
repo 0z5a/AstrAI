@@ -78,9 +78,14 @@ class Executor:
         # (input_ids, decode mask, KV bind metadata).  Eagerly sized at init
         # so the workspace is CUDA-graph-capture friendly — no allocation
         # during capture.
+        config = model.config
+        max_q_heads = config.num_attention_heads
+        head_dim = config.hidden_size // config.num_attention_heads
         self._workspace = InferenceWorkspace(
             max_batch_size=kv_cache.max_batch_size,
             max_seq_len=kv_cache.max_seq_len,
+            max_q_heads=max_q_heads,
+            head_dim=head_dim,
             device=self.device,
             dtype=self.dtype,
         )
