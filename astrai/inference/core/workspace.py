@@ -88,6 +88,11 @@ class InferenceWorkspace:
             (max_batch_size, 1), dtype=torch.long, device=device
         )
 
+        # Per-step position IDs (must be at a fixed address for CUDA-graph capture).
+        self.position_ids = torch.empty(
+            (max_batch_size,), dtype=torch.long, device=device
+        )
+
         # Split-KV partial-result buffers for decode (persistent, one global
         # alloc per process — mirrors FlashInfer's workspace pattern).
         # Shape: [max_batch_size, max_q_heads, _MAX_SPLITS, head_dim] (o_part)

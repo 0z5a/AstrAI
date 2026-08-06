@@ -5,7 +5,9 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 
+from astrai.extension.attention_backend import CudaBackend, get_backend
 from astrai.inference.core.cache import PagePool
+from astrai.inference.core.graph import CudaGraphContext
 from astrai.inference.core.task import Task
 from astrai.inference.core.workspace import InferenceWorkspace
 from astrai.inference.sample import sample
@@ -89,6 +91,12 @@ class Executor:
             device=self.device,
             dtype=self.dtype,
         )
+
+        # CUDA-graph capture: one graph per (batch_size, total_len) key.
+        # The graph captures model.forward() with fixed-address workspace
+        # inputs.  Before each replay, input content is updated in-place so
+        # the graph sees fresh token IDs / positions / KV metadata.
+        self._graph_ctx = CudaGraphContext()
 
     def _sample_logits(
         self,
@@ -204,42 +212,59 @@ class Executor:
         if not tasks:
             return []
 
-        input_ids = self._workspace.fill_input_ids(
+        b = len(tasks)
+        ws = self._workspace
+
+        # ---- pre-replay: update input buffers in-place ----
+
+        input_ids = ws.fill_input_ids(
             [t.output_ids[-1] if t.output_ids else t.prompt_ids[-1] for t in tasks]
-        ).unsqueeze(1)
+        )
 
         task_ids = [t.task_id for t in tasks]
+        cur_positions = [t.next_pos for t in tasks]
 
         sig = tuple(task_ids)
-        cur_positions = [t.next_pos for t in tasks]
         cached = self._decode_cache
         if (
             cached is not None
             and cached[0] == sig
             and cur_positions == [p + 1 for p in cached[1]]
         ):
-            _, _, info, position_ids = cached
-            position_ids += 1
-            self._decode_cache = (sig, cur_positions, info, position_ids)
+            info = cached[2]
+            ws.position_ids[:b] += 1
+            self._decode_cache = (sig, cur_positions, info)
         else:
             info = _build_sampling_batch_info(tasks, self.device)
-            position_ids = torch.tensor(
-                cur_positions, dtype=torch.long, device=self.device
+            ws.position_ids[:b].copy_(
+                torch.tensor(cur_positions, dtype=torch.long, device=self.device)
             )
-            self._decode_cache = (sig, cur_positions, info, position_ids)
+            self._decode_cache = (sig, cur_positions, info)
 
-        total_len = max(t.next_pos for t in tasks) + 1
-        input_mask = self._workspace.decode_mask(position_ids, total_len)
+        total_len = max(cur_positions) + 1
+        input_mask = ws.decode_mask(ws.position_ids[:b], total_len)
+
+        kv_cache = self.kv_cache.bind_tasks(task_ids, ws)
+
+        # ---- forward (graph replay or live run + capture) ----
+
+        use_graph = (
+            self._graph_ctx.enabled
+            and "cuda" in str(self.device)
+            and isinstance(get_backend(), CudaBackend)
+        )
+        key = (b,)
+        if use_graph:
+            input_mask = ws.decode_mask(ws.position_ids[:b], ws.max_seq_len)
 
         with torch.inference_mode():
-            outputs = self.model(
-                input_ids,
+            outputs = self._graph_ctx.forward(
+                self.model,
+                key=key,
+                input_ids=input_ids.unsqueeze(1),
                 input_mask=input_mask,
-                kv_cache=self.kv_cache.bind_tasks(
-                    task_ids,
-                    self._workspace,
-                ),
-                position_ids=position_ids.unsqueeze(1),
+                kv_cache=kv_cache,
+                position_ids=ws.position_ids[:b].unsqueeze(1),
             )
             logits = outputs["logits"][:, -1, :]
 

@@ -34,7 +34,7 @@ import importlib
 import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -45,7 +45,9 @@ from astrai.extension.attention_ops import (
     attn_paged_prefill,
 )
 from astrai.factory import BaseFactory
-from astrai.inference.core.cache import KVCache
+
+if TYPE_CHECKING:
+    from astrai.inference.core.cache import KVCache
 
 _current_backend: contextvars.ContextVar["AttentionBackend"] = contextvars.ContextVar(
     "attn_backend"
@@ -199,7 +201,7 @@ def attention(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    kv_cache: Optional[KVCache] = None,
+    kv_cache: Optional["KVCache"] = None,
     layer_id: int = 0,
     attn_mask: Optional[Tensor] = None,
     is_causal: bool = False,
@@ -255,7 +257,7 @@ class AttentionBackend(ABC):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -284,7 +286,7 @@ class AttentionBackend(ABC):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -297,7 +299,7 @@ class AttentionBackend(ABC):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -326,7 +328,7 @@ class TorchNativeBackend(AttentionBackend):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -338,7 +340,7 @@ class TorchNativeBackend(AttentionBackend):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -350,7 +352,7 @@ class TorchNativeBackend(AttentionBackend):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -416,7 +418,7 @@ class CudaBackend(AttentionBackend):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -451,7 +453,7 @@ class CudaBackend(AttentionBackend):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -503,7 +505,7 @@ class FlashAttnBackend(AttentionBackend):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -515,7 +517,7 @@ class FlashAttnBackend(AttentionBackend):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -527,7 +529,7 @@ class FlashAttnBackend(AttentionBackend):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Optional["KVCache"],
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
