@@ -6,7 +6,7 @@ from astrai.inference import (
     Allocator,
     KVStorage,
     PagePool,
-    PrefixCache,
+    RadixCache,
     ReqToTokenPool,
     page_hash,
 )
@@ -77,12 +77,12 @@ def test_allocator_inc_ref_and_free():
     assert alloc._refs[p] == 0
 
 
-# ---- PrefixCache ----
+# ---- RadixCache ----
 
 
 def test_prefix_cache_lookup_returns_hits():
     token_ids = list(range(256))
-    prefix = PrefixCache(64)
+    prefix = RadixCache(64)
     pages = [0, 1, 2, 3]
     for i, p in enumerate(pages):
         prefix.record(p, token_ids, i)
@@ -92,7 +92,7 @@ def test_prefix_cache_lookup_returns_hits():
 
 def test_prefix_cache_lookup_stops_at_first_miss():
     token_ids = list(range(256))
-    prefix = PrefixCache(64)
+    prefix = RadixCache(64)
     prefix.record(0, token_ids, 0)
     prefix.record(1, [99] * 64, 1)
     hits = prefix.lookup(token_ids)
@@ -102,14 +102,14 @@ def test_prefix_cache_lookup_stops_at_first_miss():
 
 def test_prefix_cache_ignores_partial_last_page():
     token_ids = list(range(100))
-    prefix = PrefixCache(64)
+    prefix = RadixCache(64)
     prefix.record(0, token_ids, 0)
     hits = prefix.lookup(token_ids)
     assert len(hits) == 1
 
 
 def test_prefix_cache_on_evict_clears_mappings():
-    prefix = PrefixCache(64)
+    prefix = RadixCache(64)
     prefix.record(0, list(range(64)), 0)
     assert 0 in prefix._page_to_hash
     prefix.evict(0)
@@ -117,10 +117,47 @@ def test_prefix_cache_on_evict_clears_mappings():
 
 
 def test_prefix_cache_has_page():
-    prefix = PrefixCache(64)
+    prefix = RadixCache(64)
     assert not prefix.has_page(0)
     prefix.record(0, list(range(64)), 0)
     assert prefix.has_page(0)
+
+
+def test_prefix_cache_does_not_reuse_page_without_parent_prefix():
+    prefix = RadixCache(2)
+    prefix.record(0, [1, 2, 3, 4], 0)
+    prefix.record(1, [1, 2, 3, 4, 5, 6], 1)
+    prefix.record(2, [9, 10, 5, 6], 0)
+    prefix.record(3, [9, 10, 5, 6, 7, 8], 1)
+    assert prefix.lookup([1, 2, 3, 4, 5, 6]) == [0, 1]
+    assert prefix.lookup([9, 10, 5, 6, 7, 8]) == [2, 3]
+
+
+def test_prefix_cache_shares_branch_prefix():
+    prefix = RadixCache(2)
+    prefix.record(0, [1, 2, 3, 4], 0)
+    prefix.record(1, [1, 2, 3, 4], 1)
+    prefix.record(2, [1, 2, 7, 8], 1)
+    assert prefix.lookup([1, 2, 3, 4]) == [0, 1]
+    assert prefix.lookup([1, 2, 7, 8]) == [0, 2]
+    prefix.evict(1)
+    assert prefix.lookup([1, 2, 3, 4]) == [0]
+    assert prefix.lookup([1, 2, 7, 8]) == [0, 2]
+
+
+def test_prefix_cache_does_not_record_partial_page():
+    prefix = RadixCache(4)
+    prefix.record(0, [1, 2, 3, 4, 5, 6], 0)
+    prefix.record(1, [1, 2, 3, 4, 5, 6], 1)
+    assert prefix.lookup([1, 2, 3, 4, 5, 6]) == [0]
+
+    prefix.record(1, [1, 2, 3, 4, 5, 6, 7, 8], 1)
+    assert prefix.lookup([1, 2, 3, 4, 5, 6, 7, 8]) == [0, 1]
+
+
+def test_page_pool_task_cacheable_ids_excludes_unmaterialized_tail():
+    pool = _make_paged_pool_ps64()
+    assert pool.task_cacheable_ids("missing", [1, 2], [3, 4]) == [1, 2, 3]
 
 
 # ---- ReqToTokenPool ----

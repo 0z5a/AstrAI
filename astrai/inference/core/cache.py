@@ -4,7 +4,7 @@ Layer 1 — KVStorage:      flat token-level K/V buffers [n_layers, size, H, D]
 Layer 2 — ReqToTokenPool:  index table [req_idx, pos] → physical token slot
 Layer 3 — Allocator:       slot/page allocation with ref-counting and LRU
 
-PagePool orchestrates all three plus PrefixCache (content addressing).
+PagePool orchestrates all three plus RadixCache (prefix addressing).
 KVCache is a pure dataclass passed to the model for direct buffer access.
 
 Two modes:
@@ -23,10 +23,12 @@ from torch import Tensor
 from astrai.inference.core.workspace import InferenceWorkspace
 
 
-def page_hash(token_ids: List[int], page_idx: int, page_size: int) -> int:
+def page_hash(
+    token_ids: List[int], page_idx: int, page_size: int, parent_hash: int = 0
+) -> int:
     start = page_idx * page_size
     end = min(start + page_size, len(token_ids))
-    h = 0
+    h = parent_hash
     for i in range(start, end):
         h = (h * 31 + token_ids[i]) & 0xFFFFFFFFFFFFFFFF
     return h
@@ -83,45 +85,96 @@ class Allocator:
                 self._lru.move_to_end(idx)
 
 
-class PrefixCache:
-    """Hash-based prefix matching: maps page hashes to physical page indices."""
+class RadixNode:
+    """A page-aligned edge in the CPU-side prefix radix."""
+
+    __slots__ = ("parent", "children", "page_idx", "tokens", "lock_ref")
+
+    def __init__(self, parent=None, tokens=(), page_idx=None):
+        self.parent = parent
+        self.children: Dict[tuple, "RadixNode"] = {}
+        self.page_idx = page_idx
+        self.tokens = tuple(tokens)
+        self.lock_ref = 0
+
+
+class RadixCache:
+    """Page-granular radix prefix index with exact token matching."""
 
     def __init__(self, page_size: int):
         self._page_size = page_size
+        self._root = RadixNode()
+        self._page_to_node: Dict[int, RadixNode] = {}
+        # Retained as an introspection-compatible map; matching never relies on
+        # this lossy value.
         self._page_to_hash: Dict[int, int] = {}
-        self._hash_to_page: Dict[int, int] = {}
         self._lock = threading.Lock()
 
     def evict(self, idx: int):
         with self._lock:
-            h = self._page_to_hash.pop(idx, None)
-            if h is not None:
-                self._hash_to_page.pop(h, None)
+            node = self._page_to_node.pop(idx, None)
+            self._page_to_hash.pop(idx, None)
+            if node is None:
+                return
+            node.page_idx = None
+            parent = node.parent
+            if parent is not None:
+                parent.children.pop(node.tokens, None)
 
     def has_page(self, idx: int) -> bool:
         with self._lock:
-            return idx in self._page_to_hash
+            return idx in self._page_to_node
 
     def lookup(self, token_ids: List[int]) -> List[int]:
         with self._lock:
             full_pages = len(token_ids) // self._page_size
             hits: List[int] = []
+            node = self._root
             for i in range(full_pages):
-                h = page_hash(token_ids, i, self._page_size)
-                p = self._hash_to_page.get(h)
-                if p is None:
+                start = i * self._page_size
+                page_tokens = tuple(token_ids[start : start + self._page_size])
+                child = node.children.get(page_tokens)
+                if child is None or child.page_idx is None:
                     break
-                hits.append(p)
+                hits.append(child.page_idx)
+                node = child
             return hits
 
     def record(self, page_idx: int, token_ids: List[int], logical_page_idx: int):
         with self._lock:
-            h = page_hash(token_ids, logical_page_idx, self._page_size)
-            old_h = self._page_to_hash.pop(page_idx, None)
-            if old_h is not None:
-                self._hash_to_page.pop(old_h, None)
-            self._page_to_hash[page_idx] = h
-            self._hash_to_page[h] = page_idx
+            full_pages = len(token_ids) // self._page_size
+            if logical_page_idx >= full_pages:
+                return
+            old = self._page_to_node.pop(page_idx, None)
+            self._page_to_hash.pop(page_idx, None)
+            if old is not None and old.parent is not None:
+                old.parent.children.pop(old.tokens, None)
+
+            node = self._root
+            for i in range(logical_page_idx + 1):
+                start = i * self._page_size
+                page_tokens = tuple(token_ids[start : start + self._page_size])
+                child = node.children.get(page_tokens)
+                if child is None:
+                    child = RadixNode(node, page_tokens)
+                    node.children[page_tokens] = child
+                node = child
+            if node.page_idx is not None and node.page_idx != page_idx:
+                replaced = node.page_idx
+                self._page_to_node.pop(replaced, None)
+                self._page_to_hash.pop(replaced, None)
+            node.page_idx = page_idx
+            self._page_to_node[page_idx] = node
+            self._page_to_hash[page_idx] = page_hash(
+                token_ids, logical_page_idx, self._page_size
+            )
+
+    def release(self, pages: List[int]) -> None:
+        with self._lock:
+            for page_idx in pages:
+                node = self._page_to_node.get(page_idx)
+                if node is not None and node.lock_ref:
+                    node.lock_ref -= 1
 
 
 class ReqToTokenPool:
@@ -223,7 +276,7 @@ class KVCache:
 class PagePool:
     """Top-level KV cache manager.
 
-    Combines KVStorage + ReqToTokenPool + Allocator + PrefixCache.
+    Combines KVStorage + ReqToTokenPool + Allocator + RadixCache.
 
     Args:
         n_layers: Number of transformer layers.
@@ -275,11 +328,11 @@ class PagePool:
                     i * max_seq_len, (i + 1) * max_seq_len, device=device
                 )
             self._alloc: Optional[Allocator] = None
-            self._prefix: Optional[PrefixCache] = None
+            self._prefix: Optional[RadixCache] = None
         else:
             n_pages = self.n_tokens // page_size
             self._alloc = Allocator(n_pages)
-            self._prefix = PrefixCache(page_size) if page_size > 1 else None
+            self._prefix = RadixCache(page_size) if page_size > 1 else None
             if self._prefix is not None:
                 self._alloc.on_evict = self._prefix.evict
 
@@ -429,6 +482,17 @@ class PagePool:
         full_pages = len(prompt_ids) // self.page_size
         for i in range(start_logical_page, min(full_pages, len(pages))):
             self._prefix.record(pages[i], prompt_ids, i)
+
+    def task_cacheable_ids(
+        self, task_id: str, prompt_ids: List[int], output_ids: List[int]
+    ):
+        """Return the sequence whose KV entries are already materialized.
+
+        The first sampled output is produced by prompt prefill, and the last
+        sampled output has not been decoded into KV yet.  Therefore the cache
+        can safely retain the prompt plus every output except the last one.
+        """
+        return list(prompt_ids) + list(output_ids[:-1])
 
     # ---- bind for forward ----
 

@@ -164,6 +164,13 @@ class InferenceScheduler:
             while not self._stop_event.is_set():
                 finished = self._task_mgr.remove_finished_tasks(stop_ids)
                 for task in finished:
+                    if task.status == TaskStatus.FINISHED:
+                        cache.task_record_hashes(
+                            task.task_id,
+                            cache.task_cacheable_ids(
+                                task.task_id, task.prompt_ids, task.output_ids
+                            ),
+                        )
                     cache.task_free(task.task_id)
 
                 active = self._task_mgr.get_active_tasks()

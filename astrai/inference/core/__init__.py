@@ -5,7 +5,7 @@ from astrai.inference.core.cache import (
     KVCache,
     KVStorage,
     PagePool,
-    PrefixCache,
+    RadixCache,
     ReqToTokenPool,
     page_hash,
 )
@@ -18,7 +18,7 @@ __all__ = [
     "KVCache",
     "KVStorage",
     "PagePool",
-    "PrefixCache",
+    "RadixCache",
     "ReqToTokenPool",
     "page_hash",
     "Executor",
