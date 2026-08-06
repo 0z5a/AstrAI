@@ -261,6 +261,14 @@ def test_run_batch_respects_max_tokens(device):
         scheduler.stop()
 
 
+def test_run_batch_zero_max_tokens_returns_empty(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        assert scheduler.run_batch([[10, 20, 30]], max_tokens=0) == [[]]
+    finally:
+        scheduler.stop()
+
+
 def test_run_batch_stop_id_terminates(device):
     """A token matching stop_ids terminates generation for that prompt."""
     scheduler, _tok, _model = _make_real_scheduler(device)

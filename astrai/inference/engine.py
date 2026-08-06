@@ -146,6 +146,12 @@ class InferenceEngine:
         is_batch = isinstance(prompt, list)
         prompts = prompt if is_batch else [prompt]
 
+        if max_tokens is not None and max_tokens <= 0:
+            if stream:
+                return iter(())
+            results = [""] * len(prompts)
+            return results if is_batch else results[0]
+
         if stream:
             return self._generate_streaming(
                 prompts,

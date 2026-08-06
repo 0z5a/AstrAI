@@ -288,6 +288,9 @@ class InferenceScheduler:
                 t_max = seq_cap - len(ids)
             else:
                 t_max = min(t_max, seq_cap - len(ids))
+            if t_max <= 0:
+                tasks.append(None)
+                continue
             task = Task(
                 task_id=f"batch_{uuid.uuid4().hex[:8]}",
                 prompt_ids=list(ids),
