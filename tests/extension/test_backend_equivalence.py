@@ -27,9 +27,9 @@ def _ws(pool: PagePool) -> InferenceWorkspace:
 def test_training_forward_matches_torch(cuda_model):
     """Training forward (kv_cache=None) should produce identical logits.
 
-    CudaBackend is inference-only: it raises when kv_cache is None.  Training
-    must use TorchNativeBackend (the default).  Verify the torch path is
-    stable and that CudaBackend rejects the training path explicitly.
+    CudaBackend is now safe as a default: for training (``kv_cache=None``)
+    or non-bf16 inputs it falls back to torch SDPA.  Verify the fallback
+    path matches the torch-native forward exactly.
     """
     import pytest
 
@@ -39,11 +39,13 @@ def test_training_forward_matches_torch(cuda_model):
     with torch.no_grad():
         out_torch = model(input_ids)
 
-    with pytest.raises(RuntimeError, match="does not support training"):
-        with attn_backend(ATTN_BACKEND.CUDA):
-            with torch.no_grad():
-                model(input_ids)
+    with attn_backend(ATTN_BACKEND.CUDA):
+        with torch.no_grad():
+            out_cuda = model(input_ids)
 
+    torch.testing.assert_close(
+        out_cuda["logits"], out_torch["logits"], atol=1e-6, rtol=1e-6
+    )
     assert out_torch["logits"].shape[0] == 2
 
 

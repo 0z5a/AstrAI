@@ -44,6 +44,7 @@ from astrai.extension.attention_ops import (
     attn_paged_decode,
     attn_paged_prefill,
 )
+from astrai.extension.loader import is_available
 from astrai.factory import BaseFactory
 
 if TYPE_CHECKING:
@@ -136,15 +137,65 @@ class ATTN_BACKEND(enum.Enum):
     FLASH = "flash"
 
 
+_default_backend: Optional["AttentionBackend"] = None
+
+
+def _priority_backends() -> list["AttentionBackend"]:
+    """Available backends in priority order: flash -> cuda -> torch."""
+    backends: list[AttentionBackend] = []
+    if flash_attn_available():
+        backends.append(FlashAttnBackend())
+    if is_available("attn_paged_decode") and is_available("attn_paged_prefill"):
+        backends.append(CudaBackend())
+    backends.append(TorchNativeBackend())
+    return backends
+
+
+def _backend_supports(
+    backend: "AttentionBackend",
+    q: Tensor,
+    kv_cache: Optional["KVCache"],
+    attn_mask: Optional[Tensor],
+    is_causal: bool,
+) -> bool:
+    """Whether ``backend`` can run this attention call.
+
+    The CUDA kernels are bf16-only, support head_dim in 32/64/128/256, and
+    need a KV cache (decode/prefill); everything else falls back to torch.
+    """
+    if isinstance(backend, CudaBackend):
+        return (
+            kv_cache is not None
+            and q.dtype == torch.bfloat16
+            and q.size(-1) in (32, 64, 128, 256)
+        )
+    if isinstance(backend, FlashAttnBackend):
+        return flash_attn_available() and not (attn_mask is not None and not is_causal)
+    return True
+
+
+def _resolve_default_backend() -> "AttentionBackend":
+    """Pick the highest-priority available backend: flash -> cuda -> torch.
+
+    Resolved lazily on first ``get_backend()`` (flash/cuda availability is
+    checked once and cached).  Per-call capability fallback happens in
+    ``attention()``, so this default is safe for training and fp32 models.
+    """
+    return _priority_backends()[0]
+
+
 def get_backend() -> "AttentionBackend":
     """Return the active backend for the current thread/context.
 
-    Falls back to a ``TorchNativeBackend`` singleton when no backend
-    has been activated via ``with``.
+    Falls back to the highest-priority available backend (flash -> cuda ->
+    torch_native) when no backend has been activated via ``with``.
     """
     try:
         return _current_backend.get()
     except LookupError:
+        global _default_backend
+        if _default_backend is None:
+            _default_backend = _resolve_default_backend()
         return _default_backend
 
 
@@ -225,6 +276,16 @@ def attention(
         [batch, q_len, n_heads * head_dim]
     """
     backend = get_backend()
+    if not _backend_supports(backend, q, kv_cache, attn_mask, is_causal):
+        # The active backend cannot run this call (e.g. CUDA on a training /
+        # fp32 / unsupported-head_dim input) — fall back to the highest-
+        # priority backend that can, ending at torch SDPA.
+        for candidate in _priority_backends():
+            if isinstance(candidate, type(backend)):
+                continue
+            if _backend_supports(candidate, q, kv_cache, attn_mask, is_causal):
+                backend = candidate
+                break
     return backend.forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
 
 
@@ -393,7 +454,7 @@ class TorchNativeBackend(AttentionBackend):
         return out
 
 
-_default_backend = TorchNativeBackend()
+_default_backend = None
 
 
 @AttentionBackendFactory.register(ATTN_BACKEND.CUDA.value)
@@ -407,8 +468,9 @@ class CudaBackend(AttentionBackend):
     ``attn_paged_prefill`` with ragged-batch support via qo_indptr +
     kv_indptr.
 
-    ``kv_cache is None`` (training) is not handled — use
-    ``TorchNativeBackend`` for training.
+    ``kv_cache is None`` (training) raises — the per-call fallback to
+    torch SDPA for training / fp32 / unsupported head_dim happens in the
+    ``attention()`` entry point.
 
     Raises ``RuntimeError`` if the required kernel is not available.
     """
@@ -426,8 +488,9 @@ class CudaBackend(AttentionBackend):
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
-        kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
-        kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
+        loc = kv_cache.out_cache_loc[:, 0]
+        kv_cache.k_buffer[layer_id].index_copy_(0, loc, k[:, 0])
+        kv_cache.v_buffer[layer_id].index_copy_(0, loc, v[:, 0])
 
         b = q.size(0)
         q_3d = q.squeeze(1)
@@ -461,8 +524,13 @@ class CudaBackend(AttentionBackend):
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
-        kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
-        kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
+        loc = kv_cache.out_cache_loc.reshape(-1)
+        kv_cache.k_buffer[layer_id].index_copy_(
+            0, loc, k.reshape(-1, k.size(2), k.size(3))
+        )
+        kv_cache.v_buffer[layer_id].index_copy_(
+            0, loc, v.reshape(-1, v.size(2), v.size(3))
+        )
 
         b = q.size(0)
         q_len = q.size(1)
