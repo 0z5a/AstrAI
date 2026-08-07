@@ -54,6 +54,9 @@ jobs:
       - name: Build wheel (with CUDA kernels)
         run: |
           CSRC_KERNELS=true pip wheel . --no-deps --no-build-isolation -w dist/
+          for f in dist/*.whl; do
+            mv "$f" "dist/$(basename "$f" .whl)+${{ matrix.cuda_tag }}.whl"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
