@@ -25,19 +25,49 @@ function (pure ``record -> Dict[str, Tensor]``) is forwarded to
 
 from abc import ABC, abstractmethod
 from functools import partial
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from astrai.config.preprocess_config import PipelineConfig
 from astrai.dataset.storage import (
     Store,
     StoreFactory,
     detect_format,
 )
 from astrai.factory import BaseFactory
+from astrai.preprocessing.transform import TokenizeTransform
 from astrai.tokenize import AutoTokenizer
+
+_DEFAULT_MESSAGES_CONFIG = {
+    "version": 1,
+    "input": {"sections": [{"field": "messages", "action": "$role", "template": True}]},
+    "mask": {"system": "mask", "user": "mask", "assistant": "train"},
+    "mask_default": "mask",
+    "output": {"position_ids_mode": "doc_reset"},
+}
+
+
+def _build_jsonl_transform(
+    path: str, tokenizer_path: Optional[str] = None
+) -> Optional["TokenizeTransform"]:
+    """Auto-build a TokenizeTransform for JSONL eager loading.
+
+    Reads ``dataset_config.json`` from the data dir if present, or
+    falls back to the built-in chatml SFT config when *tokenizer_path*
+    is provided.
+    """
+    root = Path(path)
+    config_path = root / "dataset_config.json" if root.is_dir() else None
+    if config_path is not None and config_path.exists():
+        return TokenizeTransform.from_config_file(str(config_path))
+    if tokenizer_path:
+        config = PipelineConfig.from_dict(_DEFAULT_MESSAGES_CONFIG)
+        return TokenizeTransform(config, tokenizer_path)
+    return None
 
 
 def dpo_tokenize(
@@ -349,16 +379,18 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
         )
         if processor is not None:
             store.load(load_path, processor=processor, **kwargs)
+        elif storage_type == "jsonl":
+            transform = _build_jsonl_transform(load_path, tokenizer_path)
+            if transform is None:
+                raise FileNotFoundError(
+                    f"JSONL dataset config not found. Expected "
+                    f"dataset_config.json alongside *.jsonl files, pass "
+                    f"tokenizer_path= for the built-in messages config, or "
+                    f"use processor= for lazy on-the-fly tokenisation."
+                )
+            store.load(load_path, transform=transform, **kwargs)
         else:
-            load_kwargs = dict(kwargs)
-            if (
-                tokenizer_path is not None
-                and storage_type == "jsonl"
-                and train_type in ("seq", "sft")
-                and "tokenizer_path" not in load_kwargs
-            ):
-                load_kwargs["tokenizer_path"] = tokenizer_path
-            store.load(load_path, **load_kwargs)
+            store.load(load_path, **kwargs)
 
         return cls.create(train_type, store=store)
 

@@ -9,6 +9,7 @@ import torch
 from astrai.dataset.dataset import (
     DatasetFactory,
     GRPODataset,
+    _build_jsonl_transform,
     dpo_tokenize,
     grpo_collate_fn,
 )
@@ -525,7 +526,7 @@ def test_json_store_seq(base_test_env):
     )
 
     store = StoreFactory.create("jsonl")
-    store.load(data_dir)
+    store.load(data_dir, transform=_build_jsonl_transform(data_dir))
     assert len(store) > 0
     assert "sequence" in store.keys
 
@@ -580,7 +581,7 @@ def test_json_store_no_tokenizer_path(base_test_env):
         json.dump(config, f, ensure_ascii=False, indent=2)
 
     store = StoreFactory.create("jsonl")
-    store.load(data_dir)
+    store.load(data_dir, transform=_build_jsonl_transform(data_dir))
     assert len(store) > 0
     assert "sequence" in store.keys
     assert "loss_mask" in store.keys
@@ -597,7 +598,7 @@ def test_jsonl_store_seq(base_test_env):
     )
 
     store = StoreFactory.create("jsonl")
-    store.load(data_dir)
+    store.load(data_dir, transform=_build_jsonl_transform(data_dir))
     assert len(store) > 0
     assert "sequence" in store.keys
 
@@ -638,7 +639,7 @@ def test_jsonl_store_sft(base_test_env):
     )
 
     store = StoreFactory.create("jsonl")
-    store.load(data_dir)
+    store.load(data_dir, transform=_build_jsonl_transform(data_dir))
     assert "sequence" in store.keys
     assert "loss_mask" in store.keys
     assert "position_ids" in store.keys
@@ -1085,7 +1086,7 @@ def test_jsonl_store_eager_len_returns_token_count(base_test_env):
     )
 
     store = JsonlStore()
-    store.load(data_dir)
+    store.load(data_dir, transform=_build_jsonl_transform(data_dir))
 
     assert store.num_records == 2
     assert len(store.keys) > 0

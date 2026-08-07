@@ -55,9 +55,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from astrai.config.preprocess_config import PipelineConfig
 from astrai.factory import BaseFactory
-from astrai.preprocessing.transform import TokenizeTransform
 from astrai.serialization import (
     load_bin,
     load_bin_offsets,
@@ -536,18 +534,7 @@ class JsonlStore(Store, Streamable, Recordable):
       ``len(store)`` returns ``num_records``; stream primitives raise.
     """
 
-    CONFIG_NAME = "dataset_config.json"
     segments_are_records = True
-
-    _DEFAULT_MESSAGES_CONFIG = {
-        "version": 1,
-        "input": {
-            "sections": [{"field": "messages", "action": "$role", "template": True}]
-        },
-        "mask": {"system": "mask", "user": "mask", "assistant": "train"},
-        "mask_default": "mask",
-        "output": {"position_ids_mode": "doc_reset"},
-    }
 
     def __init__(
         self,
@@ -569,22 +556,10 @@ class JsonlStore(Store, Streamable, Recordable):
             return
 
         if transform is None:
-            root = Path(path)
-            config_path = root / self.CONFIG_NAME if root.is_dir() else None
-            if config_path is not None and config_path.exists():
-                transform = TokenizeTransform.from_config_file(str(config_path))
-            else:
-                tokenizer_path = kwargs.get("tokenizer_path")
-                if not tokenizer_path:
-                    raise FileNotFoundError(
-                        f"JSONL dataset config not found. Expected "
-                        f"{self.CONFIG_NAME} alongside *.jsonl files, pass an "
-                        f"explicit transform, pass processor= for lazy "
-                        f"on-the-fly tokenisation, or pass tokenizer_path= to "
-                        f"use the built-in messages config."
-                    )
-                config = PipelineConfig.from_dict(self._DEFAULT_MESSAGES_CONFIG)
-                transform = TokenizeTransform(config, tokenizer_path)
+            raise ValueError(
+                "JsonlStore eager mode requires transform=. "
+                "Use DatasetFactory.load() which auto-constructs it."
+            )
 
         transformed = transform.apply(records)
         self._normalize(transformed)
