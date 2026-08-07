@@ -5,6 +5,7 @@ import torch
 
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.transformer import AutoRegressiveLM
+from tests.conftest import skip_no_kernel  # noqa: F401 re-export for test modules
 
 D = 64
 CFG = dict(

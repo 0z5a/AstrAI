@@ -111,7 +111,7 @@ struct PagedKV {
         return p.max_q_len;
     }
     HOST_DEV_FORCEINLINE int host_kv_len(const AttentionParams<bf16>& p) {
-        return p.max_seq_len;
+        return p.max_context_len;
     }
 
     // prefill: Q rows start at qo_indptr[batch] (ragged batch base)
