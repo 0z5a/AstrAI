@@ -21,7 +21,6 @@ from astrai.dataset import (
 )
 from astrai.factory import BaseFactory
 from astrai.inference import (
-    GenerationRequest,
     InferenceEngine,
     ProtocolHandler,
     SamplingPipeline,
@@ -98,7 +97,6 @@ __all__ = [
     "EmbeddingEncoder",
     "EncoderConfig",
     "ExecutorFactory",
-    "GenerationRequest",
     "InferenceEngine",
     "LoRAConfig",
     "Pipeline",

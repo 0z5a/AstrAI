@@ -22,7 +22,8 @@ Usage — mirroring ``torch.nn.attention.sdpa_kernel``:
 
 Thread-safe via ``contextvars`` — each scheduler thread gets its own
 active backend. ``get_backend()`` returns the active one, falling back
-to a process-wide ``TorchNativeBackend`` singleton.
+to a process-wide default (cuda > flash > torch, overridable via
+``ASTR_BACKEND``).
 
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 (blhd). The backend returns ``[batch, seq_len, n_heads * head_dim]``.
@@ -30,8 +31,9 @@ Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 
 import contextvars
 import enum
+import functools
 import importlib
-import threading
+import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Union
@@ -54,60 +56,15 @@ _current_backend: contextvars.ContextVar["AttentionBackend"] = contextvars.Conte
     "attn_backend"
 )
 
-_lock = threading.Lock()
-_flash_available: Optional[bool] = None
 
-
+@functools.lru_cache(maxsize=1)
 def flash_attn_available() -> bool:
-    """Return ``True`` if the optional ``flash-attn`` package is usable.
-
-    ``flash-attn`` is not a hard dependency (declared only as an optional
-    extra and imported lazily), so this is checked at first use and cached.
-    The check is stronger than "import works": it also gates on the GPU
-    compute capability for the installed major version and smoke-tests a
-    real tiny kernel call, because wheels that import fine can still fail
-    at the first actual invocation (wrong arch build, torch mismatch, or a
-    missing ``flash_attn_func`` entry point).  It never raises.
-    """
-    global _flash_available
-    if _flash_available is None:
-        with _lock:
-            if _flash_available is None:
-                _flash_available = _flash_attn_check()
-    return _flash_available
-
-
-_flash_attn_module = None
-_flash_attn_import_tried = False
-
-
-def _get_flash_attn():
-    """Lazily import and cache the optional ``flash_attn`` module.
-
-    Uses ``importlib.import_module`` so no static import binds the name when
-    the package is absent.  Returns the module object, or ``None`` if the
-    package is not installed or cannot be imported.  Never raises.
-    """
-    global _flash_attn_module, _flash_attn_import_tried
-    if not _flash_attn_import_tried:
-        _flash_attn_import_tried = True
-        try:
-            _flash_attn_module = importlib.import_module("flash_attn")
-        except Exception:
-            _flash_attn_module = None
-    return _flash_attn_module
-
-
-def _flash_attn_check() -> bool:
     if not torch.cuda.is_available():
         return False
     fa = _get_flash_attn()
     if fa is None:
         return False
 
-    # version + compute-capability gate:
-    #   FlashAttention-2 kernels need sm_70+; FlashAttention-3 (tcgen05,
-    #   sm_90/sm_100) needs sm_90+.
     try:
         major = int(fa.__version__.split(".")[0])
         cc = torch.cuda.get_device_capability()
@@ -117,8 +74,6 @@ def _flash_attn_check() -> bool:
     if (major >= 3 and cc_num < 90) or (major < 3 and 0 < cc_num < 70):
         return False
 
-    # smoke-test the real kernel: a wheel that imports but was built for a
-    # different arch/torch fails here instead of at the first real forward.
     try:
         if not hasattr(fa, "flash_attn_func"):
             return False
@@ -127,6 +82,14 @@ def _flash_attn_check() -> bool:
         return bool(torch.isfinite(out).all().item())
     except Exception:
         return False
+
+
+@functools.lru_cache(maxsize=1)
+def _get_flash_attn():
+    try:
+        return importlib.import_module("flash_attn")
+    except Exception:
+        return None
 
 
 class ATTN_BACKEND(enum.Enum):
@@ -141,12 +104,12 @@ _default_backend: Optional["AttentionBackend"] = None
 
 
 def _priority_backends() -> list["AttentionBackend"]:
-    """Available backends in priority order: flash -> cuda -> torch."""
+    """Available backends in priority order: cuda -> flash -> torch."""
     backends: list[AttentionBackend] = []
-    if flash_attn_available():
-        backends.append(FlashAttnBackend())
     if is_available("attn_paged_decode") and is_available("attn_paged_prefill"):
         backends.append(CudaBackend())
+    if flash_attn_available():
+        backends.append(FlashAttnBackend())
     backends.append(TorchNativeBackend())
     return backends
 
@@ -179,20 +142,31 @@ def _backend_supports(
 
 
 def _resolve_default_backend() -> "AttentionBackend":
-    """Pick the highest-priority available backend: flash -> cuda -> torch.
+    """Pick the highest-priority available backend (cuda -> flash -> torch).
 
-    Resolved lazily on first ``get_backend()`` (flash/cuda availability is
-    checked once and cached).  Per-call capability fallback happens in
-    ``attention()``, so this default is safe for training and fp32 models.
+    Set ``ASTR_BACKEND`` to override: ``ASTR_BACKEND=cuda``, ``torch_native``,
+    or ``flash``.  The value is the registered name (same as the
+    ``ATTN_BACKEND`` enum value).
+
+    Resolved lazily on first ``get_backend()`` and cached.  Per-call
+    capability fallback happens in ``attention()``, so the default is
+    safe for training and fp32 models.
     """
+    forced = os.environ.get("ASTR_BACKEND", "").strip().lower()
+    if forced:
+        try:
+            return AttentionBackendFactory.create(forced)
+        except (ValueError, RuntimeError):
+            pass
     return _priority_backends()[0]
 
 
 def get_backend() -> "AttentionBackend":
     """Return the active backend for the current thread/context.
 
-    Falls back to the highest-priority available backend (flash -> cuda ->
-    torch_native) when no backend has been activated via ``with``.
+    Falls back to the highest-priority available backend (cuda -> flash ->
+    torch_native) when no backend has been activated via ``with``.  Set
+    ``ASTR_BACKEND`` to override the default.
     """
     try:
         return _current_backend.get()
@@ -250,6 +224,28 @@ def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
         .expand(bs, slen, n_heads, n_rep, head_dim)
         .reshape(bs, slen, n_heads * n_rep, head_dim)
     )
+
+
+def _write_and_gather_kv(
+    kv_cache: "KVCache",
+    k: Tensor,
+    v: Tensor,
+    layer_id: int,
+    q: Tensor,
+    attn_mask: Optional[Tensor],
+) -> tuple[Tensor, Tensor]:
+    kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
+    kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
+    max_len = kv_cache.max_len
+    indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
+    if q.size(1) == 1 and attn_mask is not None and attn_mask.dim() == 4:
+        pos_mask = attn_mask[:, 0, 0]
+    else:
+        pos_mask = (
+            torch.arange(max_len, device=q.device)[None, :] < kv_cache.seq_lens[:, None]
+        )
+    indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
+    return kv_cache.k_buffer[layer_id, indices], kv_cache.v_buffer[layer_id, indices]
 
 
 def attention(
@@ -371,6 +367,17 @@ class AttentionBackend(ABC):
     ) -> Tensor:
         """Multi-token prefill or training forward."""
 
+    @staticmethod
+    def supports_graph() -> bool:
+        """Return True if this backend supports CUDA-graph capture.
+
+        Override in subclasses that can run under ``torch.cuda.graph``.
+
+        Called on the *active* backend instance (or its class) — a cheap
+        boolean check with no side-effects.
+        """
+        return False
+
 
 class AttentionBackendFactory(BaseFactory[AttentionBackend]):
     """Factory for registered attention backends."""
@@ -427,24 +434,7 @@ class TorchNativeBackend(AttentionBackend):
         is_causal: bool = False,
     ) -> Tensor:
         if kv_cache is not None:
-            kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
-            kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
-
-            max_len = kv_cache.max_len
-            indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
-            # Zero out padding positions so gather never touches invalid slots.
-            # Decode: attn_mask[:,0,0] is exactly the per-position validity
-            # mask ([B, max_len], True=keep).  Prefill: fall back to seq_lens.
-            if q.size(1) == 1 and attn_mask is not None and attn_mask.dim() == 4:
-                pos_mask = attn_mask[:, 0, 0]
-            else:
-                pos_mask = (
-                    torch.arange(max_len, device=q.device)[None, :]
-                    < kv_cache.seq_lens[:, None]
-                )
-            indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
-            k = kv_cache.k_buffer[layer_id, indices]
-            v = kv_cache.v_buffer[layer_id, indices]
+            k, v = _write_and_gather_kv(kv_cache, k, v, layer_id, q, attn_mask)
 
         n_rep = q.size(2) // k.size(2)
         if n_rep > 1:
@@ -460,9 +450,6 @@ class TorchNativeBackend(AttentionBackend):
         )
         out = out.permute(0, 2, 1, 3).contiguous().flatten(2)
         return out
-
-
-_default_backend = None
 
 
 @AttentionBackendFactory.register(ATTN_BACKEND.CUDA.value)
@@ -487,10 +474,15 @@ class CudaBackend(AttentionBackend):
     def supports(**kwargs) -> bool:
         head_dim = kwargs.get("head_dim", -1)
         return (
-            head_dim in (32, 64, 128, 256)
+            torch.cuda.is_available()
+            and head_dim in (32, 64, 128, 256)
             and is_available("attn_paged_decode")
             and is_available("attn_paged_prefill")
         )
+
+    @staticmethod
+    def supports_graph() -> bool:
+        return True
 
     def fwd_decode(
         self,
@@ -572,12 +564,6 @@ class CudaBackend(AttentionBackend):
         return out.reshape(b, q_len, q.size(2), q.size(3)).flatten(2)
 
 
-def _kv_cache_is_contiguous(kv_cache: "KVCache") -> bool:
-    return kv_cache.k_buffer.size(1) == kv_cache.req_to_token.size(
-        0
-    ) * kv_cache.req_to_token.size(1)
-
-
 @AttentionBackendFactory.register(ATTN_BACKEND.FLASH.value)
 class FlashAttnBackend(AttentionBackend):
     """FlashAttention backend via the optional ``flash-attn`` package.
@@ -629,24 +615,11 @@ class FlashAttnBackend(AttentionBackend):
         is_causal: bool = False,
     ) -> Tensor:
         if kv_cache is not None:
-            if q.size(1) == 1 and _kv_cache_is_contiguous(kv_cache):
+            if q.size(1) == 1 and kv_cache.k_buffer.size(
+                1
+            ) == kv_cache.req_to_token.size(0) * kv_cache.req_to_token.size(1):
                 return self._decode_with_kvcache(q, k, v, kv_cache, layer_id)
-
-            kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
-            kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
-
-            max_len = kv_cache.max_len
-            indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
-            if q.size(1) == 1 and attn_mask is not None and attn_mask.dim() == 4:
-                pos_mask = attn_mask[:, 0, 0]
-            else:
-                pos_mask = (
-                    torch.arange(max_len, device=q.device)[None, :]
-                    < kv_cache.seq_lens[:, None]
-                )
-            indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
-            k = kv_cache.k_buffer[layer_id, indices]
-            v = kv_cache.v_buffer[layer_id, indices]
+            k, v = _write_and_gather_kv(kv_cache, k, v, layer_id, q, attn_mask)
 
         n_rep = q.size(2) // k.size(2)
         if n_rep > 1:

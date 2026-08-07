@@ -179,9 +179,7 @@ class Executor:
         max_q_heads = config.num_attention_heads
         head_dim = config.hidden_size // config.num_attention_heads
         self._head_dim = head_dim
-        self._graph_supported = CudaBackend.supports(
-            head_dim=head_dim
-        ) and "cuda" in str(self.device)
+        self._graph_supported = CudaBackend.supports(head_dim=head_dim)
         self._workspace = InferenceWorkspace(
             max_batch_size=kv_cache.max_batch_size,
             max_seq_len=kv_cache.max_seq_len,
@@ -367,7 +365,7 @@ class Executor:
         use_graph = (
             self._graph_ctx.enabled
             and self._graph_supported
-            and isinstance(get_backend(), CudaBackend)
+            and get_backend().supports_graph()
         )
         key = (b,)
         if use_graph:

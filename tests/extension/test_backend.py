@@ -19,12 +19,13 @@ def test_default_backend_is_torch_native():
     """Default is the highest-priority available backend (flash > cuda > torch)."""
     from astrai.extension.attention_backend import (
         CudaBackend,
+        FlashAttnBackend,
         TorchNativeBackend,
         _resolve_default_backend,
     )
 
     backend = get_backend()
-    assert isinstance(backend, (CudaBackend, TorchNativeBackend))
+    assert isinstance(backend, (CudaBackend, FlashAttnBackend, TorchNativeBackend))
     assert isinstance(backend, type(_resolve_default_backend()))
 
 

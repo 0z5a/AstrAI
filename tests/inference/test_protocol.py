@@ -8,7 +8,6 @@ import pytest
 from astrai.inference.api.anthropic import AnthropicResponseBuilder
 from astrai.inference.api.openai import OpenAIResponseBuilder
 from astrai.inference.api.protocol import GenContext, StopChecker, StopInfo
-from astrai.inference.engine import GenerationRequest
 
 
 def _make_ctx(**kwargs):
@@ -255,32 +254,3 @@ class TestAnthropicResponseBuilder:
         resp = builder.format_response(ctx, "full text", stop)
         assert resp["content"][0]["text"] == "full text"
         assert resp["stop_reason"] == "end_turn"
-
-
-class TestGenerationRequestValidation:
-    def test_valid_params(self):
-        gr = GenerationRequest(
-            messages=[{"role": "user", "content": "hi"}],
-            top_k=50,
-            top_p=0.9,
-            temperature=0.7,
-        )
-        assert gr.top_k == 50
-
-    def test_invalid_top_p_raises(self):
-        with pytest.raises(ValueError, match="top_p"):
-            GenerationRequest(messages=[{"role": "user", "content": "hi"}], top_p=1.5)
-
-    def test_invalid_top_k_raises(self):
-        with pytest.raises(ValueError, match="top_k"):
-            GenerationRequest(messages=[{"role": "user", "content": "hi"}], top_k=-1)
-
-    def test_invalid_temperature_raises(self):
-        with pytest.raises(ValueError, match="temperature"):
-            GenerationRequest(
-                messages=[{"role": "user", "content": "hi"}], temperature=-0.1
-            )
-
-    def test_top_k_zero_valid(self):
-        gr = GenerationRequest(messages=[{"role": "user", "content": "hi"}], top_k=0)
-        assert gr.top_k == 0

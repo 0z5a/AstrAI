@@ -5,7 +5,7 @@ Layers:
   - api/:         HTTP orchestration (ProtocolHandler, server)
   - protocols/:   Response builders (OpenAI, Anthropic)
   - transport/:   SSE transport utilities
-  - engine.py:    Facade (InferenceEngine), Value Object (GenerationRequest)
+  - engine.py:    Facade (InferenceEngine)
   - sample.py:    Strategy pattern (TemperatureStrategy, TopKStrategy, TopPStrategy, FrequencyPenaltyStrategy)
 """
 
@@ -42,7 +42,7 @@ from astrai.inference.core import (
     TaskStatus,
     page_hash,
 )
-from astrai.inference.engine import GenerationRequest, InferenceEngine
+from astrai.inference.engine import InferenceEngine
 from astrai.inference.sample import (
     BaseSamplingStrategy,
     FrequencyPenaltyStrategy,
@@ -55,7 +55,6 @@ from astrai.inference.sample import (
 
 __all__ = [
     "InferenceEngine",
-    "GenerationRequest",
     "InferenceScheduler",
     "Executor",
     "STOP",

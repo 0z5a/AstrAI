@@ -64,44 +64,6 @@ class GenerateResult:
             return self.results.copy()
 
 
-class GenerationRequest:
-    """Request parameters for text generation."""
-
-    def __init__(
-        self,
-        messages: List[Dict[str, str]],
-        top_k: int = 50,
-        top_p: float = 1.0,
-        temperature: float = 1.0,
-        max_tokens: Optional[int] = None,
-        frequency_penalty: float = 0.0,
-        rep_window: int = 64,
-        stream: bool = False,
-    ):
-        if not (isinstance(top_k, int) and top_k >= 0):
-            raise ValueError("top_k must be a non-negative integer")
-        if not (0.0 <= top_p <= 1.0):
-            raise ValueError("top_p must be a float between 0.0 and 1.0")
-        if not (isinstance(temperature, (int, float)) and temperature >= 0):
-            raise ValueError("temperature must be a non-negative number")
-        if not (
-            isinstance(frequency_penalty, (int, float))
-            and -2.0 <= frequency_penalty <= 2.0
-        ):
-            raise ValueError("frequency_penalty must be between -2.0 and 2.0")
-        if not (isinstance(rep_window, int) and rep_window > 0):
-            raise ValueError("rep_window must be a positive integer")
-
-        self.messages = messages
-        self.top_k = top_k
-        self.top_p = top_p
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.frequency_penalty = frequency_penalty
-        self.rep_window = rep_window
-        self.stream = stream
-
-
 class InferenceEngine:
     """Unified inference engine backed by continuous-batching scheduler."""
 
@@ -152,28 +114,17 @@ class InferenceEngine:
             results = [""] * len(prompts)
             return results if is_batch else results[0]
 
-        if stream:
-            return self._generate_streaming(
-                prompts,
-                is_batch,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                frequency_penalty,
-                rep_window,
-            )
-        else:
-            return self._generate_non_streaming(
-                prompts,
-                is_batch,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                frequency_penalty,
-                rep_window,
-            )
+        return self._generate(
+            prompts,
+            is_batch,
+            stream,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            rep_window,
+        )
 
     def generate_async(
         self,
@@ -185,9 +136,10 @@ class InferenceEngine:
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
     ) -> AsyncGenerator[str, None]:
-        sync_gen = self._generate_streaming(
+        sync_gen = self._generate(
             [prompt],
             False,
+            True,
             max_tokens,
             temperature,
             top_p,
@@ -199,51 +151,30 @@ class InferenceEngine:
         async def _agen():
             loop = asyncio.get_event_loop()
             while True:
-                token = await loop.run_in_executor(None, self._next_token, sync_gen)
-                if token is None:
+                try:
+                    token = await loop.run_in_executor(None, next, sync_gen)
+                except StopIteration:
                     break
                 yield token
 
         return _agen()
 
-    @staticmethod
-    def _next_token(gen: Generator) -> Optional[str]:
-        try:
-            return next(gen)
-        except StopIteration:
-            return None
-
-    def generate_with_request(
-        self, request: GenerationRequest
-    ) -> Union[Generator[str, None, None], str, List[str]]:
-        prompt = self.tokenizer.apply_chat_template(request.messages, tokenize=False)
-        return self.generate(
-            prompt=prompt,
-            stream=request.stream,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            frequency_penalty=request.frequency_penalty,
-            rep_window=request.rep_window,
-        )
-
-    def _submit_tasks(
+    def _generate(
         self,
         prompts: List[str],
+        is_batch: bool,
+        stream: bool,
         max_tokens: Optional[int],
         temperature: float,
         top_p: float,
         top_k: int,
         frequency_penalty: float,
         rep_window: int,
-    ) -> Tuple[GenerateResult, List[str]]:
+    ) -> Union[Generator, str, List[str]]:
         n = len(prompts)
         result = GenerateResult(count=n)
-        task_ids = []
-        for i, p in enumerate(prompts):
-            cb = self._make_callback(result, i)
-            task_id = self.scheduler.add_task(
+        task_ids = [
+            self.scheduler.add_task(
                 prompt=p,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -251,39 +182,23 @@ class InferenceEngine:
                 top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
-                stream_callback=cb,
+                stream_callback=lambda token, idx=i: result.append(token, idx),
             )
-            task_ids.append(task_id)
-        return result, task_ids
+            for i, p in enumerate(prompts)
+        ]
 
-    @staticmethod
-    def _make_callback(result: GenerateResult, idx: int):
-        def cb(token):
-            result.append(token, idx)
+        if not stream:
+            try:
+                result.wait_completion()
+            except TimeoutError:
+                for tid in task_ids:
+                    self.scheduler.remove_task(tid)
+                raise
+            for tid in task_ids:
+                self.scheduler.remove_task(tid)
+            res = result.get_results()
+            return res if is_batch else res[0]
 
-        return cb
-
-    def _generate_streaming(
-        self,
-        prompts: List[str],
-        is_batch: bool,
-        max_tokens: Optional[int],
-        temperature: float,
-        top_p: float,
-        top_k: int,
-        frequency_penalty: float,
-        rep_window: int,
-    ) -> Generator:
-        result, task_ids = self._submit_tasks(
-            prompts,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            frequency_penalty,
-            rep_window,
-        )
-        n = len(prompts)
         remaining = n
         finished = [False] * n
 
@@ -306,40 +221,6 @@ class InferenceEngine:
                     self.scheduler.remove_task(tid)
 
         return gen()
-
-    def _generate_non_streaming(
-        self,
-        prompts: List[str],
-        is_batch: bool,
-        max_tokens: Optional[int],
-        temperature: float,
-        top_p: float,
-        top_k: int,
-        frequency_penalty: float,
-        rep_window: int,
-    ) -> Union[str, List[str]]:
-        result, task_ids = self._submit_tasks(
-            prompts,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            frequency_penalty,
-            rep_window,
-        )
-
-        try:
-            result.wait_completion()
-        except TimeoutError:
-            for tid in task_ids:
-                self.scheduler.remove_task(tid)
-            raise
-
-        for tid in task_ids:
-            self.scheduler.remove_task(tid)
-
-        res = result.get_results()
-        return res if is_batch else res[0]
 
     def get_stats(self) -> Dict[str, Any]:
         return self.scheduler.get_stats()
