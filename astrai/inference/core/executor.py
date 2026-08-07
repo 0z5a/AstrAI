@@ -5,7 +5,12 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 
-from astrai.extension.attention_backend import CudaBackend, get_backend
+from astrai.extension.attention_backend import (
+    ATTN_BACKEND,
+    CudaBackend,
+    attn_backend,
+    get_backend,
+)
 from astrai.inference.core.cache import PagePool
 from astrai.inference.core.graph import CudaGraphContext
 from astrai.inference.core.task import Task
@@ -53,6 +58,71 @@ def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
     )
 
 
+def _warmup_cuda_graphs(
+    model: AutoModel,
+    pool: PagePool,
+    ws: InferenceWorkspace,
+    gctx: "CudaGraphContext",
+    max_batch_size: int,
+    prompt_len: int = 32,
+    device: Optional[str] = None,
+):
+    batch_sizes = [1]
+    n = 2
+    while n <= max_batch_size:
+        batch_sizes.append(n)
+        n *= 2
+    if max_batch_size not in batch_sizes:
+        batch_sizes.append(max_batch_size)
+
+    dev = device or next(model.parameters()).device
+
+    for b in batch_sizes:
+        task_ids = [f"_gr_{b}_{i}" for i in range(b)]
+        prompt_tokens = [list(range(prompt_len)) for _ in range(b)]
+        alloc_ok = True
+        for tid, pt in zip(task_ids, prompt_tokens):
+            if not pool.task_alloc(tid, pt):
+                alloc_ok = False
+                break
+        if not alloc_ok:
+            for tid in task_ids:
+                pool.task_free(tid)
+            continue
+
+        with torch.inference_mode(), attn_backend(ATTN_BACKEND.CUDA):
+            kv_cache = pool.bind_tasks(task_ids, ws, start_pos=0)
+            ids_in = torch.tensor(prompt_tokens, dtype=torch.long, device=dev)
+            pos_in = torch.arange(prompt_len, device=dev).unsqueeze(0).expand(b, -1)
+            model(
+                ids_in,
+                input_mask=pos_in.unsqueeze(-1) >= torch.arange(prompt_len, device=dev),
+                kv_cache=kv_cache,
+                position_ids=pos_in,
+            )
+
+            for step in range(2):
+                seq_pos = prompt_len + step
+                ws.position_ids[:b] = seq_pos
+                for tid in task_ids:
+                    pool.task_extend(tid, seq_pos)
+                kv = pool.bind_tasks(task_ids, ws)
+                input_mask = ws.decode_mask(ws.position_ids[:b], ws.max_seq_len)
+                ids_buf = ws.fill_input_ids([step] * b)
+                gctx.forward(
+                    model,
+                    key=(b,),
+                    input_ids=ids_buf.unsqueeze(1),
+                    input_mask=input_mask,
+                    kv_cache=kv,
+                    position_ids=ws.position_ids[:b].unsqueeze(1),
+                )
+
+        for tid in task_ids:
+            pool.task_free(tid)
+        torch.cuda.synchronize()
+
+
 class Executor:
     """Model forward passes for prefill and decode phases."""
 
@@ -92,11 +162,30 @@ class Executor:
             dtype=self.dtype,
         )
 
-        # CUDA-graph capture: one graph per (batch_size, total_len) key.
-        # The graph captures model.forward() with fixed-address workspace
-        # inputs.  Before each replay, input content is updated in-place so
-        # the graph sees fresh token IDs / positions / KV metadata.
+        # CUDA-graph capture: one graph per (batch_size,) key.
+        # Enabled at init-time via _warmup_cuda_graphs for CudaBackend
+        # on supported head_dims; left disabled otherwise.
         self._graph_ctx = CudaGraphContext()
+        self._try_enable_cuda_graph()
+
+    def _try_enable_cuda_graph(self):
+        on_cuda = "cuda" in str(self.device)
+        head_dim = (
+            self.model.config.hidden_size // self.model.config.num_attention_heads
+        )
+        if not on_cuda or head_dim not in (32, 64, 128, 256):
+            return
+
+        self._graph_ctx.set_enabled(True)
+        _warmup_cuda_graphs(
+            self.model,
+            self.kv_cache,
+            self._workspace,
+            self._graph_ctx,
+            max_batch_size=self.kv_cache.max_batch_size,
+            prompt_len=32,
+            device=self.device,
+        )
 
     def _sample_logits(
         self,
@@ -253,19 +342,32 @@ class Executor:
             and "cuda" in str(self.device)
             and isinstance(get_backend(), CudaBackend)
         )
+        if use_graph:
+            head_dim = (
+                self.model.config.hidden_size // self.model.config.num_attention_heads
+            )
+            use_graph = use_graph and head_dim in (32, 64, 128, 256)
         key = (b,)
         if use_graph:
             input_mask = ws.decode_mask(ws.position_ids[:b], ws.max_seq_len)
 
         with torch.inference_mode():
-            outputs = self._graph_ctx.forward(
-                self.model,
-                key=key,
-                input_ids=input_ids.unsqueeze(1),
-                input_mask=input_mask,
-                kv_cache=kv_cache,
-                position_ids=ws.position_ids[:b].unsqueeze(1),
-            )
+            if use_graph:
+                outputs = self._graph_ctx.forward(
+                    self.model,
+                    key=key,
+                    input_ids=input_ids.unsqueeze(1),
+                    input_mask=input_mask,
+                    kv_cache=kv_cache,
+                    position_ids=ws.position_ids[:b].unsqueeze(1),
+                )
+            else:
+                outputs = self.model(
+                    input_ids.unsqueeze(1),
+                    input_mask=input_mask,
+                    kv_cache=kv_cache,
+                    position_ids=ws.position_ids[:b].unsqueeze(1),
+                )
             logits = outputs["logits"][:, -1, :]
 
         return self._sample_logits(logits, tasks, return_logprobs, info=info)
