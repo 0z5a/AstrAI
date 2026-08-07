@@ -388,6 +388,10 @@ class TorchNativeBackend(AttentionBackend):
     runs SDPA directly on the projected q/k/v.
     """
 
+    @staticmethod
+    def supports(**kwargs) -> bool:
+        return True
+
     def fwd_decode(
         self,
         q: Tensor,
@@ -478,6 +482,15 @@ class CudaBackend(AttentionBackend):
 
     Raises ``RuntimeError`` if the required kernel is not available.
     """
+
+    @staticmethod
+    def supports(**kwargs) -> bool:
+        head_dim = kwargs.get("head_dim", -1)
+        return (
+            head_dim in (32, 64, 128, 256)
+            and is_available("attn_paged_decode")
+            and is_available("attn_paged_prefill")
+        )
 
     def fwd_decode(
         self,
@@ -575,14 +588,11 @@ class FlashAttnBackend(AttentionBackend):
 
     Prefill / non-contiguous decode: falls back to KV gather +
     ``flash_attn_func``.
-
-    This backend only does flash attention — inputs ``flash-attn`` cannot
-    express (missing package, custom attention mask on prefill, fp32,
-    unsupported head_dim) raise a clear error instead of silently falling
-    back to torch.
-
-    For a torch fallback, select ``TorchNativeBackend`` instead.
     """
+
+    @staticmethod
+    def supports(**kwargs) -> bool:
+        return flash_attn_available()
 
     def fwd_decode(
         self,
