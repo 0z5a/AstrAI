@@ -187,7 +187,7 @@ docker run --gpus all -it astrai:latest
 
 # 运行推理服务
 docker run --gpus all -p 8000:8000 astrai:latest \
-  python -m scripts.tools.server --port 8000 --device cuda
+  python scripts/tools/server.py --port 8000 --device cuda
 
 # 挂载数据卷
 docker run --gpus all -v /path/to/data:/data -it astrai:latest

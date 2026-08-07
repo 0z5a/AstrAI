@@ -214,6 +214,7 @@ python scripts/eval/evaluate_ifd.py \
 | `--sentinel_text` | `\n` | Prefix for unconditional pass (`""` → bos/pad fallback) |
 | `--per_token` | False | Include per-token IFD breakdown |
 | `--max_samples` | None | Random subsample per file |
+| `--append_eos` / `--no-append_eos` | `True` | Append (or skip) EOS token to instruction/response |
 
 **How it works**: Two forward passes per batch — (1) conditional: packed BFD sequence with context + response, (2) unconditional: response prefixed with a sentinel. IFD = mean_conditional_loss / mean_unconditional_loss. IFD > 1 means the instruction makes the response harder to predict (higher quality data).
 

@@ -36,7 +36,7 @@ pip install -e .
 # pip install -e ".[dev]"
 ```
 
-> **CUDA kernels** are opt-in. They are not built by default. When built, they can be activated via `with attn_backend(ATTN_BACKEND.CUDA):` for accelerated decode/prefill, and the fused rotary embedding kernel is auto-dispatched when available. You can skip them for normal usage.
+> **CUDA kernels** are opt-in at build time (`CSRC_KERNELS=true`). Once built, `CudaBackend` is the default attention backend on GPU (cuda > flash > torch priority). Override via `ASTR_BACKEND` env var or `attn_backend()` context manager. Fused rotary embedding kernel is auto-dispatched when available. Skip for CPU-only usage.
 
 ## 2. Download Model Weights
 
@@ -232,7 +232,7 @@ docker build -t astrai:latest .
 
 # Run inference server with GPU
 docker run --gpus all -p 8000:8000 astrai:latest \
-  python -m scripts.tools.server --port 8000 --device cuda
+  python scripts/tools/server.py --port 8000 --device cuda
 
 # Docker Compose (GPU)
 docker compose up -d

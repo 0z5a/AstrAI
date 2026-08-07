@@ -65,9 +65,13 @@ Attention computation (cache I/O + SDPA/kernel dispatch) is decoupled from the m
 
 ```
 AttentionBackend (ABC)
-  ├── TorchNativeBackend   SDPA + indirect KV cache gather (default)
-  └── CudaBackend          CUDA kernel dispatch (attn_paged_decode, attn_paged_prefill)
+  ├── CudaBackend          CUDA kernel dispatch (default on GPU)
+  ├── FlashAttnBackend     Optional flash-attn dispatch (fallback)
+  └── TorchNativeBackend   SDPA + indirect KV cache gather (always-available fallback)
 ```
+
+Default priority: cuda > flash > torch.  Set ``ASTR_BACKEND=cuda|torch_native|flash``
+to override.
 
 Select via context manager (mirrors `torch.nn.attention.sdpa_kernel`):
 
@@ -82,7 +86,7 @@ with attn_backend(ATTN_BACKEND.CUDA):
 
 `CudaBackend` prefill path: writes K/V, then calls `attn_paged_prefill` — a ragged-batch (paged) prefill kernel that reads K/V directly from the flat pool via `req_to_token`, addressing each request's `q_len`/`kv_len` through `qo_indptr` and `kv_indptr`. No explicit K/V gather needed.
 
-Fallback: `CudaBackend` delegates to `TorchNativeBackend` when a CUDA kernel is not available.
+Fallback: when `CudaBackend` cannot handle an input (wrong dtype or head_dim), `FlashAttnBackend` is tried next (if installed), then `TorchNativeBackend`.
 
 ### Rotary Embedding Backend
 
@@ -143,7 +147,6 @@ Adding a protocol = one builder file, no handler subclassing needed.
 ```
 InferenceEngine
   ├── generate(prompt, stream, ...) → str | List[str] | Generator
-  ├── generate_with_request(req)    → same
   ├── generate_async(prompt, ...)   → AsyncGenerator
   ├── get_stats()                   → Dict
   └── shutdown()
@@ -229,19 +232,6 @@ The HTTP protocols and direct engine API have distinct request models and defaul
 | `top_k` | Optional[int] | 50 | Top-k count |
 | `stream` | Optional[bool] | False | Stream output |
 | `stop_sequences` | Optional[List[str]] | None | Stop sequences |
-
-**Engine** (`GenerationRequest`):
-
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `messages` | List[Dict[str, str]] | required | Messages to format before generation |
-| `top_k` | int | 50 | Top-k count; 0 disables filtering |
-| `top_p` | float | 1.0 | Nucleus threshold |
-| `temperature` | float | 1.0 | Sampling temperature; 0 enables greedy decoding |
-| `max_tokens` | Optional[int] | None | Max generation length |
-| `frequency_penalty` | float | 0.0 | Frequency penalty (-2.0 to 2.0) |
-| `rep_window` | int | 64 | Recent-token window used by the frequency penalty |
-| `stream` | bool | False | Stream output |
 
 ### SSE Streaming Format
 

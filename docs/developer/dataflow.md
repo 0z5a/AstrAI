@@ -72,7 +72,7 @@ metadata, but the preprocessing `BinWriter` currently does not write offsets.
 
 - If `load_path` is a file: `.jsonl` selects `"jsonl"`; other suffixes raise `ValueError`.
 - If `load_path` is a directory: any recursive `*.bin` plus a `meta.json` selects `"bin"`; otherwise any recursive `*.jsonl` selects `"jsonl"`.
-- Detection does not require `dataset_config.json`; configuration is selected later when `JsonlStore.load()` chooses a transform.
+- Detection does not require `dataset_config.json`; configuration is selected later when `DatasetFactory.load()` constructs a transform via `_build_jsonl_transform()` and passes it to `JsonlStore.load()`.
 
 ### Store Backends
 
@@ -89,11 +89,16 @@ access methods.
 **MmapStore**: Memory-maps `.bin` files. OS page cache sharing is native — no explicit `share_memory_()` needed. Uses `torch.from_numpy(np.memmap(...))`. `segments_are_records=False` — bin segments are contiguous streams; record access is driven by `_offsets` (written when `save_bin(..., record_keys=...)` was used at preprocessing time).
 
 **JsonlStore**: Reads a `.jsonl` file or the sorted top-level `*.jsonl` files in
-a directory. Eager transform selection uses the first available route:
+a directory. Eager transform selection is owned by
+`DatasetFactory._build_jsonl_transform()` (called from `DatasetFactory.load()`) —
+the factory picks the first available route:
 
-1. An explicit `transform=` argument.
+1. An explicit `transform=` argument passed through `store.load()`.
 2. `dataset_config.json` in the JSONL directory. It follows `PipelineConfig` and may add `tokenizer_path`; when omitted, the config directory is used.
 3. The built-in `messages` transform when `tokenizer_path=` is supplied. It masks system/user turns, trains assistant turns, and emits document-reset position IDs.
+
+`JsonlStore.load()` requires `transform=` to be passed explicitly for eager mode
+(raises `ValueError` if missing).
 
 Only DPO gets an automatic lazy route from `DatasetFactory`: raw JSONL plus
 `tokenizer_path` installs `dpo_processor` and tokenizes each record in
