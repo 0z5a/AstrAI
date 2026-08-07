@@ -71,7 +71,7 @@ def _inner_run(batch_per_device, ckpt_interval, ckpt_dir, ready_file):
         optimizer_fn=optimizer_fn,
         scheduler_fn=scheduler_fn,
         ckpt_dir=ckpt_dir,
-        n_epoch=1,
+        n_epoch=99999,
         batch_per_device=batch_per_device,
         ckpt_interval=ckpt_interval,
         grad_accum_steps=1,
@@ -94,7 +94,7 @@ def _spawn_train_and_signal(ckpt_dir, sig, timeout=120):
     )
     p.start()
 
-    deadline = time.time() + 30
+    deadline = time.time() + 10
     while time.time() < deadline:
         if os.path.exists(ready_file):
             with open(ready_file) as f:
