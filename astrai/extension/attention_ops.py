@@ -102,6 +102,7 @@ def attn_paged_decode(
     is_causal: bool = False,
     o_part_buf: Optional[torch.Tensor] = None,
     ml_part_buf: Optional[torch.Tensor] = None,
+    out_buf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """SGLang-style paged decode (q_len == 1, flat KV pool).
 
@@ -121,6 +122,7 @@ def attn_paged_decode(
         is_causal: apply causal mask
         o_part_buf: pre-allocated split-KV o partial buffer (workflow bypass)
         ml_part_buf: pre-allocated split-KV m/l buffer (workflow bypass)
+        out_buf: pre-allocated output buffer [batch, n_heads, head_dim] (graph-safe)
 
     Returns:
         [batch, n_heads, head_dim] (bf16, 3D)
@@ -139,6 +141,7 @@ def attn_paged_decode(
         causal_offset=causal_offset,
         o_part_buf=o_part_buf,
         ml_part_buf=ml_part_buf,
+        out_buf=out_buf,
     )
 
 

@@ -263,6 +263,7 @@ class KVCache:
         qo_indptr: [batch+1] int32 — prefill qo prefix-sum (None in decode)
         decode_o_part: split-KV o partial workspace (mirrors FlashInfer)
         decode_ml_part: split-KV m/l partial workspace (mirrors FlashInfer)
+        decode_out: pre-allocated decode output buffer (graph-safe)
     """
 
     k_buffer: Tensor
@@ -276,6 +277,7 @@ class KVCache:
     qo_indptr: Optional[Tensor] = None
     decode_o_part: Optional[Tensor] = None
     decode_ml_part: Optional[Tensor] = None
+    decode_out: Optional[Tensor] = None
 
 
 class PagePool:
@@ -571,6 +573,7 @@ class PagePool:
             )
             qo_indptr = workspace.qo_indptr[: b + 1]
             decode_o_part, decode_ml_part = None, None
+            decode_out = None
         else:
             write_pos = seq_lens_t - 1
             loc = self._req_pool.req_to_token[req_pool_indices, write_pos].unsqueeze(-1)
@@ -579,6 +582,7 @@ class PagePool:
             qo_indptr = None
             decode_o_part = getattr(workspace, "decode_o_part", None)
             decode_ml_part = getattr(workspace, "decode_ml_part", None)
+            decode_out = getattr(workspace, "decode_out", None)
 
         return KVCache(
             k_buffer=self._storage.k_buffer,
@@ -592,6 +596,7 @@ class PagePool:
             qo_indptr=qo_indptr,
             decode_o_part=decode_o_part,
             decode_ml_part=decode_ml_part,
+            decode_out=decode_out,
         )
 
     # ---- internals ----

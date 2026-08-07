@@ -9,6 +9,7 @@ from astrai import setup_logging
 from astrai.config import BaseModelConfig, ConfigFactory
 from astrai.extension import ATTN_BACKEND, AttentionBackendFactory, attn_backend
 from astrai.inference.core.cache import PagePool
+from astrai.inference.core.graph import CudaGraphContext
 from astrai.inference.core.workspace import InferenceWorkspace
 from astrai.model import AutoModel, AutoRegressiveLM
 
@@ -57,6 +58,7 @@ class GenerationBenchmark:
         dtype: torch.dtype = torch.bfloat16,
         cache_type: str = "contiguous",
         backend: Union[str, ATTN_BACKEND] = ATTN_BACKEND.CUDA,
+        cuda_graph: bool = False,
     ):
         self.device = device
         self.dtype = dtype
@@ -64,6 +66,7 @@ class GenerationBenchmark:
         self.model = model
         self.config = config
         self.backend = backend
+        self.cuda_graph = cuda_graph
 
     def _make_pool(self, batch_size: int, max_seq_len: int) -> PagePool:
         return PagePool(
@@ -218,10 +221,96 @@ class GenerationBenchmark:
         gen_length: int = 128,
         num_trials: int = 5,
     ) -> BenchmarkResult:
+        if self.cuda_graph and self.backend == "cuda":
+            return self._run_graph_decode_benchmark(
+                batch_size, prompt_length, gen_length, num_trials
+            )
+        return self._run_plain_decode_benchmark(
+            batch_size, prompt_length, gen_length, num_trials
+        )
+
+    def _run_graph_decode_benchmark(
+        self,
+        batch_size: int,
+        prompt_length: int,
+        gen_length: int,
+        num_trials: int,
+    ) -> BenchmarkResult:
         import time
 
-        # Decode grows seq_len monotonically up to prompt + 5 + gen*num_trials
-        # (warmup 5 steps, then one step per trial), so size the pool to cover it.
+        max_seq_len = prompt_length + 5 + gen_length * num_trials
+        pool = self._make_pool(batch_size, max_seq_len)
+        workspace = self._make_workspace(pool, self.config)
+        task_ids = self._run_prefill(pool, batch_size, prompt_length, workspace)
+
+        b = batch_size
+        input_ids_buf = torch.zeros(b, 1, dtype=torch.long, device=self.device)
+        position_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
+        arange = torch.arange(max_seq_len, device=self.device)
+
+        gctx = CudaGraphContext(enabled=True)
+        graph_key = (b,)
+
+        def _decode_graph_step(seq_len):
+            input_ids_buf.copy_(
+                torch.randint(0, self.config.vocab_size, (b, 1), device=self.device)
+            )
+            position_ids_buf[:] = seq_len
+            for tid in task_ids:
+                pool.task_extend(tid, seq_len)
+            kv_cache = pool.bind_tasks(task_ids, workspace, self.device)
+
+            input_mask = torch.ge(
+                position_ids_buf[:, None],
+                arange,
+                out=workspace.input_mask[:b, 0, :max_seq_len],
+            )
+            input_mask = input_mask.unsqueeze(1)
+
+            with torch.inference_mode(), attn_backend(self.backend):
+                return gctx.forward(
+                    self.model,
+                    key=graph_key,
+                    input_ids=input_ids_buf,
+                    input_mask=input_mask,
+                    kv_cache=kv_cache,
+                    position_ids=position_ids_buf.unsqueeze(1),
+                )
+
+        for i in range(5):
+            _decode_graph_step(prompt_length + i)
+        torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        for i in range(gen_length * num_trials):
+            _decode_graph_step(prompt_length + 5 + i)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        tokens = batch_size * gen_length * num_trials
+        tps = tokens / elapsed
+        return BenchmarkResult(
+            name="decode",
+            batch_size=batch_size,
+            seq_len=gen_length,
+            tokens_per_second=tps,
+            latency_ms=elapsed / (gen_length * num_trials) * 1000,
+            metadata={
+                "benchmark_type": "decode",
+                "num_trials": num_trials,
+                "prompt_length": prompt_length,
+                "cuda_graph": True,
+            },
+        )
+
+    def _run_plain_decode_benchmark(
+        self,
+        batch_size: int,
+        prompt_length: int,
+        gen_length: int,
+        num_trials: int,
+    ) -> BenchmarkResult:
+        import time
+
         max_seq_len = prompt_length + 5 + gen_length * num_trials
         pool = self._make_pool(batch_size, max_seq_len)
         workspace = self._make_workspace(pool, self.config)
@@ -289,6 +378,11 @@ def print_benchmark_result(result: BenchmarkResult) -> None:
 @click.option("--prefill_only", is_flag=True, help="Prefill benchmark only.")
 @click.option("--decode_only", is_flag=True, help="Decode benchmark only.")
 @click.option(
+    "--cuda-graph",
+    is_flag=True,
+    help="Enable CUDA graph capture for decode (cuda backend only).",
+)
+@click.option(
     "--ckpt",
     required=False,
     default=None,
@@ -317,6 +411,7 @@ def benchmark_command(
     num_trials: int,
     prefill_only: bool,
     decode_only: bool,
+    cuda_graph: bool,
     ckpt: Optional[str],
     config_path: Optional[Path],
 ) -> None:
@@ -357,6 +452,7 @@ def benchmark_command(
             dtype=dtype_map[dtype],
             cache_type=cache,
             backend=name,
+            cuda_graph=cuda_graph,
         )
 
         click.secho(

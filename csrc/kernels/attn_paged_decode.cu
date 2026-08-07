@@ -13,7 +13,8 @@ torch::Tensor attn_paged_decode(
     int64_t causal_offset,
     double scale,
     c10::optional<torch::Tensor> o_part_buf,
-    c10::optional<torch::Tensor> ml_part_buf
+    c10::optional<torch::Tensor> ml_part_buf,
+    c10::optional<torch::Tensor> out_buf
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -23,7 +24,18 @@ torch::Tensor attn_paged_decode(
                                    req_to_token, req_pool_indices, kv_indptr,
                                    max_seq_len, mask, causal_offset, scale, p);
 
-    auto O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
+    torch::Tensor O;
+    if (out_buf.has_value() && out_buf->defined()) {
+        TORCH_CHECK(out_buf->dtype() == q.dtype(), "out_buf dtype must match q");
+        TORCH_CHECK(out_buf->size(0) >= q.size(0), "out_buf batch too small");
+        TORCH_CHECK(out_buf->size(1) >= q.size(1), "out_buf heads too small");
+        TORCH_CHECK(out_buf->size(2) >= q.size(2), "out_buf head_dim too small");
+        O = out_buf.value().slice(0, 0, q.size(0))
+                            .slice(1, 0, q.size(1))
+                            .slice(2, 0, q.size(2));
+    } else {
+        O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
+    }
     p.o = (bf16*)O.data_ptr();
 
     if (o_part_buf.has_value() && ml_part_buf.has_value()
@@ -57,5 +69,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("scale") = 0.0,
         py::arg("o_part_buf") = py::none(),
         py::arg("ml_part_buf") = py::none(),
+        py::arg("out_buf") = py::none(),
         "SGLang-style paged decode: flat KV pool + req_to_token + kv_indptr.");
 }

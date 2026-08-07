@@ -108,6 +108,14 @@ class InferenceWorkspace:
             device=device,
         )
 
+        # Decode output buffer (graph-safe pre-alloc).  Shape matches the
+        # decode kernel's output: [batch, q_head, head_dim].
+        self.decode_out = torch.empty(
+            (max_batch_size, max_q_heads, head_dim),
+            dtype=dtype,
+            device=device,
+        )
+
     def decode_buffers(self, batch: int, q_heads: int):
         """Return ``(o_part, ml_part)`` view sliced to live dimensions."""
         return (

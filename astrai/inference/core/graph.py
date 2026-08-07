@@ -86,12 +86,14 @@ class CudaGraphContext:
         if key in self._graphs:
             self._graphs[key].replay()
         elif key in self._warmed:
+            cap_output = model(**kwargs)
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 self._outputs[key] = model(**kwargs)
             self._graphs[key] = graph
             self._warmed.discard(key)
+            return cap_output
         else:
             self._warmed.add(key)
             self._outputs[key] = model(**kwargs)
