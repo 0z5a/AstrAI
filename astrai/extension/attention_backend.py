@@ -135,6 +135,8 @@ def _backend_supports(
     if isinstance(backend, FlashAttnBackend):
         if not flash_attn_available():
             return False
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return False
         if q.size(1) == 1 and kv_cache is not None:
             return True
         return not (attn_mask is not None and not is_causal)

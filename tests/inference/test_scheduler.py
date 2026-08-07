@@ -180,7 +180,7 @@ def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
 def _make_real_scheduler(device):
     """Build a scheduler backed by a tiny real model for run_batch tests."""
     cfg = make_rollout_config(max_position_embeddings=64)
-    model = AutoRegressiveLM(cfg).to(device=device).eval()
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     tokenizer = FakeTokenizer()
     scheduler = InferenceScheduler(
         model=model,
