@@ -5,14 +5,12 @@ multi-rank environment without requiring multiple GPUs.
 """
 
 import torch
-import torch.distributed as dist
-import torch.nn as nn
 
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.parallel import get_rank, spawn_parallel_fn
 from astrai.parallel.executor import broadcast_state_dict, create_ref_model
 from astrai.trainer.strategy import GRPOStrategy
-from tests.helpers import FakeExecutor, make_rollout_config
+from tests.helpers import make_rollout_config
 
 
 def _broadcast_worker():
@@ -77,8 +75,6 @@ def _create_ref_model_worker():
     )
 
     assert ref is not None, f"rank {rank}: ref model is None"
-    # Every rank should have rank-0's weights, not its own
-    rank0_sd = model.state_dict() if rank == 0 else None
     # Broadcast rank-0's original weights for comparison
     if rank == 0:
         expected_sd = {k: v.clone() for k, v in model.state_dict().items()}

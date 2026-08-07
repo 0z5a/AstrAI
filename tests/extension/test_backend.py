@@ -10,7 +10,6 @@ from astrai.extension import (
     ATTN_BACKEND,
     AttentionBackendFactory,
     CudaBackend,
-    TorchNativeBackend,
     attn_backend,
     get_backend,
 )

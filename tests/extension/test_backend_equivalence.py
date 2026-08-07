@@ -31,7 +31,6 @@ def test_training_forward_matches_torch(cuda_model):
     or non-bf16 inputs it falls back to torch SDPA.  Verify the fallback
     path matches the torch-native forward exactly.
     """
-    import pytest
 
     model, _ = cuda_model
     input_ids = torch.randint(0, 1000, (2, 16), device="cuda")

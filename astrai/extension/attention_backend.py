@@ -492,7 +492,6 @@ class CudaBackend(AttentionBackend):
         kv_cache.k_buffer[layer_id].index_copy_(0, loc, k[:, 0])
         kv_cache.v_buffer[layer_id].index_copy_(0, loc, v[:, 0])
 
-        b = q.size(0)
         q_3d = q.squeeze(1)
 
         kv_indptr = kv_cache.kv_indptr

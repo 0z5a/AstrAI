@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 import torch
 
-from astrai.config.preprocess_config import PipelineConfig
 from astrai.dataset.dataset import (
     DatasetFactory,
     GRPODataset,
