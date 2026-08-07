@@ -13,14 +13,37 @@ Two modes:
 """
 
 import threading
-from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, OrderedDict
 
 import torch
 from torch import Tensor
 
 from astrai.inference.core.workspace import InferenceWorkspace
+
+
+@dataclass
+class _BindState:
+    """Cached bind metadata for steady-state decode increment detection."""
+
+    sig: tuple
+    seq_lens: List[int]
+
+
+def _is_steady_increment(
+    prev_sig: Optional[tuple],
+    prev_vals: Optional[List[int]],
+    cur_sig: tuple,
+    cur_vals: List[int],
+) -> bool:
+    """True when the same ordered set has every value +1 from the previous step."""
+    return (
+        prev_sig is not None
+        and prev_vals is not None
+        and prev_sig == cur_sig
+        and len(prev_vals) == len(cur_vals)
+        and all(c == p + 1 for c, p in zip(cur_vals, prev_vals))
+    )
 
 
 def page_hash(
@@ -350,13 +373,10 @@ class PagePool:
         self._task_pages: Dict[str, List[int]] = {}
         self._lock = threading.Lock()
 
-        # Steady-state decode validation state: the ordered task set and its
-        # Python seq_lens mirror.  When the same set advances every sequence
-        # by exactly one token per step, bind_tasks updates the stable
-        # buffers in-place (+=1 / +=inc) instead of re-cumsumming.  Any
-        # task-set change is a miss and rebuilds.
-        self._bind_sig: Optional[tuple] = None
-        self._bind_seq_lens: Optional[List[int]] = None
+        # Steady-state decode validation: when the same ordered task set
+        # advances every sequence by exactly one token per step, bind_tasks
+        # updates the stable buffers in-place instead of re-cumsumming.
+        self._bind_state: Optional[_BindState] = None
 
     # ---- task lifecycle ----
 
@@ -529,13 +549,11 @@ class PagePool:
         inc_buf = workspace.inc
         ocl_buf = workspace.out_cache_loc
 
+        prev = self._bind_state
         incremental = (
             start_pos is None
-            and self._bind_sig is not None
-            and self._bind_sig == sig
-            and self._bind_seq_lens is not None
-            and len(self._bind_seq_lens) == b
-            and all(s == p + 1 for s, p in zip(seq_lens, self._bind_seq_lens))
+            and prev is not None
+            and _is_steady_increment(prev.sig, prev.seq_lens, sig, seq_lens)
         )
         if incremental:
             # Steady-state decode: advance the stable buffers in-place.
@@ -557,8 +575,7 @@ class PagePool:
             req_pool_indices = rpi_buf[:b]
             seq_lens_t = sl_buf[:b]
             kv_indptr = kvp_buf[: b + 1]
-        self._bind_sig = sig
-        self._bind_seq_lens = list(seq_lens)
+        self._bind_state = _BindState(sig, list(seq_lens))
 
         if start_pos is not None:
             seq_len = seq_lens[0]

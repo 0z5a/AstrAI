@@ -14,7 +14,7 @@ from astrai.extension.attention_backend import (
     attn_backend,
     get_backend,
 )
-from astrai.inference.core.cache import PagePool
+from astrai.inference.core.cache import PagePool, _is_steady_increment
 from astrai.inference.core.graph import CudaGraphContext
 from astrai.inference.core.task import Task
 from astrai.inference.core.workspace import InferenceWorkspace
@@ -52,6 +52,19 @@ class SamplingBatchInfo:
     top_ps: Tensor  # float32 [B]
     freq_penalties: Tensor  # float32 [B]
     has_freq: bool  # any frequency_penalty != 0 (avoids per-step GPU .any())
+
+
+@dataclass
+class DecodeSteadyState:
+    """Cached decode metadata for the steady-state case.
+
+    When the same ordered task set decodes one token per step, sampling
+    params and task signature are reused; only positions advance by 1.
+    """
+
+    task_sig: tuple
+    positions: list[int]
+    sampling_info: SamplingBatchInfo
 
 
 def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
@@ -165,11 +178,10 @@ class Executor:
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
 
-        # Per-step decode cache for the steady-state case where the same
-        # ordered task set decodes one token per step.  Sampling params are
-        # constant across steps; position_ids grows by exactly 1.  Single-slot:
-        # any task-set change is a cache miss.
-        self._decode_cache: Optional[tuple] = None
+        # Per-step decode cache for the steady-state case (same ordered
+        # task set decodes one token per step).  Sampling params stay
+        # constant; only positions advance.
+        self._decode_cache: Optional[DecodeSteadyState] = None
 
         # Pre-allocated fixed-shape buffers for the decode hot path
         # (input_ids, decode mask, KV bind metadata).  Eagerly sized at init
@@ -340,20 +352,18 @@ class Executor:
 
         sig = tuple(task_ids)
         cached = self._decode_cache
-        if (
-            cached is not None
-            and cached[0] == sig
-            and cur_positions == [p + 1 for p in cached[1]]
-        ):
-            info = cached[2]
+        prev_sig = cached.task_sig if cached is not None else None
+        prev_pos = cached.positions if cached is not None else None
+        if _is_steady_increment(prev_sig, prev_pos, sig, cur_positions):
+            info = cached.sampling_info
             ws.position_ids[:b] += 1
-            self._decode_cache = (sig, cur_positions, info)
+            self._decode_cache = DecodeSteadyState(sig, cur_positions, info)
         else:
             info = _build_sampling_batch_info(tasks, self.device)
             ws.position_ids[:b].copy_(
                 torch.tensor(cur_positions, dtype=torch.long, device=self.device)
             )
-            self._decode_cache = (sig, cur_positions, info)
+            self._decode_cache = DecodeSteadyState(sig, cur_positions, info)
 
         total_len = max(cur_positions) + 1
         input_mask = ws.decode_mask(ws.position_ids[:b], total_len)
