@@ -121,7 +121,10 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
             load_tile(ti_begin + i, i);
 
         for (int it = 0; it < ntiles; it++) {
-            cp_async_wait_group<STAGES - 1>();
+            if (it + 1 == ntiles)
+                cp_async_wait_group<0>();
+            else
+                cp_async_wait_group<STAGES - 1>();
             __syncwarp();
             process_tile(it, it & (STAGES - 1));
             __syncwarp();
