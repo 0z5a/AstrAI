@@ -7,7 +7,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 
 from tokenizers.decoders import DecodeStream
 
-from astrai.inference.core.metrics import MetricsCollector
+from astrai.inference.metrics import MetricsCollector
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 STOP = object()

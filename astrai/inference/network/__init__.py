@@ -4,8 +4,7 @@
 lazy singleton FastAPI instance.
 """
 
-from astrai.inference.api.protocol import GenContext, ProtocolHandler, StopChecker
-from astrai.inference.api.server import (
+from astrai.inference.network.app import (
     AnthropicMessage,
     ChatCompletionRequest,
     ChatMessage,
@@ -15,7 +14,8 @@ from astrai.inference.api.server import (
     get_app,
     run_server,
 )
-from astrai.inference.api.tool_parser import (
+from astrai.inference.network.protocol import GenContext, ProtocolHandler, StopChecker
+from astrai.inference.network.tool_parser import (
     BaseToolParser,
     SimpleJsonToolParser,
     ToolParserFactory,

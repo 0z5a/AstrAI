@@ -7,9 +7,9 @@ import torch
 
 from astrai.config import BaseModelConfig, ConfigFactory
 from astrai.extension import ATTN_BACKEND, AttentionBackendFactory, attn_backend
-from astrai.inference.core.cache import PagePool, TaskCacheManager
-from astrai.inference.core.graph import CudaGraphContext
-from astrai.inference.core.workspace import InferenceWorkspace
+from astrai.inference.cache import PagePool, TaskCacheManager
+from astrai.inference.runtime.graph import CudaGraphContext
+from astrai.inference.workspace import InferenceWorkspace
 from astrai.model import AutoModel, AutoRegressiveLM
 
 _DTYPES = ["bfloat16", "float16", "float32"]
@@ -93,12 +93,7 @@ class GenerationBenchmark:
 
     @staticmethod
     def _make_task_cache(pool: PagePool) -> TaskCacheManager:
-        return TaskCacheManager(
-            strategy=pool._strategy,
-            req_pool=pool._req_pool,
-            max_seq_len=pool.max_seq_len,
-            pool=pool,
-        )
+        return TaskCacheManager(pool)
 
     def _run_prefill(
         self,

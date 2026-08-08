@@ -6,7 +6,7 @@ Provides:
 - :class:`BaseRewardModel` — pluggable reward interface
 - :class:`RolloutGenerator` — KV-cache-backed generation of grouped
   responses + decoding (no reward); delegates the generation loop to
-  :class:`~astrai.inference.core.scheduler.InferenceScheduler.run_batch`
+  :class:`~astrai.inference.scheduler.InferenceScheduler.run_batch`
   so rollout and the production inference server share one code path
 - :class:`RolloutRunner` — orchestrates generation + scoring with a
   step-driven cache; its ``__call__`` returns ``(RolloutResult, is_fresh)``
@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor
 
-from astrai.inference.core.scheduler import InferenceScheduler
+from astrai.inference.scheduler import InferenceScheduler
 
 
 @dataclass(kw_only=True)
@@ -101,7 +101,7 @@ class RolloutGenerator:
     """Pure generation + decoding for a group of responses per prompt.
 
     Delegates the prefill/decode loop to
-    :meth:`~astrai.inference.core.scheduler.InferenceScheduler.run_batch`,
+    :meth:`~astrai.inference.scheduler.InferenceScheduler.run_batch`,
     which uses a real KV cache (no O(n²) recompute).  Has no dependency
     on any reward model; can be reused in isolation for offline
     generation, qualitative sampling, or eval pipelines.

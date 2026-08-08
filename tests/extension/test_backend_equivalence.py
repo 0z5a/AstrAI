@@ -7,18 +7,13 @@ seq_lens with padding mask), and end-to-end scheduler.run_batch.
 import torch
 
 from astrai.extension import ATTN_BACKEND, attn_backend
-from astrai.inference.core.cache import PagePool, TaskCacheManager
-from astrai.inference.core.workspace import InferenceWorkspace
+from astrai.inference.cache import PagePool, TaskCacheManager
+from astrai.inference.workspace import InferenceWorkspace
 from tests.extension.conftest import D, skip_no_kernel
 
 
 def _mk_task_cache(pool: PagePool) -> TaskCacheManager:
-    return TaskCacheManager(
-        strategy=pool._strategy,
-        req_pool=pool._req_pool,
-        max_seq_len=pool.max_seq_len,
-        pool=pool,
-    )
+    return TaskCacheManager(pool)
 
 
 def _ws(pool: PagePool) -> InferenceWorkspace:
@@ -184,7 +179,7 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
 @skip_no_kernel
 def test_run_batch_cuda_matches_torch_greedy(cuda_model):
     """Greedy decode (temperature=0) should produce identical tokens."""
-    from astrai.inference.core.scheduler import InferenceScheduler
+    from astrai.inference.scheduler import InferenceScheduler
     from tests.helpers import FakeTokenizer
 
     model, _ = cuda_model

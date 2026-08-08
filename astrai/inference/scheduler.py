@@ -5,10 +5,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from astrai.inference.core.cache import PagePool, TaskCacheManager
-from astrai.inference.core.executor import Executor
-from astrai.inference.core.metrics import MetricsCollector
-from astrai.inference.core.task import STOP, Task, TaskManager, TaskStatus
+from astrai.inference.cache import PagePool, TaskCacheManager
+from astrai.inference.metrics import MetricsCollector
+from astrai.inference.runtime.executor import Executor
+from astrai.inference.task import STOP, Task, TaskManager, TaskStatus
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
 
@@ -59,12 +59,7 @@ class InferenceScheduler:
 
         self._metrics = MetricsCollector()
 
-        self._task_cache = TaskCacheManager(
-            strategy=self._cache._strategy,
-            req_pool=self._cache._req_pool,
-            max_seq_len=self.max_seq_len,
-            pool=self._cache,
-        )
+        self._task_cache = TaskCacheManager(self._cache)
 
         self._task_mgr = TaskManager(
             tokenizer=tokenizer,

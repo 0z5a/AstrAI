@@ -13,11 +13,11 @@ from astrai.extension.attention_backend import (
     attn_backend,
     get_backend,
 )
-from astrai.inference.core.cache import PagePool, TaskCacheManager
-from astrai.inference.core.graph import CudaGraphContext
-from astrai.inference.core.task import Task
-from astrai.inference.core.workspace import InferenceWorkspace
-from astrai.inference.sample import sample
+from astrai.inference.cache import PagePool, TaskCacheManager
+from astrai.inference.runtime.graph import CudaGraphContext
+from astrai.inference.runtime.sample import sample
+from astrai.inference.task import Task
+from astrai.inference.workspace import InferenceWorkspace
 from astrai.model.automodel import AutoModel
 
 logger = logging.getLogger(__name__)
@@ -369,12 +369,8 @@ class Executor:
 
         kv_cache = self.task_cache.bind(task_ids, ws)
 
-        if self.task_cache.bind_was_steady:
-            info = (
-                self._decode_cache.sampling_info
-                if self._decode_cache is not None
-                else _build_sampling_batch_info(tasks, self.device)
-            )
+        if self.task_cache.bind_was_steady and self._decode_cache is not None:
+            info = self._decode_cache.sampling_info
             ws.position_ids[:b] += 1
         else:
             info = _build_sampling_batch_info(tasks, self.device)

@@ -5,9 +5,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from astrai.inference.api.anthropic import AnthropicResponseBuilder
-from astrai.inference.api.openai import OpenAIResponseBuilder
-from astrai.inference.api.protocol import GenContext, StopChecker, StopInfo
+from astrai.inference.network.anthropic import AnthropicResponseBuilder
+from astrai.inference.network.openai import OpenAIResponseBuilder
+from astrai.inference.network.protocol import GenContext, StopChecker, StopInfo
 
 
 def _make_ctx(**kwargs):

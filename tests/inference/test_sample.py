@@ -2,7 +2,7 @@
 
 import torch
 
-from astrai.inference.sample import (
+from astrai.inference.runtime.sample import (
     FrequencyPenaltyStrategy,
     SamplingPipeline,
     TemperatureStrategy,
@@ -268,7 +268,7 @@ def test_sample_return_logprobs_matches_manual_computation():
     logits = torch.randn(2, 30)
     tokens, logprobs = sample(logits, temperature=0.7, top_p=0.95, return_logprobs=True)
     # Recompute with the same pipeline
-    from astrai.inference.sample import (
+    from astrai.inference.runtime.sample import (
         SamplingPipeline,
         TemperatureStrategy,
         TopPStrategy,

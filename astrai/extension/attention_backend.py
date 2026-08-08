@@ -51,8 +51,11 @@ from astrai.extension.loader import is_available
 from astrai.factory import BaseFactory
 
 if TYPE_CHECKING:
-    from astrai.inference.core.cache import KVCache
+    from astrai.inference.cache import KVCache
 
+
+_default_backend: Optional["AttentionBackend"] = None
+_default_backend_lock = threading.Lock()
 _current_backend: contextvars.ContextVar["AttentionBackend"] = contextvars.ContextVar(
     "attn_backend"
 )
@@ -99,10 +102,6 @@ class ATTN_BACKEND(enum.Enum):
     TORCH_NATIVE = "torch_native"
     CUDA = "cuda"
     FLASH = "flash"
-
-
-_default_backend: Optional["AttentionBackend"] = None
-_default_backend_lock = threading.Lock()
 
 
 def _priority_backends() -> list["AttentionBackend"]:

@@ -7,14 +7,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel
 
-from astrai.inference.api.protocol import (
+from astrai.inference.engine import InferenceEngine
+from astrai.inference.network.protocol import (
     GenContext,
     ResponseBuilder,
     StopInfo,
     sse_event,
 )
-from astrai.inference.api.tool_parser import BaseToolParser, ToolParserFactory
-from astrai.inference.engine import InferenceEngine
+from astrai.inference.network.tool_parser import BaseToolParser, ToolParserFactory
 
 logger = logging.getLogger(__name__)
 

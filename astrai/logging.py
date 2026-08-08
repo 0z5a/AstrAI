@@ -10,7 +10,7 @@ def setup_logging(level: str = "INFO"):
 
     Level names: ``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``, ``CRITICAL``.
     ``DEBUG`` enables per-step prefill/decode timing logs
-    (:func:`astrai.inference.core.executor.timed`).
+    (:func:`astrai.inference.runtime.executor.timed`).
     """
     logger = logging.getLogger("astrai")
     if logger.handlers:

@@ -1,15 +1,29 @@
 """Inference module for continuous batching.
 
-Layers:
-  - core/:        Core inference loop (cache, executor, scheduler, task)
-  - api/:         HTTP orchestration (ProtocolHandler, server)
-  - protocols/:   Response builders (OpenAI, Anthropic)
-  - transport/:   SSE transport utilities
-  - engine.py:    Facade (InferenceEngine)
-  - sample.py:    Strategy pattern (TemperatureStrategy, TopKStrategy, TopPStrategy, FrequencyPenaltyStrategy)
+Subpackages:
+  - cache/:     KV cache (buffers, strategies, pool)
+  - runtime/:   Execution + sampling (executor, CUDA graph, sampling strategies)
+  - task/:      Request lifecycle + performance metrics
+  - network/:   HTTP protocol handling (server, protocol, OpenAI/Anthropic builders)
+
+Modules:
+  - scheduler.py:  Continuous batching loop
+  - workspace.py:  Pre-allocated GPU buffers
+  - engine.py:     Facade (InferenceEngine)
 """
 
-from astrai.inference.api import (
+from astrai.inference.cache import (
+    Allocator,
+    KVCache,
+    KVStorage,
+    PagePool,
+    RadixCache,
+    ReqToTokenPool,
+    TaskCacheManager,
+    page_hash,
+)
+from astrai.inference.engine import InferenceEngine
+from astrai.inference.network import (
     AnthropicMessage,
     BaseToolParser,
     ChatCompletionRequest,
@@ -25,26 +39,10 @@ from astrai.inference.api import (
     get_app,
     run_server,
 )
-from astrai.inference.api.anthropic import AnthropicResponseBuilder
-from astrai.inference.api.openai import OpenAIResponseBuilder
-from astrai.inference.core import (
-    STOP,
-    Allocator,
-    Executor,
-    InferenceScheduler,
-    KVCache,
-    KVStorage,
-    PagePool,
-    RadixCache,
-    ReqToTokenPool,
-    Task,
-    TaskCacheManager,
-    TaskManager,
-    TaskStatus,
-    page_hash,
-)
-from astrai.inference.engine import InferenceEngine
-from astrai.inference.sample import (
+from astrai.inference.network.anthropic import AnthropicResponseBuilder
+from astrai.inference.network.openai import OpenAIResponseBuilder
+from astrai.inference.runtime.executor import Executor
+from astrai.inference.runtime.sample import (
     BaseSamplingStrategy,
     FrequencyPenaltyStrategy,
     SamplingPipeline,
@@ -53,6 +51,8 @@ from astrai.inference.sample import (
     TopPStrategy,
     sample,
 )
+from astrai.inference.scheduler import InferenceScheduler
+from astrai.inference.task import STOP, Task, TaskManager, TaskStatus
 
 __all__ = [
     "InferenceEngine",

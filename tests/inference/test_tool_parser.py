@@ -2,7 +2,7 @@
 
 import pytest
 
-from astrai.inference.api.tool_parser import (
+from astrai.inference.network.tool_parser import (
     _TOOL_CALL_HEAD_RE,
     BaseToolParser,
     SimpleJsonToolParser,

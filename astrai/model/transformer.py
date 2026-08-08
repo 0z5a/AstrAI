@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.inference.core.cache import KVCache
+from astrai.inference.cache import KVCache
 from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding

@@ -11,7 +11,7 @@ from astrai.inference import (
     TaskCacheManager,
     page_hash,
 )
-from astrai.inference.core.workspace import InferenceWorkspace
+from astrai.inference.workspace import InferenceWorkspace
 
 
 def _ws(pool: PagePool) -> InferenceWorkspace:
@@ -27,12 +27,7 @@ def _ws(pool: PagePool) -> InferenceWorkspace:
 
 
 def _make_task_cache(pool: PagePool) -> TaskCacheManager:
-    return TaskCacheManager(
-        strategy=pool._strategy,
-        req_pool=pool._req_pool,
-        max_seq_len=pool.max_seq_len,
-        pool=pool,
-    )
+    return TaskCacheManager(pool)
 
 
 # ---- page_hash ----
@@ -345,7 +340,7 @@ def test_page_pool_paged_task_alloc():
     assert task_cache.task_alloc("t1", list(range(10)))
     state = task_cache._states["t1"]
     assert len(state.pages) == 10
-    assert pool._req_pool.req_to_token[state.req_idx, 0].item() == state.pages[0]
+    assert pool.req_pool.req_to_token[state.req_idx, 0].item() == state.pages[0]
 
 
 def test_page_pool_paged_task_extend():
@@ -354,7 +349,7 @@ def test_page_pool_paged_task_extend():
     task_cache.task_alloc("t1", list(range(4)))
     assert task_cache.task_extend("t1", 4)
     req_idx = task_cache._states["t1"].req_idx
-    slot = pool._req_pool.req_to_token[req_idx, 4].item()
+    slot = pool.req_pool.req_to_token[req_idx, 4].item()
     assert slot >= 0
 
 
@@ -364,7 +359,7 @@ def test_page_pool_paged_task_free_releases_slots():
     task_cache.task_alloc("t1", list(range(8)))
     task_cache.task_free("t1")
     assert "t1" not in task_cache._states
-    assert len(pool._req_pool.free_slots) == 4
+    assert len(pool.req_pool.free_slots) == 4
 
 
 def test_page_pool_paged_bind_roundtrip():

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from astrai.inference.core.scheduler import InferenceScheduler
+from astrai.inference.scheduler import InferenceScheduler
 from astrai.trainer.rollout import (
     BaseRewardModel,
     RawRollout,

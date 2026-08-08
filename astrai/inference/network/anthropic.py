@@ -6,13 +6,13 @@ from typing import Any, Dict, List, Tuple, Union
 
 from pydantic import BaseModel
 
-from astrai.inference.api.protocol import (
+from astrai.inference.engine import InferenceEngine
+from astrai.inference.network.protocol import (
     GenContext,
     ResponseBuilder,
     StopInfo,
     sse_event,
 )
-from astrai.inference.engine import InferenceEngine
 
 
 def _extract_text(content: Union[str, List[Dict[str, Any]]]) -> str:

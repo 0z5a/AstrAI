@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, random_split
 
 from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
-from astrai.inference.core.scheduler import InferenceScheduler
+from astrai.inference.scheduler import InferenceScheduler
 from astrai.model.components.lora import inject_lora
 from astrai.parallel.executor import BaseExecutor, ExecutorFactory, create_ref_model
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
