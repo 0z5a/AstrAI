@@ -140,7 +140,9 @@ def _backend_supports(
             return False
         if q.size(1) == 1 and kv_cache is not None:
             return True
-        return attn_mask is None
+        if attn_mask is None or is_causal:
+            return True
+        return attn_mask.dim() == 4
     return True
 
 
@@ -640,7 +642,7 @@ class FlashAttnBackend(AttentionBackend):
             k = repeat_kv(k, n_rep)
             v = repeat_kv(v, n_rep)
 
-        if attn_mask is not None and not is_causal:
+        if attn_mask is not None and not is_causal and attn_mask.dim() != 4:
             raise ValueError(
                 "FlashAttnBackend does not support a custom attention mask; "
                 "use a causal mask or select TorchNativeBackend."
@@ -652,7 +654,10 @@ class FlashAttnBackend(AttentionBackend):
                 "Install with `pip install flash-attn`."
             )
         out = fa.flash_attn_func(
-            q.contiguous(), k.contiguous(), v.contiguous(), causal=is_causal
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            causal=is_causal or (attn_mask is not None and attn_mask.dim() == 4),
         )
         return out.contiguous().flatten(2)
 
