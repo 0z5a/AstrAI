@@ -369,7 +369,13 @@ class Executor:
 
         kv_cache = self.task_cache.bind(task_ids, ws)
 
-        if self.task_cache.bind_was_steady and self._decode_cache is not None:
+        task_sig = tuple(task_ids)
+        reuse_decode_state = (
+            self.task_cache.bind_was_steady
+            and self._decode_cache is not None
+            and self._decode_cache.task_sig == task_sig
+        )
+        if reuse_decode_state:
             info = self._decode_cache.sampling_info
             ws.position_ids[:b] += 1
         else:
@@ -377,7 +383,7 @@ class Executor:
             ws.position_ids[:b].copy_(
                 torch.tensor(cur_positions, dtype=torch.long, device=self.device)
             )
-        self._decode_cache = DecodeSteadyState(tuple(task_ids), cur_positions, info)
+        self._decode_cache = DecodeSteadyState(task_sig, cur_positions, info)
 
         total_len = max(cur_positions) + 1
         input_mask = ws.decode_mask(ws.position_ids[:b], total_len)

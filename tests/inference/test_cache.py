@@ -415,6 +415,30 @@ def test_page_pool_paged_ps64_task_extend_crosses_page():
     assert len(task_cache._states["t1"].pages) >= 2
 
 
+def test_page_pool_prefix_hit_populates_request_mapping():
+    pool = _make_paged_pool_ps64(page_size=2, max_seq_len=8, n_tokens=16)
+    task_cache = _make_task_cache(pool)
+    prompt = [11, 12, 13, 14]
+
+    assert task_cache.task_alloc("first", prompt)
+    task_cache.task_record_hashes("first", prompt)
+    task_cache.task_free("first")
+
+    assert task_cache.task_alloc("second", prompt)
+    second_state = task_cache._states["second"]
+    expected = [
+        page * pool.page_size + offset
+        for page in second_state.pages
+        for offset in range(pool.page_size)
+    ]
+
+    assert second_state.cached == len(prompt)
+    assert (
+        pool.req_pool.req_to_token[second_state.req_idx, : len(prompt)].tolist()
+        == expected
+    )
+
+
 def test_page_pool_paged_ps64_bind_roundtrip():
     pool = _make_paged_pool_ps64(n_layers=1, n_kv_heads=2, head_dim=4)
     task_cache = _make_task_cache(pool)

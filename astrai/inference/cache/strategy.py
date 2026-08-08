@@ -299,7 +299,7 @@ class PagedStrategy(AllocationStrategy):
 
     def write_indices(self, state: TaskCacheState, prompt_ids: List[int]) -> None:
         total = len(prompt_ids)
-        for pos in range(state.cached, total):
+        for pos in range(total):
             page_idx = pos // self._page_size
             offset = pos % self._page_size
             if page_idx < len(state.pages):

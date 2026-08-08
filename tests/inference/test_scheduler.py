@@ -1,12 +1,15 @@
 """Tests for scheduler concurrency."""
 
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from astrai.inference import InferenceScheduler
+from astrai.inference.runtime.executor import DecodeSteadyState, Executor
+from astrai.inference.task import Task
 from astrai.model.transformer import AutoRegressiveLM
 from tests.helpers import FakeTokenizer, make_rollout_config
 
@@ -302,3 +305,45 @@ def test_run_batch_too_long_prompt_skipped(device):
         assert len(results[1]) <= 2
     finally:
         scheduler.stop()
+
+
+def test_decode_does_not_reuse_previous_batch_state():
+    executor = object.__new__(Executor)
+    executor.device = torch.device("cpu")
+    executor.task_cache = MagicMock()
+    executor.task_cache.bind_was_steady = True
+    executor.task_cache.bind.return_value = MagicMock()
+    executor._graph_supported = False
+    executor._graph_ctx = SimpleNamespace(enabled=False)
+
+    workspace = MagicMock()
+    workspace.position_ids = torch.tensor([2], dtype=torch.long)
+    workspace.fill_input_ids.return_value = torch.tensor([7], dtype=torch.long)
+    workspace.decode_mask.return_value = torch.ones(1, 1, 9, dtype=torch.bool)
+    executor._workspace = workspace
+    executor.model = MagicMock(
+        return_value={"logits": torch.zeros(1, 1, 10, dtype=torch.float32)}
+    )
+
+    old_info = object()
+    new_info = object()
+    executor._decode_cache = DecodeSteadyState(("old",), [2], old_info)
+    executor._sample_logits = MagicMock(return_value=[3])
+
+    task = Task("new", list(range(8)), temperature=0)
+    task.input_tokens = 8
+    task.output_ids = [7]
+    task.mark_prefill_done()
+
+    with patch(
+        "astrai.inference.runtime.executor._build_sampling_batch_info",
+        return_value=new_info,
+    ):
+        assert executor.execute_decode([task]) == [3]
+
+    assert workspace.position_ids.tolist() == [8]
+    assert executor._decode_cache.task_sig == ("new",)
+    executor._sample_logits.assert_called_once()
+    args, kwargs = executor._sample_logits.call_args
+    assert args[1:] == ([task], False)
+    assert kwargs["info"] is new_info
