@@ -34,6 +34,7 @@ import enum
 import functools
 import importlib
 import os
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Union
@@ -101,6 +102,7 @@ class ATTN_BACKEND(enum.Enum):
 
 
 _default_backend: Optional["AttentionBackend"] = None
+_default_backend_lock = threading.Lock()
 
 
 def _priority_backends() -> list["AttentionBackend"]:
@@ -139,7 +141,7 @@ def _backend_supports(
             return False
         if q.size(1) == 1 and kv_cache is not None:
             return True
-        return not (attn_mask is not None and not is_causal)
+        return attn_mask is None
     return True
 
 
@@ -175,7 +177,9 @@ def get_backend() -> "AttentionBackend":
     except LookupError:
         global _default_backend
         if _default_backend is None:
-            _default_backend = _resolve_default_backend()
+            with _default_backend_lock:
+                if _default_backend is None:
+                    _default_backend = _resolve_default_backend()
         return _default_backend
 
 
@@ -279,9 +283,18 @@ def attention(
     """
     backend = get_backend()
     if not _backend_supports(backend, q, kv_cache, attn_mask, is_causal):
-        # The active backend cannot run this call (e.g. CUDA on a training /
-        # fp32 / unsupported-head_dim input) — fall back to the highest-
-        # priority backend that can, ending at torch SDPA.
+        try:
+            explicit = _current_backend.get()
+        except LookupError:
+            explicit = None
+        if explicit is not None:
+            raise RuntimeError(
+                f"Explicitly-set backend {type(backend).__name__} cannot "
+                f"handle this attention call (shape={q.shape}, "
+                f"dtype={q.dtype}, kv_cache={'none' if kv_cache is None else 'present'}, "
+                f"attn_mask={'none' if attn_mask is None else 'present'}). "
+                f"Remove the attn_backend() context or switch to a compatible backend."
+            )
         for candidate in _priority_backends():
             if isinstance(candidate, type(backend)):
                 continue
