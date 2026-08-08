@@ -13,7 +13,7 @@ from astrai.extension.attention_backend import (
     attn_backend,
     get_backend,
 )
-from astrai.inference.core.cache import PagePool, _is_steady_increment
+from astrai.inference.core.cache import PagePool, TaskCacheManager
 from astrai.inference.core.graph import CudaGraphContext
 from astrai.inference.core.task import Task
 from astrai.inference.core.workspace import InferenceWorkspace
@@ -99,6 +99,7 @@ def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
 def _warmup_cuda_graphs(
     model: AutoModel,
     pool: PagePool,
+    task_cache: TaskCacheManager,
     ws: InferenceWorkspace,
     gctx: CudaGraphContext,
     max_batch_size: int,
@@ -113,12 +114,12 @@ def _warmup_cuda_graphs(
     # that follows.  Custom .so kernels do NOT need this — they are pre-built.
     warmup_len = 64
     tid = "_warmup_prefill"
-    if pool.task_alloc(tid, list(range(warmup_len))):
+    if task_cache.task_alloc(tid, list(range(warmup_len))):
         with (
             torch.inference_mode(),
             timed("warmup prefill", logger),
         ):
-            kv = pool.bind_tasks([tid], ws, start_pos=0)
+            kv = task_cache.bind([tid], ws, start_pos=0)
             ids_in = torch.arange(warmup_len, device=dev).unsqueeze(0)
             pos_in = ids_in
             model(
@@ -127,7 +128,7 @@ def _warmup_cuda_graphs(
                 kv_cache=kv,
                 position_ids=pos_in,
             )
-        pool.task_free(tid)
+        task_cache.task_free(tid)
 
     batch_sizes = [1]
     n = 2
@@ -142,12 +143,12 @@ def _warmup_cuda_graphs(
         prompt_tokens = [list(range(prompt_len)) for _ in range(b)]
         alloc_ok = True
         for tid, pt in zip(task_ids, prompt_tokens):
-            if not pool.task_alloc(tid, pt):
+            if not task_cache.task_alloc(tid, pt):
                 alloc_ok = False
                 break
         if not alloc_ok:
             for tid in task_ids:
-                pool.task_free(tid)
+                task_cache.task_free(tid)
             continue
 
         with (
@@ -159,8 +160,8 @@ def _warmup_cuda_graphs(
                 seq_pos = step
                 ws.position_ids[:b] = seq_pos
                 for tid in task_ids:
-                    pool.task_extend(tid, seq_pos)
-                kv = pool.bind_tasks(task_ids, ws)
+                    task_cache.task_extend(tid, seq_pos)
+                kv = task_cache.bind(task_ids, ws)
                 input_mask = ws.decode_mask(ws.position_ids[:b], ws.max_seq_len)
                 ids_buf = ws.fill_input_ids([step] * b)
                 gctx.forward(
@@ -173,7 +174,7 @@ def _warmup_cuda_graphs(
                 )
 
         for tid in task_ids:
-            pool.task_free(tid)
+            task_cache.task_free(tid)
         torch.cuda.synchronize()
 
 
@@ -184,11 +185,13 @@ class Executor:
         self,
         model: AutoModel,
         kv_cache: PagePool,
+        task_cache: TaskCacheManager,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
     ):
         self.model = model
         self.kv_cache = kv_cache
+        self.task_cache = task_cache
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
 
@@ -228,6 +231,7 @@ class Executor:
         _warmup_cuda_graphs(
             self.model,
             self.kv_cache,
+            self.task_cache,
             self._workspace,
             self._graph_ctx,
             max_batch_size=self.kv_cache.max_batch_size,
@@ -321,7 +325,7 @@ class Executor:
                 input_ids,
                 input_mask=input_mask,
                 position_ids=position_ids,
-                kv_cache=self.kv_cache.bind_tasks(
+                kv_cache=self.task_cache.bind(
                     task_ids,
                     self._workspace,
                     start_pos=start_pos,
@@ -363,25 +367,24 @@ class Executor:
         task_ids = [t.task_id for t in tasks]
         cur_positions = [t.next_pos for t in tasks]
 
-        sig = tuple(task_ids)
-        cached = self._decode_cache
-        prev_sig = cached.task_sig if cached is not None else None
-        prev_pos = cached.positions if cached is not None else None
-        if _is_steady_increment(prev_sig, prev_pos, sig, cur_positions):
-            info = cached.sampling_info
+        kv_cache = self.task_cache.bind(task_ids, ws)
+
+        if self.task_cache.bind_was_steady:
+            info = (
+                self._decode_cache.sampling_info
+                if self._decode_cache is not None
+                else _build_sampling_batch_info(tasks, self.device)
+            )
             ws.position_ids[:b] += 1
-            self._decode_cache = DecodeSteadyState(sig, cur_positions, info)
         else:
             info = _build_sampling_batch_info(tasks, self.device)
             ws.position_ids[:b].copy_(
                 torch.tensor(cur_positions, dtype=torch.long, device=self.device)
             )
-            self._decode_cache = DecodeSteadyState(sig, cur_positions, info)
+        self._decode_cache = DecodeSteadyState(tuple(task_ids), cur_positions, info)
 
         total_len = max(cur_positions) + 1
         input_mask = ws.decode_mask(ws.position_ids[:b], total_len)
-
-        kv_cache = self.kv_cache.bind_tasks(task_ids, ws)
 
         # ---- forward (graph replay or live run + capture) ----
 

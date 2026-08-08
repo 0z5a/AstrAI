@@ -7,6 +7,7 @@ from astrai.inference.core.cache import (
     PagePool,
     RadixCache,
     ReqToTokenPool,
+    TaskCacheManager,
     page_hash,
 )
 from astrai.inference.core.executor import Executor
@@ -21,6 +22,7 @@ __all__ = [
     "PagePool",
     "RadixCache",
     "ReqToTokenPool",
+    "TaskCacheManager",
     "page_hash",
     "Executor",
     "InferenceScheduler",

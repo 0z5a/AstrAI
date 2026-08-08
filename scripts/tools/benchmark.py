@@ -7,7 +7,7 @@ import torch
 
 from astrai.config import BaseModelConfig, ConfigFactory
 from astrai.extension import ATTN_BACKEND, AttentionBackendFactory, attn_backend
-from astrai.inference.core.cache import PagePool
+from astrai.inference.core.cache import PagePool, TaskCacheManager
 from astrai.inference.core.graph import CudaGraphContext
 from astrai.inference.core.workspace import InferenceWorkspace
 from astrai.model import AutoModel, AutoRegressiveLM
@@ -91,9 +91,19 @@ class GenerationBenchmark:
             dtype=pool.dtype,
         )
 
+    @staticmethod
+    def _make_task_cache(pool: PagePool) -> TaskCacheManager:
+        return TaskCacheManager(
+            strategy=pool._strategy,
+            req_pool=pool._req_pool,
+            max_seq_len=pool.max_seq_len,
+            pool=pool,
+        )
+
     def _run_prefill(
         self,
         pool: PagePool,
+        task_cache: TaskCacheManager,
         batch_size: int,
         prompt_len: int,
         workspace: InferenceWorkspace,
@@ -112,9 +122,9 @@ class GenerationBenchmark:
 
         task_ids = [f"bench_{i}" for i in range(batch_size)]
         for tid in task_ids:
-            pool.task_alloc(tid, list(range(prompt_len)))
+            task_cache.task_alloc(tid, list(range(prompt_len)))
 
-        kv_cache = pool.bind_tasks(task_ids, workspace, self.device, start_pos=0)
+        kv_cache = task_cache.bind(task_ids, workspace, self.device, start_pos=0)
         with torch.inference_mode(), attn_backend(self.backend):
             self.model(
                 input_ids,
@@ -128,6 +138,7 @@ class GenerationBenchmark:
     def _run_decode_step(
         self,
         pool: PagePool,
+        task_cache: TaskCacheManager,
         task_ids: list,
         seq_len: int,
         workspace: InferenceWorkspace,
@@ -141,11 +152,11 @@ class GenerationBenchmark:
         )
         total_len = seq_len + 1
         for tid in task_ids:
-            pool.task_extend(tid, seq_len)
+            task_cache.task_extend(tid, seq_len)
         input_mask = position_ids[:, :, None] >= torch.arange(
             total_len, device=self.device
         )
-        kv_cache = pool.bind_tasks(task_ids, workspace, self.device)
+        kv_cache = task_cache.bind(task_ids, workspace, self.device)
         with torch.inference_mode(), attn_backend(self.backend):
             self.model(
                 input_ids,
@@ -164,9 +175,10 @@ class GenerationBenchmark:
 
         pool = self._make_pool(batch_size, prompt_length)
         workspace = self._make_workspace(pool, self.config)
+        task_cache = self._make_task_cache(pool)
         task_ids = [f"bench_prefill_{i}" for i in range(batch_size)]
         for tid in task_ids:
-            pool.task_alloc(tid, list(range(prompt_length)))
+            task_cache.task_alloc(tid, list(range(prompt_length)))
 
         input_ids = torch.randint(
             0, self.config.vocab_size, (batch_size, prompt_length), device=self.device
@@ -179,7 +191,7 @@ class GenerationBenchmark:
         input_mask = position_ids.unsqueeze(-1) >= torch.arange(
             prompt_length, device=self.device
         )
-        kv_cache = pool.bind_tasks(task_ids, workspace, self.device, start_pos=0)
+        kv_cache = task_cache.bind(task_ids, workspace, self.device, start_pos=0)
 
         for _ in range(3):
             with torch.inference_mode(), attn_backend(self.backend):
@@ -240,7 +252,10 @@ class GenerationBenchmark:
         max_seq_len = prompt_length + 5 + gen_length * num_trials
         pool = self._make_pool(batch_size, max_seq_len)
         workspace = self._make_workspace(pool, self.config)
-        task_ids = self._run_prefill(pool, batch_size, prompt_length, workspace)
+        task_cache = self._make_task_cache(pool)
+        task_ids = self._run_prefill(
+            pool, task_cache, batch_size, prompt_length, workspace
+        )
 
         b = batch_size
         input_ids_buf = torch.zeros(b, 1, dtype=torch.long, device=self.device)
@@ -256,8 +271,8 @@ class GenerationBenchmark:
             )
             position_ids_buf[:] = seq_len
             for tid in task_ids:
-                pool.task_extend(tid, seq_len)
-            kv_cache = pool.bind_tasks(task_ids, workspace, self.device)
+                task_cache.task_extend(tid, seq_len)
+            kv_cache = task_cache.bind(task_ids, workspace, self.device)
 
             input_mask = torch.ge(
                 position_ids_buf[:, None],
@@ -313,15 +328,22 @@ class GenerationBenchmark:
         max_seq_len = prompt_length + 5 + gen_length * num_trials
         pool = self._make_pool(batch_size, max_seq_len)
         workspace = self._make_workspace(pool, self.config)
-        task_ids = self._run_prefill(pool, batch_size, prompt_length, workspace)
+        task_cache = self._make_task_cache(pool)
+        task_ids = self._run_prefill(
+            pool, task_cache, batch_size, prompt_length, workspace
+        )
 
         for i in range(5):
-            self._run_decode_step(pool, task_ids, prompt_length + i, workspace)
+            self._run_decode_step(
+                pool, task_cache, task_ids, prompt_length + i, workspace
+            )
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
         for i in range(gen_length * num_trials):
-            self._run_decode_step(pool, task_ids, prompt_length + 5 + i, workspace)
+            self._run_decode_step(
+                pool, task_cache, task_ids, prompt_length + 5 + i, workspace
+            )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
         tokens = batch_size * gen_length * num_trials

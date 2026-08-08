@@ -77,7 +77,17 @@ class Task:
         self.output_logprobs: List[float] = []
         self.input_tokens: int = 0
         self.output_tokens: int = 0
+        self._kv_len: int = 0
         self._decoder: Optional[StreamDecoder] = None
+
+    def mark_prefill_done(self):
+        """Prompt KV is materialized by prefill; first output sampled but
+        not yet written to KV."""
+        self._kv_len = self.input_tokens
+
+    def advance_kv(self):
+        """One more position written to KV (after a decode forward)."""
+        self._kv_len += 1
 
     def decode_new_token(self, tokenizer: AutoTokenizer) -> str:
         """Decode the last appended output token, buffering incomplete
@@ -91,8 +101,13 @@ class Task:
 
     @property
     def next_pos(self) -> int:
-        # The first output is sampled from prefill and enters KV on the next step.
-        return self.input_tokens + max(0, len(self.output_ids) - 1)
+        """KV position where the next decode step will write."""
+        return self._kv_len
+
+    @property
+    def prefill_done(self) -> bool:
+        """True when all prompt KV entries are materialized."""
+        return self._kv_len >= self.input_tokens > 0
 
     def is_finished(self, stop_ids: List[int]) -> bool:
         if self.max_tokens is not None and self.output_tokens >= self.max_tokens:

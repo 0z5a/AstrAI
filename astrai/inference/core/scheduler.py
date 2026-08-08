@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from astrai.inference.core.cache import PagePool
+from astrai.inference.core.cache import PagePool, TaskCacheManager
 from astrai.inference.core.executor import Executor
 from astrai.inference.core.metrics import MetricsCollector
 from astrai.inference.core.task import STOP, Task, TaskManager, TaskStatus
@@ -59,6 +59,13 @@ class InferenceScheduler:
 
         self._metrics = MetricsCollector()
 
+        self._task_cache = TaskCacheManager(
+            strategy=self._cache._strategy,
+            req_pool=self._cache._req_pool,
+            max_seq_len=self.max_seq_len,
+            pool=self._cache,
+        )
+
         self._task_mgr = TaskManager(
             tokenizer=tokenizer,
             max_batch_size=max_batch_size,
@@ -69,6 +76,7 @@ class InferenceScheduler:
         self._executor = Executor(
             model=model,
             kv_cache=self._cache,
+            task_cache=self._task_cache,
             device=self.device,
             dtype=self.dtype,
         )
@@ -81,7 +89,7 @@ class InferenceScheduler:
 
     def remove_task(self, task_id: str):
         for task in self._task_mgr.remove_task(task_id):
-            self._cache.task_free(task.task_id)
+            self._task_cache.task_free(task.task_id)
 
     def get_stats(self) -> Dict[str, Any]:
         return self._task_mgr.get_stats()
@@ -109,9 +117,7 @@ class InferenceScheduler:
             already appended to ``output_ids``) and tasks that hit the
             sequence cap and were marked ``ABORTED``.
         """
-        cache = self._cache
-
-        to_prefill = [t for t in tasks if t.output_tokens == 0 and t.prompt_ids]
+        to_prefill = [t for t in tasks if not t.prefill_done and t.prompt_ids]
         prefilled_ids = set()
         produced: List[Task] = []
         if to_prefill:
@@ -120,7 +126,9 @@ class InferenceScheduler:
 
             groups: Dict[Tuple[int, int], List[Task]] = {}
             for t in to_prefill:
-                start_pos = min(cache.task_cached(t.task_id), len(t.prompt_ids) - 1)
+                start_pos = min(
+                    self._task_cache.task_cached(t.task_id), len(t.prompt_ids) - 1
+                )
                 groups.setdefault((len(t.prompt_ids), start_pos), []).append(t)
 
             for (prompt_len, start_pos), group in groups.items():
@@ -132,12 +140,13 @@ class InferenceScheduler:
                 for t, out in zip(prefilled, step_out):
                     t.output_ids.append(out[0] if return_logprobs else out)
                     t.output_tokens += 1
+                    t.mark_prefill_done()
                     prefilled_ids.add(t.task_id)
                     produced.append(t)
 
-                start_logical_page = start_pos // getattr(cache, "page_size", 64)
+                start_logical_page = start_pos // self._cache.page_size
                 for t in group:
-                    cache.task_record_hashes(
+                    self._task_cache.task_record_hashes(
                         t.task_id, t.prompt_ids, start_logical_page
                     )
 
@@ -146,7 +155,7 @@ class InferenceScheduler:
         for t in tasks:
             if t.task_id in prefilled_ids:
                 continue
-            if cache.task_extend(t.task_id, t.next_pos):
+            if self._task_cache.task_extend(t.task_id, t.next_pos):
                 decoded.append(t)
             else:
                 t.status = TaskStatus.ABORTED
@@ -160,25 +169,25 @@ class InferenceScheduler:
             for t, out in zip(decoded, step_out):
                 t.output_ids.append(out[0] if return_logprobs else out)
                 t.output_tokens += 1
+                t.advance_kv()
                 produced.append(t)
 
         return produced, aborted
 
     def _run_generation_loop(self):
         stop_ids = self._task_mgr.tokenizer.stop_ids
-        cache = self._cache
         try:
             while not self._stop_event.is_set():
                 finished = self._task_mgr.remove_finished_tasks(stop_ids)
                 for task in finished:
                     if task.status == TaskStatus.FINISHED:
-                        cache.task_record_hashes(
+                        self._task_cache.task_record_hashes(
                             task.task_id,
-                            cache.task_cacheable_ids(
+                            self._task_cache.task_cacheable_ids(
                                 task.task_id, task.prompt_ids, task.output_ids
                             ),
                         )
-                    cache.task_free(task.task_id)
+                    self._task_cache.task_free(task.task_id)
 
                 active = self._task_mgr.get_active_tasks()
                 available = self._task_mgr.max_batch_size - len(active)
@@ -186,7 +195,7 @@ class InferenceScheduler:
                     candidates = self._task_mgr.pull_candidates(available)
                     failed = []
                     for task in candidates:
-                        if cache.task_alloc(task.task_id, task.prompt_ids):
+                        if self._task_cache.task_alloc(task.task_id, task.prompt_ids):
                             self._task_mgr.activate(task)
                         else:
                             failed.append(task)
@@ -216,7 +225,7 @@ class InferenceScheduler:
             logger.error(f"Scheduler loop crashed: {e}", exc_info=True)
             for task in self._task_mgr.get_active_tasks():
                 self._task_mgr.invoke_callback(task.task_id, STOP)
-                cache.task_free(task.task_id)
+                self._task_cache.task_free(task.task_id)
             for task in self._task_mgr.get_waiting_tasks():
                 self._task_mgr.invoke_callback(task.task_id, STOP)
             self._task_mgr.clear_queues()
@@ -237,10 +246,10 @@ class InferenceScheduler:
         self._loop_thread = None
         for task in self._task_mgr.get_active_tasks():
             self._task_mgr.invoke_callback(task.task_id, STOP)
-            self._cache.task_free(task.task_id)
+            self._task_cache.task_free(task.task_id)
         for task in self._task_mgr.get_waiting_tasks():
             self._task_mgr.invoke_callback(task.task_id, STOP)
-            self._cache.task_free(task.task_id)
+            self._task_cache.task_free(task.task_id)
         self._task_mgr.clear_queues()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -279,7 +288,6 @@ class InferenceScheduler:
             ``List[Tuple[List[int], List[float]]]``.
         """
         stop_ids = self._task_mgr.tokenizer.stop_ids
-        cache = self._cache
         seq_cap = self.max_seq_len
 
         tasks: List[Task] = []
@@ -305,7 +313,7 @@ class InferenceScheduler:
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
             )
-            if not cache.task_alloc(task.task_id, task.prompt_ids):
+            if not self._task_cache.task_alloc(task.task_id, task.prompt_ids):
                 tasks.append(None)
                 continue
             task.input_tokens = len(task.prompt_ids)
@@ -324,7 +332,7 @@ class InferenceScheduler:
                     self._metrics.mark_finished(
                         t.task_id, t.input_tokens, t.output_tokens
                     )
-                    cache.task_free(t.task_id)
+                    self._task_cache.task_free(t.task_id)
 
         results: List[Any] = []
         for t in tasks:

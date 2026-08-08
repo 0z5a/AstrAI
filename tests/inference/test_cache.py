@@ -8,6 +8,7 @@ from astrai.inference import (
     PagePool,
     RadixCache,
     ReqToTokenPool,
+    TaskCacheManager,
     page_hash,
 )
 from astrai.inference.core.workspace import InferenceWorkspace
@@ -22,6 +23,15 @@ def _ws(pool: PagePool) -> InferenceWorkspace:
         head_dim=4,
         device=pool.device,
         dtype=pool.dtype,
+    )
+
+
+def _make_task_cache(pool: PagePool) -> TaskCacheManager:
+    return TaskCacheManager(
+        strategy=pool._strategy,
+        req_pool=pool._req_pool,
+        max_seq_len=pool.max_seq_len,
+        pool=pool,
     )
 
 
@@ -116,9 +126,9 @@ def test_prefix_cache_ignores_partial_last_page():
 def test_prefix_cache_on_evict_clears_mappings():
     prefix = RadixCache(64)
     prefix.record(0, list(range(64)), 0)
-    assert 0 in prefix._page_to_hash
+    assert prefix.has_page(0)
     prefix.evict(0)
-    assert 0 not in prefix._page_to_hash
+    assert not prefix.has_page(0)
 
 
 def test_prefix_cache_has_page():
@@ -162,7 +172,8 @@ def test_prefix_cache_does_not_record_partial_page():
 
 def test_page_pool_task_cacheable_ids_excludes_unmaterialized_tail():
     pool = _make_paged_pool_ps64()
-    assert pool.task_cacheable_ids("missing", [1, 2], [3, 4]) == [1, 2, 3]
+    task_cache = _make_task_cache(pool)
+    assert task_cache.task_cacheable_ids("missing", [1, 2], [3, 4]) == [1, 2, 3]
 
 
 # ---- ReqToTokenPool ----
@@ -243,31 +254,35 @@ def _make_contiguous_pool(**kwargs):
 
 def test_page_pool_contiguous_task_alloc_free():
     pool = _make_contiguous_pool()
-    assert pool.task_alloc("t1", [1, 2, 3])
-    assert "t1" in pool._task_req
-    pool.task_free("t1")
-    assert "t1" not in pool._task_req
+    task_cache = _make_task_cache(pool)
+    assert task_cache.task_alloc("t1", [1, 2, 3])
+    assert "t1" in task_cache._states
+    task_cache.task_free("t1")
+    assert "t1" not in task_cache._states
 
 
 def test_page_pool_contiguous_task_extend():
     pool = _make_contiguous_pool()
-    pool.task_alloc("t1", [1, 2, 3])
-    assert pool.task_extend("t1", 3)
-    assert pool.task_extend("t1", 63)
-    assert not pool.task_extend("t1", 64)
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", [1, 2, 3])
+    assert task_cache.task_extend("t1", 3)
+    assert task_cache.task_extend("t1", 63)
+    assert not task_cache.task_extend("t1", 64)
 
 
 def test_page_pool_contiguous_task_cached():
     pool = _make_contiguous_pool()
-    pool.task_alloc("t1", [1, 2, 3])
-    assert pool.task_cached("t1") == 0
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", [1, 2, 3])
+    assert task_cache.task_cached("t1") == 0
 
 
 def test_page_pool_contiguous_bind_tasks_prefill():
     pool = _make_contiguous_pool()
-    pool.task_alloc("t1", list(range(10)))
-    pool.task_alloc("t2", list(range(10)))
-    kv = pool.bind_tasks(["t1", "t2"], _ws(pool), start_pos=0)
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", list(range(10)))
+    task_cache.task_alloc("t2", list(range(10)))
+    kv = task_cache.bind(["t1", "t2"], _ws(pool), start_pos=0)
     assert kv.out_cache_loc.shape == (2, 10)
     assert kv.seq_lens.tolist() == [10, 10]
     assert kv.req_pool_indices.shape == (2,)
@@ -275,12 +290,13 @@ def test_page_pool_contiguous_bind_tasks_prefill():
 
 def test_page_pool_contiguous_bind_tasks_decode():
     pool = _make_contiguous_pool()
-    pool.task_alloc("t1", list(range(10)))
-    pool.task_alloc("t2", list(range(8)))
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", list(range(10)))
+    task_cache.task_alloc("t2", list(range(8)))
     # Simulate one decode extension so seq_lens advance to 11 and 9.
-    assert pool.task_extend("t1", 10)
-    assert pool.task_extend("t2", 8)
-    kv = pool.bind_tasks(["t1", "t2"], _ws(pool))
+    assert task_cache.task_extend("t1", 10)
+    assert task_cache.task_extend("t2", 8)
+    kv = task_cache.bind(["t1", "t2"], _ws(pool))
     assert kv.out_cache_loc.shape == (2, 1)
     assert kv.seq_lens.tolist() == [11, 9]
 
@@ -288,9 +304,10 @@ def test_page_pool_contiguous_bind_tasks_decode():
 def test_page_pool_contiguous_bind_roundtrip():
     """Write KV via bind_tasks, then gather via req_to_token indexing."""
     pool = _make_contiguous_pool(n_layers=1, n_kv_heads=2, head_dim=4)
-    pool.task_alloc("t1", list(range(4)))
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", list(range(4)))
 
-    kv = pool.bind_tasks(["t1"], _ws(pool), start_pos=0)
+    kv = task_cache.bind(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
     v = torch.randn(1, 4, 2, 4)
     kv.k_buffer[0, kv.out_cache_loc] = k
@@ -324,35 +341,38 @@ def _make_paged_pool(**kwargs):
 
 def test_page_pool_paged_task_alloc():
     pool = _make_paged_pool()
-    assert pool.task_alloc("t1", list(range(10)))
-    req_idx = pool._task_req["t1"]
-    slots = pool._task_slots["t1"]
-    assert len(slots) == 10
-    assert pool._req_pool.req_to_token[req_idx, 0].item() == slots[0]
+    task_cache = _make_task_cache(pool)
+    assert task_cache.task_alloc("t1", list(range(10)))
+    state = task_cache._states["t1"]
+    assert len(state.pages) == 10
+    assert pool._req_pool.req_to_token[state.req_idx, 0].item() == state.pages[0]
 
 
 def test_page_pool_paged_task_extend():
     pool = _make_paged_pool()
-    pool.task_alloc("t1", list(range(4)))
-    assert pool.task_extend("t1", 4)
-    req_idx = pool._task_req["t1"]
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", list(range(4)))
+    assert task_cache.task_extend("t1", 4)
+    req_idx = task_cache._states["t1"].req_idx
     slot = pool._req_pool.req_to_token[req_idx, 4].item()
     assert slot >= 0
 
 
 def test_page_pool_paged_task_free_releases_slots():
     pool = _make_paged_pool(n_tokens=16)
-    pool.task_alloc("t1", list(range(8)))
-    pool.task_free("t1")
-    assert "t1" not in pool._task_req
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", list(range(8)))
+    task_cache.task_free("t1")
+    assert "t1" not in task_cache._states
     assert len(pool._req_pool.free_slots) == 4
 
 
 def test_page_pool_paged_bind_roundtrip():
     pool = _make_paged_pool(n_layers=1, n_kv_heads=2, head_dim=4)
-    pool.task_alloc("t1", list(range(4)))
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", list(range(4)))
 
-    kv = pool.bind_tasks(["t1"], _ws(pool), start_pos=0)
+    kv = task_cache.bind(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
     v = torch.randn(1, 4, 2, 4)
     kv.k_buffer[0, kv.out_cache_loc] = k
@@ -384,26 +404,29 @@ def _make_paged_pool_ps64(**kwargs):
 
 def test_page_pool_paged_ps64_task_alloc():
     pool = _make_paged_pool_ps64()
+    task_cache = _make_task_cache(pool)
     prompt = list(range(200))
-    assert pool.task_alloc("t1", prompt)
-    assert pool.task_cached("t1") == 0
+    assert task_cache.task_alloc("t1", prompt)
+    assert task_cache.task_cached("t1") == 0
     n_pages = (200 + 63) // 64
-    assert len(pool._task_pages["t1"]) == n_pages
+    assert len(task_cache._states["t1"].pages) == n_pages
 
 
 def test_page_pool_paged_ps64_task_extend_crosses_page():
     pool = _make_paged_pool_ps64()
-    pool.task_alloc("t1", list(range(64)))
-    assert pool.task_extend("t1", 64)
-    assert len(pool._task_pages["t1"]) >= 2
+    task_cache = _make_task_cache(pool)
+    task_cache.task_alloc("t1", list(range(64)))
+    assert task_cache.task_extend("t1", 64)
+    assert len(task_cache._states["t1"].pages) >= 2
 
 
 def test_page_pool_paged_ps64_bind_roundtrip():
     pool = _make_paged_pool_ps64(n_layers=1, n_kv_heads=2, head_dim=4)
+    task_cache = _make_task_cache(pool)
     prompt = list(range(128))
-    pool.task_alloc("t1", prompt)
+    task_cache.task_alloc("t1", prompt)
 
-    kv = pool.bind_tasks(["t1"], _ws(pool), start_pos=0)
+    kv = task_cache.bind(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 128, 2, 4)
     v = torch.randn(1, 128, 2, 4)
     kv.k_buffer[0, kv.out_cache_loc] = k

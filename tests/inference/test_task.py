@@ -20,11 +20,12 @@ def test_task_default_status_is_pending():
 def test_task_next_pos():
     task = Task("id1", [1, 2, 3])
     task.input_tokens = 5
+    task.mark_prefill_done()
     assert task.next_pos == 5
-    task.output_ids.append(4)
-    assert task.next_pos == 5
-    task.output_ids.append(5)
+    task.advance_kv()
     assert task.next_pos == 6
+    task.advance_kv()
+    assert task.next_pos == 7
 
 
 def test_task_is_finished_max_tokens():
