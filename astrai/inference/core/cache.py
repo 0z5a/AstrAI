@@ -413,6 +413,8 @@ class PagePool:
                 if slots is None:
                     for p in self._task_pages[task_id]:
                         self._alloc.free(p)
+                    self._task_pages.pop(task_id, None)
+                    self._task_slots.pop(task_id, None)
                     self._req_pool.free([req_idx])
                     del self._task_req[task_id]
                     return False
@@ -427,6 +429,8 @@ class PagePool:
                             self._alloc.free(hp)
                         for np_ in new_pages:
                             self._alloc.free(np_)
+                        self._task_pages.pop(task_id, None)
+                        self._task_slots.pop(task_id, None)
                         self._req_pool.free([req_idx])
                         del self._task_req[task_id]
                         return False
@@ -442,6 +446,7 @@ class PagePool:
         req_idx = self._task_req.pop(task_id, None)
         if req_idx is None:
             return
+        self._bind_state = None
         self._task_len.pop(req_idx, None)
         self._task_cached.pop(task_id, None)
 
@@ -455,6 +460,9 @@ class PagePool:
             else:
                 for p in self._task_pages.get(task_id, []):
                     self._alloc.free(p)
+            if self.page_size == 1:
+                for slot in self._task_slots.get(task_id, []):
+                    self._alloc.free(slot)
             self._task_pages.pop(task_id, None)
             self._task_slots.pop(task_id, None)
 
@@ -503,7 +511,7 @@ class PagePool:
     def task_record_hashes(
         self, task_id: str, prompt_ids: List[int], start_logical_page: int = 0
     ):
-        if self._prefix is None or self.contiguous:
+        if self._prefix is None:
             return
         pages = self._task_pages.get(task_id, [])
         full_pages = len(prompt_ids) // self.page_size
@@ -634,9 +642,6 @@ class PagePool:
     def _write_req_to_token(self, task_id: str, prompt_ids: List[int], cached: int):
         req_idx = self._task_req[task_id]
         total = len(prompt_ids)
-
-        if self.contiguous:
-            return
 
         if self.page_size == 1:
             slots = self._task_slots.get(task_id, [])

@@ -68,7 +68,6 @@ class InferenceScheduler:
 
         self._executor = Executor(
             model=model,
-            tokenizer=tokenizer,
             kv_cache=self._cache,
             device=self.device,
             dtype=self.dtype,
@@ -210,9 +209,6 @@ class InferenceScheduler:
                     if new_text:
                         self._task_mgr.invoke_callback(t.task_id, new_text)
                     if t.is_finished(stop_ids):
-                        remaining = t.flush_remaining(self._task_mgr.tokenizer)
-                        if remaining:
-                            self._task_mgr.invoke_callback(t.task_id, remaining)
                         self._task_mgr.invoke_callback(t.task_id, STOP)
 
         except Exception as e:

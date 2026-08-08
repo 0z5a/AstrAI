@@ -19,7 +19,6 @@ from astrai.inference.core.task import Task
 from astrai.inference.core.workspace import InferenceWorkspace
 from astrai.inference.sample import sample
 from astrai.model.automodel import AutoModel
-from astrai.tokenize.tokenizer import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -184,13 +183,11 @@ class Executor:
     def __init__(
         self,
         model: AutoModel,
-        tokenizer: AutoTokenizer,
         kv_cache: PagePool,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
     ):
         self.model = model
-        self.tokenizer = tokenizer
         self.kv_cache = kv_cache
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
@@ -207,7 +204,6 @@ class Executor:
         config = model.config
         max_q_heads = config.num_attention_heads
         head_dim = config.hidden_size // config.num_attention_heads
-        self._head_dim = head_dim
         self._graph_supported = CudaBackend.supports(head_dim=head_dim)
         self._workspace = InferenceWorkspace(
             max_batch_size=kv_cache.max_batch_size,

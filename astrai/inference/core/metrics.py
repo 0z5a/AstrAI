@@ -12,7 +12,7 @@ class TaskTiming:
     """Timestamp snapshots and computed metrics for one generation task.
 
     Created by :class:`MetricsCollector` at task-registration time;
-    updated via ``prefill_scope`` / ``mark_finished``.
+    updated via ``record`` / ``mark_finished``.
     """
 
     task_id: str
@@ -24,8 +24,6 @@ class TaskTiming:
     output_tokens: int = 0
     _decode_steps: int = 0
     _decode_total_s: float = 0.0
-
-    # derived metrics
 
     # derived metrics
 
@@ -116,7 +114,7 @@ class MetricsCollector:
         metrics = MetricsCollector()
         metrics.register(task_id, arrival_time)
 
-        with metrics.prefill_scope(task_ids):
+        with metrics.record(task_ids, "prefill"):
             run_prefill(...)
 
         metrics.mark_finished(task_id, input_tokens, output_tokens)

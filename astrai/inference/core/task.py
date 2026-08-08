@@ -1,4 +1,3 @@
-import logging
 import threading
 import time
 import uuid
@@ -10,8 +9,6 @@ from tokenizers.decoders import DecodeStream
 
 from astrai.inference.core.metrics import MetricsCollector
 from astrai.tokenize.tokenizer import AutoTokenizer
-
-logger = logging.getLogger(__name__)
 
 STOP = object()
 
@@ -92,16 +89,6 @@ class Task:
             self._decoder = StreamDecoder(tokenizer)
         return self._decoder.push(self.output_ids[-1])
 
-    def flush_remaining(self, tokenizer: AutoTokenizer) -> str:
-        """Emit any text still buffered in the decoder.
-
-        With the Rust-native DecodeStream, the stream is always in a
-        correct state — any completed text was already emitted by the
-        last ``push``.  A trailing incomplete multi-byte sequence has no
-        valid text to emit, so this is a no-op.
-        """
-        return ""
-
     @property
     def next_pos(self) -> int:
         # The first output is sampled from prefill and enters KV on the next step.
@@ -156,11 +143,6 @@ class TaskManager:
         prompt_ids = self.tokenizer.encode(prompt)
         if len(prompt_ids) > self.max_seq_len:
             prompt_ids = prompt_ids[-self.max_seq_len :]
-
-        if len(prompt_ids) > self.max_seq_len:
-            if stream_callback:
-                stream_callback(STOP)
-            return task_id
 
         if max_tokens is None:
             max_tokens = self.max_seq_len - len(prompt_ids)

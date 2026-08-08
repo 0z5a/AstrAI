@@ -363,20 +363,6 @@ def sample(
         ``True`` — a ``(token_ids, chosen_logprobs)`` tuple where
         ``chosen_logprobs`` has shape ``[batch]``.
     """
-    greedy = (
-        bool((temperature == 0).all())
-        if isinstance(temperature, Tensor)
-        else temperature == 0
-    )
-
-    if greedy:
-        tokens = logits.argmax(dim=-1)
-        if not return_logprobs:
-            return tokens
-        log_probs = torch.log_softmax(logits.float(), dim=-1)
-        chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
-        return tokens, chosen
-
     has_freq = (
         (isinstance(frequency_penalty, Tensor) and (frequency_penalty != 0).any())
         if isinstance(frequency_penalty, Tensor)

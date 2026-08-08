@@ -181,12 +181,10 @@ class ProtocolHandler:
         self, agen: AsyncGenerator, ctx: GenContext, stop_sequences: List[str]
     ) -> Dict[str, Any]:
         checker = StopChecker(stop_sequences)
-        chunks: List[str] = []
         body = ""
         matched = None
 
         async for token in agen:
-            chunks.append(token)
             body += token
 
             matched = checker.check(body)
@@ -195,6 +193,5 @@ class ProtocolHandler:
 
             ctx.completion_tokens += 1
 
-        content = "".join(chunks)
         stop = StopInfo(matched=matched, body=body)
-        return self.builder.format_response(ctx, content, stop)
+        return self.builder.format_response(ctx, body, stop)
