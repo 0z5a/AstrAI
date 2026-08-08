@@ -26,15 +26,26 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def timed(label: str, log: Optional[logging.Logger] = None):
-    """Wall-clock debug timer, enabled when the logger level is DEBUG or lower."""
+    """GPU-precise timer via CUDA events; falls back to perf_counter on CPU."""
     log = log or logger
     if not log.isEnabledFor(logging.DEBUG):
         yield
         return
-    tic = time.perf_counter()
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+    else:
+        tic = time.perf_counter()
     yield
-    elapsed_ms = (time.perf_counter() - tic) * 1000
-    log.debug("%s %.1fms", label, elapsed_ms)
+    if use_cuda:
+        end.record()
+        torch.cuda.synchronize()
+        elapsed_ms = start.elapsed_time(end)
+    else:
+        elapsed_ms = (time.perf_counter() - tic) * 1000
+    log.debug("%s %.2fms", label, elapsed_ms)
 
 
 @dataclass
