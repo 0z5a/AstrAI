@@ -7,6 +7,7 @@ import torch
 
 from astrai.inference.core.cache import PagePool
 from astrai.inference.core.executor import Executor
+from astrai.inference.core.metrics import MetricsCollector
 from astrai.inference.core.task import STOP, Task, TaskManager, TaskStatus
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
@@ -56,10 +57,13 @@ class InferenceScheduler:
                 dtype=self.dtype,
             )
 
+        self._metrics = MetricsCollector()
+
         self._task_mgr = TaskManager(
             tokenizer=tokenizer,
             max_batch_size=max_batch_size,
             max_seq_len=self.max_seq_len,
+            metrics=self._metrics,
         )
 
         self._executor = Executor(
@@ -121,14 +125,17 @@ class InferenceScheduler:
                 groups.setdefault((len(t.prompt_ids), start_pos), []).append(t)
 
             for (prompt_len, start_pos), group in groups.items():
-                prefilled, step_out = self._executor.execute_prefill(
-                    group, prompt_len, start_pos, return_logprobs=return_logprobs
-                )
+                with self._metrics.record([t.task_id for t in group], "prefill"):
+                    prefilled, step_out = self._executor.execute_prefill(
+                        group, prompt_len, start_pos, return_logprobs=return_logprobs
+                    )
+
                 for t, out in zip(prefilled, step_out):
                     t.output_ids.append(out[0] if return_logprobs else out)
                     t.output_tokens += 1
                     prefilled_ids.add(t.task_id)
                     produced.append(t)
+
                 start_logical_page = start_pos // getattr(cache, "page_size", 64)
                 for t in group:
                     cache.task_record_hashes(
@@ -147,9 +154,10 @@ class InferenceScheduler:
                 aborted.append(t)
 
         if decoded:
-            step_out = self._executor.execute_decode(
-                decoded, return_logprobs=return_logprobs
-            )
+            with self._metrics.record([t.task_id for t in decoded], "decode"):
+                step_out = self._executor.execute_decode(
+                    decoded, return_logprobs=return_logprobs
+                )
             for t, out in zip(decoded, step_out):
                 t.output_ids.append(out[0] if return_logprobs else out)
                 t.output_tokens += 1
@@ -305,6 +313,7 @@ class InferenceScheduler:
                 tasks.append(None)
                 continue
             task.input_tokens = len(task.prompt_ids)
+            self._metrics.register(task.task_id)
             tasks.append(task)
 
         try:
@@ -316,6 +325,9 @@ class InferenceScheduler:
         finally:
             for t in tasks:
                 if t is not None:
+                    self._metrics.mark_finished(
+                        t.task_id, t.input_tokens, t.output_tokens
+                    )
                     cache.task_free(t.task_id)
 
         results: List[Any] = []

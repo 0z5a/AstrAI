@@ -10,6 +10,7 @@ from astrai.inference.core.cache import (
     page_hash,
 )
 from astrai.inference.core.executor import Executor
+from astrai.inference.core.metrics import MetricsCollector, TaskTiming
 from astrai.inference.core.scheduler import InferenceScheduler
 from astrai.inference.core.task import STOP, Task, TaskManager, TaskStatus
 
@@ -23,6 +24,8 @@ __all__ = [
     "page_hash",
     "Executor",
     "InferenceScheduler",
+    "MetricsCollector",
+    "TaskTiming",
     "STOP",
     "Task",
     "TaskManager",

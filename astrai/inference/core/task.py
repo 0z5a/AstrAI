@@ -8,6 +8,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 
 from tokenizers.decoders import DecodeStream
 
+from astrai.inference.core.metrics import MetricsCollector
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 logger = logging.getLogger(__name__)
@@ -79,8 +80,6 @@ class Task:
         self.output_logprobs: List[float] = []
         self.input_tokens: int = 0
         self.output_tokens: int = 0
-        self.arrival_time = time.time()
-        self.finish_time: Optional[float] = None
         self._decoder: Optional[StreamDecoder] = None
 
     def decode_new_token(self, tokenizer: AutoTokenizer) -> str:
@@ -124,6 +123,7 @@ class TaskManager:
         tokenizer: AutoTokenizer,
         max_batch_size: int = 16,
         max_seq_len: int = 8192,
+        metrics: Optional["MetricsCollector"] = None,
     ):
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
@@ -138,6 +138,8 @@ class TaskManager:
 
         self._total_tasks = 0
         self._total_tokens = 0
+
+        self._metrics = metrics
 
     def add_task(
         self,
@@ -182,6 +184,9 @@ class TaskManager:
             if stream_callback:
                 self._callbacks[task_id] = stream_callback
 
+        if self._metrics is not None:
+            self._metrics.register(task_id)
+
         self._task_event.set()
         return task_id
 
@@ -201,25 +206,32 @@ class TaskManager:
             cb(token)
 
     def get_stats(self) -> Dict[str, Any]:
-        return {
+        stats: Dict[str, Any] = {
             "total_tasks": self._total_tasks,
             "total_tokens": self._total_tokens,
             "active_tasks": len(self.active_tasks),
             "waiting_queue": len(self.waiting_queue),
         }
+        if self._metrics is not None:
+            stats.update(self._metrics.get_stats())
+        return stats
 
     def remove_finished_tasks(self, stop_ids: List[int]) -> List[Task]:
         with self._lock:
             finished = []
             for task in self.active_tasks:
                 if task.status == TaskStatus.ABORTED:
-                    task.finish_time = time.time()
                     finished.append(task)
                 elif task.is_finished(stop_ids):
                     task.status = TaskStatus.FINISHED
-                    task.finish_time = time.time()
                     finished.append(task)
                     self._total_tokens += task.output_tokens
+
+            if self._metrics is not None:
+                for task in finished:
+                    self._metrics.mark_finished(
+                        task.task_id, task.input_tokens, task.output_tokens
+                    )
 
             self.active_tasks = [
                 t
