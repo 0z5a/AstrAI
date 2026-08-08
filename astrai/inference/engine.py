@@ -204,21 +204,17 @@ class InferenceEngine:
 
         def gen():
             nonlocal remaining
-            try:
-                while remaining > 0:
-                    items = result.pop_all()
-                    for idx, token in items:
-                        if token is STOP:
-                            if not finished[idx]:
-                                finished[idx] = True
-                                remaining -= 1
-                        else:
-                            yield (idx, token) if is_batch else token
-                    if remaining > 0:
-                        result.wait(timeout=0.05)
-            finally:
-                for tid in task_ids:
-                    self.scheduler.remove_task(tid)
+            while remaining > 0:
+                items = result.pop_all()
+                for idx, token in items:
+                    if token is STOP:
+                        if not finished[idx]:
+                            finished[idx] = True
+                            remaining -= 1
+                    else:
+                        yield (idx, token) if is_batch else token
+                if remaining > 0:
+                    result.wait(timeout=0.05)
 
         return gen()
 
