@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,19 +22,19 @@ from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 logger = logging.getLogger(__name__)
-_TIMED = os.environ.get("ASTRAI_TIMED", "") == "1"
 
 
 @contextmanager
 def timed(label: str, log: Optional[logging.Logger] = None):
-    """Wall-clock debug timer, enabled via ``ASTRAI_TIMED=1``."""
-    if not _TIMED:
+    """Wall-clock debug timer, enabled when the logger level is DEBUG or lower."""
+    log = log or logger
+    if not log.isEnabledFor(logging.DEBUG):
         yield
         return
     tic = time.perf_counter()
     yield
     elapsed_ms = (time.perf_counter() - tic) * 1000
-    (log or logger).info("%s %.1fms", label, elapsed_ms)
+    log.debug("%s %.1fms", label, elapsed_ms)
 
 
 @dataclass

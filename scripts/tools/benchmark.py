@@ -5,7 +5,6 @@ from typing import Optional, Union
 import click
 import torch
 
-from astrai import setup_logging
 from astrai.config import BaseModelConfig, ConfigFactory
 from astrai.extension import ATTN_BACKEND, AttentionBackendFactory, attn_backend
 from astrai.inference.core.cache import PagePool
@@ -478,5 +477,4 @@ def benchmark_command(
 
 
 if __name__ == "__main__":
-    setup_logging()
     benchmark_command()

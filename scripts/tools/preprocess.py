@@ -2,7 +2,6 @@
 
 import click
 
-from astrai import setup_logging
 from astrai.config.preprocess_config import PipelineConfig
 from astrai.preprocessing.pipeline import Pipeline
 
@@ -48,5 +47,4 @@ def preprocess_command(inputs, output_dir, pipeline_config, tokenizer_path, batc
 
 
 if __name__ == "__main__":
-    setup_logging()
     preprocess_command()

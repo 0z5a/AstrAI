@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from astrai.inference import InferenceEngine
+from astrai import InferenceEngine
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 

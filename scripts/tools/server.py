@@ -3,7 +3,6 @@ from pathlib import Path
 import click
 import torch
 
-from astrai import setup_logging
 from astrai.inference import run_server
 
 _DTYPES = ["bfloat16", "float16", "float32"]
@@ -65,5 +64,4 @@ def server_command(
 
 
 if __name__ == "__main__":
-    setup_logging()
     server_command()
