@@ -121,25 +121,10 @@ def _warmup_cuda_graphs(
         with (
             torch.inference_mode(),
             attn_backend(ATTN_BACKEND.CUDA),
-            timed(f"warmup prefill b={b}", logger),
-        ):
-            kv_cache = pool.bind_tasks(task_ids, ws, start_pos=0)
-            ids_in = torch.tensor(prompt_tokens, dtype=torch.long, device=dev)
-            pos_in = torch.arange(prompt_len, device=dev).unsqueeze(0).expand(b, -1)
-            model(
-                ids_in,
-                input_mask=pos_in.unsqueeze(-1) >= torch.arange(prompt_len, device=dev),
-                kv_cache=kv_cache,
-                position_ids=pos_in,
-            )
-
-        with (
-            torch.inference_mode(),
-            attn_backend(ATTN_BACKEND.CUDA),
             timed(f"warmup decode b={b}", logger),
         ):
             for step in range(2):
-                seq_pos = prompt_len + step
+                seq_pos = step
                 ws.position_ids[:b] = seq_pos
                 for tid in task_ids:
                     pool.task_extend(tid, seq_pos)
