@@ -80,7 +80,7 @@ template <typename KV>
 struct PrefillLauncherScalar {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
     static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
-        constexpr int G = 8, ROWS = 32, P_BC = 32;
+        constexpr int G = (HEAD_DIM == 32) ? 4 : 8, ROWS = 32, P_BC = 32;
         int q_len = KV::host_q_len(p);
         dim3 grid((q_len + ROWS - 1) / ROWS, p.q_head, p.batch);
         dim3 block(G, ROWS);
@@ -161,6 +161,10 @@ struct DecodeLauncherScalar {
         int g = min(group_size, 32);  // cap at 32 to respect 1024-thread limit
         dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
         dim3 block(32, g);
+        cudaFuncSetAttribute(
+            attn_decode_split_kv_kernel<HEAD_DIM, KV, IsCausal, HasMask>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem);
         attn_decode_split_kv_kernel<HEAD_DIM, KV, IsCausal, HasMask>
             <<<grid, block, smem, stream>>>(p);
     }

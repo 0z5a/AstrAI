@@ -323,6 +323,7 @@ int main() {
     // ---- PREFILL ----
     {
         const int configs[][7] = {
+            {1,2,1,64,128,32,0},     // scalar fallback D=32
             {1,2,1,64,128,64,0},     // tiny: B,Hq,Hk,q,kv,D,causal
             {1,32,4,512,512,128,0},  // standard
             {1,32,4,128,256,128,0},  // medium

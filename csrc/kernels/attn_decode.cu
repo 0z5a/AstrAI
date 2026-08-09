@@ -29,8 +29,15 @@ torch::Tensor attn_decode(
         TORCH_CHECK(o_part_buf->scalar_type() == torch::kFloat32, "o_part_buf must be f32");
         TORCH_CHECK(ml_part_buf->scalar_type() == torch::kFloat32, "ml_part_buf must be f32");
         int64_t o_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * p.head_dim;
+        int64_t ml_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * 2;
         TORCH_CHECK(o_part_buf->numel() >= o_needed,
                      "o_part_buf too small: need ", o_needed, " got ", o_part_buf->numel());
+        TORCH_CHECK(ml_part_buf->numel() >= ml_needed,
+                     "ml_part_buf too small: need ", ml_needed, " got ", ml_part_buf->numel());
+        TORCH_CHECK(o_part_buf->is_cuda() && ml_part_buf->is_cuda(),
+                     "split buffers must be CUDA tensors");
+        TORCH_CHECK(o_part_buf->is_contiguous() && ml_part_buf->is_contiguous(),
+                     "split buffers must be contiguous");
         p.o_part = (float*)o_part_buf->data_ptr();
         p.ml_part = (float*)ml_part_buf->data_ptr();
     } else {

@@ -106,14 +106,17 @@ inline void attn_pack_params(
     TORCH_CHECK(v.dtype() == torch::kBFloat16);
     TORCH_CHECK(k.sizes() == v.sizes(), "K and V must have identical shapes");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4, "Q/K/V must be 4D");
-
     extract_q_dims_and_strides(q, layout, p);
 
     if (layout == BLHD) k = k.transpose(1, 2), v = v.transpose(1, 2);
 
     p.kv_head = (int)k.size(1);
     p.kv_len = (int)k.size(2);
+    TORCH_CHECK(p.q_head % p.kv_head == 0,
+                "q_head must be divisible by kv_head");
     TORCH_CHECK(k.size(3) == p.head_dim, "K/V head_dim must match Q");
+    TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
+                "Q/K/V head_dim must be contiguous");
 
     p.kv_stride_b = (int)k.stride(0);
     p.kv_stride_h = (int)k.stride(1);
@@ -170,6 +173,8 @@ inline void attn_pack_paged_decode_params(
     p.head_dim = (int)q.size(2);
     p.kv_head = (int)k_cache.size(1);
     TORCH_CHECK(k_cache.size(2) == p.head_dim, "k_cache head_dim mismatch");
+    TORCH_CHECK(q.stride(2) == 1 && k_cache.stride(2) == 1 && v_cache.stride(2) == 1,
+                "Q/K/V head_dim must be contiguous");
     TORCH_CHECK(p.head_dim % 32 == 0, "head_dim must be multiple of 32");
     TORCH_CHECK(p.q_head % p.kv_head == 0, "q_head must be divisible by kv_head");
 
@@ -252,6 +257,8 @@ inline void attn_pack_paged_prefill_params(
     p.kv_head = (int)k_cache.size(1);
     p.batch = (int)req_pool_indices.size(0);
     TORCH_CHECK(k_cache.size(2) == p.head_dim, "k_cache head_dim mismatch");
+    TORCH_CHECK(q.stride(2) == 1 && k_cache.stride(2) == 1 && v_cache.stride(2) == 1,
+                "Q/K/V head_dim must be contiguous");
     TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
     TORCH_CHECK(p.q_head % p.kv_head == 0, "q_head must be divisible by kv_head");
     TORCH_CHECK(kv_indptr.size(0) == p.batch + 1, "kv_indptr must be [batch+1]");

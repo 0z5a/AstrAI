@@ -27,12 +27,14 @@ torch::Tensor attn_paged_decode(
     torch::Tensor O;
     if (out_buf.has_value() && out_buf->defined()) {
         TORCH_CHECK(out_buf->dtype() == q.dtype(), "out_buf dtype must match q");
+        TORCH_CHECK(out_buf->is_cuda() && out_buf->is_contiguous(),
+                    "out_buf must be a contiguous CUDA tensor");
         TORCH_CHECK(out_buf->size(0) >= q.size(0), "out_buf batch too small");
-        TORCH_CHECK(out_buf->size(1) >= q.size(1), "out_buf heads too small");
-        TORCH_CHECK(out_buf->size(2) >= q.size(2), "out_buf head_dim too small");
-        O = out_buf.value().slice(0, 0, q.size(0))
-                            .slice(1, 0, q.size(1))
-                            .slice(2, 0, q.size(2));
+        TORCH_CHECK(out_buf->size(1) == q.size(1), "out_buf heads must match q");
+        TORCH_CHECK(out_buf->size(2) == q.size(2), "out_buf head_dim must match q");
+        TORCH_CHECK(q.is_contiguous(),
+                    "q must be contiguous when out_buf is provided");
+        O = out_buf.value().slice(0, 0, q.size(0));
     } else {
         O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
     }
@@ -43,8 +45,15 @@ torch::Tensor attn_paged_decode(
         TORCH_CHECK(o_part_buf->scalar_type() == torch::kFloat32, "o_part_buf must be f32");
         TORCH_CHECK(ml_part_buf->scalar_type() == torch::kFloat32, "ml_part_buf must be f32");
         int64_t o_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * p.head_dim;
+        int64_t ml_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * 2;
         TORCH_CHECK(o_part_buf->numel() >= o_needed,
                      "o_part_buf too small: need ", o_needed, " got ", o_part_buf->numel());
+        TORCH_CHECK(ml_part_buf->numel() >= ml_needed,
+                     "ml_part_buf too small: need ", ml_needed, " got ", ml_part_buf->numel());
+        TORCH_CHECK(o_part_buf->is_cuda() && ml_part_buf->is_cuda(),
+                    "split buffers must be CUDA tensors");
+        TORCH_CHECK(o_part_buf->is_contiguous() && ml_part_buf->is_contiguous(),
+                    "split buffers must be contiguous");
         p.o_part = (float*)o_part_buf->data_ptr();
         p.ml_part = (float*)ml_part_buf->data_ptr();
     } else {
