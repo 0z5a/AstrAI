@@ -7,7 +7,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
 from astrai.inference import InferenceScheduler
+from astrai.inference.metrics import MetricsCollector
 from astrai.inference.runtime.executor import DecodeSteadyState, Executor
 from astrai.inference.task import Task
 from astrai.model.transformer import AutoRegressiveLM
@@ -74,6 +76,69 @@ def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
 
     assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
     assert len(results["task_ids"]) == 50
+
+
+def test_generation_loop_activates_backend_in_worker_thread():
+    scheduler = object.__new__(InferenceScheduler)
+    scheduler._backend = TorchNativeBackend()
+    scheduler._stop_event = threading.Event()
+    scheduler._task_cache = MagicMock()
+
+    observed = []
+    task_mgr = MagicMock()
+    task_mgr.tokenizer.stop_ids = [0]
+    task_mgr.remove_finished_tasks.return_value = []
+    task_mgr.get_active_tasks.return_value = []
+    task_mgr.max_batch_size = 1
+    task_mgr.pull_candidates.return_value = []
+    task_mgr.has_work.return_value = False
+
+    def observe_backend(*args, **kwargs):
+        observed.append(type(get_backend()))
+        scheduler._stop_event.set()
+
+    task_mgr.wait_for_tasks.side_effect = observe_backend
+    scheduler._task_mgr = task_mgr
+
+    thread = threading.Thread(target=scheduler._run_generation_loop)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert observed == [TorchNativeBackend]
+
+
+def test_step_splits_decode_batch_by_request_backend():
+    scheduler = object.__new__(InferenceScheduler)
+    scheduler._task_cache = MagicMock()
+    scheduler._task_cache.task_extend.return_value = True
+    scheduler._metrics = MetricsCollector()
+    scheduler._executor = MagicMock()
+
+    observed = []
+
+    def execute(tasks, **kwargs):
+        observed.append((type(get_backend()), [task.task_id for task in tasks]))
+        return [1] * len(tasks)
+
+    scheduler._executor.execute_decode.side_effect = execute
+
+    torch_task = Task("torch", [1], backend=TorchNativeBackend())
+    cuda_task = Task("cuda", [1], backend=CudaBackend())
+    for task in (torch_task, cuda_task):
+        task.input_tokens = 1
+        task.output_ids = [1]
+        task.mark_prefill_done()
+        scheduler._metrics.register(task.task_id)
+
+    produced, aborted = scheduler._step([torch_task, cuda_task])
+
+    assert aborted == []
+    assert produced == [torch_task, cuda_task]
+    assert observed == [
+        (TorchNativeBackend, ["torch"]),
+        (CudaBackend, ["cuda"]),
+    ]
 
 
 def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):

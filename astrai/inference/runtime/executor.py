@@ -8,9 +8,7 @@ import torch
 from torch import Tensor
 
 from astrai.extension.attention_backend import (
-    ATTN_BACKEND,
     CudaBackend,
-    attn_backend,
     get_backend,
 )
 from astrai.inference.cache import PagePool, TaskCacheManager
@@ -153,7 +151,6 @@ def _warmup_cuda_graphs(
 
         with (
             torch.inference_mode(),
-            attn_backend(ATTN_BACKEND.CUDA),
             timed(f"warmup decode b={b}", logger),
         ):
             for step in range(2):
@@ -208,7 +205,10 @@ class Executor:
         config = model.config
         max_q_heads = config.num_attention_heads
         head_dim = config.hidden_size // config.num_attention_heads
-        self._graph_supported = CudaBackend.supports(head_dim=head_dim)
+        backend = get_backend()
+        self._graph_supported = backend.supports_graph() and CudaBackend.supports(
+            head_dim=head_dim
+        )
         self._workspace = InferenceWorkspace(
             max_batch_size=kv_cache.max_batch_size,
             max_seq_len=kv_cache.max_seq_len,
@@ -239,6 +239,10 @@ class Executor:
             max_batch_size=self.kv_cache.max_batch_size,
             device=self.device,
         )
+
+    @property
+    def cuda_graph_enabled(self) -> bool:
+        return self._graph_ctx.enabled and self._graph_supported
 
     def _sample_logits(
         self,

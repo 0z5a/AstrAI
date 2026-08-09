@@ -56,8 +56,10 @@ if TYPE_CHECKING:
 
 _default_backend: Optional["AttentionBackend"] = None
 _default_backend_lock = threading.Lock()
-_current_backend: contextvars.ContextVar["AttentionBackend"] = contextvars.ContextVar(
-    "attn_backend"
+_env_backend_name: Optional[str] = None
+_env_backend: Optional["AttentionBackend"] = None
+_current_backend: contextvars.ContextVar[Optional["AttentionBackend"]] = (
+    contextvars.ContextVar("attn_backend", default=None)
 )
 
 
@@ -149,39 +151,70 @@ def _backend_supports(
 def _resolve_default_backend() -> "AttentionBackend":
     """Pick the highest-priority available backend (cuda -> flash -> torch).
 
-    Set ``ASTR_BACKEND`` to override: ``ASTR_BACKEND=cuda``, ``torch_native``,
-    or ``flash``.  The value is the registered name (same as the
-    ``ATTN_BACKEND`` enum value).
-
     Resolved lazily on first ``get_backend()`` and cached.  Per-call
     capability fallback happens in ``attention()``, so the default is
     safe for training and fp32 models.
     """
-    forced = os.environ.get("ASTR_BACKEND", "").strip().lower()
-    if forced:
-        try:
-            return AttentionBackendFactory.create(forced)
-        except (ValueError, RuntimeError):
-            pass
     return _priority_backends()[0]
 
 
-def get_backend() -> "AttentionBackend":
-    """Return the active backend for the current thread/context.
+def _environment_backend() -> Optional["AttentionBackend"]:
+    """Resolve the process-wide ``ASTR_BACKEND`` override, if configured."""
+    global _env_backend, _env_backend_name
+    name = os.environ.get("ASTR_BACKEND", "").strip().lower()
+    if not name:
+        return None
+    if name != _env_backend_name:
+        with _default_backend_lock:
+            if name != _env_backend_name:
+                try:
+                    _env_backend = AttentionBackendFactory.create(name)
+                except (ValueError, RuntimeError):
+                    _env_backend = None
+                _env_backend_name = name
+    return _env_backend
 
-    Falls back to the highest-priority available backend (cuda -> flash ->
-    torch_native) when no backend has been activated via ``with``.  Set
-    ``ASTR_BACKEND`` to override the default.
+
+def _resolve_backend(
+    backend: Optional[Union[str, ATTN_BACKEND, "AttentionBackend", type]] = None,
+) -> "AttentionBackend":
+    """Resolve a backend configuration, defaulting to the process policy."""
+    if backend is not None:
+        if isinstance(backend, ATTN_BACKEND):
+            return AttentionBackendFactory.create(backend.value)
+        if isinstance(backend, str):
+            return AttentionBackendFactory.create(backend)
+        if isinstance(backend, type) and issubclass(backend, AttentionBackend):
+            return backend()
+        if isinstance(backend, AttentionBackend):
+            return backend
+        raise TypeError(
+            f"expected a registered name, ATTN_BACKEND, AttentionBackend type, "
+            f"or instance, got {type(backend).__name__}"
+        )
+
+    global _default_backend
+    if _default_backend is None:
+        with _default_backend_lock:
+            if _default_backend is None:
+                _default_backend = _resolve_default_backend()
+    return _default_backend
+
+
+def get_backend(
+    use_default: bool = True,
+) -> Optional["AttentionBackend"]:
+    """Return the context override, optionally falling back to the process default.
+
+    ``ASTR_BACKEND`` is a process-wide override and takes precedence over the
+    context value. Pass ``use_default=False`` at request submission to retain
+    only an environment override or the caller's :func:`attn_backend` value.
     """
-    try:
-        return _current_backend.get()
-    except LookupError:
-        global _default_backend
-        if _default_backend is None:
-            with _default_backend_lock:
-                if _default_backend is None:
-                    _default_backend = _resolve_default_backend()
-        return _default_backend
+    return (
+        _environment_backend()
+        or _current_backend.get()
+        or (_resolve_backend() if use_default else None)
+    )
 
 
 @contextmanager
@@ -200,20 +233,7 @@ def attn_backend(backend: Union[str, ATTN_BACKEND, "AttentionBackend", type]):
         with attn_backend(TorchNativeBackend()):
             ...
     """
-    if isinstance(backend, ATTN_BACKEND):
-        instance = AttentionBackendFactory.create(backend.value)
-    elif isinstance(backend, str):
-        instance = AttentionBackendFactory.create(backend)
-    elif isinstance(backend, type) and issubclass(backend, AttentionBackend):
-        instance = backend()
-    elif isinstance(backend, AttentionBackend):
-        instance = backend
-    else:
-        raise TypeError(
-            f"expected a registered name, ATTN_BACKEND, AttentionBackend type, "
-            f"or instance, "
-            f"got {type(backend).__name__}"
-        )
+    instance = _resolve_backend(backend)
     token = _current_backend.set(instance)
     try:
         yield instance
@@ -284,10 +304,7 @@ def attention(
     """
     backend = get_backend()
     if not _backend_supports(backend, q, kv_cache, attn_mask, is_causal):
-        try:
-            explicit = _current_backend.get()
-        except LookupError:
-            explicit = None
+        explicit = get_backend(use_default=False)
         if explicit is not None:
             raise RuntimeError(
                 f"Explicitly-set backend {type(backend).__name__} cannot "

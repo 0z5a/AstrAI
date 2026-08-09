@@ -3,6 +3,7 @@
 import threading
 from unittest.mock import MagicMock, patch
 
+from astrai.extension import TorchNativeBackend, attn_backend
 from astrai.inference import STOP
 from astrai.inference.engine import GenerateResult, InferenceEngine
 
@@ -199,3 +200,40 @@ def test_engine_generate_zero_max_tokens_stream_is_empty():
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         assert list(eng.generate("hello", stream=True, max_tokens=0)) == []
         instance.add_task.assert_not_called()
+
+
+def test_engine_passes_backend_to_scheduler():
+    mock_model = MagicMock()
+    mock_tokenizer = MagicMock()
+
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        InferenceEngine(
+            mock_model,
+            mock_tokenizer,
+            max_batch_size=1,
+            backend="torch_native",
+        )
+
+    assert MockSched.call_args.kwargs["backend"] == "torch_native"
+
+
+def test_generate_captures_calling_backend_context():
+    mock_model = MagicMock()
+    mock_tokenizer = MagicMock()
+    captured = []
+
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        instance = MockSched.return_value
+
+        def fake_add(prompt, **kwargs):
+            captured.append(kwargs["backend"])
+            kwargs["stream_callback"](STOP)
+            return "task"
+
+        instance.add_task.side_effect = fake_add
+        engine = InferenceEngine(mock_model, mock_tokenizer)
+        with attn_backend("torch_native"):
+            assert engine.generate("hello") == ""
+
+    assert len(captured) == 1
+    assert isinstance(captured[0], TorchNativeBackend)

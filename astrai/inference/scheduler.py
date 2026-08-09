@@ -1,10 +1,17 @@
 import logging
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import nullcontext
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from astrai.extension import (
+    ATTN_BACKEND,
+    AttentionBackend,
+    attn_backend,
+    get_backend,
+)
 from astrai.inference.cache import PagePool, TaskCacheManager
 from astrai.inference.metrics import MetricsCollector
 from astrai.inference.runtime.executor import Executor
@@ -28,6 +35,7 @@ class InferenceScheduler:
         dtype: Optional[torch.dtype] = None,
         cache: Optional[PagePool] = None,
         enable_cuda_graph: bool = True,
+        backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
     ):
         config = model.config
 
@@ -69,14 +77,31 @@ class InferenceScheduler:
             metrics=self._metrics,
         )
 
-        self._executor = Executor(
-            model=model,
-            kv_cache=self._cache,
-            task_cache=self._task_cache,
-            device=self.device,
-            dtype=self.dtype,
-            enable_cuda_graph=enable_cuda_graph,
-        )
+        if backend is None:
+            self._backend = None
+            default_backend = get_backend()
+            self._backend_name = type(default_backend).__name__
+            with attn_backend(default_backend):
+                self._executor = Executor(
+                    model=model,
+                    kv_cache=self._cache,
+                    task_cache=self._task_cache,
+                    device=self.device,
+                    dtype=self.dtype,
+                    enable_cuda_graph=enable_cuda_graph,
+                )
+        else:
+            with attn_backend(backend):
+                self._backend = get_backend()
+                self._backend_name = type(self._backend).__name__
+                self._executor = Executor(
+                    model=model,
+                    kv_cache=self._cache,
+                    task_cache=self._task_cache,
+                    device=self.device,
+                    dtype=self.dtype,
+                    enable_cuda_graph=enable_cuda_graph,
+                )
 
         self._stop_event = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
@@ -90,6 +115,26 @@ class InferenceScheduler:
 
     def get_stats(self) -> Dict[str, Any]:
         return self._task_mgr.get_stats()
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend_name
+
+    @property
+    def cuda_graph_enabled(self) -> bool:
+        return self._executor.cuda_graph_enabled
+
+    def _backend_context(self):
+        if self._backend is None:
+            return nullcontext()
+        return attn_backend(self._backend)
+
+    @staticmethod
+    def _task_backend_groups(tasks: List[Task]):
+        groups = {}
+        for task in tasks:
+            groups.setdefault(task.backend, (task.backend, []))[1].append(task)
+        return groups.values()
 
     def _step(
         self, tasks: List[Task], return_logprobs: bool = False
@@ -121,15 +166,24 @@ class InferenceScheduler:
             for t in to_prefill:
                 t.input_tokens = len(t.prompt_ids)
 
-            groups: Dict[Tuple[int, int], List[Task]] = {}
+            groups: Dict[Tuple[int, int, Optional[AttentionBackend]], List[Task]] = {}
             for t in to_prefill:
                 start_pos = min(
                     self._task_cache.task_cached(t.task_id), len(t.prompt_ids) - 1
                 )
-                groups.setdefault((len(t.prompt_ids), start_pos), []).append(t)
+                groups.setdefault((len(t.prompt_ids), start_pos, t.backend), []).append(
+                    t
+                )
 
-            for (prompt_len, start_pos), group in groups.items():
-                with self._metrics.record([t.task_id for t in group], "prefill"):
+            for (prompt_len, start_pos, _), group in groups.items():
+                backend = group[0].backend
+                backend_context = (
+                    attn_backend(backend) if backend is not None else nullcontext()
+                )
+                with (
+                    backend_context,
+                    self._metrics.record([t.task_id for t in group], "prefill"),
+                ):
                     prefilled, step_out = self._executor.execute_prefill(
                         group, prompt_len, start_pos, return_logprobs=return_logprobs
                     )
@@ -158,12 +212,18 @@ class InferenceScheduler:
                 t.status = TaskStatus.ABORTED
                 aborted.append(t)
 
-        if decoded:
-            with self._metrics.record([t.task_id for t in decoded], "decode"):
+        for backend, group in self._task_backend_groups(decoded):
+            backend_context = (
+                attn_backend(backend) if backend is not None else nullcontext()
+            )
+            with (
+                backend_context,
+                self._metrics.record([t.task_id for t in group], "decode"),
+            ):
                 step_out = self._executor.execute_decode(
-                    decoded, return_logprobs=return_logprobs
+                    group, return_logprobs=return_logprobs
                 )
-            for t, out in zip(decoded, step_out):
+            for t, out in zip(group, step_out):
                 t.output_ids.append(out[0] if return_logprobs else out)
                 t.output_tokens += 1
                 t.advance_kv()
@@ -174,48 +234,51 @@ class InferenceScheduler:
     def _run_generation_loop(self):
         stop_ids = self._task_mgr.tokenizer.stop_ids
         try:
-            while not self._stop_event.is_set():
-                finished = self._task_mgr.remove_finished_tasks(stop_ids)
-                for task in finished:
-                    if task.status == TaskStatus.FINISHED:
-                        self._task_cache.task_record_hashes(
-                            task.task_id,
-                            self._task_cache.task_cacheable_ids(
-                                task.task_id, task.prompt_ids, task.output_ids
-                            ),
-                        )
-                    self._task_cache.task_free(task.task_id)
+            with self._backend_context():
+                while not self._stop_event.is_set():
+                    finished = self._task_mgr.remove_finished_tasks(stop_ids)
+                    for task in finished:
+                        if task.status == TaskStatus.FINISHED:
+                            self._task_cache.task_record_hashes(
+                                task.task_id,
+                                self._task_cache.task_cacheable_ids(
+                                    task.task_id, task.prompt_ids, task.output_ids
+                                ),
+                            )
+                        self._task_cache.task_free(task.task_id)
 
-                active = self._task_mgr.get_active_tasks()
-                available = self._task_mgr.max_batch_size - len(active)
-                if available > 0:
-                    candidates = self._task_mgr.pull_candidates(available)
-                    failed = []
-                    for task in candidates:
-                        if self._task_cache.task_alloc(task.task_id, task.prompt_ids):
-                            self._task_mgr.activate(task)
-                        else:
-                            failed.append(task)
-                    if failed:
-                        self._task_mgr.return_to_waiting(failed)
+                    active = self._task_mgr.get_active_tasks()
+                    available = self._task_mgr.max_batch_size - len(active)
+                    if available > 0:
+                        candidates = self._task_mgr.pull_candidates(available)
+                        failed = []
+                        for task in candidates:
+                            if self._task_cache.task_alloc(
+                                task.task_id, task.prompt_ids
+                            ):
+                                self._task_mgr.activate(task)
+                            else:
+                                failed.append(task)
+                        if failed:
+                            self._task_mgr.return_to_waiting(failed)
 
-                if not self._task_mgr.has_work():
-                    self._task_mgr.wait_for_tasks(timeout=1.0)
-                    continue
+                    if not self._task_mgr.has_work():
+                        self._task_mgr.wait_for_tasks(timeout=1.0)
+                        continue
 
-                active = self._task_mgr.get_active_tasks()
+                    active = self._task_mgr.get_active_tasks()
 
-                decoded, aborted = self._step(active)
+                    decoded, aborted = self._step(active)
 
-                for t in aborted:
-                    self._task_mgr.invoke_callback(t.task_id, STOP)
-
-                for t in decoded:
-                    new_text = t.decode_new_token(self._task_mgr.tokenizer)
-                    if new_text:
-                        self._task_mgr.invoke_callback(t.task_id, new_text)
-                    if t.is_finished(stop_ids):
+                    for t in aborted:
                         self._task_mgr.invoke_callback(t.task_id, STOP)
+
+                    for t in decoded:
+                        new_text = t.decode_new_token(self._task_mgr.tokenizer)
+                        if new_text:
+                            self._task_mgr.invoke_callback(t.task_id, new_text)
+                        if t.is_finished(stop_ids):
+                            self._task_mgr.invoke_callback(t.task_id, STOP)
 
         except Exception as e:
             self._stop_event.set()
@@ -286,6 +349,7 @@ class InferenceScheduler:
         """
         stop_ids = self._task_mgr.tokenizer.stop_ids
         seq_cap = self.max_seq_len
+        request_backend = get_backend(use_default=False)
 
         tasks: List[Task] = []
         for ids in prompt_ids_list:
@@ -309,6 +373,7 @@ class InferenceScheduler:
                 top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
+                backend=request_backend,
             )
             if not self._task_cache.task_alloc(task.task_id, task.prompt_ids):
                 tasks.append(None)
@@ -320,9 +385,10 @@ class InferenceScheduler:
         try:
             live = [t for t in tasks if t is not None]
 
-            while live:
-                decoded, _ = self._step(live, return_logprobs=return_logprobs)
-                live = [t for t in decoded if not t.is_finished(stop_ids)]
+            with self._backend_context():
+                while live:
+                    decoded, _ = self._step(live, return_logprobs=return_logprobs)
+                    live = [t for t in decoded if not t.is_finished(stop_ids)]
         finally:
             for t in tasks:
                 if t is not None:

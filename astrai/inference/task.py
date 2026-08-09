@@ -3,12 +3,15 @@ import time
 import uuid
 from collections import deque
 from enum import Enum
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional
 
 from tokenizers.decoders import DecodeStream
 
 from astrai.inference.metrics import MetricsCollector
 from astrai.tokenize.tokenizer import AutoTokenizer
+
+if TYPE_CHECKING:
+    from astrai.extension import AttentionBackend
 
 STOP = object()
 
@@ -62,6 +65,7 @@ class Task:
         top_k: int = 50,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
+        backend: Optional["AttentionBackend"] = None,
     ):
         self.task_id = task_id
         self.prompt_ids = prompt_ids
@@ -71,6 +75,7 @@ class Task:
         self.top_k = top_k
         self.frequency_penalty = frequency_penalty
         self.rep_window = rep_window
+        self.backend = backend
 
         self.status = TaskStatus.PENDING
         self.output_ids: List[int] = []
@@ -152,6 +157,7 @@ class TaskManager:
         top_k: int = 50,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
+        backend: Optional["AttentionBackend"] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
         task_id = f"task_{int(time.time())}_{uuid.uuid4().hex[:8]}"
@@ -173,6 +179,7 @@ class TaskManager:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             rep_window=rep_window,
+            backend=backend,
         )
 
         with self._lock:

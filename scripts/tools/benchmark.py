@@ -259,21 +259,20 @@ class GenerationBenchmark:
             max_seq_len=max_seq_len,
             cache=pool,
             enable_cuda_graph=self.cuda_graph,
+            backend=self.backend,
         )
         prompts = [prompt] * batch_size
 
         try:
             # Capture graphs and populate the allocator before timing. The
             # first request also includes model/scheduler startup effects.
-            with attn_backend(self.backend):
-                engine.generate(prompts, max_tokens=gen_length, temperature=0.0)
+            engine.generate(prompts, max_tokens=gen_length, temperature=0.0)
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
 
             t0 = time.perf_counter()
             for _ in range(num_trials):
-                with attn_backend(self.backend):
-                    engine.generate(prompts, max_tokens=gen_length, temperature=0.0)
+                engine.generate(prompts, max_tokens=gen_length, temperature=0.0)
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0
@@ -291,7 +290,8 @@ class GenerationBenchmark:
                 "benchmark_type": "engine_decode",
                 "num_trials": num_trials,
                 "prompt_length": prompt_tokens,
-                "engine": True,
+                "backend": engine.backend_name,
+                "cuda_graph": engine.cuda_graph_enabled,
             },
         )
 

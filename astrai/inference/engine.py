@@ -8,6 +8,7 @@ from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Tuple, 
 import torch
 import torch.nn as nn
 
+from astrai.extension import ATTN_BACKEND, AttentionBackend, get_backend
 from astrai.inference.cache import PagePool
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.task import STOP
@@ -75,6 +76,7 @@ class InferenceEngine:
         max_seq_len: Optional[int] = None,
         cache: Optional[PagePool] = None,
         enable_cuda_graph: bool = True,
+        backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -85,6 +87,7 @@ class InferenceEngine:
             max_seq_len=max_seq_len,
             cache=cache,
             enable_cuda_graph=enable_cuda_graph,
+            backend=backend,
         )
 
         self.scheduler.start()
@@ -174,6 +177,7 @@ class InferenceEngine:
         rep_window: int,
     ) -> Union[Generator, str, List[str]]:
         n = len(prompts)
+        request_backend = get_backend(use_default=False)
         result = GenerateResult(count=n)
         task_ids = [
             self.scheduler.add_task(
@@ -184,6 +188,7 @@ class InferenceEngine:
                 top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
+                backend=request_backend,
                 stream_callback=lambda token, idx=i: result.append(token, idx),
             )
             for i, p in enumerate(prompts)
@@ -222,6 +227,14 @@ class InferenceEngine:
 
     def get_stats(self) -> Dict[str, Any]:
         return self.scheduler.get_stats()
+
+    @property
+    def backend_name(self) -> str:
+        return self.scheduler.backend_name
+
+    @property
+    def cuda_graph_enabled(self) -> bool:
+        return self.scheduler.cuda_graph_enabled
 
     def shutdown(self):
         self.scheduler.stop()

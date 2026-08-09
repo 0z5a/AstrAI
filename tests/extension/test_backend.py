@@ -42,6 +42,20 @@ def test_attn_backend_context_with_registered_name():
     assert get_backend() is default
 
 
+def test_backend_can_read_only_context_selection():
+    assert get_backend(use_default=False) is None
+    with attn_backend("cuda") as backend:
+        assert get_backend(use_default=False) is backend
+    assert get_backend(use_default=False) is None
+
+
+def test_environment_backend_overrides_context(monkeypatch):
+    monkeypatch.setenv("ASTR_BACKEND", "torch_native")
+    with attn_backend("cuda"):
+        assert type(get_backend()).__name__ == "TorchNativeBackend"
+        assert type(get_backend(use_default=False)).__name__ == "TorchNativeBackend"
+
+
 def test_attention_backend_factory_lists_builtin_backends():
     assert AttentionBackendFactory.list_registered() == [
         "cuda",
