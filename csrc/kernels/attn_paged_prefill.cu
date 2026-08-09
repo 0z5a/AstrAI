@@ -24,7 +24,7 @@ torch::Tensor attn_paged_prefill(
                                     max_q_len, causal_offset, scale, p);
 
     auto O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
-    p.o = (bf16*)O.data_ptr();
+    p.o_ptr = (bf16*)O.data_ptr();
 
     DISPATCH_HEAD_DIM(p.head_dim, dispatch_paged_prefill, p, stream);
     C10_CUDA_CHECK(cudaGetLastError());

@@ -545,7 +545,6 @@ class CudaBackend(AttentionBackend):
             kv_cache.req_to_token,
             kv_cache.req_pool_indices,
             kv_indptr,
-            kv_cache.max_len,
             is_causal=True,
             o_part_buf=kv_cache.decode_o_part,
             ml_part_buf=kv_cache.decode_ml_part,

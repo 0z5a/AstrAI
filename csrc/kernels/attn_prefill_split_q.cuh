@@ -149,6 +149,6 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
         float rl = (l > 1e-20f) ? (1.0f / l) : 0.0f;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
-            p.o[o_off + i * p.q_d_stride] = __float2bfloat16(acc[i] * rl);
+            p.o_ptr[o_off + i * p.q_d_stride] = __float2bfloat16(acc[i] * rl);
     }
 }

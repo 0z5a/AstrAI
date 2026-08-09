@@ -133,7 +133,7 @@ static inline void dispatch_paged_prefill(AttentionParams<bf16>& p, cudaStream_t
 template <typename KV>
 struct DecodeLauncherMMA {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams<bf16>& p, int group_size, cudaStream_t stream) {
+    static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
         int G = p.q_head / p.kv_head;
         constexpr int MAX_G = 16;
         int num_passes = (G + MAX_G - 1) / MAX_G;
@@ -153,11 +153,12 @@ struct DecodeLauncherMMA {
 template <typename KV>
 struct DecodeLauncherScalar {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams<bf16>& p, int group_size, cudaStream_t stream) {
+    static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
         int kv_len = KV::host_kv_len(p);
         int chunks_total = (kv_len + DC_CHUNK - 1) / DC_CHUNK;
         p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
         size_t smem = 2 * DC_CHUNK * p.head_dim * sizeof(bf16);
+        int group_size = p.q_head / p.kv_head;
         int g = min(group_size, 32);  // cap at 32 to respect 1024-thread limit
         dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
         dim3 block(32, g);
@@ -174,16 +175,15 @@ template <int HEAD_DIM>
 static inline void dispatch_decode(AttentionParams<bf16>& p, cudaStream_t stream) {
     bool is_causal = (p.causal_offset >= 0);
     bool has_mask = (p.use_mask && p.mask);
-    int group_size = p.q_head / p.kv_head;
 
 #ifndef ASTRAI_NO_MMA
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
                          DecodeLauncherMMA<ContigKV>::template launch,
-                         HEAD_DIM, p, group_size, stream);
+                         HEAD_DIM, p, stream);
 #else
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
                          DecodeLauncherScalar<ContigKV>::template launch,
-                         HEAD_DIM, p, group_size, stream);
+                         HEAD_DIM, p, stream);
 #endif
 
     attn_decode_combine_kernel<ContigKV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
@@ -193,16 +193,15 @@ template <int HEAD_DIM>
 static inline void dispatch_paged_decode(AttentionParams<bf16>& p, cudaStream_t stream) {
     bool is_causal = (p.causal_offset >= 0);
     bool has_mask = (p.use_mask && p.mask);
-    int group_size = p.q_head / p.kv_head;
 
 #ifndef ASTRAI_NO_MMA
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
                          DecodeLauncherMMA<PagedKV>::template launch,
-                         HEAD_DIM, p, group_size, stream);
+                         HEAD_DIM, p, stream);
 #else
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
                          DecodeLauncherScalar<PagedKV>::template launch,
-                         HEAD_DIM, p, group_size, stream);
+                         HEAD_DIM, p, stream);
 #endif
 
     attn_decode_combine_kernel<PagedKV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);

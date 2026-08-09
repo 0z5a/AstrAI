@@ -8,7 +8,6 @@ torch::Tensor attn_paged_decode(
     torch::Tensor req_to_token,
     torch::Tensor req_pool_indices,
     torch::Tensor kv_indptr,
-    int64_t max_seq_len,
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
@@ -22,7 +21,7 @@ torch::Tensor attn_paged_decode(
     AttentionParams<bf16> p;
     attn_pack_paged_decode_params(q, k_cache, v_cache,
                                    req_to_token, req_pool_indices, kv_indptr,
-                                   max_seq_len, mask, causal_offset, scale, p);
+                                   mask, causal_offset, scale, p);
 
     torch::Tensor O;
     if (out_buf.has_value() && out_buf->defined()) {
@@ -38,7 +37,7 @@ torch::Tensor attn_paged_decode(
     } else {
         O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
     }
-    p.o = (bf16*)O.data_ptr();
+    p.o_ptr = (bf16*)O.data_ptr();
 
     if (o_part_buf.has_value() && ml_part_buf.has_value()
         && o_part_buf->defined() && ml_part_buf->defined()) {
@@ -72,7 +71,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("req_to_token"),
         py::arg("req_pool_indices"),
         py::arg("kv_indptr"),
-        py::arg("max_seq_len"),
         py::arg("mask") = py::none(),
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,

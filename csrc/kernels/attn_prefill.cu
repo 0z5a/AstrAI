@@ -19,7 +19,7 @@ torch::Tensor attn_prefill(
 
     auto O = torch::empty_strided(q.sizes(), q.strides(), q.options());
     auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
-    p.o = (bf16*)O_view.data_ptr();
+    p.o_ptr = (bf16*)O_view.data_ptr();
 
     DISPATCH_HEAD_DIM(p.head_dim, dispatch_prefill, p, stream);
     C10_CUDA_CHECK(cudaGetLastError());

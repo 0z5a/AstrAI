@@ -61,7 +61,7 @@ static int run_decode_test(int B, int Hq, int Hk, int sl, int D, int causal) {
     p.use_mask=0; p.causal_offset=causal?0:-1;
     p.scale=1.0f/sqrtf((float)D);
     set_default_strides(p);
-    p.q_ptr=dQ; p.k_ptr=dK; p.v_ptr=dV; p.mask=nullptr; p.o=dO;
+    p.q_ptr=dQ; p.k_ptr=dK; p.v_ptr=dV; p.mask=nullptr; p.o_ptr=dO;
 
     DecodeScratch sc;
     setup_scratch(p, sc);
@@ -141,7 +141,7 @@ static void bench_decode() {
         p.head_dim = D; p.use_mask = 0; p.causal_offset = -1;
         p.scale = 1.0f / sqrtf((float)D);
         set_default_strides(p);
-        p.q_ptr = dQ; p.k_ptr = dK; p.v_ptr = dV; p.mask = nullptr; p.o = dO;
+        p.q_ptr = dQ; p.k_ptr = dK; p.v_ptr = dV; p.mask = nullptr; p.o_ptr = dO;
 
         DecodeScratch sc;
         setup_scratch(p, sc);
@@ -188,7 +188,7 @@ static int run_prefill_test(int B, int Hq, int Hk, int ql, int kl, int D, int ca
     p.use_mask=0; p.causal_offset=causal?0:-1;
     set_default_strides(p);
     p.scale=1.0f/sqrtf((float)D);
-    p.q_ptr=dQ; p.k_ptr=dK; p.v_ptr=dV; p.mask=nullptr; p.o=dO;
+    p.q_ptr=dQ; p.k_ptr=dK; p.v_ptr=dV; p.mask=nullptr; p.o_ptr=dO;
 
     double t0=now_ms();
     dispatch_by_head_dim(D, PrefillDispatch{p});
@@ -262,7 +262,7 @@ static void bench_prefill() {
         p.use_mask=0; p.causal_offset=causal?0:-1;
         set_default_strides(p);
         p.scale=1.0f/sqrtf((float)D);
-        p.q_ptr=dQ; p.k_ptr=dK; p.v_ptr=dV; p.mask=nullptr; p.o=dO;
+        p.q_ptr=dQ; p.k_ptr=dK; p.v_ptr=dV; p.mask=nullptr; p.o_ptr=dO;
 
         auto launch = [&]() { dispatch_by_head_dim(D, PrefillDispatch{p}); };
         for (int i=0;i<WARMUP;i++) launch();

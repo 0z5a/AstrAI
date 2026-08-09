@@ -218,9 +218,9 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
     // Kernel launch
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM; p.total_q = B;
+    p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx; p.max_seq_len = max_sl;
+    p.max_context_len = max_ctx;
     p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
     p.mask_h_stride = 0; p.mask_l_stride = 0;
@@ -228,7 +228,7 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
-    p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
+    p.o_ptr = d_o; p.o_part = d_op; p.ml_part = d_ml;
 
     dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
     cudaDeviceSynchronize();
@@ -353,9 +353,9 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
 
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM; p.total_q = B;
+    p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx; p.max_seq_len = max_sl;
+    p.max_context_len = max_ctx;
     p.causal_offset = -1; p.use_mask = 1;
     p.mask = d_mask; p.mask_b_stride = max_sl;
     p.mask_h_stride = 0; p.mask_l_stride = 0;
@@ -363,7 +363,7 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
-    p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
+    p.o_ptr = d_o; p.o_part = d_op; p.ml_part = d_ml;
 
     dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
     cudaDeviceSynchronize();
@@ -486,9 +486,9 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     // Kernel launch
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM; p.total_q = total_q;
+    p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx; p.max_seq_len = max_sl;
+    p.max_context_len = max_ctx;
     int max_ql = 0;
     for (int b = 0; b < B; b++) max_ql = max(max_ql, q_lens[b]);
     p.max_q_len = max_ql;
@@ -499,7 +499,7 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
-    p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;
+    p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
     dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
     cudaDeviceSynchronize();
@@ -623,9 +623,9 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
 
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM; p.total_q = total_q;
+    p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx; p.max_seq_len = q_len;
+    p.max_context_len = max_ctx;
     p.max_q_len = q_len;
     p.causal_offset = -1; p.use_mask = 1;
     p.mask = d_mask; p.mask_b_stride = q_len * q_len;
@@ -634,7 +634,7 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
-    p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;
+    p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
     dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
     cudaDeviceSynchronize();
@@ -713,16 +713,16 @@ static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
 
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM; p.total_q = B;
+    p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx; p.max_seq_len = seq_len;
+    p.max_context_len = max_ctx;
     p.causal_offset = 0; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
-    p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
+    p.o_ptr = d_o; p.o_part = d_op; p.ml_part = d_ml;
 
     auto launch = [&]() {
         dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
@@ -790,17 +790,17 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
 
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM; p.total_q = total_q;
+    p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx; p.max_seq_len = kv_len;
-    p.total_q = total_q; p.max_q_len = q_len;
+    p.max_context_len = max_ctx;
+    p.max_q_len = q_len;
     p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
-    p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;
+    p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
     auto launch = [&]() {
         dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});

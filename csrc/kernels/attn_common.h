@@ -18,55 +18,54 @@ enum TensorLayout : int {
 // drift out of sync.
 template<typename T, typename AT = float>
 struct AttentionParams {
-    // ---- shared across all paths ----
+    // Shape
     int batch;
     int q_head;
     int kv_head;
     int head_dim;
-    float scale;
+    int q_len;   // Contiguous mode; paged mode uses qo_indptr.
+    int kv_len;  // Contiguous mode; paged mode uses kv_indptr.
 
+    // Attention behavior
+    float scale;
     // -1 = non-causal; >=0 = absolute position of first Q token
     int causal_offset;
     int use_mask;
-    int num_splits;
 
-    // Q strides 
+    // pointers
+    const T* __restrict__ q_ptr;
+    const T* __restrict__ k_ptr;
+    const T* __restrict__ v_ptr;
+    T* __restrict__ o_ptr;
+    const bool* __restrict__ mask;
+
+    // strides
     int q_b_stride;
-    int q_h_stride; 
+    int q_h_stride;
     int q_l_stride;
     int q_d_stride;
 
-    // K/V strides 
     int kv_b_stride;
     int kv_h_stride;
     int kv_l_stride;
     int kv_d_stride;
 
-    // Mask strides
     int mask_b_stride;
     int mask_h_stride;
-    int mask_l_stride; 
+    int mask_l_stride;
 
-    const T* __restrict__ q_ptr;
-    const T* __restrict__ k_ptr;
-    const T* __restrict__ v_ptr;
-    const bool* __restrict__ mask;
-    
-    T* __restrict__ o;
+    // Paged K/V addressing
+    const int64_t* __restrict__ req_to_token;     // [num_reqs, max_context_len]
+    const int64_t* __restrict__ req_pool_indices; // [batch]
+    const int* __restrict__ kv_indptr;             // [batch + 1]
+    const int* __restrict__ qo_indptr;             // [batch + 1] or nullptr for decode
+    int max_context_len; // req_to_token stride (dim 1)
+
+    // Decode split-KV workspace
+    int num_splits;
     AT* __restrict__ o_part;
     AT* __restrict__ ml_part;
 
-    // ---- contiguous K/V mode ----
-    int q_len;
-    int kv_len;
-
-    // Indexing
-    const int64_t* __restrict__ req_to_token;      // [num_reqs, max_context_len]
-    const int64_t* __restrict__ req_pool_indices;   // [batch]
-    const int* __restrict__ kv_indptr;               // [batch+1]
-    const int* __restrict__ qo_indptr;               // [batch+1] or nullptr (decode)
-    int max_context_len;  // req_to_token stride (dim 1)
-    int max_seq_len;      // max per-request seq_len (host-side, for split computation)
-    int total_q;          // total Q tokens across all requests (host-side, for grid)
-    int max_q_len;        // max per-request q_len (host-side, for prefill grid)
+    // Host-provided paged prefill grid bound
+    int max_q_len;
 };

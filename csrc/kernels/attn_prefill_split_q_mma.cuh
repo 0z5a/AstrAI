@@ -143,13 +143,13 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][0] * rl0,
                                                       Oacc[dn8][1] * rl0);
             *reinterpret_cast<__nv_bfloat162*>(
-                &p.o[o_base + qr0 * p.q_l_stride + d * p.q_d_stride]) = v;
+                &p.o_ptr[o_base + qr0 * p.q_l_stride + d * p.q_d_stride]) = v;
         }
         if (qr1 < q_len) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][2] * rl1,
                                                       Oacc[dn8][3] * rl1);
             *reinterpret_cast<__nv_bfloat162*>(
-                &p.o[o_base + qr1 * p.q_l_stride + d * p.q_d_stride]) = v;
+                &p.o_ptr[o_base + qr1 * p.q_l_stride + d * p.q_d_stride]) = v;
         }
     }
 }

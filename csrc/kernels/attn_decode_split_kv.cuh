@@ -139,5 +139,5 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
 
     float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
     int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
-    p.o[o_off] = __float2bfloat16(acc * inv);
+    p.o_ptr[o_off] = __float2bfloat16(acc * inv);
 }

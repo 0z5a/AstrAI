@@ -130,7 +130,7 @@ inline void attn_pack_params(
     p.q_ptr = (const T*)q.data_ptr();
     p.k_ptr = (const T*)k.data_ptr();
     p.v_ptr = (const T*)v.data_ptr();
-    p.o = nullptr;
+    p.o_ptr = nullptr;
     p.o_part = nullptr;
     p.ml_part = nullptr;
 
@@ -148,7 +148,6 @@ inline void attn_pack_paged_decode_params(
     torch::Tensor req_to_token,
     torch::Tensor req_pool_indices,
     torch::Tensor kv_indptr,
-    int64_t max_seq_len,
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
@@ -190,8 +189,6 @@ inline void attn_pack_paged_decode_params(
     p.kv_indptr = kv_indptr.data_ptr<int>();
     p.qo_indptr = nullptr;
     p.max_context_len = (int)req_to_token.size(1);
-    p.max_seq_len = (int)max_seq_len;
-    p.total_q = p.batch;  // decode: 1 Q token per request
     p.max_q_len = 1;
 
     p.causal_offset = (int)causal_offset;
@@ -213,7 +210,7 @@ inline void attn_pack_paged_decode_params(
         p.mask_l_stride = 0;
     }
 
-    p.o = nullptr;
+    p.o_ptr = nullptr;
     p.o_part = nullptr;
     p.ml_part = nullptr;
 }
@@ -276,11 +273,7 @@ inline void attn_pack_paged_prefill_params(
     p.kv_indptr = kv_indptr.data_ptr<int>();
     p.qo_indptr = qo_indptr.data_ptr<int>();
     p.max_context_len = (int)req_to_token.size(1);
-    p.total_q = (int)q.size(0);  // prefill: flattened Q across all requests
     p.max_q_len = (int)max_q_len;
-    // max_seq_len is unused by the prefill path (decode uses it for split
-    // computation); fill with max_q_len only to keep the POD struct defined.
-    p.max_seq_len = p.max_q_len;
 
     p.causal_offset = (int)causal_offset;
     p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
@@ -312,7 +305,7 @@ inline void attn_pack_paged_prefill_params(
     }
     p.scale = (scale > 0.0) ? (float)scale : 1.0f / sqrtf((float)p.head_dim);
 
-    p.o = nullptr;
+    p.o_ptr = nullptr;
     p.o_part = nullptr;
     p.ml_part = nullptr;
 }

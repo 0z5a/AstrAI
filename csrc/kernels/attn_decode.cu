@@ -22,7 +22,7 @@ torch::Tensor attn_decode(
 
     auto O = torch::empty_strided(q.sizes(), q.strides(), q.options());
     auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
-    p.o = (bf16*)O_view.data_ptr();
+    p.o_ptr = (bf16*)O_view.data_ptr();
 
     if (o_part_buf.has_value() && ml_part_buf.has_value()
         && o_part_buf->defined() && ml_part_buf->defined()) {
