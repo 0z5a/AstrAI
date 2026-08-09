@@ -68,6 +68,15 @@ class GenerationBenchmark:
         self.cuda_graph = cuda_graph
 
     def _make_pool(self, batch_size: int, max_seq_len: int) -> PagePool:
+        if self.cache_type == "contiguous":
+            n_tokens = None
+        elif self.cache_type == "paged":
+            # Keep the total token capacity equal to contiguous mode while
+            # routing allocation through the shared paged pool.
+            n_tokens = batch_size * max_seq_len
+        else:
+            raise ValueError(f"unsupported cache type: {self.cache_type}")
+
         return PagePool(
             n_layers=self.config.num_hidden_layers,
             n_kv_heads=self.config.num_key_value_heads,
@@ -77,7 +86,7 @@ class GenerationBenchmark:
             device=self.device,
             dtype=self.dtype,
             page_size=1,
-            n_tokens=None,
+            n_tokens=n_tokens,
         )
 
     @staticmethod
