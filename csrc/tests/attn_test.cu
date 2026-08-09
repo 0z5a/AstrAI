@@ -9,6 +9,9 @@ nvcc -I csrc -arch=sm_89 -O3 \
 #include "test_utils.cuh"
 #include "../kernels/attn_dispatchers.cuh"
 
+struct DecodeDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_decode<H>(p, 0); } };
+struct PrefillDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_prefill<H>(p, 0); } };
+
 // Split-K scratch (torch-free)
 struct DecodeScratch {
     float* o_part = nullptr;
@@ -30,8 +33,6 @@ static void free_scratch(DecodeScratch& sc) {
 // ======================================================================
 
 static int run_decode_test(int B, int Hq, int Hk, int sl, int D, int causal) {
-    int gs = Hq / Hk;
-
     size_t nQ = B*Hq*1*D, nKV = B*Hk*sl*D;
     float *hQ=new float[nQ], *hK=new float[nKV], *hV=new float[nKV];
     for (size_t i=0;i<nQ;i++) hQ[i]=randf();
@@ -67,7 +68,7 @@ static int run_decode_test(int B, int Hq, int Hk, int sl, int D, int causal) {
     p.o_part = sc.o_part; p.ml_part = sc.ml_part;
 
     double t0=now_ms();
-    dispatch_by_head_dim(D, [&]<int H>() { dispatch_decode<H>(p, 0); });
+    dispatch_by_head_dim(D, DecodeDispatch{p});
     cudaDeviceSynchronize();
     (void)t0;
     cudaError_t err=cudaGetLastError();
@@ -146,7 +147,7 @@ static void bench_decode() {
         setup_scratch(p, sc);
         p.o_part = sc.o_part; p.ml_part = sc.ml_part;
 
-        auto launch = [&]() { dispatch_by_head_dim(D, [&]<int H>() { dispatch_decode<H>(p, 0); }); };
+        auto launch = [&]() { dispatch_by_head_dim(D, DecodeDispatch{p}); };
         double flops = 4.0 * B * Hq * (double)sl * D;
         BenchResult r = bench_kernel(launch, WARMUP, ITERS, flops);
 
@@ -190,7 +191,7 @@ static int run_prefill_test(int B, int Hq, int Hk, int ql, int kl, int D, int ca
     p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
 
     double t0=now_ms();
-    dispatch_by_head_dim(D, [&]<int H>() { dispatch_prefill<H>(p, 0); });
+    dispatch_by_head_dim(D, PrefillDispatch{p});
     cudaDeviceSynchronize();
     (void)t0;
     cudaError_t err=cudaGetLastError();
@@ -263,7 +264,7 @@ static void bench_prefill() {
         p.scale=1.0f/sqrtf((float)D);
         p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
 
-        auto launch = [&]() { dispatch_by_head_dim(D, [&]<int H>() { dispatch_prefill<H>(p, 0); }); };
+        auto launch = [&]() { dispatch_by_head_dim(D, PrefillDispatch{p}); };
         for (int i=0;i<WARMUP;i++) launch();
         cudaDeviceSynchronize();
         cudaError_t err=cudaGetLastError();
