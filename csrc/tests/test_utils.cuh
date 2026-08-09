@@ -107,29 +107,29 @@ void dispatch_by_head_dim(int head_dim, Fn&& fn) {
 // Set default strides for contiguous b h l d layout on AttentionParams.
 template<typename P>
 inline void set_default_strides(P& p) {
-    p.q_stride_b  = p.q_head * p.q_len * p.head_dim;
-    p.q_stride_h  = p.q_len * p.head_dim;
-    p.q_stride_l  = p.head_dim;
-    p.q_stride_d  = 1;
-    p.kv_stride_b = p.kv_head * p.kv_len * p.head_dim;
-    p.kv_stride_h = p.kv_len * p.head_dim;
-    p.kv_stride_l = p.head_dim;
-    p.kv_stride_d = 1;
+    p.q_b_stride  = p.q_head * p.q_len * p.head_dim;
+    p.q_h_stride  = p.q_len * p.head_dim;
+    p.q_l_stride  = p.head_dim;
+    p.q_d_stride  = 1;
+    p.kv_b_stride = p.kv_head * p.kv_len * p.head_dim;
+    p.kv_h_stride = p.kv_len * p.head_dim;
+    p.kv_l_stride = p.head_dim;
+    p.kv_d_stride = 1;
     p.mask_b_stride = p.kv_len;
     p.mask_h_stride = 0;
-    p.mask_q_stride = 0;
+    p.mask_l_stride = 0;
 }
 
 // Set default Q strides for a paged decode params struct.
 template<typename P>
 inline void set_default_paged_strides(P& p) {
-    p.q_stride_b  = p.q_head * p.q_len * p.head_dim;
-    p.q_stride_h  = p.q_len * p.head_dim;
-    p.q_stride_l  = p.head_dim;
-    p.q_stride_d  = 1;
+    p.q_b_stride  = p.q_head * p.q_len * p.head_dim;
+    p.q_h_stride  = p.q_len * p.head_dim;
+    p.q_l_stride  = p.head_dim;
+    p.q_d_stride  = 1;
     p.mask_b_stride = p.kv_len;
     p.mask_h_stride = 0;
-    p.mask_q_stride = 0;
+    p.mask_l_stride = 0;
 }
 
 // Generic CPU reference for multi-query / grouped-query attention.

@@ -45,7 +45,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     const int qrb = qrow0 + gid + 8;
     const bool va = qra < q_len, vb = qrb < q_len;
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(p.q + q_base, p.q_stride_l, p.q_stride_d,
+    load_q_mma_frags<Traits::KD>(p.q_ptr + q_base, p.q_l_stride, p.q_d_stride,
                                   qra, qrb, va, vb, tid4, Qa);
 
     float Oacc[Traits::DN8][4];
@@ -122,7 +122,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
                                  : seq_len;
             mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1,
                                                qr0, qr1,
-                                               p.mask_b_stride, p.mask_h_stride, p.mask_q_stride,
+                                               p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
                                                batch, q_head, q_head,
                                                p.mask,
                                                va, vb,
@@ -143,13 +143,13 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][0] * rl0,
                                                       Oacc[dn8][1] * rl0);
             *reinterpret_cast<__nv_bfloat162*>(
-                &p.o[o_base + qr0 * p.q_stride_l + d * p.q_stride_d]) = v;
+                &p.o[o_base + qr0 * p.q_l_stride + d * p.q_d_stride]) = v;
         }
         if (qr1 < q_len) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][2] * rl1,
                                                       Oacc[dn8][3] * rl1);
             *reinterpret_cast<__nv_bfloat162*>(
-                &p.o[o_base + qr1 * p.q_stride_l + d * p.q_stride_d]) = v;
+                &p.o[o_base + qr1 * p.q_l_stride + d * p.q_d_stride]) = v;
         }
     }
 }

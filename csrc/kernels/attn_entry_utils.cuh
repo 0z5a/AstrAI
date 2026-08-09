@@ -42,10 +42,10 @@ inline void extract_q_dims_and_strides(torch::Tensor& q, int64_t layout, P& p) {
     p.q_head = (int)q.size(1);
     p.q_len = (int)q.size(2);
     p.head_dim = (int)q.size(3);
-    p.q_stride_b = (int)q.stride(0);
-    p.q_stride_h = (int)q.stride(1);
-    p.q_stride_l = (int)q.stride(2);
-    p.q_stride_d = (int)q.stride(3);
+    p.q_b_stride = (int)q.stride(0);
+    p.q_h_stride = (int)q.stride(1);
+    p.q_l_stride = (int)q.stride(2);
+    p.q_d_stride = (int)q.stride(3);
 }
 
 // ---- Shared mask packing ----
@@ -63,17 +63,17 @@ inline void pack_mask(const c10::optional<torch::Tensor>& mask, P& p) {
         if (m.dim() == 2) {
             p.mask_b_stride = (int)m.stride(0);
             p.mask_h_stride = 0;
-            p.mask_q_stride = 0;
+            p.mask_l_stride = 0;
         } else if (m.dim() == 3) {
             TORCH_CHECK(m.size(1) == 1 || m.size(1) == p.q_len, "mask q_len mismatch");
             p.mask_b_stride = (int)m.stride(0);
             p.mask_h_stride = 0;
-            p.mask_q_stride = (m.size(1) == 1) ? 0 : (int)m.stride(1);
+            p.mask_l_stride = (m.size(1) == 1) ? 0 : (int)m.stride(1);
         } else if (m.dim() == 4) {
             TORCH_CHECK(m.size(2) == 1 || m.size(2) == p.q_len, "mask q_len mismatch");
             p.mask_b_stride = (int)m.stride(0);
             p.mask_h_stride = (m.size(1) == 1) ? 0 : (int)m.stride(1);
-            p.mask_q_stride = (m.size(2) == 1) ? 0 : (int)m.stride(2);
+            p.mask_l_stride = (m.size(2) == 1) ? 0 : (int)m.stride(2);
         } else {
             TORCH_CHECK(false, "mask must be 2D, 3D, or 4D");
         }
@@ -82,7 +82,7 @@ inline void pack_mask(const c10::optional<torch::Tensor>& mask, P& p) {
         p.mask = nullptr;
         p.mask_b_stride = 0;
         p.mask_h_stride = 0;
-        p.mask_q_stride = 0;
+        p.mask_l_stride = 0;
     }
 }
 
@@ -118,18 +118,18 @@ inline void attn_pack_params(
     TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
                 "Q/K/V head_dim must be contiguous");
 
-    p.kv_stride_b = (int)k.stride(0);
-    p.kv_stride_h = (int)k.stride(1);
-    p.kv_stride_l = (int)k.stride(2);
-    p.kv_stride_d = (int)k.stride(3);
+    p.kv_b_stride = (int)k.stride(0);
+    p.kv_h_stride = (int)k.stride(1);
+    p.kv_l_stride = (int)k.stride(2);
+    p.kv_d_stride = (int)k.stride(3);
 
     p.causal_offset = (int)causal_offset;
     p.use_mask = mask.has_value() ? 1 : 0;
     p.scale = (scale > 0.0) ? (float)scale : 1.0f / sqrtf((float)p.head_dim);
 
-    p.q = (const T*)q.data_ptr();
-    p.k = (const T*)k.data_ptr();
-    p.v = (const T*)v.data_ptr();
+    p.q_ptr = (const T*)q.data_ptr();
+    p.k_ptr = (const T*)k.data_ptr();
+    p.v_ptr = (const T*)v.data_ptr();
     p.o = nullptr;
     p.o_part = nullptr;
     p.ml_part = nullptr;
@@ -178,13 +178,13 @@ inline void attn_pack_paged_decode_params(
     TORCH_CHECK(p.head_dim % 32 == 0, "head_dim must be multiple of 32");
     TORCH_CHECK(p.q_head % p.kv_head == 0, "q_head must be divisible by kv_head");
 
-    p.q_stride_l = (int)q.stride(0);
-    p.q_stride_h = (int)q.stride(1);
-    p.q_stride_d = (int)q.stride(2);
+    p.q_l_stride = (int)q.stride(0);
+    p.q_h_stride = (int)q.stride(1);
+    p.q_d_stride = (int)q.stride(2);
 
-    p.k_cache = (const T*)k_cache.data_ptr();
-    p.v_cache = (const T*)v_cache.data_ptr();
-    p.q = (const T*)q.data_ptr();
+    p.k_ptr = (const T*)k_cache.data_ptr();
+    p.v_ptr = (const T*)v_cache.data_ptr();
+    p.q_ptr = (const T*)q.data_ptr();
     p.req_to_token = req_to_token.data_ptr<int64_t>();
     p.req_pool_indices = req_pool_indices.data_ptr<int64_t>();
     p.kv_indptr = kv_indptr.data_ptr<int>();
@@ -204,13 +204,13 @@ inline void attn_pack_paged_decode_params(
         TORCH_CHECK(m.size(0) == p.batch, "mask batch mismatch");
         p.mask_b_stride = (int)m.stride(0);
         p.mask_h_stride = 0;
-        p.mask_q_stride = 0;
+        p.mask_l_stride = 0;
         p.mask = m.data_ptr<bool>();
     } else {
         p.mask = nullptr;
         p.mask_b_stride = 0;
         p.mask_h_stride = 0;
-        p.mask_q_stride = 0;
+        p.mask_l_stride = 0;
     }
 
     p.o = nullptr;
@@ -264,13 +264,13 @@ inline void attn_pack_paged_prefill_params(
     TORCH_CHECK(kv_indptr.size(0) == p.batch + 1, "kv_indptr must be [batch+1]");
     TORCH_CHECK(qo_indptr.size(0) == p.batch + 1, "qo_indptr must be [batch+1]");
 
-    p.q_stride_l = (int)q.stride(0);
-    p.q_stride_h = (int)q.stride(1);
-    p.q_stride_d = (int)q.stride(2);
+    p.q_l_stride = (int)q.stride(0);
+    p.q_h_stride = (int)q.stride(1);
+    p.q_d_stride = (int)q.stride(2);
 
-    p.k_cache = (const T*)k_cache.data_ptr();
-    p.v_cache = (const T*)v_cache.data_ptr();
-    p.q = (const T*)q.data_ptr();
+    p.k_ptr = (const T*)k_cache.data_ptr();
+    p.v_ptr = (const T*)v_cache.data_ptr();
+    p.q_ptr = (const T*)q.data_ptr();
     p.req_to_token = req_to_token.data_ptr<int64_t>();
     p.req_pool_indices = req_pool_indices.data_ptr<int64_t>();
     p.kv_indptr = kv_indptr.data_ptr<int>();
@@ -292,14 +292,14 @@ inline void attn_pack_paged_prefill_params(
             TORCH_CHECK(m.size(1) <= p.max_context_len, "mask kv_len mismatch");
             p.mask_b_stride = (int)m.stride(0);
             p.mask_h_stride = 0;
-            p.mask_q_stride = 0;
+            p.mask_l_stride = 0;
         } else if (m.dim() == 4) {
             TORCH_CHECK(m.size(1) == 1 || m.size(1) == p.q_head, "mask head mismatch");
             TORCH_CHECK(m.size(2) == 1 || m.size(2) == p.max_q_len, "mask q_len mismatch");
             TORCH_CHECK(m.size(3) <= p.max_context_len, "mask kv_len mismatch");
             p.mask_b_stride = (int)m.stride(0);
             p.mask_h_stride = (m.size(1) == 1) ? 0 : (int)m.stride(1);
-            p.mask_q_stride = (m.size(2) == 1) ? 0 : (int)m.stride(2);
+            p.mask_l_stride = (m.size(2) == 1) ? 0 : (int)m.stride(2);
         } else {
             TORCH_CHECK(false, "mask must be 2D or 4D");
         }
@@ -308,7 +308,7 @@ inline void attn_pack_paged_prefill_params(
         p.mask = nullptr;
         p.mask_b_stride = 0;
         p.mask_h_stride = 0;
-        p.mask_q_stride = 0;
+        p.mask_l_stride = 0;
     }
     p.scale = (scale > 0.0) ? (float)scale : 1.0f / sqrtf((float)p.head_dim);
 

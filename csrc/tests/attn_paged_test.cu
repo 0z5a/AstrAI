@@ -68,7 +68,7 @@ static void cpu_paged_prefill_ref(
     const float* Q, const float* K_pool, const float* V_pool,
     const int64_t* req_to_token, const int64_t* req_pool_indices,
     const int* kv_indptr, const int* qo_indptr,
-    const bool* mask, int mask_q_stride, int mask_kv_stride,
+    const bool* mask, int mask_l_stride, int mask_kv_stride,
     int B, int Hq, int Hkv, int D, int max_ctx_len, int causal,
     float* O)
 {
@@ -87,7 +87,7 @@ static void cpu_paged_prefill_ref(
                 float accum[256] = {0.0f};
                 int lim = causal ? min(seq_len, causal_off + qi + 1) : seq_len;
                 for (int kj = 0; kj < lim; kj++) {
-                    if (mask && !mask[b * mask_q_stride * mask_kv_stride
+                    if (mask && !mask[b * mask_l_stride * mask_kv_stride
                                      + qi * mask_kv_stride + kj]) continue;
                     int64_t slot = req_to_token[req_idx * max_ctx_len + kj];
                     float dot = 0.0f;
@@ -219,13 +219,13 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = B;
-    p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
+    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx; p.max_seq_len = max_sl;
     p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
-    p.mask_h_stride = 0; p.mask_q_stride = 0;
+    p.mask_h_stride = 0; p.mask_l_stride = 0;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q = d_q; p.k_cache = d_k_pool; p.v_cache = d_v_pool;
+    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
     p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
@@ -354,13 +354,13 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = B;
-    p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
+    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx; p.max_seq_len = max_sl;
     p.causal_offset = -1; p.use_mask = 1;
     p.mask = d_mask; p.mask_b_stride = max_sl;
-    p.mask_h_stride = 0; p.mask_q_stride = 0;
+    p.mask_h_stride = 0; p.mask_l_stride = 0;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q = d_q; p.k_cache = d_k_pool; p.v_cache = d_v_pool;
+    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
     p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
@@ -487,16 +487,16 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = total_q;
-    p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
+    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx; p.max_seq_len = max_sl;
     int max_ql = 0;
     for (int b = 0; b < B; b++) max_ql = max(max_ql, q_lens[b]);
     p.max_q_len = max_ql;
     p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
-    p.mask_h_stride = 0; p.mask_q_stride = 0;
+    p.mask_h_stride = 0; p.mask_l_stride = 0;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q = d_q; p.k_cache = d_k_pool; p.v_cache = d_v_pool;
+    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
     p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;
@@ -624,14 +624,14 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = total_q;
-    p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
+    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx; p.max_seq_len = q_len;
     p.max_q_len = q_len;
     p.causal_offset = -1; p.use_mask = 1;
     p.mask = d_mask; p.mask_b_stride = q_len * q_len;
-    p.mask_h_stride = 0; p.mask_q_stride = q_len;
+    p.mask_h_stride = 0; p.mask_l_stride = q_len;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q = d_q; p.k_cache = d_k_pool; p.v_cache = d_v_pool;
+    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
     p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;
@@ -714,12 +714,12 @@ static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = B;
-    p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
+    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx; p.max_seq_len = seq_len;
     p.causal_offset = 0; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q = d_q; p.k_cache = d_k_pool; p.v_cache = d_v_pool;
+    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
     p.o = d_o; p.o_part = d_op; p.ml_part = d_ml;
@@ -791,13 +791,13 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM; p.total_q = total_q;
-    p.q_stride_l = Hq * HEAD_DIM; p.q_stride_h = HEAD_DIM; p.q_stride_d = 1;
+    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx; p.max_seq_len = kv_len;
     p.total_q = total_q; p.max_q_len = q_len;
     p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q = d_q; p.k_cache = d_k_pool; p.v_cache = d_v_pool;
+    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
     p.o = d_o; p.o_part = nullptr; p.ml_part = nullptr;

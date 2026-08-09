@@ -13,11 +13,11 @@
 //
 //   ContigKV:  K/V are dense [batch, kv_head, kv_len, head_dim] tensors.
 //              Params fields used: k, v, kv_stride_*, kv_len, q_len,
-//              q_stride_b, causal_offset.
+//              q_b_stride, causal_offset.
 //   PagedKV:   K/V live in a flat pool [size, kv_head, head_dim] indexed via
 //              req_to_token.  Params fields used: k_cache, v_cache,
 //              req_to_token, req_pool_indices, kv_indptr, qo_indptr,
-//              max_context_len, q_stride_l.
+//              max_context_len, q_l_stride.
 //
 // Addressing state that is constant across a whole kernel invocation for one
 // (batch, kv_head) pair is captured once by make_ctx<HEAD_DIM>() and passed
@@ -32,7 +32,7 @@ using bf16 = __nv_bfloat16;
 
 // Hoisted per-(batch, kv_head) addressing context.
 struct KVContext {
-    int kv_base;          // contig: batch*kv_stride_b + kv_head*kv_stride_h
+    int kv_base;          // contig: batch*kv_b_stride + kv_head*kv_h_stride
     int64_t req_idx;      // paged: req_pool_indices[batch]
     int64_t rtt_stride;   // paged: max_context_len
     int64_t pool_stride;  // paged: kv_head * HEAD_DIM
@@ -64,15 +64,15 @@ struct ContigKV {
         return p.kv_len;
     }
 
-    // prefill: element offset of the request's Q rows (kernel adds qrow*q_stride_l)
+    // prefill: element offset of the request's Q rows (kernel adds qrow*q_l_stride)
     HOST_DEV_FORCEINLINE int q_base(
         const AttentionParams<bf16>& p, int batch, int q_head) {
-        return batch * p.q_stride_b + q_head * p.q_stride_h;
+        return batch * p.q_b_stride + q_head * p.q_h_stride;
     }
     // decode: same offset (q_len == 1, so there is no row stride component)
     HOST_DEV_FORCEINLINE int q_decode_base(
         const AttentionParams<bf16>& p, int batch, int q_head) {
-        return batch * p.q_stride_b + q_head * p.q_stride_h;
+        return batch * p.q_b_stride + q_head * p.q_h_stride;
     }
 
     HOST_DEV_FORCEINLINE int kv_len(const AttentionParams<bf16>& p, int batch) {
@@ -93,13 +93,13 @@ struct ContigKV {
     HOST_DEV_FORCEINLINE KVContext make_ctx(
         const AttentionParams<bf16>& p, int batch, int kv_head) {
         KVContext c = {};
-        c.kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
+        c.kv_base = batch * p.kv_b_stride + kv_head * p.kv_h_stride;
         return c;
     }
     HOST_DEV_FORCEINLINE KVAddr kv_addr(
         const AttentionParams<bf16>& p, const KVContext& c, int kc, int d, bool valid) {
-        const int g_off = c.kv_base + kc * p.kv_stride_l + d * p.kv_stride_d;
-        return {&p.k[g_off], &p.v[g_off], valid};
+        const int g_off = c.kv_base + kc * p.kv_l_stride + d * p.kv_d_stride;
+        return {&p.k_ptr[g_off], &p.v_ptr[g_off], valid};
     }
 };
 
@@ -117,12 +117,12 @@ struct PagedKV {
     // prefill: Q rows start at qo_indptr[batch] (ragged batch base)
     HOST_DEV_FORCEINLINE int q_base(
         const AttentionParams<bf16>& p, int batch, int q_head) {
-        return p.qo_indptr[batch] * p.q_stride_l + q_head * p.q_stride_h;
+        return p.qo_indptr[batch] * p.q_l_stride + q_head * p.q_h_stride;
     }
     // decode: Q is [batch, q_head, head_dim], so batch is the outer row
     HOST_DEV_FORCEINLINE int q_decode_base(
         const AttentionParams<bf16>& p, int batch, int q_head) {
-        return batch * p.q_stride_l + q_head * p.q_stride_h;
+        return batch * p.q_l_stride + q_head * p.q_h_stride;
     }
 
     HOST_DEV_FORCEINLINE int kv_len(const AttentionParams<bf16>& p, int batch) {
@@ -154,6 +154,6 @@ struct PagedKV {
         const int64_t slot = valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : 0;
         const bool ok = valid && (slot >= 0);
         const int64_t gmem_off = slot * c.pool_stride + c.head_off + d;
-        return {&p.k_cache[gmem_off], &p.v_cache[gmem_off], ok};
+        return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], ok};
     }
 };

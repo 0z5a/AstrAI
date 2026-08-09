@@ -27,9 +27,9 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     // Q: [batch, q_head, q_len=1, head_dim] — stride-based
     float q_reg[8];
     int q_off = KV::q_decode_base(p, batch, q_head)
-              + lane * hd_per_thread * p.q_stride_d;
+              + lane * hd_per_thread * p.q_d_stride;
     for (int i = 0; i < hd_per_thread; i++)
-        q_reg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]);
+        q_reg[i] = __bfloat162float(p.q_ptr[q_off + i * p.q_d_stride]);
 
     int mask_base = batch * p.mask_b_stride + q_head * p.mask_h_stride;
 
@@ -138,6 +138,6 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     }
 
     float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
-    int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_stride_d;
+    int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
     p.o[o_off] = __float2bfloat16(acc * inv);
 }

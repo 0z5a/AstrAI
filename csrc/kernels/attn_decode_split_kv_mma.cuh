@@ -48,7 +48,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(p.q + q_base, p.q_stride_h, p.q_stride_d,
+    load_q_mma_frags<Traits::KD>(p.q_ptr + q_base, p.q_h_stride, p.q_d_stride,
                                   qra, qrb, va, vb, tid4, Qa);
 
     float Oacc[Traits::DN8][4];
@@ -107,7 +107,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         int maxc = IsCausal ? KV::decode_attend_len(p, batch) : seq_len;
         mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc,
                                            0, 0,
-                                            p.mask_b_stride, p.mask_h_stride, p.mask_q_stride,
+                                            p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
                                             batch, q_head0 + gid, q_head0 + gid + 8,
                                             p.mask,
                                             va, vb,

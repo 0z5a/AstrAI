@@ -57,10 +57,10 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     const int q_base = KV::q_base(p, batch, q_head);
     float qreg[DPT];
     if (q_row < q_len) {
-        int q_off = q_base + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
+        int q_off = q_base + q_row * p.q_l_stride + gpos * DPT * p.q_d_stride;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
-            qreg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]);
+            qreg[i] = __bfloat162float(p.q_ptr[q_off + i * p.q_d_stride]);
     }
 
     float m = -FLT_MAX, l = 0.0f;
@@ -105,7 +105,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
             }
         }
 
-        int mask_row_base = mask_batch_base + q_row * p.mask_q_stride;
+        int mask_row_base = mask_batch_base + q_row * p.mask_l_stride;
         for (int s = 0; s < lim; s++) {
             const bf16* kr = sK + s * HEAD_DIM + gpos * DPT;
             float part = 0.0f;
@@ -145,10 +145,10 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     }
 
     if (q_row < q_len) {
-        int o_off = q_base + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
+        int o_off = q_base + q_row * p.q_l_stride + gpos * DPT * p.q_d_stride;
         float rl = (l > 1e-20f) ? (1.0f / l) : 0.0f;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
-            p.o[o_off + i * p.q_stride_d] = __float2bfloat16(acc[i] * rl);
+            p.o[o_off + i * p.q_d_stride] = __float2bfloat16(acc[i] * rl);
     }
 }

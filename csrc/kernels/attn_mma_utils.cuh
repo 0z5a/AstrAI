@@ -133,8 +133,8 @@ __device__ __forceinline__ void cp_async_wait_group() {
 // ---------------------------------------------------------------------------
 // Q-load: load query rows directly from global memory into mma A-operand
 // register layout. One call replaces ~15 duplicated lines in each MMA kernel.
-// stride_row is p.q_stride_h for decode (q_len=1, G heads) or
-//              p.q_stride_l for prefill (multi-q rows).
+// stride_row is p.q_h_stride for decode (q_len=1, G heads) or
+//              p.q_l_stride for prefill (multi-q rows).
 // ---------------------------------------------------------------------------
 template <int KD>
 __device__ inline void load_q_mma_frags(
@@ -198,7 +198,7 @@ __device__ inline void mma_softmax_tile(
     int kv0,
     int maxc0, int maxc1,
     int qrow0, int qrow1,
-    int mask_b_stride, int mask_h_stride, int mask_q_stride,
+    int mask_b_stride, int mask_h_stride, int mask_l_stride,
     int mask_batch, int mask_head0, int mask_head1,
     const bool* __restrict__ mask,
     bool valid0, bool valid1,
@@ -211,8 +211,8 @@ __device__ inline void mma_softmax_tile(
     int tid4 = lane & 3;
 
     float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
-    int mask_base0 = mask_batch * mask_b_stride + mask_head0 * mask_h_stride + qrow0 * mask_q_stride;
-    int mask_base1 = mask_batch * mask_b_stride + mask_head1 * mask_h_stride + qrow1 * mask_q_stride;
+    int mask_base0 = mask_batch * mask_b_stride + mask_head0 * mask_h_stride + qrow0 * mask_l_stride;
+    int mask_base1 = mask_batch * mask_b_stride + mask_head1 * mask_h_stride + qrow1 * mask_l_stride;
     #pragma unroll
     for (int n8 = 0; n8 < Traits::NC8; n8++) {
         int cc = kv0 + n8 * 8 + 2 * tid4;
