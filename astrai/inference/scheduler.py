@@ -27,6 +27,7 @@ class InferenceScheduler:
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         cache: Optional[PagePool] = None,
+        enable_cuda_graph: bool = True,
     ):
         config = model.config
 
@@ -74,6 +75,7 @@ class InferenceScheduler:
             task_cache=self._task_cache,
             device=self.device,
             dtype=self.dtype,
+            enable_cuda_graph=enable_cuda_graph,
         )
 
         self._stop_event = threading.Event()

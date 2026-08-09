@@ -188,6 +188,7 @@ class Executor:
         task_cache: TaskCacheManager,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
+        enable_cuda_graph: bool = True,
     ):
         self.model = model
         self.kv_cache = kv_cache
@@ -221,7 +222,8 @@ class Executor:
         # Enabled at init-time via _warmup_cuda_graphs for CudaBackend
         # on supported head_dims; left disabled otherwise.
         self._graph_ctx = CudaGraphContext()
-        self._try_enable_cuda_graph()
+        if enable_cuda_graph:
+            self._try_enable_cuda_graph()
 
     def _try_enable_cuda_graph(self):
         if not self._graph_supported:

@@ -74,6 +74,7 @@ class InferenceEngine:
         max_batch_size: int = 1,
         max_seq_len: Optional[int] = None,
         cache: Optional[PagePool] = None,
+        enable_cuda_graph: bool = True,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -83,6 +84,7 @@ class InferenceEngine:
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             cache=cache,
+            enable_cuda_graph=enable_cuda_graph,
         )
 
         self.scheduler.start()
