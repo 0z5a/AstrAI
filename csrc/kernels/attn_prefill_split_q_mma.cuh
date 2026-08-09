@@ -24,18 +24,11 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     const int tid4 = lane & 3;   // 0..3
 
     const int q_head = blockIdx.y;
-    __shared__ int mapped_batch;
-    __shared__ int mapped_q_tile;
-    if (threadIdx.x == 0) {
-        mapped_batch = -1;
-        KV::template map_q_tile<Traits::BR * Traits::WARPS>(
-            p, blockIdx.x, blockIdx.z, mapped_batch, mapped_q_tile);
-    }
-    __syncthreads();
-    if (mapped_batch < 0)
+    __shared__ QTileMapper<Traits::BR * Traits::WARPS, KV> qmap;
+    if (!qmap.init(p, blockIdx.x, blockIdx.z))
         return;
-    const int batch = mapped_batch;
-    const int q_tile = mapped_q_tile;
+    const int batch = qmap.batch;
+    const int q_tile = qmap.q_tile;
     const int kv_head = q_head / (p.q_head / p.kv_head);
     const int qrow0 = (q_tile * Traits::WARPS + warp) * Traits::BR;
 

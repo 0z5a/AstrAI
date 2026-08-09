@@ -183,3 +183,25 @@ struct PagedKV {
         return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], ok};
     }
 };
+
+// ---- Q-tile mapping broadcast ----
+// The flat grid maps a tile index to (batch, local q_tile) once per block
+// (thread 0 computes it via KV::map_q_tile), then publishes the result to
+// the whole block through shared memory.  Tail blocks past the ragged tile
+// total get batch == -1 and the whole block exits before any work.
+// Usage in a kernel:  __shared__ QTileMapper<ROWS, KV> qmap;
+template <int ROWS, typename KV>
+struct QTileMapper {
+    int batch;
+    int q_tile;
+
+    __device__ __forceinline__ bool init(const AttentionParams<bf16>& p,
+                                         int flat_tile, int grid_batch) {
+        if ((threadIdx.x | threadIdx.y) == 0) {
+            batch = -1;
+            KV::template map_q_tile<ROWS>(p, flat_tile, grid_batch, batch, q_tile);
+        }
+        __syncthreads();
+        return batch >= 0;
+    }
+};
