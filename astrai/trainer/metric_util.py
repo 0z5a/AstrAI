@@ -1,3 +1,4 @@
+import math
 from typing import Dict
 
 import torch
@@ -26,6 +27,8 @@ class GradSNRTracker:
     """Track gradient signal-to-noise ratio via EMA of first/second moments.
 
     SNR = E[g]^2 / Var(g) = E[g]^2 / (E[g^2] - E[g]^2)
+
+    The reported value is the power ratio in decibels: ``10 * log10(SNR)``.
 
     The tracker accumulates per-parameter EMA moments across optimizer steps.
     Call ``update`` after backward (before ``optimizer.step``) and read
@@ -64,7 +67,8 @@ class GradSNRTracker:
             noise = (v - m.pow(2)).clamp(min=0).sum().item()
             total_signal += signal
             total_noise += noise
-        return total_signal / (total_noise + self.eps)
+        snr = total_signal / (total_noise + self.eps)
+        return 10.0 * math.log10(max(snr, self.eps))
 
 
 def ctx_get_loss(ctx):
