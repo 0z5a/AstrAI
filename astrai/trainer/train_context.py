@@ -231,14 +231,21 @@ class TrainContextBuilder:
             seed=cfg.random_seed,
             shuffle=shuffle,
         )
-        return DataLoader(
-            dataset,
+        loader_kwargs = dict(
+            dataset=dataset,
             batch_size=cfg.batch_per_device,
             sampler=sampler,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
-            prefetch_factor=cfg.prefetch_factor,
             collate_fn=cfg.collate_fn,
+        )
+        # PyTorch rejects prefetch_factor/persistent_workers when workers=0.
+        if cfg.num_workers > 0:
+            loader_kwargs["persistent_workers"] = cfg.persistent_workers
+            if cfg.prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+        return DataLoader(
+            **loader_kwargs,
         )
 
     def _restore_optimizer_state(self, context: TrainContext) -> None:

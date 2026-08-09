@@ -252,6 +252,12 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
     help="Pin memory.",
 )
 @opt(
+    "--persistent_workers/--no-persistent_workers",
+    default=True,
+    group="Data Loading",
+    help="Keep DataLoader workers alive between epochs.",
+)
+@opt(
     "--window_size",
     type=int,
     default=None,
@@ -606,6 +612,7 @@ def train(
     random_seed: int,
     num_workers: int,
     pin_memory: bool,
+    persistent_workers: bool,
     gradient_checkpointing: bool,
     window_size: int,
     stride: int,
@@ -797,6 +804,7 @@ def train(
         random_seed=random_seed,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
         nprocs=nprocs,
         backend=backend,
         master_addr=master_addr,

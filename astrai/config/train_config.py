@@ -48,6 +48,7 @@ class TrainConfig(BaseConfig):
         random_seed (int): Random seed. Defaults to 3407.
         num_workers (int): Number of workers for dataloader. Defaults to 0.
         prefetch_factor (Optional[int]): Prefetch factor for dataloader. Defaults to None.
+        persistent_workers (bool): Keep DataLoader workers alive between epochs. Defaults to False.
         pin_memory (bool): Pin memory for dataloader. Defaults to False.
         collate_fn (Optional[Callable[[List[Any]], Any]]): Collate function for dataloader (e.g. dpo_collate_fn). Defaults to None.
         nprocs (int): Number of processes for distributed training. Defaults to 1.
@@ -98,6 +99,7 @@ class TrainConfig(BaseConfig):
     random_seed: int = 3407
     num_workers: int = 0
     prefetch_factor: Optional[int] = None
+    persistent_workers: bool = False
     pin_memory: bool = False
     collate_fn: Optional[Callable[[List[Any]], Any]] = None
 
