@@ -57,8 +57,16 @@ struct ContigKV {
     static constexpr bool kPaged = false;
 
     // host-side length hooks (grid + split computation in the launchers)
-    HOST_DEV_FORCEINLINE int host_q_len(const AttentionParams<bf16>& p) {
-        return p.q_len;
+    HOST_DEV_FORCEINLINE int host_q_blocks(const AttentionParams<bf16>& p, int rows) {
+        return (p.q_len + rows - 1) / rows;
+    }
+    template <int ROWS>
+    HOST_DEV_FORCEINLINE bool map_q_tile(const AttentionParams<bf16>&,
+                                         int flat_tile, int grid_batch,
+                                         int& batch, int& q_tile) {
+        batch = grid_batch;
+        q_tile = flat_tile;
+        return true;
     }
     HOST_DEV_FORCEINLINE int host_kv_len(const AttentionParams<bf16>& p) {
         return p.kv_len;
@@ -107,8 +115,26 @@ struct ContigKV {
 struct PagedKV {
     static constexpr bool kPaged = true;
 
-    HOST_DEV_FORCEINLINE int host_q_len(const AttentionParams<bf16>& p) {
-        return p.max_q_len;
+    HOST_DEV_FORCEINLINE int host_q_blocks(const AttentionParams<bf16>& p, int rows) {
+        // sum(ceil(q_len[b] / rows)) <= ceil(total_q / rows) + batch - 1.
+        return (p.q_len + rows - 1) / rows + p.batch - 1;
+    }
+    template <int ROWS>
+    HOST_DEV_FORCEINLINE bool map_q_tile(const AttentionParams<bf16>& p,
+                                         int flat_tile, int,
+                                         int& batch, int& q_tile) {
+        int tile_base = 0;
+        for (int b = 0; b < p.batch; ++b) {
+            int len = p.qo_indptr[b + 1] - p.qo_indptr[b];
+            int tiles = (len + ROWS - 1) / ROWS;
+            if (flat_tile < tile_base + tiles) {
+                batch = b;
+                q_tile = flat_tile - tile_base;
+                return true;
+            }
+            tile_base += tiles;
+        }
+        return false;
     }
     HOST_DEV_FORCEINLINE int host_kv_len(const AttentionParams<bf16>& p) {
         return p.max_context_len;

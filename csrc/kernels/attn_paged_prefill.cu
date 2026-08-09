@@ -10,7 +10,6 @@ torch::Tensor attn_paged_prefill(
     torch::Tensor kv_indptr,
     torch::Tensor qo_indptr,
     c10::optional<torch::Tensor> mask,
-    int64_t max_q_len,
     int64_t causal_offset,
     double scale
 ) {
@@ -21,7 +20,7 @@ torch::Tensor attn_paged_prefill(
     attn_pack_paged_prefill_params(q, k_cache, v_cache,
                                     req_to_token, req_pool_indices,
                                     kv_indptr, qo_indptr, mask,
-                                    max_q_len, causal_offset, scale, p);
+                                    causal_offset, scale, p);
 
     auto O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
     p.o_ptr = (bf16*)O.data_ptr();
@@ -41,7 +40,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("kv_indptr"),
         py::arg("qo_indptr"),
         py::arg("mask") = py::none(),
-        py::arg("max_q_len"),
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,
         "SGLang-style paged prefill: flat KV pool + ragged batch.");

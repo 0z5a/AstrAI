@@ -66,9 +66,9 @@ struct PrefillLauncherMMA {
         constexpr int WARPS = 4;
         constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
         using Traits = KernelTraits<HEAD_DIM, BC, WARPS, 2>;
-        int q_len = KV::host_q_len(p);
-        dim3 grid((q_len + Traits::BR * WARPS - 1) / (Traits::BR * WARPS),
-                  p.q_head, p.batch);
+        constexpr int ROWS = Traits::BR * WARPS;
+        dim3 grid(KV::host_q_blocks(p, ROWS), p.q_head,
+                  KV::kPaged ? 1 : p.batch);
         dim3 block(Traits::NUM_THREADS);
         attn_prefill_split_q_mma_kernel<Traits, KV, IsCausal, HasMask>
             <<<grid, block, 0, stream>>>(p);
@@ -81,8 +81,8 @@ struct PrefillLauncherScalar {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
     static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
         constexpr int G = (HEAD_DIM == 32) ? 4 : 8, ROWS = 32, P_BC = 32;
-        int q_len = KV::host_q_len(p);
-        dim3 grid((q_len + ROWS - 1) / ROWS, p.q_head, p.batch);
+        dim3 grid(KV::host_q_blocks(p, ROWS), p.q_head,
+                  KV::kPaged ? 1 : p.batch);
         dim3 block(G, ROWS);
         attn_prefill_split_q_kernel_t<HEAD_DIM, KV, G, ROWS, P_BC, IsCausal, HasMask>
             <<<grid, block, 0, stream>>>(p);

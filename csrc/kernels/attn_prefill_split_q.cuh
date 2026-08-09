@@ -36,9 +36,20 @@ template <int HEAD_DIM, typename KV, int G, int ROWS, int P_BC, bool IsCausal, b
 __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     constexpr int DPT = HEAD_DIM / G;
 
-    int q_tile = blockIdx.x;
+    __shared__ int mapped_batch;
+    __shared__ int mapped_q_tile;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        mapped_batch = -1;
+        KV::template map_q_tile<ROWS>(
+            p, blockIdx.x, blockIdx.z, mapped_batch, mapped_q_tile);
+    }
+    __syncthreads();
+    if (mapped_batch < 0)
+        return;
+
+    int q_tile = mapped_q_tile;
     int q_head = blockIdx.y;
-    int batch  = blockIdx.z;
+    int batch  = mapped_batch;
     int gpos   = threadIdx.x;  // 0..G-1  (which d-chunk)
     int row    = threadIdx.y;  // 0..ROWS-1
     int q_row  = q_tile * ROWS + row;

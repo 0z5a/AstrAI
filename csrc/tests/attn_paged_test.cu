@@ -489,9 +489,7 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx;
-    int max_ql = 0;
-    for (int b = 0; b < B; b++) max_ql = max(max_ql, q_lens[b]);
-    p.max_q_len = max_ql;
+    p.q_len = total_q;
     p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
     p.mask_h_stride = 0; p.mask_l_stride = 0;
@@ -626,7 +624,7 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx;
-    p.max_q_len = q_len;
+    p.q_len = B * q_len;
     p.causal_offset = -1; p.use_mask = 1;
     p.mask = d_mask; p.mask_b_stride = q_len * q_len;
     p.mask_h_stride = 0; p.mask_l_stride = q_len;
@@ -793,7 +791,7 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     p.head_dim = HEAD_DIM;
     p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
     p.max_context_len = max_ctx;
-    p.max_q_len = q_len;
+    p.q_len = B * q_len;
     p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
     p.mask = nullptr; p.mask_b_stride = 0;
     p.scale = 1.0f / sqrtf((float)HEAD_DIM);

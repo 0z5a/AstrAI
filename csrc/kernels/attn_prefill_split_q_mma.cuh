@@ -24,9 +24,20 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     const int tid4 = lane & 3;   // 0..3
 
     const int q_head = blockIdx.y;
-    const int batch = blockIdx.z;
+    __shared__ int mapped_batch;
+    __shared__ int mapped_q_tile;
+    if (threadIdx.x == 0) {
+        mapped_batch = -1;
+        KV::template map_q_tile<Traits::BR * Traits::WARPS>(
+            p, blockIdx.x, blockIdx.z, mapped_batch, mapped_q_tile);
+    }
+    __syncthreads();
+    if (mapped_batch < 0)
+        return;
+    const int batch = mapped_batch;
+    const int q_tile = mapped_q_tile;
     const int kv_head = q_head / (p.q_head / p.kv_head);
-    const int qrow0 = (blockIdx.x * Traits::WARPS + warp) * Traits::BR;
+    const int qrow0 = (q_tile * Traits::WARPS + warp) * Traits::BR;
 
     // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
     const int seq_len    = KV::kv_len(p, batch);
@@ -61,7 +72,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     // Causal tile-skip bounds (dead code when IsCausal == false)
     const int max_kv = qrow0 + Traits::BR - 1 + causal_off;
     const int block_max_kv =
-        blockIdx.x * Traits::WARPS * Traits::BR + Traits::WARPS * Traits::BR - 1
+        q_tile * Traits::WARPS * Traits::BR + Traits::WARPS * Traits::BR - 1
         + causal_off;
 
     int t_end = tiles - 1;

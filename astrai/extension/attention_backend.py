@@ -590,7 +590,6 @@ class CudaBackend(AttentionBackend):
             kv_indptr,
             qo_indptr,
             attn_mask,
-            q_len,
             is_causal=is_causal,
         )
         return out.reshape(b, q_len, q.size(2), q.size(3)).flatten(2)

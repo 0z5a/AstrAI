@@ -23,7 +23,7 @@ struct AttentionParams {
     int q_head;
     int kv_head;
     int head_dim;
-    int q_len;   // Contiguous mode; paged mode uses qo_indptr.
+    int q_len;   // Per-request in contiguous mode; total_q in paged mode.
     int kv_len;  // Contiguous mode; paged mode uses kv_indptr.
 
     // Attention behavior
@@ -66,6 +66,4 @@ struct AttentionParams {
     AT* __restrict__ o_part;
     AT* __restrict__ ml_part;
 
-    // Host-provided paged prefill grid bound
-    int max_q_len;
 };

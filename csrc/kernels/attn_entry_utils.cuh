@@ -189,7 +189,6 @@ inline void attn_pack_paged_decode_params(
     p.kv_indptr = kv_indptr.data_ptr<int>();
     p.qo_indptr = nullptr;
     p.max_context_len = (int)req_to_token.size(1);
-    p.max_q_len = 1;
 
     p.causal_offset = (int)causal_offset;
     p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
@@ -228,7 +227,6 @@ inline void attn_pack_paged_prefill_params(
     torch::Tensor kv_indptr,
     torch::Tensor qo_indptr,
     c10::optional<torch::Tensor> mask,
-    int64_t max_q_len,
     int64_t causal_offset,
     double scale,
     AttentionParams<T>& p
@@ -251,6 +249,7 @@ inline void attn_pack_paged_prefill_params(
 
     p.q_head = (int)q.size(1);
     p.head_dim = (int)q.size(2);
+    p.q_len = (int)q.size(0);
     p.kv_head = (int)k_cache.size(1);
     p.batch = (int)req_pool_indices.size(0);
     TORCH_CHECK(k_cache.size(2) == p.head_dim, "k_cache head_dim mismatch");
@@ -273,7 +272,6 @@ inline void attn_pack_paged_prefill_params(
     p.kv_indptr = kv_indptr.data_ptr<int>();
     p.qo_indptr = qo_indptr.data_ptr<int>();
     p.max_context_len = (int)req_to_token.size(1);
-    p.max_q_len = (int)max_q_len;
 
     p.causal_offset = (int)causal_offset;
     p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
@@ -288,7 +286,7 @@ inline void attn_pack_paged_prefill_params(
             p.mask_l_stride = 0;
         } else if (m.dim() == 4) {
             TORCH_CHECK(m.size(1) == 1 || m.size(1) == p.q_head, "mask head mismatch");
-            TORCH_CHECK(m.size(2) == 1 || m.size(2) == p.max_q_len, "mask q_len mismatch");
+            TORCH_CHECK(m.size(2) > 0 && m.size(2) <= p.q_len, "mask q_len mismatch");
             TORCH_CHECK(m.size(3) <= p.max_context_len, "mask kv_len mismatch");
             p.mask_b_stride = (int)m.stride(0);
             p.mask_h_stride = (m.size(1) == 1) ? 0 : (int)m.stride(1);

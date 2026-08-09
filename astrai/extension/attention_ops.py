@@ -151,7 +151,6 @@ def attn_paged_prefill(
     kv_indptr: torch.Tensor,
     qo_indptr: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
-    max_q_len: int = 0,
     is_causal: bool = False,
 ) -> torch.Tensor:
     """SGLang-style paged prefill (ragged batch, flat KV pool).
@@ -169,7 +168,6 @@ def attn_paged_prefill(
         kv_indptr: [batch+1] (int32) — prefix sum of per-request kv_lens
         qo_indptr: [batch+1] (int32) — prefix sum of per-request q_lens
         mask: 4D [batch, 1, q_len, kv_len] (bool, True=keep) or None
-        max_q_len: max per-request q_len (Python int, for grid computation)
         is_causal: apply causal mask
 
     Returns:
@@ -186,6 +184,5 @@ def attn_paged_prefill(
         kv_indptr,
         qo_indptr,
         mask,
-        max_q_len,
         causal_offset=causal_offset,
     )
