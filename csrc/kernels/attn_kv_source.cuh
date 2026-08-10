@@ -184,24 +184,29 @@ struct PagedKV {
     }
 };
 
-// ---- Q-tile mapping broadcast ----
-// The flat grid maps a tile index to (batch, local q_tile) once per block
-// (thread 0 computes it via KV::map_q_tile), then publishes the result to
-// the whole block through shared memory.  Tail blocks past the ragged tile
-// total get batch == -1 and the whole block exits before any work.
-// Usage in a kernel:  __shared__ QTileMapper<ROWS, KV> qmap;
+// ---- Q-block mapping ----
+// Contiguous grids map directly to (batch, q_tile). Paged grids flatten the
+// ragged Q tiles, so one thread resolves the request and broadcasts it.
 template <int ROWS, typename KV>
-struct QTileMapper {
-    int batch;
-    int q_tile;
+__device__ __forceinline__ bool map_q_block(
+    const AttentionParams<bf16>& p, int& batch, int& q_tile) {
+    if constexpr (!KV::kPaged) {
+        batch = blockIdx.z;
+        q_tile = blockIdx.x;
+        return true;
+    } else {
+        __shared__ int mapped_batch;
+        __shared__ int mapped_q_tile;
 
-    __device__ __forceinline__ bool init(const AttentionParams<bf16>& p,
-                                         int flat_tile, int grid_batch) {
         if ((threadIdx.x | threadIdx.y) == 0) {
-            batch = -1;
-            KV::template map_q_tile<ROWS>(p, flat_tile, grid_batch, batch, q_tile);
+            mapped_batch = -1;
+            KV::template map_q_tile<ROWS>(
+                p, blockIdx.x, blockIdx.z, mapped_batch, mapped_q_tile);
         }
         __syncthreads();
+
+        batch = mapped_batch;
+        q_tile = mapped_q_tile;
         return batch >= 0;
     }
-};
+}
