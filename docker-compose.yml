@@ -46,3 +46,40 @@ services:
       retries: 3
       start_period: 120s
     restart: unless-stopped
+
+  trainer:
+    profiles: [train]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CUDA_TAG: ${CUDA_TAG:-cu128}
+    init: true
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ${TRAIN_DATA_DIR:-./data}:/data:ro
+      - ${TRAIN_MODEL_DIR:-./params}:/models/base:ro
+      - ${TRAIN_CHECKPOINT_DIR:-./checkpoints}:/checkpoints
+    environment:
+      - TRAIN_JOB_NAME=${TRAIN_JOB_NAME:-astrai-train}
+      - TRAIN_CONFIG=${TRAIN_CONFIG:-}
+      - BASE_MODEL=${BASE_MODEL:-/models/base}
+      - CHECKPOINT_ROOT=/checkpoints
+      - TRAIN_GPU_COUNT=${TRAIN_GPU_COUNT:-all}
+      - CUDA_VISIBLE_DEVICES
+    entrypoint: ["bash", "/app/scripts/docker/train-entrypoint.sh"]
+    ipc: ${TRAIN_IPC_MODE:-host}
+    stop_grace_period: ${TRAIN_STOP_GRACE_PERIOD:-10m}
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: ${TRAIN_LOG_MAX_SIZE:-100m}
+        max-file: ${TRAIN_LOG_MAX_FILES:-5}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${TRAIN_GPU_COUNT:-all}
+              capabilities: [gpu]
