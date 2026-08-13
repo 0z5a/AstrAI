@@ -5,7 +5,9 @@ services:
       dockerfile: Dockerfile
       args:
         CUDA_TAG: ${CUDA_TAG:-cu128}
-    user: "${UID:-1000}:${GID:-1000}"
+        USER_UID: ${ASTRAI_UID:-1000}
+        USER_GID: ${ASTRAI_GID:-1000}
+    user: "${ASTRAI_UID:-1000}:${ASTRAI_GID:-1000}"
     ports:
       - "8000:8000"
     volumes:
@@ -33,7 +35,9 @@ services:
       dockerfile: Dockerfile
       args:
         CUDA_TAG: ${CUDA_TAG:-cu128}
-    user: "${UID:-1000}:${GID:-1000}"
+        USER_UID: ${ASTRAI_UID:-1000}
+        USER_GID: ${ASTRAI_GID:-1000}
+    user: "${ASTRAI_UID:-1000}:${ASTRAI_GID:-1000}"
     ports:
       - "8000:8000"
     volumes:
@@ -54,8 +58,10 @@ services:
       dockerfile: Dockerfile
       args:
         CUDA_TAG: ${CUDA_TAG:-cu128}
+        USER_UID: ${ASTRAI_UID:-1000}
+        USER_GID: ${ASTRAI_GID:-1000}
     init: true
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${ASTRAI_UID:-1000}:${ASTRAI_GID:-1000}"
     volumes:
       - ${TRAIN_DATA_DIR:-./data}:/data:ro
       - ${TRAIN_MODEL_DIR:-./params}:/models/base:ro
@@ -67,6 +73,8 @@ services:
       - CHECKPOINT_ROOT=/checkpoints
       - TRAIN_GPU_COUNT=${TRAIN_GPU_COUNT:-all}
       - CUDA_VISIBLE_DEVICES
+      - NCCL_P2P_DISABLE
+      - NCCL_NET_GDR_LEVEL
     entrypoint: ["bash", "/app/scripts/docker/train-entrypoint.sh"]
     ipc: ${TRAIN_IPC_MODE:-host}
     stop_grace_period: ${TRAIN_STOP_GRACE_PERIOD:-10m}
@@ -81,5 +89,5 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: ${TRAIN_GPU_COUNT:-all}
+              count: all
               capabilities: [gpu]

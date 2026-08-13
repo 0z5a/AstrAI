@@ -42,8 +42,9 @@ EOF
 load_env() {
     if [[ -f "${ENV_FILE}" ]]; then
         set -a
+        # UID/GID are readonly in bash; compose gets them via ASTRAI_UID/GID in compose()
         # shellcheck disable=SC1090
-        source "${ENV_FILE}"
+        source <(grep -v -E '^[[:space:]]*(UID|GID)=' "${ENV_FILE}")
         set +a
     fi
 
@@ -75,7 +76,10 @@ compose() {
     if [[ -f "${ENV_FILE}" ]]; then
         command+=(--env-file "${ENV_FILE}")
     fi
-    "${command[@]}" "$@"
+
+    # Inject the host user into compose so container processes share the
+    # checkpoint directory ownership (bash UID/GID are readonly).
+    ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" "${command[@]}" "$@"
 }
 
 init_environment() {

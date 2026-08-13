@@ -57,8 +57,13 @@ COPY docs/ ./docs/
 COPY pyproject.toml .
 COPY README.md .
 
-# Create non-root user
-RUN useradd -m astrai && chown -R astrai:astrai /app
+# Create non-root user matching the host uid/gid (passed via build args)
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN groupadd -g "${USER_GID}" astrai \
+    && useradd -m -u "${USER_UID}" -g astrai astrai \
+    && chown -R astrai:astrai /app
+ENV HOME=/home/astrai
 USER astrai
 
 ENV PYTHONUNBUFFERED=1 \
