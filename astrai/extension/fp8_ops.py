@@ -65,23 +65,21 @@ fp8_mm.register_autograd(_fp8_mm_backward, setup_context=_fp8_mm_setup_context)
 
 
 def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
-    """FP8 replacement for F.linear(x, w, bias).
+    """FP8 replacement for F.linear(x, w, bias), fused in one CUDA call.
 
     x: [..., K] bf16 (any leading dims), w: [N,K] bf16 (in_dim=K).
-    The kernel computes a @ b^T with zero-copy col-major mapping, so w is
-    passed as-is (no transpose).
+    The kernel pipeline (scale cast -> cublasLt fp8 GEMM -> unscale + bias ->
+    transpose -> bf16) runs inside a single extension call, so Python-side
+    dispatch overhead is paid once per linear instead of per operator.
     """
-    orig_shape = x.shape
-    x2d = x.reshape(-1, w.size(1))
-    sx = x2d.abs().amax() / 448.0
-    sw = w.abs().amax() / 448.0
-    x8 = (x2d / sx).to(torch.float8_e4m3fn)
-    w8 = (w / sw).to(torch.float8_e4m3fn)
-    out = torch.ops.custom.fp8_mm(x8, w8, sx, sw)
-    out = out * (sx * sw)
-    if bias is not None:
-        out = out + bias
-    return out.reshape(*orig_shape[:-1], -1)
+    if bias is None:
+        bias = torch.empty(0, device=x.device, dtype=x.dtype)
+    return get_module("fp8_mm").fp8_linear_forward(x, w, bias)
+
+
+def fp8_linear_backward(g, x, w, masks):
+    """Fused linear backward (dX/dW/dB in one CUDA call, scale-corrected)."""
+    return get_module("fp8_mm").fp8_linear_backward(g, x, w, masks)
 
 
 def fp8_available() -> bool:

@@ -11,6 +11,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cublasLt.h>
+#include <cuda_fp8.h>
 #include <cstdint>
 
 static cublasLtHandle_t g_handle = nullptr;
@@ -102,7 +103,192 @@ torch::Tensor fp8_mm(torch::Tensor a, torch::Tensor b) {
     return buf.transpose(0, 1).contiguous();
 }
 
+
+// Debug variant: return the raw col-major buffer WITHOUT the transpose copy,
+// so the cost of the transpose can be measured in isolation.
+torch::Tensor fp8_mm_view(torch::Tensor a, torch::Tensor b) {
+  TORCH_CHECK(a.is_cuda() && b.is_cuda(), "CUDA tensors required");
+  TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn, "a must be float8_e4m3fn");
+  TORCH_CHECK(b.scalar_type() == torch::kFloat8_e4m3fn, "b must be float8_e4m3fn");
+  const at::cuda::OptionalCUDAGuard guard(a.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto a_c = a.contiguous();
+  auto b_c = b.contiguous();
+  int64_t m = a_c.size(0), k = a_c.size(1), n = b_c.size(0);
+  TORCH_CHECK(b_c.size(1) == k, "inner dim mismatch");
+  auto buf = torch::empty({n, m}, a_c.options().dtype(torch::kBFloat16));
+  ensure_cublas_lt();
+  set_layout(g_layout_a, k, m, k);
+  set_layout(g_layout_b, k, n, k);
+  set_layout(g_layout_c, m, n, m);
+  float alpha = 1.0f, beta = 0.0f;
+  cublasLtMatmulHeuristicResult_t heur;
+  int returned = 0;
+  cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(
+      g_handle, g_desc, g_layout_a, g_layout_b, g_layout_c, g_layout_c, g_pref, 1,
+      &heur, &returned);
+  TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
+              "cublasLtMatmulAlgoGetHeuristic failed: ", cublasLtGetStatusName(st));
+  st = cublasLtMatmul(g_handle, g_desc, &alpha, a_c.data_ptr(), g_layout_a,
+                      b_c.data_ptr(), g_layout_b, &beta, buf.data_ptr(), g_layout_c,
+                      buf.data_ptr(), g_layout_c, &heur.algo, g_workspace, g_ws_size,
+                      stream.stream());
+  TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
+              "cublasLtMatmul failed: ", cublasLtGetStatusName(st));
+    return buf;  // col-major [M,N] storage, no transpose
+}
+
+// ---------------------------------------------------------------------------
+// Fused FP8 linear forward: one call = scale cast x8/w8 -> cublasLt GEMM
+// (bf16 output) -> transpose + unscale + bias -> bf16 [..., N].
+// ---------------------------------------------------------------------------
+
+__global__ void cast_bf16_to_fp8_kernel(
+    const __nv_bfloat16* __restrict__ src, __nv_fp8_e4m3* __restrict__ dst,
+    int64_t n) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __nv_fp8_e4m3(__bfloat162float(src[i]));
+}
+
+__global__ void transpose_bias_cast_kernel(
+    const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+    const float* __restrict__ bias, int64_t m, int64_t n) {
+    // src is col-major [M,N] (= row-major C^T[N,M]); write row-major C[M,N].
+    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t total = m * n;
+    if (idx >= total) return;
+    int64_t i = idx / n, j = idx % n;
+    float v = __bfloat162float(src[j * m + i]);
+    if (bias) v += bias[j];
+    dst[idx] = __float2bfloat16(v);
+}
+
+static int64_t g_last_m = -1, g_last_k = -1, g_last_n = -1;
+static cublasLtMatmulAlgo_t g_last_algo;
+
+static cublasStatus_t get_algo_cached(int64_t m, int64_t k, int64_t n,
+                                      cublasLtMatmulAlgo_t* algo) {
+    if (m == g_last_m && k == g_last_k && n == g_last_n) {
+        *algo = g_last_algo;
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    cublasLtMatmulHeuristicResult_t heur;
+    int returned = 0;
+    cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(
+        g_handle, g_desc, g_layout_a, g_layout_b, g_layout_c, g_layout_c, g_pref, 1,
+        &heur, &returned);
+    if (st != CUBLAS_STATUS_SUCCESS || returned == 0) return st;
+    g_last_algo = heur.algo;
+    g_last_m = m; g_last_k = k; g_last_n = n;
+    *algo = heur.algo;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+torch::Tensor fp8_linear_forward(torch::Tensor x, torch::Tensor w,
+                                 torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda() && w.is_cuda(), "CUDA tensors required");
+    TORCH_CHECK(x.dtype() == torch::kBFloat16, "x must be bf16");
+    TORCH_CHECK(w.dtype() == torch::kBFloat16, "w must be bf16");
+    const at::cuda::OptionalCUDAGuard guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto x_c = x.reshape({-1, w.size(1)}).contiguous();
+    auto w_c = w.contiguous();
+    int64_t m = x_c.size(0), k = x_c.size(1), n = w_c.size(0);
+    TORCH_CHECK(w_c.size(1) == k, "inner dim mismatch");
+    auto out = torch::empty({m, n}, x_c.options());
+
+    ensure_cublas_lt();
+    set_layout(g_layout_a, k, m, k);
+    set_layout(g_layout_b, k, n, k);
+    set_layout(g_layout_c, m, n, m);  // bf16 col-major [M,N] output
+
+    auto x8 = torch::empty({m, k}, x_c.options().dtype(torch::kFloat8_e4m3fn));
+    auto w8 = torch::empty({n, k}, w_c.options().dtype(torch::kFloat8_e4m3fn));
+    int64_t block = 256;
+    cast_bf16_to_fp8_kernel<<<(unsigned)((m * k + block - 1) / block), block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(x8.data_ptr()), m * k);
+    cast_bf16_to_fp8_kernel<<<(unsigned)((n * k + block - 1) / block), block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w8.data_ptr()), n * k);
+    C10_CUDA_CHECK(cudaGetLastError());
+
+    auto buf = torch::empty({n, m}, out.options());  // col-major [M,N] = C^T
+    float alpha = 1.0f, beta = 0.0f;
+    cublasLtMatmulAlgo_t algo;
+    cublasStatus_t st = get_algo_cached(m, k, n, &algo);
+    TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
+                "cublasLtMatmulAlgoGetHeuristic failed: ", cublasLtGetStatusName(st));
+    st = cublasLtMatmul(g_handle, g_desc, &alpha, x8.data_ptr(), g_layout_a,
+                        w8.data_ptr(), g_layout_b, &beta, buf.data_ptr(), g_layout_c,
+                        buf.data_ptr(), g_layout_c, &algo, g_workspace, g_ws_size,
+                        stream.stream());
+    TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
+                "cublasLtMatmul failed: ", cublasLtGetStatusName(st));
+
+    float* bias_ptr = nullptr;
+    auto bias_f = torch::Tensor();
+    if (bias.defined() && bias.numel() > 0) {
+        bias_f = bias.to(torch::kFloat32).contiguous();
+        bias_ptr = bias_f.data_ptr<float>();
+    }
+    transpose_bias_cast_kernel<<<(unsigned)((m * n + block - 1) / block), block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(buf.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), bias_ptr, m, n);
+    C10_CUDA_CHECK(cudaGetLastError());
+
+    std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end() - 1);
+    shape.push_back(n);
+    return out.reshape(shape);
+}
+
+// ---------------------------------------------------------------------------
+// Fused FP8 linear backward: dX = (g*sw) @ W, dW = (g*sx)^T @ X, dB = sum(g).
+// Scales are recomputed from x/w (identical to forward, no state needed).
+// ---------------------------------------------------------------------------
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward(
+    torch::Tensor g, torch::Tensor x, torch::Tensor w,
+    std::vector<int64_t> masks) {
+    const at::cuda::OptionalCUDAGuard guard(g.device());
+    auto g_c = g.reshape({-1, w.size(0)}).contiguous();
+    auto x_c = x.reshape({-1, x.size(-1)}).contiguous();
+    int64_t n = w.size(0);
+
+    auto grad_input = torch::empty_like(x);
+    auto grad_weight = torch::empty_like(w);
+    auto grad_bias = torch::empty({0}, g_c.options().dtype(g.dtype()));
+    // Compute dtype follows the input tensor (bf16 model -> bf16 GEMMs,
+    // fp32 input -> fp32); w is cast to match, no branch needed.
+    auto dtype = x_c.dtype();
+    auto g_w = g_c.to(dtype);
+    auto w_w = w.to(dtype);
+    if (masks[0]) {
+        grad_input.copy_(torch::mm(g_w, w_w).reshape_as(x));
+    }
+    if (masks[1]) {
+        grad_weight.copy_(torch::mm(g_w.t(), x_c));
+    }
+    if (masks[2]) {
+        grad_bias = g.sum(0).to(g.dtype());
+    }
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>(
+        grad_input, grad_weight, grad_bias);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fp8_mm_view", &fp8_mm_view, py::arg("a"), py::arg("b"),
+          "FP8 GEMM returning raw col-major buffer (debug)");
     m.def("fp8_mm", &fp8_mm, py::arg("a"), py::arg("b"),
-          "FP8 e4m3 GEMM: a[M,K] x b[N,K] -> fp32[M,N] (pre-scaled inputs)");
+          "FP8 e4m3 GEMM: a[M,K] x b[N,K] -> bf16[M,N] (pre-scaled inputs)");
+    m.def("fp8_linear_forward", &fp8_linear_forward,
+          py::arg("x"), py::arg("w"), py::arg("bias"),
+          "Fused FP8 linear forward: scale cast + cublasLt GEMM + unscale "
+          "+ bias + transpose -> bf16, single call");
+    m.def("fp8_linear_backward", &fp8_linear_backward,
+          py::arg("g"), py::arg("x"), py::arg("w"), py::arg("masks"),
+          "Fused linear backward: dX = g*sw @ W, dW = (g*sx)^T @ X, "
+          "dB = sum(g), single call");
 }

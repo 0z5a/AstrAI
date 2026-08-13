@@ -10,7 +10,7 @@ import threading
 import torch
 from torch.library import Library
 
-from astrai.extension.fp8_ops import fp8_linear_forward
+from astrai.extension.fp8_ops import fp8_linear_backward, fp8_linear_forward
 
 _state = threading.local()
 
@@ -25,7 +25,7 @@ def fp8_linear_enabled() -> bool:
 
 
 def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
-    if fp8_linear_enabled() and x.dtype in (torch.bfloat16, torch.float32):
+    if fp8_linear_enabled() and x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16:
         return fp8_linear_forward(x, w, bias)
     return torch.ops.aten.linear.default.redispatch(
         torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd),
@@ -37,10 +37,12 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
 
 def _linear_backward_cuda_impl(input_tensor, grad_output, weight, output_mask):
     # VariableType wraps aten::linear; its backward runs aten::linear_backward
-    # with schema (self, grad_output, weight, mask). weight is the leaf
-    # parameter, so its dtype is the model-precision baseline; cast everything
-    # to it (bf16 model -> bf16 GEMMs, fp32 model -> fp32, no branch):
+    # with schema (self, grad_output, weight, mask). When fp8 is enabled the
+    # fused CUDA backward runs in one call (scale-corrected); otherwise the
+    # plain bf16/fp32 math, dtype aligned to the leaf weight:
     #   grad_input = g @ W, grad_weight = g^T @ X, grad_bias = sum(g, dim=0)
+    if fp8_linear_enabled() and weight.dtype == torch.bfloat16:
+        return fp8_linear_backward(grad_output, input_tensor, weight, list(output_mask))
     compute_dtype = weight.dtype
     grad = grad_output.to(compute_dtype)
     grad_2d = grad.reshape(-1, weight.size(0))
