@@ -1,10 +1,12 @@
 import os
+import re
 from collections import OrderedDict
 from collections.abc import Callable
 from functools import partial
 
 import click
 import torch
+import yaml
 from click.core import ParameterSource
 from torch import optim
 
@@ -48,13 +50,30 @@ def opt(*param_decls, group: str, **kwargs):
     return click.option(*param_decls, **kwargs)
 
 
+_YAML_FLOAT_PATTERN = re.compile(
+    r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+    |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+    |[-+]?\.(?:inf|Inf|INF)
+    |\.(?:nan|NaN|NAN))$""",
+    re.X,
+)
+
+
+def _enable_yaml12_floats() -> None:
+    """PyYAML implements YAML 1.1, where ``2e-5`` parses as a string; switch its
+    float resolver to the YAML 1.2 core schema so scientific notation works."""
+    yaml.SafeLoader.add_implicit_resolver(
+        "tag:yaml.org,2002:float", _YAML_FLOAT_PATTERN, list("-+0123456789.")
+    )
+
+
 def _merge_yaml_into_kwargs(
     config_path: str,
     passed_kwargs: dict,
     explicit_keys: set[str] | None = None,
 ) -> dict:
     """Merge Click defaults, YAML values, then explicit CLI values."""
-    import yaml
+    _enable_yaml12_floats()
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f) or {}
