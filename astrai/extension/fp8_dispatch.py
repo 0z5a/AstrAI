@@ -35,31 +35,32 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
     )
 
 
-def _linear_backward_cuda_impl(input, grad_output, weight, output_mask):
+def _linear_backward_cuda_impl(input_tensor, grad_output, weight, output_mask):
     # VariableType wraps aten::linear; its backward runs aten::linear_backward
-    # with schema (self, grad_output, weight, mask). Implement the bf16
-    # gradient math directly (no redispatch), supporting [..., K] inputs:
-    #   dX = g @ W, dW = g^T @ X, dB = sum(g, dim=0)
-    g = grad_output.to(torch.bfloat16)
-    g2d = g.reshape(-1, weight.size(0))
-    x2d = input.reshape(-1, input.size(-1)).to(torch.bfloat16)
-    dX = (
-        torch.mm(g2d, weight)
+    # with schema (self, grad_output, weight, mask). weight is the leaf
+    # parameter, so its dtype is the model-precision baseline; cast everything
+    # to it (bf16 model -> bf16 GEMMs, fp32 model -> fp32, no branch):
+    #   grad_input = g @ W, grad_weight = g^T @ X, grad_bias = sum(g, dim=0)
+    compute_dtype = weight.dtype
+    grad = grad_output.to(compute_dtype)
+    grad_2d = grad.reshape(-1, weight.size(0))
+    input_2d = input_tensor.reshape(-1, input_tensor.size(-1)).to(compute_dtype)
+    grad_input = (
+        torch.mm(grad_2d, weight)
         if output_mask[0]
-        else torch.empty(0, device=input.device, dtype=input.dtype)
+        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
     )
-    dX = dX.reshape_as(input)
-    dW = (
-        torch.mm(g2d.t(), x2d)
+    grad_weight = (
+        torch.mm(grad_2d.t(), input_2d)
         if output_mask[1]
-        else torch.empty(0, device=input.device, dtype=input.dtype)
+        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
     )
-    dB = (
-        g.sum(dim=0)
+    grad_bias = (
+        grad.sum(dim=0)
         if output_mask[2]
-        else torch.empty(0, device=input.device, dtype=input.dtype)
+        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
     )
-    return dX, dW, dB
+    return grad_input.reshape_as(input_tensor), grad_weight, grad_bias
 
 
 _lib = Library("aten", "IMPL", "CUDA")
