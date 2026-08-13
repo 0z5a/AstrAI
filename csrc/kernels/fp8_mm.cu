@@ -36,7 +36,7 @@ static void ensure_cublas_lt() {
                 CUBLAS_STATUS_SUCCESS);
     TORCH_CHECK(cublasLtMatrixLayoutCreate(&g_layout_b, CUDA_R_8F_E4M3, 1, 1, 1) ==
                 CUBLAS_STATUS_SUCCESS);
-    TORCH_CHECK(cublasLtMatrixLayoutCreate(&g_layout_c, CUDA_R_32F, 1, 1, 1) ==
+    TORCH_CHECK(cublasLtMatrixLayoutCreate(&g_layout_c, CUDA_R_16BF, 1, 1, 1) ==
                 CUBLAS_STATUS_SUCCESS);
     TORCH_CHECK(cublasLtMatmulPreferenceCreate(&g_pref) == CUBLAS_STATUS_SUCCESS);
     size_t ws = 16 * 1024 * 1024;
@@ -71,7 +71,7 @@ torch::Tensor fp8_mm(torch::Tensor a, torch::Tensor b) {
     int64_t m = a_c.size(0), k = a_c.size(1), n = b_c.size(0);
     TORCH_CHECK(b_c.size(1) == k, "inner dim mismatch");
 
-    auto buf = torch::empty({n, m}, a_c.options().dtype(torch::kFloat32));
+    auto buf = torch::empty({n, m}, a_c.options().dtype(torch::kBFloat16));
 
     ensure_cublas_lt();
     set_layout(g_layout_a, k, m, k);  // A col-major [K,M] (a row-major, op=T)
