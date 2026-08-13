@@ -17,6 +17,7 @@ KERNEL_NAMES = [
     "attn_paged_decode",
     "attn_paged_prefill",
     "rotary_emb",
+    "fp8_mm",
 ]
 
 _available: dict[str, bool] = {}

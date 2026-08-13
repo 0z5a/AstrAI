@@ -48,7 +48,7 @@ set(TORCH_LIBS
 
 set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH}")
 
-set(KERNELS attn_decode attn_prefill attn_paged_decode attn_paged_prefill rotary_emb)
+set(KERNELS attn_decode attn_prefill attn_paged_decode attn_paged_prefill rotary_emb fp8_mm)
 
 foreach(name ${KERNELS})
     add_library(${name} MODULE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${name}.cu")
@@ -61,6 +61,9 @@ foreach(name ${KERNELS})
         "${PYTHON_INCLUDE_DIR}")
 
     target_link_libraries(${name} PRIVATE ${TORCH_LIBS})
+    if(${name} STREQUAL "fp8_mm")
+        target_link_libraries(${name} PRIVATE CUDA::cublasLt)
+    endif()
     target_link_options(${name} PRIVATE "-Wl,-rpath,${TORCH_LIB_DIR}")
 
     target_compile_options(${name} PRIVATE
