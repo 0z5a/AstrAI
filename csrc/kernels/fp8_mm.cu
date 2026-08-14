@@ -154,9 +154,9 @@ __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ src,
     int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     float amax = 0.f;
     if (i < n) {
-        float v = __bfloat162float(src[i]) * *scale_inv;
-        dst[i] = cast_fp8<T8>(v);
-        amax = fabsf(v);
+        float raw = __bfloat162float(src[i]);
+        dst[i] = cast_fp8<T8>(raw * *scale_inv);
+        amax = fabsf(raw);
     }
     for (int off = 16; off; off >>= 1)
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
@@ -182,9 +182,9 @@ __global__ void transpose_quantize_kernel(
     float amax = 0.f;
     for (int j = 0; j < 32; j += 8) {
         if (x < cols && y + j < rows) {
-            float v = __bfloat162float(src[(y + j) * cols + x]) * *scale_inv;
-            tile[threadIdx.y + j][threadIdx.x] = cast_fp8<T8>(v);
-            amax = fmaxf(amax, fabsf(v));
+            float raw = __bfloat162float(src[(y + j) * cols + x]);
+            tile[threadIdx.y + j][threadIdx.x] = cast_fp8<T8>(raw * *scale_inv);
+            amax = fmaxf(amax, fabsf(raw));
         }
     }
     __syncthreads();
@@ -382,6 +382,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward_scal
     auto gt8 = masks[1] ? torch::empty({n, m}, fp8_options) : torch::Tensor();
     auto wt8 = masks[0] ? torch::empty({k, n}, fp8_options) : torch::Tensor();
     auto xt8 = masks[1] ? torch::empty({k, m}, fp8_options) : torch::Tensor();
+    // w/x transpose-quantize amax goes to a scratch buffer, NOT amax_g: the
+    // gradient scale must only see the gradient's own max-abs.
+    auto amax_t = torch::zeros({1}, g_c.options().dtype(torch::kFloat32));
 
     int64_t block = 256;
     quantize_kernel<__nv_fp8_e4m3>
@@ -394,8 +397,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward_scal
         transpose_quantize_kernel<__nv_fp8_e4m3>
             <<<blocks, threads, 0, stream.stream()>>>(
                 reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr()), swi_ptr,
-                reinterpret_cast<__nv_fp8_e4m3*>(wt8.data_ptr()), amax_g_ptr,
-                n, k);
+                reinterpret_cast<__nv_fp8_e4m3*>(wt8.data_ptr()),
+                amax_t.data_ptr<float>(), n, k);
         fp8_gemm_into(g8, wt8, grad_input.reshape({m, k}), m, n, k, sg_ptr,
                       sw_ptr, stream.stream());
     }
@@ -405,13 +408,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward_scal
         transpose_quantize_kernel<__nv_fp8_e4m3>
             <<<g_blocks, threads, 0, stream.stream()>>>(
                 reinterpret_cast<const __nv_bfloat16*>(g_c.data_ptr()), sgi_ptr,
-                reinterpret_cast<__nv_fp8_e4m3*>(gt8.data_ptr()), amax_g_ptr,
-                m, n);
+                reinterpret_cast<__nv_fp8_e4m3*>(gt8.data_ptr()),
+                amax_t.data_ptr<float>(), m, n);
         transpose_quantize_kernel<__nv_fp8_e4m3>
             <<<x_blocks, threads, 0, stream.stream()>>>(
                 reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr()), sxi_ptr,
-                reinterpret_cast<__nv_fp8_e4m3*>(xt8.data_ptr()), amax_g_ptr,
-                m, k);
+                reinterpret_cast<__nv_fp8_e4m3*>(xt8.data_ptr()),
+                amax_t.data_ptr<float>(), m, k);
         fp8_gemm_into(gt8, xt8, grad_weight, n, m, k, sg_ptr, sx_ptr,
                       stream.stream());
     }

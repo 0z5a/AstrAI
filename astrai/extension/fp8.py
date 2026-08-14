@@ -52,8 +52,15 @@ class FP8TensorMeta:
         "idx",
         "x_scale",
         "x_scale_inv",
+        "x_history",
+        "x_idx",
         "g_scale",
         "g_scale_inv",
+        "g_history",
+        "g_idx",
+        "w_init",
+        "x_init",
+        "g_init",
     )
 
     def __init__(self, device: torch.device, update_interval: int):
@@ -65,8 +72,43 @@ class FP8TensorMeta:
         self.idx = 0
         self.x_scale = torch.ones(1, device=device, dtype=torch.float32)
         self.x_scale_inv = torch.ones(1, device=device, dtype=torch.float32)
+        self.x_history = torch.ones(update_interval, device=device, dtype=torch.float32)
+        self.x_idx = 0
         self.g_scale = torch.ones(1, device=device, dtype=torch.float32)
         self.g_scale_inv = torch.ones(1, device=device, dtype=torch.float32)
+        self.g_history = torch.ones(update_interval, device=device, dtype=torch.float32)
+        self.g_idx = 0
+        self.w_init = False
+        self.x_init = False
+        self.g_init = False
+
+    def init_scale(self, t: torch.Tensor) -> None:
+        """Immediate scale from the current amax; used on the first call.
+
+        A scale of 1 would underflow small activations/gradients (e4m3 min
+        normal is 2^-6); initialize from the actual amax once, then delayed
+        updates take over.
+        """
+        amax = t.abs().amax().to(torch.float32).clamp_min(1e-12)
+        self.scale.copy_(amax / E4M3_MAX)
+        self.scale_inv.copy_(E4M3_MAX / amax)
+        self.record(amax)
+
+    def push_x_scale(self, amax: torch.Tensor) -> None:
+        """Window update for the activation scale (delayed, TE style)."""
+        self.x_history[self.x_idx] = amax.reshape(())
+        self.x_idx = (self.x_idx + 1) % self.x_history.numel()
+        m = self.x_history.max()
+        self.x_scale.copy_(m / E4M3_MAX)
+        self.x_scale_inv.copy_(E4M3_MAX / m)
+
+    def push_g_scale(self, amax: torch.Tensor) -> None:
+        """Window update for the gradient scale (delayed, TE style)."""
+        self.g_history[self.g_idx] = amax.reshape(())
+        self.g_idx = (self.g_idx + 1) % self.g_history.numel()
+        m = self.g_history.max()
+        self.g_scale.copy_(m / E4M3_MAX)
+        self.g_scale_inv.copy_(E4M3_MAX / m)
 
     def record(self, amax: torch.Tensor) -> None:
         """Push the latest amax into the ring buffer (device-side copy, no sync)."""
@@ -155,13 +197,6 @@ def fp8_autocast(enabled: bool = True, update_interval: int = 16):
         state.update_interval = prev_interval
 
 
-def _update_delayed_scale(scale, scale_inv, amax) -> None:
-    """scale = amax / 448 for the *next* call (device-side, no sync)."""
-    amax_f = amax.reshape(()).to(torch.float32).clamp_min(1e-12)
-    scale.copy_(amax_f / E4M3_MAX)
-    scale_inv.copy_(E4M3_MAX / amax_f)
-
-
 def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
     """TE-style scaled fp8 linear forward (called from the aten::linear impl).
 
@@ -173,6 +208,15 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
     state = fp8_state()
     meta = state.get_weight_meta(w)
+    if not meta.w_init:
+        meta.init_scale(w)
+        meta.w_init = True
+    if not meta.x_init:
+        amax = x.abs().amax().to(torch.float32).clamp_min(1e-12)
+        meta.x_history.fill_(amax)
+        meta.x_scale.copy_(amax / E4M3_MAX)
+        meta.x_scale_inv.copy_(E4M3_MAX / amax)
+        meta.x_init = True
     amax_x = torch.empty(1, device=x.device, dtype=torch.float32)
     amax_w = torch.empty(1, device=x.device, dtype=torch.float32)
     out = linear_forward_scaled(
@@ -187,7 +231,7 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
         amax_w,
     )
     meta.record(amax_w)
-    _update_delayed_scale(meta.x_scale, meta.x_scale_inv, amax_x)
+    meta.push_x_scale(amax_x)
     return out
 
 
@@ -195,6 +239,12 @@ def fp8_linear_backward(g, x, w, masks):
     """TE-style scaled fp8 linear backward (called from aten::linear_backward)."""
     state = fp8_state()
     meta = state.get_weight_meta(w)
+    if not meta.g_init:
+        amax = g.abs().amax().to(torch.float32).clamp_min(1e-12)
+        meta.g_history.fill_(amax)
+        meta.g_scale.copy_(amax / E4M3_MAX)
+        meta.g_scale_inv.copy_(E4M3_MAX / amax)
+        meta.g_init = True
     amax_g = torch.empty(1, device=g.device, dtype=torch.float32)
     out = linear_backward_scaled(
         g,
@@ -209,7 +259,7 @@ def fp8_linear_backward(g, x, w, masks):
         meta.x_scale_inv,
         amax_g,
     )
-    _update_delayed_scale(meta.g_scale, meta.g_scale_inv, amax_g)
+    meta.push_g_scale(amax_g)
     return out
 
 
