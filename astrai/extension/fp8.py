@@ -1,24 +1,41 @@
-"""FP8 training state: per-tensor scales, amax history, delayed scaling.
+"""FP8 training: scaling state and aten::linear dispatch.
 
-TE-style (TransformerEngine) delayed scaling:
-- weight tensors carry an ``FP8TensorMeta`` keyed by (data_ptr, shape) with a
-  fixed scale derived from a 16-step amax history window;
-- activations/gradients reuse the quantize kernel's free atomic amax, delayed
-  one step (scale updated after each call, used by the next call);
-- ``fp8_autocast()`` context manager toggles fp8 dispatch (like
-  ``torch.autocast``) and advances the scale-update counter once per step.
-  Entering it also ensures the aten::linear CUDA impl is registered, so
-  ``import astrai.extension.fp8_dispatch`` is not required by callers.
+Layered (see also ``fp8_ops.py`` for the CUDA interface adapter):
+
+1. Kernel interface: "fp8_ops" — the only module touching the pybind.
+2. Training state (this module): per-tensor scales, amax history, delayed
+   scaling, and the ``fp8_autocast`` context (TE-style, like
+   ``torch.autocast``).
+3. aten::linear integration (this module): registers the CUDA impl and the
+   M/N alignment guard.
+
+Usage::
+
+    from astrai.extension.fp8 import fp8_autocast
+
+    with fp8_autocast(enabled=True):
+        logits = model(input_ids)
+        loss.backward()
+
+Importing this module registers the aten::linear CUDA implementation.
 """
 
 from contextlib import contextmanager
 
 import torch
+from torch.library import Library
+
+from astrai.extension.fp8_ops import (
+    linear_backward_scaled,
+    linear_forward_scaled,
+)
 
 E4M3_MAX = 448.0
 
-# FP8 GEMM layout: D = A_SCALE * B_SCALE * A * B, so the per-tensor scales are
-# amax/448 (e4m3) and the quantization divides by scale (multiplies by 1/scale).
+
+# ---------------------------------------------------------------------------
+# Layer 2: training state (scales, amax history, delayed scaling, autocast)
+# ---------------------------------------------------------------------------
 
 
 class FP8TensorMeta:
@@ -155,11 +172,10 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
     state = fp8_state()
-    mod = _mod()
     meta = state.get_weight_meta(w)
     amax_x = torch.empty(1, device=x.device, dtype=torch.float32)
     amax_w = torch.empty(1, device=x.device, dtype=torch.float32)
-    out = mod.fp8_linear_forward_scaled(
+    out = linear_forward_scaled(
         x,
         w,
         bias,
@@ -178,14 +194,13 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
 def fp8_linear_backward(g, x, w, masks):
     """TE-style scaled fp8 linear backward (called from aten::linear_backward)."""
     state = fp8_state()
-    mod = _mod()
     meta = state.get_weight_meta(w)
     amax_g = torch.empty(1, device=g.device, dtype=torch.float32)
-    out = mod.fp8_linear_backward_scaled(
+    out = linear_backward_scaled(
         g,
         x,
         w,
-        list(masks),
+        masks,
         meta.g_scale,
         meta.scale,
         meta.x_scale,
@@ -198,7 +213,72 @@ def fp8_linear_backward(g, x, w, masks):
     return out
 
 
-def _mod():
-    from astrai.extension.loader import get_module
+# ---------------------------------------------------------------------------
+# Layer 3: aten::linear integration
+# ---------------------------------------------------------------------------
 
-    return get_module("fp8_mm")
+
+def fp8_linear_enable(enabled: bool = True) -> None:
+    """Toggle fp8 dispatch for aten::linear (global; backward runs on engine
+    worker threads, so a thread-local flag would be lost during backward)."""
+    fp8_state().enabled = enabled
+
+
+def fp8_linear_enabled() -> bool:
+    return fp8_state().enabled
+
+
+def _fp8_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """cuBLASLt fp8 requires M % 16 == 0 and N % 16 == 0 (K is padded)."""
+    m = x.numel() // x.size(-1)
+    return m % 16 == 0 and w.size(0) % 16 == 0
+
+
+def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
+    if (
+        fp8_linear_enabled()
+        and x.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and _fp8_supported(x, w)
+    ):
+        return fp8_linear_forward(x, w, bias)
+    return torch.ops.aten.linear.default.redispatch(
+        torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd),
+        x,
+        w,
+        bias,
+    )
+
+
+def _linear_backward_cuda_impl(input_tensor, grad_output, weight, output_mask):
+    if (
+        fp8_linear_enabled()
+        and weight.dtype == torch.bfloat16
+        and _fp8_supported(grad_output, weight)
+    ):
+        return fp8_linear_backward(grad_output, input_tensor, weight, list(output_mask))
+    compute_dtype = weight.dtype
+    grad = grad_output.to(compute_dtype)
+    grad_2d = grad.reshape(-1, weight.size(0))
+    input_2d = input_tensor.reshape(-1, input_tensor.size(-1)).to(compute_dtype)
+    grad_input = (
+        torch.mm(grad_2d, weight)
+        if output_mask[0]
+        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
+    )
+    grad_weight = (
+        torch.mm(grad_2d.t(), input_2d)
+        if output_mask[1]
+        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
+    )
+    grad_bias = (
+        grad.sum(dim=0)
+        if output_mask[2]
+        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
+    )
+    return grad_input.reshape_as(input_tensor), grad_weight, grad_bias
+
+
+_lib = Library("aten", "IMPL", "CUDA")
+_lib.impl("linear", _linear_cuda_impl)
+_lib.impl("linear_backward", _linear_backward_cuda_impl)
