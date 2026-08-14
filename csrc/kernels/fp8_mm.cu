@@ -87,7 +87,11 @@ static cublasStatus_t get_algo_cached(int64_t m, int64_t k, int64_t n,
                                       cublasLtMatmulAlgo_t* algo);
 
 static void fp8_gemm_into(torch::Tensor lhs, torch::Tensor rhs, torch::Tensor out,
-                          int64_t m, int64_t k, int64_t n, cudaStream_t stream);
+                          int64_t m, int64_t k, int64_t n,
+                          const float* a_scale, const float* b_scale,
+                          cudaStream_t stream);
+
+static const float k_scale_one = 1.0f;
 
 static void set_layout(cublasLtMatrixLayout_t layout, int64_t rows, int64_t cols,
                        int64_t ld) {
@@ -117,34 +121,70 @@ torch::Tensor fp8_mm(torch::Tensor a, torch::Tensor b) {
 
     auto buf = torch::empty({m, n}, a_c.options().dtype(torch::kBFloat16));
     ensure_cublas_lt();
-    fp8_gemm_into(a_c, b_c, buf, m, k, n, stream.stream());
+    fp8_gemm_into(a_c, b_c, buf, m, k, n, &k_scale_one, &k_scale_one,
+                  stream.stream());
     return buf;
 }
 
 
 // ---------------------------------------------------------------------------
-// Fused FP8 linear forward: one call = scale cast x8/w8 -> cublasLt GEMM
-// (bf16 output) -> bias in-place -> bf16 [..., N].
+// Quantize: bf16 * scale_inv -> fp8, one atomicMax amax per kernel call.
+// amax_ptr must be zeroed before launch; float-bits atomicMax works because
+// |v| >= 0 has a monotonic IEEE bit pattern.
 // ---------------------------------------------------------------------------
 
-__global__ void cast_bf16_to_fp8_kernel(
-    const __nv_bfloat16* __restrict__ src, __nv_fp8_e4m3* __restrict__ dst,
-    int64_t n) {
-    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = __nv_fp8_e4m3(__bfloat162float(src[i]));
+template <typename T8>
+__device__ __forceinline__ T8 cast_fp8(float v);
+
+template <>
+__device__ __forceinline__ __nv_fp8_e4m3 cast_fp8<__nv_fp8_e4m3>(float v) {
+    return __nv_fp8_e4m3(v);
 }
 
-__global__ void transpose_cast_bf16_to_fp8_kernel(
-    const __nv_bfloat16* __restrict__ src, __nv_fp8_e4m3* __restrict__ dst,
-    int64_t rows, int64_t cols) {
-    __shared__ __nv_fp8_e4m3 tile[32][33];
+template <>
+__device__ __forceinline__ __nv_fp8_e5m2 cast_fp8<__nv_fp8_e5m2>(float v) {
+    return __nv_fp8_e5m2(v);
+}
+
+template <typename T8>
+__global__ void quantize_kernel(const __nv_bfloat16* __restrict__ src,
+                                const float* __restrict__ scale_inv,
+                                T8* __restrict__ dst,
+                                float* __restrict__ amax_ptr, int64_t n) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    float amax = 0.f;
+    if (i < n) {
+        float v = __bfloat162float(src[i]) * *scale_inv;
+        dst[i] = cast_fp8<T8>(v);
+        amax = fabsf(v);
+    }
+    for (int off = 16; off; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    __shared__ float sm[8];
+    if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = 0.f;
+        for (int w = 0; w < blockDim.x / 32; ++w) m = fmaxf(m, sm[w]);
+        atomicMax(reinterpret_cast<unsigned*>(amax_ptr), __float_as_uint(m));
+    }
+}
+
+// Same but with a transpose (rows x cols bf16 row-major -> fp8 [cols, rows]).
+template <typename T8>
+__global__ void transpose_quantize_kernel(
+    const __nv_bfloat16* __restrict__ src, const float* __restrict__ scale_inv,
+    T8* __restrict__ dst, float* __restrict__ amax_ptr, int64_t rows,
+    int64_t cols) {
+    __shared__ T8 tile[32][33];
     int64_t x = blockIdx.x * 32 + threadIdx.x;
     int64_t y = blockIdx.y * 32 + threadIdx.y;
+    float amax = 0.f;
     for (int j = 0; j < 32; j += 8) {
         if (x < cols && y + j < rows) {
-            tile[threadIdx.y + j][threadIdx.x] =
-                __nv_fp8_e4m3(__bfloat162float(src[(y + j) * cols + x]));
+            float v = __bfloat162float(src[(y + j) * cols + x]) * *scale_inv;
+            tile[threadIdx.y + j][threadIdx.x] = cast_fp8<T8>(v);
+            amax = fmaxf(amax, fabsf(v));
         }
     }
     __syncthreads();
@@ -155,6 +195,16 @@ __global__ void transpose_cast_bf16_to_fp8_kernel(
         if (x < rows && y + j < cols) {
             dst[(y + j) * rows + x] = tile[threadIdx.x][threadIdx.y + j];
         }
+    }
+    for (int off = 16; off; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    __shared__ float sm[8];
+    if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = 0.f;
+        for (int w = 0; w < blockDim.x / 32; ++w) m = fmaxf(m, sm[w]);
+        atomicMax(reinterpret_cast<unsigned*>(amax_ptr), __float_as_uint(m));
     }
 }
 
@@ -196,11 +246,21 @@ static cublasStatus_t get_algo_cached(int64_t m, int64_t k, int64_t n,
 }
 
 static void fp8_gemm_into(torch::Tensor lhs, torch::Tensor rhs, torch::Tensor out,
-                          int64_t m, int64_t k, int64_t n, cudaStream_t stream) {
+                          int64_t m, int64_t k, int64_t n,
+                          const float* a_scale, const float* b_scale,
+                          cudaStream_t stream) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     set_layout(g_layout_a, k, n, k);  // param A = rhs (op=T -> [N,K])
     set_layout(g_layout_b, k, m, k);  // param B = lhs (op=N -> [K,M])
     set_layout(g_layout_c, n, m, n);  // col-major [N,M] == row-major [M,N]
+    // Per-tensor FP32 scales applied inside the GEMM:
+    // D = alpha * A_SCALE * B_SCALE * A * B (alpha = 1).
+    TORCH_CHECK(cublasLtMatmulDescSetAttribute(
+                    g_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale,
+                    sizeof(a_scale)) == CUBLAS_STATUS_SUCCESS);
+    TORCH_CHECK(cublasLtMatmulDescSetAttribute(
+                    g_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale,
+                    sizeof(b_scale)) == CUBLAS_STATUS_SUCCESS);
     float alpha = 1.0f, beta = 0.0f;
     static AlgoCache cache;
     cublasLtMatmulAlgo_t algo;
@@ -215,11 +275,22 @@ static void fp8_gemm_into(torch::Tensor lhs, torch::Tensor rhs, torch::Tensor ou
                 "cublasLtMatmul failed: ", cublasLtGetStatusName(st));
 }
 
-torch::Tensor fp8_linear_forward(torch::Tensor x, torch::Tensor w,
-                                 torch::Tensor bias) {
+// ---------------------------------------------------------------------------
+// Scaled FP8 linear forward: quantize x/w with per-tensor scales -> cublasLt
+// GEMM (scales applied inside) -> bias in-place -> bf16 [..., N].
+// sx/sw: f32 scale tensors (device scalars); sx_inv/sw_inv: 1/scale.
+// amax_x/amax_w: f32 buffers receiving max-abs of the quantized tensors.
+// ---------------------------------------------------------------------------
+
+torch::Tensor fp8_linear_forward_scaled(torch::Tensor x, torch::Tensor w,
+                                        torch::Tensor bias, torch::Tensor sx,
+                                        torch::Tensor sw, torch::Tensor sx_inv,
+                                        torch::Tensor sw_inv,
+                                        torch::Tensor amax_x,
+                                        torch::Tensor amax_w) {
     TORCH_CHECK(x.is_cuda() && w.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK(x.dtype() == torch::kBFloat16, "x must be bf16");
-    TORCH_CHECK(w.dtype() == torch::kBFloat16, "w must be bf16");
+    TORCH_CHECK(x.dtype() == torch::kBFloat16 && w.dtype() == torch::kBFloat16,
+                "x and w must be bf16");
     const at::cuda::OptionalCUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -229,22 +300,30 @@ torch::Tensor fp8_linear_forward(torch::Tensor x, torch::Tensor w,
     TORCH_CHECK(w_c.size(1) == k, "inner dim mismatch");
     ensure_cublas_lt();
 
+    const float* sx_ptr = sx.data_ptr<float>();
+    const float* sw_ptr = sw.data_ptr<float>();
+    const float* sxi_ptr = sx_inv.data_ptr<float>();
+    const float* swi_ptr = sw_inv.data_ptr<float>();
+    float* amax_x_ptr = amax_x.data_ptr<float>();
+    float* amax_w_ptr = amax_w.data_ptr<float>();
+    C10_CUDA_CHECK(cudaMemsetAsync(amax_x_ptr, 0, sizeof(float), stream.stream()));
+    C10_CUDA_CHECK(cudaMemsetAsync(amax_w_ptr, 0, sizeof(float), stream.stream()));
+
     auto x8 = torch::empty({m, k}, x_c.options().dtype(torch::kFloat8_e4m3fn));
     auto w8 = torch::empty({n, k}, w_c.options().dtype(torch::kFloat8_e4m3fn));
     int64_t block = 256;
-    cast_bf16_to_fp8_kernel<<<(unsigned)((m * k + block - 1) / block), block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr()),
-        reinterpret_cast<__nv_fp8_e4m3*>(x8.data_ptr()), m * k);
-    cast_bf16_to_fp8_kernel<<<(unsigned)((n * k + block - 1) / block), block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr()),
-        reinterpret_cast<__nv_fp8_e4m3*>(w8.data_ptr()), n * k);
+    quantize_kernel<__nv_fp8_e4m3>
+        <<<(unsigned)((m * k + block - 1) / block), block, 0, stream.stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr()), sxi_ptr,
+            reinterpret_cast<__nv_fp8_e4m3*>(x8.data_ptr()), amax_x_ptr, m * k);
+    quantize_kernel<__nv_fp8_e4m3>
+        <<<(unsigned)((n * k + block - 1) / block), block, 0, stream.stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr()), swi_ptr,
+            reinterpret_cast<__nv_fp8_e4m3*>(w8.data_ptr()), amax_w_ptr, n * k);
     C10_CUDA_CHECK(cudaGetLastError());
 
-    // A/B swap makes the col-major [N,M] storage directly represent the
-    // row-major output [M,N]. Keep this buffer as the public output so the
-    // bias path does not need a second allocation or a copy kernel.
     auto out = torch::empty({m, n}, x_c.options());
-    fp8_gemm_into(x8, w8, out, m, k, n, stream.stream());
+    fp8_gemm_into(x8, w8, out, m, k, n, sw_ptr, sx_ptr, stream.stream());
 
     if (bias.defined() && bias.numel() > 0) {
         TORCH_CHECK(bias.scalar_type() == torch::kBFloat16 && bias.numel() == n,
@@ -261,12 +340,15 @@ torch::Tensor fp8_linear_forward(torch::Tensor x, torch::Tensor w,
 }
 
 // ---------------------------------------------------------------------------
-// Fused FP8 linear backward: dX = g @ W, dW = g^T @ X, dB = sum(g).
+// Scaled FP8 linear backward: dX = g @ W, dW = g^T @ X, dB = sum(g).
+// Scales: g uses sg (immediate), w/x reuse the forward scales.
 // ---------------------------------------------------------------------------
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward_scaled(
     torch::Tensor g, torch::Tensor x, torch::Tensor w,
-    std::vector<int64_t> masks) {
+    std::vector<int64_t> masks, torch::Tensor sg, torch::Tensor sw,
+    torch::Tensor sx, torch::Tensor sg_inv, torch::Tensor sw_inv,
+    torch::Tensor sx_inv, torch::Tensor amax_g) {
     const at::cuda::OptionalCUDAGuard guard(g.device());
     TORCH_CHECK(g.dtype() == torch::kBFloat16 && x.dtype() == torch::kBFloat16 &&
                     w.dtype() == torch::kBFloat16,
@@ -286,6 +368,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward(
     auto grad_bias = torch::empty({0}, g_c.options().dtype(g.dtype()));
     ensure_cublas_lt();
 
+    const float* sg_ptr = sg.data_ptr<float>();
+    const float* sw_ptr = sw.data_ptr<float>();
+    const float* sx_ptr = sx.data_ptr<float>();
+    const float* sgi_ptr = sg_inv.data_ptr<float>();
+    const float* swi_ptr = sw_inv.data_ptr<float>();
+    const float* sxi_ptr = sx_inv.data_ptr<float>();
+    float* amax_g_ptr = amax_g.data_ptr<float>();
+    C10_CUDA_CHECK(cudaMemsetAsync(amax_g_ptr, 0, sizeof(float), stream.stream()));
+
     auto fp8_options = g_c.options().dtype(torch::kFloat8_e4m3fn);
     auto g8 = torch::empty({m, n}, fp8_options);
     auto gt8 = masks[1] ? torch::empty({n, m}, fp8_options) : torch::Tensor();
@@ -293,28 +384,36 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward(
     auto xt8 = masks[1] ? torch::empty({k, m}, fp8_options) : torch::Tensor();
 
     int64_t block = 256;
-    cast_bf16_to_fp8_kernel<<<(unsigned)((m * n + block - 1) / block), block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(g_c.data_ptr()),
-        reinterpret_cast<__nv_fp8_e4m3*>(g8.data_ptr()), m * n);
+    quantize_kernel<__nv_fp8_e4m3>
+        <<<(unsigned)((m * n + block - 1) / block), block, 0, stream.stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(g_c.data_ptr()), sgi_ptr,
+            reinterpret_cast<__nv_fp8_e4m3*>(g8.data_ptr()), amax_g_ptr, m * n);
     dim3 threads(32, 8);
     if (masks[0]) {
         dim3 blocks((k + 31) / 32, (n + 31) / 32);
-        transpose_cast_bf16_to_fp8_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr()),
-            reinterpret_cast<__nv_fp8_e4m3*>(wt8.data_ptr()), n, k);
-        fp8_gemm_into(g8, wt8, grad_input.reshape({m, k}), m, n, k,
-                      stream.stream());
+        transpose_quantize_kernel<__nv_fp8_e4m3>
+            <<<blocks, threads, 0, stream.stream()>>>(
+                reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr()), swi_ptr,
+                reinterpret_cast<__nv_fp8_e4m3*>(wt8.data_ptr()), amax_g_ptr,
+                n, k);
+        fp8_gemm_into(g8, wt8, grad_input.reshape({m, k}), m, n, k, sg_ptr,
+                      sw_ptr, stream.stream());
     }
     if (masks[1]) {
         dim3 g_blocks((n + 31) / 32, (m + 31) / 32);
         dim3 x_blocks((k + 31) / 32, (m + 31) / 32);
-        transpose_cast_bf16_to_fp8_kernel<<<g_blocks, threads, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(g_c.data_ptr()),
-            reinterpret_cast<__nv_fp8_e4m3*>(gt8.data_ptr()), m, n);
-        transpose_cast_bf16_to_fp8_kernel<<<x_blocks, threads, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr()),
-            reinterpret_cast<__nv_fp8_e4m3*>(xt8.data_ptr()), m, k);
-        fp8_gemm_into(gt8, xt8, grad_weight, n, m, k, stream.stream());
+        transpose_quantize_kernel<__nv_fp8_e4m3>
+            <<<g_blocks, threads, 0, stream.stream()>>>(
+                reinterpret_cast<const __nv_bfloat16*>(g_c.data_ptr()), sgi_ptr,
+                reinterpret_cast<__nv_fp8_e4m3*>(gt8.data_ptr()), amax_g_ptr,
+                m, n);
+        transpose_quantize_kernel<__nv_fp8_e4m3>
+            <<<x_blocks, threads, 0, stream.stream()>>>(
+                reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr()), sxi_ptr,
+                reinterpret_cast<__nv_fp8_e4m3*>(xt8.data_ptr()), amax_g_ptr,
+                m, k);
+        fp8_gemm_into(gt8, xt8, grad_weight, n, m, k, sg_ptr, sx_ptr,
+                      stream.stream());
     }
     C10_CUDA_CHECK(cudaGetLastError());
     if (masks[2]) {
@@ -327,12 +426,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_linear_backward(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_mm", &fp8_mm, py::arg("a"), py::arg("b"),
           "FP8 e4m3 GEMM: a[M,K] x b[N,K] -> bf16[M,N] (pre-scaled inputs)");
-    m.def("fp8_linear_forward", &fp8_linear_forward,
-          py::arg("x"), py::arg("w"), py::arg("bias"),
-          "Fused FP8 linear forward: scale cast + cublasLt GEMM + bias "
-          "-> bf16, single call");
-    m.def("fp8_linear_backward", &fp8_linear_backward,
+    m.def("fp8_linear_forward_scaled", &fp8_linear_forward_scaled,
+          py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("sx"),
+          py::arg("sw"), py::arg("sx_inv"), py::arg("sw_inv"),
+          py::arg("amax_x"), py::arg("amax_w"),
+          "Scaled FP8 linear forward: quantize with per-tensor scales + "
+          "cublasLt GEMM (scales applied inside) + bias -> bf16");
+    m.def("fp8_linear_backward_scaled", &fp8_linear_backward_scaled,
           py::arg("g"), py::arg("x"), py::arg("w"), py::arg("masks"),
-          "Fused linear backward: dX = g*sw @ W, dW = (g*sx)^T @ X, "
-          "dB = sum(g), single call");
+          py::arg("sg"), py::arg("sw"), py::arg("sx"), py::arg("sg_inv"),
+          py::arg("sw_inv"), py::arg("sx_inv"), py::arg("amax_g"),
+          "Scaled FP8 linear backward: dX = g*sw @ W, dW = (g*sx)^T @ X, "
+          "dB = sum(g)");
 }

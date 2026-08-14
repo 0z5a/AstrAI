@@ -65,21 +65,17 @@ fp8_mm.register_autograd(_fp8_mm_backward, setup_context=_fp8_mm_setup_context)
 
 
 def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
-    """FP8 replacement for F.linear(x, w, bias), fused in one CUDA call.
+    """TE-style scaled fp8 linear forward (delegates to fp8_state)."""
+    from astrai.extension.fp8_state import fp8_linear_forward as _f
 
-    x: [..., K] bf16 (any leading dims), w: [N,K] bf16 (in_dim=K).
-    The kernel pipeline (scale cast -> cublasLt fp8 GEMM -> unscale + bias ->
-    transpose -> bf16) runs inside a single extension call, so Python-side
-    dispatch overhead is paid once per linear instead of per operator.
-    """
-    if bias is None:
-        bias = torch.empty(0, device=x.device, dtype=x.dtype)
-    return get_module("fp8_mm").fp8_linear_forward(x, w, bias)
+    return _f(x, w, bias)
 
 
 def fp8_linear_backward(g, x, w, masks):
-    """Fused linear backward (dX/dW/dB in one CUDA call, scale-corrected)."""
-    return get_module("fp8_mm").fp8_linear_backward(g, x, w, masks)
+    """TE-style scaled fp8 linear backward (delegates to fp8_state)."""
+    from astrai.extension.fp8_state import fp8_linear_backward as _b
+
+    return _b(g, x, w, masks)
 
 
 def fp8_available() -> bool:

@@ -11,21 +11,31 @@ import torch
 from torch.library import Library
 
 from astrai.extension.fp8_ops import fp8_linear_backward, fp8_linear_forward
-
-_state = threading.local()
+from astrai.extension.fp8_state import fp8_autocast, fp8_state
 
 
 def fp8_linear_enable(enabled: bool = True) -> None:
     """Toggle fp8 dispatch for aten::linear on this thread."""
-    _state.enabled = enabled
+    fp8_state().enabled = enabled
 
 
 def fp8_linear_enabled() -> bool:
-    return getattr(_state, "enabled", False)
+    return fp8_state().enabled
+
+
+def _fp8_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """cuBLASLt fp8 requires M % 16 == 0 and N % 16 == 0 (K is padded); else fall back."""
+    m = x.numel() // x.size(-1)
+    return m % 16 == 0 and w.size(0) % 16 == 0
 
 
 def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
-    if fp8_linear_enabled() and x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16:
+    if (
+        fp8_linear_enabled()
+        and x.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and _fp8_supported(x, w)
+    ):
         return fp8_linear_forward(x, w, bias)
     return torch.ops.aten.linear.default.redispatch(
         torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd),
@@ -41,7 +51,11 @@ def _linear_backward_cuda_impl(input_tensor, grad_output, weight, output_mask):
     # fused CUDA backward runs in one call (scale-corrected); otherwise the
     # plain bf16/fp32 math, dtype aligned to the leaf weight:
     #   grad_input = g @ W, grad_weight = g^T @ X, grad_bias = sum(g, dim=0)
-    if fp8_linear_enabled() and weight.dtype == torch.bfloat16:
+    if (
+        fp8_linear_enabled()
+        and weight.dtype == torch.bfloat16
+        and _fp8_supported(grad_output, weight)
+    ):
         return fp8_linear_backward(grad_output, input_tensor, weight, list(output_mask))
     compute_dtype = weight.dtype
     grad = grad_output.to(compute_dtype)
