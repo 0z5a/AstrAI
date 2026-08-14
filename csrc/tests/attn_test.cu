@@ -118,7 +118,8 @@ static void bench_decode() {
     printf("\n===== DECODE BENCH (warmup=%d iters=%d) =====\n", WARMUP, ITERS);
     print_bench_header();
 
-    for (int ci = 0; ci < 6; ci++) {
+    int n = sizeof(cfgs) / sizeof(cfgs[0]);
+    for (int ci = 0; ci < n; ci++) {
         int B = cfgs[ci][0], Hq = cfgs[ci][1], Hk = cfgs[ci][2];
         int sl = cfgs[ci][3], D = cfgs[ci][4];
         size_t nQ = (size_t)B * Hq * D;
@@ -229,6 +230,12 @@ static int run_prefill_test(int B, int Hq, int Hk, int ql, int kl, int D, int ca
 
 static void bench_prefill() {
     const int cfgs[][7] = {
+        {1,32,4,1024,1024,32,0},
+        {1,32,4,1024,1024,32,1},
+        {1,32,4,4096,4096,32,1},
+        {1,32,4,1024,1024,64,0},
+        {1,32,4,1024,1024,64,1},
+        {1,32,4,4096,4096,64,1},
         {1,32,4,512,512,128,0},
         {1,32,4,1024,1024,128,0},
         {1,32,4,2048,2048,128,0},
@@ -324,7 +331,9 @@ int main() {
     {
         const int configs[][7] = {
             {1,2,1,64,128,32,0},     // scalar fallback D=32
+            {1,4,2,256,256,32,1},     // causal D=32 dispatch
             {1,2,1,64,128,64,0},     // tiny: B,Hq,Hk,q,kv,D,causal
+            {1,4,2,256,256,64,1},     // causal D=64 dispatch
             {1,32,4,512,512,128,0},  // standard
             {1,32,4,128,256,128,0},  // medium
             {1,4,2,256,256,128,1},   // causal

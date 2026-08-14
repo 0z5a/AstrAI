@@ -59,14 +59,34 @@ inline int compute_num_splits(int base_blocks, int tiles_total,
 // ======================================================================
 
 #ifndef ASTRAI_NO_MMA
+template <int BC_>
+struct PrefillKernelConfig {
+    static constexpr int BC = BC_;
+    static constexpr int WARPS = 4;
+    static constexpr int STAGES = 2;
+};
+
+// Compile-time configuration map shared by contiguous and paged prefill.
+// Unsupported head dimensions intentionally have no mapping.
+template <int HEAD_DIM, bool IsCausal>
+struct PrefillConfigMap;
+
+template <> struct PrefillConfigMap<32, false>  : PrefillKernelConfig<32> {};
+template <> struct PrefillConfigMap<32, true>   : PrefillKernelConfig<64> {};
+template <> struct PrefillConfigMap<64, false>  : PrefillKernelConfig<32> {};
+template <> struct PrefillConfigMap<64, true>   : PrefillKernelConfig<64> {};
+template <> struct PrefillConfigMap<128, false> : PrefillKernelConfig<32> {};
+template <> struct PrefillConfigMap<128, true>  : PrefillKernelConfig<32> {};
+template <> struct PrefillConfigMap<256, false> : PrefillKernelConfig<16> {};
+template <> struct PrefillConfigMap<256, true>  : PrefillKernelConfig<16> {};
+
 template <typename KV>
 struct PrefillLauncherMMA {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
     static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
-        constexpr int WARPS = 4;
-        constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
-        using Traits = KernelTraits<HEAD_DIM, BC, WARPS, 2>;
-        constexpr int ROWS = Traits::BR * WARPS;
+        using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
+        using Traits = KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES>;
+        constexpr int ROWS = Traits::BR * Config::WARPS;
         dim3 grid(KV::host_q_blocks(p, ROWS), p.q_head,
                   KV::kPaged ? 1 : p.batch);
         dim3 block(Traits::NUM_THREADS);
