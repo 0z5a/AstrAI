@@ -14,7 +14,6 @@ from astrai.dataset.storage import (
     Streamable,
     detect_format,
 )
-from astrai.dataset.streaming import StreamingSeqDataset
 from astrai.serialization import (
     load_bin,
     save_bin,
@@ -35,5 +34,4 @@ __all__ = [
     "save_bin",
     "load_bin",
     "RDSampler",
-    "StreamingSeqDataset",
 ]
