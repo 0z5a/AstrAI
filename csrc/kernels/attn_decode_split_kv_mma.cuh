@@ -73,7 +73,8 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
             int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
             int kc = kv0 + r;
             bool valid = kc < seq_len;
-            KVAddr a = KV::kv_addr(p, kctx, kc, d, valid);
+            int token = KV::resolve_token(p, kctx, kc, valid);
+            KVAddr a = KV::kv_addr_from_token(p, kctx, token, d);
             int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
             cp_async_16_pred(&dK[off], a.k, a.valid);
             cp_async_16_pred(&dV[off], a.v, a.valid);

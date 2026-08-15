@@ -104,10 +104,18 @@ struct ContigKV {
         c.kv_base = batch * p.kv_b_stride + kv_head * p.kv_h_stride;
         return c;
     }
-    HOST_DEV_FORCEINLINE KVAddr kv_addr(
-        const AttentionParams<bf16>& p, const KVContext& c, int kc, int d, bool valid) {
-        const int g_off = c.kv_base + kc * p.kv_l_stride + d * p.kv_d_stride;
-        return {&p.k_ptr[g_off], &p.v_ptr[g_off], valid};
+    HOST_DEV_FORCEINLINE int resolve_token(
+        const AttentionParams<bf16>& p, const KVContext& c, int kc, bool valid) {
+        return valid ? kc : -1;
+    }
+    HOST_DEV_FORCEINLINE KVAddr kv_addr_from_token(
+        const AttentionParams<bf16>& p, const KVContext& c, int token, int d) {
+        const bool valid = token >= 0;
+        const int safe_token = valid ? token : 0;
+        const int64_t gmem_off = (int64_t)c.kv_base
+            + (int64_t)safe_token * p.kv_l_stride
+            + (int64_t)d * p.kv_d_stride;
+        return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], valid};
     }
 };
 
@@ -175,12 +183,16 @@ struct PagedKV {
         c.head_off = (int64_t)kv_head * HEAD_DIM;
         return c;
     }
-    HOST_DEV_FORCEINLINE KVAddr kv_addr(
-        const AttentionParams<bf16>& p, const KVContext& c, int kc, int d, bool valid) {
-        const int slot = valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : 0;
-        const bool ok = valid && (slot >= 0);
-        const int64_t gmem_off = (int64_t)slot * c.pool_stride + c.head_off + d;
-        return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], ok};
+    HOST_DEV_FORCEINLINE int resolve_token(
+        const AttentionParams<bf16>& p, const KVContext& c, int kc, bool valid) {
+        return valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : -1;
+    }
+    HOST_DEV_FORCEINLINE KVAddr kv_addr_from_token(
+        const AttentionParams<bf16>& p, const KVContext& c, int slot, int d) {
+        const bool valid = slot >= 0;
+        const int safe_slot = valid ? slot : 0;
+        const int64_t gmem_off = (int64_t)safe_slot * c.pool_stride + c.head_off + d;
+        return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], valid};
     }
 };
 

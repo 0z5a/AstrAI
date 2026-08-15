@@ -90,7 +90,8 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
             int s = i / HEAD_DIM;
             int d_dim = i % HEAD_DIM;
             int kc = kv0 + s;
-            KVAddr a = KV::kv_addr(p, kctx, kc, d_dim, true);
+            int token = KV::resolve_token(p, kctx, kc, true);
+            KVAddr a = KV::kv_addr_from_token(p, kctx, token, d_dim);
             sK[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
             sV[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
         }

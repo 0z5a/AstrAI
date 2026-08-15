@@ -57,7 +57,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             int s = i / p.head_dim;
             int d_dim = i % p.head_dim;
             int kc = chunk_start + s;
-            KVAddr a = KV::kv_addr(p, kctx, kc, d_dim, true);
+            int token = KV::resolve_token(p, kctx, kc, true);
+            KVAddr a = KV::kv_addr_from_token(p, kctx, token, d_dim);
             k_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
             v_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
         }
