@@ -113,8 +113,8 @@ def attn_paged_decode(
         q: [batch, n_heads, head_dim] (bf16, 3D — no seq dim)
         k_cache: [pool_size, n_kv_heads, head_dim] (bf16, flat)
         v_cache: same as k_cache
-        req_to_token: [num_reqs, max_context_len] (int64) — token -> slot
-        req_pool_indices: [batch] (int64) — rows into req_to_token
+        req_to_token: [num_reqs, max_context_len] (int32) — token -> slot
+        req_pool_indices: [batch] (int32) — rows into req_to_token
         kv_indptr: [batch+1] (int32) — prefix sum of per-request seq_lens
         mask: 2D [batch, max_context_len] (bool, True=keep) or None
         is_causal: apply causal mask
@@ -163,8 +163,8 @@ def attn_paged_prefill(
         q: [total_q, n_heads, head_dim] (bf16, 3D — flattened across requests)
         k_cache: [pool_size, n_kv_heads, head_dim] (bf16, flat)
         v_cache: same as k_cache
-        req_to_token: [num_reqs, max_context_len] (int64)
-        req_pool_indices: [batch] (int64)
+        req_to_token: [num_reqs, max_context_len] (int32)
+        req_pool_indices: [batch] (int32)
         kv_indptr: [batch+1] (int32) — prefix sum of per-request kv_lens
         qo_indptr: [batch+1] (int32) — prefix sum of per-request q_lens
         mask: 4D [batch, 1, q_len, kv_len] (bool, True=keep) or None

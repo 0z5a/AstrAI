@@ -33,7 +33,7 @@ using bf16 = __nv_bfloat16;
 // Hoisted per-(batch, kv_head) addressing context.
 struct KVContext {
     int kv_base;          // contig: batch*kv_b_stride + kv_head*kv_h_stride
-    int64_t req_idx;      // paged: req_pool_indices[batch]
+    int req_idx;          // paged: req_pool_indices[batch]
     int64_t rtt_stride;   // paged: max_context_len
     int64_t pool_stride;  // paged: kv_head * HEAD_DIM
     int64_t head_off;     // paged: kv_head * HEAD_DIM
@@ -177,9 +177,9 @@ struct PagedKV {
     }
     HOST_DEV_FORCEINLINE KVAddr kv_addr(
         const AttentionParams<bf16>& p, const KVContext& c, int kc, int d, bool valid) {
-        const int64_t slot = valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : 0;
+        const int slot = valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : 0;
         const bool ok = valid && (slot >= 0);
-        const int64_t gmem_off = slot * c.pool_stride + c.head_off + d;
+        const int64_t gmem_off = (int64_t)slot * c.pool_stride + c.head_off + d;
         return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], ok};
     }
 };

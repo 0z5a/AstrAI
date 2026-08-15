@@ -74,7 +74,7 @@ class InferenceWorkspace:
         # when the Executor passes this workspace).  Stable addresses make the
         # decode forward CUDA-graph capturable.
         self.req_pool_indices = torch.empty(
-            (max_batch_size,), dtype=torch.long, device=device
+            (max_batch_size,), dtype=torch.int32, device=device
         )
         self.seq_lens = torch.empty((max_batch_size,), dtype=torch.long, device=device)
         self.kv_indptr = torch.empty(
@@ -85,7 +85,7 @@ class InferenceWorkspace:
         )
         self.inc = torch.arange(max_batch_size + 1, dtype=torch.int32, device=device)
         self.out_cache_loc = torch.empty(
-            (max_batch_size, 1), dtype=torch.long, device=device
+            (max_batch_size, 1), dtype=torch.int32, device=device
         )
 
         # Per-step position IDs (must be at a fixed address for CUDA-graph capture).

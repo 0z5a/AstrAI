@@ -8,8 +8,11 @@ import torch
 
 from astrai.extension import ATTN_BACKEND, attn_backend
 from astrai.inference.cache import PagePool, TaskCacheManager
+from astrai.inference.runtime.graph import CudaGraphContext
+from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.workspace import InferenceWorkspace
 from tests.extension.conftest import D, skip_no_kernel
+from tests.helpers import FakeTokenizer
 
 
 def _mk_task_cache(pool: PagePool) -> TaskCacheManager:
@@ -177,11 +180,68 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
 
 
 @skip_no_kernel
+def test_decode_cuda_graph_replay_is_exact(cuda_model):
+    """INT32 cache indices must remain graph-capturable and replay exactly."""
+    model, _ = cuda_model
+    device = "cuda"
+    prompt_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+    cache = PagePool(
+        n_layers=2,
+        n_kv_heads=1,
+        head_dim=D,
+        max_batch_size=1,
+        max_seq_len=64,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    task_cache = _mk_task_cache(cache)
+    ws = _ws(cache)
+    task_cache.task_alloc("t1", prompt_ids)
+
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    position_ids = torch.arange(len(prompt_ids), device=device).unsqueeze(0)
+    input_mask = torch.ones(1, len(prompt_ids), dtype=torch.bool, device=device)
+
+    with attn_backend(ATTN_BACKEND.CUDA), torch.inference_mode():
+        model(
+            input_ids,
+            input_mask=input_mask,
+            position_ids=position_ids,
+            kv_cache=task_cache.bind(["t1"], ws, start_pos=0),
+        )
+
+        task_cache.task_extend("t1", len(prompt_ids))
+        kv_cache = task_cache.bind(["t1"], ws)
+        assert kv_cache.req_to_token.dtype == torch.int32
+        assert kv_cache.req_pool_indices.dtype == torch.int32
+        assert kv_cache.out_cache_loc.dtype == torch.int32
+
+        decode_args = {
+            "input_ids": torch.tensor([[9]], dtype=torch.long, device=device),
+            "input_mask": torch.ones(1, 1, 64, dtype=torch.bool, device=device),
+            "position_ids": torch.tensor([[len(prompt_ids)]], device=device),
+            "kv_cache": kv_cache,
+        }
+        graph = CudaGraphContext(enabled=True)
+        graph.forward(model, key=(1,), **decode_args)
+        graph.forward(model, key=(1,), **decode_args)
+        first = graph.forward(model, key=(1,), **decode_args)["logits"].clone()
+        slot = kv_cache.out_cache_loc[0, 0]
+        first_k = kv_cache.k_buffer[:, slot].clone()
+        first_v = kv_cache.v_buffer[:, slot].clone()
+
+        second = graph.forward(model, key=(1,), **decode_args)["logits"].clone()
+        torch.cuda.synchronize()
+
+    assert graph.has_graph((1,))
+    torch.testing.assert_close(second, first, rtol=0, atol=0)
+    torch.testing.assert_close(kv_cache.k_buffer[:, slot], first_k, rtol=0, atol=0)
+    torch.testing.assert_close(kv_cache.v_buffer[:, slot], first_v, rtol=0, atol=0)
+
+
+@skip_no_kernel
 def test_run_batch_cuda_matches_torch_greedy(cuda_model):
     """Greedy decode (temperature=0) should produce identical tokens."""
-    from astrai.inference.scheduler import InferenceScheduler
-    from tests.helpers import FakeTokenizer
-
     model, _ = cuda_model
     tokenizer = FakeTokenizer()
 

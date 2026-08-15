@@ -18,7 +18,7 @@ struct PagedPrefillDispatch { AttentionParams<bf16>& p; template<int H> void ope
 // kv_indptr: [B+1].  mask: [B, max_seq_len] bool (True=keep) or NULL.
 static void cpu_paged_decode_ref(
     const float* Q, const float* K_pool, const float* V_pool,
-    const int64_t* req_to_token, const int64_t* req_pool_indices,
+    const int* req_to_token, const int* req_pool_indices,
     const int* kv_indptr, const bool* mask, int mask_b_stride,
     int B, int Hq, int Hkv, int D, int max_ctx_len,
     float* O)
@@ -27,7 +27,7 @@ static void cpu_paged_decode_ref(
     int n_rep = Hq / Hkv;
     for (int b = 0; b < B; b++) {
         int seq_len = kv_indptr[b + 1] - kv_indptr[b];
-        int64_t req_idx = req_pool_indices[b];
+        int req_idx = req_pool_indices[b];
         #pragma omp parallel for schedule(dynamic)
         for (int h = 0; h < Hq; h++) {
             int kv_h = h / n_rep;
@@ -35,7 +35,7 @@ static void cpu_paged_decode_ref(
             float accum[256] = {0.0f};
             for (int kj = 0; kj < seq_len; kj++) {
                 if (mask && !mask[b * mask_b_stride + kj]) continue;
-                int64_t slot = req_to_token[req_idx * max_ctx_len + kj];
+                int slot = req_to_token[req_idx * max_ctx_len + kj];
                 float dot = 0.0f;
                 for (int d = 0; d < D; d++)
                     dot += Q[(b * Hq + h) * D + d] *
@@ -66,7 +66,7 @@ static void cpu_paged_decode_ref(
 //   attention mask on top of the (unused) causal logic.
 static void cpu_paged_prefill_ref(
     const float* Q, const float* K_pool, const float* V_pool,
-    const int64_t* req_to_token, const int64_t* req_pool_indices,
+    const int* req_to_token, const int* req_pool_indices,
     const int* kv_indptr, const int* qo_indptr,
     const bool* mask, int mask_l_stride, int mask_kv_stride,
     int B, int Hq, int Hkv, int D, int max_ctx_len, int causal,
@@ -78,7 +78,7 @@ static void cpu_paged_prefill_ref(
         int seq_len = kv_indptr[b + 1] - kv_indptr[b];
         int q_len = qo_indptr[b + 1] - qo_indptr[b];
         int causal_off = seq_len - q_len;
-        int64_t req_idx = req_pool_indices[b];
+        int req_idx = req_pool_indices[b];
         #pragma omp parallel for collapse(2) schedule(dynamic)
         for (int h = 0; h < Hq; h++) {
             for (int qi = 0; qi < q_len; qi++) {
@@ -89,7 +89,7 @@ static void cpu_paged_prefill_ref(
                 for (int kj = 0; kj < lim; kj++) {
                     if (mask && !mask[b * mask_l_stride * mask_kv_stride
                                      + qi * mask_kv_stride + kj]) continue;
-                    int64_t slot = req_to_token[req_idx * max_ctx_len + kj];
+                    int slot = req_to_token[req_idx * max_ctx_len + kj];
                     float dot = 0.0f;
                     for (int d = 0; d < D; d++)
                         dot += Q[(qo_indptr[b] + qi) * Hq * D + h * D + d] *
@@ -149,14 +149,14 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
 
     size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int64_t);
-    size_t sz_rpi = (size_t)B * sizeof(int64_t);
+    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
+    size_t sz_rpi = (size_t)B * sizeof(int);
     size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
     size_t sz_op = (size_t)B * Hq * MAX_SPLITS * HEAD_DIM * sizeof(float);
     size_t sz_ml = (size_t)B * Hq * MAX_SPLITS * 2 * sizeof(float);
 
     bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int64_t *d_rtt, *d_rpi;
+    int *d_rtt, *d_rpi;
     int *d_kvi;
     float *d_op, *d_ml;
     cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
@@ -181,7 +181,7 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
     cudaMemcpy(d_v_pool, h_v_pool, sz_kv, cudaMemcpyHostToDevice);
 
     // req_to_token: assign unique slots per request (scattered, not contiguous)
-    int64_t* h_rtt = (int64_t*)malloc(sz_rtt);
+    int* h_rtt = (int*)malloc(sz_rtt);
     int next_slot = 0;
     for (int r = 0; r < num_reqs; r++)
         for (int p = 0; p < max_ctx; p++) {
@@ -191,7 +191,7 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
     cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
 
     // req_pool_indices: pick B random request rows
-    int64_t* h_rpi = (int64_t*)malloc(sz_rpi);
+    int* h_rpi = (int*)malloc(sz_rpi);
     for (int b = 0; b < B; b++) h_rpi[b] = b;
     cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
 
@@ -278,15 +278,15 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
 
     size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int64_t);
-    size_t sz_rpi = (size_t)B * sizeof(int64_t);
+    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
+    size_t sz_rpi = (size_t)B * sizeof(int);
     size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
     size_t sz_mask = (size_t)B * max_sl * sizeof(bool);
     size_t sz_op = (size_t)B * Hq * MAX_SPLITS * HEAD_DIM * sizeof(float);
     size_t sz_ml = (size_t)B * Hq * MAX_SPLITS * 2 * sizeof(float);
 
     bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int64_t *d_rtt, *d_rpi;
+    int *d_rtt, *d_rpi;
     int *d_kvi;
     bool *d_mask;
     float *d_op, *d_ml;
@@ -312,7 +312,7 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
     cudaMemcpy(d_k_pool, h_k_pool, sz_kv, cudaMemcpyHostToDevice);
     cudaMemcpy(d_v_pool, h_v_pool, sz_kv, cudaMemcpyHostToDevice);
 
-    int64_t* h_rtt = (int64_t*)malloc(sz_rtt);
+    int* h_rtt = (int*)malloc(sz_rtt);
     int next_slot = 0;
     for (int r = 0; r < num_reqs; r++)
         for (int p = 0; p < max_ctx; p++) {
@@ -321,7 +321,7 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
         }
     cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
 
-    int64_t* h_rpi = (int64_t*)malloc(sz_rpi);
+    int* h_rpi = (int*)malloc(sz_rpi);
     for (int b = 0; b < B; b++) h_rpi[b] = b;
     cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
 
@@ -417,13 +417,13 @@ static int run_prefill_test(int B, int Hq, int Hkv,
 
     size_t sz_q  = (size_t)total_q * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int64_t);
-    size_t sz_rpi = (size_t)B * sizeof(int64_t);
+    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
+    size_t sz_rpi = (size_t)B * sizeof(int);
     size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
     size_t sz_qoi = (size_t)(B + 1) * sizeof(int);
 
     bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int64_t *d_rtt, *d_rpi;
+    int *d_rtt, *d_rpi;
     int *d_kvi, *d_qoi;
     cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
     cudaMalloc(&d_k_pool, sz_kv); cudaMalloc(&d_v_pool, sz_kv);
@@ -446,7 +446,7 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     cudaMemcpy(d_k_pool, h_k_pool, sz_kv, cudaMemcpyHostToDevice);
     cudaMemcpy(d_v_pool, h_v_pool, sz_kv, cudaMemcpyHostToDevice);
 
-    int64_t* h_rtt = (int64_t*)malloc(sz_rtt);
+    int* h_rtt = (int*)malloc(sz_rtt);
     int next_slot = 0;
     for (int r = 0; r < num_reqs; r++)
         for (int p = 0; p < max_ctx; p++) {
@@ -455,7 +455,7 @@ static int run_prefill_test(int B, int Hq, int Hkv,
         }
     cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
 
-    int64_t* h_rpi = (int64_t*)malloc(sz_rpi);
+    int* h_rpi = (int*)malloc(sz_rpi);
     for (int b = 0; b < B; b++) h_rpi[b] = b;
     cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
 
@@ -546,14 +546,14 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
 
     size_t sz_q  = (size_t)total_q * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int64_t);
-    size_t sz_rpi = (size_t)B * sizeof(int64_t);
+    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
+    size_t sz_rpi = (size_t)B * sizeof(int);
     size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
     size_t sz_qoi = (size_t)(B + 1) * sizeof(int);
     size_t sz_mask = (size_t)B * q_len * q_len * sizeof(bool);
 
     bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int64_t *d_rtt, *d_rpi;
+    int *d_rtt, *d_rpi;
     int *d_kvi, *d_qoi;
     bool *d_mask;
     cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
@@ -577,7 +577,7 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     cudaMemcpy(d_k_pool, h_k_pool, sz_kv, cudaMemcpyHostToDevice);
     cudaMemcpy(d_v_pool, h_v_pool, sz_kv, cudaMemcpyHostToDevice);
 
-    int64_t* h_rtt = (int64_t*)malloc(sz_rtt);
+    int* h_rtt = (int*)malloc(sz_rtt);
     int next_slot = 0;
     for (int r = 0; r < num_reqs; r++)
         for (int p = 0; p < max_ctx; p++) {
@@ -586,7 +586,7 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
         }
     cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
 
-    int64_t* h_rpi = (int64_t*)malloc(sz_rpi);
+    int* h_rpi = (int*)malloc(sz_rpi);
     h_rpi[0] = 0;
     cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
 
@@ -673,14 +673,14 @@ static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
 
     size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int64_t);
-    size_t sz_rpi = (size_t)B * sizeof(int64_t);
+    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
+    size_t sz_rpi = (size_t)B * sizeof(int);
     size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
     size_t sz_op = (size_t)B * Hq * MAX_SPLITS * HEAD_DIM * sizeof(float);
     size_t sz_ml = (size_t)B * Hq * MAX_SPLITS * 2 * sizeof(float);
 
     bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int64_t *d_rtt, *d_rpi;
+    int *d_rtt, *d_rpi;
     int *d_kvi;
     float *d_op, *d_ml;
     cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
@@ -696,12 +696,12 @@ static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
     cudaMemcpy(d_k_pool, tmp, sz_kv, cudaMemcpyHostToDevice);
     cudaMemcpy(d_v_pool, tmp, sz_kv, cudaMemcpyHostToDevice);
 
-    int64_t* h_rtt = (int64_t*)malloc(sz_rtt);
+    int* h_rtt = (int*)malloc(sz_rtt);
     for (int r = 0; r < num_reqs; r++)
         for (int p = 0; p < max_ctx; p++)
             h_rtt[r * max_ctx + p] = (r * max_ctx + p) % pool_size;
     cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
-    int64_t* h_rpi = (int64_t*)malloc(sz_rpi);
+    int* h_rpi = (int*)malloc(sz_rpi);
     for (int b = 0; b < B; b++) h_rpi[b] = b;
     cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
     int* h_kvi = (int*)malloc(sz_kvi);
@@ -749,13 +749,13 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
 
     size_t sz_q  = (size_t)total_q * Hq * HEAD_DIM * sizeof(bf16);
     size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int64_t);
-    size_t sz_rpi = (size_t)B * sizeof(int64_t);
+    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
+    size_t sz_rpi = (size_t)B * sizeof(int);
     size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
     size_t sz_qoi = (size_t)(B + 1) * sizeof(int);
 
     bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int64_t *d_rtt, *d_rpi;
+    int *d_rtt, *d_rpi;
     int *d_kvi, *d_qoi;
     cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
     cudaMalloc(&d_k_pool, sz_kv); cudaMalloc(&d_v_pool, sz_kv);
@@ -769,12 +769,12 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     cudaMemcpy(d_k_pool, tmp, sz_kv, cudaMemcpyHostToDevice);
     cudaMemcpy(d_v_pool, tmp, sz_kv, cudaMemcpyHostToDevice);
 
-    int64_t* h_rtt = (int64_t*)malloc(sz_rtt);
+    int* h_rtt = (int*)malloc(sz_rtt);
     for (int r = 0; r < num_reqs; r++)
         for (int p = 0; p < max_ctx; p++)
             h_rtt[r * max_ctx + p] = (r * max_ctx + p) % pool_size;
     cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
-    int64_t* h_rpi = (int64_t*)malloc(sz_rpi);
+    int* h_rpi = (int*)malloc(sz_rpi);
     for (int b = 0; b < B; b++) h_rpi[b] = b;
     cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
     int* h_kvi = (int*)malloc(sz_kvi);

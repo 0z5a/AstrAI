@@ -160,8 +160,9 @@ inline void attn_pack_paged_decode_params(
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bf16");
     TORCH_CHECK(k_cache.dtype() == torch::kBFloat16, "k_cache must be bf16");
     TORCH_CHECK(v_cache.dtype() == torch::kBFloat16, "v_cache must be bf16");
-    TORCH_CHECK(req_to_token.dtype() == torch::kLong, "req_to_token must be int64");
-    TORCH_CHECK(req_pool_indices.dtype() == torch::kLong, "req_pool_indices must be int64");
+    TORCH_CHECK(req_to_token.dtype() == torch::kInt32, "req_to_token must be int32");
+    TORCH_CHECK(req_pool_indices.dtype() == torch::kInt32,
+                "req_pool_indices must be int32");
     TORCH_CHECK(kv_indptr.dtype() == torch::kInt32, "kv_indptr must be int32");
     TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "k_cache and v_cache must match");
     TORCH_CHECK(k_cache.dim() == 3, "k_cache must be 3D [size, kv_head, head_dim]");
@@ -184,8 +185,8 @@ inline void attn_pack_paged_decode_params(
     p.k_ptr = (const T*)k_cache.data_ptr();
     p.v_ptr = (const T*)v_cache.data_ptr();
     p.q_ptr = (const T*)q.data_ptr();
-    p.req_to_token = req_to_token.data_ptr<int64_t>();
-    p.req_pool_indices = req_pool_indices.data_ptr<int64_t>();
+    p.req_to_token = req_to_token.data_ptr<int>();
+    p.req_pool_indices = req_pool_indices.data_ptr<int>();
     p.kv_indptr = kv_indptr.data_ptr<int>();
     p.qo_indptr = nullptr;
     p.max_context_len = (int)req_to_token.size(1);
@@ -239,8 +240,9 @@ inline void attn_pack_paged_prefill_params(
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bf16");
     TORCH_CHECK(k_cache.dtype() == torch::kBFloat16, "k_cache must be bf16");
     TORCH_CHECK(v_cache.dtype() == torch::kBFloat16, "v_cache must be bf16");
-    TORCH_CHECK(req_to_token.dtype() == torch::kLong, "req_to_token must be int64");
-    TORCH_CHECK(req_pool_indices.dtype() == torch::kLong, "req_pool_indices must be int64");
+    TORCH_CHECK(req_to_token.dtype() == torch::kInt32, "req_to_token must be int32");
+    TORCH_CHECK(req_pool_indices.dtype() == torch::kInt32,
+                "req_pool_indices must be int32");
     TORCH_CHECK(kv_indptr.dtype() == torch::kInt32, "kv_indptr must be int32");
     TORCH_CHECK(qo_indptr.dtype() == torch::kInt32, "qo_indptr must be int32");
     TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "k_cache and v_cache must match");
@@ -267,8 +269,8 @@ inline void attn_pack_paged_prefill_params(
     p.k_ptr = (const T*)k_cache.data_ptr();
     p.v_ptr = (const T*)v_cache.data_ptr();
     p.q_ptr = (const T*)q.data_ptr();
-    p.req_to_token = req_to_token.data_ptr<int64_t>();
-    p.req_pool_indices = req_pool_indices.data_ptr<int64_t>();
+    p.req_to_token = req_to_token.data_ptr<int>();
+    p.req_pool_indices = req_pool_indices.data_ptr<int>();
     p.kv_indptr = kv_indptr.data_ptr<int>();
     p.qo_indptr = qo_indptr.data_ptr<int>();
     p.max_context_len = (int)req_to_token.size(1);

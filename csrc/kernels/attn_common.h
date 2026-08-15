@@ -55,8 +55,8 @@ struct AttentionParams {
     int mask_l_stride;
 
     // Paged K/V addressing
-    const int64_t* __restrict__ req_to_token;     // [num_reqs, max_context_len]
-    const int64_t* __restrict__ req_pool_indices; // [batch]
+    const int* __restrict__ req_to_token;         // [num_reqs, max_context_len]
+    const int* __restrict__ req_pool_indices;     // [batch]
     const int* __restrict__ kv_indptr;             // [batch + 1]
     const int* __restrict__ qo_indptr;             // [batch + 1] or nullptr for decode
     int max_context_len; // req_to_token stride (dim 1)

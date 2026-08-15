@@ -531,8 +531,8 @@ class CudaBackend(AttentionBackend):
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
         loc = kv_cache.out_cache_loc[:, 0]
-        kv_cache.k_buffer[layer_id].index_copy_(0, loc, k[:, 0])
-        kv_cache.v_buffer[layer_id].index_copy_(0, loc, v[:, 0])
+        kv_cache.k_buffer[layer_id, loc] = k[:, 0]
+        kv_cache.v_buffer[layer_id, loc] = v[:, 0]
 
         q_3d = q.squeeze(1)
 
@@ -566,12 +566,8 @@ class CudaBackend(AttentionBackend):
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
         loc = kv_cache.out_cache_loc.reshape(-1)
-        kv_cache.k_buffer[layer_id].index_copy_(
-            0, loc, k.reshape(-1, k.size(2), k.size(3))
-        )
-        kv_cache.v_buffer[layer_id].index_copy_(
-            0, loc, v.reshape(-1, v.size(2), v.size(3))
-        )
+        kv_cache.k_buffer[layer_id, loc] = k.reshape(-1, k.size(2), k.size(3))
+        kv_cache.v_buffer[layer_id, loc] = v.reshape(-1, v.size(2), v.size(3))
 
         b = q.size(0)
         q_len = q.size(1)

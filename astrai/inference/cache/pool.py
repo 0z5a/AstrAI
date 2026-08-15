@@ -115,6 +115,8 @@ class PagePool:
 
         self.contiguous = n_tokens is None
         self.n_tokens = max_batch_size * max_seq_len if self.contiguous else n_tokens
+        if self.n_tokens > torch.iinfo(torch.int32).max:
+            raise ValueError("KV cache token count exceeds the int32 slot index limit")
 
         self._storage = KVStorage(
             self.n_tokens, n_layers, n_kv_heads, head_dim, device, dtype
@@ -124,7 +126,10 @@ class PagePool:
         if self.contiguous:
             for i in range(max_batch_size):
                 self._req_pool.req_to_token[i] = torch.arange(
-                    i * max_seq_len, (i + 1) * max_seq_len, device=device
+                    i * max_seq_len,
+                    (i + 1) * max_seq_len,
+                    dtype=torch.int32,
+                    device=device,
                 )
             self._strategy: AllocationStrategy = ContiguousStrategy()
         else:
@@ -184,7 +189,7 @@ class PagePool:
             kvp_buf[: b + 1] += inc_buf[: b + 1]
         else:
             rpi_buf[:b].copy_(
-                torch.tensor(req_indices, dtype=torch.long, device=device)
+                torch.tensor(req_indices, dtype=torch.int32, device=device)
             )
             sl_buf[:b].copy_(torch.tensor(seq_lens, dtype=torch.long, device=device))
             kvp_buf[: b + 1].zero_()

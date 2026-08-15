@@ -176,6 +176,7 @@ def test_page_pool_task_cacheable_ids_excludes_unmaterialized_tail():
 
 def test_req_to_token_pool_alloc_free():
     pool = ReqToTokenPool(4, 128, torch.device("cpu"))
+    assert pool.req_to_token.dtype == torch.int32
     slots = pool.alloc(2)
     assert len(slots) == 2
     assert len(pool.free_slots) == 2
@@ -279,8 +280,10 @@ def test_page_pool_contiguous_bind_tasks_prefill():
     task_cache.task_alloc("t2", list(range(10)))
     kv = task_cache.bind(["t1", "t2"], _ws(pool), start_pos=0)
     assert kv.out_cache_loc.shape == (2, 10)
+    assert kv.out_cache_loc.dtype == torch.int32
     assert kv.seq_lens.tolist() == [10, 10]
     assert kv.req_pool_indices.shape == (2,)
+    assert kv.req_pool_indices.dtype == torch.int32
 
 
 def test_page_pool_contiguous_bind_tasks_decode():

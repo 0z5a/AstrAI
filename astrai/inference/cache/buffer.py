@@ -27,7 +27,7 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.req_to_token = torch.zeros(
-            (size, max_context_len), dtype=torch.long, device=device
+            (size, max_context_len), dtype=torch.int32, device=device
         )
         self.free_slots = list(range(size))
         self._lock = threading.Lock()
