@@ -99,22 +99,22 @@ __device__ __forceinline__ int swiz_col(int d, int r, int mask = 7) {
     return ((d >> 3) ^ (r & mask)) << 3 | (d & 7);
 }
 
-// cp.async: copy 16 bytes (8 bf16) from global to shared memory directly.
-__device__ __forceinline__ void cp_async_16(bf16* smem_ptr, const void* gmem_ptr) {
-    unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
-                 :: "r"(smem_addr), "l"(gmem_ptr));
-}
-
 // Predicated cp.async: copy 16 bytes when `pred`, otherwise zero-fill.
-// src_size=0 → no bytes read from src, so out-of-bounds src address is safe.
+// BypassL1 defaults to .cg (L2 only); false selects .ca (L1 + L2).
+// src_size=0 means no bytes are read, so an out-of-bounds address is safe.
+template <bool BypassL1 = true>
 __device__ __forceinline__ void cp_async_16_pred(bf16* smem_ptr,
                                                   const void* gmem_ptr,
                                                   bool pred) {
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
     int src_size = pred ? 16 : 0;
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
-                 :: "r"(smem_addr), "l"(gmem_ptr), "r"(src_size));
+    if constexpr (BypassL1) {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                     :: "r"(smem_addr), "l"(gmem_ptr), "r"(src_size));
+    } else {
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
+                     :: "r"(smem_addr), "l"(gmem_ptr), "r"(src_size));
+    }
 }
 
 __device__ __forceinline__ void cp_async_commit() {

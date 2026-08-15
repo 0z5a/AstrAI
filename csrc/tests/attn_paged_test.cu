@@ -667,8 +667,8 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
 // ======================================================================
 template <int HEAD_DIM>
 static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
-    int max_ctx = seq_len + 16;
-    int pool_size = B * max_ctx;
+    int max_ctx = max(16384, seq_len + 16);
+    int pool_size = B * (seq_len + 16);
     int num_reqs = B;
 
     size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
@@ -933,9 +933,9 @@ int main() {
     bench_decode<128>(1, 32, 4, 1024);
     bench_decode<128>(1, 32, 4, 2048);
     bench_decode<128>(1, 32, 4, 4096);
+    bench_decode<128>(1, 32, 4, 16384);
     bench_decode<128>(4, 32, 4, 2048);
     bench_decode<128>(16, 32, 4, 2048);
-    bench_decode<128>(32, 32, 4, 1024);
 
     printf("\n===== PAGED PREFILL BENCH =====\n");
     print_bench_header();
