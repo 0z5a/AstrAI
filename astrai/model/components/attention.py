@@ -5,8 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.extension import attention
-from astrai.extension.rotary_backend import apply_rotary_emb
+from astrai.extension.backend import apply_rotary_emb, attention
 from astrai.factory import BaseFactory
 from astrai.inference.cache import KVCache
 from astrai.model.components.linear import Linear

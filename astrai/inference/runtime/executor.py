@@ -7,7 +7,7 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 
-from astrai.extension.attention_backend import (
+from astrai.extension.backend.attention import (
     CudaBackend,
     get_backend,
 )

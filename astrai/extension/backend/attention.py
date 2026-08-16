@@ -32,7 +32,6 @@ Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 import contextvars
 import enum
 import functools
-import importlib
 import os
 import threading
 from abc import ABC, abstractmethod
@@ -43,12 +42,17 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.extension.attention_ops import (
+from astrai.extension.loader import is_available
+from astrai.extension.ops.attention import (
     attn_paged_decode,
     attn_paged_prefill,
 )
-from astrai.extension.loader import is_available
 from astrai.factory import BaseFactory
+
+try:
+    import flash_attn as _flash_attn
+except Exception:
+    _flash_attn = None
 
 if TYPE_CHECKING:
     from astrai.inference.cache import KVCache
@@ -67,7 +71,7 @@ _current_backend: contextvars.ContextVar[Optional["AttentionBackend"]] = (
 def flash_attn_available() -> bool:
     if not torch.cuda.is_available():
         return False
-    fa = _get_flash_attn()
+    fa = _flash_attn
     if fa is None:
         return False
 
@@ -88,14 +92,6 @@ def flash_attn_available() -> bool:
         return bool(torch.isfinite(out).all().item())
     except Exception:
         return False
-
-
-@functools.lru_cache(maxsize=1)
-def _get_flash_attn():
-    try:
-        return importlib.import_module("flash_attn")
-    except Exception:
-        return None
 
 
 class ATTN_BACKEND(enum.Enum):
@@ -145,7 +141,7 @@ def _backend_supports(
         if q.dtype not in (torch.float16, torch.bfloat16):
             return False
         if fwd is not None:
-            return q.ndim == 3 and hasattr(_get_flash_attn(), "flash_attn_varlen_func")
+            return q.ndim == 3 and hasattr(_flash_attn, "flash_attn_varlen_func")
         if attn_mask is None or is_causal:
             return True
         return attn_mask.dim() == 4
@@ -680,7 +676,7 @@ class FlashAttnBackend(AttentionBackend):
                 "FlashAttnBackend does not support a custom attention mask; "
                 "use a causal mask or select TorchNativeBackend."
             )
-        fa = _get_flash_attn()
+        fa = _flash_attn
         if fa is None:
             raise RuntimeError(
                 "FlashAttnBackend requires the optional 'flash-attn' package. "
@@ -702,7 +698,7 @@ class FlashAttnBackend(AttentionBackend):
         kv_cache: "KVCache",
         layer_id: int,
     ) -> Tensor:
-        fa = _get_flash_attn()
+        fa = _flash_attn
         if fa is None or not hasattr(fa, "flash_attn_varlen_func"):
             raise RuntimeError("packed inference requires flash_attn_varlen_func")
         kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k

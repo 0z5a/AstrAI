@@ -2,14 +2,13 @@
 
 import torch
 
+from astrai.extension.ops.attention import attn_prefill
 from tests.extension.conftest import D, skip_no_kernel
 
 
 @skip_no_kernel
 def test_kernel_accepts_2d_mask():
     """Kernel should accept 2D mask [batch, kv_len]."""
-    from astrai.extension.attention_ops import attn_prefill
-
     batch, q_len, n_heads, n_kv_heads = 1, 8, 4, 1
     kv_len = 8
     q = torch.randn(batch, q_len, n_heads, D, device="cuda", dtype=torch.bfloat16)
@@ -25,8 +24,6 @@ def test_kernel_accepts_2d_mask():
 @skip_no_kernel
 def test_kernel_accepts_3d_mask():
     """Kernel should accept 3D mask [batch, q_len, kv_len]."""
-    from astrai.extension.attention_ops import attn_prefill
-
     batch, q_len, n_heads, n_kv_heads = 1, 8, 4, 1
     kv_len = 8
     q = torch.randn(batch, q_len, n_heads, D, device="cuda", dtype=torch.bfloat16)
@@ -41,8 +38,6 @@ def test_kernel_accepts_3d_mask():
 @skip_no_kernel
 def test_kernel_accepts_4d_mask():
     """Kernel should accept 4D mask [batch, n_heads, q_len, kv_len]."""
-    from astrai.extension.attention_ops import attn_prefill
-
     batch, q_len, n_heads, n_kv_heads = 1, 8, 4, 1
     kv_len = 8
     q = torch.randn(batch, q_len, n_heads, D, device="cuda", dtype=torch.bfloat16)
@@ -58,8 +53,6 @@ def test_kernel_accepts_4d_mask():
 @skip_no_kernel
 def test_4d_mask_matches_no_mask_when_all_true():
     """A 4D all-True mask should produce the same output as no mask."""
-    from astrai.extension.attention_ops import attn_prefill
-
     batch, q_len, n_heads, n_kv_heads = 1, 8, 4, 1
     kv_len = 8
     q = torch.randn(batch, q_len, n_heads, D, device="cuda", dtype=torch.bfloat16)

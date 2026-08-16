@@ -1,8 +1,8 @@
 """FP8 training: scaling state and aten::linear dispatch.
 
-Layered (see also ``fp8_ops.py`` for the CUDA interface adapter):
+Layered (see also ``ops/fp8.py`` for the CUDA interface adapter):
 
-1. Kernel interface: "fp8_ops" — the only module touching the pybind.
+1. Kernel interface: ``ops.fp8`` - the only module touching the pybind.
 2. Training state (this module): per-tensor scales, amax history, delayed
    scaling, and the ``fp8_autocast`` context (TE-style, like
    ``torch.autocast``).
@@ -25,7 +25,7 @@ from contextlib import contextmanager
 import torch
 from torch.library import Library
 
-from astrai.extension.fp8_ops import (
+from astrai.extension.ops.fp8 import (
     linear_backward_scaled,
     linear_forward_scaled,
 )

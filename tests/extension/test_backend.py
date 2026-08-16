@@ -10,6 +10,8 @@ from astrai.extension import (
     ATTN_BACKEND,
     AttentionBackendFactory,
     CudaBackend,
+    FlashAttnBackend,
+    TorchNativeBackend,
     attn_backend,
     get_backend,
 )
@@ -17,13 +19,6 @@ from astrai.extension import (
 
 def test_default_backend_resolves_to_available():
     """Default backend is the first available in cuda > flash > torch order."""
-    from astrai.extension.attention_backend import (
-        CudaBackend,
-        FlashAttnBackend,
-        TorchNativeBackend,
-        _resolve_default_backend,
-    )
-
     backend = get_backend()
     assert isinstance(backend, (CudaBackend, FlashAttnBackend, TorchNativeBackend))
 

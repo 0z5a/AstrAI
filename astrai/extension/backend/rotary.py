@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from astrai.extension.loader import is_available
+from astrai.extension.ops.rotary import rotary_emb as _cuda_rotary
 
 _cache = {"available": None}
 
@@ -48,7 +49,5 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
         and x.is_cuda
         and x.dtype == torch.bfloat16
     ):
-        from astrai.extension.rotary_ops import rotary_emb as _cuda_rotary
-
         return _cuda_rotary(x, freqs_cis)
     return _torch_apply(x, freqs_cis)

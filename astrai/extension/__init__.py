@@ -15,25 +15,25 @@ Each wrapper calls its compiled CUDA kernel directly. Fallback to torch
 SDPA is handled by the attention backend, not the wrapper functions.
 """
 
-from astrai.extension.attention_backend import (
+from astrai.extension.backend import (
     ATTN_BACKEND,
     AttentionBackend,
     AttentionBackendFactory,
     CudaBackend,
     FlashAttnBackend,
     TorchNativeBackend,
+    apply_rotary_emb,
     attention,
     attn_backend,
     get_backend,
 )
-from astrai.extension.attention_ops import (
+from astrai.extension.loader import KERNEL_NAMES, is_available
+from astrai.extension.ops import (
     TensorLayout,
     attn_decode,
     attn_paged_decode,
     attn_prefill,
 )
-from astrai.extension.loader import KERNEL_NAMES, is_available
-from astrai.extension.rotary_backend import apply_rotary_emb
 
 __all__ = [
     "ATTN_BACKEND",

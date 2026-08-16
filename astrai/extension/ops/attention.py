@@ -1,4 +1,4 @@
-"""Attention kernel wrapper functions — one entry point per compiled kernel.
+"""Attention kernel wrapper functions - one entry point per compiled kernel.
 
 Each wrapper calls its CUDA kernel directly. If the kernel is not
 available, raises ``RuntimeError``. Fallback to torch SDPA is the

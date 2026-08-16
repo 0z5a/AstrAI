@@ -1,4 +1,4 @@
-from astrai.extension.rotary_backend import apply_rotary_emb
+from astrai.extension.backend.rotary import apply_rotary_emb
 from astrai.model.components.attention import GQA, MLA
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding

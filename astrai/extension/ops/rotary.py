@@ -2,7 +2,7 @@
 
 Calls the compiled CUDA kernel directly. If the kernel is not available,
 raises ``RuntimeError``. Fallback to torch complex multiply is the
-responsibility of ``astrai.extension.rotary_backend.apply_rotary_emb``.
+responsibility of ``astrai.extension.backend.rotary.apply_rotary_emb``.
 
 Layout: x is packed [tokens, n_heads, head_dim] or dense
 [batch, seq_len, n_heads, head_dim]. ``freqs_cis`` has matching token axes.
