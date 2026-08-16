@@ -176,12 +176,19 @@ Three-layer separation (SGLang-inspired):
 
 ### Attention Backend
 
+The extension package separates mechanism from policy:
+
+- `astrai/extension/ops/` contains stateless wrappers that invoke one exact compiled kernel and fail when it is unavailable.
+- `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O.
+- Model and inference code use the stable `astrai.extension` API instead of selecting ops directly.
+
 Attention computation is decoupled from the model via `AttentionBackend` ABC (`astrai/extension/backend/attention.py`):
 
-- **`CudaBackend`** (default): decode path uses `attn_paged_decode` with `page_size=1` (the `req_to_token` table serves as the page table, each token slot is a single-token "page"); prefill path uses the ragged-batch `attn_paged_prefill` (addresses each request via `qo_indptr` + `kv_indptr` directly against the flat pool). Falls back to `FlashAttnBackend` when dtype unsupported.
+- **`CudaBackend`** (default when supported): decode path uses `attn_paged_decode` with `page_size=1` (the `req_to_token` table serves as the page table, each token slot is a single-token "page"); prefill path uses the ragged-batch `attn_paged_prefill` (addresses each request via `qo_indptr` + `kv_indptr` directly against the flat pool).
 - **`FlashAttnBackend`**: optional flash-attn dispatch with `flash_attn_with_kvcache` fast path for contiguous cache; falls back to KV gather + `flash_attn_func`.
 - **`TorchNativeBackend`** (always-available fallback): writes K/V to cache, gathers via `req_to_token` indirect indexing, calls `F.scaled_dot_product_attention`.
-- Default priority: cuda > flash > torch. Set `ASTR_BACKEND=cuda|torch_native|flash` to override.
+- The `attention(...)` entry point uses cuda > flash > torch priority and chooses another compatible backend when an automatically selected backend cannot handle a call.
+- `ASTR_BACKEND=cuda|torch_native|flash` and `attn_backend(...)` are explicit selections; incompatible calls raise instead of silently changing backend.
 
 Rotary embedding is applied via `apply_rotary_emb` in `astrai/extension/backend/rotary.py`, which auto-dispatches to the fused CUDA kernel (`rotary_emb.cu`) during inference or torch complex multiply during training (for autograd compatibility). Both attention backends share the same rotary dispatch.
 
@@ -195,6 +202,8 @@ with attn_backend(ATTN_BACKEND.CUDA):
 ```
 
 Layout convention: all q/k/v are `[batch, seq_len, n_heads, head_dim]` (blhd). Scale is always `1/sqrt(head_dim)`.
+
+Direct imports from `astrai.extension.ops` are reserved for low-level kernel tests and code that intentionally requires a specific compiled implementation. They do not provide fallback.
 
 ## Mask Algorithm Internals
 
@@ -253,4 +262,4 @@ total_steps          = (batches_per_replica // grad_accum_steps) * n_epoch
 
 This accounts for data-parallel sharding — each rank processes `1/nprocs` of the dataset.
 
-> Document Update Time: 2026-08-02
+> Document Update Time: 2026-08-16

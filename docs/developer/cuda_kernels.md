@@ -81,6 +81,113 @@ NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
 
 Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all five kernel targets in parallel via `cmake --build -j N`.
 
+## Python Extension Architecture
+
+The Python extension package separates low-level kernel bindings from execution
+policy:
+
+```text
+astrai/extension/
+├── __init__.py             # Stable public API
+├── loader.py               # Optional compiled-module discovery and loading
+├── ops/
+│   ├── attention.py        # Stateless attention kernel wrappers
+│   └── rotary.py           # Stateless rotary kernel wrapper
+└── backend/
+    ├── attention.py        # Backend selection, KV cache I/O, and fallback
+    └── rotary.py           # Per-call CUDA/torch rotary dispatch
+```
+
+The dependency direction is one-way:
+
+```text
+model / inference
+       |
+       v
+extension public API
+       |
+       v
+backend policy  --->  ops wrappers  --->  loader  --->  compiled .so
+       |
+       +----------->  torch / flash-attn fallback
+```
+
+`ops` must not import `backend`. This keeps direct kernel bindings independent
+of model, cache, fallback, and backend-selection policy.
+
+### Ops Layer
+
+`astrai.extension.ops` is the low-level boundary around compiled extensions:
+
+- Wrappers are stateless and map Python arguments to pybind or
+  `torch.library.custom_op` calls.
+- Wrappers validate kernel availability and raise `RuntimeError` when a
+  requested extension was not built.
+- Wrappers do not choose another implementation, gather KV cache entries, or
+  decide whether an input is supported by a backend.
+- Tests that specifically exercise a compiled kernel may import from
+  `astrai.extension.ops`.
+
+For example, `attn_prefill(...)` means "run this CUDA kernel" rather than "run
+attention using the best available implementation":
+
+```python
+from astrai.extension.ops import attn_prefill
+
+output = attn_prefill(q, k, v, mask=mask, is_causal=True)
+```
+
+If the kernel is unavailable, this call fails. Callers that need fallback and
+capability dispatch must use the public `attention(...)` entry point instead.
+
+### Backend Layer
+
+`astrai.extension.backend` owns execution policy:
+
+- It selects CUDA, FlashAttention, or torch-native attention.
+- It checks per-call constraints such as dtype, shape, head dimension, cache
+  availability, and installed optional dependencies.
+- It owns KV cache writes and reads because those operations differ by backend.
+- It provides torch fallbacks and raises when an explicitly requested backend
+  cannot handle a call.
+- Rotary dispatch follows the same boundary without a backend class: the
+  policy layer chooses the fused op for supported inference calls and otherwise
+  uses the autograd-compatible torch implementation.
+
+Normal model and inference code should import the stable API from
+`astrai.extension`:
+
+```python
+from astrai.extension import ATTN_BACKEND, attention, attn_backend
+
+output = attention(q, k, v, kv_cache=cache, layer_id=layer_id, fwd="decode")
+
+with attn_backend(ATTN_BACKEND.TORCH_NATIVE):
+    output = attention(q, k, v)
+```
+
+The package root re-exports the supported high-level API and selected direct
+kernel wrappers. Internal code should use `astrai.extension.backend` only when
+it needs a backend type or policy implementation, and `astrai.extension.ops`
+only when it deliberately requires one exact kernel.
+
+### Placement Rules
+
+When extending this package:
+
+| Change | Location |
+|--------|----------|
+| Add a pybind call for a compiled kernel | `astrai/extension/ops/` |
+| Add argument translation required by the compiled ABI | `astrai/extension/ops/` |
+| Add capability checks or implementation selection | `astrai/extension/backend/` |
+| Add a torch or third-party fallback | `astrai/extension/backend/` |
+| Add attention KV cache behavior | `astrai/extension/backend/attention.py` |
+| Expose a supported user-facing symbol | `astrai/extension/__init__.py` |
+
+Imports belong at module scope. Optional dependencies such as `flash_attn` may
+use a module-level guarded import. Type-only imports that would create a runtime
+cycle belong under `TYPE_CHECKING`.
+
 ## Attention Backend
 
 `astrai/extension/backend/attention.py` provides the backend abstraction:
@@ -102,7 +209,11 @@ with attn_backend(ATTN_BACKEND.CUDA):
     engine.generate("hello")
 ```
 
-`CudaBackend` falls back to `FlashAttnBackend` (when flash-attn is installed and supports the input dtype) or `TorchNativeBackend` otherwise.
+The `attention(...)` policy entry point falls back to `FlashAttnBackend` (when
+flash-attn is installed and supports the call) or `TorchNativeBackend` when the
+automatically selected CUDA backend cannot handle an input. An explicit
+`ASTR_BACKEND` or `attn_backend(...)` selection is strict and raises instead of
+silently switching implementations.
 
 ### Rotary Backend
 
@@ -187,4 +298,4 @@ csrc/
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-> Document Update Time: 2026-07-31
+> Document Update Time: 2026-08-16

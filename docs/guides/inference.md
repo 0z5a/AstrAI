@@ -61,6 +61,14 @@ Attention layers do raw buffer indexing: `k_buffer[layer_id, out_cache_loc] = k`
 
 ## Attention Backend
 
+Inference code calls the policy API exported by `astrai.extension`. The
+extension implementation is split into two layers:
+
+- `astrai.extension.backend` owns capability checks, backend selection,
+  fallback, and KV cache I/O.
+- `astrai.extension.ops` contains direct wrappers around compiled CUDA kernels;
+  these wrappers raise if a kernel is unavailable and do not fall back.
+
 Attention computation (cache I/O + SDPA/kernel dispatch) is decoupled from the model via `AttentionBackend` ABC:
 
 ```
@@ -70,8 +78,9 @@ AttentionBackend (ABC)
   └── TorchNativeBackend   SDPA + indirect KV cache gather (always-available fallback)
 ```
 
-Default priority: cuda > flash > torch.  Set ``ASTR_BACKEND=cuda|torch_native|flash``
-to override.
+Default priority is cuda > flash > torch. Automatic selection may choose a
+compatible fallback for a particular call. Set
+`ASTR_BACKEND=cuda|torch_native|flash` to require one backend process-wide.
 
 Select via context manager (mirrors `torch.nn.attention.sdpa_kernel`):
 
@@ -82,11 +91,19 @@ with attn_backend(ATTN_BACKEND.CUDA):
     engine.generate("hello")
 ```
 
+Environment and context selections are strict: if the selected backend cannot
+handle the call, inference raises an error rather than silently switching.
+
 `CudaBackend` decode path: writes K/V to cache, then calls `attn_paged_decode` with `page_size=1` — the `req_to_token` table serves directly as the page table, each token slot is a single-token "page". No explicit K/V gather needed.
 
 `CudaBackend` prefill path: writes K/V, then calls `attn_paged_prefill` — a ragged-batch (paged) prefill kernel that reads K/V directly from the flat pool via `req_to_token`, addressing each request's `q_len`/`kv_len` through `qo_indptr` and `kv_indptr`. No explicit K/V gather needed.
 
 Fallback: when `CudaBackend` cannot handle an input (wrong dtype or head_dim), `FlashAttnBackend` is tried next (if installed), then `TorchNativeBackend`.
+
+This fallback is performed by the public `attention(...)` policy entry point
+only when no backend was explicitly selected. Import from
+`astrai.extension.ops` only for direct kernel tests or when failure on a missing
+kernel is the intended behavior.
 
 ### Rotary Embedding Backend
 
@@ -329,4 +346,4 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
     print(token)
 ```
 
-> Document Update Time: 2026-07-31
+> Document Update Time: 2026-08-16
