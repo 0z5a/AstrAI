@@ -3,13 +3,10 @@
 #include "attn_common.h"
 
 // ============================================================================
-// KVSource policies — the single dimension along which the paged and
-// non-paged attention kernels differ.  Each kernel is templated on one of
-// these (ContigKV / PagedKV) and stays fully generic: the policy owns every
-// place where "where does K/V live" and "what is this request's seq_len"
-// are answered.  All methods are __host__ __device__ so the same policy
-// serves both the device kernels (addressing, seq_len) and the host-side
-// launchers (grid / split computation).
+// Attention layout policies keep Q scheduling independent from K/V storage.
+// DenseQSchedule / PackedQSchedule map blocks to Q tiles; ContigKV / PagedKV
+// resolve logical K/V positions to physical addresses. This lets the shared
+// kernels compose Q layout and K/V storage without coupling the two concerns.
 //
 //   ContigKV:  K/V are dense [batch, kv_head, kv_len, head_dim] tensors.
 //              Params fields used: k, v, kv_stride_*, kv_len, q_len,
@@ -25,10 +22,75 @@
 // (e.g. the req_pool_indices global read) element-by-element.
 // ============================================================================
 
-// Every policy method is static + callable from both host and device code.
+#define HOST_FORCEINLINE static __host__ __forceinline__
+#define DEVICE_FORCEINLINE static __device__ __forceinline__
 #define HOST_DEV_FORCEINLINE static __host__ __device__ __forceinline__
 
 using bf16 = __nv_bfloat16;
+
+// ============================================================================
+// Q scheduling policies
+//
+// Map CUDA blocks to request-local Q tiles independently of K/V storage.
+// Dense tensors encode the request in blockIdx.z; packed ragged tensors use
+// a compact precomputed work map indexed by blockIdx.x.
+// ============================================================================
+
+struct DenseQSchedule {
+    HOST_FORCEINLINE int host_q_blocks(
+        const AttentionParams<bf16>& p, int rows) {
+        return (p.q_len + rows - 1) / rows;
+    }
+
+    HOST_FORCEINLINE int host_grid_batch(
+        const AttentionParams<bf16>& p) {
+        return p.batch;
+    }
+
+    DEVICE_FORCEINLINE void map_block(
+        const AttentionParams<bf16>&, int& batch, int& q_tile) {
+        batch = blockIdx.z;
+        q_tile = blockIdx.x;
+    }
+
+    DEVICE_FORCEINLINE int q_len(
+        const AttentionParams<bf16>& p, int) {
+        return p.q_len;
+    }
+
+    DEVICE_FORCEINLINE int q_base(
+        const AttentionParams<bf16>& p, int batch, int q_head) {
+        return batch * p.q_b_stride + q_head * p.q_h_stride;
+    }
+};
+
+struct PackedQSchedule {
+    HOST_FORCEINLINE int host_q_blocks(
+        const AttentionParams<bf16>& p, int) {
+        return p.num_q_tiles;
+    }
+
+    HOST_FORCEINLINE int host_grid_batch(
+        const AttentionParams<bf16>&) {
+        return 1;
+    }
+
+    DEVICE_FORCEINLINE void map_block(
+        const AttentionParams<bf16>& p, int& batch, int& q_tile) {
+        batch = p.q_tile_to_batch[blockIdx.x];
+        q_tile = p.q_tile_to_index[blockIdx.x];
+    }
+
+    DEVICE_FORCEINLINE int q_len(
+        const AttentionParams<bf16>& p, int batch) {
+        return p.qo_indptr[batch + 1] - p.qo_indptr[batch];
+    }
+
+    DEVICE_FORCEINLINE int q_base(
+        const AttentionParams<bf16>& p, int batch, int q_head) {
+        return p.qo_indptr[batch] * p.q_l_stride + q_head * p.q_h_stride;
+    }
+};
 
 // Hoisted per-(batch, kv_head) addressing context.
 struct KVContext {
@@ -56,59 +118,40 @@ struct KVAddr {
 struct ContigKV {
     static constexpr bool kPaged = false;
 
-    // host-side length hooks (grid + split computation in the launchers)
-    HOST_DEV_FORCEINLINE int host_q_blocks(const AttentionParams<bf16>& p, int rows) {
-        return (p.q_len + rows - 1) / rows;
-    }
-    template <int ROWS>
-    HOST_DEV_FORCEINLINE bool map_q_tile(const AttentionParams<bf16>&,
-                                         int flat_tile, int grid_batch,
-                                         int& batch, int& q_tile) {
-        batch = grid_batch;
-        q_tile = flat_tile;
-        return true;
-    }
-    HOST_DEV_FORCEINLINE int host_kv_len(const AttentionParams<bf16>& p) {
+    HOST_FORCEINLINE int host_kv_len(const AttentionParams<bf16>& p) {
         return p.kv_len;
     }
 
-    // prefill: element offset of the request's Q rows (kernel adds qrow*q_l_stride)
-    HOST_DEV_FORCEINLINE int q_base(
-        const AttentionParams<bf16>& p, int batch, int q_head) {
-        return batch * p.q_b_stride + q_head * p.q_h_stride;
-    }
     // decode: same offset (q_len == 1, so there is no row stride component)
-    HOST_DEV_FORCEINLINE int q_decode_base(
+    DEVICE_FORCEINLINE int q_decode_base(
         const AttentionParams<bf16>& p, int batch, int q_head) {
         return batch * p.q_b_stride + q_head * p.q_h_stride;
     }
 
-    HOST_DEV_FORCEINLINE int kv_len(const AttentionParams<bf16>& p, int batch) {
+    DEVICE_FORCEINLINE int kv_len(const AttentionParams<bf16>& p, int) {
         return p.kv_len;
     }
-    HOST_DEV_FORCEINLINE int q_len(const AttentionParams<bf16>& p, int batch) {
-        return p.q_len;
-    }
-    HOST_DEV_FORCEINLINE int causal_offset(const AttentionParams<bf16>& p, int batch) {
+    DEVICE_FORCEINLINE int causal_offset(
+        const AttentionParams<bf16>& p, int, int) {
         return p.causal_offset;
     }
     // decode: exclusive bound of the single query's attend range
-    HOST_DEV_FORCEINLINE int decode_attend_len(const AttentionParams<bf16>& p, int batch) {
+    DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams<bf16>& p, int) {
         return (p.kv_len < p.causal_offset + 1) ? p.kv_len : (p.causal_offset + 1);
     }
 
     template <int HEAD_DIM>
-    HOST_DEV_FORCEINLINE KVContext make_ctx(
+    DEVICE_FORCEINLINE KVContext make_ctx(
         const AttentionParams<bf16>& p, int batch, int kv_head) {
         KVContext c = {};
         c.kv_base = batch * p.kv_b_stride + kv_head * p.kv_h_stride;
         return c;
     }
-    HOST_DEV_FORCEINLINE int resolve_token(
+    DEVICE_FORCEINLINE int resolve_token(
         const AttentionParams<bf16>& p, const KVContext& c, int kc, bool valid) {
         return valid ? kc : -1;
     }
-    HOST_DEV_FORCEINLINE KVAddr kv_addr_from_token(
+    DEVICE_FORCEINLINE KVAddr kv_addr_from_token(
         const AttentionParams<bf16>& p, const KVContext& c, int token, int d) {
         const bool valid = token >= 0;
         const int safe_token = valid ? token : 0;
@@ -123,58 +166,30 @@ struct ContigKV {
 struct PagedKV {
     static constexpr bool kPaged = true;
 
-    HOST_DEV_FORCEINLINE int host_q_blocks(const AttentionParams<bf16>& p, int rows) {
-        // sum(ceil(q_len[b] / rows)) <= ceil(total_q / rows) + batch - 1.
-        return (p.q_len + rows - 1) / rows + p.batch - 1;
-    }
-    template <int ROWS>
-    HOST_DEV_FORCEINLINE bool map_q_tile(const AttentionParams<bf16>& p,
-                                         int flat_tile, int,
-                                         int& batch, int& q_tile) {
-        int tile_base = 0;
-        for (int b = 0; b < p.batch; ++b) {
-            int len = p.qo_indptr[b + 1] - p.qo_indptr[b];
-            int tiles = (len + ROWS - 1) / ROWS;
-            if (flat_tile < tile_base + tiles) {
-                batch = b;
-                q_tile = flat_tile - tile_base;
-                return true;
-            }
-            tile_base += tiles;
-        }
-        return false;
-    }
-    HOST_DEV_FORCEINLINE int host_kv_len(const AttentionParams<bf16>& p) {
+    HOST_FORCEINLINE int host_kv_len(const AttentionParams<bf16>& p) {
         return p.max_context_len;
     }
 
-    // prefill: Q rows start at qo_indptr[batch] (ragged batch base)
-    HOST_DEV_FORCEINLINE int q_base(
-        const AttentionParams<bf16>& p, int batch, int q_head) {
-        return p.qo_indptr[batch] * p.q_l_stride + q_head * p.q_h_stride;
-    }
     // decode: Q is [batch, q_head, head_dim], so batch is the outer row
-    HOST_DEV_FORCEINLINE int q_decode_base(
+    DEVICE_FORCEINLINE int q_decode_base(
         const AttentionParams<bf16>& p, int batch, int q_head) {
         return batch * p.q_l_stride + q_head * p.q_h_stride;
     }
 
-    HOST_DEV_FORCEINLINE int kv_len(const AttentionParams<bf16>& p, int batch) {
+    DEVICE_FORCEINLINE int kv_len(const AttentionParams<bf16>& p, int batch) {
         return p.kv_indptr[batch + 1] - p.kv_indptr[batch];
     }
-    HOST_DEV_FORCEINLINE int q_len(const AttentionParams<bf16>& p, int batch) {
-        return p.qo_indptr[batch + 1] - p.qo_indptr[batch];
-    }
-    HOST_DEV_FORCEINLINE int causal_offset(const AttentionParams<bf16>& p, int batch) {
-        return kv_len(p, batch) - q_len(p, batch);
+    DEVICE_FORCEINLINE int causal_offset(
+        const AttentionParams<bf16>& p, int batch, int q_len) {
+        return kv_len(p, batch) - q_len;
     }
     // decode: the query is the last token, so [0, seq_len) IS its causal range
-    HOST_DEV_FORCEINLINE int decode_attend_len(const AttentionParams<bf16>& p, int batch) {
+    DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams<bf16>& p, int batch) {
         return kv_len(p, batch);
     }
 
     template <int HEAD_DIM>
-    HOST_DEV_FORCEINLINE KVContext make_ctx(
+    DEVICE_FORCEINLINE KVContext make_ctx(
         const AttentionParams<bf16>& p, int batch, int kv_head) {
         KVContext c = {};
         c.req_idx = p.req_pool_indices[batch];
@@ -183,11 +198,11 @@ struct PagedKV {
         c.head_off = (int64_t)kv_head * HEAD_DIM;
         return c;
     }
-    HOST_DEV_FORCEINLINE int resolve_token(
+    DEVICE_FORCEINLINE int resolve_token(
         const AttentionParams<bf16>& p, const KVContext& c, int kc, bool valid) {
         return valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : -1;
     }
-    HOST_DEV_FORCEINLINE KVAddr kv_addr_from_token(
+    DEVICE_FORCEINLINE KVAddr kv_addr_from_token(
         const AttentionParams<bf16>& p, const KVContext& c, int slot, int d) {
         const bool valid = slot >= 0;
         const int safe_slot = valid ? slot : 0;
@@ -195,30 +210,3 @@ struct PagedKV {
         return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], valid};
     }
 };
-
-// ---- Q-block mapping ----
-// Contiguous grids map directly to (batch, q_tile). Paged grids flatten the
-// ragged Q tiles, so one thread resolves the request and broadcasts it.
-template <int ROWS, typename KV>
-__device__ __forceinline__ bool map_q_block(
-    const AttentionParams<bf16>& p, int& batch, int& q_tile) {
-    if constexpr (!KV::kPaged) {
-        batch = blockIdx.z;
-        q_tile = blockIdx.x;
-        return true;
-    } else {
-        __shared__ int mapped_batch;
-        __shared__ int mapped_q_tile;
-
-        if ((threadIdx.x | threadIdx.y) == 0) {
-            mapped_batch = -1;
-            KV::template map_q_tile<ROWS>(
-                p, blockIdx.x, blockIdx.z, mapped_batch, mapped_q_tile);
-        }
-        __syncthreads();
-
-        batch = mapped_batch;
-        q_tile = mapped_q_tile;
-        return batch >= 0;
-    }
-}

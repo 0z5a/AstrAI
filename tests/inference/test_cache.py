@@ -286,6 +286,16 @@ def test_page_pool_contiguous_bind_tasks_prefill():
     assert kv.req_pool_indices.dtype == torch.int32
 
 
+def test_page_pool_bind_tasks_builds_compact_q_tile_mapping():
+    pool = _make_contiguous_pool(max_batch_size=3, max_seq_len=256)
+
+    kv = pool.bind_tasks([0, 1, 2], [70, 10, 130], _ws(pool), start_pos=0)
+
+    assert kv.qo_indptr.tolist() == [0, 70, 80, 210]
+    assert kv.q_tile_to_batch.tolist() == [0, 0, 1, 2, 2, 2]
+    assert kv.q_tile_to_index.tolist() == [0, 1, 0, 0, 1, 2]
+
+
 def test_page_pool_contiguous_bind_tasks_decode():
     pool = _make_contiguous_pool()
     task_cache = _make_task_cache(pool)

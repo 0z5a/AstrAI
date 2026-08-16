@@ -9,6 +9,8 @@ torch::Tensor attn_paged_prefill(
     torch::Tensor req_pool_indices,
     torch::Tensor kv_indptr,
     torch::Tensor qo_indptr,
+    torch::Tensor q_tile_to_batch,
+    torch::Tensor q_tile_to_index,
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale
@@ -18,8 +20,9 @@ torch::Tensor attn_paged_prefill(
 
     AttentionParams<bf16> p;
     attn_pack_paged_prefill_params(q, k_cache, v_cache,
-                                    req_to_token, req_pool_indices,
-                                    kv_indptr, qo_indptr, mask,
+                                     req_to_token, req_pool_indices,
+                                     kv_indptr, qo_indptr,
+                                     q_tile_to_batch, q_tile_to_index, mask,
                                     causal_offset, scale, p);
 
     auto O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
@@ -39,6 +42,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("req_pool_indices"),
         py::arg("kv_indptr"),
         py::arg("qo_indptr"),
+        py::arg("q_tile_to_batch"),
+        py::arg("q_tile_to_index"),
         py::arg("mask") = py::none(),
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,

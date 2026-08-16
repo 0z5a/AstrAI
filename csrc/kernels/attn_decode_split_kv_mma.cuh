@@ -2,7 +2,7 @@
 #include <cfloat>
 #include <cuda_bf16.h>
 #include "attn_common.h"
-#include "attn_kv_source.cuh"
+#include "attn_layout_policies.cuh"
 #include "attn_mma_utils.cuh"
 #include "attn_warp_utils.cuh"
 

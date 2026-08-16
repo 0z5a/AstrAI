@@ -2,7 +2,7 @@
 #include <cfloat>
 #include <cuda_bf16.h>
 #include "attn_common.h"
-#include "attn_kv_source.cuh"
+#include "attn_layout_policies.cuh"
 
 using bf16 = __nv_bfloat16;
 
@@ -32,13 +32,13 @@ __device__ __forceinline__ void ld8(const bf16* p, float* o) {
     }
 }
 
-template <int HEAD_DIM, typename KV, int G, int ROWS, int P_BC, bool IsCausal, bool HasMask>
+template <int HEAD_DIM, typename QSchedule, typename KV, int G, int ROWS, int P_BC,
+          bool IsCausal, bool HasMask>
 __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     constexpr int DPT = HEAD_DIM / G;
 
     int batch, q_tile;
-    if (!map_q_block<ROWS, KV>(p, batch, q_tile))
-        return;
+    QSchedule::map_block(p, batch, q_tile);
 
     int q_head = blockIdx.y;
     int gpos   = threadIdx.x;  // 0..G-1  (which d-chunk)
@@ -47,8 +47,8 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
 
     // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
     const int seq_len    = KV::kv_len(p, batch);
-    const int q_len      = KV::q_len(p, batch);
-    const int causal_off = KV::causal_offset(p, batch);
+    const int q_len      = QSchedule::q_len(p, batch);
+    const int causal_off = KV::causal_offset(p, batch, q_len);
     const int kv_head = q_head / (p.q_head / p.kv_head);
     const KVContext kctx = KV::template make_ctx<HEAD_DIM>(p, batch, kv_head);
 
@@ -56,7 +56,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     __shared__ __align__(16) bf16 sV[P_BC * HEAD_DIM];
 
     // Q: stride-based load [batch, q_head, q_len, head_dim]
-    const int q_base = KV::q_base(p, batch, q_head);
+    const int q_base = QSchedule::q_base(p, batch, q_head);
     float qreg[DPT];
     if (q_row < q_len) {
         int q_off = q_base + q_row * p.q_l_stride + gpos * DPT * p.q_d_stride;

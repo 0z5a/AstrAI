@@ -2,7 +2,7 @@
 #include <cuda_bf16.h>
 #include <float.h>
 #include "attn_common.h"
-#include "attn_kv_source.cuh"
+#include "attn_layout_policies.cuh"
 #include "attn_warp_utils.cuh"
 constexpr int DC_CHUNK = 64;
 

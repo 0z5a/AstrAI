@@ -3,7 +3,7 @@
 // No torch dependency; pure CUDA.
 //
 // The paged and contiguous kernels are unified by the KVSource policy
-// (ContigKV / PagedKV from attn_kv_source.cuh), so each launcher struct
+// (ContigKV / PagedKV from attn_layout_policies.cuh), so each launcher struct
 // below is templated on KV and the paged dispatch is just the same launcher
 // instantiated with PagedKV.  Only the grid/split math differs, and that is
 // covered by KV::host_q_len / KV::host_kv_len.
@@ -11,7 +11,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include "attn_warp_utils.cuh"
-#include "attn_kv_source.cuh"
+#include "attn_layout_policies.cuh"
 #include "attn_prefill_split_q.cuh"
 #include "attn_decode_split_kv.cuh"
 #ifndef ASTRAI_NO_MMA
@@ -80,31 +80,32 @@ template <> struct PrefillConfigMap<128, true>  : PrefillKernelConfig<32> {};
 template <> struct PrefillConfigMap<256, false> : PrefillKernelConfig<16> {};
 template <> struct PrefillConfigMap<256, true>  : PrefillKernelConfig<16> {};
 
-template <typename KV>
+template <typename QSchedule, typename KV>
 struct PrefillLauncherMMA {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
     static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
         using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
         using Traits = KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES>;
         constexpr int ROWS = Traits::BR * Config::WARPS;
-        dim3 grid(KV::host_q_blocks(p, ROWS), p.q_head,
-                  KV::kPaged ? 1 : p.batch);
+        dim3 grid(QSchedule::host_q_blocks(p, ROWS), p.q_head,
+                  QSchedule::host_grid_batch(p));
         dim3 block(Traits::NUM_THREADS);
-        attn_prefill_split_q_mma_kernel<Traits, KV, IsCausal, HasMask>
+        attn_prefill_split_q_mma_kernel<Traits, QSchedule, KV, IsCausal, HasMask>
             <<<grid, block, 0, stream>>>(p);
     }
 };
 #endif
 
-template <typename KV>
+template <typename QSchedule, typename KV>
 struct PrefillLauncherScalar {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
     static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
-        constexpr int G = (HEAD_DIM == 32) ? 4 : 8, ROWS = 32, P_BC = 32;
-        dim3 grid(KV::host_q_blocks(p, ROWS), p.q_head,
-                  KV::kPaged ? 1 : p.batch);
+        constexpr int G = (HEAD_DIM == 32) ? 4 : 8, ROWS = 64, P_BC = 32;
+        dim3 grid(QSchedule::host_q_blocks(p, ROWS), p.q_head,
+                  QSchedule::host_grid_batch(p));
         dim3 block(G, ROWS);
-        attn_prefill_split_q_kernel_t<HEAD_DIM, KV, G, ROWS, P_BC, IsCausal, HasMask>
+        attn_prefill_split_q_kernel_t<HEAD_DIM, QSchedule, KV, G, ROWS, P_BC,
+                                      IsCausal, HasMask>
             <<<grid, block, 0, stream>>>(p);
     }
 };
@@ -115,12 +116,14 @@ static inline void dispatch_prefill(AttentionParams<bf16>& p, cudaStream_t strea
     bool has_mask = (p.use_mask && p.mask);
 
 #ifndef ASTRAI_NO_MMA
+    using Launcher = PrefillLauncherMMA<DenseQSchedule, ContigKV>;
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         PrefillLauncherMMA<ContigKV>::template launch,
+                         Launcher::template launch,
                          HEAD_DIM, p, stream);
 #else
+    using Launcher = PrefillLauncherScalar<DenseQSchedule, ContigKV>;
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         PrefillLauncherScalar<ContigKV>::template launch,
+                         Launcher::template launch,
                          HEAD_DIM, p, stream);
 #endif
 }
@@ -131,12 +134,14 @@ static inline void dispatch_paged_prefill(AttentionParams<bf16>& p, cudaStream_t
     bool has_mask = (p.use_mask && p.mask);
 
 #ifndef ASTRAI_NO_MMA
+    using Launcher = PrefillLauncherMMA<PackedQSchedule, PagedKV>;
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         PrefillLauncherMMA<PagedKV>::template launch,
+                         Launcher::template launch,
                          HEAD_DIM, p, stream);
 #else
+    using Launcher = PrefillLauncherScalar<PackedQSchedule, PagedKV>;
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         PrefillLauncherScalar<PagedKV>::template launch,
+                         Launcher::template launch,
                          HEAD_DIM, p, stream);
 #endif
 }

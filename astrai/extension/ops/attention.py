@@ -150,6 +150,8 @@ def attn_paged_prefill(
     req_pool_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     qo_indptr: torch.Tensor,
+    q_tile_to_batch: torch.Tensor,
+    q_tile_to_index: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
 ) -> torch.Tensor:
@@ -167,6 +169,8 @@ def attn_paged_prefill(
         req_pool_indices: [batch] (int32)
         kv_indptr: [batch+1] (int32) — prefix sum of per-request kv_lens
         qo_indptr: [batch+1] (int32) — prefix sum of per-request q_lens
+        q_tile_to_batch: [num_q_tiles] (int32) — request index per Q tile
+        q_tile_to_index: [num_q_tiles] (int32) — local Q tile index per request
         mask: 4D [batch, 1, q_len, kv_len] (bool, True=keep) or None
         is_causal: apply causal mask
 
@@ -183,6 +187,8 @@ def attn_paged_prefill(
         req_pool_indices,
         kv_indptr,
         qo_indptr,
+        q_tile_to_batch,
+        q_tile_to_index,
         mask,
         causal_offset=causal_offset,
     )

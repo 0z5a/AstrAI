@@ -227,6 +227,8 @@ inline void attn_pack_paged_prefill_params(
     torch::Tensor req_pool_indices,
     torch::Tensor kv_indptr,
     torch::Tensor qo_indptr,
+    torch::Tensor q_tile_to_batch,
+    torch::Tensor q_tile_to_index,
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
@@ -237,6 +239,7 @@ inline void attn_pack_paged_prefill_params(
     TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda());
     TORCH_CHECK(req_to_token.is_cuda() && req_pool_indices.is_cuda());
     TORCH_CHECK(kv_indptr.is_cuda() && qo_indptr.is_cuda());
+    TORCH_CHECK(q_tile_to_batch.is_cuda() && q_tile_to_index.is_cuda());
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bf16");
     TORCH_CHECK(k_cache.dtype() == torch::kBFloat16, "k_cache must be bf16");
     TORCH_CHECK(v_cache.dtype() == torch::kBFloat16, "v_cache must be bf16");
@@ -245,6 +248,10 @@ inline void attn_pack_paged_prefill_params(
                 "req_pool_indices must be int32");
     TORCH_CHECK(kv_indptr.dtype() == torch::kInt32, "kv_indptr must be int32");
     TORCH_CHECK(qo_indptr.dtype() == torch::kInt32, "qo_indptr must be int32");
+    TORCH_CHECK(q_tile_to_batch.dtype() == torch::kInt32,
+                "q_tile_to_batch must be int32");
+    TORCH_CHECK(q_tile_to_index.dtype() == torch::kInt32,
+                "q_tile_to_index must be int32");
     TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "k_cache and v_cache must match");
     TORCH_CHECK(k_cache.dim() == 3, "k_cache must be 3D [size, kv_head, head_dim]");
     TORCH_CHECK(q.dim() == 3, "q must be 3D [total_q, q_head, head_dim]");
@@ -261,6 +268,10 @@ inline void attn_pack_paged_prefill_params(
     TORCH_CHECK(p.q_head % p.kv_head == 0, "q_head must be divisible by kv_head");
     TORCH_CHECK(kv_indptr.size(0) == p.batch + 1, "kv_indptr must be [batch+1]");
     TORCH_CHECK(qo_indptr.size(0) == p.batch + 1, "qo_indptr must be [batch+1]");
+    TORCH_CHECK(q_tile_to_batch.dim() == 1 && q_tile_to_index.dim() == 1,
+                "Q tile mappings must be 1D");
+    TORCH_CHECK(q_tile_to_batch.size(0) == q_tile_to_index.size(0),
+                "Q tile mappings must have equal length");
 
     p.q_l_stride = (int)q.stride(0);
     p.q_h_stride = (int)q.stride(1);
@@ -273,6 +284,9 @@ inline void attn_pack_paged_prefill_params(
     p.req_pool_indices = req_pool_indices.data_ptr<int>();
     p.kv_indptr = kv_indptr.data_ptr<int>();
     p.qo_indptr = qo_indptr.data_ptr<int>();
+    p.q_tile_to_batch = q_tile_to_batch.data_ptr<int>();
+    p.q_tile_to_index = q_tile_to_index.data_ptr<int>();
+    p.num_q_tiles = (int)q_tile_to_batch.size(0);
     p.max_context_len = (int)req_to_token.size(1);
 
     p.causal_offset = (int)causal_offset;

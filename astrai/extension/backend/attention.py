@@ -610,6 +610,8 @@ class CudaBackend(AttentionBackend):
             kv_cache.req_pool_indices,
             kv_cache.kv_indptr,
             kv_cache.qo_indptr,
+            kv_cache.q_tile_to_batch,
+            kv_cache.q_tile_to_index,
             attn_mask,
             is_causal=is_causal,
         )

@@ -12,6 +12,26 @@
 struct PagedDecodeDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_paged_decode<H>(p, 0); } };
 struct PagedPrefillDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_paged_prefill<H>(p, 0); } };
 
+static int make_q_tile_mapping(const std::vector<int>& q_lens,
+                               int** d_batch, int** d_tile) {
+    constexpr int ROWS = 64;
+    std::vector<int> h_batch;
+    std::vector<int> h_tile;
+    for (int b = 0; b < (int)q_lens.size(); ++b) {
+        int n_tiles = (q_lens[b] + ROWS - 1) / ROWS;
+        for (int tile = 0; tile < n_tiles; ++tile) {
+            h_batch.push_back(b);
+            h_tile.push_back(tile);
+        }
+    }
+    size_t bytes = h_batch.size() * sizeof(int);
+    cudaMalloc(d_batch, bytes);
+    cudaMalloc(d_tile, bytes);
+    cudaMemcpy(*d_batch, h_batch.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(*d_tile, h_tile.data(), bytes, cudaMemcpyHostToDevice);
+    return (int)h_batch.size();
+}
+
 // ---- CPU reference: paged decode with variable seq_lens ----
 // Q: [B, Hq, D], K/V pool: [pool_size, Hkv, D]
 // req_to_token: [num_reqs, max_ctx_len], req_pool_indices: [B]
@@ -483,6 +503,9 @@ static int run_prefill_test(int B, int Hq, int Hkv,
                              nullptr, 0, 0,
                              B, Hq, Hkv, HEAD_DIM, max_ctx, causal, h_o_ref);
 
+    int *d_qtb, *d_qti;
+    int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
+
     // Kernel launch
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
@@ -497,6 +520,8 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
+    p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
+    p.num_q_tiles = num_q_tiles;
     p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
     dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
@@ -523,6 +548,7 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     free(h_o_ref); free(h_o_bf); free(h_o_got);
     cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
     cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_qoi);
+    cudaFree(d_qtb); cudaFree(d_qti);
     return pass ? 0 : 1;
 }
 
@@ -619,6 +645,10 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
                              h_mask, q_len, q_len,
                              B, Hq, Hkv, HEAD_DIM, max_ctx, 0, h_o_ref);
 
+    std::vector<int> q_lens(B, q_len);
+    int *d_qtb, *d_qti;
+    int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
+
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM;
@@ -632,6 +662,8 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
+    p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
+    p.num_q_tiles = num_q_tiles;
     p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
     dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
@@ -659,6 +691,7 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
     cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_qoi);
     cudaFree(d_mask);
+    cudaFree(d_qtb); cudaFree(d_qti);
     return pass ? 0 : 1;
 }
 
@@ -786,6 +819,10 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     for (int b = 0; b < B; b++) h_qoi[b + 1] = h_qoi[b] + q_len;
     cudaMemcpy(d_qoi, h_qoi, sz_qoi, cudaMemcpyHostToDevice);
 
+    std::vector<int> q_lens(B, q_len);
+    int *d_qtb, *d_qti;
+    int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
+
     AttentionParams<bf16> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
     p.head_dim = HEAD_DIM;
@@ -798,6 +835,8 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
     p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
     p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
+    p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
+    p.num_q_tiles = num_q_tiles;
     p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
     auto launch = [&]() {
@@ -827,6 +866,7 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     free(tmp); free(h_rtt); free(h_rpi); free(h_kvi); free(h_qoi);
     cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
     cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_qoi);
+    cudaFree(d_qtb); cudaFree(d_qti);
 }
 
 int main() {

@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 _MAX_SPLITS = 32
+Q_TILE_ROWS = 64
 
 
 class InferenceWorkspace:
@@ -82,6 +83,13 @@ class InferenceWorkspace:
         )
         self.qo_indptr = torch.empty(
             (max_batch_size + 1,), dtype=torch.int32, device=device
+        )
+        max_q_tiles = max_batch_size * ((max_seq_len + Q_TILE_ROWS - 1) // Q_TILE_ROWS)
+        self.q_tile_to_batch = torch.empty(
+            (max_q_tiles,), dtype=torch.int32, device=device
+        )
+        self.q_tile_to_index = torch.empty(
+            (max_q_tiles,), dtype=torch.int32, device=device
         )
         self.inc = torch.arange(max_batch_size + 1, dtype=torch.int32, device=device)
         self.out_cache_loc = torch.empty(

@@ -19,9 +19,10 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 | Split-KV MMA decode | `attn_decode_split_kv_mma.cuh` | Split KV across warps + MMA (sm_80+) |
 | Split-Q MMA prefill | `attn_prefill_split_q_mma.cuh` | Split Q across warps + MMA (sm_80+) |
 
-> The paged and non-paged paths are ONE kernel templated on a `KVSource`
-> policy (`ContigKV` / `PagedKV` in `attn_kv_source.cuh`); there are no
-> separate `attn_paged_*.cuh` files anymore.
+> The paged and non-paged paths share one kernel body. Prefill is templated on
+> an independent Q schedule (`DenseQSchedule` / `PackedQSchedule`) and KV
+> source (`ContigKV` / `PagedKV`); decode only needs the KV source. There are
+> no separate `attn_paged_*.cuh` files.
 
 ### Rotary Embedding Kernel
 
@@ -238,6 +239,47 @@ mask:      2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool, True=keep)
 
 Layout convention: all q/k/v are `[batch, seq_len, n_heads, head_dim]` (blhd). Scale is always `1/sqrt(head_dim)`.
 
+### Q Scheduling and KV Addressing
+
+Prefill separates Q work scheduling from KV storage:
+
+- `DenseQSchedule` maps a rectangular grid directly with
+  `batch = blockIdx.z` and `q_tile = blockIdx.x`.
+- `PackedQSchedule` consumes a compact work map for a packed
+  `[total_q, q_heads, head_dim]` tensor.
+- `ContigKV` and `PagedKV` only provide KV lengths and translate logical KV
+  positions into physical addresses. They do not schedule Q blocks.
+
+For ragged Q lengths `[70, 10, 130]` and 64 rows per Q tile, cache binding
+builds:
+
+```text
+qo_indptr       = [0, 70, 80, 210]
+q_tile_to_batch = [0, 0, 1, 2, 2, 2]
+q_tile_to_index = [0, 1, 0, 0, 1, 2]
+```
+
+Paged prefill launches:
+
+```text
+grid.x = num_q_tiles  # 6, exactly the valid ragged work items
+grid.y = q_heads
+grid.z = 1
+```
+
+Each block resolves its request and request-local tile in O(1):
+
+```cpp
+batch = q_tile_to_batch[blockIdx.x];
+q_tile = q_tile_to_index[blockIdx.x];
+```
+
+The kernel then uses `qo_indptr[batch]` for the packed Q base and adjacent
+`qo_indptr` / `kv_indptr` entries for that request's Q and KV lengths. This
+avoids the previous per-block linear scan over the batch, shared-memory
+broadcast, mapping barrier, and upper-bound grid with potentially invalid
+blocks.
+
 ## Standalone Testing
 
 Each `csrc/tests/*.cu` file has the `nvcc` compile command in its header comment. Example:
@@ -285,7 +327,7 @@ csrc/
 │   ├── attn_decode_split_kv_mma.cuh     # Split-KV + MMA variant (contig + paged)
 │   ├── attn_prefill_split_q.cuh         # Split-Q variant (contig + paged via KVSource)
 │   ├── attn_prefill_split_q_mma.cuh     # Split-Q + MMA variant (contig + paged)
-│   ├── attn_kv_source.cuh               # KVSource policies (ContigKV / PagedKV)
+│   ├── attn_layout_policies.cuh          # Q schedules and KVSource policies
 │   ├── attn_dispatchers.cuh             # Kernel dispatch macros + KV-templated launchers
 │   ├── attn_entry_utils.cuh             # Entry point helpers
 │   ├── attn_mma_utils.cuh               # MMA utilities

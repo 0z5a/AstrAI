@@ -25,7 +25,7 @@ from astrai.inference.cache.strategy import (
     RadixCache,
     TaskCacheState,
 )
-from astrai.inference.workspace import InferenceWorkspace
+from astrai.inference.workspace import Q_TILE_ROWS, InferenceWorkspace
 
 # Re-export everything so existing ``from astrai.inference.cache import ...``
 # continues to work unchanged after the file split.
@@ -217,6 +217,21 @@ class PagePool:
                 torch.tensor(q_lens, dtype=torch.int32, device=device).cumsum(0)
             )
             qo_indptr = workspace.qo_indptr[: b + 1]
+            tile_batches = []
+            tile_indices = []
+            for batch, q_len in enumerate(q_lens):
+                n_tiles = (q_len + Q_TILE_ROWS - 1) // Q_TILE_ROWS
+                tile_batches.extend([batch] * n_tiles)
+                tile_indices.extend(range(n_tiles))
+            n_tiles = len(tile_batches)
+            workspace.q_tile_to_batch[:n_tiles].copy_(
+                torch.tensor(tile_batches, dtype=torch.int32, device=device)
+            )
+            workspace.q_tile_to_index[:n_tiles].copy_(
+                torch.tensor(tile_indices, dtype=torch.int32, device=device)
+            )
+            q_tile_to_batch = workspace.q_tile_to_batch[:n_tiles]
+            q_tile_to_index = workspace.q_tile_to_index[:n_tiles]
             decode_o_part = decode_ml_part = decode_out = None
         else:
             # ---- decode: out_cache_loc is a single column (last position) ----
@@ -226,6 +241,7 @@ class PagePool:
             out_cache_loc = ocl_buf[:b].reshape(-1)
             workspace.qo_indptr[: b + 1].copy_(inc_buf[: b + 1])
             qo_indptr = workspace.qo_indptr[: b + 1]
+            q_tile_to_batch = q_tile_to_index = None
             decode_o_part = getattr(workspace, "decode_o_part", None)
             decode_ml_part = getattr(workspace, "decode_ml_part", None)
             decode_out = getattr(workspace, "decode_out", None)
@@ -240,6 +256,8 @@ class PagePool:
             max_len=max(seq_lens),
             kv_indptr=kv_indptr,
             qo_indptr=qo_indptr,
+            q_tile_to_batch=q_tile_to_batch,
+            q_tile_to_index=q_tile_to_index,
             decode_o_part=decode_o_part,
             decode_ml_part=decode_ml_part,
             decode_out=decode_out,

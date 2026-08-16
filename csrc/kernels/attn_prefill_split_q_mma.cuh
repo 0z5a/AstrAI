@@ -2,7 +2,7 @@
 #include <cfloat>
 #include <cuda_bf16.h>
 #include "attn_common.h"
-#include "attn_kv_source.cuh"
+#include "attn_layout_policies.cuh"
 #include "attn_mma_utils.cuh"
 
 // Tensor-core prefill flash attention (raw mma.sync PTX), unified across
@@ -16,7 +16,7 @@
 // dead branches in the inner compute loop (FA2-style).
 //
 // Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2>.
-template <typename Traits, typename KV, bool IsCausal, bool HasMask>
+template <typename Traits, typename QSchedule, typename KV, bool IsCausal, bool HasMask>
 __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -25,15 +25,14 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
 
     const int q_head = blockIdx.y;
     int batch, q_tile;
-    if (!map_q_block<Traits::BR * Traits::WARPS, KV>(p, batch, q_tile))
-        return;
+    QSchedule::map_block(p, batch, q_tile);
     const int kv_head = q_head / (p.q_head / p.kv_head);
     const int qrow0 = (q_tile * Traits::WARPS + warp) * Traits::BR;
 
     // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
     const int seq_len    = KV::kv_len(p, batch);
-    const int q_len      = KV::q_len(p, batch);
-    const int causal_off = KV::causal_offset(p, batch);
+    const int q_len      = QSchedule::q_len(p, batch);
+    const int causal_off = KV::causal_offset(p, batch, q_len);
     const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
 
     // Static shared memory: double-buffered K/V (no sQ — Q goes direct
@@ -42,7 +41,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     __shared__ __align__(16) bf16 sV[Traits::STAGES * Traits::BC * Traits::LD];
 
     // Load Q fragments straight from global into mma A-operand layout.
-    const int q_base = KV::q_base(p, batch, q_head);
+    const int q_base = QSchedule::q_base(p, batch, q_head);
     const int qra = qrow0 + gid;
     const int qrb = qrow0 + gid + 8;
     const bool va = qra < q_len, vb = qrb < q_len;
@@ -138,7 +137,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     // ---- write output: packed bf16x2 stores ----
     float rl0 = (l0 > 1e-20f) ? (1.0f / l0) : 0.0f;
     float rl1 = (l1 > 1e-20f) ? (1.0f / l1) : 0.0f;
-    const int o_base = KV::q_base(p, batch, q_head);
+    const int o_base = QSchedule::q_base(p, batch, q_head);
     #pragma unroll
     for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;

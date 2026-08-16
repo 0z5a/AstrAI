@@ -99,6 +99,8 @@ class KVCache:
     max_len: int = 0
     kv_indptr: Optional[Tensor] = None
     qo_indptr: Optional[Tensor] = None
+    q_tile_to_batch: Optional[Tensor] = None
+    q_tile_to_index: Optional[Tensor] = None
     decode_o_part: Optional[Tensor] = None
     decode_ml_part: Optional[Tensor] = None
     decode_out: Optional[Tensor] = None
