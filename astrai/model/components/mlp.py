@@ -100,13 +100,14 @@ class DeepSeekMoE(nn.Module):
 
     def forward(self, x: Tensor) -> FFNOutput:
         include_aux_loss = self.training and torch.is_grad_enabled()
-        bsz, seq_len, dim = x.shape
+        shape = x.shape
+        dim = shape[-1]
         x_flat = x.view(-1, dim)
 
         shared_out = self._shared_forward(x_flat)
         routed_output = self._routed_forward(x_flat, include_aux_loss)
 
-        out = (shared_out + routed_output["hidden_states"]).view(bsz, seq_len, dim)
+        out = (shared_out + routed_output["hidden_states"]).view(shape)
         return {
             "hidden_states": out,
             "aux_loss": routed_output["aux_loss"],

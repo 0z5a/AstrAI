@@ -39,6 +39,52 @@ def _make_model(config=None) -> AutoRegressiveLM:
     return AutoRegressiveLM(config)
 
 
+def test_model_forward_contract_uses_dense_training_and_packed_inference():
+    from astrai.inference.cache import PagePool, TaskCacheManager
+    from astrai.inference.workspace import InferenceWorkspace
+
+    config = AutoRegressiveLMConfig(**TINY_CONFIG)
+    model = AutoRegressiveLM(config).eval()
+    dense = model(torch.tensor([[1, 2, 3]]))
+    assert dense["logits"].shape == (1, 3, config.vocab_size)
+
+    pool = PagePool(
+        n_layers=config.num_hidden_layers,
+        n_kv_heads=config.num_key_value_heads,
+        head_dim=config.hidden_size // config.num_attention_heads,
+        max_batch_size=1,
+        max_seq_len=config.max_position_embeddings,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    cache = TaskCacheManager(pool)
+    workspace = InferenceWorkspace(
+        1,
+        config.max_position_embeddings,
+        config.num_attention_heads,
+        config.hidden_size // config.num_attention_heads,
+        torch.device("cpu"),
+        torch.float32,
+    )
+    assert cache.task_alloc("t", [1, 2, 3])
+    packed = model(
+        torch.tensor([1, 2, 3]),
+        position_ids=torch.arange(3),
+        kv_cache=cache.bind(["t"], workspace, start_pos=0),
+        fwd="prefill",
+    )
+    assert packed["logits"].shape == (3, config.vocab_size)
+
+    with pytest.raises(ValueError, match="training input_ids"):
+        model(torch.tensor([1, 2, 3]))
+    with pytest.raises(ValueError, match="inference input_ids"):
+        model(
+            torch.tensor([[1, 2, 3]]),
+            kv_cache=cache.bind(["t"], workspace, start_pos=0),
+            fwd="prefill",
+        )
+
+
 def _router_stats(probs, topk_indices):
     return {"probs": probs, "topk_indices": topk_indices}
 

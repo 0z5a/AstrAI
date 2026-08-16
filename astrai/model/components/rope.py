@@ -65,9 +65,12 @@ class RotaryEmbedding(nn.Module):
             [batch, seq_len, dim/2, 2] (f32) — [cos, sin] pairs.
         """
         if position_ids is None:
-            position_ids = (
-                torch.arange(x.size(1), device=x.device)
-                .unsqueeze(0)
-                .expand(x.size(0), -1)
-            )
+            if x.ndim == 2:
+                position_ids = torch.arange(x.size(0), device=x.device)
+            else:
+                position_ids = (
+                    torch.arange(x.size(1), device=x.device)
+                    .unsqueeze(0)
+                    .expand(x.size(0), -1)
+                )
         return self.freqs_cis[position_ids].float()

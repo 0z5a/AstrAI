@@ -123,6 +123,7 @@ def _backend_supports(
     kv_cache: Optional["KVCache"],
     attn_mask: Optional[Tensor],
     is_causal: bool,
+    fwd: Optional[str],
 ) -> bool:
     """Whether ``backend`` can run this attention call.
 
@@ -131,17 +132,20 @@ def _backend_supports(
     """
     if isinstance(backend, CudaBackend):
         return (
-            kv_cache is not None
+            fwd in ("prefill", "decode")
+            and kv_cache is not None
+            and q.ndim == 3
             and q.dtype == torch.bfloat16
             and q.size(-1) in (32, 64, 128, 256)
+            and is_available(f"attn_paged_{fwd}")
         )
     if isinstance(backend, FlashAttnBackend):
         if not flash_attn_available():
             return False
         if q.dtype not in (torch.float16, torch.bfloat16):
             return False
-        if q.size(1) == 1 and kv_cache is not None:
-            return True
+        if fwd is not None:
+            return q.ndim == 3 and hasattr(_get_flash_attn(), "flash_attn_varlen_func")
         if attn_mask is None or is_causal:
             return True
         return attn_mask.dim() == 4
@@ -243,13 +247,13 @@ def attn_backend(backend: Union[str, ATTN_BACKEND, "AttentionBackend", type]):
 
 def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     """Expand KV heads to match Q heads for GQA."""
-    bs, slen, n_heads, head_dim = x.shape
     if n_rep == 1:
         return x
+    n_heads, head_dim = x.shape[-2:]
     return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_heads * n_rep, head_dim)
+        x.unsqueeze(-2)
+        .expand(*x.shape[:-2], n_heads, n_rep, head_dim)
+        .reshape(*x.shape[:-2], n_heads * n_rep, head_dim)
     )
 
 
@@ -283,6 +287,7 @@ def attention(
     layer_id: int = 0,
     attn_mask: Optional[Tensor] = None,
     is_causal: bool = False,
+    fwd: Optional[str] = None,
 ) -> Tensor:
     """Functional attention entry point — mirrors ``F.scaled_dot_product_attention``.
 
@@ -302,9 +307,11 @@ def attention(
     Returns:
         [batch, q_len, n_heads * head_dim]
     """
+    explicit = get_backend(use_default=False)
     backend = get_backend()
-    if not _backend_supports(backend, q, kv_cache, attn_mask, is_causal):
-        explicit = get_backend(use_default=False)
+    if fwd is None and explicit is None:
+        backend = TorchNativeBackend()
+    if not _backend_supports(backend, q, kv_cache, attn_mask, is_causal, fwd):
         if explicit is not None:
             raise RuntimeError(
                 f"Explicitly-set backend {type(backend).__name__} cannot "
@@ -316,10 +323,10 @@ def attention(
         for candidate in _priority_backends():
             if isinstance(candidate, type(backend)):
                 continue
-            if _backend_supports(candidate, q, kv_cache, attn_mask, is_causal):
+            if _backend_supports(candidate, q, kv_cache, attn_mask, is_causal, fwd):
                 backend = candidate
                 break
-    return backend.forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
+    return backend.forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal, fwd)
 
 
 class AttentionBackend(ABC):
@@ -355,6 +362,7 @@ class AttentionBackend(ABC):
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
         """Dispatch to decode or extend based on q_len.
 
@@ -370,9 +378,11 @@ class AttentionBackend(ABC):
         Returns:
             [batch, q_len, n_heads * head_dim]
         """
-        if kv_cache is not None and q.size(1) == 1:
+        if fwd == "decode":
             return self.fwd_decode(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-        return self.fwd_prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
+        if fwd == "prefill" or fwd is None:
+            return self.fwd_prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
+        raise ValueError(f"unsupported attention forward mode: {fwd}")
 
     @abstractmethod
     def fwd_decode(
@@ -466,23 +476,52 @@ class TorchNativeBackend(AttentionBackend):
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
     ) -> Tensor:
-        if kv_cache is not None:
-            k, v = _write_and_gather_kv(kv_cache, k, v, layer_id, q, attn_mask)
+        if q.ndim == 4:
+            n_rep = q.size(2) // k.size(2)
+            if n_rep > 1:
+                k = repeat_kv(k, n_rep)
+                v = repeat_kv(v, n_rep)
+            return (
+                F.scaled_dot_product_attention(
+                    q.permute(0, 2, 1, 3),
+                    k.permute(0, 2, 1, 3),
+                    v.permute(0, 2, 1, 3),
+                    attn_mask,
+                    is_causal=is_causal,
+                )
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )
 
-        n_rep = q.size(2) // k.size(2)
-        if n_rep > 1:
-            k = repeat_kv(k, n_rep)
-            v = repeat_kv(v, n_rep)
-
-        out = F.scaled_dot_product_attention(
-            q.permute(0, 2, 1, 3),
-            k.permute(0, 2, 1, 3),
-            v.permute(0, 2, 1, 3),
-            attn_mask,
-            is_causal=is_causal,
-        )
-        out = out.permute(0, 2, 1, 3).contiguous().flatten(2)
-        return out
+        if kv_cache is None or kv_cache.qo_indptr is None:
+            raise ValueError("packed attention requires KV cache metadata")
+        kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
+        kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
+        outputs = []
+        n_rep = q.size(1) // k.size(1)
+        for i in range(kv_cache.req_pool_indices.numel()):
+            q_start = int(kv_cache.qo_indptr[i])
+            q_end = int(kv_cache.qo_indptr[i + 1])
+            indices = kv_cache.req_to_token[
+                kv_cache.req_pool_indices[i], : kv_cache.seq_lens[i]
+            ]
+            k_i = kv_cache.k_buffer[layer_id, indices]
+            v_i = kv_cache.v_buffer[layer_id, indices]
+            if n_rep > 1:
+                k_i = repeat_kv(k_i, n_rep)
+                v_i = repeat_kv(v_i, n_rep)
+            q_len = q_end - q_start
+            kv_len = k_i.size(0)
+            q_pos = torch.arange(kv_len - q_len, kv_len, device=q.device)
+            causal_mask = q_pos[:, None] >= torch.arange(kv_len, device=q.device)
+            out = F.scaled_dot_product_attention(
+                q[q_start:q_end].transpose(0, 1).unsqueeze(0),
+                k_i.transpose(0, 1).unsqueeze(0),
+                v_i.transpose(0, 1).unsqueeze(0),
+                attn_mask=causal_mask,
+            )
+            outputs.append(out.squeeze(0).transpose(0, 1))
+        return torch.cat(outputs)
 
 
 @AttentionBackendFactory.register(ATTN_BACKEND.CUDA.value)
@@ -530,16 +569,14 @@ class CudaBackend(AttentionBackend):
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
-        loc = kv_cache.out_cache_loc[:, 0]
-        kv_cache.k_buffer[layer_id, loc] = k[:, 0]
-        kv_cache.v_buffer[layer_id, loc] = v[:, 0]
-
-        q_3d = q.squeeze(1)
+        loc = kv_cache.out_cache_loc
+        kv_cache.k_buffer[layer_id, loc] = k
+        kv_cache.v_buffer[layer_id, loc] = v
 
         kv_indptr = kv_cache.kv_indptr
 
         out = attn_paged_decode(
-            q_3d,
+            q,
             kv_cache.k_buffer[layer_id],
             kv_cache.v_buffer[layer_id],
             kv_cache.req_to_token,
@@ -550,7 +587,7 @@ class CudaBackend(AttentionBackend):
             ml_part_buf=kv_cache.decode_ml_part,
             out_buf=kv_cache.decode_out,
         )
-        return out.unsqueeze(1).flatten(2)
+        return out
 
     def fwd_prefill(
         self,
@@ -565,30 +602,22 @@ class CudaBackend(AttentionBackend):
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
-        loc = kv_cache.out_cache_loc.reshape(-1)
-        kv_cache.k_buffer[layer_id, loc] = k.reshape(-1, k.size(2), k.size(3))
-        kv_cache.v_buffer[layer_id, loc] = v.reshape(-1, v.size(2), v.size(3))
-
-        b = q.size(0)
-        q_len = q.size(1)
-
-        kv_indptr = kv_cache.kv_indptr
-        qo_indptr = kv_cache.qo_indptr
-
-        q_flat = q.reshape(b * q_len, q.size(2), q.size(3))
+        loc = kv_cache.out_cache_loc
+        kv_cache.k_buffer[layer_id, loc] = k
+        kv_cache.v_buffer[layer_id, loc] = v
 
         out = attn_paged_prefill(
-            q_flat,
+            q,
             kv_cache.k_buffer[layer_id],
             kv_cache.v_buffer[layer_id],
             kv_cache.req_to_token,
             kv_cache.req_pool_indices,
-            kv_indptr,
-            qo_indptr,
+            kv_cache.kv_indptr,
+            kv_cache.qo_indptr,
             attn_mask,
             is_causal=is_causal,
         )
-        return out.reshape(b, q_len, q.size(2), q.size(3)).flatten(2)
+        return out
 
 
 @AttentionBackendFactory.register(ATTN_BACKEND.FLASH.value)
@@ -617,7 +646,7 @@ class FlashAttnBackend(AttentionBackend):
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
     ) -> Tensor:
-        return self._forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
+        return self._forward_packed(q, k, v, kv_cache, layer_id)
 
     def fwd_prefill(
         self,
@@ -629,25 +658,18 @@ class FlashAttnBackend(AttentionBackend):
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
     ) -> Tensor:
-        return self._forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
+        if q.ndim == 3:
+            return self._forward_packed(q, k, v, kv_cache, layer_id)
+        return self._forward_dense(q, k, v, attn_mask, is_causal)
 
-    def _forward(
+    def _forward_dense(
         self,
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
     ) -> Tensor:
-        if kv_cache is not None:
-            if q.size(1) == 1 and kv_cache.k_buffer.size(
-                1
-            ) == kv_cache.req_to_token.size(0) * kv_cache.req_to_token.size(1):
-                return self._decode_with_kvcache(q, k, v, kv_cache, layer_id)
-            k, v = _write_and_gather_kv(kv_cache, k, v, layer_id, q, attn_mask)
-
         n_rep = q.size(2) // k.size(2)
         if n_rep > 1:
             k = repeat_kv(k, n_rep)
@@ -670,9 +692,9 @@ class FlashAttnBackend(AttentionBackend):
             v.contiguous(),
             causal=is_causal or (attn_mask is not None and attn_mask.dim() == 4),
         )
-        return out.contiguous().flatten(2)
+        return out.contiguous()
 
-    def _decode_with_kvcache(
+    def _forward_packed(
         self,
         q: Tensor,
         k: Tensor,
@@ -680,22 +702,27 @@ class FlashAttnBackend(AttentionBackend):
         kv_cache: "KVCache",
         layer_id: int,
     ) -> Tensor:
-        max_batch = kv_cache.req_to_token.size(0)
-        max_seq = kv_cache.req_to_token.size(1)
-        n_kv = k.size(2)
-
-        k_cache = kv_cache.k_buffer[layer_id].view(max_batch, max_seq, n_kv, k.size(3))
-        v_cache = kv_cache.v_buffer[layer_id].view(max_batch, max_seq, n_kv, v.size(3))
-
         fa = _get_flash_attn()
-        out = fa.flash_attn_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            k=k,
-            v=v,
-            cache_seqlens=(kv_cache.seq_lens - 1).to(torch.int32),
-            cache_batch_idx=kv_cache.req_pool_indices.to(torch.int32),
+        if fa is None or not hasattr(fa, "flash_attn_varlen_func"):
+            raise RuntimeError("packed inference requires flash_attn_varlen_func")
+        kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
+        kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
+        page_table = kv_cache.req_to_token[
+            kv_cache.req_pool_indices, : kv_cache.max_len
+        ]
+        positions = torch.arange(kv_cache.max_len, device=q.device)
+        indices = page_table[positions.unsqueeze(0) < kv_cache.seq_lens.unsqueeze(1)]
+        k_flat = kv_cache.k_buffer[layer_id, indices].contiguous()
+        v_flat = kv_cache.v_buffer[layer_id, indices].contiguous()
+        out = fa.flash_attn_varlen_func(
+            q.contiguous(),
+            k_flat,
+            v_flat,
+            kv_cache.qo_indptr,
+            kv_cache.kv_indptr,
+            int((kv_cache.qo_indptr[1:] - kv_cache.qo_indptr[:-1]).max()),
+            int(kv_cache.seq_lens.max()),
+            dropout_p=0.0,
             causal=True,
         )
-        return out.flatten(2)
+        return out

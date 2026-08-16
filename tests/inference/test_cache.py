@@ -279,7 +279,7 @@ def test_page_pool_contiguous_bind_tasks_prefill():
     task_cache.task_alloc("t1", list(range(10)))
     task_cache.task_alloc("t2", list(range(10)))
     kv = task_cache.bind(["t1", "t2"], _ws(pool), start_pos=0)
-    assert kv.out_cache_loc.shape == (2, 10)
+    assert kv.out_cache_loc.shape == (20,)
     assert kv.out_cache_loc.dtype == torch.int32
     assert kv.seq_lens.tolist() == [10, 10]
     assert kv.req_pool_indices.shape == (2,)
@@ -295,7 +295,7 @@ def test_page_pool_contiguous_bind_tasks_decode():
     assert task_cache.task_extend("t1", 10)
     assert task_cache.task_extend("t2", 8)
     kv = task_cache.bind(["t1", "t2"], _ws(pool))
-    assert kv.out_cache_loc.shape == (2, 1)
+    assert kv.out_cache_loc.shape == (2,)
     assert kv.seq_lens.tolist() == [11, 9]
 
 

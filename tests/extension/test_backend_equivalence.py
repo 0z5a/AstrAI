@@ -59,17 +59,9 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
     """Inference prefill with KV cache should match torch backend."""
     model, _ = cuda_model
     prompt_ids = [[1, 2, 3, 4, 5, 6, 7, 8], [10, 11, 12, 13, 14, 15]]
-    max_len = max(len(p) for p in prompt_ids)
-    batch = len(prompt_ids)
-
     device = "cuda"
-    input_ids = torch.zeros(batch, max_len, dtype=torch.long, device=device)
-    input_mask = torch.zeros(batch, max_len, dtype=torch.bool, device=device)
-    position_ids = torch.zeros(batch, max_len, dtype=torch.long, device=device)
-    for i, p in enumerate(prompt_ids):
-        input_ids[i, : len(p)] = torch.tensor(p, device=device)
-        input_mask[i, : len(p)] = True
-        position_ids[i, : len(p)] = torch.arange(len(p), device=device)
+    input_ids = torch.tensor(sum(prompt_ids, []), dtype=torch.long, device=device)
+    position_ids = torch.cat([torch.arange(len(p), device=device) for p in prompt_ids])
 
     cache = PagePool(
         n_layers=2,
@@ -88,7 +80,7 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
     kv1 = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
         out_torch = model(
-            input_ids, input_mask=input_mask, kv_cache=kv1, position_ids=position_ids
+            input_ids, kv_cache=kv1, position_ids=position_ids, fwd="prefill"
         )
 
     task_cache.task_free("t1")
@@ -100,22 +92,24 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
         with torch.inference_mode():
             out_cuda = model(
                 input_ids,
-                input_mask=input_mask,
                 kv_cache=kv2,
                 position_ids=position_ids,
+                fwd="prefill",
             )
 
+    offset = 0
     for i, p in enumerate(prompt_ids):
         d = (
             (
-                out_torch["logits"][i, : len(p)].float()
-                - out_cuda["logits"][i, : len(p)].float()
+                out_torch["logits"][offset : offset + len(p)].float()
+                - out_cuda["logits"][offset : offset + len(p)].float()
             )
             .abs()
             .max()
             .item()
         )
         assert d == 0.0, f"Prefill diff for sample {i}: {d}"
+        offset += len(p)
 
 
 @skip_no_kernel
@@ -136,15 +130,8 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     )
 
     # Prefill to populate cache
-    max_len = max(len(p) for p in prompt_ids)
-    batch = len(prompt_ids)
-    input_ids = torch.zeros(batch, max_len, dtype=torch.long, device=device)
-    input_mask = torch.zeros(batch, max_len, dtype=torch.bool, device=device)
-    position_ids = torch.zeros(batch, max_len, dtype=torch.long, device=device)
-    for i, p in enumerate(prompt_ids):
-        input_ids[i, : len(p)] = torch.tensor(p, device=device)
-        input_mask[i, : len(p)] = True
-        position_ids[i, : len(p)] = torch.arange(len(p), device=device)
+    input_ids = torch.tensor(sum(prompt_ids, []), dtype=torch.long, device=device)
+    position_ids = torch.cat([torch.arange(len(p), device=device) for p in prompt_ids])
 
     task_cache = _mk_task_cache(cache)
     ws = _ws(cache)
@@ -152,28 +139,22 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     task_cache.task_alloc("t2", prompt_ids[1])
     kv = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
-        model(input_ids, input_mask=input_mask, kv_cache=kv, position_ids=position_ids)
+        model(input_ids, kv_cache=kv, position_ids=position_ids, fwd="prefill")
 
     # Decode step — seq_lens are 9 and 7 (after extending)
-    dec_ids = torch.tensor([[99], [98]], dtype=torch.long, device=device)
-    dec_pos = torch.tensor([[8], [6]], dtype=torch.long, device=device)
-    total_len = 9
-    dec_mask = dec_pos[:, None, None] >= torch.arange(total_len, device=device)
+    dec_ids = torch.tensor([99, 98], dtype=torch.long, device=device)
+    dec_pos = torch.tensor([8, 6], dtype=torch.long, device=device)
 
     task_cache.task_extend("t1", 8)
     task_cache.task_extend("t2", 6)
     kv_t = task_cache.bind(["t1", "t2"], ws)
     with torch.inference_mode():
-        out_torch = model(
-            dec_ids, input_mask=dec_mask, kv_cache=kv_t, position_ids=dec_pos
-        )
+        out_torch = model(dec_ids, kv_cache=kv_t, position_ids=dec_pos, fwd="decode")
 
     kv_c = task_cache.bind(["t1", "t2"], ws)
     with attn_backend(ATTN_BACKEND.CUDA):
         with torch.inference_mode():
-            out_cuda = model(
-                dec_ids, input_mask=dec_mask, kv_cache=kv_c, position_ids=dec_pos
-            )
+            out_cuda = model(dec_ids, kv_cache=kv_c, position_ids=dec_pos, fwd="decode")
 
     diff = (out_torch["logits"].float() - out_cuda["logits"].float()).abs().max().item()
     assert diff < 0.05, f"Decode diff (mixed seq_lens): {diff}"
@@ -198,16 +179,15 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
     ws = _ws(cache)
     task_cache.task_alloc("t1", prompt_ids)
 
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    position_ids = torch.arange(len(prompt_ids), device=device).unsqueeze(0)
-    input_mask = torch.ones(1, len(prompt_ids), dtype=torch.bool, device=device)
+    input_ids = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+    position_ids = torch.arange(len(prompt_ids), device=device)
 
     with attn_backend(ATTN_BACKEND.CUDA), torch.inference_mode():
         model(
             input_ids,
-            input_mask=input_mask,
             position_ids=position_ids,
             kv_cache=task_cache.bind(["t1"], ws, start_pos=0),
+            fwd="prefill",
         )
 
         task_cache.task_extend("t1", len(prompt_ids))
@@ -217,16 +197,16 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
         assert kv_cache.out_cache_loc.dtype == torch.int32
 
         decode_args = {
-            "input_ids": torch.tensor([[9]], dtype=torch.long, device=device),
-            "input_mask": torch.ones(1, 1, 64, dtype=torch.bool, device=device),
-            "position_ids": torch.tensor([[len(prompt_ids)]], device=device),
+            "input_ids": torch.tensor([9], dtype=torch.long, device=device),
+            "position_ids": torch.tensor([len(prompt_ids)], device=device),
             "kv_cache": kv_cache,
+            "fwd": "decode",
         }
         graph = CudaGraphContext(enabled=True)
         graph.forward(model, key=(1,), **decode_args)
         graph.forward(model, key=(1,), **decode_args)
         first = graph.forward(model, key=(1,), **decode_args)["logits"].clone()
-        slot = kv_cache.out_cache_loc[0, 0]
+        slot = kv_cache.out_cache_loc[0]
         first_k = kv_cache.k_buffer[:, slot].clone()
         first_v = kv_cache.v_buffer[:, slot].clone()
 

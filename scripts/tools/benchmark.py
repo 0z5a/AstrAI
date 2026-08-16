@@ -118,16 +118,11 @@ class GenerationBenchmark:
         workspace: InferenceWorkspace,
     ) -> list:
         input_ids = torch.randint(
-            0, self.config.vocab_size, (batch_size, prompt_len), device=self.device
+            0, self.config.vocab_size, (batch_size * prompt_len,), device=self.device
         )
-        position_ids = (
-            torch.arange(0, prompt_len, dtype=torch.long, device=self.device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        input_mask = position_ids.unsqueeze(-1) >= torch.arange(
-            prompt_len, device=self.device
-        )
+        position_ids = torch.arange(
+            prompt_len, dtype=torch.long, device=self.device
+        ).repeat(batch_size)
 
         task_ids = [f"bench_{i}" for i in range(batch_size)]
         for tid in task_ids:
@@ -137,9 +132,9 @@ class GenerationBenchmark:
         with torch.inference_mode(), attn_backend(self.backend):
             self.model(
                 input_ids,
-                input_mask=input_mask,
                 kv_cache=kv_cache,
                 position_ids=position_ids,
+                fwd="prefill",
             )
         torch.cuda.synchronize()
         return task_ids
@@ -154,24 +149,20 @@ class GenerationBenchmark:
     ):
         batch_size = len(task_ids)
         input_ids = torch.randint(
-            0, self.config.vocab_size, (batch_size, 1), device=self.device
+            0, self.config.vocab_size, (batch_size,), device=self.device
         )
         position_ids = torch.tensor(
-            [[seq_len] for _ in range(batch_size)], dtype=torch.long, device=self.device
+            [seq_len] * batch_size, dtype=torch.long, device=self.device
         )
-        total_len = seq_len + 1
         for tid in task_ids:
             task_cache.task_extend(tid, seq_len)
-        input_mask = position_ids[:, :, None] >= torch.arange(
-            total_len, device=self.device
-        )
         kv_cache = task_cache.bind(task_ids, workspace, self.device)
         with torch.inference_mode(), attn_backend(self.backend):
             self.model(
                 input_ids,
-                input_mask=input_mask,
                 kv_cache=kv_cache,
                 position_ids=position_ids,
+                fwd="decode",
             )
 
     def run_prefill_benchmark(
@@ -188,25 +179,23 @@ class GenerationBenchmark:
             task_cache.task_alloc(tid, list(range(prompt_length)))
 
         input_ids = torch.randint(
-            0, self.config.vocab_size, (batch_size, prompt_length), device=self.device
+            0,
+            self.config.vocab_size,
+            (batch_size * prompt_length,),
+            device=self.device,
         )
-        position_ids = (
-            torch.arange(0, prompt_length, dtype=torch.long, device=self.device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        input_mask = position_ids.unsqueeze(-1) >= torch.arange(
-            prompt_length, device=self.device
-        )
+        position_ids = torch.arange(
+            prompt_length, dtype=torch.long, device=self.device
+        ).repeat(batch_size)
         kv_cache = task_cache.bind(task_ids, workspace, self.device, start_pos=0)
 
         for _ in range(3):
             with torch.inference_mode(), attn_backend(self.backend):
                 self.model(
                     input_ids,
-                    input_mask=input_mask,
                     kv_cache=kv_cache,
                     position_ids=position_ids,
+                    fwd="prefill",
                 )
 
         torch.cuda.synchronize()
@@ -215,9 +204,9 @@ class GenerationBenchmark:
             with torch.inference_mode(), attn_backend(self.backend):
                 self.model(
                     input_ids,
-                    input_mask=input_mask,
                     kv_cache=kv_cache,
                     position_ids=position_ids,
+                    fwd="prefill",
                 )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
@@ -311,37 +300,29 @@ class GenerationBenchmark:
         )
 
         b = batch_size
-        input_ids_buf = torch.zeros(b, 1, dtype=torch.long, device=self.device)
+        input_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
         position_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
-        arange = torch.arange(max_seq_len, device=self.device)
 
         gctx = CudaGraphContext(enabled=True)
         graph_key = (b,)
 
         def _decode_graph_step(seq_len):
             input_ids_buf.copy_(
-                torch.randint(0, self.config.vocab_size, (b, 1), device=self.device)
+                torch.randint(0, self.config.vocab_size, (b,), device=self.device)
             )
             position_ids_buf[:] = seq_len
             for tid in task_ids:
                 task_cache.task_extend(tid, seq_len)
             kv_cache = task_cache.bind(task_ids, workspace, self.device)
 
-            input_mask = torch.ge(
-                position_ids_buf[:, None],
-                arange,
-                out=workspace.input_mask[:b, 0, :max_seq_len],
-            )
-            input_mask = input_mask.unsqueeze(1)
-
             with torch.inference_mode(), attn_backend(self.backend):
                 return gctx.forward(
                     self.model,
                     key=graph_key,
                     input_ids=input_ids_buf,
-                    input_mask=input_mask,
                     kv_cache=kv_cache,
-                    position_ids=position_ids_buf.unsqueeze(1),
+                    position_ids=position_ids_buf,
+                    fwd="decode",
                 )
 
         for i in range(5):

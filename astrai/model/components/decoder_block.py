@@ -54,6 +54,7 @@ class DecoderBlock(nn.Module):
         attention_mask: Optional[Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> DecoderOutput:
         attn_output = self.attention(
             self.input_norm(x),
@@ -61,6 +62,7 @@ class DecoderBlock(nn.Module):
             attention_mask,
             kv_cache,
             is_causal,
+            fwd,
         )
         x = attn_output + x
         normalized = self.post_attention_norm(x)

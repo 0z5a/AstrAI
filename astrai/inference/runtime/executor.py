@@ -118,13 +118,13 @@ def _warmup_cuda_graphs(
             timed("warmup prefill", logger),
         ):
             kv = task_cache.bind([tid], ws, start_pos=0)
-            ids_in = torch.arange(warmup_len, device=dev).unsqueeze(0)
+            ids_in = torch.arange(warmup_len, device=dev)
             pos_in = ids_in
             model(
                 ids_in,
-                input_mask=pos_in.unsqueeze(-1) >= torch.arange(warmup_len, device=dev),
                 kv_cache=kv,
                 position_ids=pos_in,
+                fwd="prefill",
             )
         task_cache.task_free(tid)
 
@@ -159,15 +159,14 @@ def _warmup_cuda_graphs(
                 for tid in task_ids:
                     task_cache.task_extend(tid, seq_pos)
                 kv = task_cache.bind(task_ids, ws)
-                input_mask = ws.decode_mask(ws.position_ids[:b], ws.max_seq_len)
                 ids_buf = ws.fill_input_ids([step] * b)
                 gctx.forward(
                     model,
                     key=(b,),
-                    input_ids=ids_buf.unsqueeze(1),
-                    input_mask=input_mask,
+                    input_ids=ids_buf,
                     kv_cache=kv,
-                    position_ids=ws.position_ids[:b].unsqueeze(1),
+                    position_ids=ws.position_ids[:b],
+                    fwd="decode",
                 )
 
         for tid in task_ids:
@@ -308,20 +307,15 @@ class Executor:
         batch_sz = len(tasks)
 
         input_ids = torch.tensor(
-            [t.prompt_ids[start_pos:prompt_len] for t in tasks],
+            [token for t in tasks for token in t.prompt_ids[start_pos:prompt_len]],
             dtype=torch.long,
             device=self.device,
         )
 
         task_ids = [t.task_id for t in tasks]
-        position_ids = (
-            torch.arange(start_pos, prompt_len, dtype=torch.long, device=self.device)
-            .unsqueeze(0)
-            .expand(batch_sz, -1)
-        )
-        input_mask = position_ids.unsqueeze(-1) >= torch.arange(
-            prompt_len, device=self.device
-        )
+        position_ids = torch.arange(
+            start_pos, prompt_len, dtype=torch.long, device=self.device
+        ).repeat(batch_sz)
 
         with (
             torch.inference_mode(),
@@ -329,15 +323,18 @@ class Executor:
         ):
             outputs = self.model(
                 input_ids,
-                input_mask=input_mask,
                 position_ids=position_ids,
                 kv_cache=self.task_cache.bind(
                     task_ids,
                     self._workspace,
                     start_pos=start_pos,
                 ),
+                fwd="prefill",
             )
-            logits = outputs["logits"][:, -1, :]
+            q_len = prompt_len - start_pos
+            logits = outputs["logits"][
+                torch.arange(1, batch_sz + 1, device=self.device) * q_len - 1
+            ]
 
         return tasks, self._sample_logits(logits, tasks, return_logprobs)
 
@@ -391,9 +388,6 @@ class Executor:
             )
         self._decode_cache = DecodeSteadyState(task_sig, cur_positions, info)
 
-        total_len = max(cur_positions) + 1
-        input_mask = ws.decode_mask(ws.position_ids[:b], total_len)
-
         # ---- forward (graph replay or live run + capture) ----
 
         use_graph = (
@@ -402,9 +396,6 @@ class Executor:
             and get_backend().supports_graph()
         )
         key = (b,)
-        if use_graph:
-            input_mask = ws.decode_mask(ws.position_ids[:b], ws.max_seq_len)
-
         with (
             torch.inference_mode(),
             timed(f"execute_decode forward b={b}", logger),
@@ -413,18 +404,18 @@ class Executor:
                 outputs = self._graph_ctx.forward(
                     self.model,
                     key=key,
-                    input_ids=input_ids.unsqueeze(1),
-                    input_mask=input_mask,
+                    input_ids=input_ids,
                     kv_cache=kv_cache,
-                    position_ids=ws.position_ids[:b].unsqueeze(1),
+                    position_ids=ws.position_ids[:b],
+                    fwd="decode",
                 )
             else:
                 outputs = self.model(
-                    input_ids.unsqueeze(1),
-                    input_mask=input_mask,
+                    input_ids,
                     kv_cache=kv_cache,
-                    position_ids=ws.position_ids[:b].unsqueeze(1),
+                    position_ids=ws.position_ids[:b],
+                    fwd="decode",
                 )
-            logits = outputs["logits"][:, -1, :]
+            logits = outputs["logits"]
 
         return self._sample_logits(logits, tasks, return_logprobs, info=info)

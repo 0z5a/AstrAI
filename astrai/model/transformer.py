@@ -105,8 +105,20 @@ class AutoRegressiveLM(AutoModel):
         input_mask: Optional[Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         position_ids: Optional[Tensor] = None,
+        fwd: Optional[str] = None,
     ) -> Dict[str, Tensor]:
-        assert input_ids.ndim == 2
+        if fwd is None:
+            if input_ids.ndim != 2:
+                raise ValueError("training input_ids must be [batch, seq_len]")
+            if kv_cache is not None:
+                raise ValueError("training forward does not accept a KV cache")
+        elif fwd in ("prefill", "decode"):
+            if input_ids.ndim != 1:
+                raise ValueError("inference input_ids must be packed [tokens]")
+            if kv_cache is None:
+                raise ValueError("inference forward requires a KV cache")
+        else:
+            raise ValueError(f"unsupported forward mode: {fwd}")
 
         x = self.embed_tokens(input_ids)
         rotary_emb = self.rotary_embedding(x, position_ids)
@@ -122,6 +134,7 @@ class AutoRegressiveLM(AutoModel):
                 attn_mask,
                 kv_cache,
                 use_sdpa_causal_mask,
+                fwd,
             )
             x = layer_output["hidden_states"]
             stats = layer_output.get("router_stats")

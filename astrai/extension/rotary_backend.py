@@ -26,7 +26,7 @@ def _torch_apply(x: Tensor, freqs_cis: Tensor) -> Tensor:
     dtype = x.dtype
     x_ = x.float().reshape(*x.shape[:-1], -1, 2)
     x_complex = torch.view_as_complex(x_)
-    freqs_cis_complex = torch.complex(cos, sin).unsqueeze(2)
+    freqs_cis_complex = torch.complex(cos, sin).unsqueeze(-2)
     x_rotated = x_complex * freqs_cis_complex
     x_out = torch.view_as_real(x_rotated).flatten(-2)
     return x_out.to(dtype)

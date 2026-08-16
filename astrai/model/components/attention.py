@@ -56,9 +56,7 @@ class GQA(nn.Module):
             self.gate = Linear(dim, dim)
 
     def _split_heads(self, x: Tensor, n_heads) -> Tensor:
-        batch_size, seq_len, _ = x.shape
-        x = x.reshape(batch_size, seq_len, n_heads, self.head_dim)
-        return x
+        return x.reshape(*x.shape[:-1], n_heads, self.head_dim)
 
     def forward(
         self,
@@ -67,6 +65,7 @@ class GQA(nn.Module):
         attn_mask: Tensor = None,
         kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
         q = self._split_heads(self.q_proj(x), self.n_heads)
         k = self._split_heads(self.k_proj(x), self.n_kv_heads)
@@ -76,7 +75,9 @@ class GQA(nn.Module):
         if self.use_qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-        sdqa_out = attention(q, k, v, kv_cache, self.layer_id, attn_mask, is_causal)
+        sdqa_out = attention(
+            q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
+        ).reshape(*x.shape[:-1], self.dim)
 
         if self.use_gated_attention:
             sdqa_out = sdqa_out * F.sigmoid(self.gate(x))
@@ -141,17 +142,16 @@ class MLA(nn.Module):
         attn_mask: Tensor = None,
         kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
-        bsz, seq_len, _ = x.size()
-
         q = self.q_proj(x)
-        q = q.view(bsz, seq_len, self.n_heads, self.head_dim)
+        q = q.reshape(*x.shape[:-1], self.n_heads, self.head_dim)
 
         kv_compressed = self.kv_a_proj(x)
         kv_compressed = self.kv_norm(kv_compressed)
 
         kv = self.kv_b_proj(kv_compressed)
-        kv = kv.view(bsz, seq_len, self.n_kv_heads, -1)
+        kv = kv.reshape(*x.shape[:-1], self.n_kv_heads, -1)
 
         k_nope, k_rope, v = torch.split(
             kv, [self.qk_nope_head_dim, self.qk_rope_head_dim, self.head_dim], dim=-1
@@ -171,7 +171,9 @@ class MLA(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        attn_out = attention(q, k, v, kv_cache, self.layer_id, attn_mask, is_causal)
+        attn_out = attention(
+            q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
+        ).reshape(*x.shape[:-1], self.dim)
 
         if self.use_gated_attention:
             attn_out = attn_out * F.sigmoid(self.gate(x))
