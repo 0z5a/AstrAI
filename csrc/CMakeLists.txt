@@ -61,9 +61,6 @@ foreach(name ${KERNELS})
         "${PYTHON_INCLUDE_DIR}")
 
     target_link_libraries(${name} PRIVATE ${TORCH_LIBS})
-    if(${name} STREQUAL "fp8_mm")
-        target_link_libraries(${name} PRIVATE CUDA::cublasLt)
-    endif()
     target_link_options(${name} PRIVATE "-Wl,-rpath,${TORCH_LIB_DIR}")
 
     target_compile_options(${name} PRIVATE
