@@ -13,10 +13,10 @@ scripts/train.sh           host-side CLI: env loading, preflight, compose wrappe
 
 | Layer | Responsible for | NOT responsible for |
 |-------|-----------------|---------------------|
-| `train.sh` | host paths, `.env.train`, preflight, lifecycle | training args, GPU selection, parallel mode |
+| `train.sh` | host paths, `.env.train` + `infra:` YAML overrides, preflight, lifecycle | training args, GPU selection, parallel mode |
 | compose | GPU passthrough, mounts, in-container env (NCCL) | training args (beyond `TRAIN_*` forwarding) |
 | entrypoint | `--ckpt_dir/--nprocs/--parallel_mode/--param_path`, resume | hyperparameters (YAML/CLI) |
-| `train.yaml` | hyperparameters (`_merge_yaml_into_kwargs`, CLI wins) | container paths, process count |
+| `train.yaml` | hyperparameters (`_merge_yaml_into_kwargs`, CLI wins); top-level `infra:` host vars | container paths, process count |
 
 ## Path Conventions
 
@@ -33,9 +33,10 @@ scripts/train.sh           host-side CLI: env loading, preflight, compose wrappe
 1. **Filter GPUs once**: compose passes the full physical set (`count: all`); `CUDA_VISIBLE_DEVICES` filters inside by physical index. Never `count: N` + physical indices (double filter leaves 1 card → `device_id out of range`).
 2. **In-container UID = host UID**: Dockerfile builds the user via `USER_UID/USER_GID` args; `train.sh` injects `ASTRAI_UID/GID` (bash `UID` is readonly). compose `user:` alone does not create the /etc/passwd entry — torch's `getpass.getuser()` then dies with `uid not found`.
 3. **In-container env vars are explicit**: `.env.train` (`--env-file`) is only compose's interpolation dictionary — never reaches the container. A var arrives only via a value-less `environment` entry (`- VAR`, read from the calling process env).
-4. **NCCL hang workaround** (this host): `NCCL_P2P_DISABLE=1` + `NCCL_NET_GDR_LEVEL=0` must be in-container.
-5. **Checkpoint complete =** `meta.json + config.json + model.safetensors + optimizer.pt + scheduler.pt`; `start` auto-resumes the latest complete one.
-6. **tqdm is silent without a TTY**: add `disable=False` in `astrai/trainer/train_callback.py`; `metric.jsonl` (per step) works as progress evidence regardless.
+4. **Host vars can come from `train.yaml` instead**: `scripts/train.sh load_infra()` reads the top-level `infra:` section of `TRAIN_CONFIG_FILE` (host side, before the container exists) and exports `TRAIN_JOB_NAME`, `TRAIN_DATA_DIR`, `TRAIN_MODEL_DIR`, `TRAIN_CHECKPOINT_DIR`, `TRAIN_GPU_COUNT`, `CUDA_VISIBLE_DEVICES`. Compose interpolation prefers the shell environment over `--env-file`, so `infra:` wins; keys absent from it fall back to `.env.train`. Requires python3 + PyYAML on the host. train.py only merges the `model/data/parallel/training/ckpt/log` sections, so the `infra` section is invisible to the trainer.
+5. **NCCL hang workaround** (this host): `NCCL_P2P_DISABLE=1` + `NCCL_NET_GDR_LEVEL=0` must be in-container.
+6. **Checkpoint complete =** `meta.json + config.json + model.safetensors + optimizer.pt + scheduler.pt`; `start` auto-resumes the latest complete one.
+7. **tqdm is silent without a TTY**: add `disable=False` in `astrai/trainer/train_callback.py`; `metric.jsonl` (per step) works as progress evidence regardless.
 
 ## Operations
 
@@ -52,6 +53,6 @@ bash scripts/train.sh clean --keep 5   # prune old checkpoints (--force to delet
 
 - `docker-compose.yml` — trainer service: `count: all`, `ASTRAI_UID/GID` build args + `user:`, env whitelist, mounts
 - `Dockerfile` — production stage builds user from `USER_UID/USER_GID`; `ENV HOME=/home/astrai`; `USER astrai`
-- `scripts/train.sh` — `load_env` filters `UID=` lines (readonly var); `compose()` injects `ASTRAI_UID/GID`
+- `scripts/train.sh` — `load_env` filters `UID=` lines (readonly var); `load_infra` reads the `infra:` section from `TRAIN_CONFIG_FILE`; `compose()` injects `ASTRAI_UID/GID`
 - `scripts/docker/train-entrypoint.sh` — GPU-count resolution, parallel mode, resume
-- `.env.train`, `train.yaml` — host-specific; templates from `scripts/train.sh init`; scientific-notation floats (`2e-5`) parse correctly since train.py uses the YAML 1.2 float schema
+- `.env.train`, `train.yaml` — host-specific; templates from `scripts/train.sh init`; scientific-notation floats (`2e-5`) parse correctly since train.py uses the YAML 1.2 float schema; `.env.train` is the fallback for host vars not present in the `infra:` section

@@ -66,6 +66,65 @@ resolve_path() {
     fi
 }
 
+# Read the optional top-level `infra:` section from TRAIN_CONFIG_FILE and
+# export the host-side variables it overrides (job name, mount paths, GPU
+# filter). Compose interpolation prefers the shell environment over the
+# --env-file, so these exports win over .env.train; keys absent from `infra`
+# fall back to the env file. Requires python3 with PyYAML on the host.
+load_infra() {
+    local infra_file exports
+
+    [[ -n "${TRAIN_CONFIG_FILE:-}" ]] || return 0
+    infra_file="$(resolve_path "${TRAIN_CONFIG_FILE}")"
+    [[ -f "${infra_file}" ]] || return 0
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        die "TRAIN_CONFIG_FILE is set but python3 is missing; it is needed to read the 'infra' section"
+    fi
+    if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        die "TRAIN_CONFIG_FILE is set but PyYAML is missing on the host (install python3-yaml)"
+    fi
+
+    exports="$(TRAIN_INFRA_FILE="${infra_file}" python3 - <<'PYEOF'
+import os
+import shlex
+import sys
+import yaml
+
+path = os.environ["TRAIN_INFRA_FILE"]
+try:
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception as exc:
+    print(f"failed to parse {path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+infra = cfg.get("infra") or {}
+if not isinstance(infra, dict):
+    print(f"the 'infra' section in {path} must be a mapping", file=sys.stderr)
+    sys.exit(1)
+
+mapping = {
+    "job_name": "TRAIN_JOB_NAME",
+    "data_dir": "TRAIN_DATA_DIR",
+    "model_dir": "TRAIN_MODEL_DIR",
+    "checkpoint_dir": "TRAIN_CHECKPOINT_DIR",
+    "gpu_count": "TRAIN_GPU_COUNT",
+    "cuda_visible_devices": "CUDA_VISIBLE_DEVICES",
+}
+for key, env_name in mapping.items():
+    if key in infra:
+        print(f"export {env_name}={shlex.quote(str(infra[key]))}")
+PYEOF
+)"
+    if [[ -n "${exports}" ]]; then
+        eval "${exports}"
+        log_info "Applied infra overrides from ${infra_file}"
+    fi
+
+    validate_job_name "${TRAIN_JOB_NAME}"
+}
+
 checkpoint_dir() {
     printf '%s/%s\n' "$(resolve_path "${TRAIN_CHECKPOINT_DIR}")" "${TRAIN_JOB_NAME}"
 }
@@ -99,6 +158,8 @@ TRAIN_CHECKPOINT_DIR=./checkpoints
 TRAIN_CONFIG_FILE=
 TRAIN_GPU_COUNT=all
 # CUDA_VISIBLE_DEVICES=0,1
+# TRAIN_* vars above can be overridden per-job via the top-level `infra:`
+# section in TRAIN_CONFIG_FILE (see docs/developer/docker-training.md).
 CUDA_TAG=cu128
 TRAIN_IPC_MODE=host
 TRAIN_STOP_GRACE_PERIOD=10m
@@ -245,6 +306,7 @@ main() {
     [[ -n "${command}" ]] || { usage; exit 1; }
     shift || true
     load_env
+    load_infra
 
     case "${command}" in
         init)
