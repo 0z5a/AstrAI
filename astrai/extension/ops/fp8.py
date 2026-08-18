@@ -47,6 +47,58 @@ def _fp8_mm_cpu(a, b, sx, sw):
     return torch.mm(a.float(), b.float().t()).to(torch.bfloat16)
 
 
+@custom_op("custom::fp8_mm_prequant", mutates_args=())
+def fp8_mm_prequant(
+    a: torch.Tensor, b: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Pre-quantized FP8 inputs, fused FP8 GEMM, FP32 accumulation, BF16 out."""
+
+
+@fp8_mm_prequant.register_fake
+def _fp8_mm_prequant_fake(a, b, scale):
+    return torch.empty((a.size(0), b.size(0)), device=a.device, dtype=torch.bfloat16)
+
+
+@fp8_mm_prequant.register_kernel("cuda")
+def _fp8_mm_prequant_cuda(a, b, scale):
+    if not (a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn):
+        raise TypeError(
+            f"pre-quantized FP8 GEMM requires fp8 inputs, got {a.dtype}/{b.dtype}"
+        )
+    return _mod().fp8_mm_prequant(a, b, scale)
+
+
+@fp8_mm_prequant.register_kernel("cpu")
+def _fp8_mm_prequant_cpu(a, b, scale):
+    return (a.float() @ b.float().t() * scale).to(torch.bfloat16)
+
+
+@custom_op("custom::fp8_mm_prequant_fp8", mutates_args=())
+def fp8_mm_prequant_fp8(
+    a: torch.Tensor, b: torch.Tensor, scale: torch.Tensor, out_scale: torch.Tensor
+) -> torch.Tensor:
+    """FP8 inputs and FP8 output: fused FP8 GEMM with FP32 accumulation."""
+
+
+@fp8_mm_prequant_fp8.register_fake
+def _fp8_mm_prequant_fp8_fake(a, b, scale, out_scale):
+    return torch.empty((a.size(0), b.size(0)), device=a.device, dtype=a.dtype)
+
+
+@fp8_mm_prequant_fp8.register_kernel("cuda")
+def _fp8_mm_prequant_fp8_cuda(a, b, scale, out_scale):
+    if not (a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn):
+        raise TypeError(
+            f"pre-quantized FP8 GEMM requires fp8 inputs, got {a.dtype}/{b.dtype}"
+        )
+    return _mod().fp8_mm_prequant_fp8(a, b, scale, out_scale)
+
+
+@fp8_mm_prequant_fp8.register_kernel("cpu")
+def _fp8_mm_prequant_fp8_cpu(a, b, scale, out_scale):
+    return (a.float() @ b.float().t() * scale * out_scale).to(torch.float8_e4m3fn)
+
+
 def linear_forward_scaled(x, w, bias, sx, sw, sx_inv, sw_inv, amax_x, amax_w):
     """Quantize BF16 inputs to FP8, accumulate in FP32, and return BF16.
 

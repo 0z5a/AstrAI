@@ -94,3 +94,63 @@ def test_fused_fp8_linear_forward_and_backward():
     torch.testing.assert_close(amax_x, x.abs().amax().float().reshape(1))
     torch.testing.assert_close(amax_w, weight.abs().amax().float().reshape(1))
     torch.testing.assert_close(amax_g, grad.abs().amax().float().reshape(1))
+
+
+def test_fp8_mm_prequant_matches_scaled_mm():
+    torch.manual_seed(11)
+    m, n, k = 512, 4096, 4096
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    a8 = a.to(torch.float8_e4m3fn)
+    w8 = weight.to(torch.float8_e4m3fn)
+    scale = torch.tensor([2.5], device="cuda")
+
+    out = get_module("fp8_mm").fp8_mm_prequant(a8, w8, scale)
+
+    # Reference via fp64: FP8 quantization error is dominated by the 3-bit
+    # mantissa, so the tolerance must track the input quantization scale.
+    ref = (a8.float().double() @ w8.float().double().t() * 2.5).to(torch.bfloat16)
+    assert out.dtype == torch.bfloat16
+    assert out.shape == (m, n)
+    torch.testing.assert_close(out, ref, atol=6.0, rtol=0.05)
+
+    # Cross-check against torch's native FP8 GEMM on identical inputs.
+    try:
+        torch._scaled_mm(
+            a8,
+            w8.t(),
+            torch.full((m, 1), 2.5, device="cuda"),
+            torch.ones((1, n), device="cuda"),
+            out_dtype=torch.bfloat16,
+        )
+    except (RuntimeError, NotImplementedError):
+        return
+    torch.testing.assert_close(
+        out,
+        torch._scaled_mm(
+            a8,
+            w8.t(),
+            torch.full((m, 1), 2.5, device="cuda"),
+            torch.ones((1, n), device="cuda"),
+            out_dtype=torch.bfloat16,
+        ),
+        atol=2.0,
+        rtol=0.01,
+    )
+
+
+def test_fp8_mm_prequant_fp8_output():
+    torch.manual_seed(13)
+    m, n, k = 512, 4096, 4096
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    a8 = a.to(torch.float8_e4m3fn)
+    w8 = weight.to(torch.float8_e4m3fn)
+    scale = torch.tensor([2.5], device="cuda")
+    out_scale = torch.tensor([0.1], device="cuda")
+
+    out = get_module("fp8_mm").fp8_mm_prequant_fp8(a8, w8, scale, out_scale)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.shape == (m, n)
+    ref = (a8.float().double() @ w8.float().double().t() * 2.5 * 0.1).to(torch.bfloat16)
+    torch.testing.assert_close(out.float().to(torch.bfloat16), ref, atol=1.0, rtol=0.05)
