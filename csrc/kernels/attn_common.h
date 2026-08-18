@@ -36,6 +36,8 @@ struct AttentionParams {
     const T* __restrict__ q_ptr;
     const T* __restrict__ k_ptr;
     const T* __restrict__ v_ptr;
+    const T* __restrict__ new_k_ptr;
+    const T* __restrict__ new_v_ptr;
     T* __restrict__ o_ptr;
     const bool* __restrict__ mask;
 
@@ -49,6 +51,9 @@ struct AttentionParams {
     int kv_h_stride;
     int kv_l_stride;
     int kv_d_stride;
+
+    int new_kv_b_stride;
+    int new_kv_h_stride;
 
     int mask_b_stride;
     int mask_h_stride;

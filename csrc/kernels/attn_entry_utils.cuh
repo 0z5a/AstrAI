@@ -130,6 +130,8 @@ inline void attn_pack_params(
     p.q_ptr = (const T*)q.data_ptr();
     p.k_ptr = (const T*)k.data_ptr();
     p.v_ptr = (const T*)v.data_ptr();
+    p.new_k_ptr = nullptr;
+    p.new_v_ptr = nullptr;
     p.o_ptr = nullptr;
     p.o_part = nullptr;
     p.ml_part = nullptr;
@@ -148,6 +150,8 @@ inline void attn_pack_paged_decode_params(
     torch::Tensor req_to_token,
     torch::Tensor req_pool_indices,
     torch::Tensor kv_indptr,
+    const c10::optional<torch::Tensor>& new_k,
+    const c10::optional<torch::Tensor>& new_v,
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
@@ -190,6 +194,33 @@ inline void attn_pack_paged_decode_params(
     p.kv_indptr = kv_indptr.data_ptr<int>();
     p.qo_indptr = nullptr;
     p.max_context_len = (int)req_to_token.size(1);
+
+    TORCH_CHECK(new_k.has_value() == new_v.has_value(),
+                "new_k and new_v must be provided together");
+    if (new_k.has_value()) {
+        auto nk = new_k.value();
+        auto nv = new_v.value();
+        TORCH_CHECK(nk.is_cuda() && nv.is_cuda(), "new K/V must be CUDA tensors");
+        TORCH_CHECK(nk.dtype() == torch::kBFloat16 && nv.dtype() == torch::kBFloat16,
+                    "new K/V must be bf16");
+        TORCH_CHECK(nk.dim() == 3 && nv.dim() == 3,
+                    "new K/V must be 3D [batch, kv_head, head_dim]");
+        TORCH_CHECK(nk.sizes() == nv.sizes(), "new K and V must have identical shapes");
+        TORCH_CHECK(nk.strides() == nv.strides(),
+                    "new K and V must have identical strides");
+        TORCH_CHECK(nk.size(0) == p.batch && nk.size(1) == p.kv_head
+                    && nk.size(2) == p.head_dim, "new K/V shape mismatch");
+        TORCH_CHECK(nk.stride(2) == 1 && nv.stride(2) == 1,
+                    "new K/V head_dim must be contiguous");
+        p.new_k_ptr = (const T*)nk.data_ptr();
+        p.new_v_ptr = (const T*)nv.data_ptr();
+        p.new_kv_b_stride = (int)nk.stride(0);
+        p.new_kv_h_stride = (int)nk.stride(1);
+    } else {
+        p.new_k_ptr = nullptr;
+        p.new_v_ptr = nullptr;
+        p.new_kv_b_stride = p.new_kv_h_stride = 0;
+    }
 
     p.causal_offset = (int)causal_offset;
     p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
@@ -279,6 +310,8 @@ inline void attn_pack_paged_prefill_params(
 
     p.k_ptr = (const T*)k_cache.data_ptr();
     p.v_ptr = (const T*)v_cache.data_ptr();
+    p.new_k_ptr = nullptr;
+    p.new_v_ptr = nullptr;
     p.q_ptr = (const T*)q.data_ptr();
     p.req_to_token = req_to_token.data_ptr<int>();
     p.req_pool_indices = req_pool_indices.data_ptr<int>();

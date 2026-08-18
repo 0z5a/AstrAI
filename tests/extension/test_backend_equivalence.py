@@ -7,6 +7,7 @@ seq_lens with padding mask), and end-to-end scheduler.run_batch.
 import torch
 
 from astrai.extension import ATTN_BACKEND, attn_backend
+from astrai.extension.ops.attention import attn_paged_decode
 from astrai.inference.cache import PagePool, TaskCacheManager
 from astrai.inference.runtime.graph import CudaGraphContext
 from astrai.inference.scheduler import InferenceScheduler
@@ -158,6 +159,56 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
 
     diff = (out_torch["logits"].float() - out_cuda["logits"].float()).abs().max().item()
     assert diff < 0.05, f"Decode diff (mixed seq_lens): {diff}"
+
+
+@skip_no_kernel
+def test_paged_decode_appends_new_kv_in_kernel():
+    """Fused decode writes current-token K/V to each request's paged slot."""
+    pool = PagePool(
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=D,
+        max_batch_size=2,
+        max_seq_len=64,
+        device="cuda",
+        dtype=torch.bfloat16,
+        page_size=8,
+        n_tokens=128,
+    )
+    task_cache = _mk_task_cache(pool)
+    ws = _ws(pool)
+    task_cache.task_alloc("t1", list(range(8)))
+    task_cache.task_alloc("t2", list(range(6)))
+    task_cache.task_extend("t1", 8)
+    task_cache.task_extend("t2", 6)
+    kv_cache = task_cache.bind(["t1", "t2"], ws)
+
+    q = torch.randn(2, 2, D, device="cuda", dtype=torch.bfloat16)
+    new_k = torch.randn(2, 1, D, device="cuda", dtype=torch.bfloat16)
+    new_v = torch.randn(2, 1, D, device="cuda", dtype=torch.bfloat16)
+    out = attn_paged_decode(
+        q,
+        kv_cache.k_buffer[0],
+        kv_cache.v_buffer[0],
+        kv_cache.req_to_token,
+        kv_cache.req_pool_indices,
+        kv_cache.kv_indptr,
+        new_k=new_k,
+        new_v=new_v,
+        is_causal=True,
+        o_part_buf=kv_cache.decode_o_part,
+        ml_part_buf=kv_cache.decode_ml_part,
+        out_buf=kv_cache.decode_out,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        kv_cache.k_buffer[0, kv_cache.out_cache_loc], new_k, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        kv_cache.v_buffer[0, kv_cache.out_cache_loc], new_v, rtol=0, atol=0
+    )
+    assert torch.isfinite(out).all()
 
 
 @skip_no_kernel

@@ -8,6 +8,8 @@ torch::Tensor attn_paged_decode(
     torch::Tensor req_to_token,
     torch::Tensor req_pool_indices,
     torch::Tensor kv_indptr,
+    c10::optional<torch::Tensor> new_k,
+    c10::optional<torch::Tensor> new_v,
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
@@ -21,6 +23,7 @@ torch::Tensor attn_paged_decode(
     AttentionParams<bf16> p;
     attn_pack_paged_decode_params(q, k_cache, v_cache,
                                    req_to_token, req_pool_indices, kv_indptr,
+                                   new_k, new_v,
                                    mask, causal_offset, scale, p);
 
     torch::Tensor O;
@@ -71,6 +74,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("req_to_token"),
         py::arg("req_pool_indices"),
         py::arg("kv_indptr"),
+        py::arg("new_k") = py::none(),
+        py::arg("new_v") = py::none(),
         py::arg("mask") = py::none(),
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,

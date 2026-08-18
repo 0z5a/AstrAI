@@ -97,6 +97,8 @@ def attn_paged_decode(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
+    new_k: Optional[torch.Tensor] = None,
+    new_v: Optional[torch.Tensor] = None,
     mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
     o_part_buf: Optional[torch.Tensor] = None,
@@ -116,6 +118,8 @@ def attn_paged_decode(
         req_to_token: [num_reqs, max_context_len] (int32) — token -> slot
         req_pool_indices: [batch] (int32) — rows into req_to_token
         kv_indptr: [batch+1] (int32) — prefix sum of per-request seq_lens
+        new_k: current-token K to append, [batch, n_kv_heads, head_dim]
+        new_v: current-token V to append, same shape as new_k
         mask: 2D [batch, max_context_len] (bool, True=keep) or None
         is_causal: apply causal mask
         o_part_buf: pre-allocated split-KV o partial buffer (workflow bypass)
@@ -134,6 +138,8 @@ def attn_paged_decode(
         req_to_token,
         req_pool_indices,
         kv_indptr,
+        new_k=new_k,
+        new_v=new_v,
         mask=mask,
         causal_offset=causal_offset,
         o_part_buf=o_part_buf,

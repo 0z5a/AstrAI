@@ -253,28 +253,6 @@ def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     )
 
 
-def _write_and_gather_kv(
-    kv_cache: "KVCache",
-    k: Tensor,
-    v: Tensor,
-    layer_id: int,
-    q: Tensor,
-    attn_mask: Optional[Tensor],
-) -> tuple[Tensor, Tensor]:
-    kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
-    kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
-    max_len = kv_cache.max_len
-    indices = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_len]
-    if q.size(1) == 1 and attn_mask is not None and attn_mask.dim() == 4:
-        pos_mask = attn_mask[:, 0, 0]
-    else:
-        pos_mask = (
-            torch.arange(max_len, device=q.device)[None, :] < kv_cache.seq_lens[:, None]
-        )
-    indices = torch.where(pos_mask, indices, torch.zeros_like(indices))
-    return kv_cache.k_buffer[layer_id, indices], kv_cache.v_buffer[layer_id, indices]
-
-
 def attention(
     q: Tensor,
     k: Tensor,
@@ -565,10 +543,6 @@ class CudaBackend(AttentionBackend):
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
 
-        loc = kv_cache.out_cache_loc
-        kv_cache.k_buffer[layer_id, loc] = k
-        kv_cache.v_buffer[layer_id, loc] = v
-
         kv_indptr = kv_cache.kv_indptr
 
         out = attn_paged_decode(
@@ -578,6 +552,8 @@ class CudaBackend(AttentionBackend):
             kv_cache.req_to_token,
             kv_cache.req_pool_indices,
             kv_indptr,
+            new_k=k,
+            new_v=v,
             is_causal=True,
             o_part_buf=kv_cache.decode_o_part,
             ml_part_buf=kv_cache.decode_ml_part,

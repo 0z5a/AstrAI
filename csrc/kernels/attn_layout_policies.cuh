@@ -160,6 +160,14 @@ struct ContigKV {
             + (int64_t)d * p.kv_d_stride;
         return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], valid};
     }
+
+    template <int VEC>
+    DEVICE_FORCEINLINE KVAddr decode_addr(
+        const AttentionParams<bf16>& p, const KVContext& c,
+        int, int, int kc, int d, bool valid, bool) {
+        int token = resolve_token(p, c, kc, valid);
+        return kv_addr_from_token(p, c, token, d);
+    }
 };
 
 // ---- Paged (SGLang-style flat pool) K/V ----
@@ -208,5 +216,40 @@ struct PagedKV {
         const int safe_slot = valid ? slot : 0;
         const int64_t gmem_off = (int64_t)safe_slot * c.pool_stride + c.head_off + d;
         return {&p.k_ptr[gmem_off], &p.v_ptr[gmem_off], valid};
+    }
+
+    DEVICE_FORCEINLINE KVAddr new_kv_addr(
+        const AttentionParams<bf16>& p, int batch, int kv_head, int d) {
+        const int64_t off = (int64_t)batch * p.new_kv_b_stride
+            + (int64_t)kv_head * p.new_kv_h_stride + d;
+        return {&p.new_k_ptr[off], &p.new_v_ptr[off], true};
+    }
+
+    DEVICE_FORCEINLINE void store_new_kv(
+        const AttentionParams<bf16>& p, const KVContext& c,
+        int seq_len, int d, const KVAddr& src) {
+        int slot = resolve_token(p, c, seq_len - 1, true);
+        const int64_t off = (int64_t)slot * c.pool_stride + c.head_off + d;
+        const_cast<bf16*>(p.k_ptr)[off] = *reinterpret_cast<const bf16*>(src.k);
+        const_cast<bf16*>(p.v_ptr)[off] = *reinterpret_cast<const bf16*>(src.v);
+    }
+
+    template <int VEC>
+    DEVICE_FORCEINLINE KVAddr decode_addr(
+        const AttentionParams<bf16>& p, const KVContext& c,
+        int batch, int kv_head, int kc, int d, bool valid, bool persist) {
+        if (p.new_k_ptr && valid && kc == kv_len(p, batch) - 1) {
+            KVAddr src = new_kv_addr(p, batch, kv_head, d);
+            if (persist) {
+                #pragma unroll
+                for (int j = 0; j < VEC; j++) {
+                    KVAddr value = new_kv_addr(p, batch, kv_head, d + j);
+                    store_new_kv(p, c, kc + 1, d + j, value);
+                }
+            }
+            return src;
+        }
+        int token = resolve_token(p, c, kc, valid);
+        return kv_addr_from_token(p, c, token, d);
     }
 };
