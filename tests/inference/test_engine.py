@@ -8,6 +8,17 @@ from astrai.inference import STOP
 from astrai.inference.engine import GenerateResult, InferenceEngine
 
 
+def _make_engine_mocks(decode=None):
+    """Build the standard mock model/tokenizer pair used by engine tests."""
+    mock_model = MagicMock()
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.encode.return_value = [1, 2, 3]
+    mock_tokenizer.stop_ids = [0]
+    if decode is not None:
+        mock_tokenizer.decode.return_value = decode
+    return mock_model, mock_tokenizer
+
+
 def test_result_append_single():
     r = GenerateResult(count=1)
     r.append("hello", 0)
@@ -102,11 +113,7 @@ def test_result_get_results():
 
 
 def test_engine_generate_non_streaming_single():
-    mock_model = MagicMock()
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.encode.return_value = [1, 2, 3]
-    mock_tokenizer.decode.return_value = "response"
-    mock_tokenizer.stop_ids = [0]
+    mock_model, mock_tokenizer = _make_engine_mocks(decode="response")
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
@@ -125,11 +132,7 @@ def test_engine_generate_non_streaming_single():
 
 
 def test_engine_generate_streaming_yields_tokens():
-    mock_model = MagicMock()
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.encode.return_value = [1, 2, 3]
-    mock_tokenizer.decode.return_value = "tok"
-    mock_tokenizer.stop_ids = [0]
+    mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
 
     callbacks_saved = []
 
@@ -154,11 +157,7 @@ def test_engine_generate_streaming_yields_tokens():
 
 
 def test_engine_generate_non_streaming_batch():
-    mock_model = MagicMock()
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.encode.return_value = [1, 2, 3]
-    mock_tokenizer.decode.return_value = "r"
-    mock_tokenizer.stop_ids = [0]
+    mock_model, mock_tokenizer = _make_engine_mocks(decode="r")
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
@@ -177,10 +176,7 @@ def test_engine_generate_non_streaming_batch():
 
 
 def test_engine_generate_zero_max_tokens_returns_empty():
-    mock_model = MagicMock()
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.encode.return_value = [1, 2, 3]
-    mock_tokenizer.stop_ids = [0]
+    mock_model, mock_tokenizer = _make_engine_mocks()
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
@@ -192,8 +188,7 @@ def test_engine_generate_zero_max_tokens_returns_empty():
 
 
 def test_engine_generate_zero_max_tokens_stream_is_empty():
-    mock_model = MagicMock()
-    mock_tokenizer = MagicMock()
+    mock_model, mock_tokenizer = _make_engine_mocks()
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
@@ -203,8 +198,7 @@ def test_engine_generate_zero_max_tokens_stream_is_empty():
 
 
 def test_engine_passes_backend_to_scheduler():
-    mock_model = MagicMock()
-    mock_tokenizer = MagicMock()
+    mock_model, mock_tokenizer = _make_engine_mocks()
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         InferenceEngine(
@@ -218,8 +212,7 @@ def test_engine_passes_backend_to_scheduler():
 
 
 def test_generate_captures_calling_backend_context():
-    mock_model = MagicMock()
-    mock_tokenizer = MagicMock()
+    mock_model, mock_tokenizer = _make_engine_mocks()
     captured = []
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:

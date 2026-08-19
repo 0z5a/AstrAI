@@ -39,6 +39,21 @@ def _make_model(config=None) -> AutoRegressiveLM:
     return AutoRegressiveLM(config)
 
 
+def _make_batch(config, batch_size=2, seq_len=8, with_extra=False):
+    """Build a random token batch, optionally with position ids and loss mask."""
+    vocab = config.vocab_size
+    batch = {
+        "input_ids": torch.randint(0, vocab, (batch_size, seq_len)),
+        "target_ids": torch.randint(0, vocab, (batch_size, seq_len)),
+    }
+    if with_extra:
+        batch["position_ids"] = (
+            torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
+        )
+        batch["loss_mask"] = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    return batch
+
+
 def test_model_forward_contract_uses_dense_training_and_packed_inference():
     from astrai.inference.cache import PagePool, TaskCacheManager
     from astrai.inference.workspace import InferenceWorkspace
@@ -180,13 +195,6 @@ class TestSEQStrategyMoE:
         self.model = _make_model(self.config).to(device)
         self.model.train()
 
-    def _make_batch(self, batch_size=2, seq_len=8):
-        vocab = self.config.vocab_size
-        input_ids = torch.randint(0, vocab, (batch_size, seq_len))
-        # target = input shifted right
-        target_ids = torch.randint(0, vocab, (batch_size, seq_len))
-        return {"input_ids": input_ids, "target_ids": target_ids}
-
     def test_compute_loss_returns_scalar(self):
         """compute_loss should return a scalar tensor."""
         strategy = SEQStrategy(
@@ -194,7 +202,7 @@ class TestSEQStrategyMoE:
             self.device,
             moe_aux_loss_coef=0.01,
         )
-        loss = strategy.compute_loss(self._make_batch())
+        loss = strategy.compute_loss(_make_batch(self.config))
         assert loss.ndim == 0
         assert loss.requires_grad
 
@@ -205,7 +213,7 @@ class TestSEQStrategyMoE:
             self.device,
             moe_aux_loss_coef=0.01,
         )
-        output = strategy.compute_loss_output(self._make_batch())
+        output = strategy.compute_loss_output(_make_batch(self.config))
 
         assert "loss" in output
         assert "metrics" in output
@@ -225,7 +233,7 @@ class TestSEQStrategyMoE:
             self.device,
             moe_aux_loss_coef=0.01,
         )
-        strategy.compute_loss_output(self._make_batch())
+        strategy.compute_loss_output(_make_batch(self.config))
 
         moe_metrics = strategy._moe_metrics
         assert moe_metrics, "_moe_metrics should not be empty for MoE model"
@@ -246,7 +254,7 @@ class TestSEQStrategyMoE:
             self.device,
             moe_aux_loss_coef=0.0,
         )
-        output = strategy.compute_loss_output(self._make_batch())
+        output = strategy.compute_loss_output(_make_batch(self.config))
         metrics = output["metrics"]
 
         # task_loss and loss should be equal (aux weighted by zero)
@@ -268,7 +276,7 @@ class TestSEQStrategyMoE:
             self.device,
             moe_aux_loss_coef=0.01,
         )
-        output = strategy.compute_loss_output(self._make_batch())
+        output = strategy.compute_loss_output(_make_batch(self.config))
         assert output["metrics"]["loss"] > output["metrics"]["task_loss"] + 1e-12
 
     def test_factory_creates_strategy_with_coef(self):
@@ -294,7 +302,7 @@ class TestSEQStrategyMoE:
             self.device,
             moe_aux_loss_coef=0.01,
         )
-        output = strategy.compute_loss_output(self._make_batch())
+        output = strategy.compute_loss_output(_make_batch(self.config))
         metrics = output["metrics"]
 
         assert "moe_aux_loss" not in metrics
@@ -313,19 +321,6 @@ class TestSFTStrategyMoE:
         self.model = _make_model(self.config).to(device)
         self.model.train()
 
-    def _make_batch(self, batch_size=2, seq_len=8):
-        vocab = self.config.vocab_size
-        input_ids = torch.randint(0, vocab, (batch_size, seq_len))
-        target_ids = torch.randint(0, vocab, (batch_size, seq_len))
-        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
-        loss_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-        return {
-            "input_ids": input_ids,
-            "target_ids": target_ids,
-            "position_ids": position_ids,
-            "loss_mask": loss_mask,
-        }
-
     def test_compute_loss_output_with_aux_loss(self):
         """SFTStrategy produces MoE metrics when coef > 0."""
         strategy = SFTStrategy(
@@ -333,7 +328,7 @@ class TestSFTStrategyMoE:
             self.device,
             moe_aux_loss_coef=0.01,
         )
-        output = strategy.compute_loss_output(self._make_batch())
+        output = strategy.compute_loss_output(_make_batch(self.config, with_extra=True))
 
         metrics = output["metrics"]
         assert "moe_aux_loss" in metrics
@@ -351,7 +346,7 @@ class TestSFTStrategyMoE:
             self.device,
             moe_aux_loss_coef=0.0,
         )
-        output = strategy.compute_loss_output(self._make_batch())
+        output = strategy.compute_loss_output(_make_batch(self.config, with_extra=True))
         metrics = output["metrics"]
 
         assert metrics["loss"] == pytest.approx(metrics["task_loss"], abs=1e-6)

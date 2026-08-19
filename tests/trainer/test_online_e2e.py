@@ -1,4 +1,4 @@
-"""End-to-end integration test for online DPO rollout."""
+"""End-to-end integration tests for online GRPO/DPO rollout."""
 
 import os
 from functools import partial
@@ -40,7 +40,7 @@ class InstructionDataset(Dataset):
 class LengthRewardModel(BaseRewardModel):
     """Rewards each response by its (non-pad) token count.
 
-    Enough for DPO to distinguish chosen/rejected from the rollout group.
+    Gives the group-normalized advantage a non-degenerate signal.
     """
 
     def score(self, prompts, responses):
@@ -75,31 +75,34 @@ def _scheduler_fn(optim):
     )
 
 
+_ONLINE_STRATEGIES = [
+    pytest.param(
+        "online_grpo",
+        {"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
+        id="grpo",
+    ),
+    pytest.param("online_dpo", {"beta": 0.1, "group_size": 2}, id="dpo"),
+]
+
+
 @pytest.mark.integration
-def test_online_dpo_end_to_end(base_test_env):
-    """Run one epoch of online DPO with KV-cache-backed rollout."""
+@pytest.mark.parametrize(("strategy", "strategy_kwargs"), _ONLINE_STRATEGIES)
+def test_online_rollout_end_to_end(base_test_env, strategy, strategy_kwargs):
+    """Run one epoch of online RL rollout with KV-cache-backed generation."""
     test_dir = base_test_env["test_dir"]
     device = base_test_env["device"]
     tokenizer = base_test_env["tokenizer"]
     model_config = base_test_env["transformer_config"]
 
-    # Equip tokenizer with a chat template so RolloutGenerator can
-    # render instruction/input via apply_chat_template.
     tokenizer.set_chat_template(CHAT_TEMPLATE)
     tokenizer.save_pretrained(test_dir)
 
-    model_fn = partial(_model_fn, model_config)
-    optimizer_fn = _optimizer_fn
-    scheduler_fn = _scheduler_fn
-
-    dataset = InstructionDataset()
-
     train_config = TrainConfig(
-        strategy="online_dpo",
-        model_fn=model_fn,
-        dataset=dataset,
-        optimizer_fn=optimizer_fn,
-        scheduler_fn=scheduler_fn,
+        strategy=strategy,
+        model_fn=partial(_model_fn, model_config),
+        dataset=InstructionDataset(),
+        optimizer_fn=_optimizer_fn,
+        scheduler_fn=_scheduler_fn,
         ckpt_dir=os.path.join(test_dir, "ckpt"),
         n_epoch=1,
         batch_per_device=2,
@@ -109,7 +112,7 @@ def test_online_dpo_end_to_end(base_test_env):
         device_type=device,
         nprocs=1,
         parallel_mode="none",
-        strategy_kwargs={"beta": 0.1, "group_size": 2},
+        strategy_kwargs=strategy_kwargs,
         rollout_interval=1,
         rollout_temperature=1.0,
         rollout_top_k=0,

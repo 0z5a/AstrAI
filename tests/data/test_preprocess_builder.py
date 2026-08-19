@@ -12,10 +12,10 @@ from astrai.preprocessing.builder import (
     SectionedMaskBuilder,
     SingleOutputMaskBuilder,
 )
-from tests.data.conftest import (
-    _CHAT_SECTIONS,
-    _INSTRUCTION_SECTIONS,
-    _TEXT_SECTIONS,
+from tests.data.factories import (
+    CHAT_SECTIONS,
+    INSTRUCTION_SECTIONS,
+    TEXT_SECTIONS,
     make_chat_config,
     make_dpo_chat_config,
     make_grpo_config,
@@ -101,7 +101,7 @@ def test_chat_uniform_masking(
     mask_rules, mask_default, expect_nonzero, chat_tokenizer, builder
 ):
     config = PipelineConfig(
-        input=InputConfig(sections=_CHAT_SECTIONS),
+        input=InputConfig(sections=CHAT_SECTIONS),
         mask=mask_rules,
         mask_default=mask_default,
         preprocessing=ProcessingConfig(max_seq_len=2048),
@@ -128,7 +128,7 @@ def test_chat_empty_messages(chat_tokenizer, builder):
 
 def test_chat_domain_extraction(chat_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=_CHAT_SECTIONS),
+        input=InputConfig(sections=CHAT_SECTIONS),
         mask={"assistant": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=2048),
@@ -147,7 +147,7 @@ def test_chat_domain_extraction(chat_tokenizer, builder):
 
 def test_chat_truncation(chat_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=_CHAT_SECTIONS),
+        input=InputConfig(sections=CHAT_SECTIONS),
         mask={"assistant": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=10),
@@ -237,7 +237,7 @@ def test_text_empty(test_tokenizer, builder):
 
 def test_text_too_short(test_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=_TEXT_SECTIONS),
+        input=InputConfig(sections=TEXT_SECTIONS),
         preprocessing=ProcessingConfig(min_chars=100),
     )
     assert builder.build({"text": "short"}, config, test_tokenizer) is None
@@ -245,7 +245,7 @@ def test_text_too_short(test_tokenizer, builder):
 
 def test_text_truncation(test_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=_TEXT_SECTIONS),
+        input=InputConfig(sections=TEXT_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=3, min_chars=1),
     )
     item = {"text": "This is a very long text that should be truncated"}
@@ -255,7 +255,7 @@ def test_text_truncation(test_tokenizer, builder):
 
 def test_sectioned_chat(chat_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=_CHAT_SECTIONS),
+        input=InputConfig(sections=CHAT_SECTIONS),
         mask={"system": "mask", "user": "mask", "assistant": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=2048),
@@ -275,7 +275,7 @@ def test_sectioned_chat(chat_tokenizer, builder):
 
 def test_sectioned_instruction(test_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=_INSTRUCTION_SECTIONS),
+        input=InputConfig(sections=INSTRUCTION_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=0),
     )
     item = {"prompt": "Q: Why?", "response": "A: Because."}
@@ -288,7 +288,7 @@ def test_sectioned_instruction(test_tokenizer, builder):
 
 def test_sectioned_text(test_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=_TEXT_SECTIONS),
+        input=InputConfig(sections=TEXT_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=1),
     )
     item = {"text": "Hello world, this is a test."}
@@ -299,7 +299,7 @@ def test_sectioned_text(test_tokenizer, builder):
 
 def test_sectioned_text_too_short(test_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=_TEXT_SECTIONS),
+        input=InputConfig(sections=TEXT_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=100),
     )
     assert builder.build({"text": "short"}, config, test_tokenizer) is None

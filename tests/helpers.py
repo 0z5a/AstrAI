@@ -4,10 +4,12 @@ import json
 import os
 
 import torch
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers
 from torch.utils.data import Dataset
 
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.transformer import AutoRegressiveLM
+from astrai.tokenize import AutoTokenizer
 
 TINY_CONFIG = dict(
     vocab_size=1000,
@@ -55,6 +57,44 @@ def make_model(device, **cfg_overrides):
     model = AutoRegressiveLM(cfg).to(device=device)
     model.eval()
     return model, cfg
+
+
+def build_test_tokenizer(
+    vocab_size: int = 1000,
+    *,
+    special_tokens=("<unk>", "<pad>"),
+    special_token_map=None,
+    add_prefix_space: bool = True,
+    train_data=None,
+    chat_template: str | None = None,
+) -> AutoTokenizer:
+    """Build a lightweight BPE ``AutoTokenizer`` for tests.
+
+    ``special_token_map`` defaults to ``{"unk_token", "pad_token"}``
+    pointing at the first two special tokens.
+    """
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(
+        add_prefix_space=add_prefix_space
+    )
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size,
+        min_frequency=1,
+        special_tokens=list(special_tokens),
+    )
+    tokenizer.train_from_iterator(
+        train_data if train_data is not None else [chr(i) for i in range(256)],
+        trainer,
+    )
+    auto_tokenizer = AutoTokenizer()
+    auto_tokenizer._tokenizer = tokenizer
+    auto_tokenizer._special_token_map = special_token_map or {
+        "unk_token": special_tokens[0],
+        "pad_token": special_tokens[1],
+    }
+    if chat_template is not None:
+        auto_tokenizer.set_chat_template(chat_template)
+    return auto_tokenizer
 
 
 def make_frozen(model, device):

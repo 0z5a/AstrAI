@@ -4,9 +4,9 @@ from astrai.config.preprocess_config import (
     InputConfig,
     PipelineConfig,
 )
-from tests.data.conftest import (
-    _INSTRUCTION_SECTIONS,
-    _TEXT_SECTIONS,
+from tests.data.factories import (
+    INSTRUCTION_SECTIONS,
+    TEXT_SECTIONS,
     make_dpo_chat_config,
 )
 
@@ -43,26 +43,26 @@ def test_from_dict_flat():
 
 def test_to_dict_roundtrip():
     config = PipelineConfig(
-        input=InputConfig(sections=_INSTRUCTION_SECTIONS),
+        input=InputConfig(sections=INSTRUCTION_SECTIONS),
         mask={"prompt": "mask", "response": "train"},
         mask_default="mask",
     )
     d = config.to_dict()
     config2 = PipelineConfig.from_dict(d)
-    assert config2.input.sections == _INSTRUCTION_SECTIONS
+    assert config2.input.sections == INSTRUCTION_SECTIONS
     assert config2.mask == {"prompt": "mask", "response": "train"}
 
 
 def test_to_file_from_file(temp_dir):
     config = PipelineConfig(
-        input=InputConfig(sections=_TEXT_SECTIONS),
+        input=InputConfig(sections=TEXT_SECTIONS),
         mask={"text": "train"},
         mask_default="mask",
     )
     path = os.path.join(temp_dir, "config.json")
     config.to_file(path)
     loaded = PipelineConfig.from_file(path)
-    assert loaded.input.sections == _TEXT_SECTIONS
+    assert loaded.input.sections == TEXT_SECTIONS
     assert loaded.mask == {"text": "train"}
 
 

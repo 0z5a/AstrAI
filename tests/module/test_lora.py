@@ -1,9 +1,6 @@
-import tempfile
-
 import pytest
 import torch
 
-from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model import AutoRegressiveLM
 from astrai.model.components.linear import Linear
 from astrai.model.components.lora import (
@@ -16,22 +13,20 @@ from astrai.model.components.lora import (
     merge_lora,
     save_lora,
 )
+from tests.helpers import make_tiny_config
 
-MODEL_KWARGS = dict(
+LORA_MODEL_KWARGS = dict(
     vocab_size=1000,
     hidden_size=64,
     num_attention_heads=4,
     num_key_value_heads=2,
     intermediate_size=128,
-    num_hidden_layers=2,
     max_position_embeddings=32,
-    rms_norm_eps=1e-5,
 )
 
 
 def _make_model(**kwargs):
-    kw = {**MODEL_KWARGS, **kwargs}
-    config = AutoRegressiveLMConfig(**kw)
+    config = make_tiny_config(**{**LORA_MODEL_KWARGS, **kwargs})
     model = AutoRegressiveLM(config)
     model.eval()
     return model
@@ -227,7 +222,7 @@ def test_state_dict_after_inject_consistent_with_original():
     assert len(lora_keys) > 0
 
 
-def test_save_load_roundtrip():
+def test_save_load_roundtrip(temp_dir):
     model = _make_model()
     cfg = inject_lora(model, r=4, alpha=8, target_modules={"q_proj"})
 
@@ -240,20 +235,19 @@ def test_save_load_roundtrip():
     with torch.no_grad():
         out_src = model(x)["logits"].clone()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        save_lora(model, tmpdir, cfg)
+    save_lora(model, temp_dir, cfg)
 
-        model2 = _make_model()
-        model2.load_state_dict(model.state_dict(), strict=False)
-        load_lora(model2, tmpdir)
+    model2 = _make_model()
+    model2.load_state_dict(model.state_dict(), strict=False)
+    load_lora(model2, temp_dir)
 
-        with torch.no_grad():
-            out_dst = model2(x)["logits"]
+    with torch.no_grad():
+        out_dst = model2(x)["logits"]
 
-        torch.testing.assert_close(out_src, out_dst)
+    torch.testing.assert_close(out_src, out_dst)
 
 
-def test_save_after_merge_raises():
+def test_save_after_merge_raises(temp_dir):
     model = _make_model()
     cfg = inject_lora(model, r=4, alpha=8, target_modules={"q_proj"})
 
@@ -262,16 +256,14 @@ def test_save_after_merge_raises():
             if isinstance(m, LoRALinear):
                 m.lora_B.fill_(0.5)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        save_lora(model, tmpdir, cfg)
-        merge_lora(model)
+    save_lora(model, temp_dir, cfg)
+    merge_lora(model)
 
-        with tempfile.TemporaryDirectory() as tmpdir2:
-            with pytest.raises(RuntimeError, match="No LoRA parameters"):
-                save_lora(model, tmpdir2, cfg)
+    with pytest.raises(RuntimeError, match="No LoRA parameters"):
+        save_lora(model, temp_dir, cfg)
 
 
-def test_load_lora_on_already_injected():
+def test_load_lora_on_already_injected(temp_dir):
     model = _make_model()
     inject_lora(model, r=4, alpha=8, target_modules={"q_proj"})
 
@@ -280,18 +272,17 @@ def test_load_lora_on_already_injected():
             if isinstance(m, LoRALinear):
                 m.lora_B.fill_(0.5)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        save_lora(model, tmpdir, LoRAConfig(r=4, alpha=8, target_modules=("q_proj",)))
+    save_lora(model, temp_dir, LoRAConfig(r=4, alpha=8, target_modules=("q_proj",)))
 
-        model2 = _make_model()
-        model2.load_state_dict(model.state_dict(), strict=False)
-        inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
+    model2 = _make_model()
+    model2.load_state_dict(model.state_dict(), strict=False)
+    inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
 
-        load_lora(model2, tmpdir)
-        assert _get_lora_count(model2) > 0
+    load_lora(model2, temp_dir)
+    assert _get_lora_count(model2) > 0
 
 
-def test_load_lora_mismatched_r_raises():
+def test_load_lora_mismatched_r_raises(temp_dir):
     model = _make_model()
     cfg = inject_lora(model, r=8, alpha=16, target_modules={"q_proj"})
 
@@ -300,15 +291,14 @@ def test_load_lora_mismatched_r_raises():
             if isinstance(m, LoRALinear):
                 m.lora_B.fill_(0.5)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        save_lora(model, tmpdir, cfg)
+    save_lora(model, temp_dir, cfg)
 
-        model2 = _make_model()
-        model2.load_state_dict(model.state_dict(), strict=False)
-        inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
+    model2 = _make_model()
+    model2.load_state_dict(model.state_dict(), strict=False)
+    inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
 
-        with pytest.raises(RuntimeError, match="size mismatch"):
-            load_lora(model2, tmpdir)
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        load_lora(model2, temp_dir)
 
 
 def test_merge_preserves_output():

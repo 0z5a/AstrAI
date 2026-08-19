@@ -9,10 +9,10 @@ from astrai.config.preprocess_config import (
 )
 from astrai.preprocessing.packing import PackingStrategyFactory
 from astrai.preprocessing.pipeline import Pipeline, filter_by_length
-from tests.data.conftest import (
-    _CHAT_SECTIONS,
-    _INSTRUCTION_SECTIONS,
-    _TEXT_SECTIONS,
+from tests.data.factories import (
+    CHAT_SECTIONS,
+    INSTRUCTION_SECTIONS,
+    TEXT_SECTIONS,
     make_dpo_chat_config,
     make_grpo_no_template_config,
 )
@@ -54,7 +54,7 @@ def test_full_chat_pipeline(temp_dir, chat_tokenizer_dir):
         )
 
     config = PipelineConfig(
-        input=InputConfig(sections=_CHAT_SECTIONS),
+        input=InputConfig(sections=CHAT_SECTIONS),
         mask={"system": "mask", "user": "mask", "assistant": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=2048),
@@ -97,7 +97,7 @@ def test_full_text_pipeline(temp_dir, tokenizer_dir):
         )
 
     config = PipelineConfig(
-        input=InputConfig(sections=_TEXT_SECTIONS),
+        input=InputConfig(sections=TEXT_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=10),
         output=OutputConfig(storage_format="bin"),
     )
@@ -138,7 +138,7 @@ def test_full_instruction_pipeline(temp_dir, tokenizer_dir):
         )
 
     config = PipelineConfig(
-        input=InputConfig(sections=_INSTRUCTION_SECTIONS),
+        input=InputConfig(sections=INSTRUCTION_SECTIONS),
         mask={"prompt": "mask", "response": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=2048),
@@ -164,7 +164,7 @@ def test_dtype_override(temp_dir, tokenizer_dir):
         f.write(json.dumps({"prompt": "Q", "response": "A"}) + "\n")
 
     config = PipelineConfig(
-        input=InputConfig(sections=_INSTRUCTION_SECTIONS),
+        input=InputConfig(sections=INSTRUCTION_SECTIONS),
         mask={"prompt": "mask", "response": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=2048),
