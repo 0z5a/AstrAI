@@ -140,8 +140,10 @@ class TrainContextBuilder:
                         checkpoint.consumed_samples // per_step * per_step
                     )
                     state.checkpoint = checkpoint
-        if not state.model_config and hasattr(cfg.model_fn(), "config"):
-            state.model_config = cfg.model_fn().config.to_dict()
+        if not state.model_config:
+            model = cfg.model_fn()
+            if hasattr(model, "config"):
+                state.model_config = model.config.to_dict()
         return state
 
     def _create_context(
@@ -260,7 +262,7 @@ class TrainContextBuilder:
 
     def _create_strategy(self, context: TrainContext, executor: BaseExecutor) -> dict:
         cfg = self.config
-        kwargs = dict(cfg.extra_kwargs)
+        kwargs = dict(cfg.strategy_kwargs)
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
         if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo"):
             kwargs["ref_model"] = create_ref_model(

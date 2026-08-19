@@ -836,7 +836,7 @@ def train(
         gradient_checkpointing_modules=grad_ckpt_modules,
         compile_mode=compile_mode,
         executor_kwargs=executor_kwargs,
-        extra_kwargs=strategy_kwargs,
+        strategy_kwargs=strategy_kwargs,
         neftune_alpha=neftune_alpha,
         collate_fn=collate_fn,
         rollout_interval=rollout_interval,

@@ -70,7 +70,7 @@ class TrainConfig(BaseConfig):
         rollout_max_tokens (int): Maximum generated tokens per response in rollout. Defaults to 1024.
         reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
         executor_kwargs (Dict[str, Any]): Extra kwargs passed to ExecutorFactory.create(). Defaults to {}.
-        extra_kwargs (Dict[str, Any]): Other arguments. Defaults to {}.
+        strategy_kwargs (Dict[str, Any]): Extra strategy arguments. Defaults to {}.
     """
 
     model_fn: Callable[[], nn.Module]
@@ -125,7 +125,7 @@ class TrainConfig(BaseConfig):
     reward_model_fn: Optional[Callable] = None
 
     executor_kwargs: Dict[str, Any] = field(default_factory=dict)
-    extra_kwargs: Dict[str, Any] = field(default_factory=dict)
+    strategy_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     @field_validator("strategy")
     def _validate_strategy(cls, v: str) -> str:

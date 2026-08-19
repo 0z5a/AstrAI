@@ -109,7 +109,7 @@ def test_online_dpo_end_to_end(base_test_env):
         device_type=device,
         nprocs=1,
         parallel_mode="none",
-        extra_kwargs={"beta": 0.1, "group_size": 2},
+        strategy_kwargs={"beta": 0.1, "group_size": 2},
         rollout_interval=1,
         rollout_temperature=1.0,
         rollout_top_k=0,

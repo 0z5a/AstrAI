@@ -184,7 +184,7 @@ class BaseStrategy(ABC):
         self.executor = kwargs.pop("executor", None)
         self.moe_aux_loss_coef = kwargs.pop("moe_aux_loss_coef", 0.01)
         self._moe_metrics: Dict[str, float] = {}
-        self.extra_kwargs = kwargs
+        self.strategy_kwargs = kwargs
         self._rollout_runner = None
 
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:

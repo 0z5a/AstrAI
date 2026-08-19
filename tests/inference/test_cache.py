@@ -2,7 +2,7 @@
 
 import torch
 
-from astrai.inference import (
+from astrai.inference.cache import (
     Allocator,
     KVStorage,
     PagePool,
