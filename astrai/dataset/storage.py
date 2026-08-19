@@ -217,7 +217,7 @@ class Store(ABC):
         """
         if self._window_size <= 0:
             raise RuntimeError("sample_window() requires window_size > 0 (stream mode)")
-        if self._window_size <= 0 or self._length <= self._window_size:
+        if self._length <= self._window_size:
             raise IndexError(
                 f"Data too short for window: token_count={self._length}, "
                 f"window_size={self._window_size}"

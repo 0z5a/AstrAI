@@ -5,7 +5,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import safetensors.torch as st
 import torch
@@ -22,18 +22,22 @@ def save_safetensors(state_dict: dict, path: Union[str, Path]):
     st.save_file(state_dict, str(path))
 
 
-def load_safetensors(path: Union[str, Path], broadcast: bool = False) -> dict:
+def _broadcast_load(loader: Callable[[], dict], broadcast: bool) -> dict:
+    """Load on rank 0 and broadcast the object to all ranks."""
     if not broadcast or not dist.is_initialized():
-        return st.load_file(str(path))
-
+        return loader()
     rank = get_rank()
     if rank == 0:
-        state_dict = st.load_file(str(path))
+        data = loader()
     else:
-        state_dict = {}
-    tmp = [state_dict]
+        data = {}
+    tmp = [data]
     dist.broadcast_object_list(tmp, src=0)
     return tmp[0]
+
+
+def load_safetensors(path: Union[str, Path], broadcast: bool = False) -> dict:
+    return _broadcast_load(lambda: st.load_file(str(path)), broadcast)
 
 
 def save_json(data: dict, path: Union[str, Path]):
@@ -42,19 +46,7 @@ def save_json(data: dict, path: Union[str, Path]):
 
 
 def load_json(path: Union[str, Path], broadcast: bool = False) -> dict:
-    if not broadcast or not dist.is_initialized():
-        with open(str(path), "r") as f:
-            return json.load(f)
-
-    rank = get_rank()
-    if rank == 0:
-        with open(str(path), "r") as f:
-            data = json.load(f)
-    else:
-        data = {}
-    tmp = [data]
-    dist.broadcast_object_list(tmp, src=0)
-    return tmp[0]
+    return _broadcast_load(lambda: json.loads(Path(path).read_text()), broadcast)
 
 
 def save_torch(obj: Any, path: Union[str, Path]):

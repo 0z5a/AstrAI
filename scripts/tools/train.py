@@ -11,6 +11,12 @@ from click.core import ParameterSource
 from torch import optim
 
 from astrai.config import AutoRegressiveLMConfig, TrainConfig
+from astrai.config.train_config import (
+    BACKENDS,
+    PARALLEL_MODES,
+    START_METHODS,
+    TRAIN_TYPES,
+)
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
 from astrai.model import AutoRegressiveLM
 from astrai.model.components.decoder_block import DecoderBlock
@@ -92,12 +98,12 @@ def _merge_yaml_into_kwargs(
     return merged
 
 
-_TRAIN_TYPE = ["seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"]
-_PARALLEL = ["none", "ddp", "fsdp"]
+_TRAIN_TYPE = sorted(TRAIN_TYPES)
+_PARALLEL = sorted(PARALLEL_MODES)
 _SCHEDULES = ["cosine", "sgdr", "wsd"]
 _OPTIMIZERS = OptimizerFactory.list_registered()
-_BACKENDS = ["nccl", "gloo"]
-_START_METHODS = ["spawn", "fork", "forkserver"]
+_BACKENDS = sorted(BACKENDS)
+_START_METHODS = sorted(START_METHODS)
 
 
 @click.command(
@@ -651,17 +657,10 @@ def train(
     decay_steps: int,
     **kwargs,
 ):
-    if train_type not in [
-        "seq",
-        "sft",
-        "dpo",
-        "grpo",
-        "online_grpo",
-        "online_dpo",
-    ]:
+    if train_type not in _TRAIN_TYPE:
         raise ValueError(
             f"Invalid train_type '{train_type}'. "
-            f"Must be one of: seq, sft, dpo, grpo, online_grpo, online_dpo"
+            f"Must be one of: {', '.join(_TRAIN_TYPE)}"
         )
     if not os.path.exists(param_path):
         raise FileNotFoundError(f"Model directory not found: {param_path}")

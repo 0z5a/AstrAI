@@ -16,8 +16,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, OrderedDict
 
-import torch
-
 from astrai.inference.cache.buffer import ReqToTokenPool
 
 # ---- data contract: per-task slot state ----

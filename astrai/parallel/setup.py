@@ -247,18 +247,15 @@ class LocalStrategy(LaunchStrategy):
             ctx.join()
 
 
-def _detect_launcher() -> str:
-    """Detect the distributed launcher from environment.
-
-    Returns one of: "torchelastic", "torchrun", "external", "local".
-    """
+def _is_external_launcher() -> bool:
+    """Whether an external launcher (torchrun/elastic/manual env) started us."""
     if dist.is_torchelastic_launched():
-        return "torchelastic"
+        return True
     if "LOCAL_WORLD_SIZE" in os.environ:
-        return "torchrun"
+        return True
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        return "external"
-    return "local"
+        return True
+    return False
 
 
 def spawn_parallel_fn(
@@ -273,8 +270,7 @@ def spawn_parallel_fn(
 ):
     if master_port is None:
         master_port = find_free_port()
-    launcher = _detect_launcher()
-    if launcher in ("torchelastic", "torchrun", "external"):
+    if _is_external_launcher():
         strategy = TorchrunStrategy(
             world_size, backend, master_addr, master_port, device_type, start_method
         )

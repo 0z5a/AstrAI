@@ -204,7 +204,6 @@ class TrainContextBuilder:
     def _create_dataloaders(
         self, context: TrainContext, train_dataset, val_dataset
     ) -> None:
-        cfg = self.config
         sampler_offset = context.consumed_samples // context.world_size
         if self._resume and sampler_offset > 0:
             samples_per_replica = (

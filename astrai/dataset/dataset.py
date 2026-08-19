@@ -383,10 +383,10 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
             transform = _build_jsonl_transform(load_path, tokenizer_path)
             if transform is None:
                 raise FileNotFoundError(
-                    f"JSONL dataset config not found. Expected "
-                    f"dataset_config.json alongside *.jsonl files, pass "
-                    f"tokenizer_path= for the built-in messages config, or "
-                    f"use processor= for lazy on-the-fly tokenisation."
+                    "JSONL dataset config not found. Expected "
+                    "dataset_config.json alongside *.jsonl files, pass "
+                    "tokenizer_path= for the built-in messages config, or "
+                    "use processor= for lazy on-the-fly tokenisation."
                 )
             store.load(load_path, transform=transform, **kwargs)
         else:

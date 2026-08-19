@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import IO, Callable, List, Optional, Protocol, runtime_checkable
 
@@ -17,15 +18,11 @@ from astrai.parallel import only_on_rank
 from astrai.parallel.setup import get_current_device
 from astrai.serialization import Checkpoint
 from astrai.trainer.metric_util import (
-    ctx_get_dead_expert_fraction,
     ctx_get_grad_norm,
     ctx_get_grad_snr,
-    ctx_get_load_imbalance_max,
-    ctx_get_load_imbalance_mean,
     ctx_get_loss,
     ctx_get_lr,
-    ctx_get_moe_aux_loss,
-    ctx_get_router_entropy,
+    ctx_get_moe_metric,
     ctx_get_val_loss,
 )
 from astrai.trainer.train_context import TrainContext
@@ -262,11 +259,15 @@ class MetricCallback(TrainCallback):
             "val_loss": ctx_get_val_loss,
             "grad_norm": ctx_get_grad_norm,
             "grad_snr": ctx_get_grad_snr,
-            "moe_aux_loss": ctx_get_moe_aux_loss,
-            "router_entropy": ctx_get_router_entropy,
-            "dead_expert_fraction": ctx_get_dead_expert_fraction,
-            "load_imbalance_mean": ctx_get_load_imbalance_mean,
-            "load_imbalance_max": ctx_get_load_imbalance_max,
+            "moe_aux_loss": partial(ctx_get_moe_metric, key="aux_loss"),
+            "router_entropy": partial(ctx_get_moe_metric, key="router_entropy"),
+            "dead_expert_fraction": partial(
+                ctx_get_moe_metric, key="dead_expert_fraction"
+            ),
+            "load_imbalance_mean": partial(
+                ctx_get_moe_metric, key="load_imbalance_mean"
+            ),
+            "load_imbalance_max": partial(ctx_get_moe_metric, key="load_imbalance_max"),
         }
 
     def _metrics(self, context: TrainContext, names):

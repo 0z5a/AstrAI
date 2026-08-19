@@ -29,12 +29,6 @@ class FFNOutput(TypedDict):
     router_stats: Optional[RouterStats]
 
 
-class RoutedOutput(TypedDict):
-    hidden_states: Tensor
-    aux_loss: Optional[Tensor]
-    router_stats: Optional[RouterStats]
-
-
 @FFNFactory.register("mlp")
 class MLP(nn.Module):
     def __init__(self, dim: int, dim_ffn: int, down_init_std: float = 0.02):
@@ -122,7 +116,7 @@ class DeepSeekMoE(nn.Module):
             / self.n_shared_experts
         )
 
-    def _routed_forward(self, x: Tensor, include_aux_loss: bool) -> RoutedOutput:
+    def _routed_forward(self, x: Tensor, include_aux_loss: bool) -> FFNOutput:
         N, D = x.shape
         K = self.n_activated_experts
         E = self.n_routed_experts

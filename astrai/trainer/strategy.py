@@ -1,6 +1,6 @@
 """Training strategy implementations with factory pattern."""
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Callable, Dict, List, Optional, TypedDict, Union
 
 import torch
@@ -187,7 +187,6 @@ class BaseStrategy(ABC):
         self.extra_kwargs = kwargs
         self._rollout_runner = None
 
-    @abstractmethod
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
         """Compute loss for the given batch.
 
@@ -197,7 +196,7 @@ class BaseStrategy(ABC):
         Returns:
             Computed loss tensor
         """
-        raise NotImplementedError
+        return self.compute_loss_output(batch)["loss"]
 
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         return self._normalize_output(self.compute_loss(batch))
@@ -328,9 +327,6 @@ class SEQStrategy(BaseStrategy):
         super().__init__(model, device, **kwargs)
         self.label_smoothing = label_smoothing
 
-    def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
-        return self.compute_loss_output(batch)["loss"]
-
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
         input_ids, target_ids = batch["input_ids"], batch["target_ids"]
@@ -368,9 +364,6 @@ class SFTStrategy(BaseStrategy):
     ):
         super().__init__(model, device, **kwargs)
         self.label_smoothing = label_smoothing
-
-    def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
-        return self.compute_loss_output(batch)["loss"]
 
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
@@ -425,9 +418,6 @@ class DPOStrategy(BaseStrategy):
         self.ref_model = ref_model
         self.beta = beta
         self.reduction = reduction
-
-    def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
-        return self.compute_loss_output(batch)["loss"]
 
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
@@ -552,9 +542,6 @@ class GRPOStrategy(BaseStrategy):
             state_dict = broadcast_state_dict(state_dict)
         if state_dict is not None:
             self.old_model.load_state_dict(state_dict)
-
-    def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
-        return self.compute_loss_output(batch)["loss"]
 
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)

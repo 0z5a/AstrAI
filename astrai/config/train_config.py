@@ -11,10 +11,10 @@ from torch.utils.data import Dataset
 from astrai.config.base import BaseConfig
 from astrai.model.components.lora import LoRAConfig
 
-_TRAIN_TYPES = frozenset({"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"})
-_PARALLEL_MODES = frozenset({"none", "ddp", "fsdp"})
-_BACKENDS = frozenset({"nccl", "gloo"})
-_START_METHODS = frozenset({"spawn", "fork", "forkserver"})
+TRAIN_TYPES = frozenset({"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"})
+PARALLEL_MODES = frozenset({"none", "ddp", "fsdp"})
+BACKENDS = frozenset({"nccl", "gloo"})
+START_METHODS = frozenset({"spawn", "fork", "forkserver"})
 _COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
 
 
@@ -129,31 +129,31 @@ class TrainConfig(BaseConfig):
 
     @field_validator("strategy")
     def _validate_strategy(cls, v: str) -> str:
-        if v not in _TRAIN_TYPES:
+        if v not in TRAIN_TYPES:
             raise ValueError(
-                f"strategy must be one of {sorted(_TRAIN_TYPES)}, got {v!r}"
+                f"strategy must be one of {sorted(TRAIN_TYPES)}, got {v!r}"
             )
         return v
 
     @field_validator("parallel_mode")
     def _validate_parallel_mode(cls, v: str) -> str:
-        if v not in _PARALLEL_MODES:
+        if v not in PARALLEL_MODES:
             raise ValueError(
-                f"parallel_mode must be one of {sorted(_PARALLEL_MODES)}, got {v!r}"
+                f"parallel_mode must be one of {sorted(PARALLEL_MODES)}, got {v!r}"
             )
         return v
 
     @field_validator("backend")
     def _validate_backend(cls, v: str) -> str:
-        if v not in _BACKENDS:
-            raise ValueError(f"backend must be one of {sorted(_BACKENDS)}, got {v!r}")
+        if v not in BACKENDS:
+            raise ValueError(f"backend must be one of {sorted(BACKENDS)}, got {v!r}")
         return v
 
     @field_validator("start_method")
     def _validate_start_method(cls, v: str) -> str:
-        if v not in _START_METHODS:
+        if v not in START_METHODS:
             raise ValueError(
-                f"start_method must be one of {sorted(_START_METHODS)}, got {v!r}"
+                f"start_method must be one of {sorted(START_METHODS)}, got {v!r}"
             )
         return v
 
