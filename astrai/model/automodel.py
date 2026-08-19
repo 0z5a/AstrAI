@@ -4,7 +4,7 @@ AutoModel base class for model loading and saving.
 
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Self, Union
+from typing import Union
 
 import torch.nn as nn
 
@@ -90,7 +90,3 @@ class AutoModel(nn.Module):
             state_dict=self.state_dict(),
             save_directory=str(save_directory),
         )
-
-    def to(self, *args, **kwargs) -> Self:
-        """Move model to device/dtype."""
-        return super().to(*args, **kwargs)

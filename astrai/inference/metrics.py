@@ -148,17 +148,6 @@ class MetricsCollector:
         self._completed.append(timing)
         self._accumulate(timing)
 
-    def clear(self):
-        """Reset all state (e.g. on engine shutdown)."""
-        self._timings.clear()
-        self._completed.clear()
-        self._ttft_ms_sum = 0.0
-        self._ttft_ms_count = 0
-        self._decode_tps_sum = 0.0
-        self._decode_tps_count = 0
-        self._e2e_ms_sum = 0.0
-        self._e2e_ms_count = 0
-
     # timing scopes
 
     @contextmanager
@@ -179,17 +168,6 @@ class MetricsCollector:
             elif phase == "decode":
                 t._decode_steps += 1
                 t._decode_total_s += dt
-
-    # access
-
-    def get_timing(self, task_id: str) -> Optional[TaskTiming]:
-        """Return the timing record for *task_id* (active or completed)."""
-        if task_id in self._timings:
-            return self._timings[task_id]
-        for t in self._completed:
-            if t.task_id == task_id:
-                return t
-        return None
 
     # aggregate stats
 

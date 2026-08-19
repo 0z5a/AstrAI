@@ -124,13 +124,6 @@ class InferenceWorkspace:
             device=device,
         )
 
-    def decode_buffers(self, batch: int, q_heads: int):
-        """Return ``(o_part, ml_part)`` view sliced to live dimensions."""
-        return (
-            self.decode_o_part[:batch, :q_heads],
-            self.decode_ml_part[:batch, :q_heads],
-        )
-
     def fill_input_ids(self, ids: "list[int]") -> Tensor:
         """Write ``ids`` into the device buffer and return ``[B]``.
 

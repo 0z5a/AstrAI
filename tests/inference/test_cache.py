@@ -201,23 +201,6 @@ def test_req_to_token_pool_write():
 # ---- KVStorage ----
 
 
-def test_kv_storage_set_and_get():
-    storage = KVStorage(
-        size=16,
-        n_layers=2,
-        n_kv_heads=4,
-        head_dim=8,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-    )
-    loc = torch.tensor([[0, 1]], dtype=torch.long)
-    k = torch.randn(1, 2, 4, 8)
-    v = torch.randn(1, 2, 4, 8)
-    storage.set_kv_buffer(0, loc, k, v)
-    assert torch.allclose(storage.get_key_buffer(0)[loc], k)
-    assert torch.allclose(storage.get_value_buffer(0)[loc], v)
-
-
 def test_kv_storage_buffer_shape():
     storage = KVStorage(
         size=32,

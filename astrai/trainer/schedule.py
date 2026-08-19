@@ -2,7 +2,7 @@
 
 import math
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import List
 
 from torch.optim.lr_scheduler import LRScheduler
 
@@ -19,12 +19,6 @@ class BaseScheduler(LRScheduler, ABC):
     def get_lr(self) -> List[float]:
         """Calculate the current learning rate."""
         raise NotImplementedError
-
-    def state_dict(self) -> Dict[str, Any]:
-        return super().state_dict()
-
-    def load_state_dict(self, state_dict: Dict[str, Any]):
-        super().load_state_dict(state_dict)
 
 
 class SchedulerFactory(BaseFactory["BaseScheduler"]):

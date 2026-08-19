@@ -72,16 +72,6 @@ class KVStorage:
             (n_layers, size, n_kv_heads, head_dim), device=device, dtype=dtype
         )
 
-    def get_key_buffer(self, layer_id: int) -> Tensor:
-        return self.k_buffer[layer_id]
-
-    def get_value_buffer(self, layer_id: int) -> Tensor:
-        return self.v_buffer[layer_id]
-
-    def set_kv_buffer(self, layer_id: int, loc: Tensor, k: Tensor, v: Tensor) -> None:
-        self.k_buffer[layer_id, loc] = k
-        self.v_buffer[layer_id, loc] = v
-
 
 @dataclass
 class KVCache:

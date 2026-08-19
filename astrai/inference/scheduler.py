@@ -79,29 +79,21 @@ class InferenceScheduler:
 
         if backend is None:
             self._backend = None
-            default_backend = get_backend()
-            self._backend_name = type(default_backend).__name__
-            with attn_backend(default_backend):
-                self._executor = Executor(
-                    model=model,
-                    kv_cache=self._cache,
-                    task_cache=self._task_cache,
-                    device=self.device,
-                    dtype=self.dtype,
-                    enable_cuda_graph=enable_cuda_graph,
-                )
+            active_backend = get_backend()
         else:
-            with attn_backend(backend):
+            active_backend = backend
+        with attn_backend(active_backend):
+            if backend is not None:
                 self._backend = get_backend()
-                self._backend_name = type(self._backend).__name__
-                self._executor = Executor(
-                    model=model,
-                    kv_cache=self._cache,
-                    task_cache=self._task_cache,
-                    device=self.device,
-                    dtype=self.dtype,
-                    enable_cuda_graph=enable_cuda_graph,
-                )
+            self._backend_name = type(get_backend()).__name__
+            self._executor = Executor(
+                model=model,
+                kv_cache=self._cache,
+                task_cache=self._task_cache,
+                device=self.device,
+                dtype=self.dtype,
+                enable_cuda_graph=enable_cuda_graph,
+            )
 
         self._stop_event = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
@@ -283,12 +275,7 @@ class InferenceScheduler:
         except Exception as e:
             self._stop_event.set()
             logger.error(f"Scheduler loop crashed: {e}", exc_info=True)
-            for task in self._task_mgr.get_active_tasks():
-                self._task_mgr.invoke_callback(task.task_id, STOP)
-                self._task_cache.task_free(task.task_id)
-            for task in self._task_mgr.get_waiting_tasks():
-                self._task_mgr.invoke_callback(task.task_id, STOP)
-            self._task_mgr.clear_queues()
+            self._abort_and_clear(free_waiting=False)
 
     def start(self):
         if self._loop_thread is not None and self._loop_thread.is_alive():
@@ -304,15 +291,20 @@ class InferenceScheduler:
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=2.0)
         self._loop_thread = None
+        self._abort_and_clear(free_waiting=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _abort_and_clear(self, free_waiting: bool):
+        """Invoke STOP callbacks, release cache slots, and clear task queues."""
         for task in self._task_mgr.get_active_tasks():
             self._task_mgr.invoke_callback(task.task_id, STOP)
             self._task_cache.task_free(task.task_id)
         for task in self._task_mgr.get_waiting_tasks():
             self._task_mgr.invoke_callback(task.task_id, STOP)
-            self._task_cache.task_free(task.task_id)
+            if free_waiting:
+                self._task_cache.task_free(task.task_id)
         self._task_mgr.clear_queues()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     def run_batch(
         self,

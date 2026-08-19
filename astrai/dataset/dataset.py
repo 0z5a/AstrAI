@@ -492,9 +492,6 @@ class DPODataset(BaseDataset):
 
     required_keys = ["chosen", "rejected", "chosen_mask", "rejected_mask"]
 
-    def make_processor(self, tokenizer, max_len: int):
-        return partial(dpo_processor, tokenizer=tokenizer, max_len=max_len)
-
     def __getitem__(self, index: int) -> Dict[str, Tensor]:
         return {
             "chosen": self.store.fetch_record(index, "chosen").to(dtype=torch.long),
