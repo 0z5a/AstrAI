@@ -4,7 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/scripts/docker/lib/train-common.sh"
 
-ENV_FILE="${TRAIN_ENV_FILE:-${ROOT_DIR}/.env.train}"
 COMPOSE_BASE=(
     docker compose
     --project-directory "${ROOT_DIR}"
@@ -14,48 +13,26 @@ COMPOSE_BASE=(
 
 usage() {
     cat <<'EOF'
-Usage: scripts/train.sh <command> [options]
+Usage: scripts/train.sh <command> [CONFIG] [options]
+
+CONFIG defaults to ./train.yaml. The same file declares host runtime settings
+under `runtime:` and trainer settings under model/data/parallel/training/ckpt/log.
 
 Commands:
-  init                 Create local directories and .env.train
-  preflight            Validate Docker, paths, GPU settings, and Compose
-  build                Build the trainer image
-  start [--foreground] [-- ARGS...] Start or resume training
-  stop                 Gracefully stop and checkpoint training
-  restart              Stop, then start training
-  logs                 Follow trainer logs
-  status               Show container and latest checkpoint status
-  latest               Print the latest complete checkpoint path
-  list                 List all complete checkpoints
-  clean [--keep N]     Preview old checkpoint removal
-  clean --force        Remove old checkpoints after previewing
-
-Environment:
-  TRAIN_ENV_FILE       Env file path (default: .env.train)
-  TRAIN_CONFIG_FILE    Optional host YAML mounted only when the job starts
-
-Training arguments come from an externally mounted TRAIN_CONFIG or ARGS passed
-after --. The image does not contain experiment configuration.
+  init [CONFIG]                     Create runtime directories
+  preflight [CONFIG]                Validate Docker, paths, GPUs, and Compose
+  build [CONFIG]                    Build the trainer image
+  start [CONFIG] [--foreground] [-- ARGS...]
+                                    Start or resume training
+  stop [CONFIG]                     Gracefully stop and checkpoint training
+  restart [CONFIG]                  Stop, then start training
+  logs [CONFIG]                     Follow trainer logs
+  status [CONFIG]                   Show container and checkpoint status
+  latest [CONFIG]                   Print the latest complete checkpoint
+  list [CONFIG]                     List complete checkpoints
+  clean [CONFIG] [--keep N] [--force]
+                                    Preview or remove old checkpoints
 EOF
-}
-
-load_env() {
-    if [[ -f "${ENV_FILE}" ]]; then
-        set -a
-        # UID/GID are readonly in bash; compose gets them via ASTRAI_UID/GID in compose()
-        # shellcheck disable=SC1090
-        source <(grep -v -E '^[[:space:]]*(UID|GID)=' "${ENV_FILE}")
-        set +a
-    fi
-
-    TRAIN_JOB_NAME="${TRAIN_JOB_NAME:-astrai-train}"
-    TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-./data}"
-    TRAIN_MODEL_DIR="${TRAIN_MODEL_DIR:-./params}"
-    TRAIN_CHECKPOINT_DIR="${TRAIN_CHECKPOINT_DIR:-./checkpoints}"
-    TRAIN_GPU_COUNT="${TRAIN_GPU_COUNT:-all}"
-    TRAIN_STOP_TIMEOUT="${TRAIN_STOP_TIMEOUT:-600}"
-
-    validate_job_name "${TRAIN_JOB_NAME}"
 }
 
 resolve_path() {
@@ -66,203 +43,147 @@ resolve_path() {
     fi
 }
 
-# Read the optional top-level `infra:` section from TRAIN_CONFIG_FILE and
-# export the host-side variables it overrides (job name, mount paths, GPU
-# filter). Compose interpolation prefers the shell environment over the
-# --env-file, so these exports win over .env.train; keys absent from `infra`
-# fall back to the env file. Requires python3 with PyYAML on the host.
-load_infra() {
-    local infra_file exports
+load_config() {
+    CONFIG_FILE="$(resolve_path "$1")"
+    [[ -f "${CONFIG_FILE}" ]] || die "Training config not found: ${CONFIG_FILE}"
+    require_command python3
+    python3 -c 'import yaml' >/dev/null 2>&1 ||
+        die "PyYAML is required on the host (install python3-yaml)"
 
-    [[ -n "${TRAIN_CONFIG_FILE:-}" ]] || return 0
-    infra_file="$(resolve_path "${TRAIN_CONFIG_FILE}")"
-    [[ -f "${infra_file}" ]] || return 0
-
-    if ! command -v python3 >/dev/null 2>&1; then
-        die "TRAIN_CONFIG_FILE is set but python3 is missing; it is needed to read the 'infra' section"
-    fi
-    if ! python3 -c 'import yaml' >/dev/null 2>&1; then
-        die "TRAIN_CONFIG_FILE is set but PyYAML is missing on the host (install python3-yaml)"
-    fi
-
-    exports="$(TRAIN_INFRA_FILE="${infra_file}" python3 - <<'PYEOF'
-import os
-import shlex
-import sys
-import yaml
-
-path = os.environ["TRAIN_INFRA_FILE"]
-try:
-    with open(path) as f:
-        cfg = yaml.safe_load(f) or {}
-except Exception as exc:
-    print(f"failed to parse {path}: {exc}", file=sys.stderr)
-    sys.exit(1)
-
-infra = cfg.get("infra") or {}
-if not isinstance(infra, dict):
-    print(f"the 'infra' section in {path} must be a mapping", file=sys.stderr)
-    sys.exit(1)
-
-mapping = {
-    "job_name": "TRAIN_JOB_NAME",
-    "data_dir": "TRAIN_DATA_DIR",
-    "model_dir": "TRAIN_MODEL_DIR",
-    "checkpoint_dir": "TRAIN_CHECKPOINT_DIR",
-    "gpu_count": "TRAIN_GPU_COUNT",
-    "cuda_visible_devices": "CUDA_VISIBLE_DEVICES",
-}
-for key, env_name in mapping.items():
-    if key in infra:
-        print(f"export {env_name}={shlex.quote(str(infra[key]))}")
-PYEOF
-)"
-    if [[ -n "${exports}" ]]; then
-        eval "${exports}"
-        log_info "Applied infra overrides from ${infra_file}"
-    fi
-
+    local exports
+    exports="$(python3 "${ROOT_DIR}/scripts/tools/train_runtime.py" exports "${CONFIG_FILE}")" ||
+        die "Failed to load runtime configuration"
+    eval "${exports}"
     validate_job_name "${TRAIN_JOB_NAME}"
 }
 
-checkpoint_dir() {
-    printf '%s/%s\n' "$(resolve_path "${TRAIN_CHECKPOINT_DIR}")" "${TRAIN_JOB_NAME}"
+compose() {
+    ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" "${COMPOSE_BASE[@]}" "$@"
 }
 
-compose() {
-    local -a command=("${COMPOSE_BASE[@]}")
+checkpoint_dir() {
+    printf '%s/%s\n' "${TRAIN_CHECKPOINT_DIR}" "${TRAIN_JOB_NAME}"
+}
 
-    if [[ -f "${ENV_FILE}" ]]; then
-        command+=(--env-file "${ENV_FILE}")
+container_name() {
+    printf 'astrai-trainer-%s\n' "${TRAIN_JOB_NAME}"
+}
+
+timer_pid_file() {
+    printf '/tmp/astrai-timer-%s.pid\n' "${TRAIN_JOB_NAME}"
+}
+
+timer_log_file() {
+    printf '/tmp/astrai-timer-%s.log\n' "${TRAIN_JOB_NAME}"
+}
+
+cancel_timer() {
+    local pid_file pid
+    pid_file="$(timer_pid_file)"
+    [[ -f "${pid_file}" ]] || return 0
+    pid="$(<"${pid_file}")"
+    if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${pid}" 2>/dev/null; then
+        kill "${pid}" 2>/dev/null || true
     fi
+    rm -f -- "${pid_file}"
+}
 
-    # Inject the host user into compose so container processes share the
-    # checkpoint directory ownership (bash UID/GID are readonly).
-    ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" "${command[@]}" "$@"
+schedule_timer() {
+    (( TRAIN_MAX_DURATION_SECONDS > 0 )) || return 0
+    cancel_timer
+    local pid_file log_file
+    pid_file="$(timer_pid_file)"
+    log_file="$(timer_log_file)"
+    (
+        sleep "${TRAIN_MAX_DURATION_SECONDS}"
+        "${ROOT_DIR}/scripts/train.sh" stop "${CONFIG_FILE}" --from-timer
+    ) >"${log_file}" 2>&1 &
+    printf '%s\n' "$!" >"${pid_file}"
+    log_info "Automatic stop scheduled in ${TRAIN_MAX_DURATION_SECONDS}s"
 }
 
 init_environment() {
-    local data_dir model_dir checkpoints_dir
-
-    data_dir="$(resolve_path "${TRAIN_DATA_DIR}")"
-    model_dir="$(resolve_path "${TRAIN_MODEL_DIR}")"
-    checkpoints_dir="$(resolve_path "${TRAIN_CHECKPOINT_DIR}")"
-    mkdir -p "${data_dir}" "${model_dir}" "${checkpoints_dir}"
-
-    if [[ ! -f "${ENV_FILE}" ]]; then
-        cat >"${ENV_FILE}" <<'EOF'
-TRAIN_JOB_NAME=astrai-train
-TRAIN_DATA_DIR=./data
-TRAIN_MODEL_DIR=./params
-TRAIN_CHECKPOINT_DIR=./checkpoints
-TRAIN_CONFIG_FILE=
-TRAIN_GPU_COUNT=all
-# CUDA_VISIBLE_DEVICES=0,1
-# TRAIN_* vars above can be overridden per-job via the top-level `infra:`
-# section in TRAIN_CONFIG_FILE (see docs/developer/docker-training.md).
-CUDA_TAG=cu128
-TRAIN_IPC_MODE=host
-TRAIN_STOP_GRACE_PERIOD=10m
-TRAIN_STOP_TIMEOUT=600
-CHECKPOINT_KEEP_LAST=5
-EOF
-        log_info "Created ${ENV_FILE}"
-    else
-        log_info "Keeping existing ${ENV_FILE}"
-    fi
-    log_info "Data: ${data_dir}"
-    log_info "Model: ${model_dir}"
-    log_info "Checkpoints: ${checkpoints_dir}"
+    mkdir -p "${TRAIN_DATA_DIR}" "${TRAIN_MODEL_DIR}" "${TRAIN_CHECKPOINT_DIR}"
+    log_info "Data: ${TRAIN_DATA_DIR}"
+    log_info "Model: ${TRAIN_MODEL_DIR}"
+    log_info "Checkpoints: ${TRAIN_CHECKPOINT_DIR}"
 }
 
 preflight() {
-    local data_dir model_dir checkpoints_dir config_file latest visible_count
-
+    local latest visible_count
     require_command docker
     docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
-    [[ "${TRAIN_GPU_COUNT}" == "all" || "${TRAIN_GPU_COUNT}" =~ ^[1-9][0-9]*$ ]] ||
-        die "TRAIN_GPU_COUNT must be 'all' or a positive integer"
+    [[ -d "${TRAIN_DATA_DIR}" ]] || die "Training data directory not found: ${TRAIN_DATA_DIR}"
+    mkdir -p "$(checkpoint_dir)"
+    [[ -w "$(checkpoint_dir)" ]] || die "Checkpoint directory is not writable: $(checkpoint_dir)"
 
-    data_dir="$(resolve_path "${TRAIN_DATA_DIR}")"
-    model_dir="$(resolve_path "${TRAIN_MODEL_DIR}")"
-    checkpoints_dir="$(resolve_path "${TRAIN_CHECKPOINT_DIR}")"
-    [[ -d "${data_dir}" ]] || die "Training data directory not found: ${data_dir}"
-    mkdir -p "${checkpoints_dir}/${TRAIN_JOB_NAME}"
-    [[ -w "${checkpoints_dir}/${TRAIN_JOB_NAME}" ]] || die "Checkpoint directory is not writable"
-
-    if [[ -n "${TRAIN_CONFIG_FILE:-}" ]]; then
-        config_file="$(resolve_path "${TRAIN_CONFIG_FILE}")"
-        [[ -f "${config_file}" ]] || die "Training config not found: ${config_file}"
-    fi
-
-    latest="$(find_latest_checkpoint "${checkpoints_dir}/${TRAIN_JOB_NAME}" || true)"
+    latest="$(find_latest_checkpoint "$(checkpoint_dir)" || true)"
     if [[ -z "${latest}" ]]; then
-        [[ -s "${model_dir}/config.json" ]] || die "Model config not found: ${model_dir}/config.json"
-        [[ -s "${model_dir}/model.safetensors" ]] || die "Model weights not found: ${model_dir}/model.safetensors"
+        [[ -s "${TRAIN_MODEL_DIR}/config.json" ]] ||
+            die "Model config not found: ${TRAIN_MODEL_DIR}/config.json"
+        [[ -s "${TRAIN_MODEL_DIR}/model.safetensors" ]] ||
+            die "Model weights not found: ${TRAIN_MODEL_DIR}/model.safetensors"
     else
         log_info "Resume candidate: ${latest}"
     fi
 
-    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "${TRAIN_GPU_COUNT}" != "all" ]]; then
+    if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
         IFS=',' read -r -a visible_gpus <<<"${CUDA_VISIBLE_DEVICES}"
         visible_count="${#visible_gpus[@]}"
         (( visible_count == TRAIN_GPU_COUNT )) ||
-            die "TRAIN_GPU_COUNT=${TRAIN_GPU_COUNT}, but CUDA_VISIBLE_DEVICES exposes ${visible_count} GPU(s)"
+            die "Configured GPU count and visible device list disagree"
     fi
 
     compose config --quiet
-    log_info "Preflight passed for ${TRAIN_JOB_NAME} (GPU request: ${TRAIN_GPU_COUNT})"
+    log_info "Preflight passed for ${TRAIN_JOB_NAME} (GPU request: ${TRAIN_GPU_COUNT}, parallel: ${TRAIN_PARALLEL_MODE})"
+}
+
+runtime_environment_args() {
+    RUNTIME_ENV_ARGS=()
+    local pair
+    while IFS= read -r -d '' pair; do
+        RUNTIME_ENV_ARGS+=(--env "${pair}")
+    done < <(python3 "${ROOT_DIR}/scripts/tools/train_runtime.py" environment "${CONFIG_FILE}")
 }
 
 start_training() {
     local foreground="$1"
-    local config_file container running
-    local -a run_options=()
     shift
-
+    local container running
+    local -a run_options
     preflight
-    if [[ -n "${TRAIN_CONFIG_FILE:-}" ]]; then
-        config_file="$(resolve_path "${TRAIN_CONFIG_FILE}")"
-        run_options+=(
-            --volume "${config_file}:/run/astrai/train.yaml:ro"
-            --env TRAIN_CONFIG=/run/astrai/train.yaml
-        )
-    elif [[ -z "${TRAIN_CONFIG:-}" && $# -eq 0 ]]; then
-        die "Set TRAIN_CONFIG_FILE or pass complete trainer arguments after --"
-    fi
-
-    container="astrai-trainer-${TRAIN_JOB_NAME}"
+    runtime_environment_args
+    container="$(container_name)"
     running="$(docker inspect --format '{{.State.Running}}' "${container}" 2>/dev/null || true)"
     [[ "${running}" != "true" ]] || die "Trainer is already running: ${container}"
     docker rm "${container}" >/dev/null 2>&1 || true
+
+    run_options=(
+        --volume "${CONFIG_FILE}:/run/astrai/train.yaml:ro"
+        --env TRAIN_CONFIG=/run/astrai/train.yaml
+        "${RUNTIME_ENV_ARGS[@]}"
+    )
     if [[ "${foreground}" == "true" ]]; then
         compose run --build --rm "${run_options[@]}" trainer "$@"
     else
-        compose run -d --build --name "${container}" \
-            "${run_options[@]}" trainer "$@"
-        log_info "Training started; run scripts/train.sh logs to follow it"
+        compose run -d --build --name "${container}" "${run_options[@]}" trainer "$@"
+        schedule_timer
+        log_info "Training started; run scripts/train.sh logs ${CONFIG_FILE} to follow it"
     fi
 }
 
 stop_training() {
+    local from_timer="$1"
+    [[ "${from_timer}" == "true" ]] || cancel_timer
     log_info "Stopping trainer with ${TRAIN_STOP_TIMEOUT}s grace period"
-    docker stop --timeout "${TRAIN_STOP_TIMEOUT}" "astrai-trainer-${TRAIN_JOB_NAME}" >/dev/null 2>&1 ||
+    docker stop --timeout "${TRAIN_STOP_TIMEOUT}" "$(container_name)" >/dev/null 2>&1 ||
         log_warn "Trainer container is not running"
-}
-
-restart_training() {
-    local container="astrai-trainer-${TRAIN_JOB_NAME}"
-
-    docker inspect "${container}" >/dev/null 2>&1 ||
-        die "Trainer container not found; use start with a config or CLI arguments first"
-    log_info "Restarting trainer with ${TRAIN_STOP_TIMEOUT}s grace period"
-    docker restart --timeout "${TRAIN_STOP_TIMEOUT}" "${container}" >/dev/null
+    [[ "${from_timer}" != "true" ]] || rm -f -- "$(timer_pid_file)"
 }
 
 show_status() {
     local latest
-
-    docker ps -a --filter "name=^/astrai-trainer-${TRAIN_JOB_NAME}$"
+    docker ps -a --filter "name=^/$(container_name)$"
     latest="$(find_latest_checkpoint "$(checkpoint_dir)" || true)"
     if [[ -n "${latest}" ]]; then
         log_info "Latest checkpoint: ${latest}"
@@ -274,7 +195,6 @@ show_status() {
 clean_checkpoints() {
     local keep="$1" force="$2" dir count remove_count index path
     local -a checkpoints=()
-
     [[ "${keep}" =~ ^[1-9][0-9]*$ ]] || die "--keep must be a positive integer"
     dir="$(checkpoint_dir)"
     while IFS= read -r line; do
@@ -287,7 +207,6 @@ clean_checkpoints() {
         log_info "Nothing to clean; ${count} complete checkpoint(s), keeping ${keep}"
         return
     fi
-
     for ((index = 0; index < remove_count; index++)); do
         path="${checkpoints[index]}"
         if [[ "${force}" == "true" ]]; then
@@ -301,58 +220,49 @@ clean_checkpoints() {
 }
 
 main() {
-    local command="${1:-}" foreground=false keep="${CHECKPOINT_KEEP_LAST:-5}" force=false
+    local command="${1:-}" config="${TRAIN_CONFIG_FILE:-${ROOT_DIR}/train.yaml}"
+    local foreground=false keep force=false from_timer=false
     local -a train_args=()
     [[ -n "${command}" ]] || { usage; exit 1; }
     shift || true
-    load_env
-    load_infra
+
+    if [[ "${command}" =~ ^(help|-h|--help)$ ]]; then
+        usage
+        return
+    fi
+
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        config="$1"
+        shift
+    fi
+    load_config "${config}"
+    keep="${CHECKPOINT_KEEP_LAST}"
 
     case "${command}" in
-        init)
-            init_environment
-            ;;
-        preflight)
-            preflight
-            ;;
-        build)
-            preflight
-            compose build trainer
-            ;;
+        init) init_environment ;;
+        preflight) preflight ;;
+        build) preflight; compose build trainer ;;
         start)
             while [[ $# -gt 0 ]]; do
                 case "$1" in
-                    --foreground)
-                        foreground=true
-                        shift
-                        ;;
-                    --)
-                        shift
-                        train_args=("$@")
-                        break
-                        ;;
-                    *)
-                        die "Unknown start option: $1 (put trainer arguments after --)"
-                        ;;
+                    --foreground) foreground=true; shift ;;
+                    --) shift; train_args=("$@"); break ;;
+                    *) die "Unknown start option: $1 (put trainer arguments after --)" ;;
                 esac
             done
             start_training "${foreground}" "${train_args[@]}"
             ;;
         stop)
-            stop_training
+            [[ "${1:-}" != "--from-timer" ]] || from_timer=true
+            stop_training "${from_timer}"
             ;;
         restart)
-            restart_training
+            stop_training false
+            start_training false
             ;;
-        logs)
-            docker logs -f --tail "${TRAIN_LOG_TAIL:-200}" "astrai-trainer-${TRAIN_JOB_NAME}"
-            ;;
-        status)
-            show_status
-            ;;
-        latest)
-            find_latest_checkpoint "$(checkpoint_dir)" || die "No complete checkpoint found"
-            ;;
+        logs) docker logs -f --tail "${TRAIN_LOG_TAIL:-200}" "$(container_name)" ;;
+        status) show_status ;;
+        latest) find_latest_checkpoint "$(checkpoint_dir)" || die "No complete checkpoint found" ;;
         list)
             list_complete_checkpoints "$(checkpoint_dir)" | while read -r _epoch _step path; do
                 printf '%s\n' "${path}"
@@ -361,28 +271,14 @@ main() {
         clean)
             while [[ $# -gt 0 ]]; do
                 case "$1" in
-                    --keep)
-                        [[ $# -ge 2 ]] || die "--keep requires a value"
-                        keep="$2"
-                        shift 2
-                        ;;
-                    --force)
-                        force=true
-                        shift
-                        ;;
-                    *)
-                        die "Unknown clean option: $1"
-                        ;;
+                    --keep) [[ $# -ge 2 ]] || die "--keep requires a value"; keep="$2"; shift 2 ;;
+                    --force) force=true; shift ;;
+                    *) die "Unknown clean option: $1" ;;
                 esac
             done
             clean_checkpoints "${keep}" "${force}"
             ;;
-        help|-h|--help)
-            usage
-            ;;
-        *)
-            die "Unknown command: ${command}"
-            ;;
+        *) die "Unknown command: ${command}" ;;
     esac
 }
 

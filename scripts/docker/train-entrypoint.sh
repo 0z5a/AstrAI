@@ -10,12 +10,27 @@ CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${TRAIN_JOB_NAME}"
 BASE_MODEL="${BASE_MODEL:-/models/base}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-}"
 TRAIN_GPU_COUNT="${TRAIN_GPU_COUNT:-all}"
+TRAIN_PARALLEL_MODE="${TRAIN_PARALLEL_MODE:-auto}"
 
 validate_job_name "${TRAIN_JOB_NAME}"
 if [[ "${TRAIN_GPU_COUNT}" == "all" ]]; then
     TRAIN_GPU_COUNT="$(python -c 'import torch; print(torch.cuda.device_count())')"
 fi
 [[ "${TRAIN_GPU_COUNT}" =~ ^[1-9][0-9]*$ ]] || die "No visible GPU found"
+if [[ "${TRAIN_PARALLEL_MODE}" == "auto" ]]; then
+    if (( TRAIN_GPU_COUNT > 1 )); then
+        TRAIN_PARALLEL_MODE=ddp
+    else
+        TRAIN_PARALLEL_MODE=none
+    fi
+fi
+[[ "${TRAIN_PARALLEL_MODE}" =~ ^(none|ddp|fsdp)$ ]] || die "Invalid parallel mode: ${TRAIN_PARALLEL_MODE}"
+if [[ "${TRAIN_PARALLEL_MODE}" == "none" ]] && (( TRAIN_GPU_COUNT != 1 )); then
+    die "Parallel mode none requires exactly one GPU"
+fi
+if [[ "${TRAIN_PARALLEL_MODE}" != "none" ]] && (( TRAIN_GPU_COUNT < 2 )); then
+    die "Parallel mode ${TRAIN_PARALLEL_MODE} requires at least two GPUs"
+fi
 if [[ -n "${TRAIN_CONFIG}" ]]; then
     [[ -f "${TRAIN_CONFIG}" ]] || die "Training config not found: ${TRAIN_CONFIG}"
 fi
@@ -36,11 +51,7 @@ if [[ -n "${TRAIN_CONFIG}" ]]; then
     train_args+=(--config "${TRAIN_CONFIG}")
 fi
 
-if (( TRAIN_GPU_COUNT > 1 )); then
-    train_args+=(--parallel_mode ddp)
-else
-    train_args+=(--parallel_mode none)
-fi
+train_args+=(--parallel_mode "${TRAIN_PARALLEL_MODE}")
 
 if [[ -n "${latest_checkpoint}" ]]; then
     log_info "Resuming ${TRAIN_JOB_NAME} from ${latest_checkpoint}"
@@ -52,7 +63,7 @@ else
     train_args+=(--param_path "${BASE_MODEL}")
 fi
 
-log_info "GPUs=${TRAIN_GPU_COUNT}, checkpoints=${CHECKPOINT_DIR}"
+log_info "GPUs=${TRAIN_GPU_COUNT}, parallel=${TRAIN_PARALLEL_MODE}, checkpoints=${CHECKPOINT_DIR}"
 
 # Replace the shell so the container init forwards SIGTERM to the trainer.
 exec "${train_args[@]}" "$@"

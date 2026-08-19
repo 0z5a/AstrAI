@@ -1,58 +1,125 @@
 # Containerized Training Deployment
 
-Rules for running AstrAI distributed training in containers, distilled from real deployment failures. Read before touching `Dockerfile`, `docker-compose.yml`, `scripts/train.sh`, `train-entrypoint.sh`. AGENTS.md mirrors this locally; this file is the committed version.
+AstrAI uses one training YAML as the declaration for both host-side container
+runtime settings and in-container training settings. Do not invoke the trainer
+with raw `docker compose up`; use `scripts/train.sh` so preflight validation,
+checkpoint recovery, and graceful shutdown remain active.
 
 ## Architecture
 
-```
-scripts/train.sh           host-side CLI: env loading, preflight, compose wrapper, lifecycle
-  └── docker-compose.yml   GPU passthrough, mounts, in-container env vars, entrypoint
-        └── train-entrypoint.sh   GPU-count resolution, parallel-mode selection, auto-resume
+```text
+train.yaml
+  ├── runtime                parsed on the host before Docker starts
+  └── model/data/...         parsed by train.py inside the container
+        │
+scripts/train.sh             preflight, Compose wrapper, lifecycle, timer
+  └── docker-compose.yml     GPU passthrough, mounts, image, container limits
+        └── train-entrypoint.sh   process count, parallel mode, auto-resume
               └── train.py --config /run/astrai/train.yaml
 ```
 
-| Layer | Responsible for | NOT responsible for |
-|-------|-----------------|---------------------|
-| `train.sh` | host paths, `.env.train` + `infra:` YAML overrides, preflight, lifecycle | training args, GPU selection, parallel mode |
-| compose | GPU passthrough, mounts, in-container env (NCCL) | training args (beyond `TRAIN_*` forwarding) |
-| entrypoint | `--ckpt_dir/--nprocs/--parallel_mode/--param_path`, resume | hyperparameters (YAML/CLI) |
-| `train.yaml` | hyperparameters (`_merge_yaml_into_kwargs`, CLI wins); top-level `infra:` host vars | container paths, process count |
+The two parsers deliberately own different sections. `scripts/tools/train_runtime.py`
+reads only `runtime`; `scripts/tools/train.py` reads only
+`model/data/parallel/training/ckpt/log`. Explicit trainer arguments after `--`
+override training YAML values.
 
-## Path Conventions
+## Runtime Schema
 
-| Host var | Container | Perm | Purpose |
-|---|---|---|---|
-| `TRAIN_DATA_DIR` | `/data` | ro | dataset (`data_root_path` must be `/data`) |
-| `TRAIN_MODEL_DIR` | `/models/base` | ro | base model (`config.json` + `model.safetensors`) |
-| `TRAIN_CHECKPOINT_DIR` | `/checkpoints` | rw | checkpoint root, per-`TRAIN_JOB_NAME` subdirs |
-| `TRAIN_CONFIG_FILE` | `/run/astrai/train.yaml` | ro | training YAML (mounted only on `start`) |
-| code | `/app` | image | **not a mount**; rebuild image for code changes |
+```yaml
+runtime:
+  job_name: astrai-train
+  paths:
+    data: ./data
+    model: ./params
+    checkpoints: ./checkpoints
+  gpu:
+    devices: all
+    parallel_mode: auto  # one GPU: none; multiple GPUs: ddp
+  container:
+    cuda_tag: cu128
+    ipc: host
+    stop_grace_period: 10m
+    stop_timeout_seconds: 600
+    checkpoint_keep_last: 5
+    # max_duration_hours: 12
+  # Add host-specific workarounds only when required:
+  # environment:
+  #   NCCL_P2P_DISABLE: "1"
+  #   NCCL_NET_GDR_LEVEL: "0"
+```
 
-## Hard Rules
+- Relative paths resolve from the YAML file's directory, not the current shell.
+- `devices` is either `all` or a non-empty physical GPU index list. Compose
+  passes all GPUs once; `CUDA_VISIBLE_DEVICES` performs the only filtering.
+- The process count is derived from `devices`. With `all`, the entrypoint uses
+  `torch.cuda.device_count()` after Docker starts.
+- `parallel_mode: auto` selects `none` for one GPU and `ddp` for multiple GPUs.
+  Use `fsdp` explicitly when model sharding is required.
+- To select specific physical GPUs, replace `all` with a list such as
+  `devices: [0, 1]`.
+- `environment` values are explicitly passed to the training container. Keep
+  host-specific NCCL workarounds here; they are not universal defaults.
+- `max_duration_hours` starts a detached host timer that calls the same graceful
+  `stop` command. A manual stop cancels the timer.
 
-1. **Filter GPUs once**: compose passes the full physical set (`count: all`); `CUDA_VISIBLE_DEVICES` filters inside by physical index. Never `count: N` + physical indices (double filter leaves 1 card → `device_id out of range`).
-2. **In-container UID = host UID**: Dockerfile builds the user via `USER_UID/USER_GID` args; `train.sh` injects `ASTRAI_UID/GID` (bash `UID` is readonly). compose `user:` alone does not create the /etc/passwd entry — torch's `getpass.getuser()` then dies with `uid not found`.
-3. **In-container env vars are explicit**: `.env.train` (`--env-file`) is only compose's interpolation dictionary — never reaches the container. A var arrives only via a value-less `environment` entry (`- VAR`, read from the calling process env).
-4. **Host vars can come from `train.yaml` instead**: `scripts/train.sh load_infra()` reads the top-level `infra:` section of `TRAIN_CONFIG_FILE` (host side, before the container exists) and exports `TRAIN_JOB_NAME`, `TRAIN_DATA_DIR`, `TRAIN_MODEL_DIR`, `TRAIN_CHECKPOINT_DIR`, `TRAIN_GPU_COUNT`, `CUDA_VISIBLE_DEVICES`. Compose interpolation prefers the shell environment over `--env-file`, so `infra:` wins; keys absent from it fall back to `.env.train`. Requires python3 + PyYAML on the host. train.py only merges the `model/data/parallel/training/ckpt/log` sections, so the `infra` section is invisible to the trainer.
-5. **NCCL hang workaround** (this host): `NCCL_P2P_DISABLE=1` + `NCCL_NET_GDR_LEVEL=0` must be in-container.
-6. **Checkpoint complete =** `meta.json + config.json + model.safetensors + optimizer.pt + scheduler.pt`; `start` auto-resumes the latest complete one.
-7. **tqdm is silent without a TTY**: add `disable=False` in `astrai/trainer/train_callback.py`; `metric.jsonl` (per step) works as progress evidence regardless.
+## Fixed Container Paths
+
+| Runtime path | Container path | Access |
+|---|---|---|
+| `runtime.paths.data` | `/data` | read-only |
+| `runtime.paths.model` | `/models/base` | read-only |
+| `runtime.paths.checkpoints` | `/checkpoints` | read-write |
+| the selected YAML | `/run/astrai/train.yaml` | read-only |
+
+Training configuration must therefore use `data_root_path: /data`. The source
+code is baked into `/app`; `start` uses `--build`, so code changes rebuild the
+image when necessary.
 
 ## Operations
 
+The config argument defaults to `./train.yaml`:
+
 ```bash
-bash scripts/train.sh init        # first run: dirs + .env.train (edit per machine)
-bash scripts/train.sh preflight   # validate Docker/paths/GPU/model/YAML/compose
-bash scripts/train.sh start       # build + start in background (auto-resume)
-bash scripts/train.sh start --foreground -- --dry-run   # print plan only
-bash scripts/train.sh logs | status | stop | restart
-bash scripts/train.sh clean --keep 5   # prune old checkpoints (--force to delete)
+bash scripts/train.sh init [CONFIG]
+bash scripts/train.sh preflight [CONFIG]
+bash scripts/train.sh start [CONFIG]
+bash scripts/train.sh start [CONFIG] --foreground -- --dry-run
+bash scripts/train.sh logs [CONFIG]
+bash scripts/train.sh status [CONFIG]
+bash scripts/train.sh stop [CONFIG]
+bash scripts/train.sh restart [CONFIG]
+bash scripts/train.sh clean [CONFIG] --keep 5
+bash scripts/train.sh clean [CONFIG] --keep 5 --force
 ```
 
-## Files
+`init` creates the declared runtime directories but does not generate or mutate
+the YAML. `preflight` validates Docker, paths, base model files, checkpoint
+writability, GPU configuration, and rendered Compose configuration.
 
-- `docker-compose.yml` — trainer service: `count: all`, `ASTRAI_UID/GID` build args + `user:`, env whitelist, mounts
-- `Dockerfile` — production stage builds user from `USER_UID/USER_GID`; `ENV HOME=/home/astrai`; `USER astrai`
-- `scripts/train.sh` — `load_env` filters `UID=` lines (readonly var); `load_infra` reads the `infra:` section from `TRAIN_CONFIG_FILE`; `compose()` injects `ASTRAI_UID/GID`
-- `scripts/docker/train-entrypoint.sh` — GPU-count resolution, parallel mode, resume
-- `.env.train`, `train.yaml` — host-specific; templates from `scripts/train.sh init`; scientific-notation floats (`2e-5`) parse correctly since train.py uses the YAML 1.2 float schema; `.env.train` is the fallback for host vars not present in the `infra:` section
+## Checkpoint Recovery
+
+Checkpoints are stored below
+`runtime.paths.checkpoints/<job_name>/epoch_<N>_step_<N>`. A checkpoint is
+complete only when it contains:
+
+```text
+meta.json
+config.json
+model.safetensors
+optimizer.pt
+scheduler.pt
+```
+
+`start` resumes the latest complete checkpoint and ignores partial writes. If no
+complete checkpoint exists, `/models/base/config.json` and
+`/models/base/model.safetensors` are required. `stop` sends `SIGTERM`; the
+trainer finishes at a batch boundary and saves an emergency checkpoint before
+the Docker timeout expires.
+
+## Hard Rules
+
+1. Keep Docker settings in `runtime` and trainer settings in the remaining YAML sections.
+2. Filter GPUs once: Compose passes `count: all`; `devices` becomes `CUDA_VISIBLE_DEVICES`.
+3. Do not force DDP for a model that requires FSDP; declare the mode explicitly.
+4. Do not use `kill -9` for routine shutdown; use `scripts/train.sh stop CONFIG`.
+5. The image user is built with the host UID/GID so mounted checkpoints retain usable ownership.
