@@ -10,7 +10,15 @@ import torch.nn as nn
 
 from astrai.config.model_config import BaseModelConfig, ConfigFactory
 from astrai.factory import BaseFactory
-from astrai.serialization import load_model_config, load_model_weights, save_model
+from astrai.serialization import (
+    HF_MODEL_TYPES,
+    adapt_config,
+    convert_hf_weights,
+    load_model_config,
+    load_model_weights,
+    looks_like_hf_state_dict,
+    save_model,
+)
 
 
 @contextmanager
@@ -57,7 +65,25 @@ class AutoModel(nn.Module):
         path: Union[str, Path],
         disable_random_init: bool = True,
         strict: bool = True,
+        weights_format: str = "auto",
     ) -> nn.Module:
+        """Load a model directory.
+
+        Args:
+            path: Directory containing ``config.json`` and optionally
+                ``model.safetensors``.
+            disable_random_init: Replace parameter initializers with no-ops
+                while building the model.
+            strict: Passed to ``load_state_dict``.
+            weights_format: ``"auto"`` detects HuggingFace checkpoints
+                (LLaMA-style keys and ``model_type``) and converts them;
+                ``"astrai"`` skips conversion; ``"hf"`` forces it.
+        """
+        if weights_format not in ("auto", "astrai", "hf"):
+            raise ValueError(
+                f"weights_format must be one of 'auto', 'astrai', 'hf', "
+                f"got {weights_format!r}"
+            )
 
         model_path = Path(path)
 
@@ -66,6 +92,12 @@ class AutoModel(nn.Module):
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
         raw = load_model_config(str(model_path))
+        is_hf_config = weights_format == "hf" or (
+            weights_format == "auto" and raw.get("model_type") in HF_MODEL_TYPES
+        )
+        if is_hf_config:
+            raw = adapt_config(raw)
+
         config = ConfigFactory.load(raw)
         model_type = config.model_type or "autoregressive_lm"
 
@@ -75,8 +107,14 @@ class AutoModel(nn.Module):
             model = actual_cls(config)
 
         weights_path = model_path / "model.safetensors"
-        if weights_path.exists():
+        index_path = model_path / "model.safetensors.index.json"
+        if weights_path.exists() or index_path.exists():
             state_dict = load_model_weights(str(model_path))
+            is_hf_weights = is_hf_config or (
+                weights_format == "auto" and looks_like_hf_state_dict(state_dict)
+            )
+            if is_hf_weights:
+                state_dict = convert_hf_weights(state_dict, config)
             model.load_state_dict(state_dict, strict=strict)
 
         return model

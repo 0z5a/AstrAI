@@ -58,6 +58,14 @@ The model directory contains:
 - `model.safetensors` — model weights
 - `tokenizer.json` + `tokenizer_config.json` — tokenizer files (including chat template)
 
+External HuggingFace checkpoints of the LLaMA layout (e.g. `meta-llama/...`,
+`mistralai/...`, `Qwen/Qwen2-...`) can be loaded directly: `AutoModel.from_pretrained`
+auto-detects HF `model_type` / key names (`input_layernorm`, `gate_proj`, MoE
+`experts.<j>` ...) and converts config and weights in place. Dense and MoE
+(Mixtral / DeepSeek-V3 layout) FFNs are supported; MLA attention
+(DeepSeek-V2/V3) and biased projections (`attention_bias`) are not. Pass
+`weights_format="astrai"` to skip conversion, or `"hf"` to force it.
+
 ## 3. Run Inference
 
 ### Interactive Chat (Simplest)

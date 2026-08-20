@@ -22,9 +22,21 @@ from astrai.serialization.dataset import (
     load_bin_offsets,
     save_bin,
 )
+from astrai.serialization.hf_adapter import (
+    HF_MODEL_TYPES,
+    adapt_config,
+    convert_hf_config,
+    convert_hf_weights,
+    looks_like_hf_state_dict,
+)
 
 __all__ = [
     "Checkpoint",
+    "HF_MODEL_TYPES",
+    "adapt_config",
+    "convert_hf_config",
+    "convert_hf_weights",
+    "looks_like_hf_state_dict",
     "load_json",
     "load_model_config",
     "load_model_weights",

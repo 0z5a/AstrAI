@@ -13,6 +13,7 @@ from astrai.inference.engine import InferenceEngine
 from astrai.inference.runtime.graph import CudaGraphContext
 from astrai.inference.workspace import InferenceWorkspace
 from astrai.model import AutoModel, AutoRegressiveLM
+from astrai.serialization import adapt_config
 from astrai.tokenize import AutoTokenizer
 
 _DTYPES = ["bfloat16", "float16", "float32"]
@@ -478,7 +479,9 @@ def benchmark_command(
     if ckpt is not None:
         click.echo(f"Loading model from {ckpt} ...")
         config = ConfigFactory.load(
-            json.loads((Path(ckpt) / "config.json").read_text(encoding="utf-8-sig"))
+            adapt_config(
+                json.loads((Path(ckpt) / "config.json").read_text(encoding="utf-8-sig"))
+            )
         )
         model = AutoModel.from_pretrained(ckpt)
     else:

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
+from astrai.config.model_config import ConfigFactory
 from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
 from astrai.inference.scheduler import InferenceScheduler
@@ -15,7 +16,13 @@ from astrai.model.components.lora import inject_lora
 from astrai.parallel.executor import BaseExecutor, ExecutorFactory, create_ref_model
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
-from astrai.serialization import Checkpoint, load_json
+from astrai.serialization import (
+    Checkpoint,
+    adapt_config,
+    convert_hf_weights,
+    load_json,
+    looks_like_hf_state_dict,
+)
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.metric_util import GradSNRTracker
 from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
@@ -126,9 +133,18 @@ class TrainContextBuilder:
         if self._param_path:
             config_path = Path(self._param_path) / "config.json"
             if config_path.exists():
-                state.model_config = load_json(config_path)
+                state.model_config = adapt_config(load_json(config_path))
             checkpoint = Checkpoint.load_any(self._param_path)
             if checkpoint is not None:
+                if checkpoint.config:
+                    checkpoint.config = adapt_config(checkpoint.config)
+                if checkpoint.state_dict and looks_like_hf_state_dict(
+                    checkpoint.state_dict
+                ):
+                    checkpoint.state_dict = convert_hf_weights(
+                        checkpoint.state_dict,
+                        ConfigFactory.load(checkpoint.config or state.model_config),
+                    )
                 state.state_dict = checkpoint.state_dict
                 state.model_config = checkpoint.config or state.model_config
                 if self._resume:

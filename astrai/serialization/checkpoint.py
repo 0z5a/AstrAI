@@ -91,7 +91,21 @@ def load_model_config(save_directory: str) -> dict:
 
 
 def load_model_weights(save_directory: str) -> dict:
-    return load_state_dict(Path(save_directory) / _WEIGHTS_FILE)
+    save_path = Path(save_directory)
+    weights_file = save_path / _WEIGHTS_FILE
+    if weights_file.exists():
+        return load_state_dict(weights_file)
+
+    index_path = save_path / "model.safetensors.index.json"
+    if index_path.exists():
+        index = load_json(index_path)
+        weight_map = index.get("weight_map", {})
+        state_dict = {}
+        for shard in sorted(set(weight_map.values())):
+            state_dict.update(load_state_dict(save_path / shard))
+        return state_dict
+
+    raise FileNotFoundError(f"No model weights found in {save_directory}")
 
 
 def load_state_dict(path: Union[str, Path], broadcast: bool = False) -> dict:
@@ -182,8 +196,10 @@ class Checkpoint:
         if meta_path.exists():
             return cls.load(save_dir, broadcast=broadcast)
 
-        if weights_path.exists():
-            state_dict = load_state_dict(weights_path, broadcast=broadcast)
+        weights_path = save_path / _WEIGHTS_FILE
+        index_path = save_path / "model.safetensors.index.json"
+        if weights_path.exists() or index_path.exists():
+            state_dict = load_model_weights(save_dir)
             config = {}
             config_path = save_path / _CONFIG_FILE
             if config_path.exists():
