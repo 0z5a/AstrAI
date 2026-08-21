@@ -9,9 +9,11 @@ services:
         USER_GID: ${ASTRAI_GID:-1000}
     user: "${ASTRAI_UID:-1000}:${ASTRAI_GID:-1000}"
     ports:
-      - "8000:8000"
+      - "${SERVE_PORT:-8000}:${SERVE_CONTAINER_PORT:-8000}"
     volumes:
-      - ./params:/app/params:ro
+      - ${SERVE_PARAM_DIR:-./params}:/app/params:ro
+    environment:
+      - CUDA_VISIBLE_DEVICES
     command: python -m scripts.tools.server --port 8000 --device cuda
     deploy:
       resources:
@@ -39,9 +41,9 @@ services:
         USER_GID: ${ASTRAI_GID:-1000}
     user: "${ASTRAI_UID:-1000}:${ASTRAI_GID:-1000}"
     ports:
-      - "8000:8000"
+      - "${SERVE_PORT:-8000}:${SERVE_CONTAINER_PORT:-8000}"
     volumes:
-      - ./params:/app/params:ro
+      - ${SERVE_PARAM_DIR:-./params}:/app/params:ro
     command: python -m scripts.tools.server --port 8000 --device cpu
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

@@ -191,6 +191,9 @@ docker compose up -d
 
 # Docker Compose CPU server profile (CUDA-only generation scripts/demos are unavailable)
 docker compose --profile cpu up -d
+
+# YAML-driven serving (see serve.yaml; up/run/down/logs/status...)
+bash scripts/serve.sh up
 ```
 
 > **Note**: `--gpus all` is required for CUDA support. Without it, `torch.cuda.is_available()` will return `False`.

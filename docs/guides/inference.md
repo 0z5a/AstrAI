@@ -171,6 +171,31 @@ InferenceEngine
 
 `GenerateResult` uses `Condition` for non-streaming (`wait_completion()`) and `Event` for streaming (`wait()`). Stream callback is `cb(token)`.
 
+## Launching the Server
+
+`scripts/tools/server.py` accepts every option as a CLI flag or from a YAML
+config file (`--config serve.yaml`); explicit CLI flags override YAML values.
+The YAML `server:` section mirrors the flags:
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8000
+  device: cuda
+  dtype: bfloat16
+  max_batch_size: 16
+  max_seq_len: null
+```
+
+```bash
+python scripts/tools/server.py --config serve.yaml
+python scripts/tools/server.py --config serve.yaml --port 9000  # CLI wins
+```
+
+In Docker, `scripts/serve.sh` drives the same YAML (a `runtime:` section
+controls ports/GPU/mounts); see
+[Docker Serving](../developer/docker-serving.md).
+
 ## HTTP API
 
 ```

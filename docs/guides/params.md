@@ -203,6 +203,7 @@ nohup python scripts/tools/train.py \
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `--config`, `-c` | path | `None` | Serving YAML config. CLI flags override YAML values |
 | `--host` | str | `0.0.0.0` | Host address |
 | `--port` | int | `8000` | Port number |
 | `--param_path` | path | `project_root/params` | Path to model parameters |
@@ -216,6 +217,22 @@ Usage:
 ```bash
 python scripts/tools/server.py --param_path ./params --device cuda --dtype bfloat16
 ```
+
+YAML config (a `server:` section; explicit CLI flags override YAML values):
+```bash
+python scripts/tools/server.py --config serve.yaml
+```
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8000
+  device: cuda
+  dtype: bfloat16
+  max_batch_size: 16
+  max_seq_len: null
+```
+`serve.yaml` also carries a `runtime:` section for the Docker wrapper; see
+[Docker Serving](../developer/docker-serving.md).
 
 See [Inference Guide](inference.md) for HTTP API documentation.
 
