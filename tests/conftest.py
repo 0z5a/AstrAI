@@ -1,7 +1,5 @@
 import json
 import os
-import shutil
-import tempfile
 
 import pytest
 import torch
@@ -44,20 +42,18 @@ def test_tokenizer():
     return create_test_tokenizer()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def test_model(device):
-    """Session-scoped small AutoRegressiveLM model, created once."""
+    """Function-scoped small AutoRegressiveLM model, isolated per test."""
     config = make_tiny_config()
     model = AutoRegressiveLM(config).to(device=device)
     return {"model": model, "device": device, "config": config}
 
 
 @pytest.fixture
-def temp_dir():
-    """Function-scoped temporary directory, cleaned up after each test."""
-    d = tempfile.mkdtemp()
-    yield d
-    shutil.rmtree(d, ignore_errors=True)
+def temp_dir(tmp_path):
+    """Function-scoped temporary directory, cleaned up by pytest."""
+    return str(tmp_path)
 
 
 @pytest.fixture

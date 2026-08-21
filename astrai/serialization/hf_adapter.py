@@ -44,6 +44,8 @@ HF_MODEL_TYPES = frozenset(
 
 _EMBED = re.compile(r"^model\.embed_tokens\.weight$")
 _ATTN = re.compile(r"^model\.layers\.(\d+)\.self_attn\.(q|k|v|o)_proj\.(weight|bias)$")
+_Q_NORM = re.compile(r"^model\.layers\.(\d+)\.self_attn\.q_norm\.weight$")
+_K_NORM = re.compile(r"^model\.layers\.(\d+)\.self_attn\.k_norm\.weight$")
 _INPUT_NORM = re.compile(r"^model\.layers\.(\d+)\.input_layernorm\.weight$")
 _POST_NORM = re.compile(r"^model\.layers\.(\d+)\.post_attention_layernorm\.weight$")
 _FINAL_NORM = re.compile(r"^model\.norm\.weight$")
@@ -56,7 +58,7 @@ _MOE_EXPERTS = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(weight|bias)$"
 )
 _MOE_SHARED = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(\d+)\."
+    r"^model\.layers\.(\d+)\.mlp\.shared_expert(?:s)?\.(\d+)\."
     r"(gate|up|down)_proj\.(weight|bias)$"
 )
 
@@ -72,6 +74,17 @@ def looks_like_hf_state_dict(state_dict: Mapping[str, Any]) -> bool:
         or "mlp.experts." in key
         for key in state_dict
     )
+
+
+def _is_dense_mlp_layer(config: BaseConfig, layer_id: int) -> bool:
+    """Return whether a layer uses dense MLP instead of routed experts."""
+    if getattr(config, "ffn_type", "mlp") != "moe":
+        return True
+    mlp_only = getattr(config, "mlp_only_layers", None) or []
+    if layer_id in mlp_only:
+        return True
+    step = getattr(config, "decoder_sparse_step", 1) or 1
+    return step > 1 and (layer_id + 1) % step != 0
 
 
 def adapt_config(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -112,6 +125,8 @@ def convert_hf_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         "topk_method",
         "norm_topk_prob",
         "moe_aux_loss_coef",
+        "decoder_sparse_step",
+        "mlp_only_layers",
         "neftune_alpha",
     ):
         if key in raw:
@@ -119,6 +134,13 @@ def convert_hf_config(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     if "qk_norm" in raw and "use_qk_norm" not in cfg:
         cfg["use_qk_norm"] = raw["qk_norm"]
+    if (
+        raw.get("model_type") in ("gemma", "gemma2")
+        and "use_qk_norm" not in cfg
+        and "qk_norm" not in raw
+    ):
+        # Gemma/Gemma2 always apply RMSNorm to Q and K before attention.
+        cfg["use_qk_norm"] = True
 
     n_heads = raw.get("num_attention_heads")
     if cfg.get("num_key_value_heads") is None and n_heads is not None:
@@ -205,6 +227,10 @@ def convert_hf_weights(
                             f"layers.{m.group(1)}.mlp.shared_experts.{m.group(2)}."
                             f"{m.group(3)}.{m.group(4)}"
                         )
+            if new_key is None:
+                m = _DENSE_MLP.match(key)
+                if m and _is_dense_mlp_layer(config, int(m.group(1))):
+                    new_key = f"layers.{m.group(1)}.mlp.{m.group(2)}.{m.group(3)}"
         else:
             m = _DENSE_MLP.match(key)
             if m:
@@ -216,6 +242,10 @@ def convert_hf_weights(
                 new_key = (
                     f"layers.{m.group(1)}.attention.{m.group(2)}_proj.{m.group(3)}"
                 )
+            elif (m := _Q_NORM.match(key)) is not None:
+                new_key = f"layers.{m.group(1)}.attention.q_norm.weight"
+            elif (m := _K_NORM.match(key)) is not None:
+                new_key = f"layers.{m.group(1)}.attention.k_norm.weight"
             elif (m := _INPUT_NORM.match(key)) is not None:
                 new_key = f"layers.{m.group(1)}.input_norm.weight"
             elif (m := _POST_NORM.match(key)) is not None:

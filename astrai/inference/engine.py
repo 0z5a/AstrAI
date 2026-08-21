@@ -156,9 +156,8 @@ class InferenceEngine:
         async def _agen():
             loop = asyncio.get_event_loop()
             while True:
-                try:
-                    token = await loop.run_in_executor(None, next, sync_gen)
-                except StopIteration:
+                token = await loop.run_in_executor(None, next, sync_gen, None)
+                if token is None:
                     break
                 yield token
 

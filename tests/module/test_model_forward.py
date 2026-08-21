@@ -54,6 +54,20 @@ def _make_batch(config, batch_size=2, seq_len=8, with_extra=False):
     return batch
 
 
+def _make_seq_moe_fixture(device):
+    config = _make_tiny_moe_config()
+    model = _make_model(config).to(device)
+    model.train()
+    return config, model
+
+
+def _make_sft_moe_fixture(device):
+    config = _make_tiny_moe_config()
+    model = _make_model(config).to(device)
+    model.train()
+    return config, model
+
+
 def test_model_forward_contract_uses_dense_training_and_packed_inference():
     from astrai.inference.cache import PagePool, TaskCacheManager
     from astrai.inference.workspace import InferenceWorkspace
@@ -185,172 +199,166 @@ def test_moe_metrics_flow_through_wrapped_model(device):
     assert "router_entropy" in strategy._moe_metrics
 
 
-class TestSEQStrategyMoE:
-    """End‑to‑end tests for SEQStrategy with MoE aux loss."""
-
-    @pytest.fixture(autouse=True)
-    def setup(self, device):
-        self.device = device
-        self.config = _make_tiny_moe_config()
-        self.model = _make_model(self.config).to(device)
-        self.model.train()
-
-    def test_compute_loss_returns_scalar(self):
-        """compute_loss should return a scalar tensor."""
-        strategy = SEQStrategy(
-            self.model,
-            self.device,
-            moe_aux_loss_coef=0.01,
-        )
-        loss = strategy.compute_loss(_make_batch(self.config))
-        assert loss.ndim == 0
-        assert loss.requires_grad
-
-    def test_compute_loss_output_has_metrics(self):
-        """compute_loss_output dict with moe_aux_loss_coef > 0 includes MoE metrics."""
-        strategy = SEQStrategy(
-            self.model,
-            self.device,
-            moe_aux_loss_coef=0.01,
-        )
-        output = strategy.compute_loss_output(_make_batch(self.config))
-
-        assert "loss" in output
-        assert "metrics" in output
-        assert output["loss"].ndim == 0
-        assert output["loss"].requires_grad
-
-        metrics = output["metrics"]
-        # MoE metrics should appear when coef > 0 and model has MoE layers
-        for key in ("moe_aux_loss", "moe_aux_loss_weighted", "task_loss", "loss"):
-            assert key in metrics, f"Missing metric: {key}"
-            assert isinstance(metrics[key], float)
-
-    def test_moe_metrics_populated_after_forward(self):
-        """strategy._moe_metrics populated after compute_loss_output."""
-        strategy = SEQStrategy(
-            self.model,
-            self.device,
-            moe_aux_loss_coef=0.01,
-        )
-        strategy.compute_loss_output(_make_batch(self.config))
-
-        moe_metrics = strategy._moe_metrics
-        assert moe_metrics, "_moe_metrics should not be empty for MoE model"
-        for key in (
-            "aux_loss",
-            "router_entropy",
-            "dead_expert_fraction",
-            "load_imbalance_mean",
-            "load_imbalance_max",
-        ):
-            assert key in moe_metrics, f"Missing _moe_metrics key: {key}"
-            assert isinstance(moe_metrics[key], float)
-
-    def test_zero_coef_zeroes_weighted_aux(self):
-        """moe_aux_loss_coef=0 → weighted_aux_loss is zero, task_loss == loss."""
-        strategy = SEQStrategy(
-            self.model,
-            self.device,
-            moe_aux_loss_coef=0.0,
-        )
-        output = strategy.compute_loss_output(_make_batch(self.config))
-        metrics = output["metrics"]
-
-        # task_loss and loss should be equal (aux weighted by zero)
-        assert "task_loss" in metrics
-        assert "loss" in metrics
-        assert metrics["loss"] == pytest.approx(metrics["task_loss"], abs=1e-6)
-
-        # weighted aux loss is zero
-        assert metrics.get("moe_aux_loss_weighted") == pytest.approx(0.0, abs=1e-6)
-
-        # MoE diagnostics are still collected (monitoring purposes)
-        assert strategy._moe_metrics
-        assert "router_entropy" in strategy._moe_metrics
-
-    def test_aux_loss_added_to_total_loss(self):
-        """Total loss > task_loss when moe_aux_loss_coef > 0."""
-        strategy = SEQStrategy(
-            self.model,
-            self.device,
-            moe_aux_loss_coef=0.01,
-        )
-        output = strategy.compute_loss_output(_make_batch(self.config))
-        assert output["metrics"]["loss"] > output["metrics"]["task_loss"] + 1e-12
-
-    def test_factory_creates_strategy_with_coef(self):
-        """StrategyFactory.create passes moe_aux_loss_coef to strategy."""
-        strategy = StrategyFactory.create(
-            "seq",
-            model=self.model,
-            device=self.device,
-            moe_aux_loss_coef=0.02,
-        )
-        assert strategy.moe_aux_loss_coef == 0.02
-
-    def test_no_aux_loss_for_mlp_model(self):
-        """Pure MLP model: model outputs no aux_loss → no MoE metrics."""
-        from astrai.config.model_config import AutoRegressiveLMConfig
-
-        mlp_config = AutoRegressiveLMConfig(**{**TINY_CONFIG, "ffn_type": "mlp"})
-        mlp_model = AutoRegressiveLM(mlp_config).to(self.device)
-        mlp_model.train()
-
-        strategy = SEQStrategy(
-            mlp_model,
-            self.device,
-            moe_aux_loss_coef=0.01,
-        )
-        output = strategy.compute_loss_output(_make_batch(self.config))
-        metrics = output["metrics"]
-
-        assert "moe_aux_loss" not in metrics
-        assert "moe_aux_loss_weighted" not in metrics
-        assert metrics["loss"] == pytest.approx(metrics["task_loss"], abs=1e-6)
-        assert strategy._moe_metrics == {}
+def test_seq_compute_loss_returns_scalar(device):
+    """compute_loss should return a scalar tensor."""
+    config, model = _make_seq_moe_fixture(device)
+    strategy = SEQStrategy(
+        model,
+        device,
+        moe_aux_loss_coef=0.01,
+    )
+    loss = strategy.compute_loss(_make_batch(config))
+    assert loss.ndim == 0
+    assert loss.requires_grad
 
 
-class TestSFTStrategyMoE:
-    """End‑to‑end tests for SFTStrategy with MoE aux loss."""
+def test_seq_compute_loss_output_has_metrics(device):
+    """compute_loss_output dict with moe_aux_loss_coef > 0 includes MoE metrics."""
+    config, model = _make_seq_moe_fixture(device)
+    strategy = SEQStrategy(
+        model,
+        device,
+        moe_aux_loss_coef=0.01,
+    )
+    output = strategy.compute_loss_output(_make_batch(config))
 
-    @pytest.fixture(autouse=True)
-    def setup(self, device):
-        self.device = device
-        self.config = _make_tiny_moe_config()
-        self.model = _make_model(self.config).to(device)
-        self.model.train()
+    assert "loss" in output
+    assert "metrics" in output
+    assert output["loss"].ndim == 0
+    assert output["loss"].requires_grad
 
-    def test_compute_loss_output_with_aux_loss(self):
-        """SFTStrategy produces MoE metrics when coef > 0."""
-        strategy = SFTStrategy(
-            self.model,
-            self.device,
-            moe_aux_loss_coef=0.01,
-        )
-        output = strategy.compute_loss_output(_make_batch(self.config, with_extra=True))
+    metrics = output["metrics"]
+    # MoE metrics should appear when coef > 0 and model has MoE layers
+    for key in ("moe_aux_loss", "moe_aux_loss_weighted", "task_loss", "loss"):
+        assert key in metrics, f"Missing metric: {key}"
+        assert isinstance(metrics[key], float)
 
-        metrics = output["metrics"]
-        assert "moe_aux_loss" in metrics
-        assert "moe_aux_loss_weighted" in metrics
-        assert metrics["loss"] > metrics["task_loss"] + 1e-12
 
-        moe_metrics = strategy._moe_metrics
-        assert "router_entropy" in moe_metrics
-        assert "dead_expert_fraction" in moe_metrics
+def test_seq_moe_metrics_populated_after_forward(device):
+    """strategy._moe_metrics populated after compute_loss_output."""
+    config, model = _make_seq_moe_fixture(device)
+    strategy = SEQStrategy(
+        model,
+        device,
+        moe_aux_loss_coef=0.01,
+    )
+    strategy.compute_loss_output(_make_batch(config))
 
-    def test_sft_zero_coef_zeroes_weighted_aux(self):
-        """SFTStrategy with zero coef: weighted aux is zero, loss == task_loss."""
-        strategy = SFTStrategy(
-            self.model,
-            self.device,
-            moe_aux_loss_coef=0.0,
-        )
-        output = strategy.compute_loss_output(_make_batch(self.config, with_extra=True))
-        metrics = output["metrics"]
+    moe_metrics = strategy._moe_metrics
+    assert moe_metrics, "_moe_metrics should not be empty for MoE model"
+    for key in (
+        "aux_loss",
+        "router_entropy",
+        "dead_expert_fraction",
+        "load_imbalance_mean",
+        "load_imbalance_max",
+    ):
+        assert key in moe_metrics, f"Missing _moe_metrics key: {key}"
+        assert isinstance(moe_metrics[key], float)
 
-        assert metrics["loss"] == pytest.approx(metrics["task_loss"], abs=1e-6)
-        assert metrics.get("moe_aux_loss_weighted") == pytest.approx(0.0, abs=1e-6)
-        # Diagnostics still collected
-        assert strategy._moe_metrics
-        assert "router_entropy" in strategy._moe_metrics
+
+def test_seq_zero_coef_zeroes_weighted_aux(device):
+    """moe_aux_loss_coef=0 → weighted_aux_loss is zero, task_loss == loss."""
+    config, model = _make_seq_moe_fixture(device)
+    strategy = SEQStrategy(
+        model,
+        device,
+        moe_aux_loss_coef=0.0,
+    )
+    output = strategy.compute_loss_output(_make_batch(config))
+    metrics = output["metrics"]
+
+    # task_loss and loss should be equal (aux weighted by zero)
+    assert "task_loss" in metrics
+    assert "loss" in metrics
+    assert metrics["loss"] == pytest.approx(metrics["task_loss"], abs=1e-6)
+
+    # weighted aux loss is zero
+    assert metrics.get("moe_aux_loss_weighted") == pytest.approx(0.0, abs=1e-6)
+
+    # MoE diagnostics are still collected (monitoring purposes)
+    assert strategy._moe_metrics
+    assert "router_entropy" in strategy._moe_metrics
+
+
+def test_seq_aux_loss_added_to_total_loss(device):
+    """Total loss > task_loss when moe_aux_loss_coef > 0."""
+    config, model = _make_seq_moe_fixture(device)
+    strategy = SEQStrategy(
+        model,
+        device,
+        moe_aux_loss_coef=0.01,
+    )
+    output = strategy.compute_loss_output(_make_batch(config))
+    assert output["metrics"]["loss"] > output["metrics"]["task_loss"] + 1e-12
+
+
+def test_seq_factory_creates_strategy_with_coef(device):
+    """StrategyFactory.create passes moe_aux_loss_coef to strategy."""
+    _, model = _make_seq_moe_fixture(device)
+    strategy = StrategyFactory.create(
+        "seq",
+        model=model,
+        device=device,
+        moe_aux_loss_coef=0.02,
+    )
+    assert strategy.moe_aux_loss_coef == 0.02
+
+
+def test_seq_no_aux_loss_for_mlp_model(device):
+    """Pure MLP model: model outputs no aux_loss → no MoE metrics."""
+    config, _ = _make_seq_moe_fixture(device)
+    mlp_config = AutoRegressiveLMConfig(**{**TINY_CONFIG, "ffn_type": "mlp"})
+    mlp_model = AutoRegressiveLM(mlp_config).to(device)
+    mlp_model.train()
+
+    strategy = SEQStrategy(
+        mlp_model,
+        device,
+        moe_aux_loss_coef=0.01,
+    )
+    output = strategy.compute_loss_output(_make_batch(config))
+    metrics = output["metrics"]
+
+    assert "moe_aux_loss" not in metrics
+    assert "moe_aux_loss_weighted" not in metrics
+    assert metrics["loss"] == pytest.approx(metrics["task_loss"], abs=1e-6)
+    assert strategy._moe_metrics == {}
+
+
+def test_sft_compute_loss_output_with_aux_loss(device):
+    """SFTStrategy produces MoE metrics when coef > 0."""
+    config, model = _make_sft_moe_fixture(device)
+    strategy = SFTStrategy(
+        model,
+        device,
+        moe_aux_loss_coef=0.01,
+    )
+    output = strategy.compute_loss_output(_make_batch(config, with_extra=True))
+
+    metrics = output["metrics"]
+    assert "moe_aux_loss" in metrics
+    assert "moe_aux_loss_weighted" in metrics
+    assert metrics["loss"] > metrics["task_loss"] + 1e-12
+
+    moe_metrics = strategy._moe_metrics
+    assert "router_entropy" in moe_metrics
+    assert "dead_expert_fraction" in moe_metrics
+
+
+def test_sft_zero_coef_zeroes_weighted_aux(device):
+    """SFTStrategy with zero coef: weighted aux is zero, loss == task_loss."""
+    config, model = _make_sft_moe_fixture(device)
+    strategy = SFTStrategy(
+        model,
+        device,
+        moe_aux_loss_coef=0.0,
+    )
+    output = strategy.compute_loss_output(_make_batch(config, with_extra=True))
+    metrics = output["metrics"]
+
+    assert metrics["loss"] == pytest.approx(metrics["task_loss"], abs=1e-6)
+    assert metrics.get("moe_aux_loss_weighted") == pytest.approx(0.0, abs=1e-6)
+    # Diagnostics still collected
+    assert strategy._moe_metrics
+    assert "router_entropy" in strategy._moe_metrics

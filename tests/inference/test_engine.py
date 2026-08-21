@@ -1,5 +1,6 @@
 """Unit tests for GenerateResult accumulator and InferenceEngine.generate()."""
 
+import asyncio
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -154,6 +155,35 @@ def test_engine_generate_streaming_yields_tokens():
 
         tokens = list(gen)
         assert tokens == ["t1", "t2"]
+
+
+def test_engine_generate_async_yields_tokens_until_stop():
+    mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
+    callbacks_saved = []
+
+    def capture_cb(prompt, **kw):
+        callbacks_saved.append(kw.get("stream_callback"))
+
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        instance = MockSched.return_value
+        instance.add_task.side_effect = capture_cb
+        instance.remove_task.return_value = []
+
+        eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
+        agen = eng.generate_async("hello")
+
+        async def collect():
+            out = []
+            async for token in agen:
+                out.append(token)
+            return out
+
+        cb = callbacks_saved[0]
+        cb("t1")
+        cb("t2")
+        cb(STOP)
+
+        assert asyncio.run(collect()) == ["t1", "t2"]
 
 
 def test_engine_generate_non_streaming_batch():

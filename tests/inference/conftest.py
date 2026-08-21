@@ -8,6 +8,13 @@ from fastapi.testclient import TestClient
 from astrai.inference import get_app
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_app_engine():
+    """Reset the lazy FastAPI singleton engine after each inference test."""
+    yield
+    get_app().state.engine = None
+
+
 @pytest.fixture
 def client():
     """Provide a test client for the FastAPI app."""

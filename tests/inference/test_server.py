@@ -1,8 +1,15 @@
 """Unit tests for the inference HTTP server."""
 
+from pathlib import Path
+
 import pytest
+import torch
 
 from astrai.inference import get_app
+from astrai.inference.network.app import _create_engine
+from astrai.model.transformer import AutoRegressiveLM
+from astrai.serialization import save_model
+from tests.helpers import CHAT_TEMPLATE, build_test_tokenizer, make_tiny_config
 
 
 def test_health_no_model(client):
@@ -210,6 +217,43 @@ def test_chat_completions_stop_sequence_stream(client, loaded_model):
     assert any(
         "finish_reason" in line for line in content.split("\n") if "stop" in line
     )
+
+
+def test_chat_completions_real_engine(tmp_path, client):
+    """POST /v1/chat/completions with a real tiny model and tokenizer."""
+    cfg = make_tiny_config(vocab_size=256)
+    model = AutoRegressiveLM(cfg).eval()
+    save_model(cfg.to_dict(), model.state_dict(), str(tmp_path))
+
+    tokenizer = build_test_tokenizer(vocab_size=256, chat_template=CHAT_TEMPLATE)
+    tokenizer.save_pretrained(str(tmp_path))
+
+    engine = _create_engine(
+        Path(tmp_path),
+        device="cpu",
+        dtype=torch.float32,
+        max_batch_size=1,
+        max_seq_len=64,
+    )
+    try:
+        get_app().state.engine = engine
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4,
+                "temperature": 0.0,
+                "stream": False,
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        assert isinstance(content, str)
+        assert data["usage"]["completion_tokens"] > 0
+    finally:
+        engine.shutdown()
+        get_app().state.engine = None
 
 
 if __name__ == "__main__":

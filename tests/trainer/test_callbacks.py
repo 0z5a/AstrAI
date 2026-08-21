@@ -31,13 +31,11 @@ def test_gradient_checkpointing_empty_modules_noop(test_model):
     model = test_model["model"]
     callback = GradientCheckpointingCallback()
 
-    originals = [layer.forward for layer in model.layers]
-
     for layer in model.layers:
         callback._enable(layer)
 
-    for layer, orig in zip(model.layers, originals):
-        assert layer.forward is orig
+    for layer in model.layers:
+        assert not hasattr(layer, "_original_forward")
 
 
 def test_gradient_checkpointing_forward_unchanged(test_model):

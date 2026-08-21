@@ -183,6 +183,68 @@ def test_convert_hf_weights_rejects_mla():
         convert_hf_weights(sd, cfg)
 
 
+def test_convert_hf_config_qwen2_moe_preserves_sparse_fields():
+    raw = {
+        **LLAMA_RAW,
+        "model_type": "qwen2_moe",
+        "num_local_experts": 2,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 1,
+        "decoder_sparse_step": 2,
+        "mlp_only_layers": [0],
+    }
+    cfg = ConfigFactory.load(convert_hf_config(raw))
+    assert cfg.decoder_sparse_step == 2
+    assert cfg.mlp_only_layers == [0]
+
+
+def test_convert_hf_config_gemma_enables_qk_norm():
+    raw = {**LLAMA_RAW, "model_type": "gemma"}
+    cfg = ConfigFactory.load(convert_hf_config(raw))
+    assert cfg.use_qk_norm is True
+
+
+def test_convert_hf_weights_moe_with_dense_layers_roundtrip():
+    cfg = make_tiny_config(
+        ffn_type="moe",
+        n_routed_experts=2,
+        n_shared_experts=1,
+        n_activated_experts=1,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        mlp_only_layers=[0],
+        decoder_sparse_step=1,
+    )
+    model = AutoRegressiveLM(cfg)
+    converted = convert_hf_weights(to_hf_keys(model.state_dict()), cfg)
+    assert_state_dicts_equal(converted, model.state_dict())
+
+
+def test_convert_hf_weights_qwen2_moe_singular_shared_expert_roundtrip():
+    cfg = make_tiny_config(
+        ffn_type="moe",
+        n_routed_experts=2,
+        n_shared_experts=1,
+        n_activated_experts=1,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+    )
+    model = AutoRegressiveLM(cfg)
+    hf_sd = to_hf_keys(model.state_dict())
+    hf_sd = {
+        k.replace("shared_experts.", "shared_expert.", 1): v for k, v in hf_sd.items()
+    }
+    converted = convert_hf_weights(hf_sd, cfg)
+    assert_state_dicts_equal(converted, model.state_dict())
+
+
+def test_convert_hf_weights_gemma_qk_norm_roundtrip():
+    cfg = make_tiny_config(use_qk_norm=True)
+    model = AutoRegressiveLM(cfg)
+    converted = convert_hf_weights(to_hf_keys(model.state_dict()), cfg)
+    assert_state_dicts_equal(converted, model.state_dict())
+
+
 def test_from_pretrained_hf_directory(tmp_path):
     cfg = make_tiny_config()
     model = AutoRegressiveLM(cfg).eval()
