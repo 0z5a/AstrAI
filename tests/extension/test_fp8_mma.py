@@ -16,20 +16,14 @@ from astrai.extension.fp8 import (
     fp8_autocast,
     fp8_state,
 )
-from astrai.extension.loader import get_module, is_available
+from astrai.extension.loader import get_module
 from astrai.extension.ops.fp8 import (
     linear_backward_fp8,
     linear_forward_fp8,
     mm_fp8,
     quantize_bf16,
 )
-
-_GPU = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() < (8, 9)
-    or not is_available("fp8_mm"),
-    reason="fused FP8 MMA requires a built kernel and compute capability 8.9+",
-)
+from tests.conftest import skip_no_fp8
 
 
 def _scale(tensor):
@@ -45,7 +39,7 @@ def _quantize(tensor, scale):
 # --------------------------------------------------------------------------
 
 
-@_GPU
+@skip_no_fp8
 @pytest.mark.parametrize(
     ("m", "n", "k"),
     [(16, 8, 32), (17, 9, 33), (31, 15, 64), (32, 48, 96)],
@@ -67,7 +61,7 @@ def test_fused_fp8_mma_matches_explicit_quantization(m, n, k):
     torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
 
 
-@_GPU
+@skip_no_fp8
 def test_quantize_bf16_returns_amax():
     """quantize_bf16 returns (x8, amax); amax tracks the *raw* values and the
     caller never clears it (zero-initialized inside the kernel entry)."""
@@ -83,7 +77,7 @@ def test_quantize_bf16_returns_amax():
     assert torch.equal(x8, ref)
 
 
-@_GPU
+@skip_no_fp8
 def test_quantize_bf16_e5m2_format():
     x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
     x8, amax = quantize_bf16(x, torch.tensor([0.1], device="cuda"), "e5m2")
@@ -91,7 +85,7 @@ def test_quantize_bf16_e5m2_format():
     torch.testing.assert_close(amax, x.abs().amax().float().reshape(1))
 
 
-@_GPU
+@skip_no_fp8
 def test_fused_fp8_linear_forward_and_backward():
     torch.manual_seed(7)
     m, n, k = 19, 13, 37
@@ -122,7 +116,7 @@ def test_fused_fp8_linear_forward_and_backward():
     torch.testing.assert_close(amax_g, grad.abs().amax().float().reshape(1))
 
 
-@_GPU
+@skip_no_fp8
 def test_linear_backward_e5m2_gradients():
     """Hybrid backward: gradient GEMMs run in E5M2 (larger dynamic range)."""
     torch.manual_seed(5)
@@ -151,7 +145,7 @@ def test_linear_backward_e5m2_gradients():
     torch.testing.assert_close(amax_g, grad.abs().amax().float().reshape(1))
 
 
-@_GPU
+@skip_no_fp8
 def test_mm_fp8_matches_scaled_mm():
     torch.manual_seed(11)
     m, n, k = 512, 4096, 4096
@@ -180,7 +174,7 @@ def test_mm_fp8_matches_scaled_mm():
     )
 
 
-@_GPU
+@skip_no_fp8
 def test_mm_fp8_fp8_output():
     """mm_fp8 with out_dtype='e4m3' produces an FP8 output (layer-to-layer)."""
     torch.manual_seed(12)

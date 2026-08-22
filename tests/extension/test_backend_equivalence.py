@@ -12,7 +12,8 @@ from astrai.inference.cache import PagePool, TaskCacheManager
 from astrai.inference.runtime.graph import CudaGraphContext
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.workspace import InferenceWorkspace
-from tests.extension.conftest import D, skip_no_kernel
+from tests.conftest import skip_no_kernel
+from tests.extension.conftest import D
 from tests.helpers import FakeTokenizer
 
 

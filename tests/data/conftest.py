@@ -8,7 +8,6 @@ from astrai.preprocessing.builder import (
     SectionedMaskBuilder,
     SingleOutputMaskBuilder,
 )
-from tests.data.factories import make_grpo_config
 from tests.helpers import build_test_tokenizer
 
 _SPECIAL_TOKENS_CONFIG = {

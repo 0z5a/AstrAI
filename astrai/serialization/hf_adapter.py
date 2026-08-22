@@ -21,7 +21,7 @@ Not supported:
 
 import logging
 import re
-from typing import Any, Dict, Mapping, Union
+from typing import Any, Dict, Mapping
 
 import torch
 

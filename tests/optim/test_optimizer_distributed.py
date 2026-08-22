@@ -1,4 +1,3 @@
-import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import fully_shard
@@ -8,11 +7,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from astrai.model import AutoRegressiveLM
 from astrai.optim import NoraNAdamW
 from astrai.parallel.setup import find_free_port
+from tests.conftest import skip_no_cuda
 from tests.helpers import make_tiny_config
 
-pytestmark = pytest.mark.skipif(
-    torch.cuda.device_count() < 1, reason="CUDA device required"
-)
+pytestmark = skip_no_cuda
 
 
 def _assign_grads_and_step(model):

@@ -3,7 +3,8 @@
 import torch
 
 from astrai.extension.ops.attention import attn_prefill
-from tests.extension.conftest import D, skip_no_kernel
+from tests.conftest import skip_no_kernel
+from tests.extension.conftest import D
 
 
 @skip_no_kernel
