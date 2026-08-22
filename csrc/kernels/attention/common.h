@@ -13,7 +13,7 @@ enum TensorLayout : int {
 //   - Contiguous K/V: dense [batch, kv_head, kv_len, head_dim] tensors (k/v).
 //   - Paged (SGLang-style): flat pool [size, kv_head, head_dim] + req_to_token.
 // Each kernel selects the addressing via a KVSource policy (see
-// attn_layout_policies.cuh); a given call only touches the fields of one mode, so
+// layout_policies.cuh); a given call only touches the fields of one mode, so
 // this is a POD shared by both paths rather than two parallel structs that
 // drift out of sync.
 template<typename T, typename AT = float>

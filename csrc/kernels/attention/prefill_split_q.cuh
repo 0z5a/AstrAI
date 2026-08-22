@@ -1,8 +1,8 @@
 #pragma once
 #include <cfloat>
 #include <cuda_bf16.h>
-#include "attn_common.h"
-#include "attn_layout_policies.cuh"
+#include "common.h"
+#include "layout_policies.cuh"
 
 using bf16 = __nv_bfloat16;
 

@@ -7,7 +7,7 @@
 #include <cstring>
 #include <vector>
 #include "test_utils.cuh"
-#include "../kernels/attn_dispatchers.cuh"
+#include "../kernels/attention/dispatchers.cuh"
 
 struct PagedDecodeDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_paged_decode<H>(p, 0); } };
 struct PagedPrefillDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_paged_prefill<H>(p, 0); } };

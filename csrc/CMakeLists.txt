@@ -48,10 +48,33 @@ set(TORCH_LIBS
 
 set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH}")
 
-set(KERNELS attn_decode attn_prefill attn_paged_decode attn_paged_prefill rotary_emb fp8_mm)
+# Kernel registry — parallel lists of module names (.so / pybind names,
+# globally unique across families) and their per-family source paths under
+# kernels/. `loader.py` auto-discovers the .so files in astrai/extension/lib/,
+# so this CMake registry is the single place to register a new kernel.
+set(KERNEL_NAMES
+    attn_decode
+    attn_prefill
+    attn_paged_decode
+    attn_paged_prefill
+    rotary_emb
+    fp8_mm
+)
+set(KERNEL_SRCS
+    attention/decode.cu
+    attention/prefill.cu
+    attention/paged_decode.cu
+    attention/paged_prefill.cu
+    rotary/rotary_emb.cu
+    fp8/mm.cu
+)
 
-foreach(name ${KERNELS})
-    add_library(${name} MODULE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${name}.cu")
+list(LENGTH KERNEL_NAMES _kernel_count)
+math(EXPR _kernel_last "${_kernel_count} - 1")
+foreach(i RANGE ${_kernel_last})
+    list(GET KERNEL_NAMES ${i} name)
+    list(GET KERNEL_SRCS ${i} src)
+    add_library(${name} MODULE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${src}")
 
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
 

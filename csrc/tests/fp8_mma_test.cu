@@ -10,6 +10,8 @@ nvcc -I csrc -arch=sm_89 -std=c++17 -O3 --use_fast_math \
 
 #include <cuda_fp8.h>
 
+#include "../kernels/common/mma.cuh"
+
 #include <algorithm>
 #include <vector>
 
@@ -37,17 +39,6 @@ __device__ __forceinline__ unsigned load_quantize_fp8x4(
                       __bfloat162float(src[3]) * scale_inv);
 }
 
-__device__ __forceinline__ void mma_fp8_16832(float d[4],
-                                               const unsigned a[4],
-                                               const unsigned b[2]) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1]));
-}
-
 __global__ void fused_bf16_fp8_mma_kernel(
     const bf16* __restrict__ a, const bf16* __restrict__ b,
     bf16* __restrict__ out, float scale_a, float scale_b) {
@@ -71,7 +62,7 @@ __global__ void fused_bf16_fp8_mma_kernel(
     b_frag[1] = load_quantize_fp8x4(&b[group * K + k0 + 16], 1.0f / scale_b);
 
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    mma_fp8_16832(acc, a_frag, b_frag);
+    astrai::mma_sync<__nv_fp8_e4m3>(acc, a_frag, b_frag, acc);
 
     const int col = thread_in_group * 2;
     const float output_scale = scale_a * scale_b;

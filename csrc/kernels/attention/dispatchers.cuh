@@ -3,20 +3,20 @@
 // No torch dependency; pure CUDA.
 //
 // The paged and contiguous kernels are unified by the KVSource policy
-// (ContigKV / PagedKV from attn_layout_policies.cuh), so each launcher struct
+// (ContigKV / PagedKV from layout_policies.cuh), so each launcher struct
 // below is templated on KV and the paged dispatch is just the same launcher
 // instantiated with PagedKV.  Only the grid/split math differs, and that is
 // covered by KV::host_q_len / KV::host_kv_len.
 
 #include <cuda_runtime.h>
 #include <algorithm>
-#include "attn_warp_utils.cuh"
-#include "attn_layout_policies.cuh"
-#include "attn_prefill_split_q.cuh"
-#include "attn_decode_split_kv.cuh"
+#include "warp_utils.cuh"
+#include "layout_policies.cuh"
+#include "prefill_split_q.cuh"
+#include "decode_split_kv.cuh"
 #ifndef ASTRAI_NO_MMA
-#include "attn_prefill_split_q_mma.cuh"
-#include "attn_decode_split_kv_mma.cuh"
+#include "prefill_split_q_mma.cuh"
+#include "decode_split_kv_mma.cuh"
 #endif
 
 // Split-KV: compute number of splits to fill all SMs for small-batch decode.

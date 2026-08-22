@@ -1,9 +1,9 @@
 #pragma once
 #include <cfloat>
 #include <cuda_bf16.h>
-#include "attn_common.h"
-#include "attn_layout_policies.cuh"
-#include "attn_mma_utils.cuh"
+#include "common.h"
+#include "layout_policies.cuh"
+#include "mma_utils.cuh"
 
 // Tensor-core prefill flash attention (raw mma.sync PTX), unified across
 // contiguous and paged (SGLang flat-pool) K/V via the KV template parameter.

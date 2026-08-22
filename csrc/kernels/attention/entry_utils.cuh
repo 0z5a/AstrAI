@@ -2,8 +2,8 @@
 #include <float.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
-#include "attn_common.h"
-#include "attn_warp_utils.cuh"
+#include "common.h"
+#include "warp_utils.cuh"
 
 using bf16 = __nv_bfloat16;
 

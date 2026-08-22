@@ -1,24 +1,35 @@
 """Dynamic discovery and loading of compiled CUDA kernel modules.
 
-Each kernel is registered in ``csrc/build.py`` and built into a ``.so`` placed
-in this package directory. On import we try to load each one; kernels that
-failed to build (or are running on a CPU-only machine) are marked unavailable
-so the wrapper functions can fall back to ``torch`` SDPA.
+Each kernel is built by the CMake build in ``csrc/CMakeLists.txt`` into a
+``.so`` placed in ``astrai/extension/lib/`` — the module name equals the
+``.so`` name equals the pybind name (e.g. ``attn_decode``, defined via
+``TORCH_EXTENSION_NAME``). ``KERNEL_NAMES`` is discovered automatically from
+the ``.so`` files present, so adding a kernel to the CMake ``KERNELS``
+registry needs no change here. On import we try to load each one; kernels
+that failed to build (or are running on a CPU-only machine) are marked
+unavailable so the wrapper functions can fall back to ``torch`` SDPA.
 """
 
+import glob
 import importlib
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
-KERNEL_NAMES = [
-    "attn_decode",
-    "attn_prefill",
-    "attn_paged_decode",
-    "attn_paged_prefill",
-    "rotary_emb",
-    "fp8_mm",
-]
+_LIB_DIR = os.path.join(os.path.dirname(__file__), "lib")
+
+
+def _discover_kernel_names() -> list[str]:
+    """Return the module names of the compiled kernel ``.so`` files in lib/."""
+    names: list[str] = []
+    for path in glob.glob(os.path.join(_LIB_DIR, "*.so")):
+        # strip the "<soabi>.so" suffix, e.g. attn_decode.cpython-312-...so
+        names.append(os.path.basename(path).split(".", 1)[0])
+    return sorted(names)
+
+
+KERNEL_NAMES = _discover_kernel_names()
 
 _available: dict[str, bool] = {}
 _modules: dict[str, object] = {}

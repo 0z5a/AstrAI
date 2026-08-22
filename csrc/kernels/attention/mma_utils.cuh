@@ -3,6 +3,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "../common/mma.cuh"
+
 // Predicated cp.async (4-operand form) requires CUDA 11.2+.
 // bf16 mma.sync requires sm_80+ (guarded at build time by ASTRAI_NO_MMA).
 #if CUDART_VERSION < 11020
@@ -24,10 +26,10 @@ struct KernelTraits {
 
     static constexpr int BR = 16;             // Q rows per warp (mma M=16)
 
-    // Derived: mma.sync.m16n8k16 tile counts
-    static constexpr int KD  = HEAD_DIM / 16;  // Q/K k-slides
+    // Derived: mma tile counts from the shared mma_shape (m16n8k16 for bf16)
+    static constexpr int KD  = HEAD_DIM / astrai::mma_shape<bf16>::k;  // Q/K k-slides
     static constexpr int NC8 = BC / 8;          // S n-tiles (N=8)
-    static constexpr int KT2 = BC / 16;         // P k-tiles (K=16)
+    static constexpr int KT2 = BC / astrai::mma_shape<bf16>::k;        // P k-tiles (K=16)
     static constexpr int DN8 = HEAD_DIM / 8;    // O n-tiles (N=8)
 
     static constexpr int LD = HEAD_DIM;         // smem leading dim
@@ -43,16 +45,7 @@ struct KernelTraits {
 
 // ---- PTX wrappers ----
 using bf16 = __nv_bfloat16;
-
-__device__ __forceinline__ void mma16816(float* d, const unsigned* a,
-                                          const unsigned* b, const float* c) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
-        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
-          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-}
+// bf16 mma.sync lives in the shared astrai::mma_sync template (common/mma.cuh).
 
 // read two adjacent bf16 from smem as one packed .b32 (elem0 low, elem1 high)
 __device__ __forceinline__ unsigned ld2(const bf16* p) {
@@ -73,26 +66,9 @@ __device__ __forceinline__ unsigned pkb(bf16 a, bf16 b) {
     return *reinterpret_cast<unsigned*>(&v);
 }
 
-// ldmatrix: cooperatively load mma fragments from smem (one instruction per
-// 16x16 / 16x8 tile) with the exact register layout mma expects.
-__device__ __forceinline__ void ldmatrix_x4(unsigned* r, const bf16* p) {
-    unsigned a = __cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(a));
-}
-__device__ __forceinline__ void ldmatrix_x2(unsigned* r, const bf16* p) {
-    unsigned a = __cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-                 : "=r"(r[0]), "=r"(r[1])
-                 : "r"(a));
-}
-__device__ __forceinline__ void ldmatrix_x2_trans(unsigned* r, const bf16* p) {
-    unsigned a = __cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
-                 : "=r"(r[0]), "=r"(r[1])
-                 : "r"(a));
-}
+// ldmatrix lives in the shared template (common/mma.cuh):
+// `astrai::ldmatrix_x2<bf16>` / `<bf16, /*Trans=*/true>` load the K/V
+// fragments with the exact register layout mma expects.
 
 // XOR swizzle for shared-memory column at 8-bf16 chunk granularity.
 __device__ __forceinline__ int swiz_col(int d, int r, int mask = 7) {
@@ -180,9 +156,9 @@ __device__ inline void mma_compute_scores(
         #pragma unroll
         for (int kt = 0; kt < Traits::KD; kt++) {
             unsigned b[2];
-            ldmatrix_x2(b, &sK[krow_l * Traits::LD
+            astrai::ldmatrix_x2<bf16>(b, &sK[krow_l * Traits::LD
                 + swiz_col(kt * 16 + kcol_h, krow_l, Traits::SWIZ_MASK)]);
-            mma16816(Sacc[n8], Qa[kt], b, Sacc[n8]);
+            astrai::mma_sync<bf16>(Sacc[n8], Qa[kt], b, Sacc[n8]);
         }
     }
 }
@@ -290,9 +266,9 @@ __device__ inline void mma_pv_accumulate(
         #pragma unroll
         for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
             unsigned b[2];
-            ldmatrix_x2_trans(b, &sV[vrow_l * Traits::LD
+            astrai::ldmatrix_x2<bf16, true>(b, &sV[vrow_l * Traits::LD
                 + swiz_col(dn8 * 8, vrow_l, Traits::SWIZ_MASK)]);
-            mma16816(Oacc[dn8], Pa, b, Oacc[dn8]);
+            astrai::mma_sync<bf16>(Oacc[dn8], Pa, b, Oacc[dn8]);
         }
     }
 }

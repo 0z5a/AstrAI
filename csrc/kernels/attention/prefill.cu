@@ -1,5 +1,5 @@
-#include "attn_dispatchers.cuh"
-#include "attn_entry_utils.cuh"
+#include "dispatchers.cuh"
+#include "entry_utils.cuh"
 
 torch::Tensor attn_prefill(
     torch::Tensor q,

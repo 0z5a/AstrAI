@@ -1,6 +1,6 @@
 #pragma once
 #include <cuda_bf16.h>
-#include "attn_common.h"
+#include "common.h"
 
 // ============================================================================
 // Attention layout policies keep Q scheduling independent from K/V storage.

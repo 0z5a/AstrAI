@@ -1,9 +1,9 @@
 #pragma once
 #include <cuda_bf16.h>
 #include <float.h>
-#include "attn_common.h"
-#include "attn_layout_policies.cuh"
-#include "attn_warp_utils.cuh"
+#include "common.h"
+#include "layout_policies.cuh"
+#include "warp_utils.cuh"
 constexpr int DC_CHUNK = 64;
 
 // Scalar split-KV decode (fallback for sm < 80, no tensor cores), unified

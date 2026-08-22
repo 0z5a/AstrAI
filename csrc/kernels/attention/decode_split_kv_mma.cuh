@@ -1,10 +1,10 @@
 #pragma once
 #include <cfloat>
 #include <cuda_bf16.h>
-#include "attn_common.h"
-#include "attn_layout_policies.cuh"
-#include "attn_mma_utils.cuh"
-#include "attn_warp_utils.cuh"
+#include "common.h"
+#include "layout_policies.cuh"
+#include "mma_utils.cuh"
+#include "warp_utils.cuh"
 
 // Split-K (FlashDecoding) tensor-core decode via GQA head-packing, unified
 // across contiguous and paged (SGLang flat-pool) K/V via the KV template
