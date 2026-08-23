@@ -16,7 +16,7 @@ namespace fp8 {
 
 // m16n8k32 (see astrai::mma_shape<fp8 type>::k in common/mma.cuh)
 constexpr int kMmaK = 32;
-constexpr int kWarps = 8;  // 128x64 CTA = 8 warps
+constexpr int kWarps = 8;  // 128x128 CTA = 8 warps
 
 // Map the FP8Format enum to the CUDA fp8 element type consumed by mma_sync.
 template <FP8Format Fmt>
@@ -182,7 +182,7 @@ __device__ __forceinline__ T8* tile_at(T8* tile, int row, int col) {
                   "swizzle needs a power-of-two 16B-chunk count");
     return tile + row * K
            + ((((col >> 4) ^ ((row >> 2) & (kChunks - 1))) << 4)
-              + (col & 15));
+               + (col & 15));
 }
 
 // Stage-load one GEMM operand into the canonical flat [rows * K] shared tile
@@ -269,6 +269,39 @@ __device__ __forceinline__ void load_operand_tile(
 // in-kernel transpose of the operands (the binding handles transposes).
 // ---------------------------------------------------------------------------
 
+// ldmatrix with per-lane addresses (unlike common/mma.cuh's single-address
+// helpers, the fragment tiles here are XOR-swizzled per 16B chunk, so each
+// lane computes its own row/chunk address). Layout contract for fp8
+// m16n8k32 (values packed two-per-b16 slot, K-contiguous rows):
+//   x4 (A fragment): lane i points at tile row (i>>3 & 1)*8 + (i&7) of
+//       chunk (k_seg*2 + (i>>4)); reg j = matrix j = [row g][tig*4..+3] in
+//       the order (rows 0-7 c, rows 8-15 c, rows 0-7 c+1, rows 8-15 c+1) —
+//       exactly the mma.sync A operand layout.
+//   x2 (B fragment): lane i points at tile row (i&7) of chunk
+//       (k_seg*2 + ((i>>3) & 1)); reg j = [row(n) g][tig*4..+3] chunk c/c+1
+//       — exactly the mma.sync B operand layout (col operand, K-contiguous).
+__device__ __forceinline__ void ldsm_x2(unsigned r[2], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(r[0]), "=r"(r[1])
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ void ldsm_x4(unsigned r[4], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// Swizzled 16B-chunk address (tile_at's layout) as a raw shared-memory
+// pointer for ldmatrix. Requires kK == 32 (2 chunks/row swizzle).
+template <typename T8, int kK>
+__device__ __forceinline__ unsigned frag_addr(const T8* tile, int row,
+                                              int chunk) {
+    static_assert(kK == 32, "fragment swizzle offsets assume kK == 32");
+    return __cvta_generic_to_shared(
+        tile + row * kK + (((chunk ^ ((row >> 2) & 1)) << 4)));
+}
+
 // TransA / TransB select the operand memory layout. The kernel always computes
 //   out[m][n] = sum_p tileA[m][p] * tileB[n][p]
 // with the tiles materialized in the canonical [M][kK] / [N][kK] layout, so the
@@ -278,8 +311,9 @@ __device__ __forceinline__ void load_operand_tile(
 //           else        a[m*a_ld + p]   (A stored [M][K])
 //   TransB: tileB[n][p] = b[n*b_ld + p]  (B stored [N][K])
 //           else        b[p*b_ld + n]   (B stored [K][N], read transposed)
-template <typename Traits, bool OutFp8 = false, bool TransA = false, bool TransB = true>
-__global__ void fp8_gemm_kernel(FP8Params p) {
+template <typename Traits, bool OutFp8 = false, bool TransA = false,
+          bool TransB = false>
+__global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
     using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
     constexpr int kBlockM = Traits::kBlockM;
     constexpr int kBlockN = Traits::kBlockN;
@@ -287,10 +321,10 @@ __global__ void fp8_gemm_kernel(FP8Params p) {
     constexpr int kStages = Traits::kStages;
     static_assert(kStages >= 1 && kStages <= 8,
                   "FP8 GEMM stages must be in the range [1, 8]");
-    // Tiles are flat [rows * kK] with a 16B-chunk XOR swizzle (tile_at): the
-    // fragments read 4-byte K-contiguous chunks through the same mapping the
-    // staging writes, and the swizzle removes the 2-way bank conflict the
-    // unswizzled 8-word row stride caused (see tile_at).
+    // Tiles are flat [rows * kK] with a 16B-chunk XOR swizzle (tile_at):
+    // ldmatrix reads whole 16B chunks through the same mapping the staging
+    // writes, and the swizzle removes the bank conflict the unswizzled
+    // 8-word row stride caused (see tile_at).
     __shared__ __align__(16) T8 a_smem[kStages][kBlockM * kK];
     __shared__ __align__(16) T8 b_smem[kStages][kBlockN * kK];
 
@@ -306,19 +340,23 @@ __global__ void fp8_gemm_kernel(FP8Params p) {
     const int lane = tid & 31;
     const int group = lane >> 2;
     const int thread_in_group = lane & 3;
-    constexpr int warps_n = kBlockN / 16;
+    // 128x128 CTA = 8 warps as 2x4 warp tiles of 64x32 (mt x nt = 4x4 MMA).
+    constexpr int warps_n = kBlockN / 32;
     const int warp_m = warp / warps_n;
     const int warp_n = warp % warps_n;
     const int64_t row_base = blockIdx.y * kBlockM + warp_m * 64 + group;
     const int64_t output_col =
-        blockIdx.x * kBlockN + warp_n * 16 + thread_in_group * 2;
+        blockIdx.x * kBlockN + warp_n * 32 + thread_in_group * 2;
+    const int a_row0 = warp_m * 64;  // + mt * 16 in the loop
+    const int b_row0 = warp_n * 32;  // + nt * 8
     const float sa = *p.scale_a;
     const float sb = *p.scale_b;
-    float acc[4 * 4 * 2] = {};
+    float acc[4][4][4] = {};  // [nt][mt][acc]
 
     // Both operands are staged into the canonical [M][kK] / [N][kK] shared
     // tiles regardless of their global layout (see load_operand_tile), so the
     // MMA fragment reads below stay unchanged across the four layout flags.
+    // Each 128x32 tile is 256 16B chunks: one per thread.
     auto load_tile = [&](int stage, int64_t k_base) {
         // load_operand_tile's `Trans` means "the operand's contiguous dim is
         // the non-contract dim" (crosswise load). For A that is TransA; for B
@@ -326,27 +364,16 @@ __global__ void fp8_gemm_kernel(FP8Params p) {
         // K-contiguous, which is the congruous case).
         load_operand_tile<T8, kK, TransA>(
             a_smem[stage], a, m, k, a_ld, tid, k_base, blockIdx.y * kBlockM);
-        if (tid < 128)
-            load_operand_tile<T8, kK, !TransB>(
-                b_smem[stage], b, n, k, b_ld, tid, k_base,
-                blockIdx.x * kBlockN);
+        load_operand_tile<T8, kK, !TransB>(
+            b_smem[stage], b, n, k, b_ld, tid, k_base, blockIdx.x * kBlockN);
     };
 
     const int64_t tile_count = (k + kK - 1) / kK;
 
-    // Hoisted swizzle offsets for the fragment reads (see tile_at). Every
-    // row this thread reads — B rows warp_n*16 + nt*8 + group and A rows
-    // warp_m*64 + mt*16 + group (± 8) — has swizzle bit (row >> 2) & 1
-    // equal to (group >> 2) & 1: all other terms (16, 32, 64 row offsets)
-    // shift in multiples of 4 rows and leave bit 2 of the row untouched.
-    // The two chunk halves of a fragment differ by exactly one chunk bit,
-    // so the high-half offset is 16 - low. Net effect: the hot loop pays
-    // one add per LDS, same as the unswizzled layout.
-    static_assert(kK == 32,
-                  "hoisted fragment-swizzle offsets assume kK == 32");
-    const int tig4 = thread_in_group * 4;
-    const int sw_lo = ((group >> 2) & 1) << 4;
-    const int sw_hi = 16 - sw_lo;
+    // Per-lane ldmatrix row/chunk selectors (see ldsm_x2/ldsm_x4 contract).
+    const int r7 = lane & 7;          // row within the 8-row matrix
+    const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
+    const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31; B uses rh8)
 
     // Prime the pipeline. Each committed group occupies one circular shared
     // memory stage; the loop also handles K dimensions smaller than kStages.
@@ -371,36 +398,34 @@ __global__ void fp8_gemm_kernel(FP8Params p) {
         // before any thread reads tiles written by other threads.
         __syncthreads();
 
+        // 4 ldmatrix.x2 (B) + 4 ldmatrix.x4 (A) feed 16 mma.sync per k_seg —
+        // 0.5 load instructions per MMA, versus 4.5 scalar LDS per MMA in
+        // the 128x64-tile version (the kernel was LSU-issue-bound there).
 #pragma unroll
         for (int k_seg = 0; k_seg < kK / kMmaK; ++k_seg) {
-            const int klo = k_seg * kMmaK + tig4;
+            unsigned b_frag[4][2];
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
-                const T8* brow =
-                    b_smem[stage] + (warp_n * 16 + nt * 8 + group) * kK;
-                // B fragment: two 4-FP8 chunks (K-contiguous) at output row.
-                unsigned b_frag[2];
-                b_frag[0] = *reinterpret_cast<const unsigned*>(brow + klo + sw_lo);
-                b_frag[1] = *reinterpret_cast<const unsigned*>(brow + klo + sw_hi);
+            for (int nt = 0; nt < 4; ++nt) {
+                const int row = b_row0 + nt * 8 + r7;
+                ldsm_x2(b_frag[nt],
+                        frag_addr<T8, kK>(b_smem[stage], row,
+                                          k_seg * 2 + rh8));
+            }
 #pragma unroll
-                for (int mt = 0; mt < 4; ++mt) {
-                    const T8* arow =
-                        a_smem[stage] + (warp_m * 64 + mt * 16 + group) * kK;
-                    unsigned a_frag[4];
-                    a_frag[0] = *reinterpret_cast<const unsigned*>(arow + klo + sw_lo);
-                    a_frag[1] = *reinterpret_cast<const unsigned*>(
-                        arow + 8 * kK + klo + sw_lo);
-                    a_frag[2] = *reinterpret_cast<const unsigned*>(arow + klo + sw_hi);
-                    a_frag[3] = *reinterpret_cast<const unsigned*>(
-                        arow + 8 * kK + klo + sw_hi);
-                    astrai::mma_sync<typename fp8_input<Traits::kFormat>::type>(
-                        acc + (nt * 4 + mt) * 4,
-                        a_frag, b_frag, acc + (nt * 4 + mt) * 4);
-                }
+            for (int mt = 0; mt < 4; ++mt) {
+                unsigned a_frag[4];
+                const int row = a_row0 + mt * 16 + rh8 * 8 + r7;
+                ldsm_x4(a_frag,
+                        frag_addr<T8, kK>(a_smem[stage], row,
+                                          k_seg * 2 + rh16));
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt)
+                    astrai::mma_sync<T8>(acc[nt][mt], a_frag, b_frag[nt],
+                                         acc[nt][mt]);
             }
         }
         // Barrier 2: every thread finished reading this stage's tiles before
-        // the prefetch for the (i+3)-th tile overwrites them.
+        // the prefetch for the (i+kStages)-th tile overwrites them.
         __syncthreads();
         if (tile_index + kStages < tile_count) {
             load_tile(stage, (tile_index + kStages) * kK);
@@ -411,7 +436,7 @@ __global__ void fp8_gemm_kernel(FP8Params p) {
     const float output_scale = sa * sb;
     const float o8_scale = OutFp8 ? output_scale * *p.out_scale : 0.0f;
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
+    for (int nt = 0; nt < 4; ++nt) {
         const int64_t col = output_col + nt * 8;
         // Per-row store: FP8 packs two adjacent columns into one 16-bit
         // write; the BF16 path writes two scalars. Boundary columns fall
@@ -437,7 +462,7 @@ __global__ void fp8_gemm_kernel(FP8Params p) {
 #pragma unroll
         for (int mt = 0; mt < 4; ++mt) {
             const int64_t row0 = row_base + mt * 16;
-            float* tile_acc = acc + (nt * 4 + mt) * 4;
+            float* tile_acc = acc[nt][mt];
             if (col < n) {
                 store_out(row0, tile_acc[0], tile_acc[1]);
                 store_out(row0 + 8, tile_acc[2], tile_acc[3]);
@@ -460,14 +485,15 @@ void launch_fp8_quantize(const FP8Params& p, cudaStream_t stream) {
     fp8_quantize_kernel<Fmt><<<blocks, kThreads, 0, stream>>>(p);
 }
 
-// Pre-quantized GEMM tile config: 128x64 CTA, K=32, 2-stage pipeline by
-// default. Stages remains an explicit template override for tuning.
-// TransA/TransB mirror the kernel template (defaults keep the NT layout:
-// out = a @ b^T with both operands K-contiguous).
+// Pre-quantized GEMM tile config: 128x128 CTA (8 warps x 64x32 warp tiles),
+// K=32, 3-stage pipeline (24KB smem -> 2 CTAs/SM). The wide warp tile plus
+// ldmatrix fragments lifts the LSU-issue bound of the old 128x64 config.
+// Stages remains an explicit template override for tuning. TransA/TransB
+// mirror the kernel template (defaults keep the NN layout: out = a @ b).
 template <FP8Format Fmt, bool OutFp8 = false, bool TransA = false,
-          bool TransB = true, int Stages = 2>
+          bool TransB = false, int Stages = 3>
 void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
-    using Traits = Fp8GemmTraits<Fmt, 128, 64, 32, Stages>;
+    using Traits = Fp8GemmTraits<Fmt, 128, 128, 32, Stages>;
     dim3 grid((p.n + Traits::kBlockN - 1) / Traits::kBlockN,
               (p.m + Traits::kBlockM - 1) / Traits::kBlockM);
     fp8_gemm_kernel<Traits, OutFp8, TransA, TransB><<<grid, kWarps * 32, 0, stream>>>(p);
