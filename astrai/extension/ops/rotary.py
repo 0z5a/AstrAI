@@ -10,15 +10,7 @@ Layout: x is packed [tokens, n_heads, head_dim] or dense
 
 import torch
 
-from astrai.extension.loader import _available, _modules
-
-
-def _check_available():
-    if not _available.get("rotary_emb"):
-        raise RuntimeError(
-            "CUDA kernel 'rotary_emb' is not available. "
-            "Build with CSRC_KERNELS=true or use the torch fallback."
-        )
+from astrai.extension.loader import get_module
 
 
 def rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -31,9 +23,9 @@ def rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     Returns:
         Tensor with the same shape as ``x``.
     """
-    _check_available()
+    mod = get_module("rotary_emb")
     if not x.is_contiguous():
         x = x.contiguous()
     if not freqs_cis.is_contiguous():
         freqs_cis = freqs_cis.contiguous()
-    return _modules["rotary_emb"].rotary_emb(x, freqs_cis)
+    return mod.rotary_emb(x, freqs_cis)

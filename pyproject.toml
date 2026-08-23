@@ -37,6 +37,9 @@ flash = ["flash-attn>=2.6"]
 [tool.setuptools.packages.find]
 where = ["."]
 
+[tool.setuptools.package-data]
+"astrai.extension.lib" = ["*.so"]
+
 [tool.setuptools.dynamic]
 version = { attr = "astrai.__version__" }
 

@@ -17,7 +17,7 @@ from typing import Optional
 
 import torch
 
-from astrai.extension.loader import _available, _modules
+from astrai.extension.loader import get_module
 
 
 class TensorLayout(enum.IntEnum):
@@ -28,14 +28,6 @@ class TensorLayout(enum.IntEnum):
 
     BHLD = 0  # [batch, n_heads, seq_len, head_dim]
     BLHD = 1  # [batch, seq_len, n_heads, head_dim]
-
-
-def _check_available(name: str):
-    if not _available.get(name):
-        raise RuntimeError(
-            f"CUDA kernel '{name}' is not available. "
-            f"Build with CSRC_KERNELS=true or use a torch-native backend."
-        )
 
 
 def attn_decode(
@@ -57,9 +49,9 @@ def attn_decode(
     Returns:
         [batch, 1, n_heads, head_dim] (blhd, bf16)
     """
-    _check_available("attn_decode")
+    mod = get_module("attn_decode")
     causal_offset = (k.size(1) - 1) if is_causal else -1
-    return _modules["attn_decode"].attn_decode(
+    return mod.attn_decode(
         q, k, v, mask=mask, causal_offset=causal_offset, layout=TensorLayout.BLHD
     )
 
@@ -83,9 +75,9 @@ def attn_prefill(
     Returns:
         [batch, q_len, n_heads, head_dim] (blhd, bf16)
     """
-    _check_available("attn_prefill")
+    mod = get_module("attn_prefill")
     causal_offset = (k.size(1) - q.size(1)) if is_causal else -1
-    return _modules["attn_prefill"].attn_prefill(
+    return mod.attn_prefill(
         q, k, v, mask=mask, causal_offset=causal_offset, layout=TensorLayout.BLHD
     )
 
@@ -129,9 +121,9 @@ def attn_paged_decode(
     Returns:
         [batch, n_heads, head_dim] (bf16, 3D)
     """
-    _check_available("attn_paged_decode")
+    mod = get_module("attn_paged_decode")
     causal_offset = 0 if is_causal else -1
-    return _modules["attn_paged_decode"].attn_paged_decode(
+    return mod.attn_paged_decode(
         q,
         k_cache,
         v_cache,
@@ -183,9 +175,9 @@ def attn_paged_prefill(
     Returns:
         [total_q, n_heads, head_dim] (bf16, 3D)
     """
-    _check_available("attn_paged_prefill")
+    mod = get_module("attn_paged_prefill")
     causal_offset = 0 if is_causal else -1
-    return _modules["attn_paged_prefill"].attn_paged_prefill(
+    return mod.attn_paged_prefill(
         q,
         k_cache,
         v_cache,

@@ -19,26 +19,10 @@ this module is stateless.
 import torch
 from torch.library import custom_op
 
-from astrai.extension.loader import get_module, is_available
+from astrai.extension.loader import get_module
 
 # fmt string -> kernel int (0 = E4M3, 1 = E5M2)
 _FMT_TO_INT = {"e4m3": 0, "e5m2": 1}
-
-# The pybind module is loaded once at first use and cached: the loader
-# resolves modules at import time and never reloads them, so every call
-# after the first is a single None check.
-_MOD: object | None = None
-
-
-def _mod() -> object:
-    global _MOD
-    if _MOD is None:
-        if not is_available("fp8_ops"):
-            raise RuntimeError(
-                "CUDA kernel 'fp8_ops' is not available. Build with CSRC_KERNELS=true."
-            )
-        _MOD = get_module("fp8_ops")
-    return _MOD
 
 
 def _fmt_int(fmt: str) -> int:
@@ -72,7 +56,7 @@ def _fp8_quantize_fake(x, scale, fmt):
 def _fp8_quantize_cuda(x, scale, fmt):
     if x.dtype != torch.bfloat16:
         raise TypeError(f"fp8 quantize requires bf16 input, got {x.dtype}")
-    return _mod().quantize_bf16(x, scale, int(fmt))
+    return get_module("fp8_ops").quantize_bf16(x, scale, int(fmt))
 
 
 @fp8_quantize.register_kernel("cpu")
@@ -110,7 +94,7 @@ def _fp8_gemm_cuda(a, b, sa, sb, out_dtype=0, out_scale=None):
         raise TypeError(
             f"fp8 GEMM requires matching fp8 inputs, got {a.dtype}/{b.dtype}"
         )
-    return _mod().mm_fp8(a, b, sa, sb, int(out_dtype), out_scale)
+    return get_module("fp8_ops").mm_fp8(a, b, sa, sb, int(out_dtype), out_scale)
 
 
 @fp8_gemm.register_kernel("cpu")
@@ -165,7 +149,7 @@ def linear_forward_fp8(x, w, bias, sx, sw, fmt: str = "e4m3"):
         raise TypeError(f"fp8 forward requires bf16 inputs, got {x.dtype}/{w.dtype}")
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
-    return _mod().linear_forward_fp8(x, w, bias, sx, sw, _fmt_int(fmt))
+    return get_module("fp8_ops").linear_forward_fp8(x, w, bias, sx, sw, _fmt_int(fmt))
 
 
 def linear_backward_fp8(g, x, w, masks, sg, sw, sx, fmt: str = "e5m2"):
@@ -183,4 +167,6 @@ def linear_backward_fp8(g, x, w, masks, sg, sw, sx, fmt: str = "e5m2"):
         raise TypeError(
             f"fp8 backward requires bf16 inputs, got {g.dtype}/{x.dtype}/{w.dtype}"
         )
-    return _mod().linear_backward_fp8(g, x, w, list(masks), sg, sw, sx, _fmt_int(fmt))
+    return get_module("fp8_ops").linear_backward_fp8(
+        g, x, w, list(masks), sg, sw, sx, _fmt_int(fmt)
+    )
