@@ -411,16 +411,25 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
                         frag_addr<T8, kK>(b_smem[stage], row,
                                           k_seg * 2 + rh8));
             }
+            // Software-pipelined A fragments: the ldmatrix.x4 for row mt+1
+            // is issued before the MMAs consuming row mt, so the LDS fixed
+            // latency hides behind tensor-pipe work (cuts the `wait` stall,
+            // ~2.3 cycles/issue before this). Costs 4 extra registers.
+            unsigned a_frag[5][4];
+            ldsm_x4(a_frag[0],
+                    frag_addr<T8, kK>(a_smem[stage], a_row0 + rh8 * 8 + r7,
+                                      k_seg * 2 + rh16));
 #pragma unroll
             for (int mt = 0; mt < 4; ++mt) {
-                unsigned a_frag[4];
-                const int row = a_row0 + mt * 16 + rh8 * 8 + r7;
-                ldsm_x4(a_frag,
-                        frag_addr<T8, kK>(a_smem[stage], row,
-                                          k_seg * 2 + rh16));
+                if (mt < 3)
+                    ldsm_x4(a_frag[mt + 1],
+                            frag_addr<T8, kK>(
+                                a_smem[stage],
+                                a_row0 + (mt + 1) * 16 + rh8 * 8 + r7,
+                                k_seg * 2 + rh16));
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt)
-                    astrai::mma_sync<T8>(acc[nt][mt], a_frag, b_frag[nt],
+                    astrai::mma_sync<T8>(acc[nt][mt], a_frag[mt], b_frag[nt],
                                          acc[nt][mt]);
             }
         }
@@ -439,8 +448,9 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
     for (int nt = 0; nt < 4; ++nt) {
         const int64_t col = output_col + nt * 8;
         // Per-row store: FP8 packs two adjacent columns into one 16-bit
-        // write; the BF16 path writes two scalars. Boundary columns fall
-        // back to a scalar convert so the pack never crosses the row edge.
+        // write, BF16 into one 32-bit __nv_bfloat162 (single cvt+pack
+        // instruction); boundary or unaligned columns fall back to scalar
+        // converts so a pack never crosses the row edge or misaligns.
         auto store_out = [&](int64_t row, float v0, float v1) {
             if (row >= m) return;
             if constexpr (OutFp8) {
@@ -453,10 +463,17 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
                     out_fp8[row * n + col] = __nv_fp8_e4m3(v0 * o8_scale);
                 }
             } else {
-                out_bf16[row * n + col] = __float2bfloat16(v0 * output_scale);
-                if (col + 1 < n)
-                    out_bf16[row * n + col + 1] =
-                        __float2bfloat16(v1 * output_scale);
+                auto* dst = out_bf16 + row * n + col;
+                if (col + 1 < n &&
+                    (reinterpret_cast<uintptr_t>(dst) & 3) == 0) {
+                    *reinterpret_cast<__nv_bfloat162*>(dst) =
+                        __floats2bfloat162_rn(v0 * output_scale,
+                                              v1 * output_scale);
+                } else {
+                    dst[0] = __float2bfloat16(v0 * output_scale);
+                    if (col + 1 < n)
+                        dst[1] = __float2bfloat16(v1 * output_scale);
+                }
             }
         };
 #pragma unroll
