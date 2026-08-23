@@ -34,10 +34,13 @@ def _ws(pool: PagePool) -> InferenceWorkspace:
 
 @skip_no_kernel
 def test_training_forward_matches_torch(cuda_model):
-    """Training forward (kv_cache=None) uses torch-native SDPA.
+    """Training forward (kv_cache=None) resolves to a capable dense backend.
 
-    CudaBackend does not support training (requires kv_cache).
-    Torch-native backend must match default (which falls back to torch).
+    CudaBackend cannot run training (requires a KV cache), so the default
+    falls back by capability — flash when it can handle the call
+    (mask-free/causal), otherwise torch SDPA.  The default path must not
+    raise and must produce finite logits; explicitly selected torch SDPA
+    must be deterministic across runs.
     """
 
     model, _ = cuda_model
@@ -48,12 +51,15 @@ def test_training_forward_matches_torch(cuda_model):
 
     with attn_backend(ATTN_BACKEND.TORCH_NATIVE):
         with torch.no_grad():
-            out_torch = model(input_ids)
+            out_torch_a = model(input_ids)
+        with torch.no_grad():
+            out_torch_b = model(input_ids)
 
+    assert out_default["logits"].shape == out_torch_a["logits"].shape
+    assert torch.isfinite(out_default["logits"]).all()
     torch.testing.assert_close(
-        out_torch["logits"], out_default["logits"], atol=1e-6, rtol=1e-6
+        out_torch_a["logits"], out_torch_b["logits"], atol=0, rtol=0
     )
-    assert out_default["logits"].shape[0] == 2
 
 
 @skip_no_kernel

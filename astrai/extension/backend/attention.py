@@ -21,9 +21,20 @@ Usage — mirroring ``torch.nn.attention.sdpa_kernel``:
         ...
 
 Thread-safe via ``contextvars`` — each scheduler thread gets its own
-active backend. ``get_backend()`` returns the active one, falling back
-to a process-wide default (cuda > flash > torch, overridable via
-``ASTR_BACKEND``).
+active backend. Backend resolution follows a strict precedence:
+
+1. explicit ``attn_backend(...)`` context (wins over everything),
+2. the process-wide ``ASTR_BACKEND`` environment override,
+3. an implicit default picked from the available backends
+   (cuda > flash > torch).
+
+Capability is polymorphic: every backend declares ``available()``
+(machine-level) and ``supports_call(...)`` (per-call), so adding a new
+backend requires no changes to the resolution logic. Training calls
+(``fwd=None``, no KV cache) resolve through the same priority list: the
+CUDA cache kernels cannot run without a cache, so they fall back to
+flash (when it can handle the call — mask-free/causal only) and finally
+to the reference ``TorchNativeBackend``.
 
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 (blhd). The backend returns ``[batch, seq_len, n_heads * head_dim]``.
@@ -32,11 +43,12 @@ Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 import contextvars
 import enum
 import functools
+import logging
 import os
 import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -57,14 +69,19 @@ except Exception:
 if TYPE_CHECKING:
     from astrai.inference.cache import KVCache
 
+logger = logging.getLogger(__name__)
 
-_default_backend: Optional["AttentionBackend"] = None
+
 _default_backend_lock = threading.Lock()
 _env_backend_name: Optional[str] = None
 _env_backend: Optional["AttentionBackend"] = None
 _current_backend: contextvars.ContextVar[Optional["AttentionBackend"]] = (
     contextvars.ContextVar("attn_backend", default=None)
 )
+
+# Backends are stateless — one canonical instance per class, created lazily
+# and reused everywhere (resolution, fallback, context managers).
+_singletons: Dict[type, "AttentionBackend"] = {}
 
 
 @functools.lru_cache(maxsize=1)
@@ -102,58 +119,40 @@ class ATTN_BACKEND(enum.Enum):
     FLASH = "flash"
 
 
-def _priority_backends() -> list["AttentionBackend"]:
-    """Available backends in priority order: cuda -> flash -> torch."""
-    backends: list[AttentionBackend] = []
-    if is_available("attn_paged_decode") and is_available("attn_paged_prefill"):
-        backends.append(CudaBackend())
-    if flash_attn_available():
-        backends.append(FlashAttnBackend())
-    backends.append(TorchNativeBackend())
-    return backends
+def _instance(backend_cls: type) -> "AttentionBackend":
+    """Return the canonical singleton instance for a backend class.
 
-
-def _backend_supports(
-    backend: "AttentionBackend",
-    q: Tensor,
-    kv_cache: Optional["KVCache"],
-    attn_mask: Optional[Tensor],
-    is_causal: bool,
-    fwd: Optional[str],
-) -> bool:
-    """Whether ``backend`` can run this attention call.
-
-    The CUDA kernels are bf16-only, support head_dim in 32/64/128/256, and
-    need a KV cache (decode/prefill); everything else falls back to torch.
+    Backends hold no per-instance state, so a single cached instance is
+    safe and avoids per-call allocation on the attention hot path.
     """
-    if isinstance(backend, CudaBackend):
-        return (
-            fwd in ("prefill", "decode")
-            and kv_cache is not None
-            and q.ndim == 3
-            and q.dtype == torch.bfloat16
-            and q.size(-1) in (32, 64, 128, 256)
-            and is_available(f"attn_paged_{fwd}")
-        )
-    if isinstance(backend, FlashAttnBackend):
-        if not flash_attn_available():
-            return False
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            return False
-        if fwd is not None:
-            return q.ndim == 3 and hasattr(_flash_attn, "flash_attn_varlen_func")
-        if attn_mask is None or is_causal:
-            return True
-        return attn_mask.dim() == 4
-    return True
+    backend = _singletons.get(backend_cls)
+    if backend is None:
+        backend = backend_cls()
+        _singletons[backend_cls] = backend
+    return backend
+
+
+@functools.lru_cache(maxsize=1)
+def _priority_backends() -> Tuple["AttentionBackend", ...]:
+    """Available backends in priority order: cuda -> flash -> torch.
+
+    Computed once (machine availability cannot change at runtime) and
+    cached forever; the tuple always ends with ``TorchNativeBackend``,
+    which is unconditionally available.
+    """
+    return tuple(
+        _instance(cls)
+        for cls in (CudaBackend, FlashAttnBackend, TorchNativeBackend)
+        if cls.available()
+    )
 
 
 def _resolve_default_backend() -> "AttentionBackend":
     """Pick the highest-priority available backend (cuda -> flash -> torch).
 
-    Resolved lazily on first ``get_backend()`` and cached.  Per-call
-    capability fallback happens in ``attention()``, so the default is
-    safe for training and fp32 models.
+    Resolved lazily on first use and cached via ``_priority_backends``.
+    Per-call capability fallback happens in ``attention()``, so the
+    default is safe for training and fp32 models.
     """
     return _priority_backends()[0]
 
@@ -168,9 +167,14 @@ def _environment_backend() -> Optional["AttentionBackend"]:
         with _default_backend_lock:
             if name != _env_backend_name:
                 try:
-                    _env_backend = AttentionBackendFactory.create(name)
+                    _env_backend = _resolve_backend(name)
                 except (ValueError, RuntimeError):
                     _env_backend = None
+                    logger.warning(
+                        "ASTR_BACKEND=%r is not a registered attention backend; "
+                        "falling back to default resolution",
+                        name,
+                    )
                 _env_backend_name = name
     return _env_backend
 
@@ -178,43 +182,46 @@ def _environment_backend() -> Optional["AttentionBackend"]:
 def _resolve_backend(
     backend: Optional[Union[str, ATTN_BACKEND, "AttentionBackend", type]] = None,
 ) -> "AttentionBackend":
-    """Resolve a backend configuration, defaulting to the process policy."""
+    """Resolve a backend configuration to its canonical instance.
+
+    Accepts a registered name, ``ATTN_BACKEND`` enum value, backend class,
+    or instance.  Names/classes resolve to the shared singleton; a caller
+    may still pass its own instance to opt out of sharing.
+    """
     if backend is not None:
         if isinstance(backend, ATTN_BACKEND):
-            return AttentionBackendFactory.create(backend.value)
+            return _instance(AttentionBackendFactory.get_component_class(backend.value))
         if isinstance(backend, str):
-            return AttentionBackendFactory.create(backend)
+            return _instance(AttentionBackendFactory.get_component_class(backend))
         if isinstance(backend, type) and issubclass(backend, AttentionBackend):
-            return backend()
+            return _instance(backend)
         if isinstance(backend, AttentionBackend):
             return backend
         raise TypeError(
             f"expected a registered name, ATTN_BACKEND, AttentionBackend type, "
             f"or instance, got {type(backend).__name__}"
         )
-
-    global _default_backend
-    if _default_backend is None:
-        with _default_backend_lock:
-            if _default_backend is None:
-                _default_backend = _resolve_default_backend()
-    return _default_backend
+    return _resolve_default_backend()
 
 
 def get_backend(
     use_default: bool = True,
 ) -> Optional["AttentionBackend"]:
-    """Return the context override, optionally falling back to the process default.
+    """Resolve the active backend: explicit context > env > default.
 
-    ``ASTR_BACKEND`` is a process-wide override and takes precedence over the
-    context value. Pass ``use_default=False`` at request submission to retain
-    only an environment override or the caller's :func:`attn_backend` value.
+    An ``attn_backend(...)`` context is the caller's explicit choice and
+    always wins.  ``ASTR_BACKEND`` is a process-wide override consulted
+    only when no context is set.  Pass ``use_default=False`` at request
+    submission to retain only an environment override or the caller's
+    :func:`attn_backend` value.
     """
-    return (
-        _environment_backend()
-        or _current_backend.get()
-        or (_resolve_backend() if use_default else None)
-    )
+    context_backend = _current_backend.get()
+    if context_backend is not None:
+        return context_backend
+    env_backend = _environment_backend()
+    if env_backend is not None:
+        return env_backend
+    return _resolve_default_backend() if use_default else None
 
 
 @contextmanager
@@ -262,12 +269,22 @@ def attention(
     attn_mask: Optional[Tensor] = None,
     is_causal: bool = False,
     fwd: Optional[str] = None,
+    backend: Optional[Union[str, ATTN_BACKEND, "AttentionBackend", type]] = None,
 ) -> Tensor:
     """Functional attention entry point — mirrors ``F.scaled_dot_product_attention``.
 
-    Delegates to the active backend (set via ``with attn_backend(...)``).
+    Delegates to the active backend.  ``backend`` (optional) is an explicit
+    escape hatch; when omitted the backend is resolved as
+    explicit context > ``ASTR_BACKEND`` env > default (cuda > flash > torch).
     Handles KV cache I/O, GQA head expansion, and causal masking so the
     caller only needs to provide projected q/k/v.
+
+    Training calls (``fwd=None``, ``kv_cache=None``) resolve through the
+    same capability chain — the CUDA cache kernels cannot run without a
+    cache, so they fall back to flash (mask-free/causal calls only) and
+    finally to torch SDPA.  An explicitly-selected backend that cannot
+    handle the call raises — an implicit one falls back down the priority
+    list to the first capable backend.
 
     Args:
         q: [batch, q_len, n_heads, head_dim] (blhd)
@@ -277,30 +294,43 @@ def attention(
         layer_id: transformer layer index for buffer access.
         attn_mask: pre-built attention mask (SDPA-compatible).
         is_causal: whether to apply causal masking.
+        fwd: "prefill" / "decode" for inference, None for training.
+        backend: optional explicit backend (name, enum, class, or instance).
 
     Returns:
         [batch, q_len, n_heads * head_dim]
     """
-    explicit = get_backend(use_default=False)
-    backend = get_backend()
-    if fwd is None and explicit is None:
-        backend = TorchNativeBackend()
-    if not _backend_supports(backend, q, kv_cache, attn_mask, is_causal, fwd):
-        if explicit is not None:
+    if backend is not None:
+        selected = _resolve_backend(backend)
+        explicit = True
+    else:
+        context_backend = _current_backend.get()
+        explicit = context_backend is not None
+        # Resolve through the same chain as inference: explicit context >
+        # ASTR_BACKEND env > default.  Training calls (fwd=None, no cache)
+        # land on the CUDA backend and fall back by capability below —
+        # flash when it can handle the call, else torch SDPA.
+        selected = get_backend()
+        assert selected is not None
+
+    if not selected.supports_call(q, kv_cache, attn_mask, is_causal, fwd):
+        if explicit:
             raise RuntimeError(
-                f"Explicitly-set backend {type(backend).__name__} cannot "
+                f"Explicitly-set backend {type(selected).__name__} cannot "
                 f"handle this attention call (shape={q.shape}, "
                 f"dtype={q.dtype}, kv_cache={'none' if kv_cache is None else 'present'}, "
                 f"attn_mask={'none' if attn_mask is None else 'present'}). "
                 f"Remove the attn_backend() context or switch to a compatible backend."
             )
-        for candidate in _priority_backends():
-            if isinstance(candidate, type(backend)):
-                continue
-            if _backend_supports(candidate, q, kv_cache, attn_mask, is_causal, fwd):
-                backend = candidate
-                break
-    return backend.forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal, fwd)
+        selected = next(
+            (
+                candidate
+                for candidate in _priority_backends()
+                if candidate.supports_call(q, kv_cache, attn_mask, is_causal, fwd)
+            ),
+            _instance(TorchNativeBackend),
+        )
+    return selected.forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal, fwd)
 
 
 class AttentionBackend(ABC):
@@ -309,6 +339,17 @@ class AttentionBackend(ABC):
     Subclasses implement ``fwd_decode`` (q_len == 1, with cache) and
     ``fwd_prefill`` (q_len > 1, with or without cache). The public
     ``forward`` method dispatches based on q_len.
+
+    Capability contract — every backend declares:
+
+    * ``available()`` — machine-level: can this backend exist here
+      (kernel ``.so`` loaded, flash-attn present, GPU available)?
+      Used once to build the default priority list.
+    * ``supports_call(q, kv_cache, attn_mask, is_causal, fwd)`` — can this
+      backend run this *specific* call (shape/dtype/cache/mask)?  Used by
+      ``attention()`` for the per-call fallback.  Resolution logic never
+      checks concrete backend types, so adding a backend requires no
+      changes outside its own class.
 
     Three equivalent ways to activate a backend::
 
@@ -326,6 +367,30 @@ class AttentionBackend(ABC):
 
     def __exit__(self, *exc) -> None:
         _current_backend.reset(self._token)
+
+    @classmethod
+    @abstractmethod
+    def available(cls) -> bool:
+        """Return True if this backend can run on the current machine.
+
+        Checks static availability only (compiled kernels, optional
+        packages, GPU presence) — not call-specific constraints.
+        """
+
+    @abstractmethod
+    def supports_call(
+        self,
+        q: Tensor,
+        kv_cache: Optional["KVCache"],
+        attn_mask: Optional[Tensor],
+        is_causal: bool,
+        fwd: Optional[str],
+    ) -> bool:
+        """Return True if this backend can run this specific attention call.
+
+        Called on the canonical singleton instance (or a caller-provided
+        one); must be side-effect free.
+        """
 
     def forward(
         self,
@@ -412,8 +477,18 @@ class TorchNativeBackend(AttentionBackend):
     runs SDPA directly on the projected q/k/v.
     """
 
-    @staticmethod
-    def supports(**kwargs) -> bool:
+    @classmethod
+    def available(cls) -> bool:
+        return True
+
+    def supports_call(
+        self,
+        q: Tensor,
+        kv_cache: Optional["KVCache"],
+        attn_mask: Optional[Tensor],
+        is_causal: bool,
+        fwd: Optional[str],
+    ) -> bool:
         return True
 
     def fwd_decode(
@@ -516,14 +591,35 @@ class CudaBackend(AttentionBackend):
     Raises ``RuntimeError`` if the required kernel is not available.
     """
 
-    @staticmethod
-    def supports(**kwargs) -> bool:
-        head_dim = kwargs.get("head_dim", -1)
+    # Head dims supported by the CUDA kernels (single source of truth).
+    HEAD_DIMS = (32, 64, 128, 256)
+
+    @classmethod
+    def available(cls) -> bool:
         return (
             torch.cuda.is_available()
-            and head_dim in (32, 64, 128, 256)
             and is_available("attn_paged_decode")
             and is_available("attn_paged_prefill")
+        )
+
+    def supports_call(
+        self,
+        q: Tensor,
+        kv_cache: Optional["KVCache"],
+        attn_mask: Optional[Tensor],
+        is_causal: bool,
+        fwd: Optional[str],
+    ) -> bool:
+        # The CUDA kernels are bf16-only, support head_dim in
+        # HEAD_DIMS, and need a KV cache (decode/prefill); everything
+        # else falls back down the priority list to torch.
+        return (
+            fwd in ("prefill", "decode")
+            and kv_cache is not None
+            and q.ndim == 3
+            and q.dtype == torch.bfloat16
+            and q.size(-1) in self.HEAD_DIMS
+            and is_available(f"attn_paged_{fwd}")
         )
 
     @staticmethod
@@ -606,9 +702,29 @@ class FlashAttnBackend(AttentionBackend):
     ``flash_attn_func``.
     """
 
-    @staticmethod
-    def supports(**kwargs) -> bool:
+    @classmethod
+    def available(cls) -> bool:
         return flash_attn_available()
+
+    def supports_call(
+        self,
+        q: Tensor,
+        kv_cache: Optional["KVCache"],
+        attn_mask: Optional[Tensor],
+        is_causal: bool,
+        fwd: Optional[str],
+    ) -> bool:
+        if not self.available():
+            return False
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if fwd is not None:
+            return q.ndim == 3 and hasattr(_flash_attn, "flash_attn_varlen_func")
+        # Dense (training) path: flash_attn_func cannot apply a custom
+        # mask, so only mask-free calls are supported — ``is_causal`` is
+        # a flag, not a mask.  Masked training (SFT/DPO/GRPO) must fall
+        # back to TorchNativeBackend instead of silently ignoring the mask.
+        return attn_mask is None
 
     def fwd_decode(
         self,
@@ -649,9 +765,9 @@ class FlashAttnBackend(AttentionBackend):
             k = repeat_kv(k, n_rep)
             v = repeat_kv(v, n_rep)
 
-        if attn_mask is not None and not is_causal and attn_mask.dim() != 4:
+        if attn_mask is not None:
             raise ValueError(
-                "FlashAttnBackend does not support a custom attention mask; "
+                "FlashAttnBackend cannot handle a custom attention mask; "
                 "use a causal mask or select TorchNativeBackend."
             )
         fa = _flash_attn
@@ -664,7 +780,7 @@ class FlashAttnBackend(AttentionBackend):
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),
-            causal=is_causal or (attn_mask is not None and attn_mask.dim() == 4),
+            causal=is_causal,
         )
         return out.contiguous()
 

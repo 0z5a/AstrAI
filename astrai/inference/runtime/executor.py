@@ -205,8 +205,8 @@ class Executor:
         max_q_heads = config.num_attention_heads
         head_dim = config.hidden_size // config.num_attention_heads
         backend = get_backend()
-        self._graph_supported = backend.supports_graph() and CudaBackend.supports(
-            head_dim=head_dim
+        self._graph_supported = backend.supports_graph() and (
+            CudaBackend.available() and head_dim in CudaBackend.HEAD_DIMS
         )
         self._workspace = InferenceWorkspace(
             max_batch_size=kv_cache.max_batch_size,
