@@ -1,6 +1,6 @@
 """FP8 CUDA kernel interface adapter (the only module touching the pybind).
 
-Isolates the ``fp8_mm`` CUDA extension behind stable Python primitives:
+Isolates the ``fp8_ops`` CUDA extension behind stable Python primitives:
 
 - ``quantize_bf16(x, scale, fmt) -> (x8, amax)`` — BF16 → FP8 with fused amax
 - ``mm_fp8(a8, b8, sa, sb) -> out`` — pre-quantized FP8 GEMM (BF16 output)
@@ -33,11 +33,11 @@ _MOD: object | None = None
 def _mod() -> object:
     global _MOD
     if _MOD is None:
-        if not is_available("fp8_mm"):
+        if not is_available("fp8_ops"):
             raise RuntimeError(
-                "CUDA kernel 'fp8_mm' is not available. Build with CSRC_KERNELS=true."
+                "CUDA kernel 'fp8_ops' is not available. Build with CSRC_KERNELS=true."
             )
-        _MOD = get_module("fp8_mm")
+        _MOD = get_module("fp8_ops")
     return _MOD
 
 
@@ -154,16 +154,18 @@ def mm_fp8(
     return fp8_gemm(a, b, sa, sb, int(out_dtype == "e4m3"), out_scale)
 
 
-def linear_forward_fp8(x, w, bias, sx, sw):
-    """BF16 linear forward, quantizing x/w to E4M3 inside the GEMM.
+def linear_forward_fp8(x, w, bias, sx, sw, fmt: str = "e4m3"):
+    """Pure FP8 linear forward: quantize x/w to ``fmt``, pre-quantized GEMM.
 
-    Returns ``(out, amax_x, amax_w)``. ``bias`` may be ``None``.
+    Returns ``(out, amax_x, amax_w)``. ``bias`` may be ``None``. Both
+    operands share the same FP8 format (E4M3 by default; E5M2 for a
+    range-first configuration).
     """
     if not (x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16):
         raise TypeError(f"fp8 forward requires bf16 inputs, got {x.dtype}/{w.dtype}")
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
-    return _mod().linear_forward_fp8(x, w, bias, sx, sw)
+    return _mod().linear_forward_fp8(x, w, bias, sx, sw, _fmt_int(fmt))
 
 
 def linear_backward_fp8(g, x, w, masks, sg, sw, sx, fmt: str = "e5m2"):

@@ -58,7 +58,7 @@ set(KERNEL_NAMES
     attn_paged_decode
     attn_paged_prefill
     rotary_emb
-    fp8_mm
+    fp8_ops
 )
 set(KERNEL_SRCS
     attention/decode.cu
@@ -66,7 +66,7 @@ set(KERNEL_SRCS
     attention/paged_decode.cu
     attention/paged_prefill.cu
     rotary/rotary_emb.cu
-    fp8/mm.cu
+    fp8/ops.cu
 )
 
 list(LENGTH KERNEL_NAMES _kernel_count)

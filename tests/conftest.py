@@ -17,7 +17,7 @@ CUDA_AVAIL = torch.cuda.is_available()
 KERNEL_AVAIL = CUDA_AVAIL and all(is_available(k) for k in KERNEL_NAMES)
 FP8_AVAIL = (
     CUDA_AVAIL
-    and is_available("fp8_mm")
+    and is_available("fp8_ops")
     and torch.cuda.get_device_capability() >= (8, 9)
 )
 skip_no_cuda = pytest.mark.skipif(not CUDA_AVAIL, reason="CUDA not available")

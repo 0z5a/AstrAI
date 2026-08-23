@@ -11,7 +11,7 @@ AstrAI includes optional custom CUDA kernels for attention, rotary embedding, an
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary/rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
-| `fp8_mm` | `fp8/mm.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
+| `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -39,7 +39,7 @@ Standalone benchmark vs torch complex-multiply (48 calls = 24 layers × q+k): 6-
 
 ### FP8 GEMM / Linear Kernel
 
-The `fp8_mm` family (`csrc/kernels/fp8/`) accelerates bf16 linear layers by
+The `fp8_ops` family (`csrc/kernels/fp8/`) accelerates bf16 linear layers by
 quantizing to FP8 and running tensor-core GEMMs (**requires sm_89+**; fp8
 `mma.sync.m16n8k32` only exists on Ada/Hopper). It follows the same three-layer
 style as attention, but split into **three** files:
@@ -47,8 +47,8 @@ style as attention, but split into **three** files:
 | File | Role |
 |------|------|
 | `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `FP8Params` POD — no torch |
-| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_quantize_kernel` (BF16→FP8 + amax), `fp8_pq_gemm_kernel` (pre-quantized GEMM, 128×64 CTA / 64×16 warp / 3-stage cp.async) — no torch |
-| `fp8/mm.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_mm` |
+| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_quantize_kernel` (BF16→FP8 + amax), `fp8_gemm_kernel` (pre-quantized GEMM, 128×64 CTA / 64×16 warp / 3-stage cp.async) — no torch |
+| `fp8/ops.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_ops` |
 
 Scale semantics follow `torch._scaled_mm` (quantization step size: divide by
 `scale`; the kernel computes the reciprocal internally — the interface never
@@ -97,7 +97,7 @@ unset, `setup.py` auto-detects the real GPU capability through
 
 - **sm_80+** (Ampere and later): enables the tensor-core MMA path
   (`mma.sync.m16n8k16.bf16` for bf16 attention, `mma.sync.m16n8k32` for FP8).
-- **sm_89+**: required for the FP8 family (`fp8_mm`) — FP8 tensor-core
+- **sm_89+**: required for the FP8 family (`fp8_ops`) — FP8 tensor-core
   instructions only exist on Ada/Hopper and newer.
 - **`-DASTRAI_NO_MMA`** is a manual escape hatch only — the build never defines
   it automatically. To disable the MMA path, add it to `NVCC_FLAGS` yourself;
@@ -246,9 +246,14 @@ with attn_backend(ATTN_BACKEND.CUDA):
 
 The `attention(...)` policy entry point falls back to `FlashAttnBackend` (when
 flash-attn is installed and supports the call) or `TorchNativeBackend` when the
-automatically selected CUDA backend cannot handle an input. An explicit
-`ASTR_BACKEND` or `attn_backend(...)` selection is strict and raises instead of
-silently switching implementations.
+automatically selected CUDA backend cannot handle an input. Resolution
+precedence is: explicit `attn_backend(...)` context > `ASTR_BACKEND` env >
+default. An explicit `attn_backend(...)` selection is strict and raises instead
+of silently switching implementations; the env override (and the implicit
+default) fall back to the first compatible backend when incapable. Training
+calls (`fwd=None`, no KV cache) resolve by capability: the CUDA cache kernels
+cannot run without a cache, so they fall back to flash (mask-free/causal calls
+only) and finally to torch SDPA.
 
 ### Rotary Backend
 
@@ -372,7 +377,7 @@ csrc/
 │   │   └── paged_prefill.cu          #   → module attn_paged_prefill
 │   ├── rotary/
 │   │   └── rotary_emb.cu             # rotary embedding (kernel + binding in one file) → module rotary_emb
-│   └── fp8/                          # FP8 family (module name fp8_mm)
+│   └── fp8/                          # FP8 family (module name fp8_ops)
 │       ├── common.h                  #   FP8Format enum, Fp8GemmTraits, FP8Params POD (no torch)
 │       ├── gemm.cuh                  #   FP8 device code: quantize + pre-quantized GEMM kernels (no torch)
 │       └── mm.cu                     #   binding only: validation, param packing, launch dispatch, pybind

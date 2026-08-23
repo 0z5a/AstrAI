@@ -35,8 +35,6 @@ from torch.library import Library
 from astrai.extension.ops.fp8 import (
     linear_backward_fp8,
     linear_forward_fp8,
-    mm_fp8,
-    quantize_bf16,
 )
 
 # Max representable value per FP8 format (E4M3: 448, E5M2: 57344).
@@ -275,9 +273,9 @@ def _dynamic_scale(t: torch.Tensor, recipe: FP8Recipe, fmt: str) -> torch.Tensor
 def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
     """Scaled fp8 linear forward (called from the aten::linear impl).
 
-    Delayed scaling uses the fused BF16->E4M3 GEMM (quantize + amax inside the
-    kernel); dynamic scaling measures the current amax first and runs the
-    pre-quantized path.
+    Pure FP8 path for both recipes: quantize x/w with the active scales, run
+    the pre-quantized GEMM, and feed the freshly measured amax back into the
+    delayed-scaling ring (dynamic scaling measures the current amax itself).
     """
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
@@ -287,21 +285,16 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
     if not meta.w_init:
         meta.init_w(w, fmt)
     if isinstance(state.recipe, DynamicScaling):
-        x_2d = x.reshape(-1, w.size(1))
-        sx = _dynamic_scale(x_2d, state.recipe, fmt)
+        sx = _dynamic_scale(x.reshape(-1, w.size(1)), state.recipe, fmt)
         sw = _dynamic_scale(w, state.recipe, fmt)
-        x8, _ = quantize_bf16(x_2d, sx, fmt)
-        w8, _ = quantize_bf16(w, sw, fmt)
-        out = mm_fp8(x8, w8, sx, sw)
-        out = out.reshape(*x.shape[:-1], w.size(0))
-        if bias.numel():
-            out = out + bias
-        return out
-    if not meta.x_init:
-        meta.init_x(x, fmt)
-    out, amax_x, amax_w = linear_forward_fp8(x, w, bias, meta.x_scale, meta.w_scale)
-    meta.update_x(amax_x, fmt)
-    meta.update_w(amax_w, fmt)
+    else:
+        if not meta.x_init:
+            meta.init_x(x, fmt)
+        sx, sw = meta.x_scale, meta.w_scale
+    out, amax_x, amax_w = linear_forward_fp8(x, w, bias, sx, sw, fmt)
+    if not isinstance(state.recipe, DynamicScaling):
+        meta.update_x(amax_x, fmt)
+        meta.update_w(amax_w, fmt)
     return out
 
 
@@ -373,32 +366,40 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
 
 
 def _linear_backward_cuda_impl(input_tensor, grad_output, weight, output_mask):
+    # Backward dim contract: grad_output is [..., N], weight is [N, K], so
+    # the contraction check is grad_output.size(-1) == weight.size(0) (not the
+    # forward's x.size(-1) == w.size(1) — that would silently skip fp8 for
+    # every non-square layer).
     if (
         fp8_linear_enabled()
         and weight.dtype == torch.bfloat16
-        and _fp8_supported(grad_output, weight)
+        and grad_output.dim() >= 2
+        and weight.dim() == 2
+        and grad_output.size(-1) == weight.size(0)
+        and input_tensor.dim() >= 2
+        and input_tensor.size(-1) == weight.size(1)
     ):
         return fp8_linear_backward(grad_output, input_tensor, weight, list(output_mask))
     compute_dtype = weight.dtype
     grad = grad_output.to(compute_dtype)
     grad_2d = grad.reshape(-1, weight.size(0))
     input_2d = input_tensor.reshape(-1, input_tensor.size(-1)).to(compute_dtype)
+    # Unneeded grads come back full-shape-but-uninitialized (mirroring the
+    # fp8 binding), so reshape_as can never hit an empty tensor.
     grad_input = (
-        torch.mm(grad_2d, weight)
+        torch.mm(grad_2d, weight).reshape_as(input_tensor)
         if output_mask[0]
-        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
+        else torch.empty_like(input_tensor)
     )
     grad_weight = (
-        torch.mm(grad_2d.t(), input_2d)
-        if output_mask[1]
-        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
+        torch.mm(grad_2d.t(), input_2d) if output_mask[1] else torch.empty_like(weight)
     )
     grad_bias = (
         grad.sum(dim=0)
         if output_mask[2]
-        else torch.empty(0, device=input_tensor.device, dtype=input_tensor.dtype)
+        else torch.empty(0, device=grad.device, dtype=grad.dtype)
     )
-    return grad_input.reshape_as(input_tensor), grad_weight, grad_bias
+    return grad_input, grad_weight, grad_bias
 
 
 _lib = Library("aten", "IMPL", "CUDA")

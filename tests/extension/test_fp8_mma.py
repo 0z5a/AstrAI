@@ -1,6 +1,7 @@
 """FP8 primitives: kernel-level (CUDA) and policy-level (CPU-verifiable) tests.
 
-The kernel-level tests exercise the fused and pre-quantized CUDA paths; the
+The kernel-level tests exercise the pure FP8 path (quantize_bf16 + mm_fp8 for
+the forward GEMM, quantize + pre-quantized GEMMs for the backward); the
 policy-level tests (recipes, autocast context, per-tensor meta, CPU fallbacks
 of the custom ops) run without a GPU.
 """
@@ -16,7 +17,6 @@ from astrai.extension.fp8 import (
     fp8_autocast,
     fp8_state,
 )
-from astrai.extension.loader import get_module
 from astrai.extension.ops.fp8 import (
     linear_backward_fp8,
     linear_forward_fp8,
@@ -44,14 +44,15 @@ def _quantize(tensor, scale):
     ("m", "n", "k"),
     [(16, 8, 32), (17, 9, 33), (31, 15, 64), (32, 48, 96)],
 )
-def test_fused_fp8_mma_matches_explicit_quantization(m, n, k):
+def test_fp8_mm_matches_explicit_quantization(m, n, k):
     torch.manual_seed(m + n + k)
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     scale_a = _scale(a)
     scale_b = _scale(b)
-
-    out = get_module("fp8_mm").fp8_mm(a, b, scale_a, scale_b)
+    a8, _ = quantize_bf16(a, scale_a, "e4m3")
+    b8, _ = quantize_bf16(b, scale_b, "e4m3")
+    out = mm_fp8(a8, b8, scale_a, scale_b)
     expected = (
         _quantize(a, scale_a) @ _quantize(b, scale_b).t() * scale_a * scale_b
     ).to(torch.bfloat16)
@@ -86,7 +87,7 @@ def test_quantize_bf16_e5m2_format():
 
 
 @skip_no_fp8
-def test_fused_fp8_linear_forward_and_backward():
+def test_fp8_linear_forward_and_backward():
     torch.manual_seed(7)
     m, n, k = 19, 13, 37
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)

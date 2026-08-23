@@ -168,15 +168,15 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor sa,
                      out_fp8 ? &os : nullptr, m, n, k);
     if (a.scalar_type() == torch::kFloat8_e4m3fn) {
         if (out_fp8) {
-            fp8::launch_fp8_pq<FP8Format::E4M3, true>(p, stream.stream());
+            fp8::launch_fp8_gemm<FP8Format::E4M3, true>(p, stream.stream());
         } else {
-            fp8::launch_fp8_pq<FP8Format::E4M3>(p, stream.stream());
+            fp8::launch_fp8_gemm<FP8Format::E4M3>(p, stream.stream());
         }
     } else {
         if (out_fp8) {
-            fp8::launch_fp8_pq<FP8Format::E5M2, true>(p, stream.stream());
+            fp8::launch_fp8_gemm<FP8Format::E5M2, true>(p, stream.stream());
         } else {
-            fp8::launch_fp8_pq<FP8Format::E5M2>(p, stream.stream());
+            fp8::launch_fp8_gemm<FP8Format::E5M2>(p, stream.stream());
         }
     }
     C10_CUDA_CHECK(cudaGetLastError());
@@ -185,9 +185,10 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor sa,
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
     torch::Tensor x, torch::Tensor w, torch::Tensor bias, torch::Tensor sx,
-    torch::Tensor sw) {
-    // Fused BF16 -> E4M3 -> MMA -> BF16 linear forward. amax_x / amax_w are
-    // zero-initialized here and returned (caller does not clear them).
+    torch::Tensor sw, int64_t fmt) {
+    // Pure FP8 forward: quantize x/w (fmt: 0 = E4M3, 1 = E5M2), then the
+    // pre-quantized GEMM; the dequantized BF16 output gets the bias added.
+    // amax_x / amax_w come from the quantize kernels (zero-initialized here).
     TORCH_CHECK(x.is_cuda() && w.is_cuda(), "CUDA tensors required");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
                     w.scalar_type() == torch::kBFloat16,
@@ -199,14 +200,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
     const at::cuda::OptionalCUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    auto x_c = x.reshape({-1, w.size(1)}).contiguous();
-    auto w_c = w.contiguous();
+    auto x_c = x.reshape({-1, w.size(1)}).contiguous();   // [M, K]
+    auto w_c = w.contiguous();                            // [N, K]
     int64_t m = x_c.size(0), k = x_c.size(1), n = w_c.size(0);
     TORCH_CHECK(w_c.dim() == 2 && w_c.size(1) == k, "inner dim mismatch");
-    // amax slots are zero-initialized here; the kernel atomically maxes in.
-    auto amax_x = torch::zeros({1}, x.options().dtype(torch::kFloat32));
-    auto amax_w = torch::zeros({1}, x.options().dtype(torch::kFloat32));
-    auto out = torch::empty({m, n}, x_c.options());
     const bool has_bias = bias.defined() && bias.numel() > 0;
     if (has_bias) {
         TORCH_CHECK(bias.is_cuda() && bias.device() == x.device() &&
@@ -214,23 +211,42 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
                         bias.numel() == n,
                     "bias must be CUDA bf16 with shape [N]");
     }
+    const auto f8opt = fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn;
+    auto x8 = torch::empty({m, k}, x_c.options().dtype(f8opt));
+    auto w8 = torch::empty({n, k}, x_c.options().dtype(f8opt));
+    auto amax_x = torch::zeros({1}, x.options().dtype(torch::kFloat32));
+    auto amax_w = torch::zeros({1}, x.options().dtype(torch::kFloat32));
+    auto out = torch::empty({m, n}, x_c.options());
+
+    auto quantize = [&](const torch::Tensor& src, torch::Tensor& dst,
+                        const torch::Tensor& scale, torch::Tensor* amax) {
+        FP8Params qp;
+        pack_quantize_params(qp, src.data_ptr(), dst.data_ptr(), scale, amax,
+                             src.numel());
+        if (fmt) {
+            fp8::launch_fp8_quantize<FP8Format::E5M2>(qp, stream.stream());
+        } else {
+            fp8::launch_fp8_quantize<FP8Format::E4M3>(qp, stream.stream());
+        }
+    };
+    quantize(x_c, x8, sx, &amax_x);
+    quantize(w_c, w8, sw, &amax_w);
+
     FP8Params p;
-    pack_gemm_params(p, x_c.data_ptr(), w_c.data_ptr(), out.data_ptr(), sx, sw,
+    pack_gemm_params(p, x8.data_ptr(), w8.data_ptr(), out.data_ptr(), sx, sw,
                      nullptr, m, n, k);
-    p.bias = has_bias ? reinterpret_cast<const __nv_bfloat16*>(bias.data_ptr())
-                      : nullptr;
-    p.amax_a = amax_x.data_ptr<float>();
-    p.amax_b = amax_w.data_ptr<float>();
-    if (has_bias) {
-        fp8::launch_fp8_fused<true, true>(p, stream.stream());
+    if (fmt) {
+        fp8::launch_fp8_gemm<FP8Format::E5M2>(p, stream.stream());
     } else {
-        fp8::launch_fp8_fused<false, true>(p, stream.stream());
+        fp8::launch_fp8_gemm<FP8Format::E4M3>(p, stream.stream());
     }
     C10_CUDA_CHECK(cudaGetLastError());
 
     std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end() - 1);
     shape.push_back(n);
-    return {out.reshape(shape), amax_x, amax_w};
+    auto out_r = out.reshape(shape);
+    if (has_bias) out_r = out_r + bias;
+    return {out_r, amax_x, amax_w};
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -265,7 +281,6 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     auto amax_g = torch::zeros({1}, g.options().dtype(torch::kFloat32));
     auto f8opt = fmt ? g.options().dtype(torch::kFloat8_e5m2)
                      : g.options().dtype(torch::kFloat8_e4m3fn);
-    const auto q_fmt = fmt ? FP8Format::E5M2 : FP8Format::E4M3;
 
     auto quantize = [&](const torch::Tensor& src, torch::Tensor& dst,
                         const torch::Tensor& scale, torch::Tensor* amax) {
@@ -278,38 +293,46 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
             fp8::launch_fp8_quantize<FP8Format::E4M3>(qp, stream.stream());
         }
     };
-    auto pq = [&](const torch::Tensor& a8, const torch::Tensor& b8,
-                  torch::Tensor& out, const torch::Tensor& sa,
-                  const torch::Tensor& sb, int64_t mm, int64_t nn, int64_t kk) {
+    // Explicit-transpose backward: the gradient/activation tensors keep their
+    // natural row-major layout, which the GEMM consumes transposed (W is
+    // [N,K] but dX contracts over N; x is [M,K] and g is [M,N] for dW), so
+    // the fp8 operands are transposed once and run through the fast non-trans
+    // pre-quantized GEMM. g is quantized once (amax_g measured here); its
+    // transpose is derived from the same g8 so both GEMMs share the value.
+    auto pq_n = [&](const torch::Tensor& a8, const torch::Tensor& b8,
+                    torch::Tensor& out, const torch::Tensor& sa,
+                    const torch::Tensor& sb, int64_t mm, int64_t nn,
+                    int64_t kk) {
         FP8Params gp;
         pack_gemm_params(gp, a8.data_ptr(), b8.data_ptr(), out.data_ptr(), sa,
                          sb, nullptr, mm, nn, kk);
         if (fmt) {
-            fp8::launch_fp8_pq<FP8Format::E5M2>(gp, stream.stream());
+            fp8::launch_fp8_gemm<FP8Format::E5M2>(gp, stream.stream());
         } else {
-            fp8::launch_fp8_pq<FP8Format::E4M3>(gp, stream.stream());
+            fp8::launch_fp8_gemm<FP8Format::E4M3>(gp, stream.stream());
         }
     };
 
-    // dX = g @ W: quantize g once, then g8 @ w8^T.
-    if (masks[0]) {
-        auto g8 = torch::empty({m, n}, f8opt);
+    torch::Tensor g8;
+    if (masks[0] || masks[1]) {
+        g8 = torch::empty({m, n}, f8opt);
         quantize(g_c, g8, sg, &amax_g);
-        auto w_t = w_c.transpose(0, 1).contiguous();  // [K, N]
-        auto w8_t = torch::empty({k, n}, f8opt);
-        quantize(w_t, w8_t, sw, nullptr);
-        auto grad_input_2d = grad_input.reshape({m, k});
-        pq(g8, w8_t, grad_input_2d, sg, sw, m, k, n);
     }
-    // dW = g^T @ x: transposed layouts for both operands.
+    // dX = g @ W: A = g8 [M,N] natural; B = W^T [K,N] (w8 transposed in fp8).
+    if (masks[0]) {
+        auto w8 = torch::empty({n, k}, f8opt);
+        quantize(w_c, w8, sw, nullptr);
+        auto w8T = w8.transpose(0, 1).contiguous();  // [K, N]
+        auto grad_input_2d = grad_input.reshape({m, k});
+        pq_n(g8, w8T, grad_input_2d, sg, sw, m, k, n);
+    }
+    // dW = g^T @ x: A = g^T [N,M] (g8 transposed); B = x^T [K,M].
     if (masks[1]) {
-        auto g_t = g_c.transpose(0, 1).contiguous();  // [N, M]
-        auto x_t = x_c.transpose(0, 1).contiguous();  // [K, M]
-        auto g8_t = torch::empty({n, m}, f8opt);
-        auto x8_t = torch::empty({k, m}, f8opt);
-        quantize(g_t, g8_t, sg, nullptr);
-        quantize(x_t, x8_t, sx, nullptr);
-        pq(g8_t, x8_t, grad_weight, sg, sx, n, k, m);
+        auto g8T = g8.transpose(0, 1).contiguous();  // [N, M]
+        auto x8 = torch::empty({m, k}, f8opt);
+        quantize(x_c, x8, sx, nullptr);
+        auto x8T = x8.transpose(0, 1).contiguous();  // [K, M]
+        pq_n(g8T, x8T, grad_weight, sg, sx, n, k, m);
     }
     if (!masks[0] && !masks[1]) {
         amax_g.copy_(g_c.abs().amax().to(torch::kFloat32));
@@ -319,38 +342,7 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     return {grad_input, grad_weight, grad_bias, amax_g};
 }
 
-torch::Tensor fp8_mm(torch::Tensor a, torch::Tensor b, torch::Tensor sx,
-                     torch::Tensor sw) {
-    // BF16-in fused FP8 GEMM primitive (no bias, no amax): a @ b^T.
-    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK(a.scalar_type() == torch::kBFloat16 &&
-                    b.scalar_type() == torch::kBFloat16,
-                "a and b must be bf16");
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a and b must be 2D");
-    TORCH_CHECK(a.device() == b.device(), "a and b must be on the same device");
-    TORCH_CHECK(a.size(1) == b.size(1), "inner dim mismatch");
-    check_scale(sx, a, "sx");
-    check_scale(sw, a, "sw");
-    check_fp8_device(a);
-    const at::cuda::OptionalCUDAGuard guard(a.device());
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    auto a_c = a.contiguous();
-    auto b_c = b.contiguous();
-    int64_t m = a_c.size(0), n = b_c.size(0), k = a_c.size(1);
-    auto out = torch::empty({m, n}, a_c.options());
-    FP8Params p;
-    pack_gemm_params(p, a_c.data_ptr(), b_c.data_ptr(), out.data_ptr(), sx, sw,
-                     nullptr, m, n, k);
-    fp8::launch_fp8_fused<false, false>(p, stream.stream());
-    C10_CUDA_CHECK(cudaGetLastError());
-    return out;
-}
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fp8_mm", &fp8_mm, py::arg("a"), py::arg("b"), py::arg("sx"),
-          py::arg("sw"),
-          "Fused BF16 input, E4M3 MMA, FP32 accumulation, BF16 output GEMM");
     m.def("quantize_bf16", &quantize_bf16, py::arg("x"), py::arg("scale"),
           py::arg("fmt"),
           "BF16 to FP8 (E4M3/E5M2) quantize with fused amax; returns (x8, amax)");
@@ -361,7 +353,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "1=fp8 e4m3 (requires out_scale)");
     m.def("linear_forward_fp8", &linear_forward_fp8, py::arg("x"),
           py::arg("w"), py::arg("bias"), py::arg("sx"), py::arg("sw"),
-          "Fused BF16-to-FP8 linear forward; returns (out, amax_x, amax_w)");
+          py::arg("fmt") = 0,
+          "Pure FP8 linear forward: quantize x/w, pre-quantized GEMM; "
+          "returns (out, amax_x, amax_w)");
     m.def("linear_backward_fp8", &linear_backward_fp8, py::arg("g"),
           py::arg("x"), py::arg("w"), py::arg("masks"), py::arg("sg"),
           py::arg("sw"), py::arg("sx"), py::arg("fmt"),
