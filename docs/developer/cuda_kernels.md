@@ -1,23 +1,24 @@
 # CUDA Kernels
 
-AstrAI includes optional custom CUDA kernels for attention and rotary embedding. These are built when `nvcc` is available and CUDA is detected, and are dispatched via the `CudaBackend` attention backend or auto-dispatched for rotary.
+AstrAI includes optional custom CUDA kernels for attention, rotary embedding, and FP8 GEMM. These are built when `nvcc` is available and CUDA is detected, and are dispatched via the `CudaBackend` attention backend, auto-dispatched for rotary, or invoked through the FP8 linear primitives.
 
 ## Overview
 
 | Kernel | File | Description |
 |--------|------|-------------|
-| `attn_decode` | `attn_decode.cu` | GQA decode attention (split-KV) |
-| `attn_prefill` | `attn_prefill.cu` | GQA prefill attention (split-Q) |
-| `attn_paged_decode` | `attn_paged_decode.cu` | Paged KV cache decode attention |
-| `attn_paged_prefill` | `attn_paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
-| `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
+| `attn_decode` | `attention/decode.cu` | GQA decode attention (split-KV) |
+| `attn_prefill` | `attention/prefill.cu` | GQA prefill attention (split-Q) |
+| `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
+| `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
+| `rotary_emb` | `rotary/rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
+| `fp8_mm` | `fp8/mm.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
 | Variant | File | Optimization |
 |---------|------|--------------|
-| Split-KV MMA decode | `attn_decode_split_kv_mma.cuh` | Split KV across warps + MMA (sm_80+) |
-| Split-Q MMA prefill | `attn_prefill_split_q_mma.cuh` | Split Q across warps + MMA (sm_80+) |
+| Split-KV MMA decode | `attention/decode_split_kv_mma.cuh` | Split KV across warps + MMA (sm_80+) |
+| Split-Q MMA prefill | `attention/prefill_split_q_mma.cuh` | Split Q across warps + MMA (sm_80+) |
 
 > The paged and non-paged paths share one kernel body. Prefill is templated on
 > an independent Q schedule (`DenseQSchedule` / `PackedQSchedule`) and KV
@@ -26,7 +27,7 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 ### Rotary Embedding Kernel
 
-The `rotary_emb` kernel (`csrc/kernels/rotary_emb.cu`) fuses cos/sin lookup and rotation into a single kernel:
+The `rotary_emb` kernel (`csrc/kernels/rotary/rotary_emb.cu`) fuses cos/sin lookup and rotation into a single kernel:
 
 - One thread per (head, dim-pair), vectorized `__nv_bfloat162` load/store
 - f32 cos/sin input, bf16 compute and output
@@ -35,6 +36,30 @@ The `rotary_emb` kernel (`csrc/kernels/rotary_emb.cu`) fuses cos/sin lookup and 
 - No context-manager backend needed — rotary is backend-agnostic, both attention backends benefit
 
 Standalone benchmark vs torch complex-multiply (48 calls = 24 layers × q+k): 6-9x faster, max diff 0 (decode) to 3e-2 (large prefill, bf16).
+
+### FP8 GEMM / Linear Kernel
+
+The `fp8_mm` family (`csrc/kernels/fp8/`) accelerates bf16 linear layers by
+quantizing to FP8 and running tensor-core GEMMs (**requires sm_89+**; fp8
+`mma.sync.m16n8k32` only exists on Ada/Hopper). It follows the same three-layer
+style as attention, but split into **three** files:
+
+| File | Role |
+|------|------|
+| `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `FP8Params` POD — no torch |
+| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_quantize_kernel` (BF16→FP8 + amax), `fp8_pq_gemm_kernel` (pre-quantized GEMM, 128×64 CTA / 64×16 warp / 3-stage cp.async) — no torch |
+| `fp8/mm.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_mm` |
+
+Scale semantics follow `torch._scaled_mm` (quantization step size: divide by
+`scale`; the kernel computes the reciprocal internally — the interface never
+takes `*_inv`). `amax` is always returned in the original bf16 domain.
+
+Python layer (two levels): `astrai/extension/ops/fp8.py` provides stateless
+primitives (`quantize_bf16` / `mm_fp8` / `linear_forward_fp8` /
+`linear_backward_fp8`) via `torch.library.custom_op`, and
+`astrai/extension/fp8.py` is the strategy layer (`fp8_autocast`, delayed /
+dynamic scaling recipes, `fp8_linear_forward/backward` wiring `aten::linear`
+on CUDA). See the FP8 section in `AGENTS.md` for full detail.
 
 ## Build System
 
@@ -66,10 +91,17 @@ cmake --build build/cmake -j 16
 
 ### Architecture flags
 
-`setup.py` passes the GPU compute capability to CMake via `ASTRAI_CUDA_ARCH` (default `89`, i.e. sm_89 / L20):
+`setup.py` passes the GPU compute capability to CMake via `ASTRAI_CUDA_ARCH`. When
+unset, `setup.py` auto-detects the real GPU capability through
+`torch.cuda.get_device_capability()`; the CMake fallback default is `80` (sm_80):
 
-- **sm_80+** (Ampere and later): enables tensor-core MMA path (`mma.sync.m16n8k16.bf16`)
-- **Below sm_80**: adds `-DASTRAI_NO_MMA` to disable the MMA path at compile time
+- **sm_80+** (Ampere and later): enables the tensor-core MMA path
+  (`mma.sync.m16n8k16.bf16` for bf16 attention, `mma.sync.m16n8k32` for FP8).
+- **sm_89+**: required for the FP8 family (`fp8_mm`) — FP8 tensor-core
+  instructions only exist on Ada/Hopper and newer.
+- **`-DASTRAI_NO_MMA`** is a manual escape hatch only — the build never defines
+  it automatically. To disable the MMA path, add it to `NVCC_FLAGS` yourself;
+  all supported build targets are sm_80+.
 
 ### Build configuration
 
@@ -80,7 +112,7 @@ NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
              --ptxas-options=-O3,-v --extra-device-vectorization --threads=16
 ```
 
-Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all five kernel targets in parallel via `cmake --build -j N`.
+Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all six kernel targets in parallel via `cmake --build -j N`. The target list is the **single source of truth**: `KERNEL_NAMES` and the parallel `KERNEL_SRCS` list in `csrc/CMakeLists.txt`; `astrai/extension/loader.py` auto-discovers the compiled `.so` files.
 
 ## Python Extension Architecture
 
@@ -93,7 +125,9 @@ astrai/extension/
 ├── loader.py               # Optional compiled-module discovery and loading
 ├── ops/
 │   ├── attention.py        # Stateless attention kernel wrappers
-│   └── rotary.py           # Stateless rotary kernel wrapper
+│   ├── rotary.py           # Stateless rotary kernel wrapper
+│   └── fp8.py              # Stateless FP8 primitives (custom_op)
+├── fp8.py                  # FP8 strategy layer (fp8_autocast, recipes)
 └── backend/
     ├── attention.py        # Backend selection, KV cache I/O, and fallback
     └── rotary.py           # Per-call CUDA/torch rotary dispatch
@@ -293,6 +327,7 @@ nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
 Test files:
 - `attn_test.cu` — decode + prefill kernels (correctness tables + benchmarks)
 - `attn_paged_test.cu` — paged decode/prefill kernels
+- `fp8_mma_test.cu` — BF16→FP8→BF16 MMA demo (sm_89)
 
 ## Benchmarks
 
@@ -315,29 +350,39 @@ nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
 
 ```
 csrc/
-├── CMakeLists.txt        # CMake build: 5 kernel targets, torch/pybind11 linking
+├── CMakeLists.txt                    # CMake build: kernel registry (KERNEL_NAMES / KERNEL_SRCS), torch/pybind11 linking
 ├── kernels/
-│   ├── attn_common.h     # Unified attention params (contig + paged modes)
-│   ├── attn_decode.cu    # Basic decode kernel (registered)
-│   ├── attn_prefill.cu   # Basic prefill kernel (registered)
-│   ├── attn_paged_decode.cu             # Paged decode kernel (registered)
-│   ├── attn_paged_prefill.cu            # Paged prefill kernel (registered)
-│   ├── rotary_emb.cu                    # Fused rotary embedding kernel (registered)
-│   ├── attn_decode_split_kv.cuh         # Split-KV variant (contig + paged via KVSource)
-│   ├── attn_decode_split_kv_mma.cuh     # Split-KV + MMA variant (contig + paged)
-│   ├── attn_prefill_split_q.cuh         # Split-Q variant (contig + paged via KVSource)
-│   ├── attn_prefill_split_q_mma.cuh     # Split-Q + MMA variant (contig + paged)
-│   ├── attn_layout_policies.cuh          # Q schedules and KVSource policies
-│   ├── attn_dispatchers.cuh             # Kernel dispatch macros + KV-templated launchers
-│   ├── attn_entry_utils.cuh             # Entry point helpers
-│   ├── attn_mma_utils.cuh               # MMA utilities
-│   └── attn_warp_utils.cuh              # Warp-level utilities
+│   ├── common/                       # cross-family pure-CUDA helpers (no torch)
+│   │   ├── device.cuh                #   sm_at_least(), kMinSmForFp8* constants
+│   │   └── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2/x4<T>
+│   ├── attention/                    # attention family (module names keep the attn_* prefix)
+│   │   ├── common.h                  #   AttentionParams POD, TensorLayout enum (BHLD/BLHD)
+│   │   ├── warp_utils.cuh            #   warp reduction helpers
+│   │   ├── layout_policies.cuh       #   KV addressing policies: DenseQSchedule/PackedQSchedule, ContigKV/PagedKV
+│   │   ├── mma_utils.cuh             #   ldmatrix/pack helpers + online-softmax (bf16 mma via common/mma.cuh)
+│   │   ├── entry_utils.cuh           #   torch binding helpers: DISPATCH_HEAD_DIM, pack_*_params
+│   │   ├── dispatchers.cuh           #   pure-CUDA launchers: dispatch_decode/prefill (+paged), split-K math
+│   │   ├── decode_split_kv.cuh       #   decode kernel, scalar (split-KV)
+│   │   ├── decode_split_kv_mma.cuh   #   decode kernel, MMA + split-K
+│   │   ├── prefill_split_q.cuh       #   prefill kernel, scalar (split-Q)
+│   │   ├── prefill_split_q_mma.cuh   #   prefill kernel, MMA (split-Q, packed/ragged Q schedule)
+│   │   ├── decode.cu                 #   → module attn_decode
+│   │   ├── prefill.cu                #   → module attn_prefill
+│   │   ├── paged_decode.cu           #   → module attn_paged_decode
+│   │   └── paged_prefill.cu          #   → module attn_paged_prefill
+│   ├── rotary/
+│   │   └── rotary_emb.cu             # rotary embedding (kernel + binding in one file) → module rotary_emb
+│   └── fp8/                          # FP8 family (module name fp8_mm)
+│       ├── common.h                  #   FP8Format enum, Fp8GemmTraits, FP8Params POD (no torch)
+│       ├── gemm.cuh                  #   FP8 device code: quantize + pre-quantized GEMM kernels (no torch)
+│       └── mm.cu                     #   binding only: validation, param packing, launch dispatch, pybind
 └── tests/
-    ├── test_utils.cuh           # Shared test utilities
-    ├── attn_test.cu             # Decode + prefill kernels
-    └── attn_paged_test.cu       # Paged decode/prefill kernels
+    ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
+    ├── attn_test.cu                  # Decode + prefill kernels
+    ├── attn_paged_test.cu            # Paged decode/prefill kernels
+    └── fp8_mma_test.cu               # BF16→FP8→BF16 MMA demo
 ```
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-> Document Update Time: 2026-08-16
+> Document Update Time: 2026-08-22

@@ -57,7 +57,7 @@ AstrAI 是一个覆盖模型构建、训练、评测与部署的端到端 Transf
 | **数据** | 声明式 JSON 预处理、可配置掩码与样本打包、二进制/JSONL 存储和流式数据集 |
 | **推理** | 连续批处理、分页 KV Cache、Radix 前缀缓存、流式生成，以及 Torch/CUDA/FlashAttention 后端 |
 | **服务** | 基于 FastAPI 的 OpenAI 与 Anthropic 聊天补全协议，支持 SSE 流式输出和工具调用 |
-| **评测** | Perplexity、MMLU、HumanEval、IFEval、IFD 和 ROUGE 评测工具 |
+| **评测** | Perplexity、MMLU、HumanEval、IFEval、IFD、ROUGE 和权重分析评测工具 |
 | **扩展** | 基于工厂与注册表扩展模型、数据集、训练策略、回调、内核和协议组件 |
 
 ### 快速上手
@@ -71,8 +71,9 @@ AstrAI 需要 Python 3.12+，并精确固定 PyTorch 版本为 `2.11.0`。训练
 ```bash
 git clone https://github.com/ViperEkura/AstrAI.git
 cd AstrAI
-pip install -e .                                          # 纯 PyTorch（不含 CUDA 内核）
-# CSRC_KERNELS=true pip install -e . --no-build-isolation  # 可选：融合 CUDA 内核加速
+pip install -e .                                          # 检测到 nvcc + CUDA 时自动构建内核
+# CSRC_KERNELS=false pip install -e .                     # 跳过内核（纯 PyTorch）
+# CSRC_KERNELS=true pip install -e . --no-build-isolation  # 强制构建融合 CUDA 内核
 # pip install -e ".[dev]"                                  # 可选：开发依赖（pytest, ruff）
 ```
 
@@ -242,6 +243,8 @@ SSE 流式格式、错误码和统计端点详见[推理文档](guides/inference
 | [数据流程](./developer/dataflow.md) | 数据管道、存储后端与数据集架构 |
 | [内部实现](./developer/internals.md) | 训练原理：损失公式、回调生命周期、KV Cache |
 | [CUDA 内核](./developer/cuda_kernels.md) | 自定义 CUDA 注意力内核与基准测试 |
+| [Docker 服务部署](./developer/docker-serving.md) | YAML 驱动的容器化服务（`serve.yaml`、`serve.sh`） |
+| [Docker 训练部署](./developer/docker-training.md) | YAML 驱动的容器化训练（`train.yaml`、`train.sh`） |
 
 ### 贡献
 

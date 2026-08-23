@@ -39,11 +39,12 @@ ruff format .    # re-format after fix
 python -u -m pytest tests/ -v
 ```
 
-> Failed tests may leave orphan tempdirs under `%TEMP%`. Clean them manually if needed.
+> Failed tests may leave orphan tempdirs under the system temp directory
+> (`$TMPDIR` on Linux/macOS, `%TEMP%` on Windows). Clean them manually if needed.
 
 ### 4. (Optional) Full pre-commit check script
 
-If you have Git Bash available:
+If you have `bash` available (Git Bash on Windows works too):
 
 ```bash
 bash scripts/pre_commit.sh

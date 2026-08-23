@@ -54,7 +54,12 @@ KVCache
   ├── out_cache_loc          [batch, seq_len] — write indices for this forward
   ├── max_len                int — max(seq_lens), avoids GPU sync in decode
   ├── kv_indptr              [batch + 1] int32 — prefix sum of seq_lens, precomputed once per step
-  └── qo_indptr              [batch + 1] int32 — prefix sum of per-request q_lens (prefill), precomputed once per step
+  ├── qo_indptr              [batch + 1] int32 — prefix sum of per-request q_lens (prefill), precomputed once per step
+  ├── q_tile_to_batch        [num_q_tiles] int32 — prefill: Q tile → request (precomputed once per step)
+  ├── q_tile_to_index        [num_q_tiles] int32 — prefill: Q tile → request-local tile index
+  ├── decode_o_part          [batch, n_heads, head_dim] — decode split-K partial output buffer
+  ├── decode_ml_part         [batch, n_heads] — decode split-K partial max/logsum buffer
+  └── decode_out             [batch, n_heads, head_dim] — decode output accumulator
 ```
 
 Attention layers do raw buffer indexing: `k_buffer[layer_id, out_cache_loc] = k` to write, `k_buffer[layer_id, indices]` to gather.
@@ -94,7 +99,7 @@ with attn_backend(ATTN_BACKEND.CUDA):
 Environment and context selections are strict: if the selected backend cannot
 handle the call, inference raises an error rather than silently switching.
 
-`CudaBackend` decode path: writes K/V to cache, then calls `attn_paged_decode` with `page_size=1` — the `req_to_token` table serves directly as the page table, each token slot is a single-token "page". No explicit K/V gather needed.
+`CudaBackend` decode path: writes K/V via `new_k`/`new_v` while calling `attn_paged_decode` — the `req_to_token` table serves directly as the page table (conceptually a single-token "page" per slot, i.e. `page_size=1`; the op itself takes no `page_size` argument). No explicit K/V gather needed.
 
 `CudaBackend` prefill path: writes K/V, then calls `attn_paged_prefill` — a ragged-batch (paged) prefill kernel that reads K/V directly from the flat pool via `req_to_token`, addressing each request's `q_len`/`kv_len` through `qo_indptr` and `kv_indptr`. No explicit K/V gather needed.
 
@@ -253,13 +258,17 @@ The HTTP protocols and direct engine API have distinct request models and defaul
 | `max_tokens` | Optional[int] | 2048 | Max generation length |
 | `stream` | Optional[bool] | False | Stream output |
 | `stop` | Optional[Union[str, List[str]]] | None | Stop sequences |
-| `n` | Optional[int] | 1 | Number of choices requested |
-| `presence_penalty` | Optional[float] | 0.0 | Presence penalty (-2.0 to 2.0) |
+| `n` | Optional[int] | 1 | Accepted for API compatibility, **ignored** (always returns a single choice) |
+| `presence_penalty` | Optional[float] | 0.0 | Accepted for API compatibility, **ignored** |
 | `frequency_penalty` | Optional[float] | 0.0 | Frequency penalty (-2.0 to 2.0) |
-| `logit_bias` | Optional[Dict[int, float]] | None | Per-token logit bias |
-| `user` | Optional[str] | None | End-user identifier |
+| `logit_bias` | Optional[Dict[int, float]] | None | Accepted for API compatibility, **ignored** |
+| `user` | Optional[str] | None | Accepted for API compatibility, **ignored** |
 | `tools` | Optional[List[ToolDef]] | None | Tool definitions for function calling |
 | `tool_choice` | Optional[Union[str, Dict[str, Any]]] | `"auto"` | Tool selection mode or explicit tool choice |
+
+> `n`, `presence_penalty`, `logit_bias`, and `user` are validated by the request
+> model but ignored by the server (a warning is logged when a non-default value
+> is supplied).
 
 **Anthropic** (`MessagesRequest`):
 
@@ -371,4 +380,4 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
     print(token)
 ```
 
-> Document Update Time: 2026-08-16
+> Document Update Time: 2026-08-22

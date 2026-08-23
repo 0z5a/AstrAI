@@ -28,7 +28,7 @@
 |-----------|-------------|---------|
 | `--warmup_ratio` | Fraction of total steps used for LR warmup | 0.05 |
 | `--max_lr` | Maximum learning rate (cosine decay after warmup) | 3e-4 |
-| `--max_grad_norm` | Maximum gradient norm for clipping; the current CLI requires a positive number | 1.0 |
+| `--max_grad_norm` | Maximum gradient norm for clipping; `TrainConfig` validates it as positive (or `None`) | 1.0 |
 
 ### Optimizer
 
@@ -281,4 +281,4 @@ See [Preprocessing Guide](preprocessing.md) for config file format and examples.
 
 ---
 
-> Document Update Time: 2026-07-20
+> Document Update Time: 2026-08-22

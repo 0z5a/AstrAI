@@ -14,7 +14,7 @@ train.yaml
         │
 scripts/train.sh             preflight, Compose wrapper, lifecycle, timer
   └── docker-compose.yml     GPU passthrough, mounts, image, container limits
-        └── train-entrypoint.sh   process count, parallel mode, auto-resume
+        └── scripts/docker/train-entrypoint.sh   process count, parallel mode, auto-resume
               └── train.py --config /run/astrai/train.yaml
 ```
 
@@ -123,3 +123,5 @@ the Docker timeout expires.
 3. Do not force DDP for a model that requires FSDP; declare the mode explicitly.
 4. Do not use `kill -9` for routine shutdown; use `scripts/train.sh stop CONFIG`.
 5. The image user is built with the host UID/GID so mounted checkpoints retain usable ownership.
+
+> Document Update Time: 2026-08-22

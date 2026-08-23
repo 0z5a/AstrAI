@@ -26,17 +26,24 @@ This guide walks you through installing AstrAI, downloading a model, running inf
 git clone https://github.com/ViperEkura/AstrAI.git
 cd AstrAI
 
-# Basic install (pure PyTorch, no custom CUDA kernels)
+# Kernels auto-build when nvcc + CUDA are detected; skip with CSRC_KERNELS=false
 pip install -e .
 
-# With CUDA kernels (optional, for fused attention and rotary embedding)
+# Force the CUDA kernel build (fused attention, rotary embedding, FP8 GEMM)
 # CSRC_KERNELS=true pip install -e . --no-build-isolation
 
 # With dev dependencies (pytest, ruff)
 # pip install -e ".[dev]"
 ```
 
-> **CUDA kernels** are opt-in at build time (`CSRC_KERNELS=true`). Once built, `CudaBackend` is the default attention backend on GPU (cuda > flash > torch priority). Override via `ASTR_BACKEND` env var or `attn_backend()` context manager. Fused rotary embedding kernel is auto-dispatched when available. Skip for CPU-only usage.
+> **CUDA kernels** build automatically when `nvcc` is on `PATH` and
+> `torch.cuda.is_available()` returns `True`; set `CSRC_KERNELS=false` to skip
+> them, or `CSRC_KERNELS=true` to force them (required when building in an
+> isolated environment with `--no-build-isolation`). Once built, `CudaBackend`
+> is the default attention backend on GPU (cuda > flash > torch priority).
+> Override via `ASTR_BACKEND` env var or `attn_backend()` context manager.
+> Fused rotary embedding kernel is auto-dispatched when available. Skip for
+> CPU-only usage.
 
 ## 2. Download Model Weights
 
@@ -258,5 +265,7 @@ docker compose up -d
 | Multi-GPU DDP / FSDP | [Distributed Guide](guides/distributed.md) |
 | System architecture | [Architecture](developer/architecture.md) |
 | Data pipeline internals | [Data Flow](developer/dataflow.md) |
+| YAML-driven containerized serving | [Docker Serving](developer/docker-serving.md) |
+| YAML-driven containerized training | [Docker Training](developer/docker-training.md) |
 
-> Document Update Time: 2026-07-31
+> Document Update Time: 2026-08-22

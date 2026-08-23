@@ -51,7 +51,7 @@ AstrAI is an end-to-end Transformer framework for building, training, evaluating
 | **Data** | Declarative JSON preprocessing, configurable masking and packing, binary/JSONL storage, and streaming datasets |
 | **Inference** | Continuous batching, paged KV cache, radix prefix caching, streaming generation, and Torch/CUDA/FlashAttention backends |
 | **Serving** | FastAPI server with OpenAI and Anthropic chat completion protocols, including SSE streaming and tool calls |
-| **Evaluation** | Perplexity, MMLU, HumanEval, IFEval, IFD, and ROUGE evaluation tools |
+| **Evaluation** | Perplexity, MMLU, HumanEval, IFEval, IFD, ROUGE, and weight-analysis evaluation tools |
 | **Extensibility** | Factory and registry architecture for models, datasets, training strategies, callbacks, kernels, and protocol components |
 
 ### Getting Started
@@ -65,8 +65,9 @@ AstrAI requires Python 3.12+ and pins PyTorch exactly to `2.11.0`. Training, `sc
 ```bash
 git clone https://github.com/ViperEkura/AstrAI.git
 cd AstrAI
-pip install -e .                                          # pure PyTorch (no CUDA kernels)
-# CSRC_KERNELS=true pip install -e . --no-build-isolation  # optional: fused CUDA kernels
+pip install -e .                                          # kernels auto-build when nvcc + CUDA are detected
+# CSRC_KERNELS=false pip install -e .                     # skip kernels (pure PyTorch)
+# CSRC_KERNELS=true pip install -e . --no-build-isolation  # force the fused CUDA kernel build
 # pip install -e ".[dev]"                                  # dev dependencies (pytest, ruff)
 ```
 
@@ -239,6 +240,8 @@ See [Inference Guide](docs/guides/inference.md) for SSE streaming format, error 
 | [Data Flow](./docs/developer/dataflow.md) | Data pipeline, storage backends & dataset architecture |
 | [Internals](./docs/developer/internals.md) | Training internals: loss formulas, callback lifecycle, KV cache |
 | [CUDA Kernels](./docs/developer/cuda_kernels.md) | Custom CUDA attention kernels & benchmarks |
+| [Docker Serving](./docs/developer/docker-serving.md) | YAML-driven containerized serving (`serve.yaml`, `serve.sh`) |
+| [Docker Training](./docs/developer/docker-training.md) | YAML-driven containerized training (`train.yaml`, `train.sh`) |
 
 ### Contributing
 
