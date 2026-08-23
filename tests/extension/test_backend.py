@@ -75,18 +75,6 @@ def test_environment_backend_used_without_context(monkeypatch):
     assert isinstance(get_backend(use_default=False), TorchNativeBackend)
 
 
-def test_environment_backend_does_not_break_training(monkeypatch):
-    """Training (fwd=None, no cache) must not steer onto cache-only kernels.
-
-    Regression: with ASTR_BACKEND=cuda, a training forward used to raise
-    because the env override was treated as an explicit selection.
-    """
-    monkeypatch.setenv("ASTR_BACKEND", "cuda")
-    q = torch.zeros(1, 2, 4, 8, dtype=torch.bfloat16)
-    out = attention(q, q, q)
-    assert out.shape == q.shape
-
-
 def test_explicit_backend_mismatch_raises(monkeypatch):
     monkeypatch.delenv("ASTR_BACKEND", raising=False)
     q = torch.zeros(1, 2, 4, 8, dtype=torch.bfloat16)

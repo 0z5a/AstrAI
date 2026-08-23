@@ -75,7 +75,7 @@ def fp8_gemm(
     out_dtype: int = 0,
     out_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FP8 GEMM: ``a @ b^T * (sa * sb)`` with FP32 accumulation.
+    """FP8 GEMM: ``a @ b * (sa * sb)`` with FP32 accumulation.
 
     ``out_dtype``: 0 = BF16 (default), 1 = FP8 E4M3 (requires ``out_scale``,
     the quantization step for the output — mirrors ``torch._scaled_mm``).
@@ -85,7 +85,7 @@ def fp8_gemm(
 @fp8_gemm.register_fake
 def _fp8_gemm_fake(a, b, sa, sb, out_dtype=0, out_scale=None):
     dtype = torch.float8_e4m3fn if out_dtype else torch.bfloat16
-    return torch.empty((a.size(0), b.size(0)), device=a.device, dtype=dtype)
+    return torch.empty((a.size(0), b.size(1)), device=a.device, dtype=dtype)
 
 
 @fp8_gemm.register_kernel("cuda")
@@ -99,7 +99,7 @@ def _fp8_gemm_cuda(a, b, sa, sb, out_dtype=0, out_scale=None):
 
 @fp8_gemm.register_kernel("cpu")
 def _fp8_gemm_cpu(a, b, sa, sb, out_dtype=0, out_scale=None):
-    acc = a.float() @ b.float().t() * sa * sb
+    acc = a.float() @ b.float() * sa * sb
     if out_dtype:
         os_ = 1.0 if out_scale is None else out_scale
         return (acc * os_).to(torch.float8_e4m3fn)
@@ -124,7 +124,7 @@ def mm_fp8(
     out_dtype: str = "bf16",
     out_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Pre-quantized FP8 GEMM: ``a @ b^T * (sa * sb)``.
+    """Pre-quantized FP8 GEMM: ``a @ b * (sa * sb)``.
 
     ``a``/``b`` must be FP8 tensors of the same format (E4M3 or E5M2);
     ``sa``/``sb`` are their quantization steps. ``out_dtype`` is ``"bf16"``

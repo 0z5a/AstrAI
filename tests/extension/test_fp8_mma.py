@@ -47,15 +47,15 @@ def _quantize(tensor, scale):
 def test_fp8_mm_matches_explicit_quantization(m, n, k):
     torch.manual_seed(m + n + k)
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
     scale_a = _scale(a)
     scale_b = _scale(b)
     a8, _ = quantize_bf16(a, scale_a, "e4m3")
     b8, _ = quantize_bf16(b, scale_b, "e4m3")
     out = mm_fp8(a8, b8, scale_a, scale_b)
-    expected = (
-        _quantize(a, scale_a) @ _quantize(b, scale_b).t() * scale_a * scale_b
-    ).to(torch.bfloat16)
+    expected = (_quantize(a, scale_a) @ _quantize(b, scale_b) * scale_a * scale_b).to(
+        torch.bfloat16
+    )
 
     assert out.dtype == torch.bfloat16
     assert out.shape == (m, n)
@@ -151,7 +151,7 @@ def test_mm_fp8_matches_scaled_mm():
     torch.manual_seed(11)
     m, n, k = 512, 4096, 4096
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
     sa = torch.tensor([2.5], device="cuda")
     sb = torch.tensor([1.5], device="cuda")
     a8, _ = quantize_bf16(a, sa, "e4m3")
@@ -160,16 +160,16 @@ def test_mm_fp8_matches_scaled_mm():
     assert out.dtype == torch.bfloat16
     assert out.shape == (m, n)
 
-    ref = (a8.float().double() @ b8.float().double().t() * 2.5 * 1.5).to(torch.bfloat16)
+    ref = (a8.float().double() @ b8.float().double() * 2.5 * 1.5).to(torch.bfloat16)
     torch.testing.assert_close(out, ref, atol=6.0, rtol=0.05)
 
     try:
-        torch._scaled_mm(a8, b8.t(), sa, sb, out_dtype=torch.bfloat16)
+        torch._scaled_mm(a8, b8, sa, sb, out_dtype=torch.bfloat16)
     except (RuntimeError, NotImplementedError):
         return
     torch.testing.assert_close(
         out,
-        torch._scaled_mm(a8, b8.t(), sa, sb, out_dtype=torch.bfloat16),
+        torch._scaled_mm(a8, b8, sa, sb, out_dtype=torch.bfloat16),
         atol=2.0,
         rtol=0.01,
     )
@@ -181,7 +181,7 @@ def test_mm_fp8_fp8_output():
     torch.manual_seed(12)
     m, n, k = 256, 128, 64
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
     sa = torch.tensor([2.0], device="cuda")
     sb = torch.tensor([1.0], device="cuda")
     os_ = torch.tensor([0.5], device="cuda")
@@ -191,7 +191,7 @@ def test_mm_fp8_fp8_output():
     assert out8.dtype == torch.float8_e4m3fn
     assert out8.shape == (m, n)
 
-    ref = (a8.float().double() @ b8.float().double().t() * 2.0 * 1.0 * 0.5).to(
+    ref = (a8.float().double() @ b8.float().double() * 2.0 * 1.0 * 0.5).to(
         torch.bfloat16
     )
     torch.testing.assert_close(
@@ -273,22 +273,22 @@ def test_quantize_bf16_cpu_fallback():
 
 def test_mm_fp8_cpu_fallback():
     a8 = torch.tensor([[1.0, 2.0]], dtype=torch.float8_e4m3fn)
-    b8 = torch.tensor([[3.0, 4.0]], dtype=torch.float8_e4m3fn)
+    b8 = torch.tensor([[3.0], [4.0]], dtype=torch.float8_e4m3fn)
     sa = torch.tensor([2.0])
     sb = torch.tensor([0.5])
     out = mm_fp8(a8, b8, sa, sb)
-    ref = (a8.float() @ b8.float().t() * 2.0 * 0.5).to(torch.bfloat16)
+    ref = (a8.float() @ b8.float() * 2.0 * 0.5).to(torch.bfloat16)
     torch.testing.assert_close(out, ref)
 
 
 def test_mm_fp8_fp8_output_cpu():
     """CPU fallback with an FP8 output (out_dtype='e4m3' + out_scale)."""
     a8 = torch.tensor([[1.0, 2.0]], dtype=torch.float8_e4m3fn)
-    b8 = torch.tensor([[3.0, 4.0]], dtype=torch.float8_e4m3fn)
+    b8 = torch.tensor([[3.0], [4.0]], dtype=torch.float8_e4m3fn)
     sa = torch.tensor([2.0])
     sb = torch.tensor([0.5])
     os_ = torch.tensor([0.25])
     out8 = mm_fp8(a8, b8, sa, sb, out_dtype="e4m3", out_scale=os_)
     assert out8.dtype == torch.float8_e4m3fn
-    ref = (a8.float() @ b8.float().t() * 2.0 * 0.5 * 0.25).to(torch.float8_e4m3fn)
+    ref = (a8.float() @ b8.float() * 2.0 * 0.5 * 0.25).to(torch.float8_e4m3fn)
     assert torch.equal(out8, ref)

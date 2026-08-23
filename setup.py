@@ -78,7 +78,7 @@ class _CMakeBuildExt(_build_ext):
         if cmake is None:
             raise RuntimeError("cmake not found on PATH; install it to build kernels")
 
-        parallel = os.environ.get("BUILD_PARALLEL", "16")
+        parallel = os.environ.get("BUILD_PARALLEL", "4")
         cfg = [
             cmake,
             "-S",

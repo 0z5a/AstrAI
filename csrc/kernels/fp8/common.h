@@ -27,12 +27,6 @@ struct Fp8GemmTraits {
     static constexpr __nv_fp8_interpretation_t kNvFormat =
         kIsE5M2 ? __NV_E5M2 : __NV_E4M3;
     static constexpr float kFp8Max = kIsE5M2 ? 57344.0f : 448.0f;
-
-    // Saturated float -> FP8 conversion for this format.
-    __device__ __forceinline__ static unsigned char cvt(float f) {
-        return static_cast<unsigned char>(
-            __nv_cvt_float_to_fp8(f, __NV_SATFINITE, kNvFormat));
-    }
 };
 
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
@@ -56,7 +50,17 @@ struct FP8Params {
     float* __restrict__ amax_a;
     float* __restrict__ amax_b;
 
-    // Shapes. total is only used by the elementwise quantize kernel.
-    int64_t m, n, k;
-    int64_t total;
+    // Shapes. total is only used by the elementwise quantize kernel. `int`
+    // covers every realistic LLM shape; the kernels promote to int64 for all
+    // pointer arithmetic.
+    int m, n, k;
+
+    // Physical leading dimensions (column count, i.e. row stride) of A and B.
+    // For a non-transposed operand the stride equals the contract dim; for a
+    // transposed operand it is the operand's own column count. The binding
+    // packs these so the kernel reads both buffers either naturally or
+    // transposed depending on TransA/TransB.
+    int a_ld, b_ld;
+
+    int total;
 };
