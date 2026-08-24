@@ -65,9 +65,8 @@ __device__ __forceinline__ unsigned quantize2(unsigned pair, float inv,
     amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
     constexpr __nv_fp8_interpretation_t kFmt =
         Fmt == FP8Format::E5M2 ? __NV_E5M2 : __NV_E4M3;
-    return static_cast<unsigned>(
-        __nv_cvt_float2_to_fp8x2(make_float2(lo * inv, hi * inv),
-                                 __NV_SATFINITE, kFmt));
+    return static_cast<unsigned>(__nv_cvt_float2_to_fp8x2(
+        make_float2(lo * inv, hi * inv), __NV_SATFINITE, kFmt));
 }
 
 template <FP8Format Fmt>
@@ -85,8 +84,8 @@ __global__ void fp8_quantize_kernel(FP8Params p) {
     // natural; a misaligned base (contiguous view with an odd storage
     // offset) falls back to the scalar loop below via total_vec = 0.
     const bool aligned =
-        ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(x8))
-         & 15) == 0;
+        ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(x8)) & 15) ==
+        0;
     const int64_t total_vec = aligned ? p.total / 8 : 0;
     const uint4* xv = reinterpret_cast<const uint4*>(x);
     uint2* o8 = reinterpret_cast<uint2*>(x8);
@@ -143,9 +142,8 @@ __device__ __forceinline__ T8* tile_at(T8* tile, int row, int col) {
     static_assert(kChunks >= 1 && (kChunks & (kChunks - 1)) == 0,
                   "swizzle needs a power-of-two 16B-chunk count");
     constexpr int kShift = 3 - log2_const<kChunks>::value;
-    return tile + row * K
-           + ((((col >> 4) ^ ((row >> kShift) & (kChunks - 1))) << 4)
-              + (col & 15));
+    return tile + row * K +
+           ((((col >> 4) ^ ((row >> kShift) & (kChunks - 1))) << 4) + (col & 15));
 }
 
 // Stage-load one GEMM operand into the canonical flat [rows * K] shared tile
@@ -154,14 +152,18 @@ __device__ __forceinline__ T8* tile_at(T8* tile, int row, int col) {
 // layout: RowMajor (stored [rows][contract]) copies 16-byte K-contiguous runs
 // with cp.async, while ColMajor (stored [contract][rows]) reads 16-byte runs
 // along the operand's contiguous non-contract dim and scatters them across
-// the tile's rows. RowsTile is the tile's row capacity (kBlockM / kBlockN)
-// and kThreads the CTA size; the runtime `rows` bound may be smaller (tail
-// predication). `block_row` is this block's origin in the operand's row dim.
+// the tile's rows. Crosswise runs cannot use cp.async (the 16 destination
+// bytes land on 16 different rows), so their global loads are plain LDGs —
+// issued as one batch per row group before the first scatter so their
+// latencies overlap instead of serializing behind the shared stores.
+// RowsTile is the tile's row capacity (kBlockM / kBlockN) and kThreads the
+// CTA size; the runtime `rows` bound may be smaller (tail predication).
+// `block_row` is this block's origin in the operand's row dim.
 template <typename T8, int K, typename Layout, int RowsTile, int kThreads>
-__device__ __forceinline__ void load_operand_tile(
-    T8* tile, const T8* __restrict__ operand, int64_t rows,
-    int64_t contract, int64_t ld, int tid, int64_t k_base,
-    int64_t block_row) {
+__device__ __forceinline__ void
+load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
+                  int64_t contract, int64_t ld, int tid, int64_t k_base,
+                  int64_t block_row) {
     constexpr int kChunks = K / 16;
     static_assert(RowsTile * kChunks % kThreads == 0,
                   "tile chunks must divide evenly across threads");
@@ -173,22 +175,38 @@ __device__ __forceinline__ void load_operand_tile(
         // each thread covers several groups.
         constexpr int kWarpsTile = kThreads / 32;
         constexpr int kGroups = RowsTile / 16;
+        constexpr int kPasses = K / 32;
         static_assert(kGroups % kWarpsTile == 0,
                       "row groups must divide evenly across warps");
+        const int kl = tid & 31;  // byte column within a 32B pass
+        // r0 is always a multiple of 16 (block_row is a multiple of RowsTile
+        // and each group covers 16 rows), so every run shares the base+ld
+        // alignment: one uniform check instead of one per pass.
+        const bool run_aligned =
+            ((reinterpret_cast<uintptr_t>(operand) | ld) & 15) == 0;
 #pragma unroll
         for (int g = 0; g < kGroups / kWarpsTile; ++g) {
             const int rg = (tid >> 5) + g * kWarpsTile;
-            const int kl = tid & 31;  // byte column within a 32B pass
             const int64_t r0 = block_row + rg * 16;
+            const bool rows_full = r0 + 15 < rows;  // pass-invariant
+            // Batch every 16B run load of this row group before the first
+            // scatter: the LDGs are independent, and the byte-granular
+            // shared stores would otherwise serialize behind each one.
+            uint4 v[kPasses];
+            bool fast[kPasses];
 #pragma unroll
-            for (int pass = 0; pass < K / 32; ++pass) {
+            for (int pass = 0; pass < kPasses; ++pass) {
+                const int64_t k_idx = k_base + kl + pass * 32;
+                fast[pass] = rows_full && run_aligned && k_idx < contract;
+                if (fast[pass])
+                    v[pass] =
+                        *reinterpret_cast<const uint4*>(operand + k_idx * ld + r0);
+            }
+#pragma unroll
+            for (int pass = 0; pass < kPasses; ++pass) {
                 const int col = kl + pass * 32;
-                const int64_t k_idx = k_base + col;
-                const auto* src = operand + k_idx * ld + r0;
-                if (k_idx < contract && r0 + 15 < rows &&
-                    (reinterpret_cast<uintptr_t>(src) & 15) == 0) {
-                    const uint4 v = *reinterpret_cast<const uint4*>(src);
-                    const auto* bytes = reinterpret_cast<const T8*>(&v);
+                if (fast[pass]) {
+                    const auto* bytes = reinterpret_cast<const T8*>(&v[pass]);
                     // Scatter 16 bytes along the tile rows through tile_at's
                     // swizzle. Rows sharing a physical chunk form groups of
                     // (8 / kChunks) consecutive rows (see tile_at), so each
@@ -196,22 +214,26 @@ __device__ __forceinline__ void load_operand_tile(
                     constexpr int kGrp = 8 / kChunks;
 #pragma unroll
                     for (int j = 0; j < 16 / kGrp; ++j) {
-                        T8* p = tile_at<K>(tile,
-                                           rg * 16 + j * kGrp, col);
+                        T8* p = tile_at<K>(tile, rg * 16 + j * kGrp, col);
 #pragma unroll
                         for (int i = 0; i < kGrp; ++i)
                             p[i * K] = bytes[j * kGrp + i];
                     }
-                } else {
-                    // Predicated fallback: same layout, byte-granular gather.
+                } else if (k_base + col < contract) {
+                    // Row-tail or misaligned run: byte-granular gather with
+                    // per-row predication (the k column itself is in range).
 #pragma unroll
                     for (int i = 0; i < 16; ++i) {
                         const int64_t r_idx = r0 + i;
                         *tile_at<K>(tile, rg * 16 + i, col) =
-                            (r_idx < rows && k_idx < contract)
-                                ? operand[k_idx * ld + r_idx]
-                                : T8(0.0f);
+                            r_idx < rows ? operand[(k_base + col) * ld + r_idx]
+                                         : T8(0.0f);
                     }
+                } else {
+                    // Contract tail: straight zero-fill, no global traffic.
+#pragma unroll
+                    for (int i = 0; i < 16; ++i)
+                        *tile_at<K>(tile, rg * 16 + i, col) = T8(0.0f);
                 }
             }
         }
@@ -219,22 +241,27 @@ __device__ __forceinline__ void load_operand_tile(
         // Operand stored [rows][contract]: contiguous along the contract dim.
         // Linear chunk mapping: thread covers kCpt consecutive 16B chunks of
         // one row (K=64: a contiguous 32B pair; K=32: a single chunk).
-        const int r = tid / (kChunks / kCpt);
+        constexpr int kCpr = kChunks / kCpt;  // chunks per row slice
+        const int r = tid / kCpr;
+        const int c0 = (tid % kCpr) * kCpt * 16;
+        const int64_t row = block_row + r;
+        const bool row_ok = row < rows;
+        // k_base and every c are multiples of 16, so the per-chunk sources
+        // share the row base's alignment.
+        const auto* src = operand + row * ld + k_base;
+        const bool chunk_aligned = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
 #pragma unroll
         for (int j = 0; j < kCpt; ++j) {
-            const int c = ((tid % (kChunks / kCpt)) * kCpt + j) * 16;
-            const int64_t row = block_row + r;
-            const auto* src = operand + row * ld + k_base + c;
+            const int c = c0 + j * 16;
             T8* dst = tile_at<K>(tile, r, c);
-            if (row < rows && k_base + c + 15 < contract &&
-                (reinterpret_cast<uintptr_t>(src) & 15) == 0) {
-                astrai::cp_async_16(dst, src, true);
+            if (row_ok && chunk_aligned && k_base + c + 15 < contract) {
+                astrai::cp_async_16(dst, src + c, true);
             } else {
+                // Tail chunk (or misaligned base): predicated scalar fill.
 #pragma unroll
                 for (int i = 0; i < 16; ++i)
-                    dst[i] = row < rows && k_base + c + i < contract
-                                 ? src[i]
-                                 : T8(0.0f);
+                    dst[i] =
+                        row_ok && k_base + c + i < contract ? src[c + i] : T8(0.0f);
             }
         }
     }
@@ -251,8 +278,7 @@ __device__ __forceinline__ void load_operand_tile(
 // pointer for ldmatrix. Valid for kK in {32, 64} (the swizzle itself lives
 // only in tile_at; this wrapper just converts the element address).
 template <typename T8, int kK>
-__device__ __forceinline__ unsigned frag_addr(const T8* tile, int row,
-                                              int chunk) {
+__device__ __forceinline__ unsigned frag_addr(const T8* tile, int row, int chunk) {
     static_assert(kK == 32 || kK == 64,
                   "fragment swizzle offsets assume kK in {32, 64}");
     return __cvta_generic_to_shared(tile_at<kK>(tile, row, chunk << 4));
@@ -271,9 +297,11 @@ __device__ __forceinline__ unsigned frag_addr(const T8* tile, int row,
 // (mt x nt = 4x4 MMA each). The 64x128 variant runs 4 warps / 128 threads and
 // exists for small-M calls: m <= 64 wastes half of every 128-row CTA, so the
 // launcher dispatches to it there (see launch_fp8_gemm).
-template <typename Traits, bool OutFp8 = false, typename LayoutA = RowMajor, typename LayoutB = RowMajor>
-__global__ void __launch_bounds__((Traits::kBlockM / 64) * (Traits::kBlockN / 32) * 32, 2)
-fp8_gemm_kernel(FP8Params p) {
+template <typename Traits, bool OutFp8 = false, typename LayoutA = RowMajor,
+          typename LayoutB = RowMajor>
+__global__ void
+    __launch_bounds__((Traits::kBlockM / 64) * (Traits::kBlockN / 32) * 32, 2)
+    fp8_gemm_kernel(FP8Params p) {
     using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
     constexpr int kBlockM = Traits::kBlockM;
     constexpr int kBlockN = Traits::kBlockN;
@@ -327,8 +355,7 @@ fp8_gemm_kernel(FP8Params p) {
     constexpr int warps_n = kBlockN / 32;
     const int warp_m = warp / warps_n;
     const int warp_n = warp % warps_n;
-    const int64_t row_base =
-        (int64_t)block_m * kBlockM + warp_m * 64 + group;
+    const int64_t row_base = (int64_t)block_m * kBlockM + warp_m * 64 + group;
     const int64_t output_col =
         (int64_t)block_n * kBlockN + warp_n * 32 + thread_in_group * 2;
     const int a_row0 = warp_m * 64;  // + mt * 16 in the loop
@@ -345,12 +372,10 @@ fp8_gemm_kernel(FP8Params p) {
     // stage-load sees its transpose (transpose_layout_t, see common.h).
     auto load_tile = [&](int stage, int64_t k_base) {
         load_operand_tile<T8, kK, LayoutA, kBlockM, kCtaThreads>(
-            a_smem[stage], a, m, k, a_ld, tid, k_base,
-            (int64_t)block_m * kBlockM);
+            a_smem[stage], a, m, k, a_ld, tid, k_base, (int64_t)block_m * kBlockM);
         load_operand_tile<T8, kK, transpose_layout_t<LayoutB>, kBlockN,
-                          kCtaThreads>(
-            b_smem[stage], b, n, k, b_ld, tid, k_base,
-            (int64_t)block_n * kBlockN);
+                          kCtaThreads>(b_smem[stage], b, n, k, b_ld, tid, k_base,
+                                       (int64_t)block_n * kBlockN);
     };
 
     const int64_t tile_count = (k + kK - 1) / kK;
@@ -406,7 +431,7 @@ fp8_gemm_kernel(FP8Params p) {
         for (int nt = 0; nt < 4; ++nt) {
             const int row = b_row0 + nt * 8 + r7;
             astrai::ldmatrix_x2_lane(b_frag[0][nt],
-                    frag_addr<T8, kK>(b_smem[stage], row, rh8));
+                                     frag_addr<T8, kK>(b_smem[stage], row, rh8));
         }
 #pragma unroll
         for (int k_seg = 0; k_seg < kSegs; ++k_seg) {
@@ -415,9 +440,10 @@ fp8_gemm_kernel(FP8Params p) {
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     const int row = b_row0 + nt * 8 + r7;
-                    astrai::ldmatrix_x2_lane(b_frag[bnext][nt],
-                            frag_addr<T8, kK>(b_smem[stage], row,
-                                              (k_seg + 1) * 2 + rh8));
+                    astrai::ldmatrix_x2_lane(
+                        b_frag[bnext][nt],
+                        frag_addr<T8, kK>(b_smem[stage], row,
+                                          (k_seg + 1) * 2 + rh8));
                 }
             }
             // Software-pipelined A fragments: the ldmatrix.x4 for row mt+1
@@ -425,21 +451,21 @@ fp8_gemm_kernel(FP8Params p) {
             // latency hides behind tensor-pipe work (cuts the `wait` stall,
             // ~2.3 cycles/issue before this). Costs 4 extra registers.
             unsigned a_frag[5][4];
-            astrai::ldmatrix_x4_lane(a_frag[0],
-                    frag_addr<T8, kK>(a_smem[stage], a_row0 + rh8 * 8 + r7,
-                                      k_seg * 2 + rh16));
+            astrai::ldmatrix_x4_lane(
+                a_frag[0], frag_addr<T8, kK>(a_smem[stage], a_row0 + rh8 * 8 + r7,
+                                             k_seg * 2 + rh16));
 #pragma unroll
             for (int mt = 0; mt < 4; ++mt) {
                 if (mt < 3)
-                    astrai::ldmatrix_x4_lane(a_frag[mt + 1],
-                            frag_addr<T8, kK>(
-                                a_smem[stage],
-                                a_row0 + (mt + 1) * 16 + rh8 * 8 + r7,
-                                k_seg * 2 + rh16));
+                    astrai::ldmatrix_x4_lane(
+                        a_frag[mt + 1],
+                        frag_addr<T8, kK>(a_smem[stage],
+                                          a_row0 + (mt + 1) * 16 + rh8 * 8 + r7,
+                                          k_seg * 2 + rh16));
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt)
-                    astrai::mma_sync<T8>(acc[nt][mt], a_frag[mt],
-                                         b_frag[bcur][nt], acc[nt][mt]);
+                    astrai::mma_sync<T8>(acc[nt][mt], a_frag[mt], b_frag[bcur][nt],
+                                         acc[nt][mt]);
             }
         }
         // Barrier 2: every thread finished reading this stage's tiles before
@@ -487,8 +513,7 @@ fp8_gemm_kernel(FP8Params p) {
                 }
             } else {
                 auto* dst = out_bf16 + row * n + col;
-                if (col + 1 < n &&
-                    (reinterpret_cast<uintptr_t>(dst) & 3) == 0) {
+                if (col + 1 < n && (reinterpret_cast<uintptr_t>(dst) & 3) == 0) {
                     *reinterpret_cast<__nv_bfloat162*>(dst) =
                         __floats2bfloat162_rn(r0, r1);
                 } else {
