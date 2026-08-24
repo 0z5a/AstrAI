@@ -147,6 +147,36 @@ def test_linear_backward_e5m2_gradients():
 
 
 @skip_no_fp8
+def test_fp8_linear_static_fp8_weight_and_bias():
+    """Static fp8 inference: pre-quantized w8/b8 + their scales take the GEMM
+    directly (no weight quantize, amax_w = 0); the bias is fused in the
+    epilogue (bf16 and fp8 bias share the fused path)."""
+    torch.manual_seed(9)
+    m, n, k = 67, 45, 129
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.5
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16) * 0.5
+    sx, sw, sb = _scale(x), _scale(weight), _scale(bias)
+
+    w8, _ = quantize_bf16(weight, sw, "e4m3")
+    b8, _ = quantize_bf16(bias, sb, "e4m3")
+    out, amax_x, amax_w = linear_forward_fp8(x, w8, b8, sx, sw, "e4m3", sb)
+
+    qx = _quantize(x, sx)
+    qw = _quantize(weight, sw)
+    qb = _quantize(bias, sb)
+    expected = (qx @ qw.t() * sx * sw + qb * sb).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
+    torch.testing.assert_close(amax_x, x.abs().amax().float().reshape(1))
+    assert amax_w.item() == 0.0  # nothing measured on the static path
+
+    # bf16 bias stays bf16 on the same fused-epilogue path
+    out_bf16bias, _, _ = linear_forward_fp8(x, w8, bias, sx, sw, "e4m3")
+    expected_b = (qx @ qw.t() * sx * sw + bias.float()).to(torch.bfloat16)
+    torch.testing.assert_close(out_bf16bias, expected_b, atol=0.125, rtol=0.01)
+
+
+@skip_no_fp8
 def test_fp8_linear_backward_outside_autocast():
     """aten::linear records an fp8 autograd node inside fp8_autocast; the
     backward runs fp8 kernels even after the context exits (loss.backward()

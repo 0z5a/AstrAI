@@ -75,16 +75,16 @@ struct FP8Params {
     // the pre-quantized path. Scales are quantization steps (device scalars).
     const void* __restrict__ a_ptr = nullptr;
     const void* __restrict__ b_ptr = nullptr;
+    const void* __restrict__ bias = nullptr;
     const float* __restrict__ scale_a = nullptr;
     const float* __restrict__ scale_b = nullptr;
-
+    const float* __restrict__ bias_scale = nullptr;
     // Output: BF16 or FP8 (E4M3). out_scale is the output quantization step
     // (FP8 output only).
     void* __restrict__ out_ptr = nullptr;
     const float* __restrict__ out_scale = nullptr;
 
     // Fused forward extras: bias (may be null) and amax slots (may be null).
-    const __nv_bfloat16* __restrict__ bias = nullptr;
     float* __restrict__ amax_a = nullptr;
     float* __restrict__ amax_b = nullptr;
 

@@ -272,8 +272,7 @@ __device__ __forceinline__ unsigned frag_addr(const T8* tile, int row,
 // exists for small-M calls: m <= 64 wastes half of every 128-row CTA, so the
 // launcher dispatches to it there (see launch_fp8_gemm).
 template <typename Traits, bool OutFp8 = false, typename LayoutA = RowMajor, typename LayoutB = RowMajor>
-__global__ void __launch_bounds__(
-    (Traits::kBlockM / 64) * (Traits::kBlockN / 32) * 32, 2)
+__global__ void __launch_bounds__((Traits::kBlockM / 64) * (Traits::kBlockN / 32) * 32, 2)
 fp8_gemm_kernel(FP8Params p) {
     using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
     constexpr int kBlockM = Traits::kBlockM;
@@ -453,36 +452,48 @@ fp8_gemm_kernel(FP8Params p) {
     }
 
     const float output_scale = sa * sb;
-    const float o8_scale = OutFp8 ? output_scale * *p.out_scale : 0.0f;
+    // Fused bias: BF16 raw values, or FP8 storage dequantized by its own
+    // scale (bias_scale != null selects the FP8 path; the format follows the
+    // kernel's Traits). Added in real units after the operand dequantization
+    // and before any output quantization.
+    const auto* bias16 = static_cast<const __nv_bfloat16*>(p.bias);
+    const auto* bias8 = static_cast<const T8*>(p.bias);
+    auto bias_val = [&](int64_t col) -> float {
+        if (p.bias == nullptr || col >= n) return 0.0f;
+        if (p.bias_scale == nullptr) return __bfloat162float(bias16[col]);
+        return __half2float(__half(bias8[col])) * *p.bias_scale;
+    };
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt) {
         const int64_t col = output_col + nt * 8;
+        const float b0 = bias_val(col);
+        const float b1 = bias_val(col + 1);
         // Per-row store: FP8 packs two adjacent columns into one 16-bit
         // write, BF16 into one 32-bit __nv_bfloat162 (single cvt+pack
         // instruction); boundary or unaligned columns fall back to scalar
         // converts so a pack never crosses the row edge or misaligns.
         auto store_out = [&](int64_t row, float v0, float v1) {
             if (row >= m) return;
+            const float r0 = v0 * output_scale + b0;
+            const float r1 = v1 * output_scale + b1;
             if constexpr (OutFp8) {
                 if (col + 1 < n) {
                     *reinterpret_cast<unsigned short*>(out_fp8 + row * n + col) =
                         static_cast<unsigned short>(__nv_cvt_float2_to_fp8x2(
-                            make_float2(v0 * o8_scale, v1 * o8_scale),
+                            make_float2(r0 * *p.out_scale, r1 * *p.out_scale),
                             __NV_SATFINITE, __NV_E4M3));
                 } else {
-                    out_fp8[row * n + col] = __nv_fp8_e4m3(v0 * o8_scale);
+                    out_fp8[row * n + col] = __nv_fp8_e4m3(r0 * *p.out_scale);
                 }
             } else {
                 auto* dst = out_bf16 + row * n + col;
                 if (col + 1 < n &&
                     (reinterpret_cast<uintptr_t>(dst) & 3) == 0) {
                     *reinterpret_cast<__nv_bfloat162*>(dst) =
-                        __floats2bfloat162_rn(v0 * output_scale,
-                                              v1 * output_scale);
+                        __floats2bfloat162_rn(r0, r1);
                 } else {
-                    dst[0] = __float2bfloat16(v0 * output_scale);
-                    if (col + 1 < n)
-                        dst[1] = __float2bfloat16(v1 * output_scale);
+                    dst[0] = __float2bfloat16(r0);
+                    if (col + 1 < n) dst[1] = __float2bfloat16(r1);
                 }
             }
         };

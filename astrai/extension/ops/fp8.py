@@ -138,18 +138,25 @@ def mm_fp8(
     return fp8_gemm(a, b, sa, sb, int(out_dtype == "e4m3"), out_scale)
 
 
-def linear_forward_fp8(x, w, bias, sx, sw, fmt: str = "e4m3"):
+def linear_forward_fp8(x, w, bias, sx, sw, fmt: str = "e4m3", bias_scale=None):
     """Pure FP8 linear forward: quantize x/w to ``fmt``, pre-quantized GEMM.
 
-    Returns ``(out, amax_x, amax_w)``. ``bias`` may be ``None``. Both
-    operands share the same FP8 format (E4M3 by default; E5M2 for a
-    range-first configuration).
+    Returns ``(out, amax_x, amax_w)``. ``bias`` may be ``None``. For static
+    fp8 inference, ``w`` and ``bias`` may arrive pre-quantized to ``fmt``
+    (produced by :func:`quantize_bf16` with their scales as ``sw`` /
+    ``bias_scale``); a pre-quantized ``bias`` requires ``bias_scale``, and
+    its ``amax_w`` comes back 0. The bias is fused into the GEMM epilogue.
     """
-    if not (x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16):
-        raise TypeError(f"fp8 forward requires bf16 inputs, got {x.dtype}/{w.dtype}")
+    fmt8 = _fmt_dtype(fmt)
+    if x.dtype != torch.bfloat16 or w.dtype not in (torch.bfloat16, fmt8):
+        raise TypeError(
+            f"fp8 forward requires bf16 x and bf16-or-{fmt} w, got {x.dtype}/{w.dtype}"
+        )
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
-    return get_module("fp8_ops").linear_forward_fp8(x, w, bias, sx, sw, _fmt_int(fmt))
+    return get_module("fp8_ops").linear_forward_fp8(
+        x, w, bias, sx, sw, _fmt_int(fmt), bias_scale
+    )
 
 
 def linear_backward_fp8(g, x, w, masks, sg, sw, sx, fmt: str = "e5m2"):

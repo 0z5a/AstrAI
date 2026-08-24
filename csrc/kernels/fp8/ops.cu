@@ -60,7 +60,8 @@ void check_scale(const torch::Tensor& scale, const torch::Tensor& input,
 
 void pack_gemm_params(FP8Params& p, const void* a, const void* b, void* out,
                       const torch::Tensor& sa, const torch::Tensor& sb,
-                      const torch::Tensor* out_scale, int64_t m, int64_t n,
+                      const torch::Tensor* out_scale, const void* bias,
+                      const torch::Tensor* bias_scale, int64_t m, int64_t n,
                       int64_t k, int64_t a_ld, int64_t b_ld) {
     p.a_ptr = a;
     p.b_ptr = b;
@@ -68,7 +69,8 @@ void pack_gemm_params(FP8Params& p, const void* a, const void* b, void* out,
     p.scale_a = sa.data_ptr<float>();
     p.scale_b = sb.data_ptr<float>();
     p.out_scale = out_scale ? out_scale->data_ptr<float>() : nullptr;
-    p.bias = nullptr;
+    p.bias = bias;
+    p.bias_scale = bias_scale ? bias_scale->data_ptr<float>() : nullptr;
     p.amax_a = nullptr;
     p.amax_b = nullptr;
     p.m = static_cast<int>(m);
@@ -214,7 +216,8 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor sa,
                 : a_c.options().dtype(torch::kBFloat16));
     FP8Params p;
     pack_gemm_params(p, a_c.data_ptr(), b_c.data_ptr(), out.data_ptr(), sa, sb,
-                     out_fp8 ? &os : nullptr, m, n, k, a_ld, b_ld);
+                     out_fp8 ? &os : nullptr, nullptr, nullptr, m, n, k, a_ld,
+                     b_ld);
     if (a.scalar_type() == torch::kFloat8_e4m3fn)
         dispatch_gemm<FP8Format::E4M3>(p, stream.stream(), out_fp8, ta, tb);
     else
@@ -225,14 +228,21 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor sa,
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
     torch::Tensor x, torch::Tensor w, torch::Tensor bias, torch::Tensor sx,
-    torch::Tensor sw, int64_t fmt) {
+    torch::Tensor sw, int64_t fmt,
+    c10::optional<torch::Tensor> bias_scale) {
     // Pure FP8 forward: quantize x/w (fmt: 0 = E4M3, 1 = E5M2), then the
     // pre-quantized GEMM; the dequantized BF16 output gets the bias added.
-    // amax_x / amax_w come from the quantize kernels (zero-initialized here).
+    // amax_x / amax_w come from the quantize kernels (zero-initialized here;
+    // a pre-quantized w reports amax_w = 0 — nothing to feed a delayed ring).
+    // w may itself be pre-quantized fp8 storage matching fmt (static
+    // inference weights): the weight quantize is skipped, amax_w stays 0.
     TORCH_CHECK(x.is_cuda() && w.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
-                    w.scalar_type() == torch::kBFloat16,
-                "x and w must be bf16");
+    const auto f8opt = fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn;
+    const bool w_prequant = w.scalar_type() == f8opt;
+    TORCH_CHECK(
+        x.scalar_type() == torch::kBFloat16 &&
+            (w.scalar_type() == torch::kBFloat16 || w_prequant),
+        "x must be bf16; w must be bf16 or pre-quantized fp8 matching fmt");
     TORCH_CHECK(x.device() == w.device(), "x and w must be on the same device");
     check_scale(sx, x, "sx");
     check_scale(sw, x, "sw");
@@ -245,15 +255,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
     int64_t m = x_c.size(0), k = x_c.size(1), n = w_c.size(0);
     TORCH_CHECK(w_c.dim() == 2 && w_c.size(1) == k, "inner dim mismatch");
     const bool has_bias = bias.defined() && bias.numel() > 0;
+    const bool b_prequant = has_bias && bias.scalar_type() == f8opt;
     if (has_bias) {
         TORCH_CHECK(bias.is_cuda() && bias.device() == x.device() &&
-                        bias.scalar_type() == torch::kBFloat16 &&
-                        bias.numel() == n,
-                    "bias must be CUDA bf16 with shape [N]");
+                        bias.numel() == n &&
+                        (bias.scalar_type() == torch::kBFloat16 || b_prequant),
+                    "bias must be CUDA bf16 or pre-quantized fp8 matching fmt, "
+                    "with shape [N]");
+        TORCH_CHECK(b_prequant == bias_scale.has_value(),
+                    "fp8 bias requires bias_scale (and bf16 bias takes none)");
+        if (b_prequant) check_scale(*bias_scale, x, "bias_scale");
     }
-    const auto f8opt = fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn;
     auto x8 = torch::empty({m, k}, x_c.options().dtype(f8opt));
-    auto w8 = torch::empty({n, k}, x_c.options().dtype(f8opt));
     auto amax_x = torch::zeros({1}, x.options().dtype(torch::kFloat32));
     auto amax_w = torch::zeros({1}, x.options().dtype(torch::kFloat32));
     auto out = torch::empty({m, n}, x_c.options());
@@ -270,13 +283,21 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
         }
     };
     quantize(x_c, x8, sx, &amax_x);
-    quantize(w_c, w8, sw, &amax_w);
+    // Static inference weights arrive pre-quantized (w8 storage + its scale);
+    // only freshly-loaded bf16 weights quantize here.
+    torch::Tensor w8 = w_prequant
+                           ? w_c
+                           : torch::empty({n, k}, x_c.options().dtype(f8opt));
+    if (!w_prequant) quantize(w_c, w8, sw, &amax_w);
 
     FP8Params p;
     // Forward is the NT layout: A = x8 [M,K] (a_ld = k), B = w8 [N,K]
-    // (b_ld = k), out = x @ w^T. No operand transposes needed.
+    // (b_ld = k), out = x @ w^T. The bias is fused into the epilogue (bf16
+    // raw, or fp8 + bias_scale on the static path).
+    auto bias_c = has_bias ? bias.contiguous() : bias;
     pack_gemm_params(p, x8.data_ptr(), w8.data_ptr(), out.data_ptr(), sx, sw,
-                     nullptr, m, n, k, k, k);
+                     nullptr, has_bias ? bias_c.data_ptr() : nullptr,
+                     b_prequant ? &*bias_scale : nullptr, m, n, k, k, k);
     if (fmt) {
         launch_fp8_gemm<FP8Format::E5M2, false, RowMajor, ColMajor>(
             p, stream.stream());
@@ -288,9 +309,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
 
     std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end() - 1);
     shape.push_back(n);
-    auto out_r = out.reshape(shape);
-    if (has_bias) out_r = out_r + bias;
-    return {out_r, amax_x, amax_w};
+    return {out.reshape(shape), amax_x, amax_w};
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -366,8 +385,8 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
         auto grad_input_2d = grad_input.reshape({m, k});
         FP8Params gp;
         pack_gemm_params(gp, g8.data_ptr(), w8.data_ptr(),
-                         grad_input_2d.data_ptr(), sg, sw, nullptr, m, k, n, n,
-                         k);
+                         grad_input_2d.data_ptr(), sg, sw, nullptr, nullptr,
+                         nullptr, m, k, n, n, k);
         run_bwd_gemm(gp, false, false);
     }
     // dW = g^T @ x: A = g8 [M,N] read transposed (a[p*a_ld + m] = g[p,m]), B =
@@ -378,7 +397,8 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
         quantize(x_c, x8, sx, nullptr);
         FP8Params gp;
         pack_gemm_params(gp, g8.data_ptr(), x8.data_ptr(),
-                         grad_weight.data_ptr(), sg, sx, nullptr, n, k, m, n, k);
+                         grad_weight.data_ptr(), sg, sx, nullptr, nullptr,
+                         nullptr, n, k, m, n, k);
         run_bwd_gemm(gp, true, false);
     }
     if (!masks[0] && !masks[1]) {
@@ -402,9 +422,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "the operand layout (default 0/0 = a@b)");
     m.def("linear_forward_fp8", &linear_forward_fp8, py::arg("x"),
           py::arg("w"), py::arg("bias"), py::arg("sx"), py::arg("sw"),
-          py::arg("fmt") = 0,
-          "Pure FP8 linear forward: quantize x/w, pre-quantized GEMM; "
-          "returns (out, amax_x, amax_w)");
+          py::arg("fmt") = 0, py::arg("bias_scale") = py::none(),
+          "Pure FP8 linear forward: quantize x/w, pre-quantized GEMM with the "
+          "bias fused into the epilogue; w and bias may be pre-quantized fp8 "
+          "matching fmt (static inference path; fp8 bias requires bias_scale);"
+          " returns (out, amax_x, amax_w)");
     m.def("linear_backward_fp8", &linear_backward_fp8, py::arg("g"),
           py::arg("x"), py::arg("w"), py::arg("masks"), py::arg("sg"),
           py::arg("sw"), py::arg("sx"), py::arg("fmt"),
