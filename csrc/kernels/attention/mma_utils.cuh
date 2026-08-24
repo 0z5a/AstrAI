@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "../common/cp_async.cuh"
 #include "../common/mma.cuh"
 
 // Predicated cp.async (4-operand form) requires CUDA 11.2+.
@@ -10,6 +11,9 @@
 #if CUDART_VERSION < 11020
 #error "AstrAI CUDA kernels require CUDA 11.2 or later (CUDART_VERSION >= 11020)."
 #endif
+
+namespace astrai {
+namespace attention {
 
 // ============================================================================
 // KernelTraits — FlashAttention-v2 style compile-time configuration bundle.
@@ -75,36 +79,9 @@ __device__ __forceinline__ int swiz_col(int d, int r, int mask = 7) {
     return ((d >> 3) ^ (r & mask)) << 3 | (d & 7);
 }
 
-// Predicated cp.async: copy 16 bytes when `pred`, otherwise zero-fill.
-// BypassL1 defaults to .cg (L2 only); false selects .ca (L1 + L2).
-// src_size=0 means no bytes are read, so an out-of-bounds address is safe.
-template <bool BypassL1 = true>
-__device__ __forceinline__ void cp_async_16_pred(bf16* smem_ptr,
-                                                  const void* gmem_ptr,
-                                                  bool pred) {
-    unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
-    int src_size = pred ? 16 : 0;
-    if constexpr (BypassL1) {
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-                     :: "r"(smem_addr), "l"(gmem_ptr), "r"(src_size));
-    } else {
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
-                     :: "r"(smem_addr), "l"(gmem_ptr), "r"(src_size));
-    }
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;");
-}
-
-__device__ __forceinline__ void cp_async_wait_all() {
-    asm volatile("cp.async.wait_all;");
-}
-
-template <int N>
-__device__ __forceinline__ void cp_async_wait_group() {
-    asm volatile("cp.async.wait_group %0;" :: "n"(N));
-}
+// cp.async primitives live in the shared template (common/cp_async.cuh):
+// `astrai::cp_async_16` (predicated), `astrai::cp_async_commit_group`,
+// `astrai::cp_async_wait_group<N>` / `_wait_all` stage the K/V tiles.
 
 // ---------------------------------------------------------------------------
 // Q-load: load query rows directly from global memory into mma A-operand
@@ -272,3 +249,6 @@ __device__ inline void mma_pv_accumulate(
         }
     }
 }
+
+}  // namespace attention
+}  // namespace astrai

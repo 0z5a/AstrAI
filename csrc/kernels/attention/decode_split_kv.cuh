@@ -3,7 +3,11 @@
 #include <float.h>
 #include "common.h"
 #include "layout_policies.cuh"
-#include "warp_utils.cuh"
+#include "../common/reduce.cuh"
+
+namespace astrai {
+namespace attention {
+
 constexpr int DC_CHUNK = 64;
 
 // Scalar split-KV decode (fallback for sm < 80, no tensor cores), unified
@@ -142,3 +146,6 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
     p.o_ptr[o_off] = __float2bfloat16(acc * inv);
 }
+
+}  // namespace attention
+}  // namespace astrai

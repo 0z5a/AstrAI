@@ -14,10 +14,13 @@
 #include "gemm.cuh"
 #include "../common/device.cuh"
 
+using namespace astrai::fp8;
+
 namespace {
 
-// FP8Format / FP8Params live in the global namespace (common.h); the
-// launchers live in fp8:: (gemm.cuh).
+// FP8Format / FP8Params and the launchers live in astrai::fp8 (common.h /
+// gemm.cuh); this TU opens the using-directive above so the binding reads
+// them unqualified.
 
 void check_fp8_device(const torch::Tensor& tensor) {
     static std::mutex mutex;
@@ -102,7 +105,7 @@ void launch_gemm_variant(const FP8Params& p, cudaStream_t stream) {
     constexpr bool out_fp8 = (Variant & 4) != 0;
     constexpr bool trans_a = (Variant & 2) != 0;
     constexpr bool trans_b = (Variant & 1) != 0;
-    fp8::launch_fp8_gemm<Fmt, out_fp8, trans_a, trans_b>(p, stream);
+    launch_fp8_gemm<Fmt, out_fp8, trans_a, trans_b>(p, stream);
 }
 
 template <FP8Format Fmt>
@@ -151,9 +154,9 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_bf16(torch::Tensor x,
     pack_quantize_params(p, x_c.data_ptr(), x8.data_ptr(), scale, &amax,
                          x_c.numel());
     if (fmt) {
-        fp8::launch_fp8_quantize<FP8Format::E5M2>(p, stream.stream());
+        launch_fp8_quantize<FP8Format::E5M2>(p, stream.stream());
     } else {
-        fp8::launch_fp8_quantize<FP8Format::E4M3>(p, stream.stream());
+        launch_fp8_quantize<FP8Format::E4M3>(p, stream.stream());
     }
     C10_CUDA_CHECK(cudaGetLastError());
     return {x8, amax};
@@ -259,9 +262,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
         pack_quantize_params(qp, src.data_ptr(), dst.data_ptr(), scale, amax,
                              src.numel());
         if (fmt) {
-            fp8::launch_fp8_quantize<FP8Format::E5M2>(qp, stream.stream());
+            launch_fp8_quantize<FP8Format::E5M2>(qp, stream.stream());
         } else {
-            fp8::launch_fp8_quantize<FP8Format::E4M3>(qp, stream.stream());
+            launch_fp8_quantize<FP8Format::E4M3>(qp, stream.stream());
         }
     };
     quantize(x_c, x8, sx, &amax_x);
@@ -273,10 +276,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
     pack_gemm_params(p, x8.data_ptr(), w8.data_ptr(), out.data_ptr(), sx, sw,
                      nullptr, m, n, k, k, k);
     if (fmt) {
-        fp8::launch_fp8_gemm<FP8Format::E5M2, false, false, true>(
+        launch_fp8_gemm<FP8Format::E5M2, false, false, true>(
             p, stream.stream());
     } else {
-        fp8::launch_fp8_gemm<FP8Format::E4M3, false, false, true>(
+        launch_fp8_gemm<FP8Format::E4M3, false, false, true>(
             p, stream.stream());
     }
     C10_CUDA_CHECK(cudaGetLastError());
@@ -327,9 +330,9 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
         pack_quantize_params(qp, src.data_ptr(), dst.data_ptr(), scale, amax,
                              src.numel());
         if (fmt) {
-            fp8::launch_fp8_quantize<FP8Format::E5M2>(qp, stream.stream());
+            launch_fp8_quantize<FP8Format::E5M2>(qp, stream.stream());
         } else {
-            fp8::launch_fp8_quantize<FP8Format::E4M3>(qp, stream.stream());
+            launch_fp8_quantize<FP8Format::E4M3>(qp, stream.stream());
         }
     };
     // Four-layout backward: the gradient and activation tensors keep their

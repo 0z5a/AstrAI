@@ -5,6 +5,9 @@
 #include "layout_policies.cuh"
 #include "mma_utils.cuh"
 
+namespace astrai {
+namespace attention {
+
 // Tensor-core prefill flash attention (raw mma.sync PTX), unified across
 // contiguous and paged (SGLang flat-pool) K/V via the KV template parameter.
 // One warp owns BR=16 query rows. S = Q@K^T and O = P@V run on bf16 tensor
@@ -85,10 +88,10 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
             int token = KV::resolve_token(p, kctx, kc, valid);
             KVAddr a = KV::kv_addr_from_token(p, kctx, token, d);
             int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
-            cp_async_16_pred(&dK[off], a.k, a.valid);
-            cp_async_16_pred(&dV[off], a.v, a.valid);
+            astrai::cp_async_16(&dK[off], a.k, a.valid);
+            astrai::cp_async_16(&dV[off], a.v, a.valid);
         }
-        cp_async_commit();
+        astrai::cp_async_commit_group();
     };
 
     // ---- Prologue: issue first tile load ----
@@ -98,7 +101,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
         int buf = ti & 1;
 
         // Wait for current tile, then publish cross-warp + guard buffer reuse.
-        cp_async_wait_group<0>();
+        astrai::cp_async_wait_group<0>();
         __syncthreads();
         if (ti < t_end) load_tile(ti + 1, (ti + 1) & 1);
 
@@ -149,9 +152,12 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
         }
         if (qr1 < q_len) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][2] * rl1,
-                                                      Oacc[dn8][3] * rl1);
+                                                     Oacc[dn8][3] * rl1);
             *reinterpret_cast<__nv_bfloat162*>(
                 &p.o_ptr[o_base + qr1 * p.q_l_stride + d * p.q_d_stride]) = v;
         }
     }
 }
+
+}  // namespace attention
+}  // namespace astrai

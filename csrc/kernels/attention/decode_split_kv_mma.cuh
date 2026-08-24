@@ -4,7 +4,9 @@
 #include "common.h"
 #include "layout_policies.cuh"
 #include "mma_utils.cuh"
-#include "warp_utils.cuh"
+
+namespace astrai {
+namespace attention {
 
 // Split-K (FlashDecoding) tensor-core decode via GQA head-packing, unified
 // across contiguous and paged (SGLang flat-pool) K/V via the KV template
@@ -78,10 +80,10 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
             KVAddr a = KV::template decode_addr<Traits::VEC>(
                 p, kctx, batch, kv_head, kc, d, valid, pass == 0);
             int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
-            cp_async_16_pred(&dK[off], a.k, a.valid);
-            cp_async_16_pred(&dV[off], a.v, a.valid);
+            astrai::cp_async_16(&dK[off], a.k, a.valid);
+            astrai::cp_async_16(&dV[off], a.v, a.valid);
         }
-        cp_async_commit();
+        astrai::cp_async_commit_group();
     };
 
     // ---- Multi-stage cp.async pipeline ----
@@ -126,9 +128,9 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
 
         for (int it = 0; it < ntiles; it++) {
             if (it + 1 == ntiles)
-                cp_async_wait_group<0>();
+                astrai::cp_async_wait_group<0>();
             else
-                cp_async_wait_group<STAGES - 1>();
+                astrai::cp_async_wait_group<STAGES - 1>();
             __syncwarp();
             process_tile(it, it & (STAGES - 1));
             __syncwarp();
@@ -139,7 +141,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         // Fewer tiles than stages: load all, wait for all, process.
         for (int i = 0; i < ntiles; i++)
             load_tile(ti_begin + i, i);
-        cp_async_wait_group<0>();
+        astrai::cp_async_wait_all();
         __syncwarp();
         for (int it = 0; it < ntiles; it++)
             process_tile(it, it);
@@ -181,3 +183,6 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         }
     }
 }
+
+}  // namespace attention
+}  // namespace astrai

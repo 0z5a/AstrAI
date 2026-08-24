@@ -5,6 +5,12 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// Pure POD/traits header — no .cuh/CUDA-kernel includes; raw __nv_* type
+// spellings only.
+
+namespace astrai {
+namespace fp8 {
+
 // Compile-time FP8 format: E4M3 (forward / high precision, max 448) or
 // E5M2 (gradient / large dynamic range, max 57344).
 enum class FP8Format : int {
@@ -64,3 +70,6 @@ struct FP8Params {
 
     int total;
 };
+
+}  // namespace fp8
+}  // namespace astrai

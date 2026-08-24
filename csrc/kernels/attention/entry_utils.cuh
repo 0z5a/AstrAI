@@ -3,9 +3,6 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include "common.h"
-#include "warp_utils.cuh"
-
-using bf16 = __nv_bfloat16;
 
 // Dispatch head_dim: shared macro — avoids C++20 lambda template syntax.
 // Usage: DISPATCH_HEAD_DIM(hd, fn, args...)
@@ -20,6 +17,11 @@ using bf16 = __nv_bfloat16;
             TORCH_CHECK(false, "unsupported head_dim ", hd, \
                          " (supported: 32, 64, 128, 256)"); \
     }
+
+namespace astrai {
+namespace attention {
+
+using bf16 = __nv_bfloat16;
 
 // The split kernel unconditionally writes every (batch, q_head, split) slot it
 // owns — including empty split ranges, which store m = -FLT_MAX so the combine
@@ -356,3 +358,6 @@ inline void attn_pack_paged_prefill_params(
     p.o_part = nullptr;
     p.ml_part = nullptr;
 }
+
+}  // namespace attention
+}  // namespace astrai

@@ -26,6 +26,9 @@
 #define DEVICE_FORCEINLINE static __device__ __forceinline__
 #define HOST_DEV_FORCEINLINE static __host__ __device__ __forceinline__
 
+namespace astrai {
+namespace attention {
+
 using bf16 = __nv_bfloat16;
 
 // ============================================================================
@@ -253,3 +256,6 @@ struct PagedKV {
         return kv_addr_from_token(p, c, token, d);
     }
 };
+
+}  // namespace attention
+}  // namespace astrai

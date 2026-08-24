@@ -9,6 +9,8 @@
 #include "test_utils.cuh"
 #include "../kernels/attention/dispatchers.cuh"
 
+using namespace astrai::attention;
+
 struct PagedDecodeDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_paged_decode<H>(p, 0); } };
 struct PagedPrefillDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_paged_prefill<H>(p, 0); } };
 

@@ -3,6 +3,10 @@
 #include <cuda_bf16.h>
 #include "common.h"
 #include "layout_policies.cuh"
+#include "../common/reduce.cuh"
+
+namespace astrai {
+namespace attention {
 
 using bf16 = __nv_bfloat16;
 
@@ -11,14 +15,7 @@ using bf16 = __nv_bfloat16;
 // compile-time bools — the compiler eliminates dead branches.
 // Unified across contiguous and paged (SGLang flat-pool) K/V via KV.
 // Templated on <HEAD_DIM, KV, G, ROWS, P_BC, IsCausal, HasMask>.
-
-template <int G>
-__device__ __forceinline__ float group_reduce_sum(float v, unsigned mask) {
-#pragma unroll
-    for (int o = G / 2; o > 0; o >>= 1)
-        v += __shfl_xor_sync(mask, v, o);
-    return v;
-}
+// group_reduce_sum<G> lives in common/reduce.cuh (astrai::).
 
 // load 8 contiguous bf16 from (16-byte aligned) smem as one float4
 __device__ __forceinline__ void ld8(const bf16* p, float* o) {
@@ -155,3 +152,6 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
             p.o_ptr[o_off + i * p.q_d_stride] = __float2bfloat16(acc[i] * rl);
     }
 }
+
+}  // namespace attention
+}  // namespace astrai

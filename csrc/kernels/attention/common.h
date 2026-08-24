@@ -1,5 +1,10 @@
 #pragma once
 
+// Pure POD header
+
+namespace astrai {
+namespace attention {
+
 // Tensor layout for Q/K/V tensors passed to attention kernels.
 // Internally, kernels always operate on BHLD [batch, n_heads, seq_len, head_dim].
 // When the caller passes BLHD, dims 1 and 2 are transposed at entry.
@@ -7,6 +12,9 @@ enum TensorLayout : int {
     BHLD = 0,  // [batch, n_heads, seq_len, head_dim]
     BLHD = 1,  // [batch, seq_len, n_heads, head_dim]
 };
+
+// Split-KV workspace cap: max decode splits per (batch, q_head).
+constexpr int MAX_SPLITS = 32;
 
 
 // Unified attention params covering BOTH addressing modes:
@@ -73,5 +81,7 @@ struct AttentionParams {
     int num_splits;
     AT* __restrict__ o_part;
     AT* __restrict__ ml_part;
-
 };
+
+}  // namespace attention
+}  // namespace astrai

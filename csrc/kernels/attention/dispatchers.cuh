@@ -10,7 +10,6 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
-#include "warp_utils.cuh"
 #include "layout_policies.cuh"
 #include "prefill_split_q.cuh"
 #include "decode_split_kv.cuh"
@@ -18,6 +17,9 @@
 #include "prefill_split_q_mma.cuh"
 #include "decode_split_kv_mma.cuh"
 #endif
+
+namespace astrai {
+namespace attention {
 
 // Split-KV: compute number of splits to fill all SMs for small-batch decode.
 // Caps splits so each split processes at least `min_tiles_per_split` tiles,
@@ -231,3 +233,6 @@ static inline void dispatch_paged_decode(AttentionParams<bf16>& p, cudaStream_t 
 
     attn_decode_combine_kernel<PagedKV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
 }
+
+}  // namespace attention
+}  // namespace astrai

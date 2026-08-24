@@ -9,6 +9,8 @@ nvcc -I csrc -arch=sm_89 -O3 \
 #include "test_utils.cuh"
 #include "../kernels/attention/dispatchers.cuh"
 
+using namespace astrai::attention;
+
 struct DecodeDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_decode<H>(p, 0); } };
 struct PrefillDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_prefill<H>(p, 0); } };
 

@@ -10,8 +10,11 @@
 #include <type_traits>
 
 #include "common.h"
+#include "../common/cp_async.cuh"
 #include "../common/mma.cuh"
+#include "../common/reduce.cuh"
 
+namespace astrai {
 namespace fp8 {
 
 // m16n8k32 (see astrai::mma_shape<fp8 type>::k in common/mma.cuh)
@@ -35,61 +38,9 @@ struct fp8_input<FP8Format::E5M2> {
 // FP8 MMA lives in the shared astrai::mma_sync template (common/mma.cuh);
 // instantiate it with fp8_input<Fmt>::type. Accumulates in-place: callers
 // pass the same accumulator array as both `d` and `c`.
-
-__device__ __forceinline__ void atomic_max_float(float* destination,
-                                                  float value) {
-    if (destination)
-        atomicMax(reinterpret_cast<unsigned*>(destination),
-                  __float_as_uint(value));
-}
-
-__device__ __forceinline__ float warp_reduce_max(float value) {
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1) {
-        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
-    }
-    return value;
-}
-
-// One thread moves sixteen FP8 values (16 bytes) via cp.async.
-template <typename T>
-__device__ __forceinline__ void cp_async_16b(T* destination,
-                                             const T* source, bool valid) {
-    const unsigned shared_address = __cvta_generic_to_shared(destination);
-    const uint4* source_vec = reinterpret_cast<const uint4*>(source);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-                 :: "r"(shared_address), "l"(source_vec),
-                    "r"(valid ? 16 : 0));
-}
-
-// PTX requires wait_group's operand to be an immediate value. Keep it as a
-// template argument so the stage policy remains compile-time configurable.
-template <int KeepGroups>
-__device__ __forceinline__ void cp_async_wait_group() {
-    static_assert(KeepGroups >= 0 && KeepGroups <= 7,
-                  "cp.async.wait_group supports immediates in [0, 7]");
-    asm volatile("cp.async.wait_group %0;" :: "n"(KeepGroups));
-}
-
-template <int MaxKeepGroups>
-__device__ __forceinline__ void cp_async_wait_group_dispatch(int keep_groups) {
-    static_assert(MaxKeepGroups >= 0 && MaxKeepGroups <= 7,
-                  "cp.async.wait_group supports immediates in [0, 7]");
-    if (keep_groups == MaxKeepGroups) {
-        cp_async_wait_group<MaxKeepGroups>();
-    } else if constexpr (MaxKeepGroups > 0) {
-        cp_async_wait_group_dispatch<MaxKeepGroups - 1>(keep_groups);
-    } else {
-        cp_async_wait_group<0>();
-    }
-}
-
-template <int Stages>
-__device__ __forceinline__ void cp_async_commit_group() {
-    static_assert(Stages >= 1 && Stages <= 8,
-                  "FP8 GEMM stages must be in the range [1, 8]");
-    asm volatile("cp.async.commit_group;");
-}
+// warp_reduce_max / atomic_max_float (quantize amax) live in
+// common/reduce.cuh; the cp.async pipeline primitives (predicated 16-byte
+// copy, commit_group, wait_group + runtime dispatch) in common/cp_async.cuh.
 
 // ---------------------------------------------------------------------------
 // Quantize kernel: BF16 -> FP8 (E4M3 or E5M2), fused amax over raw values.
@@ -252,7 +203,7 @@ __device__ __forceinline__ void load_operand_tile(
         const bool full = k_base + c + 15 < contract;
         if (row < rows && full &&
             (reinterpret_cast<uintptr_t>(src) & 15) == 0) {
-            cp_async_16b(dst, src, true);
+            astrai::cp_async_16(dst, src, true);
         } else {
 #pragma unroll
             for (int i = 0; i < 16; ++i)
@@ -381,7 +332,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
     for (int stage = 0; stage < kStages; ++stage) {
         if (stage < tile_count) {
             load_tile(stage, static_cast<int64_t>(stage) * kK);
-            cp_async_commit_group<kStages>();
+            astrai::cp_async_commit_group();
         }
     }
 
@@ -393,7 +344,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
         // oldest group (the current stage) ready for consumption.
         const int keep_groups =
             remaining < kStages - 1 ? static_cast<int>(remaining) : kStages - 1;
-        cp_async_wait_group_dispatch<kStages - 1>(keep_groups);
+        astrai::cp_async_wait_group_dispatch<kStages - 1>(keep_groups);
         // Barrier 1: every thread's cp.async for this stage is complete
         // before any thread reads tiles written by other threads.
         __syncthreads();
@@ -438,7 +389,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
         __syncthreads();
         if (tile_index + kStages < tile_count) {
             load_tile(stage, (tile_index + kStages) * kK);
-            cp_async_commit_group<kStages>();
+            astrai::cp_async_commit_group();
         }
     }
 
@@ -517,3 +468,4 @@ void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
 }
 
 }  // namespace fp8
+}  // namespace astrai

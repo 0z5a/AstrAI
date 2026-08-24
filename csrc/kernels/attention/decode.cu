@@ -1,6 +1,8 @@
 #include "dispatchers.cuh"
 #include "entry_utils.cuh"
 
+using namespace astrai::attention;
+
 torch::Tensor attn_decode(
     torch::Tensor q,
     torch::Tensor k,
