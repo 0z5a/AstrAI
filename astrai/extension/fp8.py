@@ -15,9 +15,11 @@ Usage::
 
     with fp8_autocast(enabled=True, fp8_format="hybrid"):
         logits = model(input_ids)
-        loss.backward()
+    loss.backward()  # fp8 backward runs wherever it is called: the
+    # forward captures the fmt/recipe/meta on the autograd node
 
-Importing this module registers the aten::linear CUDA implementation.
+Importing this module registers the aten::linear CUDA and AutogradCUDA
+implementations.
 
 Format defaults follow the ecosystem consensus: E4M3 for the forward pass,
 E5M2 for the backward (gradient) pass ("hybrid"); every operand's scale is a
@@ -235,7 +237,7 @@ def fp8_autocast(
 
         with fp8_autocast(enabled=True, fp8_format="hybrid"):
             logits = model(input_ids)   # aten::linear -> fp8 path
-            loss.backward()
+        loss.backward()  # fp8 backward; state was captured at forward time
 
     Args:
         enabled: toggle fp8 dispatch for aten::linear.
@@ -298,29 +300,48 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
     return out
 
 
-def fp8_linear_backward(g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, masks):
-    """Scaled fp8 linear backward (called from aten::linear_backward).
+class _LinearFp8(torch.autograd.Function):
+    """The fp8 linear forward/backward pair (standard Function style).
 
-    The gradient is quantized to the backward format (E5M2 in hybrid mode)
-    and the dX / dW GEMMs share that single quantization.
+    The forward runs inside the ``fp8_autocast`` region and captures the
+    active fmt/recipe/meta on ``ctx``; the backward reads only the captured
+    state, so ``loss.backward()`` may run after the context exits. The
+    gradient is quantized once (E5M2 in hybrid mode) and the dX / dW GEMMs
+    share that quantization; output masks come from ``needs_input_grad``.
     """
-    state = fp8_state()
-    fmt = state.fp8_format.bwd()
-    meta = state.get_weight_meta(w)
-    if isinstance(state.recipe, DynamicScaling):
-        sg = _dynamic_scale(g, state.recipe, fmt)
-        sw = _dynamic_scale(w, state.recipe, fmt)
-        sx = _dynamic_scale(x, state.recipe, fmt)
-    else:
-        if not meta.g_init:
-            meta.init_g(g, fmt)
-        sg, sw, sx = meta.g_scale, meta.w_scale, meta.x_scale
-    grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
-        g, x, w, masks, sg, sw, sx, fmt
-    )
-    if not isinstance(state.recipe, DynamicScaling):
-        meta.update_g(amax_g, fmt)
-    return grad_x, grad_w, grad_b
+
+    @staticmethod
+    def forward(ctx, x, w, bias):
+        out = fp8_linear_forward(x, w, bias)
+        state = fp8_state()
+        ctx.save_for_backward(x, w)
+        ctx.fmt_bwd = state.fp8_format.bwd()
+        ctx.recipe = state.recipe
+        ctx.meta = state.get_weight_meta(w)
+        ctx.is_dynamic = isinstance(state.recipe, DynamicScaling)
+        return out
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, g):
+        x, w = ctx.saved_tensors
+        fmt = ctx.fmt_bwd
+        if ctx.is_dynamic:
+            sg = _dynamic_scale(g, ctx.recipe, fmt)
+            sw = _dynamic_scale(w, ctx.recipe, fmt)
+            sx = _dynamic_scale(x, ctx.recipe, fmt)
+        else:
+            meta = ctx.meta
+            if not meta.g_init:
+                meta.init_g(g, fmt)
+            sg, sw, sx = meta.g_scale, meta.w_scale, meta.x_scale
+        masks = list(ctx.needs_input_grad)
+        grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
+            g, x, w, masks, sg, sw, sx, fmt
+        )
+        if not ctx.is_dynamic:
+            ctx.meta.update_g(amax_g, fmt)
+        return grad_x, grad_w, grad_b if masks[2] else None
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +377,7 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
         and w.dtype == torch.bfloat16
         and _fp8_supported(x, w)
     ):
-        return fp8_linear_forward(x, w, bias)
+        return _LinearFp8.apply(x, w, bias)
     return torch.ops.aten.linear.default.redispatch(
         torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd),
         x,
@@ -365,43 +386,12 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
     )
 
 
-def _linear_backward_cuda_impl(input_tensor, grad_output, weight, output_mask):
-    # Backward dim contract: grad_output is [..., N], weight is [N, K], so
-    # the contraction check is grad_output.size(-1) == weight.size(0) (not the
-    # forward's x.size(-1) == w.size(1) — that would silently skip fp8 for
-    # every non-square layer).
-    if (
-        fp8_linear_enabled()
-        and weight.dtype == torch.bfloat16
-        and grad_output.dim() >= 2
-        and weight.dim() == 2
-        and grad_output.size(-1) == weight.size(0)
-        and input_tensor.dim() >= 2
-        and input_tensor.size(-1) == weight.size(1)
-    ):
-        return fp8_linear_backward(grad_output, input_tensor, weight, list(output_mask))
-    compute_dtype = weight.dtype
-    grad = grad_output.to(compute_dtype)
-    grad_2d = grad.reshape(-1, weight.size(0))
-    input_2d = input_tensor.reshape(-1, input_tensor.size(-1)).to(compute_dtype)
-    # Unneeded grads come back full-shape-but-uninitialized (mirroring the
-    # fp8 binding), so reshape_as can never hit an empty tensor.
-    grad_input = (
-        torch.mm(grad_2d, weight).reshape_as(input_tensor)
-        if output_mask[0]
-        else torch.empty_like(input_tensor)
-    )
-    grad_weight = (
-        torch.mm(grad_2d.t(), input_2d) if output_mask[1] else torch.empty_like(weight)
-    )
-    grad_bias = (
-        grad.sum(dim=0)
-        if output_mask[2]
-        else torch.empty(0, device=grad.device, dtype=grad.dtype)
-    )
-    return grad_input, grad_weight, grad_bias
-
-
 _lib = Library("aten", "IMPL", "CUDA")
 _lib.impl("linear", _linear_cuda_impl)
-_lib.impl("linear_backward", _linear_backward_cuda_impl)
+# Also replace torch's generated linear autograd formula (which would call
+# aten::linear_backward after the fp8_autocast region exits). The fp8
+# backward is owned by _LinearFp8 with its state captured at forward time,
+# so loss.backward() works wherever it is called; the same CUDA registration
+# still covers inference_mode, where autograd keys are skipped entirely.
+_lib_autograd = Library("aten", "IMPL", "AutogradCUDA")
+_lib_autograd.impl("linear", _linear_cuda_impl)

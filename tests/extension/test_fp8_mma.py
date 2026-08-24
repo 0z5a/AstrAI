@@ -147,6 +147,57 @@ def test_linear_backward_e5m2_gradients():
 
 
 @skip_no_fp8
+def test_fp8_linear_backward_outside_autocast():
+    """aten::linear records an fp8 autograd node inside fp8_autocast; the
+    backward runs fp8 kernels even after the context exits (loss.backward()
+    placement is free), instead of falling back to bf16 mm."""
+    import torch.nn.functional as F
+
+    import astrai.extension.fp8 as f8mod
+
+    torch.manual_seed(5)
+    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(
+        96, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    bias = torch.randn(96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    xr, wr, br = (t.detach().clone().requires_grad_() for t in (x, weight, bias))
+
+    calls = {"bwd": 0}
+    orig = f8mod.linear_backward_fp8
+
+    def spy(g, xx, ww, masks, sg, sw, sx, fmt="e5m2"):
+        calls["bwd"] += 1
+        return orig(g, xx, ww, masks, sg, sw, sx, fmt)
+
+    f8mod.linear_backward_fp8 = spy
+    try:
+        with fp8_autocast(enabled=True):
+            out = F.linear(x, weight, bias)
+        assert type(out.grad_fn).__name__ == "_LinearFp8Backward"
+        out.float().pow(2).sum().backward()  # outside the autocast region
+    finally:
+        f8mod.linear_backward_fp8 = orig
+        f8mod.fp8_state().reset()
+
+    assert calls["bwd"] == 1  # fp8 kernels, not the bf16 fallback
+    ref = F.linear(xr, wr, br)
+    ref.float().pow(2).sum().backward()
+
+    # E5M2 backward quantization noise: compare directions/norms (the
+    # torchao/TE style) rather than elementwise against the bf16 reference.
+    def _direction(a, b):
+        cos = torch.nn.functional.cosine_similarity(
+            a.float().flatten(), b.float().flatten(), dim=0
+        )
+        return cos > 0.99 and 0.9 < a.float().norm() / b.float().norm() < 1.1
+
+    assert _direction(x.grad, xr.grad)
+    assert _direction(weight.grad, wr.grad)
+    assert _direction(bias.grad, br.grad)
+
+
+@skip_no_fp8
 def test_mm_fp8_matches_scaled_mm():
     torch.manual_seed(11)
     m, n, k = 512, 4096, 4096
