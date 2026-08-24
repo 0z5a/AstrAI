@@ -15,6 +15,9 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
+
+#define DEVICE_FORCEINLINE static __device__ __forceinline__
+
 namespace astrai {
 
 // Compute capability of the current compilation pass: 0 in the host pass,
@@ -59,9 +62,9 @@ struct mma_shape<__nv_fp8_e5m2> {
 // below `mma_shape<InT>::min_arch` is a **compile error** — the instruction
 // does not exist there, and a silent no-op would produce wrong results.
 template <typename InT>
-__device__ __forceinline__ void mma_sync(float d[4], const unsigned a[4],
-                                         const unsigned b[2],
-                                         const float c[4]) {
+DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
+                                 const unsigned b[2],
+                                 const float c[4]) {
     static_assert(ASTRAI_DEVICE_ARCH == 0 ||
                       ASTRAI_DEVICE_ARCH >= mma_shape<InT>::min_arch,
                   "mma_sync: this MMA shape requires a newer compute "
@@ -115,7 +118,7 @@ __device__ __forceinline__ void mma_sync(float d[4], const unsigned a[4],
 // ---------------------------------------------------------------------------
 
 template <typename T, bool Trans = false>
-__device__ __forceinline__ void ldmatrix_x2(unsigned r[2], const T* p) {
+DEVICE_FORCEINLINE void ldmatrix_x2(unsigned r[2], const T* p) {
     const unsigned a = __cvta_generic_to_shared(p);
     if constexpr (Trans) {
         asm volatile(
@@ -132,12 +135,31 @@ __device__ __forceinline__ void ldmatrix_x2(unsigned r[2], const T* p) {
 
 // Four matrices at p, p+128, p+256, p+384 bytes (16-byte row stride).
 template <typename T>
-__device__ __forceinline__ void ldmatrix_x4(unsigned r[4], const T* p) {
+DEVICE_FORCEINLINE void ldmatrix_x4(unsigned r[4], const T* p) {
     const unsigned a = __cvta_generic_to_shared(p);
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
         : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
         : "r"(a));
+}
+
+// Per-lane-address variants: the caller supplies a raw shared-memory address
+// per lane instead of one common pointer. Use when the fragment tiles are
+// XOR-swizzled per 16B chunk so each lane must compute its own row and chunk
+// address (see fp8/gemm.cuh's frag_addr + lane selectors for the m16n8k32
+// operand layouts).
+DEVICE_FORCEINLINE void ldmatrix_x2_lane(unsigned r[2],
+                                          unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(r[0]), "=r"(r[1])
+                 : "r"(addr));
+}
+
+DEVICE_FORCEINLINE void ldmatrix_x4_lane(unsigned r[4],
+                                          unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
 }
 
 }  // namespace astrai

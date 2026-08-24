@@ -24,6 +24,14 @@ constexpr int MAX_SPLITS = 32;
 // layout_policies.cuh); a given call only touches the fields of one mode, so
 // this is a POD shared by both paths rather than two parallel structs that
 // drift out of sync.
+//
+// Pointer/flag members carry default member initializers: the pointers gate
+// optional paths via null checks (new_k_ptr, mask, o_part, ...), so a stack
+// `AttentionParams<T> p;` left partially packed must never see garbage
+// non-null pointers or a garbage use_mask/causal_offset — that class of bug
+// reads through wild addresses. NSDMI keeps the struct an aggregate (C++17)
+// and trivially copyable, so `= {}`, memcpy-style packing and by-value kernel
+// params all behave exactly as before.
 template<typename T, typename AT = float>
 struct AttentionParams {
     // Shape
@@ -37,17 +45,17 @@ struct AttentionParams {
     // Attention behavior
     float scale;
     // -1 = non-causal; >=0 = absolute position of first Q token
-    int causal_offset;
-    int use_mask;
+    int causal_offset = -1;
+    int use_mask = 0;
 
     // pointers
-    const T* __restrict__ q_ptr;
-    const T* __restrict__ k_ptr;
-    const T* __restrict__ v_ptr;
-    const T* __restrict__ new_k_ptr;
-    const T* __restrict__ new_v_ptr;
-    T* __restrict__ o_ptr;
-    const bool* __restrict__ mask;
+    const T* __restrict__ q_ptr = nullptr;
+    const T* __restrict__ k_ptr = nullptr;
+    const T* __restrict__ v_ptr = nullptr;
+    const T* __restrict__ new_k_ptr = nullptr;
+    const T* __restrict__ new_v_ptr = nullptr;
+    T* __restrict__ o_ptr = nullptr;
+    const bool* __restrict__ mask = nullptr;
 
     // strides
     int q_b_stride;
@@ -68,19 +76,19 @@ struct AttentionParams {
     int mask_l_stride;
 
     // Paged K/V addressing
-    const int* __restrict__ req_to_token;         // [num_reqs, max_context_len]
-    const int* __restrict__ req_pool_indices;     // [batch]
-    const int* __restrict__ kv_indptr;             // [batch + 1]
-    const int* __restrict__ qo_indptr;             // [batch + 1] or nullptr for decode
-    const int* __restrict__ q_tile_to_batch;        // [num_q_tiles], prefill only
-    const int* __restrict__ q_tile_to_index;        // [num_q_tiles], prefill only
+    const int* __restrict__ req_to_token = nullptr;      // [num_reqs, max_context_len]
+    const int* __restrict__ req_pool_indices = nullptr;  // [batch]
+    const int* __restrict__ kv_indptr = nullptr;         // [batch + 1]
+    const int* __restrict__ qo_indptr = nullptr;         // [batch + 1] or nullptr for decode
+    const int* __restrict__ q_tile_to_batch = nullptr;   // [num_q_tiles], prefill only
+    const int* __restrict__ q_tile_to_index = nullptr;   // [num_q_tiles], prefill only
     int num_q_tiles;
     int max_context_len; // req_to_token stride (dim 1)
 
     // Decode split-KV workspace
     int num_splits;
-    AT* __restrict__ o_part;
-    AT* __restrict__ ml_part;
+    AT* __restrict__ o_part = nullptr;
+    AT* __restrict__ ml_part = nullptr;
 };
 
 }  // namespace attention

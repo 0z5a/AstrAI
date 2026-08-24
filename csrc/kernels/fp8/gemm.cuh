@@ -139,17 +139,18 @@ __device__ __forceinline__ T8* tile_at(T8* tile, int row, int col) {
 // Stage-load one GEMM operand into the canonical flat [rows * K] shared tile
 // (addressing via tile_at, so stores land in the swizzled layout). The
 // transpose is folded into the staging step via a CUTLASS-style crosswise
-// layout: the congruous case copies 16-byte K-contiguous runs with cp.async,
-// while the transposed case reads 16-byte runs along the operand's contiguous
-// (non-contract) dim and scatters them across the tile's rows. `block_row` is
-// this block's origin in the operand's row dim; the caller restricts which
-// threads invoke it (all threads for A, the first 128 for B).
-template <typename T8, int K, bool Trans>
+// layout: RowMajor (stored [rows][contract]) copies 16-byte K-contiguous runs
+// with cp.async, while ColMajor (stored [contract][rows]) reads 16-byte runs
+// along the operand's contiguous non-contract dim and scatters them across
+// the tile's rows. `block_row` is this block's origin in the operand's row
+// dim; the caller restricts which threads invoke it (all threads for A, the
+// first 128 for B).
+template <typename T8, int K, typename Layout>
 __device__ __forceinline__ void load_operand_tile(
     T8* tile, const T8* __restrict__ operand, int64_t rows,
     int64_t contract, int64_t ld, int tid, int64_t k_base,
     int64_t block_row) {
-    if constexpr (Trans) {
+    if constexpr (std::is_same_v<Layout, ColMajor>) {
         // Operand stored [contract][rows]: contiguous along the non-contract dim.
         const int rg = tid >> 5;  // Rows / 16 row-groups
         const int kl = tid & 31;  // K lanes
@@ -220,50 +221,27 @@ __device__ __forceinline__ void load_operand_tile(
 // in-kernel transpose of the operands (the binding handles transposes).
 // ---------------------------------------------------------------------------
 
-// ldmatrix with per-lane addresses (unlike common/mma.cuh's single-address
-// helpers, the fragment tiles here are XOR-swizzled per 16B chunk, so each
-// lane computes its own row/chunk address). Layout contract for fp8
-// m16n8k32 (values packed two-per-b16 slot, K-contiguous rows):
-//   x4 (A fragment): lane i points at tile row (i>>3 & 1)*8 + (i&7) of
-//       chunk (k_seg*2 + (i>>4)); reg j = matrix j = [row g][tig*4..+3] in
-//       the order (rows 0-7 c, rows 8-15 c, rows 0-7 c+1, rows 8-15 c+1) —
-//       exactly the mma.sync A operand layout.
-//   x2 (B fragment): lane i points at tile row (i&7) of chunk
-//       (k_seg*2 + ((i>>3) & 1)); reg j = [row(n) g][tig*4..+3] chunk c/c+1
-//       — exactly the mma.sync B operand layout (col operand, K-contiguous).
-__device__ __forceinline__ void ldsm_x2(unsigned r[2], unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-                 : "=r"(r[0]), "=r"(r[1])
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void ldsm_x4(unsigned r[4], unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
-}
-
 // Swizzled 16B-chunk address (tile_at's layout) as a raw shared-memory
-// pointer for ldmatrix. Requires kK == 32 (2 chunks/row swizzle).
+// pointer for ldmatrix. Requires kK == 32 (2 chunks/row swizzle). The chunk
+// XOR itself lives only in tile_at; this wrapper just converts the element
+// address it returns.
 template <typename T8, int kK>
 __device__ __forceinline__ unsigned frag_addr(const T8* tile, int row,
                                               int chunk) {
     static_assert(kK == 32, "fragment swizzle offsets assume kK == 32");
-    return __cvta_generic_to_shared(
-        tile + row * kK + (((chunk ^ ((row >> 2) & 1)) << 4)));
+    return __cvta_generic_to_shared(tile_at<kK>(tile, row, chunk << 4));
 }
 
-// TransA / TransB select the operand memory layout. The kernel always computes
+// LayoutA / LayoutB tag the operands' storage (CUTLASS-style, see common.h):
+// A RowMajor = [M][K] / ColMajor = [K][M]; B RowMajor = [K][N] /
+// ColMajor = [N][K]. The kernel always computes
 //   out[m][n] = sum_p tileA[m][p] * tileB[n][p]
 // with the tiles materialized in the canonical [M][kK] / [N][kK] layout, so the
-// MMA fragments are read identically regardless of layout. The two flags only
+// MMA fragments are read identically regardless of layout. The tags only
 // change how the stage-load gathers the operand from global memory:
-//   TransA: tileA[m][p] = a[p*a_ld + m]  (A stored [K][M], i.e. A^T)
-//           else        a[m*a_ld + p]   (A stored [M][K])
-//   TransB: tileB[n][p] = b[n*b_ld + p]  (B stored [N][K])
-//           else        b[p*b_ld + n]   (B stored [K][N], read transposed)
-template <typename Traits, bool OutFp8 = false, bool TransA = false,
-          bool TransB = false>
+//   A ColMajor: tileA[m][p] = a[p*a_ld + m];  A RowMajor: a[m*a_ld + p]
+//   B RowMajor: tileB[n][p] = b[p*b_ld + n];  B ColMajor: b[n*b_ld + p]
+template <typename Traits, bool OutFp8 = false, typename LayoutA = RowMajor, typename LayoutB = RowMajor>
 __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
     using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
     constexpr int kBlockM = Traits::kBlockM;
@@ -306,22 +284,31 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
 
     // Both operands are staged into the canonical [M][kK] / [N][kK] shared
     // tiles regardless of their global layout (see load_operand_tile), so the
-    // MMA fragment reads below stay unchanged across the four layout flags.
-    // Each 128x32 tile is 256 16B chunks: one per thread.
+    // MMA fragment reads below stay unchanged across the four layout
+    // combinations. Each 128x32 tile is 256 16B chunks: one per thread.
+    // A's tag already names the operand view ([M][K] = [rows][contract]);
+    // B's tag is relative to the canonical [K][N], so the stage-load sees its
+    // transpose (transpose_layout_t, see common.h).
     auto load_tile = [&](int stage, int64_t k_base) {
-        // load_operand_tile's `Trans` means "the operand's contiguous dim is
-        // the non-contract dim" (crosswise load). For A that is TransA; for B
-        // the storage flag is inverted (TransB=true stores B as [N][K], i.e.
-        // K-contiguous, which is the congruous case).
-        load_operand_tile<T8, kK, TransA>(
+        load_operand_tile<T8, kK, LayoutA>(
             a_smem[stage], a, m, k, a_ld, tid, k_base, blockIdx.y * kBlockM);
-        load_operand_tile<T8, kK, !TransB>(
+        load_operand_tile<T8, kK, transpose_layout_t<LayoutB>>(
             b_smem[stage], b, n, k, b_ld, tid, k_base, blockIdx.x * kBlockN);
     };
 
     const int64_t tile_count = (k + kK - 1) / kK;
 
-    // Per-lane ldmatrix row/chunk selectors (see ldsm_x2/ldsm_x4 contract).
+    // Per-lane ldmatrix row/chunk selectors for common/mma.cuh's
+    // ldmatrix_*_lane (the fragment tiles are XOR-swizzled per 16B chunk, so
+    // each lane computes its own row/chunk address). Layout contract for fp8
+    // m16n8k32 (values packed two-per-b16 slot, K-contiguous rows):
+    //   x4 (A fragment): lane i points at tile row (i>>3 & 1)*8 + (i&7) of
+    //       chunk (k_seg*2 + (i>>4)); reg j = matrix j = [row g][tig*4..+3] in
+    //       the order (rows 0-7 c, rows 8-15 c, rows 0-7 c+1, rows 8-15 c+1) —
+    //       exactly the mma.sync A operand layout.
+    //   x2 (B fragment): lane i points at tile row (i&7) of chunk
+    //       (k_seg*2 + ((i>>3) & 1)); reg j = [row(n) g][tig*4..+3] chunk c/c+1
+    //       — exactly the mma.sync B operand layout (col operand, K-contiguous).
     const int r7 = lane & 7;          // row within the 8-row matrix
     const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
     const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31; B uses rh8)
@@ -358,7 +345,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
                 const int row = b_row0 + nt * 8 + r7;
-                ldsm_x2(b_frag[nt],
+                astrai::ldmatrix_x2_lane(b_frag[nt],
                         frag_addr<T8, kK>(b_smem[stage], row,
                                           k_seg * 2 + rh8));
             }
@@ -367,13 +354,13 @@ __global__ void __launch_bounds__(kWarps * 32, 2) fp8_gemm_kernel(FP8Params p) {
             // latency hides behind tensor-pipe work (cuts the `wait` stall,
             // ~2.3 cycles/issue before this). Costs 4 extra registers.
             unsigned a_frag[5][4];
-            ldsm_x4(a_frag[0],
+            astrai::ldmatrix_x4_lane(a_frag[0],
                     frag_addr<T8, kK>(a_smem[stage], a_row0 + rh8 * 8 + r7,
                                       k_seg * 2 + rh16));
 #pragma unroll
             for (int mt = 0; mt < 4; ++mt) {
                 if (mt < 3)
-                    ldsm_x4(a_frag[mt + 1],
+                    astrai::ldmatrix_x4_lane(a_frag[mt + 1],
                             frag_addr<T8, kK>(
                                 a_smem[stage],
                                 a_row0 + (mt + 1) * 16 + rh8 * 8 + r7,
@@ -456,15 +443,15 @@ void launch_fp8_quantize(const FP8Params& p, cudaStream_t stream) {
 // Pre-quantized GEMM tile config: 128x128 CTA (8 warps x 64x32 warp tiles),
 // K=32, 3-stage pipeline (24KB smem -> 2 CTAs/SM). The wide warp tile plus
 // ldmatrix fragments lifts the LSU-issue bound of the old 128x64 config.
-// Stages remains an explicit template override for tuning. TransA/TransB
+// Stages remains an explicit template override for tuning. LayoutA/LayoutB
 // mirror the kernel template (defaults keep the NN layout: out = a @ b).
-template <FP8Format Fmt, bool OutFp8 = false, bool TransA = false,
-          bool TransB = false, int Stages = 3>
+template <FP8Format Fmt, bool OutFp8 = false, typename LayoutA = RowMajor,
+          typename LayoutB = RowMajor, int Stages = 3>
 void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
     using Traits = Fp8GemmTraits<Fmt, 128, 128, 32, Stages>;
     dim3 grid((p.n + Traits::kBlockN - 1) / Traits::kBlockN,
               (p.m + Traits::kBlockM - 1) / Traits::kBlockM);
-    fp8_gemm_kernel<Traits, OutFp8, TransA, TransB><<<grid, kWarps * 32, 0, stream>>>(p);
+    fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB><<<grid, kWarps * 32, 0, stream>>>(p);
 }
 
 }  // namespace fp8

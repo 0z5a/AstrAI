@@ -103,9 +103,11 @@ void launch_gemm_variant(const FP8Params& p, cudaStream_t stream) {
     static_assert(Variant >= 0 && Variant < 8,
                   "invalid FP8 GEMM dispatch variant");
     constexpr bool out_fp8 = (Variant & 4) != 0;
-    constexpr bool trans_a = (Variant & 2) != 0;
-    constexpr bool trans_b = (Variant & 1) != 0;
-    launch_fp8_gemm<Fmt, out_fp8, trans_a, trans_b>(p, stream);
+    // Variant bits 1/0 = trans_a/trans_b -> CUTLASS-style layout tags
+    // (trans_a ? A ColMajor : RowMajor, same for B; see common.h).
+    using LayoutA = std::conditional_t<(Variant & 2) != 0, ColMajor, RowMajor>;
+    using LayoutB = std::conditional_t<(Variant & 1) != 0, ColMajor, RowMajor>;
+    launch_fp8_gemm<Fmt, out_fp8, LayoutA, LayoutB>(p, stream);
 }
 
 template <FP8Format Fmt>
@@ -276,10 +278,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
     pack_gemm_params(p, x8.data_ptr(), w8.data_ptr(), out.data_ptr(), sx, sw,
                      nullptr, m, n, k, k, k);
     if (fmt) {
-        launch_fp8_gemm<FP8Format::E5M2, false, false, true>(
+        launch_fp8_gemm<FP8Format::E5M2, false, RowMajor, ColMajor>(
             p, stream.stream());
     } else {
-        launch_fp8_gemm<FP8Format::E4M3, false, false, true>(
+        launch_fp8_gemm<FP8Format::E4M3, false, RowMajor, ColMajor>(
             p, stream.stream());
     }
     C10_CUDA_CHECK(cudaGetLastError());
@@ -337,7 +339,8 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     };
     // Four-layout backward: the gradient and activation tensors keep their
     // natural row-major layout, and the kernel reads them transposed where the
-    // GEMM needs it (TransA / TransB). No torch-level `.transpose().contiguous()`
+    // GEMM needs it (the ColMajor layout tags pick the crosswise stage-load).
+    // No torch-level `.transpose().contiguous()`
     // copies are required — dX uses g8 [M,N] as A with w8 [N,K] read transposed
     // as B; dW uses g8 transposed as A with x8 transposed as B.
     // g is quantized once (amax_g measured here); both GEMMs share g8.

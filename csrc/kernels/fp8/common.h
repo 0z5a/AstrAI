@@ -18,6 +18,34 @@ enum class FP8Format : int {
     E5M2 = 1,
 };
 
+// Operand memory layouts as types (CUTLASS-style tags). The tag names the
+// storage order of the raw buffer relative to the operand's canonical GEMM
+// matrix — A is [M][K], B is [K][N]:
+//   A RowMajor = [M][K] storage (K-contiguous rows; the default)
+//   A ColMajor = [K][M] storage (M-contiguous; A^T)
+//   B RowMajor = [K][N] storage (N-contiguous; the plain a @ b operand)
+//   B ColMajor = [N][K] storage (K-contiguous; the nn.Linear weight layout)
+// Empty tags: selection happens by type at compile time (see load_operand_tile).
+struct RowMajor {};
+struct ColMajor {};
+
+// Transpose of a layout tag: the same buffer with the rows and contract dims
+// swapped. B's tag is relative to the canonical [K][N] GEMM matrix, so the
+// stage-load (which views any operand as [rows][contract]) sees the transposed
+// tag — this trait makes that inversion explicit.
+template <typename Layout>
+struct transpose_layout;
+template <>
+struct transpose_layout<RowMajor> {
+    using type = ColMajor;
+};
+template <>
+struct transpose_layout<ColMajor> {
+    using type = RowMajor;
+};
+template <typename Layout>
+using transpose_layout_t = typename transpose_layout<Layout>::type;
+
 // Compile-time tile configuration, mirroring KernelTraits<HEAD_DIM, BC,
 // WARPS, STAGES> in the attention kernels. `Fmt` selects the FP8 conversion
 // and the MMA PTX mnemonic; the remaining parameters shape the CTA tile and
@@ -38,23 +66,27 @@ struct Fp8GemmTraits {
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
 // through quantize / fused / pre-quantized kernels. Each kernel touches only
 // the fields it needs; buffers are raw pointers packed by the torch binding.
+// Pointer members default to null (same NSDMI rationale as AttentionParams:
+// bias / amax / out_scale gate optional paths via null checks, so a partially
+// packed struct must never hold garbage non-null pointers). Still an
+// aggregate, still trivially copyable.
 struct FP8Params {
     // Inputs: a/b are BF16 for the fused (quantize-in-GEMM) path, FP8 for
     // the pre-quantized path. Scales are quantization steps (device scalars).
-    const void* __restrict__ a_ptr;
-    const void* __restrict__ b_ptr;
-    const float* __restrict__ scale_a;
-    const float* __restrict__ scale_b;
+    const void* __restrict__ a_ptr = nullptr;
+    const void* __restrict__ b_ptr = nullptr;
+    const float* __restrict__ scale_a = nullptr;
+    const float* __restrict__ scale_b = nullptr;
 
     // Output: BF16 or FP8 (E4M3). out_scale is the output quantization step
     // (FP8 output only).
-    void* __restrict__ out_ptr;
-    const float* __restrict__ out_scale;
+    void* __restrict__ out_ptr = nullptr;
+    const float* __restrict__ out_scale = nullptr;
 
     // Fused forward extras: bias (may be null) and amax slots (may be null).
-    const __nv_bfloat16* __restrict__ bias;
-    float* __restrict__ amax_a;
-    float* __restrict__ amax_b;
+    const __nv_bfloat16* __restrict__ bias = nullptr;
+    float* __restrict__ amax_a = nullptr;
+    float* __restrict__ amax_b = nullptr;
 
     // Shapes. total is only used by the elementwise quantize kernel. `int`
     // covers every realistic LLM shape; the kernels promote to int64 for all
@@ -65,7 +97,7 @@ struct FP8Params {
     // For a non-transposed operand the stride equals the contract dim; for a
     // transposed operand it is the operand's own column count. The binding
     // packs these so the kernel reads both buffers either naturally or
-    // transposed depending on TransA/TransB.
+    // transposed depending on the LayoutA/LayoutB tags (see gemm.cuh).
     int a_ld, b_ld;
 
     int total;
