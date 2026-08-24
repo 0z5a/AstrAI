@@ -58,7 +58,7 @@ static int run_decode_test(int B, int Hq, int Hk, int sl, int D, int causal) {
     cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
     cudaMemcpy(dMask,hMask,B*sl,cudaMemcpyHostToDevice);
 
-    AttentionParams<bf16> p;
+    AttentionParams<bf16> p = {};
     p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
     p.use_mask=0; p.causal_offset=causal?0:-1;
     p.scale=1.0f/sqrtf((float)D);
@@ -139,7 +139,7 @@ static void bench_decode() {
         cudaMemcpy(dV, tmp, nKV*2, cudaMemcpyHostToDevice);
         delete[] tmp;
 
-        AttentionParams<bf16> p;
+        AttentionParams<bf16> p = {};
         p.batch = B; p.q_head = Hq; p.kv_head = Hk; p.q_len = 1; p.kv_len = sl;
         p.head_dim = D; p.use_mask = 0; p.causal_offset = -1;
         p.scale = 1.0f / sqrtf((float)D);
@@ -186,7 +186,7 @@ static int run_prefill_test(int B, int Hq, int Hk, int ql, int kl, int D, int ca
     for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(hV[i]);
     cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
 
-    AttentionParams<bf16> p;
+    AttentionParams<bf16> p = {};
     p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=ql; p.kv_len=kl; p.head_dim=D;
     p.use_mask=0; p.causal_offset=causal?0:-1;
     set_default_strides(p);
@@ -266,7 +266,7 @@ static void bench_prefill() {
         for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(randf());
         cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
 
-        AttentionParams<bf16> p;
+        AttentionParams<bf16> p = {};
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=ql; p.kv_len=kl; p.head_dim=D;
         p.use_mask=0; p.causal_offset=causal?0:-1;
         set_default_strides(p);
