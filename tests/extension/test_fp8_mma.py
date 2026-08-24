@@ -334,11 +334,11 @@ def test_fp8_tensor_meta_delayed_update():
     """Meta seeds from data and refreshes the scale from the amax ring."""
     meta = FP8TensorMeta(torch.device("cpu"), DelayedScaling(history_len=4, margin=0))
     w = torch.randn(8, 8)
-    meta.init_w(w, "e4m3")
-    assert meta.w_init
-    torch.testing.assert_close(meta.w_scale, (w.abs().amax() / 448.0).reshape(1))
-    meta.update_w(torch.tensor([4.0]), "e4m3")
-    torch.testing.assert_close(meta.w_scale, torch.tensor(4.0 / 448.0).reshape(1))
+    meta.w.seed(w, "e4m3")
+    assert meta.w.initialized
+    torch.testing.assert_close(meta.w.scale, (w.abs().amax() / 448.0).reshape(1))
+    meta.w.update(torch.tensor([4.0]), "e4m3")
+    torch.testing.assert_close(meta.w.scale, torch.tensor(4.0 / 448.0).reshape(1))
 
 
 def test_quantize_bf16_cpu_fallback():

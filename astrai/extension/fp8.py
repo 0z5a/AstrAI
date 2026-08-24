@@ -41,7 +41,6 @@ from astrai.extension.ops.fp8 import (
 
 # Max representable value per FP8 format (E4M3: 448, E5M2: 57344).
 FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
-E4M3_MAX = FP8_MAX["e4m3"]  # legacy alias
 
 
 class FP8Format(str, Enum):
@@ -105,86 +104,50 @@ class DynamicScaling(FP8Recipe):
         return ((peak / FP8_MAX[fmt]) / (2**self.margin)).clamp_min(1e-12)
 
 
-class FP8TensorMeta:
-    """Per-tensor scaling state: amax history rings + derived scales.
+class _ScaleRing:
+    """One operand's delayed-scaling state: amax history ring + derived scale.
 
-    One ring per operand (weight / activation / gradient). Scales are derived
-    from the ring by the recipe; fused kernels record the amax while
-    quantizing, so the scale used at step N reflects amax from steps < N
-    (delayed one step).
+    The ring captures its recipe at construction; ``update`` records a fresh
+    amax and refreshes the scale for the *next* step (delayed one step).
     """
 
-    __slots__ = (
-        "recipe",
-        "w_hist",
-        "x_hist",
-        "g_hist",
-        "w_idx",
-        "x_idx",
-        "g_idx",
-        "w_scale",
-        "x_scale",
-        "g_scale",
-        "w_init",
-        "x_init",
-        "g_init",
-    )
+    __slots__ = ("recipe", "hist", "idx", "scale", "initialized")
 
     def __init__(self, device: torch.device, recipe: FP8Recipe):
         self.recipe = recipe
         n = recipe.history_len
-        self.w_hist = torch.ones(n, device=device, dtype=torch.float32)
-        self.x_hist = torch.ones(n, device=device, dtype=torch.float32)
-        self.g_hist = torch.ones(n, device=device, dtype=torch.float32)
-        self.w_idx = self.x_idx = self.g_idx = 0
-        self.w_scale = torch.ones(1, device=device, dtype=torch.float32)
-        self.x_scale = torch.ones(1, device=device, dtype=torch.float32)
-        self.g_scale = torch.ones(1, device=device, dtype=torch.float32)
-        self.w_init = self.x_init = self.g_init = False
+        self.hist = torch.ones(n, device=device, dtype=torch.float32)
+        self.idx = 0
+        self.scale = torch.ones(1, device=device, dtype=torch.float32)
+        self.initialized = False
 
-    # -- ring helpers -------------------------------------------------------
+    def update(self, amax: torch.Tensor, fmt: str) -> None:
+        self.hist[self.idx] = amax.reshape(())
+        self.idx = (self.idx + 1) % self.hist.numel()
+        self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
 
-    def _record(self, hist: torch.Tensor, idx: int, amax: torch.Tensor) -> int:
-        hist[idx] = amax.reshape(())
-        return (idx + 1) % hist.numel()
-
-    def _refresh(self, hist: torch.Tensor, scale: torch.Tensor, fmt: str) -> None:
-        scale.copy_(self.recipe.scale_from_history(hist, fmt))
-
-    def _seed(
-        self, hist: torch.Tensor, scale: torch.Tensor, t: torch.Tensor, fmt: str
-    ) -> None:
+    def seed(self, t: torch.Tensor, fmt: str) -> None:
         amax = t.abs().amax().to(torch.float32).clamp_min(1e-12)
-        hist.fill_(amax)
-        scale.copy_(self.recipe.scale_from_history(hist, fmt))
+        self.hist.fill_(amax)
+        self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
+        self.initialized = True
 
-    # -- per-operand updates (delayed: record now, refresh for next step) ---
 
-    def update_w(self, amax: torch.Tensor, fmt: str) -> None:
-        self.w_idx = self._record(self.w_hist, self.w_idx, amax)
-        self._refresh(self.w_hist, self.w_scale, fmt)
+class FP8TensorMeta:
+    """Per-weight delayed-scaling state: one ring per operand role.
 
-    def update_x(self, amax: torch.Tensor, fmt: str) -> None:
-        self.x_idx = self._record(self.x_hist, self.x_idx, amax)
-        self._refresh(self.x_hist, self.x_scale, fmt)
+    Holds the ``w`` / ``x`` / ``g`` rings; fused kernels record the amax
+    while quantizing, so the scale used at step N reflects amax from steps
+    < N. DynamicScaling never allocates a meta — it measures the current
+    amax inline (``_dynamic_scale``), so it needs no history storage.
+    """
 
-    def update_g(self, amax: torch.Tensor, fmt: str) -> None:
-        self.g_idx = self._record(self.g_hist, self.g_idx, amax)
-        self._refresh(self.g_hist, self.g_scale, fmt)
+    __slots__ = ("w", "x", "g")
 
-    # -- first-use seeding --------------------------------------------------
-
-    def init_w(self, w: torch.Tensor, fmt: str) -> None:
-        self._seed(self.w_hist, self.w_scale, w, fmt)
-        self.w_init = True
-
-    def init_x(self, x: torch.Tensor, fmt: str) -> None:
-        self._seed(self.x_hist, self.x_scale, x, fmt)
-        self.x_init = True
-
-    def init_g(self, g: torch.Tensor, fmt: str) -> None:
-        self._seed(self.g_hist, self.g_scale, g, fmt)
-        self.g_init = True
+    def __init__(self, device: torch.device, recipe: FP8Recipe):
+        self.w = _ScaleRing(device, recipe)
+        self.x = _ScaleRing(device, recipe)
+        self.g = _ScaleRing(device, recipe)
 
 
 class FP8State:
@@ -195,14 +158,11 @@ class FP8State:
         self.recipe: FP8Recipe = DelayedScaling()
         self.fp8_format: FP8Format = FP8Format.HYBRID
         self._metas: dict[tuple, FP8TensorMeta] = {}
-        self._last_device: Optional[torch.device] = None
 
     def get_weight_meta(self, w: torch.Tensor) -> FP8TensorMeta:
         key = (w.data_ptr(), w.shape, w.dtype)
         meta = self._metas.get(key)
         if meta is None:
-            if self._last_device is None:
-                self._last_device = w.device
             meta = FP8TensorMeta(w.device, self.recipe)
             self._metas[key] = meta
         return meta
@@ -210,7 +170,6 @@ class FP8State:
     def reset(self) -> None:
         self.enabled = False
         self._metas.clear()
-        self._last_device = None
 
 
 # Global singleton: autograd backward runs on the engine worker threads, so
@@ -283,20 +242,21 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
     state = fp8_state()
     fmt = state.fp8_format.fwd()
-    meta = state.get_weight_meta(w)
-    if not meta.w_init:
-        meta.init_w(w, fmt)
     if isinstance(state.recipe, DynamicScaling):
+        meta = None
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), state.recipe, fmt)
         sw = _dynamic_scale(w, state.recipe, fmt)
     else:
-        if not meta.x_init:
-            meta.init_x(x, fmt)
-        sx, sw = meta.x_scale, meta.w_scale
+        meta = state.get_weight_meta(w)
+        if not meta.w.initialized:
+            meta.w.seed(w, fmt)
+        if not meta.x.initialized:
+            meta.x.seed(x, fmt)
+        sx, sw = meta.x.scale, meta.w.scale
     out, amax_x, amax_w = linear_forward_fp8(x, w, bias, sx, sw, fmt)
-    if not isinstance(state.recipe, DynamicScaling):
-        meta.update_x(amax_x, fmt)
-        meta.update_w(amax_w, fmt)
+    if meta is not None:
+        meta.x.update(amax_x, fmt)
+        meta.w.update(amax_w, fmt)
     return out
 
 
@@ -317,8 +277,8 @@ class _LinearFp8(torch.autograd.Function):
         ctx.save_for_backward(x, w)
         ctx.fmt_bwd = state.fp8_format.bwd()
         ctx.recipe = state.recipe
-        ctx.meta = state.get_weight_meta(w)
         ctx.is_dynamic = isinstance(state.recipe, DynamicScaling)
+        ctx.meta = None if ctx.is_dynamic else state.get_weight_meta(w)
         return out
 
     @staticmethod
@@ -332,15 +292,15 @@ class _LinearFp8(torch.autograd.Function):
             sx = _dynamic_scale(x, ctx.recipe, fmt)
         else:
             meta = ctx.meta
-            if not meta.g_init:
-                meta.init_g(g, fmt)
-            sg, sw, sx = meta.g_scale, meta.w_scale, meta.x_scale
+            if not meta.g.initialized:
+                meta.g.seed(g, fmt)
+            sg, sw, sx = meta.g.scale, meta.w.scale, meta.x.scale
         masks = list(ctx.needs_input_grad)
         grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
             g, x, w, masks, sg, sw, sx, fmt
         )
         if not ctx.is_dynamic:
-            ctx.meta.update_g(amax_g, fmt)
+            ctx.meta.g.update(amax_g, fmt)
         return grad_x, grad_w, grad_b if masks[2] else None
 
 
