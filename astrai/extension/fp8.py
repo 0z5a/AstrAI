@@ -344,25 +344,31 @@ def fp8_linear_forward(
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), cfg.recipe, fmt)
         sw = _dynamic_scale(w, cfg.recipe, fmt)
         out, *_ = linear_forward_fp8(x, w, bias, sx, sw, fmt)
-        return out
+        return out, sx, sw
 
     meta = state.get_weight_meta(w)
     if not meta.w.initialized:
         meta.w.seed(w, fmt)
     if not meta.x.initialized:
         meta.x.seed(x, fmt)
-    # The kernel finalizes each ring in-kernel (overwriting the scale slot), so
-    # the w/x scales are taken from the ring before the quantize.
+    # The quantize kernels finalize each ring in-kernel and overwrite the ring's
+    # scale slot, which ALIASES meta.*.scale (a view into the state buffer).
+    # Snapshot the scales first so the GEMM dequantizes with the SAME scale the
+    # operands were quantized with, and so the backward can reuse this step's
+    # scale (gradient consistency with the forward). The ring finalize still
+    # publishes the next step's scale into the original slot.
     if w.dtype is not torch.bfloat16:  # static pre-quantized weight
         w_arg, sw_arg, w_ring = w, meta.w.scale, None
     else:
         w_arg, sw_arg, w_ring = w, meta.w.scale, meta.w.state
+    sx = meta.x.scale.clone()
+    sw = sw_arg.clone()
     out, _x8, _w8, _ax, _aw = linear_forward_fp8(
         x,
         w_arg,
         bias,
-        meta.x.scale,
-        sw_arg,
+        sx,
+        sw,
         fmt,
         None,
         meta.x.state,
@@ -375,7 +381,7 @@ def fp8_linear_forward(
     meta.x.advance()
     if w_ring is not None:
         meta.w.advance()
-    return out
+    return out, sx, sw
 
 
 class _LinearFp8(torch.autograd.Function):
@@ -391,8 +397,8 @@ class _LinearFp8(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w, bias):
         cfg = _current_config()
-        out = fp8_linear_forward(x, w, bias, cfg)
-        ctx.save_for_backward(x, w)
+        out, sx, sw = fp8_linear_forward(x, w, bias, cfg)
+        ctx.save_for_backward(x, w, sx, sw)
         ctx.fmt_bwd = cfg.fp8_format.bwd()
         ctx.recipe = cfg.recipe
         ctx.is_dynamic = isinstance(cfg.recipe, DynamicScaling)
@@ -402,7 +408,7 @@ class _LinearFp8(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, g):
-        x, w = ctx.saved_tensors
+        x, w, _sx_fwd, _sw_fwd = ctx.saved_tensors
         fmt = ctx.fmt_bwd
         # Per-recipe scale/ring selection; both branches share one call below.
         if ctx.is_dynamic:
@@ -414,8 +420,12 @@ class _LinearFp8(torch.autograd.Function):
             meta = ctx.meta
             if not meta.g.initialized:
                 meta.g.seed(g, fmt)
-            sg, ring, idx = meta.g.scale, meta.g.state, meta.g.idx
-            sw, sx = meta.w.scale, meta.x.scale
+            # Snapshot the g scale before its ring finalize overwrites the slot
+            # (same aliasing as the forward); reuse the forward's w/x scales so
+            # the backward quantizes with the scale the forward actually used.
+            sg = meta.g.scale.clone()
+            ring, idx = meta.g.state, meta.g.idx
+            sw, sx = _sw_fwd, _sx_fwd
         grad_x, grad_w, grad_b, _amax_g = linear_backward_fp8(
             g,
             x,

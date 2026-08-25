@@ -212,20 +212,24 @@ def linear_backward_fp8(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """FP8 linear backward; returns ``(grad_input, grad_weight, grad_bias, amax_g)``.
 
-    The gradient (and the transposed w/x operands) are quantized to ``fmt``
-    (default E5M2 — larger dynamic range for gradients) and the two GEMMs run
-    as FP8 tensor-core products sharing a single gradient quantization.
-    ``g_ring`` (delayed scaling) is a ``[hist | scale | counter]`` buffer the
-    g quantize kernel finalizes in-kernel (see :func:`linear_forward_fp8`).
+    ``g``/``x``/``w`` may each be bf16 (quantized to ``fmt`` here) or already
+    pre-quantized fp8 matching ``fmt`` — a pre-quantized operand skips its
+    quantize kernel and is read directly by the GEMM (the ``cached_cast``
+    analog for the backward, symmetric with :func:`linear_forward_fp8`'s
+    pre-quantized weight path). ``fmt`` defaults to E5M2 (larger dynamic range
+    for gradients); the two GEMMs run as FP8 tensor-core products sharing a
+    single gradient quantization. ``g_ring`` (delayed scaling) is a
+    ``[hist | scale | counter]`` buffer the g quantize kernel finalizes
+    in-kernel (see :func:`linear_forward_fp8`); a pre-quantized ``g`` does not
+    finalize it and reports ``amax_g = 0``.
     """
-    if not (
-        g.dtype == torch.bfloat16
-        and x.dtype == torch.bfloat16
-        and w.dtype == torch.bfloat16
-    ):
-        raise TypeError(
-            f"fp8 backward requires bf16 inputs, got {g.dtype}/{x.dtype}/{w.dtype}"
-        )
+    f8 = _fmt_dtype(fmt)
+    for name, t in (("g", g), ("x", x), ("w", w)):
+        if t.dtype not in (torch.bfloat16, f8):
+            raise TypeError(
+                f"fp8 backward requires bf16 or pre-quantized {fmt} inputs, "
+                f"got {name}={t.dtype}"
+            )
     return get_module("fp8_ops").linear_backward_fp8(
         g,
         x,

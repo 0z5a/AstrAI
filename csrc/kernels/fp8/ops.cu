@@ -357,10 +357,19 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     // the w/x quantizes for dX / dW never touch rings — each operand's ring
     // is finalized exactly once per step (by the forward or this kernel).
     TORCH_CHECK(g.is_cuda() && x.is_cuda() && w.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK(g.scalar_type() == torch::kBFloat16 &&
-                    x.scalar_type() == torch::kBFloat16 &&
-                    w.scalar_type() == torch::kBFloat16,
-                "g, x, and w must be bf16");
+    // Each operand may be bf16 (quantized here) or already fp8 matching fmt
+    // (reused from the forward — the fp8 cached_cast analog, symmetric with
+    // the forward's pre-quantized w path). Pre-quantized operands skip their
+    // quantize kernel; their scale is still passed for the GEMM dequant.
+    const auto f8opt = fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn;
+    const bool g_prequant = g.scalar_type() == f8opt;
+    const bool x_prequant = x.scalar_type() == f8opt;
+    const bool w_prequant = w.scalar_type() == f8opt;
+    TORCH_CHECK(
+        (g.scalar_type() == torch::kBFloat16 || g_prequant) &&
+            (x.scalar_type() == torch::kBFloat16 || x_prequant) &&
+            (w.scalar_type() == torch::kBFloat16 || w_prequant),
+        "g, x, and w must be bf16 or pre-quantized fp8 matching fmt");
     TORCH_CHECK(g.device() == x.device() && g.device() == w.device(),
                 "g, x, and w must be on the same device");
     TORCH_CHECK(masks.size() == 3, "masks must contain three values");
@@ -375,8 +384,10 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     TORCH_CHECK(x_c.size(0) == m && x_c.size(1) == k && g_c.size(1) == n,
                 "backward shape mismatch");
 
-    auto grad_input = torch::empty_like(x);
-    auto grad_weight = torch::empty_like(w);
+    auto grad_input =
+        torch::empty_like(x, x.options().dtype(torch::kBFloat16));
+    auto grad_weight =
+        torch::empty_like(w, w.options().dtype(torch::kBFloat16));
     auto grad_bias = torch::empty({0}, g.options());
     // amax_g feeds a cross-block atomic_max in the g quantize kernel; zero it
     // on the stream (empty + memset, not torch::zeros — see the forward).
@@ -385,8 +396,6 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     // is harmless.
     auto amax_g = torch::empty({1}, g.options().dtype(torch::kFloat32));
     cudaMemsetAsync(amax_g.data_ptr(), 0, sizeof(float), stream.stream());
-    auto f8opt = fmt ? g.options().dtype(torch::kFloat8_e5m2)
-                     : g.options().dtype(torch::kFloat8_e4m3fn);
 
     auto quantize = [&](const torch::Tensor& src, torch::Tensor& dst,
                         const torch::Tensor& scale, torch::Tensor* amax,
@@ -420,14 +429,23 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
 
     torch::Tensor g8;
     if (masks[0] || masks[1]) {
-        g8 = torch::empty({m, n}, f8opt);
-        quantize(g_c, g8, sg, &amax_g, g_ring, g_ring_idx, g_ring_margin);
+        if (g_prequant) {
+            g8 = g_c;
+        } else {
+            g8 = torch::empty({m, n}, g.options().dtype(f8opt));
+            quantize(g_c, g8, sg, &amax_g, g_ring, g_ring_idx, g_ring_margin);
+        }
     }
     // dX = g @ w: A = g8 [M,N] (contract over N), B = w8 [N,K] read transposed
     // (b[p*b_ld + n] = w[p,n]); out = [M,K], a_ld = N, b_ld = K, contract = N.
     if (masks[0]) {
-        auto w8 = torch::empty({n, k}, f8opt);
-        quantize(w_c, w8, sw, nullptr, c10::nullopt, 0, 0);
+        torch::Tensor w8;
+        if (w_prequant) {
+            w8 = w_c;
+        } else {
+            w8 = torch::empty({n, k}, g.options().dtype(f8opt));
+            quantize(w_c, w8, sw, nullptr, c10::nullopt, 0, 0);
+        }
         auto grad_input_2d = grad_input.reshape({m, k});
         FP8Params gp;
         pack_gemm_params(gp, g8.data_ptr(), w8.data_ptr(),
@@ -439,19 +457,31 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     // x8 [M,K] read transposed (b[p*b_ld + n] = x[p,n]); out = [N,K], a_ld = N,
     // b_ld = K, contract = M.
     if (masks[1]) {
-        auto x8 = torch::empty({m, k}, f8opt);
-        quantize(x_c, x8, sx, nullptr, c10::nullopt, 0, 0);
+        torch::Tensor x8;
+        if (x_prequant) {
+            x8 = x_c;
+        } else {
+            x8 = torch::empty({m, k}, g.options().dtype(f8opt));
+            quantize(x_c, x8, sx, nullptr, c10::nullopt, 0, 0);
+        }
         FP8Params gp;
         pack_gemm_params(gp, g8.data_ptr(), x8.data_ptr(),
                          grad_weight.data_ptr(), sg, sx, nullptr, nullptr,
                          nullptr, n, k, m, n, k);
         run_bwd_gemm(gp, true, false);
     }
-    if (!masks[0] && !masks[1]) {
+    if (!masks[0] && !masks[1] && !g_prequant) {
         amax_g.copy_(g_c.abs().amax().to(torch::kFloat32));
     }
     C10_CUDA_CHECK(cudaGetLastError());
-    if (masks[2]) grad_bias = g_c.sum(0).to(g.scalar_type());
+    if (masks[2]) {
+        // A pre-quantized g has no bf16 source to reduce; dequantize with its
+        // scale before the batch-sum so grad_bias stays in the true gradient
+        // domain (sg * sum(g8)).
+        grad_bias = g_prequant
+                        ? (g_c.to(torch::kFloat32) * sg).sum(0).to(torch::kBFloat16)
+                        : g_c.sum(0).to(g.scalar_type());
+    }
     return {grad_input, grad_weight, grad_bias, amax_g};
 }
 

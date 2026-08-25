@@ -137,6 +137,45 @@ def test_quantize_ring_in_kernel_finalize():
 
 
 @skip_no_fp8
+def test_delayed_scaling_forward_uses_snapshot_scale():
+    """Regression: the in-kernel ring finalize overwrites the scale slot, which
+    aliases the scale the GEMM must dequantize with. The forward must snapshot
+    the delayed scale first, so a changing amax across steps does not leak the
+    next-step scale into the output (otherwise out is off by
+    scale_next / scale_current)."""
+    torch.manual_seed(11)
+    dev = torch.device("cuda")
+    state = f8mod.fp8_state()
+    state.reset()
+    state.default_recipe = DelayedScaling(history_len=1, margin=0)
+    state.default_format = FP8Format.E4M3
+    try:
+        m, n, k = 32, 16, 64
+        x1 = torch.randn(m, k, device=dev, dtype=torch.bfloat16) * 0.5
+        # Smaller amax than x1: the delayed scale (amax(x1)/448) still covers
+        # x2 without fp8 saturation, while the next-step scale would differ —
+        # exactly the condition that exposed the overwrite bug.
+        x2 = torch.randn(m, k, device=dev, dtype=torch.bfloat16) * 0.35
+        w = torch.randn(n, k, device=dev, dtype=torch.bfloat16) * 0.5
+        bias = torch.zeros(n, device=dev, dtype=torch.bfloat16)
+
+        f8mod.fp8_linear_forward(x1, w, bias)  # step 1: seeds the rings
+        out2, _, _ = f8mod.fp8_linear_forward(x2, w, bias)  # amax changes
+        torch.cuda.synchronize()
+
+        # The delayed scale for step 2 is amax(x1)/448 (history_len=1); the
+        # GEMM must use that same scale for dequant as the quantize used.
+        sx = _scale(x1)
+        sw = _scale(w)
+        qx = _quantize(x2, sx)
+        qw = _quantize(w, sw)
+        expected = (qx @ qw.t() * sx * sw + bias).to(torch.bfloat16)
+        torch.testing.assert_close(out2, expected, atol=0.125, rtol=0.01)
+    finally:
+        state.reset()
+
+
+@skip_no_fp8
 def test_fp8_linear_forward_and_backward():
     torch.manual_seed(7)
     m, n, k = 19, 13, 37
