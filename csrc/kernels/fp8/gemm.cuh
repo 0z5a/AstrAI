@@ -406,13 +406,15 @@ transpose_crosswise_region(T8* tile, const T8* staging, int idx, int quad0) {
     }
 }
 
-// Layout-aware shared-memory budget and occupancy hint. A congruous or
-// direct-crosswise operand needs its kStages rotating canonical buffers; a
-// staged-crosswise operand (crosswise B with kBStaged) needs kStages K-major
-// staging buffers plus ONE canonical buffer (rewritten every tile by the
-// in-kernel transpose). The 48KB static-smem watermark picks the resident-CTA
-// hint for __launch_bounds__ (sm_89: 100KB smem per SM, so two CTAs fit while
-// each stays within the static budget).
+// Layout-aware shared-memory budget and occupancy hint. A congruous operand
+// needs its kStages rotating canonical buffers; a staged-crosswise operand
+// (crosswise B with kBStaged) needs kStages K-major staging buffers plus ONE
+// canonical buffer (rewritten every tile by the in-kernel transpose); a
+// direct-crosswise operand rotates kStages+1 canonical buffers so its load
+// can run ahead of the compute phase (see the kernel's pipelining note).
+// The 48KB static-smem watermark picks the resident-CTA hint for
+// __launch_bounds__ (sm_89: 100KB smem per SM, so two CTAs fit while each
+// stays within the static budget).
 template <typename Traits, typename LayoutA, typename LayoutB, bool StagedB>
 struct Fp8GemmSmem {
     // Crosswise = the stage-load's view: A's tag directly, B's transposed.
@@ -421,9 +423,12 @@ struct Fp8GemmSmem {
     static constexpr bool kCrossA = std::is_same_v<LayoutA, ColMajor>;
     static constexpr bool kCrossB = std::is_same_v<LayoutB, RowMajor>;
     static constexpr bool kBStagePath = kCrossB && StagedB;
+    static constexpr bool kDirectA = kCrossA;
+    static constexpr bool kDirectB = kCrossB && !kBStagePath;
     static constexpr int kBytes =
-        Traits::kStages * Traits::kBlockM * Traits::kK +
-        (kBStagePath ? Traits::kStages + 1 : Traits::kStages) *
+        (kDirectA ? Traits::kStages + 1 : Traits::kStages) *
+            Traits::kBlockM * Traits::kK +
+        (kDirectB || kBStagePath ? Traits::kStages + 1 : Traits::kStages) *
             Traits::kBlockN * Traits::kK;
     static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
 };
@@ -458,6 +463,8 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     constexpr bool kCrossB = Fp8GemmSmem<Traits, LayoutA, LayoutB, kBStaged>::kCrossB;
     constexpr bool kBStagePath =
         Fp8GemmSmem<Traits, LayoutA, LayoutB, kBStaged>::kBStagePath;
+    constexpr bool kDirectA = Fp8GemmSmem<Traits, LayoutA, LayoutB, kBStaged>::kDirectA;
+    constexpr bool kDirectB = Fp8GemmSmem<Traits, LayoutA, LayoutB, kBStaged>::kDirectB;
     static_assert(kStages >= 1 && kStages <= 8,
                   "FP8 GEMM stages must be in [1, 8]");
     // Tiles are flat [rows * kK] with a 16B-chunk XOR swizzle (tile_at):
@@ -467,17 +474,23 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // shared memory so deep pipelines (kStages * (kBlockM + kBlockN) * kK >
     // 48KB static limit) opt in via cudaFuncSetAttribute in the launcher.
     extern __shared__ __align__(16) char fp8_gemm_smem[];
-    // Per operand: congruous or direct-crosswise = kStages rotating canonical
-    // buffers; staged-crosswise (B) = kStages K-major staging buffers (filled
-    // by cp.async, one per tile in flight) followed by one canonical buffer
-    // the per-tile transpose rewrites.
+    // Per operand: congruous = kStages rotating canonical buffers; direct-
+    // crosswise = kStages+1 of them (the load for tile i+kStages targets
+    // buffer (i-1)%(kStages+1) — the one compute(i-1) finished reading at
+    // the previous barrier — so it issues right after barrier 1 and its
+    // global-load latency overlaps the MMA phase below); staged-crosswise
+    // (B) = kStages K-major staging buffers (filled by cp.async, one per
+    // tile in flight) followed by one canonical buffer the per-tile
+    // transpose rewrites.
     constexpr int kAStageBytes = kBlockM * kK;
     constexpr int kBStageBytes = kBlockN * kK;
+    constexpr int kARing = kDirectA ? kStages + 1 : kStages;  // A canonic ring
+    constexpr int kBRing = kDirectB ? kStages + 1 : kStages;  // B canonic ring
     constexpr int kStB = kStages;  // B staging ring size (see above)
     T8* const a_base = reinterpret_cast<T8*>(fp8_gemm_smem);
     T8* const b_base =
-        reinterpret_cast<T8*>(fp8_gemm_smem + kStages * kAStageBytes);
-    T8* const b_canon = b_base + kStages * kBStageBytes;  // crosswise B only
+        reinterpret_cast<T8*>(fp8_gemm_smem + kARing * kAStageBytes);
+    T8* const b_canon = b_base + kStB * kBStageBytes;  // staged B only
 
     const auto* a = reinterpret_cast<const T8*>(p.a_ptr);
     const auto* b = reinterpret_cast<const T8*>(p.b_ptr);
@@ -536,29 +549,44 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // straight into their rotating canonical buffers; crosswise operands
     // cp.async into K-major staging (zero transformation) and get a per-tile
     // smem->smem transpose below.
-    auto load_tile = [&](int tile, int stage, int64_t k_base) {
-        if constexpr (kCrossA) {
-            load_crosswise_direct<T8, kK, kBlockM, kCtaThreads>(
-                a_base + stage * kAStageBytes, a, m, k, a_ld, tid, k_base,
-                (int64_t)block_m * kBlockM);
-        } else {
+    // Asynchronous loads for tile `tile`: congruous operands cp.async into
+    // their canonical rings, a staged B cp.asyncs into its K-major staging
+    // ring. Called after the post-compute barrier, alongside the commit.
+    auto load_async = [&](int64_t tile) {
+        const int64_t k_base = tile * kK;
+        if constexpr (!kDirectA)
             load_operand_tile<T8, kK, kBlockM, kCtaThreads>(
-                a_base + stage * kAStageBytes, a, m, k, a_ld, tid, k_base,
-                (int64_t)block_m * kBlockM);
-        }
-        if constexpr (kBStagePath) {
+                a_base + (tile % kARing) * kAStageBytes, a, m, k, a_ld, tid,
+                k_base, (int64_t)block_m * kBlockM);
+        if constexpr (kBStagePath)
             stage_crosswise_tile<T8, kK, kBlockN, kCtaThreads>(
                 b_base + (tile % kStB) * kBStageBytes, b, n, k, b_ld, tid,
                 k_base, (int64_t)block_n * kBlockN);
-        } else if constexpr (kCrossB) {
-            load_crosswise_direct<T8, kK, kBlockN, kCtaThreads>(
-                b_base + stage * kBStageBytes, b, n, k, b_ld, tid, k_base,
-                (int64_t)block_n * kBlockN);
-        } else {
+        if constexpr (!kDirectB && !kBStagePath)
             load_operand_tile<T8, kK, kBlockN, kCtaThreads>(
-                b_base + stage * kBStageBytes, b, n, k, b_ld, tid, k_base,
-                (int64_t)block_n * kBlockN);
-        }
+                b_base + (tile % kBRing) * kBStageBytes, b, n, k, b_ld, tid,
+                k_base, (int64_t)block_n * kBlockN);
+    };
+    // Synchronous direct-crosswise loads for tile `tile` into the operand's
+    // (kStages+1)-deep canonical ring. In the steady state this runs right
+    // after barrier 1, so the LDG latency and the PRMT transpose overlap the
+    // MMA phase of the current tile instead of stalling the inter-barrier
+    // window (which dominated the dX/dW stall profile: barrier 3.7-4.1 +
+    // long-scoreboard 1.6-1.8 stalls per issue on the production shapes).
+    // Ring safety: the write targets buffer (i+kStages)%(kStages+1) =
+    // (i-1)%(kStages+1), which compute(i-1) finished reading before the
+    // previous barrier and compute(i+kStages) does not touch until several
+    // barriers later.
+    auto load_direct = [&](int64_t tile) {
+        const int64_t k_base = tile * kK;
+        if constexpr (kDirectA)
+            load_crosswise_direct<T8, kK, kBlockM, kCtaThreads>(
+                a_base + (tile % kARing) * kAStageBytes, a, m, k, a_ld, tid,
+                k_base, (int64_t)block_m * kBlockM);
+        if constexpr (kDirectB)
+            load_crosswise_direct<T8, kK, kBlockN, kCtaThreads>(
+                b_base + (tile % kBRing) * kBStageBytes, b, n, k, b_ld, tid,
+                k_base, (int64_t)block_n * kBlockN);
     };
     // smem->smem transpose of one k_seg region (kSegQuads contract quads) of
     // this tile's staged-crosswise B into its single canonical buffer.
@@ -591,16 +619,18 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
 
     // Prime the pipeline. Each committed group occupies one circular shared
     // memory stage; the loop also handles K dimensions smaller than kStages.
+    // Direct loads run synchronously here (back to back with their commit);
+    // the steady state below overlaps them with the compute phase.
 #pragma unroll
     for (int stage = 0; stage < kStages; ++stage) {
         if (stage < tile_count) {
-            load_tile(stage, stage, static_cast<int64_t>(stage) * kK);
+            load_async(stage);
+            load_direct(stage);
             astrai::cp_async_commit_group();
         }
     }
 
     for (int64_t tile_index = 0; tile_index < tile_count; ++tile_index) {
-        const int stage = static_cast<int>(tile_index % kStages);
         const int64_t remaining = tile_count - tile_index - 1;
 
         // Keep up to kStages - 1 younger groups in flight while making the
@@ -611,6 +641,11 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         // Barrier 1: every thread's cp.async for this stage is complete
         // before any thread reads tiles written by other threads.
         __syncthreads();
+
+        // Direct chunks for tile i+kStages: issue LDG+PRMT+STS now so the
+        // global-load latency hides behind the MMA phase below.
+        if (tile_index + kStages < tile_count)
+            load_direct(tile_index + kStages);
 
         // Staged-crosswise B: produce the canonical tile one k_seg region at
         // a time so each region's transpose overlaps the previous region's
@@ -624,9 +659,10 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
             __syncthreads();
         }
 
-        const T8* a_tile = a_base + (size_t)stage * kAStageBytes;
-        const T8* b_tile =
-            kBStagePath ? b_canon : b_base + (size_t)stage * kBStageBytes;
+        const T8* a_tile = a_base + (size_t)(tile_index % kARing) * kAStageBytes;
+        const T8* b_tile = kBStagePath
+                               ? b_canon
+                               : b_base + (size_t)(tile_index % kBRing) * kBStageBytes;
 
         // 4 ldmatrix.x2 (B) + 4 ldmatrix.x4 (A) feed 16 mma.sync per k_seg —
         // 0.5 load instructions per MMA, versus 4.5 scalar LDS per MMA in
@@ -701,8 +737,7 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         // next iteration's transposes rewrite the canonical buffer).
         __syncthreads();
         if (tile_index + kStages < tile_count) {
-            load_tile(tile_index + kStages, stage,
-                      (tile_index + kStages) * kK);
+            load_async(tile_index + kStages);
             astrai::cp_async_commit_group();
         }
     }
