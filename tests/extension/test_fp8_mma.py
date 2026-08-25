@@ -1,9 +1,9 @@
 """FP8 primitives: kernel-level (CUDA) and policy-level (CPU-verifiable) tests.
 
-The kernel-level tests exercise the pure FP8 path (quantize_bf16 + mm_fp8 for
-the forward GEMM, quantize + pre-quantized GEMMs for the backward); the
-policy-level tests (recipes, autocast context, per-tensor meta, CPU fallbacks
-of the custom ops) run without a GPU.
+The kernel-level tests exercise the two stateless primitives (``quantize`` for
+bf16/fp16/fp32 -> FP8, ``mm_fp8`` for the pre-quantized GEMM with transposed
+operands); the policy-level tests (recipes, autocast context, per-tensor meta,
+CPU fallbacks of the custom ops) run without a GPU.
 """
 
 import threading
@@ -24,12 +24,7 @@ from astrai.extension.fp8 import (
     fp8_linear_enabled,
     fp8_state,
 )
-from astrai.extension.ops.fp8 import (
-    linear_backward_fp8,
-    linear_forward_fp8,
-    mm_fp8,
-    quantize_bf16,
-)
+from astrai.extension.ops.fp8 import mm_fp8, quantize
 from tests.conftest import skip_no_fp8
 
 
@@ -37,8 +32,11 @@ def _scale(tensor):
     return (tensor.abs().amax().float() / 448.0).clamp_min(1e-12)
 
 
-def _quantize(tensor, scale):
-    return (tensor.float() / scale).to(torch.float8_e4m3fn).float()
+def _quantize(tensor, scale, fmt="e4m3"):
+    """Reference quantize: multiply by the reciprocal (the kernel's exact
+    arithmetic — a plain divide flips fp8 boundary cases by one ulp)."""
+    dtype = torch.float8_e5m2 if fmt == "e5m2" else torch.float8_e4m3fn
+    return (tensor.float() * scale.reciprocal()).to(dtype).float()
 
 
 # --------------------------------------------------------------------------
@@ -57,9 +55,9 @@ def test_fp8_mm_matches_explicit_quantization(m, n, k):
     b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
     scale_a = _scale(a)
     scale_b = _scale(b)
-    a8, _ = quantize_bf16(a, scale_a, "e4m3")
-    b8, _ = quantize_bf16(b, scale_b, "e4m3")
-    out = mm_fp8(a8, b8, scale_a, scale_b)
+    a8, _ = quantize(a, scale_a.reciprocal(), "e4m3")
+    b8, _ = quantize(b, scale_b.reciprocal(), "e4m3")
+    out = mm_fp8(a8, b8, scale_a * scale_b)
     expected = (_quantize(a, scale_a) @ _quantize(b, scale_b) * scale_a * scale_b).to(
         torch.bfloat16
     )
@@ -70,79 +68,59 @@ def test_fp8_mm_matches_explicit_quantization(m, n, k):
 
 
 @skip_no_fp8
-def test_quantize_bf16_returns_amax():
-    """quantize_bf16 returns (x8, amax); amax tracks the *raw* values and the
-    caller never clears it (zero-initialized inside the kernel entry)."""
+@pytest.mark.parametrize("in_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
+def test_quantize_input_dtypes(in_dtype, fmt):
+    """quantize accepts bf16/fp16/fp32 inputs; bytes and amax match the
+    explicit (value * multiplier) reference."""
     torch.manual_seed(3)
-    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(64, 128, device="cuda", dtype=torch.float32) * 0.5
+    x = x.to(in_dtype)
     scale = torch.tensor([0.5], device="cuda")
-    x8, amax = quantize_bf16(x, scale, "e4m3")
-    assert x8.dtype == torch.float8_e4m3fn
+    x8, amax = quantize(x, scale, fmt)
+    out_dtype = torch.float8_e5m2 if fmt == "e5m2" else torch.float8_e4m3fn
+    assert x8.dtype == out_dtype
     assert x8.shape == x.shape
     assert amax.shape == (1,)
     torch.testing.assert_close(amax, x.abs().amax().float().reshape(1))
-    ref = (x.float() / 0.5).to(torch.float8_e4m3fn)
+    ref = (x.float() * 0.5).to(out_dtype)
     assert torch.equal(x8, ref)
 
 
 @skip_no_fp8
-def test_quantize_bf16_e5m2_format():
+def test_quantize_e5m2_format():
     x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
-    x8, amax = quantize_bf16(x, torch.tensor([0.1], device="cuda"), "e5m2")
+    x8, amax = quantize(x, torch.tensor([10.0], device="cuda"), "e5m2")
     assert x8.dtype == torch.float8_e5m2
     torch.testing.assert_close(amax, x.abs().amax().float().reshape(1))
 
 
 @skip_no_fp8
-def test_quantize_ring_in_kernel_finalize():
-    """The quantize kernel finalizes the delayed-scaling ring in-kernel: the
-    measured amax lands in hist[idx], the window reduces to the next step's
-    scale on device, and the counter re-arms for the next launch."""
-    torch.manual_seed(21)
-    dev = torch.device("cuda")
-    ring = _ScaleRing(dev, DelayedScaling(history_len=4, margin=0))
-    x0 = torch.randn(256, 256, device=dev, dtype=torch.bfloat16)
-    w = torch.randn(256, 256, device=dev, dtype=torch.bfloat16)
-    sw = torch.tensor([1.0], device=dev)
-    ring.seed(x0, "e4m3")
-    hist0 = ring.hist.clone()
+@pytest.mark.parametrize("trans_a", [False, True])
+@pytest.mark.parametrize("trans_b", [False, True])
+def test_mm_fp8_transposed_operands(trans_a, trans_b):
+    """mm_fp8 handles all four operand layouts via trans_a/trans_b."""
+    torch.manual_seed(17)
+    m, n, k = 19, 13, 37
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)  # A [M][K]
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)  # B^T [N][K]
+    sa, sb = _scale(a), _scale(b)
+    a8, _ = quantize(a, sa.reciprocal(), "e4m3")
+    b8, _ = quantize(b, sb.reciprocal(), "e4m3")
+    a_op = a8.t().contiguous() if trans_a else a8
+    b_op = b8 if trans_b else b8.t().contiguous()
 
-    # Step over three fresh tensors: each launch folds its amax into
-    # hist[idx] and publishes max(hist)/448 as the next scale.
-    idx = 0
-    for _ in range(3):
-        x = torch.randn(256, 256, device=dev, dtype=torch.bfloat16) * (2.0 + 4.0 * _)
-        _ = linear_forward_fp8(
-            x,
-            w,
-            None,
-            ring.scale,
-            sw,
-            "e4m3",
-            None,
-            ring.state,
-            idx,
-            0,
-        )
-        torch.cuda.synchronize()
-        expected_hist = hist0.clone()
-        expected_hist[idx] = x.abs().amax().float()
-        torch.testing.assert_close(ring.hist, expected_hist)
-        expected_scale = (expected_hist.max() / 448.0).reshape(1)
-        torch.testing.assert_close(ring.scale, expected_scale, rtol=1e-6, atol=1e-12)
-        # counter re-armed to int32 zero
-        assert ring.state[-1].view(torch.int32).item() == 0
-        hist0 = expected_hist.clone()
-        idx = (idx + 1) % 4
+    out = mm_fp8(a_op, b_op, sa * sb, trans_a=trans_a, trans_b=trans_b)
+    assert out.shape == (m, n)
+    expected = (_quantize(a, sa) @ _quantize(b, sb).t() * sa * sb).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
 
 
 @skip_no_fp8
 def test_delayed_scaling_forward_uses_snapshot_scale():
-    """Regression: the in-kernel ring finalize overwrites the scale slot, which
-    aliases the scale the GEMM must dequantize with. The forward must snapshot
-    the delayed scale first, so a changing amax across steps does not leak the
-    next-step scale into the output (otherwise out is off by
-    scale_next / scale_current)."""
+    """The delayed scale for step N is computed from amax(steps < N); the
+    forward must snapshot the scale before the ring update, so a changing
+    amax across steps does not leak the next-step scale into the output."""
     torch.manual_seed(11)
     dev = torch.device("cuda")
     state = f8mod.fp8_state()
@@ -153,8 +131,7 @@ def test_delayed_scaling_forward_uses_snapshot_scale():
         m, n, k = 32, 16, 64
         x1 = torch.randn(m, k, device=dev, dtype=torch.bfloat16) * 0.5
         # Smaller amax than x1: the delayed scale (amax(x1)/448) still covers
-        # x2 without fp8 saturation, while the next-step scale would differ —
-        # exactly the condition that exposed the overwrite bug.
+        # x2 without fp8 saturation, while the next-step scale would differ.
         x2 = torch.randn(m, k, device=dev, dtype=torch.bfloat16) * 0.35
         w = torch.randn(n, k, device=dev, dtype=torch.bfloat16) * 0.5
         bias = torch.zeros(n, device=dev, dtype=torch.bfloat16)
@@ -177,93 +154,57 @@ def test_delayed_scaling_forward_uses_snapshot_scale():
 
 @skip_no_fp8
 def test_fp8_linear_forward_and_backward():
+    """The composed strategy path: forward quantize+GEMM+bias, backward
+    dX/dW GEMMs on transposed operands (E5M2 in hybrid)."""
     torch.manual_seed(7)
     m, n, k = 19, 13, 37
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    grad = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
     bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
-    scale_x, scale_w, scale_g = _scale(x), _scale(weight), _scale(grad)
 
-    out, x8, w8, amax_x, amax_w = linear_forward_fp8(x, weight, bias, scale_x, scale_w)
-    grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
-        grad, x, weight, [1, 1, 1], scale_g, scale_w, scale_x, "e4m3"
-    )
+    state = f8mod.fp8_state()
+    state.reset()
+    state.default_recipe = DynamicScaling()
+    try:
+        out, _, _ = f8mod.fp8_linear_forward(x, weight, bias)
 
-    qx = _quantize(x, scale_x)
-    qw = _quantize(weight, scale_w)
-    qg = _quantize(grad, scale_g)
-    expected_out = (qx @ qw.t() * scale_x * scale_w + bias).to(torch.bfloat16)
-    expected_grad_x = (qg @ qw * scale_g * scale_w).to(torch.bfloat16)
-    expected_grad_w = (qg.t() @ qx * scale_g * scale_x).to(torch.bfloat16)
+        sx, sw = _scale(x), _scale(weight)
+        qx = _quantize(x, sx)
+        qw = _quantize(weight, sw)
+        expected_out = (qx @ qw.t() * sx * sw + bias).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected_out, atol=0.125, rtol=0.01)
 
-    torch.testing.assert_close(out, expected_out, atol=0.125, rtol=0.01)
-    torch.testing.assert_close(grad_x, expected_grad_x, atol=0.125, rtol=0.01)
-    torch.testing.assert_close(grad_w, expected_grad_w, atol=0.125, rtol=0.01)
-    torch.testing.assert_close(grad_b, grad.sum(0).to(torch.bfloat16))
-    torch.testing.assert_close(amax_x, x.abs().amax().float().reshape(1))
-    torch.testing.assert_close(amax_w, weight.abs().amax().float().reshape(1))
-    torch.testing.assert_close(amax_g, grad.abs().amax().float().reshape(1))
+        # backward through the aten::linear integration (hybrid E5M2). The
+        # incoming gradient is 2*out of the *fp8* forward (bf16-rounded), not
+        # 2*exact — derive the reference from the actual output.
+        xr = x.detach().clone().requires_grad_()
+        wr = weight.detach().clone().requires_grad_()
+        br = bias.detach().clone().requires_grad_()
+        with fp8_autocast(enabled=True):
+            loss = F.linear(xr, wr, br).float().pow(2).sum()
+        loss.backward()
 
-
-@skip_no_fp8
-def test_linear_backward_e5m2_gradients():
-    """Hybrid backward: gradient GEMMs run in E5M2 (larger dynamic range)."""
-    torch.manual_seed(5)
-    m, n, k = 32, 16, 64
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 3.0
-    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    grad = torch.randn(m, n, device="cuda", dtype=torch.bfloat16) * 10.0
-    sg = _scale(grad) * 0.5
-    sw = _scale(weight)
-    sx = _scale(x)
-
-    grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
-        grad, x, weight, [1, 1, 1], sg, sw, sx, "e5m2"
-    )
-
-    def q5(t, s):
-        return (t.float() / s).to(torch.float8_e5m2).float()
-
-    qg = q5(grad, sg)
-    qw = q5(weight, sw)
-    qx = q5(x, sx)
-    expected_grad_x = (qg @ qw * sg * sw).to(torch.bfloat16)
-    expected_grad_w = (qg.t() @ qx * sg * sx).to(torch.bfloat16)
-    torch.testing.assert_close(grad_x, expected_grad_x, atol=0.5, rtol=0.05)
-    torch.testing.assert_close(grad_w, expected_grad_w, atol=0.5, rtol=0.05)
-    torch.testing.assert_close(amax_g, grad.abs().amax().float().reshape(1))
-
-
-@skip_no_fp8
-def test_fp8_linear_static_fp8_weight_and_bias():
-    """Static fp8 inference: pre-quantized w8/b8 + their scales take the GEMM
-    directly (no weight quantize, amax_w = 0); the bias is fused in the
-    epilogue (bf16 and fp8 bias share the fused path)."""
-    torch.manual_seed(9)
-    m, n, k = 67, 45, 129
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.5
-    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16) * 0.5
-    sx, sw, sb = _scale(x), _scale(weight), _scale(bias)
-
-    w8, _ = quantize_bf16(weight, sw, "e4m3")
-    b8, _ = quantize_bf16(bias, sb, "e4m3")
-    out, x8, w8_back, amax_x, amax_w = linear_forward_fp8(x, w8, b8, sx, sw, "e4m3", sb)
-
-    qx = _quantize(x, sx)
-    qw = _quantize(weight, sw)
-    qb = _quantize(bias, sb)
-    expected = (qx @ qw.t() * sx * sw + qb * sb).to(torch.bfloat16)
-    torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
-    torch.testing.assert_close(amax_x, x.abs().amax().float().reshape(1))
-    assert amax_w.item() == 0.0  # nothing measured on the static path
-    assert w8_back is w8  # pre-quantized w handed straight back
-
-    # bf16 bias stays bf16 on the same fused-epilogue path
-    out_bf16bias, *_ = linear_forward_fp8(x, w8, bias, sx, sw, "e4m3")
-    expected_b = (qx @ qw.t() * sx * sw + bias.float()).to(torch.bfloat16)
-    torch.testing.assert_close(out_bf16bias, expected_b, atol=0.125, rtol=0.01)
+        g = (2 * out.float()).to(torch.bfloat16).float()  # actual grad wrt out
+        # the dynamic path measures current-step amax in the bwd fmt (E5M2);
+        # amax must be taken in fp32 — a bf16-rounded scale flips E5M2
+        # boundary rounding (2-bit mantissa) and the reference drifts.
+        e5 = 57344.0
+        sg = (g.abs().amax() / e5).clamp_min(1e-12)
+        sw5 = (weight.abs().amax().float() / e5).clamp_min(1e-12)
+        sx5 = (x.abs().amax().float() / e5).clamp_min(1e-12)
+        expected_grad_x = (
+            _quantize(g, sg, "e5m2") @ _quantize(weight, sw5, "e5m2") * sg * sw5
+        ).to(torch.bfloat16)
+        expected_grad_w = (
+            _quantize(g, sg, "e5m2").t() @ _quantize(x, sx5, "e5m2") * sg * sx5
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(xr.grad, expected_grad_x, atol=0.5, rtol=0.05)
+        torch.testing.assert_close(wr.grad, expected_grad_w, atol=0.5, rtol=0.05)
+        torch.testing.assert_close(
+            br.grad, g.sum(0).to(torch.bfloat16), atol=0.5, rtol=0.05
+        )
+    finally:
+        state.reset()
 
 
 @skip_no_fp8
@@ -279,24 +220,24 @@ def test_fp8_linear_backward_outside_autocast():
     bias = torch.randn(96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     xr, wr, br = (t.detach().clone().requires_grad_() for t in (x, weight, bias))
 
-    calls = {"bwd": 0}
-    orig = f8mod.linear_backward_fp8
+    calls = {"fwd": 0}
+    orig = f8mod.fp8_linear_forward
 
     def spy(*args, **kwargs):
-        calls["bwd"] += 1
+        calls["fwd"] += 1
         return orig(*args, **kwargs)
 
-    f8mod.linear_backward_fp8 = spy
+    f8mod.fp8_linear_forward = spy
     try:
         with fp8_autocast(enabled=True):
             out = F.linear(x, weight, bias)
         assert type(out.grad_fn).__name__ == "_LinearFp8Backward"
         out.float().pow(2).sum().backward()  # outside the autocast region
     finally:
-        f8mod.linear_backward_fp8 = orig
+        f8mod.fp8_linear_forward = orig
         f8mod.fp8_state().reset()
 
-    assert calls["bwd"] == 1  # fp8 kernels, not the bf16 fallback
+    assert calls["fwd"] == 1  # fp8 kernels, not the bf16 fallback
     ref = F.linear(xr, wr, br)
     ref.float().pow(2).sum().backward()
 
@@ -319,15 +260,15 @@ def test_mm_fp8_matches_scaled_mm():
     m, n, k = 512, 4096, 4096
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
-    sa = torch.tensor([2.5], device="cuda")
-    sb = torch.tensor([1.5], device="cuda")
-    a8, _ = quantize_bf16(a, sa, "e4m3")
-    b8, _ = quantize_bf16(b, sb, "e4m3")
-    out = mm_fp8(a8, b8, sa, sb)
+    sa = _scale(a)
+    sb = _scale(b)
+    a8, _ = quantize(a, sa.reciprocal(), "e4m3")
+    b8, _ = quantize(b, sb.reciprocal(), "e4m3")
+    out = mm_fp8(a8, b8, sa * sb)
     assert out.dtype == torch.bfloat16
     assert out.shape == (m, n)
 
-    ref = (a8.float().double() @ b8.float().double() * 2.5 * 1.5).to(torch.bfloat16)
+    ref = (a8.float().double() @ b8.float().double() * sa * sb).to(torch.bfloat16)
     torch.testing.assert_close(out, ref, atol=6.0, rtol=0.05)
 
     try:
@@ -339,30 +280,6 @@ def test_mm_fp8_matches_scaled_mm():
         torch._scaled_mm(a8, b8, sa, sb, out_dtype=torch.bfloat16),
         atol=2.0,
         rtol=0.01,
-    )
-
-
-@skip_no_fp8
-def test_mm_fp8_fp8_output():
-    """mm_fp8 with out_dtype='e4m3' produces an FP8 output (layer-to-layer)."""
-    torch.manual_seed(12)
-    m, n, k = 256, 128, 64
-    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
-    sa = torch.tensor([2.0], device="cuda")
-    sb = torch.tensor([1.0], device="cuda")
-    os_ = torch.tensor([0.5], device="cuda")
-    a8, _ = quantize_bf16(a, sa, "e4m3")
-    b8, _ = quantize_bf16(b, sb, "e4m3")
-    out8 = mm_fp8(a8, b8, sa, sb, out_dtype="e4m3", out_scale=os_)
-    assert out8.dtype == torch.float8_e4m3fn
-    assert out8.shape == (m, n)
-
-    ref = (a8.float().double() @ b8.float().double() * 2.0 * 1.0 * 0.5).to(
-        torch.bfloat16
-    )
-    torch.testing.assert_close(
-        out8.float().to(torch.bfloat16), ref, atol=6.0, rtol=0.05
     )
 
 
@@ -423,23 +340,26 @@ def test_fp8_tensor_meta_delayed_update():
     meta.w.seed(w, "e4m3")
     assert meta.w.initialized
     torch.testing.assert_close(meta.w.scale, (w.abs().amax() / 448.0).reshape(1))
-    # [hist | scale | counter] packing: views alias the single state buffer.
+    # [hist | scale] packing: views alias the single state buffer.
     assert meta.w.state.numel() == 4 + 2
     assert meta.w.hist.data_ptr() == meta.w.state.data_ptr()
     assert meta.w.scale.data_ptr() == meta.w.state[4:].data_ptr()
-    # counter slot stays int32-zero (float bits) between launches
-    assert meta.w.state[-1].view(torch.int32).item() == 0
     meta.w.advance()
     assert meta.w.idx == 1
 
+    # update folds a fresh amax into the window and publishes the next scale
+    amax = torch.tensor([8.0])
+    meta.w.update(amax, "e4m3")
+    torch.testing.assert_close(meta.w.scale, torch.tensor([8.0 / 448.0]))
 
-def test_quantize_bf16_cpu_fallback():
+
+def test_quantize_cpu_fallback():
     """CPU fallback of the quantize primitive (scale semantics + amax)."""
     x = torch.randn(16, 32, dtype=torch.bfloat16)
-    scale = torch.tensor([0.5])
-    x8, amax = quantize_bf16(x, scale, "e4m3")
+    scale = torch.tensor([0.5])  # quantize multiplier
+    x8, amax = quantize(x, scale, "e4m3")
     assert x8.dtype == torch.float8_e4m3fn
-    ref = (x.float() / 0.5).to(torch.float8_e4m3fn)
+    ref = (x.float() * 0.5).to(torch.float8_e4m3fn)
     assert torch.equal(x8, ref)
     torch.testing.assert_close(amax, x.abs().amax().float().reshape(1))
 
@@ -447,24 +367,10 @@ def test_quantize_bf16_cpu_fallback():
 def test_mm_fp8_cpu_fallback():
     a8 = torch.tensor([[1.0, 2.0]], dtype=torch.float8_e4m3fn)
     b8 = torch.tensor([[3.0], [4.0]], dtype=torch.float8_e4m3fn)
-    sa = torch.tensor([2.0])
-    sb = torch.tensor([0.5])
-    out = mm_fp8(a8, b8, sa, sb)
-    ref = (a8.float() @ b8.float() * 2.0 * 0.5).to(torch.bfloat16)
+    scale = torch.tensor([1.0])
+    out = mm_fp8(a8, b8, scale)
+    ref = (a8.float() @ b8.float() * 1.0).to(torch.bfloat16)
     torch.testing.assert_close(out, ref)
-
-
-def test_mm_fp8_fp8_output_cpu():
-    """CPU fallback with an FP8 output (out_dtype='e4m3' + out_scale)."""
-    a8 = torch.tensor([[1.0, 2.0]], dtype=torch.float8_e4m3fn)
-    b8 = torch.tensor([[3.0], [4.0]], dtype=torch.float8_e4m3fn)
-    sa = torch.tensor([2.0])
-    sb = torch.tensor([0.5])
-    os_ = torch.tensor([0.25])
-    out8 = mm_fp8(a8, b8, sa, sb, out_dtype="e4m3", out_scale=os_)
-    assert out8.dtype == torch.float8_e4m3fn
-    ref = (a8.float() @ b8.float() * 2.0 * 0.5 * 0.25).to(torch.float8_e4m3fn)
-    assert torch.equal(out8, ref)
 
 
 # --------------------------------------------------------------------------
@@ -488,7 +394,7 @@ def test_nested_disabled_region_redispatches_bf16():
     resumes when it exits."""
     x, w = _linear()
     with fp8_autocast(enabled=True):
-        out_fp8 = F.linear(x, w)
+        F.linear(x, w)
         with fp8_autocast(enabled=False):
             out_bf16 = F.linear(x, w)
             assert type(out_bf16.grad_fn).__name__ != "_LinearFp8Backward"

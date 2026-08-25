@@ -2,10 +2,8 @@
 
 Isolates the ``fp8_ops`` CUDA extension behind stable Python primitives:
 
-- ``quantize_bf16(x, scale, fmt) -> (x8, amax)`` — BF16 → FP8 with fused amax
+- ``quantize(x, scale, fmt) -> (x8, amax)`` — BF16/FP16/FP32 → FP8 with fused amax
 - ``mm_fp8(a8, b8, sa, sb) -> out`` — pre-quantized FP8 GEMM (BF16 output)
-- ``linear_forward_fp8(x, w, bias, sx, sw) -> (out, x8, w8, amax_x, amax_w)``
-- ``linear_backward_fp8(g, x, w, masks, sg, sw, sx, fmt) -> (gx, gw, gb, amax_g)``
 
 Scale semantics: scales are *quantization steps* — the value divided out when
 quantizing (``x8 = x / scale``). Every primitive computes its own inverse
@@ -16,7 +14,7 @@ Policy (scales, amax history, delayed scaling, autocast) lives in ``fp8.py``;
 this module is stateless.
 """
 
-from typing import List, Optional, Tuple
+from typing import Tuple
 
 import torch
 from torch.library import custom_op
@@ -34,6 +32,14 @@ def _fmt_int(fmt: str) -> int:
         raise ValueError(f"unsupported fp8 format {fmt!r} (expected 'e4m3' or 'e5m2')")
 
 
+def _fmt_name(fmt: int) -> str:
+    if fmt == 0:
+        return "e4m3"
+    if fmt == 1:
+        return "e5m2"
+    raise ValueError(f"unsupported quantization type {fmt!r}")
+
+
 def _fmt_dtype(fmt: str) -> torch.dtype:
     return torch.float8_e5m2 if _fmt_int(fmt) else torch.float8_e4m3fn
 
@@ -42,28 +48,31 @@ def _fmt_dtype(fmt: str) -> torch.dtype:
 def fp8_quantize(
     x: torch.Tensor, scale: torch.Tensor, fmt: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """BF16 -> FP8 quantize with fused amax; returns ``(x8, amax)``."""
+    """Float (bf16/fp16/fp32) -> FP8 quantize with fused amax; ``scale`` is a multiplier."""
 
 
 @fp8_quantize.register_fake
 def _fp8_quantize_fake(x, scale, fmt):
-    dtype = torch.float8_e5m2 if fmt else torch.float8_e4m3fn
+    dtype = torch.float8_e5m2 if fmt == 1 else torch.float8_e4m3fn
     return (
         torch.empty(x.shape, device=x.device, dtype=dtype),
         torch.empty(1, device=x.device, dtype=torch.float32),
     )
 
 
+_QUANT_INPUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
 @fp8_quantize.register_kernel("cuda")
 def _fp8_quantize_cuda(x, scale, fmt):
-    if x.dtype != torch.bfloat16:
-        raise TypeError(f"fp8 quantize requires bf16 input, got {x.dtype}")
-    return get_module("fp8_ops").quantize_bf16(x, scale, int(fmt))
+    if x.dtype not in _QUANT_INPUT_DTYPES:
+        raise TypeError(f"fp8 quantize requires bf16/fp16/fp32 input, got {x.dtype}")
+    return get_module("fp8_ops").quantize(x, scale, int(fmt))
 
 
 @fp8_quantize.register_kernel("cpu")
 def _fp8_quantize_cpu(x, scale, fmt):
-    x8 = (x.float() / scale).to(_fmt_dtype("e5m2" if fmt else "e4m3"))
+    x8 = (x.float() * scale).to(_fmt_dtype(_fmt_name(fmt)))
     amax = x.abs().amax().float().reshape(1).clamp_min(1e-12)
     return x8, amax
 
@@ -72,50 +81,51 @@ def _fp8_quantize_cpu(x, scale, fmt):
 def fp8_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
-    sa: torch.Tensor,
-    sb: torch.Tensor,
-    out_dtype: int = 0,
-    out_scale: Optional[torch.Tensor] = None,
+    scale: torch.Tensor,
+    trans_a: int = 0,
+    trans_b: int = 0,
 ) -> torch.Tensor:
-    """FP8 GEMM: ``a @ b * (sa * sb)`` with FP32 accumulation.
+    """FP8 GEMM: ``a @ b * scale`` with FP32 accumulation.
 
-    ``out_dtype``: 0 = BF16 (default), 1 = FP8 E4M3 (requires ``out_scale``,
-    the quantization step for the output — mirrors ``torch._scaled_mm``).
+    The result is always BF16; FP8 output is a separate quantize operation.
     """
 
 
 @fp8_gemm.register_fake
-def _fp8_gemm_fake(a, b, sa, sb, out_dtype=0, out_scale=None):
-    dtype = torch.float8_e4m3fn if out_dtype else torch.bfloat16
-    return torch.empty((a.size(0), b.size(1)), device=a.device, dtype=dtype)
+def _fp8_gemm_fake(a, b, scale, trans_a=0, trans_b=0):
+    dtype = torch.bfloat16
+    return torch.empty(
+        (a.size(1) if trans_a else a.size(0), b.size(0) if trans_b else b.size(1)),
+        device=a.device,
+        dtype=dtype,
+    )
 
 
 @fp8_gemm.register_kernel("cuda")
-def _fp8_gemm_cuda(a, b, sa, sb, out_dtype=0, out_scale=None):
+def _fp8_gemm_cuda(a, b, scale, trans_a=0, trans_b=0):
     if a.dtype != b.dtype or a.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         raise TypeError(
             f"fp8 GEMM requires matching fp8 inputs, got {a.dtype}/{b.dtype}"
         )
-    return get_module("fp8_ops").mm_fp8(a, b, sa, sb, int(out_dtype), out_scale)
+    return get_module("fp8_ops").mm_fp8(a, b, scale, trans_a, trans_b)
 
 
 @fp8_gemm.register_kernel("cpu")
-def _fp8_gemm_cpu(a, b, sa, sb, out_dtype=0, out_scale=None):
-    acc = a.float() @ b.float() * sa * sb
-    if out_dtype:
-        os_ = 1.0 if out_scale is None else out_scale
-        return (acc * os_).to(torch.float8_e4m3fn)
+def _fp8_gemm_cpu(a, b, scale, trans_a=0, trans_b=0):
+    aa = a.float().t() if trans_a else a.float()
+    bb = b.float().t() if trans_b else b.float()
+    acc = aa @ bb * scale
     return acc.to(torch.bfloat16)
 
 
-def quantize_bf16(
+def quantize(
     x: torch.Tensor, scale: torch.Tensor, fmt: str = "e4m3"
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """BF16 -> FP8 quantize with fused amax; returns ``(x8, amax)``.
+    """Float (bf16/fp16/fp32) -> FP8 quantize with fused amax; returns
+    ``(x8, amax)``.
 
-    ``scale`` is the quantization step (device scalar); ``fmt`` selects
-    E4M3 or E5M2. ``amax`` is a fresh 1-element float32 tensor — the caller
-    never clears it.
+    ``scale`` is the quantization multiplier (device scalar); ``fmt`` selects
+    E4M3 or E5M2. ``amax`` is a fresh 1-element float32 tensor.
     """
     return fp8_quantize(x, scale, _fmt_int(fmt))
 
@@ -123,123 +133,14 @@ def quantize_bf16(
 def mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
-    sa: torch.Tensor,
-    sb: torch.Tensor,
-    out_dtype: str = "bf16",
-    out_scale: Optional[torch.Tensor] = None,
+    scale: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = False,
 ) -> torch.Tensor:
-    """Pre-quantized FP8 GEMM: ``a @ b * (sa * sb)``.
+    """Pre-quantized FP8 GEMM: ``a @ b * scale``.
 
-    ``a``/``b`` must be FP8 tensors of the same format (E4M3 or E5M2);
-    ``sa``/``sb`` are their quantization steps. ``out_dtype`` is ``"bf16"``
-    (default) or ``"e4m3"`` — FP8 output for layer-to-layer pipelines, which
-    requires ``out_scale`` (the output quantization step).
+    ``a``/``b`` must be FP8 tensors of the same format. ``scale`` is their
+    combined dequantization scale. The result is BF16; FP8 output is a separate
+    quantize operation.
     """
-    if out_dtype not in ("bf16", "e4m3"):
-        raise ValueError(
-            f"unsupported out_dtype {out_dtype!r} (expected 'bf16' or 'e4m3')"
-        )
-    return fp8_gemm(a, b, sa, sb, int(out_dtype == "e4m3"), out_scale)
-
-
-def linear_forward_fp8(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    sx: torch.Tensor,
-    sw: torch.Tensor,
-    fmt: str = "e4m3",
-    bias_scale: Optional[torch.Tensor] = None,
-    x_ring: Optional[torch.Tensor] = None,
-    x_ring_idx: int = 0,
-    x_ring_margin: int = 0,
-    w_ring: Optional[torch.Tensor] = None,
-    w_ring_idx: int = 0,
-    w_ring_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure FP8 linear forward: quantize x/w to ``fmt``, pre-quantized GEMM.
-
-    Returns ``(out, x8, w8, amax_x, amax_w)`` — the quantized operands are
-    handed back so the policy layer can cache the weight quantization while
-    the weight tensor is unchanged (torch autocast's cached_cast analog).
-    ``x8`` is ``[M, K]`` and ``w8`` is ``[N, K]`` (the passed-in ``w`` itself
-    on the pre-quantized path). ``bias`` may be ``None``. For static fp8
-    inference, ``w`` and ``bias`` may arrive pre-quantized to ``fmt``
-    (produced by :func:`quantize_bf16` with their scales as ``sw`` /
-    ``bias_scale``); a pre-quantized ``bias`` requires ``bias_scale``, and
-    its ``amax_w`` comes back 0. The bias is fused into the GEMM epilogue.
-    ``x_ring`` / ``w_ring`` (delayed scaling) are ``[hist | scale | counter]``
-    float32 buffers the quantize kernels finalize in-kernel: the measured
-    amax lands in ``hist[idx]`` and the next step's scale is published on
-    device, replacing the eager hist/max/scale update chain.
-    """
-    fmt8 = _fmt_dtype(fmt)
-    if x.dtype != torch.bfloat16 or w.dtype not in (torch.bfloat16, fmt8):
-        raise TypeError(
-            f"fp8 forward requires bf16 x and bf16-or-{fmt} w, got {x.dtype}/{w.dtype}"
-        )
-    if bias is None:
-        bias = torch.empty(0, device=x.device, dtype=x.dtype)
-    return get_module("fp8_ops").linear_forward_fp8(
-        x,
-        w,
-        bias,
-        sx,
-        sw,
-        _fmt_int(fmt),
-        bias_scale,
-        x_ring,
-        x_ring_idx,
-        x_ring_margin,
-        w_ring,
-        w_ring_idx,
-        w_ring_margin,
-    )
-
-
-def linear_backward_fp8(
-    g: torch.Tensor,
-    x: torch.Tensor,
-    w: torch.Tensor,
-    masks: List[bool],
-    sg: torch.Tensor,
-    sw: torch.Tensor,
-    sx: torch.Tensor,
-    fmt: str = "e5m2",
-    g_ring: Optional[torch.Tensor] = None,
-    g_ring_idx: int = 0,
-    g_ring_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FP8 linear backward; returns ``(grad_input, grad_weight, grad_bias, amax_g)``.
-
-    ``g``/``x``/``w`` may each be bf16 (quantized to ``fmt`` here) or already
-    pre-quantized fp8 matching ``fmt`` — a pre-quantized operand skips its
-    quantize kernel and is read directly by the GEMM (the ``cached_cast``
-    analog for the backward, symmetric with :func:`linear_forward_fp8`'s
-    pre-quantized weight path). ``fmt`` defaults to E5M2 (larger dynamic range
-    for gradients); the two GEMMs run as FP8 tensor-core products sharing a
-    single gradient quantization. ``g_ring`` (delayed scaling) is a
-    ``[hist | scale | counter]`` buffer the g quantize kernel finalizes
-    in-kernel (see :func:`linear_forward_fp8`); a pre-quantized ``g`` does not
-    finalize it and reports ``amax_g = 0``.
-    """
-    f8 = _fmt_dtype(fmt)
-    for name, t in (("g", g), ("x", x), ("w", w)):
-        if t.dtype not in (torch.bfloat16, f8):
-            raise TypeError(
-                f"fp8 backward requires bf16 or pre-quantized {fmt} inputs, "
-                f"got {name}={t.dtype}"
-            )
-    return get_module("fp8_ops").linear_backward_fp8(
-        g,
-        x,
-        w,
-        list(masks),
-        sg,
-        sw,
-        sx,
-        _fmt_int(fmt),
-        g_ring,
-        g_ring_idx,
-        g_ring_margin,
-    )
+    return fp8_gemm(a, b, scale, trans_a, trans_b)

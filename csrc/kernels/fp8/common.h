@@ -69,32 +69,17 @@ struct Fp8GemmTraits {
     static constexpr int kCtaThreads = (BlockM / 64) * (BlockN / 32) * 32;
 };
 
-// Quantize-kernel parameter POD: BF16 -> FP8 with fused amax and optional
-// delayed-scaling ring finalization. Separate from FP8Params so each
-// operator owns exactly the fields it touches (the GEMM never reads amax /
-// ring state). Same NSDMI rationale: amax / ring_state gate optional paths
-// via null checks. Still an aggregate, still trivially copyable.
+// Quantize-kernel parameter POD: float input (bf16 / fp16 / fp32) -> FP8
+// with fused amax.
 struct FP8QuantizeParams {
-    // BF16 input and FP8 output buffers; scale_a is the quantization step
-    // (device scalar). amax_a (may be null) is zero-initialized by the
-    // binding and receives the raw-domain absolute maximum.
-    const void* __restrict__ a_ptr = nullptr;
-    void* __restrict__ out_ptr = nullptr;
-    const float* __restrict__ scale_a = nullptr;
-    float* __restrict__ amax_a = nullptr;
+    // Float input and FP8 output buffers; scale is the quantization
+    // multiplier (device scalar). amax (may be null) is zero-initialized by
+    // the binding and receives the raw-domain absolute maximum.
+    const void* __restrict__ input_ptr = nullptr;
+    void* __restrict__ output_ptr = nullptr;
 
-    // Optional delayed-scaling ring finalization. ring_state packs
-    // [hist[ring_len] | scale | counter] with ring_len = numel - 2. When
-    // non-null and amax_a is set, the last-finishing block records the
-    // measured amax into hist[ring_idx], reduces the window and publishes
-    // the next step's scale (max(hist) / fp8_max / 2^ring_margin) — the
-    // fused replacement for the eager hist-write / max / scale-write chain,
-    // at zero extra launches. The counter slot is a persistent zero-armed
-    // int32 (float bits) electing the last block each launch.
-    float* ring_state = nullptr;
-    int ring_len = 0;
-    int ring_idx = 0;
-    int ring_margin = 0;
+    const float* __restrict__ scale = nullptr;
+    float* __restrict__ amax = nullptr;
 
     // Element count (only the elementwise quantize kernel uses it).
     int total = 0;
@@ -103,24 +88,15 @@ struct FP8QuantizeParams {
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
 // through the pre-quantized GEMM kernels. Each kernel touches only the
 // fields it needs; buffers are raw pointers packed by the torch binding.
-// Pointer members default to null (same NSDMI rationale as AttentionParams:
-// bias / out_scale gate optional paths via null checks, so a partially
-// packed struct must never hold garbage non-null pointers). Still an
-// aggregate, still trivially copyable.
+// Pointer members default to null so optional paths cannot hold garbage.
 struct FP8Params {
     // Inputs: a/b are FP8 for the pre-quantized path. Scales are
     // quantization steps (device scalars).
     const void* __restrict__ a_ptr = nullptr;
     const void* __restrict__ b_ptr = nullptr;
-    const void* __restrict__ bias = nullptr;
-    const float* __restrict__ scale_a = nullptr;
-    const float* __restrict__ scale_b = nullptr;
-    const float* __restrict__ bias_scale = nullptr;
-    // Output: BF16 or FP8 (E4M3). out_scale is the output quantization step
-    // (FP8 output only).
     void* __restrict__ out_ptr = nullptr;
-    const float* __restrict__ out_scale = nullptr;
 
+    const float* __restrict__ scale = nullptr;
     // Shapes. `int` covers every realistic LLM shape; the kernels promote
     // to int64 for all pointer arithmetic.
     int m, n, k;

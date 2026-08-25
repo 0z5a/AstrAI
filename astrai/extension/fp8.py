@@ -36,10 +36,7 @@ from typing import Dict, List, Optional
 import torch
 from torch.library import Library
 
-from astrai.extension.ops.fp8 import (
-    linear_backward_fp8,
-    linear_forward_fp8,
-)
+from astrai.extension.ops.fp8 import mm_fp8, quantize
 
 # Max representable value per FP8 format (E4M3: 448, E5M2: 57344).
 FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -95,11 +92,10 @@ class DynamicScaling(FP8Recipe):
 
 class _ScaleRing:
     """One operand's delayed-scaling state: a float32 buffer
-    ``[hist[n] | scale | counter]`` (views). The quantize kernel's last-finishing
-    block records the measured amax into ``hist[idx]``, reduces the window and
-    publishes the next scale entirely on device — the Python-side write/max/write
-    chain is gone. The counter slot stays int32-zero (float bits) between
-    launches; ``idx`` advances host-side each step.
+    ``[hist[n] | scale | counter]`` (views). ``update`` folds the amax
+    returned by the quantize primitive into ``hist[idx]`` and publishes the
+    next scale from the window; ``idx`` advances host-side each step. The
+    trailing slot is a legacy counter kept for state-buffer compatibility.
     """
 
     __slots__ = ("recipe", "state", "hist", "scale", "idx", "initialized")
@@ -114,7 +110,7 @@ class _ScaleRing:
         self.initialized = False
 
     def advance(self) -> None:
-        """Rotate to the next history slot after an in-kernel finalize."""
+        """Rotate to the next history slot after metadata update."""
         self.idx = (self.idx + 1) % self.hist.numel()
 
     def seed(self, t: torch.Tensor, fmt: str) -> None:
@@ -123,12 +119,15 @@ class _ScaleRing:
         self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
         self.initialized = True
 
+    def update(self, amax: torch.Tensor, fmt: str) -> None:
+        self.hist[self.idx].copy_(amax.reshape(()))
+        self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
+
 
 class FP8TensorMeta:
-    """Per-weight delayed-scaling state: one ring per operand role (``w``/``x``/
-    ``g``). Fused kernels record amax while quantizing, so the scale used at step
-    N reflects amax from steps < N. DynamicScaling never allocates a meta — it
-    measures the current amax inline.
+    """Per-weight delayed-scaling state for ``w``, ``x`` and ``g``.
+
+    DynamicScaling never allocates a meta; it measures the current amax inline.
     """
 
     __slots__ = ("w", "x", "g")
@@ -213,7 +212,11 @@ class FP8State:
         return meta
 
     def reset(self) -> None:
+        """Restore construction defaults (switch, recipe, format) and drop all
+        per-weight metas — a full state reset for tests / reconfiguration."""
         self.default_enabled = False
+        self.default_recipe = DelayedScaling()
+        self.default_format = FP8Format.HYBRID
         self._metas.clear()
 
 
@@ -307,6 +310,11 @@ def _dynamic_scale(t: torch.Tensor, recipe: FP8Recipe, fmt: str) -> torch.Tensor
     return recipe.scale_from_history(amax, fmt)
 
 
+def _is_fp8(dtype: torch.dtype) -> bool:
+    """A pre-quantized weight takes the GEMM directly (no re-quantize)."""
+    return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
 _zero_bias: Dict[Optional[int], torch.Tensor] = {}
 
 
@@ -326,9 +334,9 @@ def fp8_linear_forward(
 ):
     """Scaled fp8 linear forward (called from the aten::linear impl).
 
-    Pure FP8 path for both recipes: quantize x/w with the active scales, run the
-    pre-quantized GEMM. Delayed scaling finalizes the rings inside the quantize
-    kernels (amax folded into the window, next scale published on device);
+    Composed from the two stateless primitives: quantize x/w with the active
+    scales, run the pre-quantized GEMM, add the bias. Delayed scaling folds
+    the returned amax into the history ring and publishes the next scale;
     dynamic scaling measures the current amax itself. Training quantizes the
     weight every step (the optimizer bumps its version, so there is no cast
     cache, matching ``cached_cast``-less behavior).
@@ -337,49 +345,39 @@ def fp8_linear_forward(
     if cfg is None:
         cfg = _current_config()
     fmt = cfg.fp8_format.fwd()
-    margin = cfg.recipe.margin
     if bias is None:
         bias = _empty_bias(x)
-    if isinstance(cfg.recipe, DynamicScaling):  # measure-then-quantize, no state
+    if isinstance(cfg.recipe, DynamicScaling):
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), cfg.recipe, fmt)
         sw = _dynamic_scale(w, cfg.recipe, fmt)
-        out, *_ = linear_forward_fp8(x, w, bias, sx, sw, fmt)
-        return out, sx, sw
+        x8, _ = quantize(x, sx.reciprocal(), fmt)
+        w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
+        out = mm_fp8(x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True).reshape(
+            *x.shape[:-1], w.size(0)
+        )
+        return (out + bias if bias.numel() else out), sx, sw
 
     meta = state.get_weight_meta(w)
     if not meta.w.initialized:
         meta.w.seed(w, fmt)
     if not meta.x.initialized:
         meta.x.seed(x, fmt)
-    # The quantize kernels finalize each ring in-kernel and overwrite the ring's
-    # scale slot, which ALIASES meta.*.scale (a view into the state buffer).
-    # Snapshot the scales first so the GEMM dequantizes with the SAME scale the
-    # operands were quantized with, and so the backward can reuse this step's
-    # scale (gradient consistency with the forward). The ring finalize still
-    # publishes the next step's scale into the original slot.
-    if w.dtype is not torch.bfloat16:  # static pre-quantized weight
-        w_arg, sw_arg, w_ring = w, meta.w.scale, None
+    sx, sw = meta.x.scale.clone(), meta.w.scale.clone()
+    x8, amax_x = quantize(x, sx.reciprocal(), fmt)
+    if _is_fp8(w.dtype):
+        w8, amax_w = w, None
     else:
-        w_arg, sw_arg, w_ring = w, meta.w.scale, meta.w.state
-    sx = meta.x.scale.clone()
-    sw = sw_arg.clone()
-    out, _x8, _w8, _ax, _aw = linear_forward_fp8(
-        x,
-        w_arg,
-        bias,
-        sx,
-        sw,
-        fmt,
-        None,
-        meta.x.state,
-        meta.x.idx,
-        margin,
-        w_ring,
-        meta.w.idx,
-        margin,
+        w8, amax_w = quantize(w, sw.reciprocal(), fmt)
+    out = mm_fp8(x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True).reshape(
+        *x.shape[:-1], w.size(0)
     )
+    if bias.numel():
+        out = out + bias
+    meta.x.update(amax_x, fmt)
+    if amax_w is not None:
+        meta.w.update(amax_w, fmt)
     meta.x.advance()
-    if w_ring is not None:
+    if amax_w is not None:
         meta.w.advance()
     return out, sx, sw
 
@@ -410,37 +408,25 @@ class _LinearFp8(torch.autograd.Function):
     def backward(ctx, g):
         x, w, _sx_fwd, _sw_fwd = ctx.saved_tensors
         fmt = ctx.fmt_bwd
-        # Per-recipe scale/ring selection; both branches share one call below.
         if ctx.is_dynamic:
             sg = _dynamic_scale(g, ctx.recipe, fmt)
             sw = _dynamic_scale(w, ctx.recipe, fmt)
             sx = _dynamic_scale(x, ctx.recipe, fmt)
-            ring, idx = None, 0
         else:
             meta = ctx.meta
             if not meta.g.initialized:
                 meta.g.seed(g, fmt)
-            # Snapshot the g scale before its ring finalize overwrites the slot
-            # (same aliasing as the forward); reuse the forward's w/x scales so
-            # the backward quantizes with the scale the forward actually used.
             sg = meta.g.scale.clone()
-            ring, idx = meta.g.state, meta.g.idx
             sw, sx = _sw_fwd, _sx_fwd
-        grad_x, grad_w, grad_b, _amax_g = linear_backward_fp8(
-            g,
-            x,
-            w,
-            list(ctx.needs_input_grad),
-            sg,
-            sw,
-            sx,
-            fmt,
-            ring,
-            idx,
-            ctx.recipe.margin,
-        )
+        g8, amax_g = quantize(g, sg.reciprocal(), fmt)
+        x8, _ = quantize(x, sx.reciprocal(), fmt)
+        w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
+        grad_x = mm_fp8(g8, w8, sg * sw)  # g8[m,n] @ w8[n,k] natural
+        grad_w = mm_fp8(g8, x8, sg * sx, trans_a=True)  # g8.T @ x8
+        grad_b = g.sum(0).to(torch.bfloat16)
         if not ctx.is_dynamic:
-            meta.g.advance()  # the g quantize kernel finalized the ring in-kernel
+            meta.g.update(amax_g, fmt)
+            meta.g.advance()
         return grad_x, grad_w, grad_b if ctx.needs_input_grad[2] else None
 
 

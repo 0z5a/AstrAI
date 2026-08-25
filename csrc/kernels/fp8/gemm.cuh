@@ -2,7 +2,8 @@
 // FP8 GEMM device code — pure CUDA, no torch. Mirrors the attention kernel
 // layout (attn_*_mma.cuh): kernels take the FP8Params POD, tile shape and
 // FP8 format ride on compile-time template parameters, and launchers are
-// plain functions usable from both the torch binding and pure C tests.
+// plain functions usable from both the torch binding and pure C tests. The
+// quantize kernel lives in quantize.cuh.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -46,128 +47,11 @@ struct fp8_input<FP8Format::E5M2> {
 // FP8 MMA lives in the shared astrai::mma_sync template (common/mma.cuh);
 // instantiate it with fp8_input<Fmt>::type. Accumulates in-place: callers
 // pass the same accumulator array as both `d` and `c`.
-// warp_reduce_max / atomic_max_float (quantize amax) live in
-// common/reduce.cuh; the cp.async pipeline primitives (predicated 16-byte
-// copy, commit_group, wait_group + runtime dispatch) in common/cp_async.cuh.
+// warp_reduce_sum / group_reduce_sum (GEMM) live in common/reduce.cuh; the
+// cp.async pipeline primitives (predicated 16-byte copy, commit_group,
+// wait_group + runtime dispatch) in common/cp_async.cuh.
 
 // ---------------------------------------------------------------------------
-// Quantize kernel: BF16 -> FP8 (E4M3 or E5M2), fused amax over raw values.
-// ---------------------------------------------------------------------------
-
-// Convert one packed bf16 pair to one packed fp8 pair. amax sees the *raw*
-// (unscaled) values; the stored bytes see value * inv. Bit-identical to the
-// scalar __nv_fp8_*(q) constructor path (round-nearest-even + satfinite).
-template <FP8Format Fmt>
-__device__ __forceinline__ unsigned quantize2(unsigned pair, float inv,
-                                              float& amax) {
-    const float lo = __bfloat162float(__ushort_as_bfloat16(pair & 0xffffu));
-    const float hi = __bfloat162float(__ushort_as_bfloat16(pair >> 16));
-    amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
-    constexpr __nv_fp8_interpretation_t kFmt =
-        Fmt == FP8Format::E5M2 ? __NV_E5M2 : __NV_E4M3;
-    return static_cast<unsigned>(__nv_cvt_float2_to_fp8x2(
-        make_float2(lo * inv, hi * inv), __NV_SATFINITE, kFmt));
-}
-
-template <FP8Format Fmt>
-__global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
-    const float inv = 1.0f / *p.scale_a;
-    const auto* x = reinterpret_cast<const __nv_bfloat16*>(p.a_ptr);
-    void* x8 = p.out_ptr;
-    float* amax = p.amax_a;
-    float local_amax = 0.0f;
-    const int64_t stride = (int64_t)blockDim.x * gridDim.x;
-
-    // Vectorized body: 8 bf16 (16B load) -> 8 fp8 (8B store) per step. Torch
-    // allocations are >=16B aligned and the binding passes freshly allocated
-    // contiguous buffers, so element 0 keeps the uint4/uint2 accesses
-    // natural; a misaligned base (contiguous view with an odd storage
-    // offset) falls back to the scalar loop below via total_vec = 0.
-    const bool aligned =
-        ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(x8)) & 15) ==
-        0;
-    const int64_t total_vec = aligned ? p.total / 8 : 0;
-    const uint4* xv = reinterpret_cast<const uint4*>(x);
-    uint2* o8 = reinterpret_cast<uint2*>(x8);
-    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total_vec;
-         i += stride) {
-        const uint4 v = xv[i];
-        const unsigned pair[4] = {v.x, v.y, v.z, v.w};
-        unsigned packed[2] = {0u, 0u};
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            packed[j >> 1] |= quantize2<Fmt>(pair[j], inv, local_amax)
-                              << (16 * (j & 1));
-        o8[i] = make_uint2(packed[0], packed[1]);
-    }
-    // Scalar tail (and full fallback for misaligned bases).
-    for (int64_t i = total_vec * 8 + blockIdx.x * blockDim.x + threadIdx.x;
-         i < p.total; i += stride) {
-        const float f = __bfloat162float(x[i]);
-        local_amax = fmaxf(local_amax, fabsf(f));
-        if constexpr (Fmt == FP8Format::E5M2) {
-            reinterpret_cast<__nv_fp8_e5m2*>(x8)[i] = __nv_fp8_e5m2(f * inv);
-        } else {
-            reinterpret_cast<__nv_fp8_e4m3*>(x8)[i] = __nv_fp8_e4m3(f * inv);
-        }
-    }
-    if (amax) {
-        local_amax = warp_reduce_max(local_amax);
-        __shared__ float slots[32];
-        if ((threadIdx.x & 31) == 0) slots[threadIdx.x >> 5] = local_amax;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float v = 0.0f;
-            for (int w = 0; w < (blockDim.x >> 5); ++w) v = fmaxf(v, slots[w]);
-            atomic_max_float(amax, v);
-        }
-    }
-    if (p.ring_state && amax) {
-        // Delayed-scaling ring finalization as a last-block epilogue (the
-        // CUDA threadFenceReduction pattern): the fence + counter elect the
-        // final block once every block's atomic_max above is visible; warp 0
-        // folds the fresh amax into the window, reduces it and publishes the
-        // next step's scale, then re-arms the counter for the next launch.
-        // __fdiv_rn / ldexpf keep the scale bit-identical to the eager
-        // (peak / fp8_max) / 2^margin fp32 chain despite --use_fast_math.
-        __threadfence();
-        __shared__ bool ring_last;
-        if (threadIdx.x == 0)
-            ring_last = atomicAdd(reinterpret_cast<int*>(p.ring_state +
-                                                        p.ring_len + 1),
-                                  1) == gridDim.x - 1;
-        __syncthreads();
-        if (ring_last && threadIdx.x < 32) {
-            float* hist = p.ring_state;
-            const int lane = threadIdx.x;
-            float v = 0.0f;
-            if (lane < p.ring_len) v = hist[lane];
-            if (lane == p.ring_idx) {
-                v = *amax;  // the global amax is final now
-                hist[lane] = v;
-            }
-            // Windows longer than one warp (atypical) fold the tail.
-            for (int i = lane + 32; i < p.ring_len; i += 32) {
-                float h = hist[i];
-                if (i == p.ring_idx) {
-                    h = *amax;
-                    hist[i] = h;
-                }
-                v = fmaxf(v, h);
-            }
-            const float peak = warp_reduce_max(v);
-            if (lane == 0) {
-                constexpr float kFmtMax =
-                    Fmt == FP8Format::E5M2 ? 57344.0f : 448.0f;
-                p.ring_state[p.ring_len] = fmaxf(
-                    ldexpf(__fdiv_rn(peak, kFmtMax), -p.ring_margin), 1e-12f);
-                __threadfence();
-                // Re-arm the counter (0.0f bits == int32 0).
-                p.ring_state[p.ring_len + 1] = 0.0f;
-            }
-        }
-    }
-}
 
 // Swizzled address inside a flat [rows * K] staging tile: the 16-byte chunk
 // index is XORed with a row-dependent slice so a warp's fragment load (8
@@ -446,8 +330,7 @@ struct Fp8GemmSmem {
 // (mt x nt = 4x4 MMA each). The 64x128 variant runs 4 warps / 128 threads and
 // exists for small-M calls: m <= 64 wastes half of every 128-row CTA, so the
 // launcher dispatches to it there (see launch_fp8_gemm).
-template <typename Traits, bool OutFp8 = false, 
-        typename LayoutA = RowMajor, typename LayoutB = RowMajor, bool kGroupRaster = false,
+template <typename Traits, typename LayoutA = RowMajor, typename LayoutB = RowMajor, bool kGroupRaster = false,
         bool kBStaged = true>
 __global__ void __launch_bounds__(Traits::kCtaThreads,
                                   Fp8GemmSmem<Traits, LayoutA, LayoutB,
@@ -495,7 +378,6 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     const auto* a = reinterpret_cast<const T8*>(p.a_ptr);
     const auto* b = reinterpret_cast<const T8*>(p.b_ptr);
     auto* out_bf16 = reinterpret_cast<__nv_bfloat16*>(p.out_ptr);
-    auto* out_fp8 = reinterpret_cast<__nv_fp8_e4m3*>(p.out_ptr);
     const int64_t m = p.m, n = p.n, k = p.k;
     const int64_t a_ld = p.a_ld, b_ld = p.b_ld;
 
@@ -537,8 +419,7 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         (int64_t)block_n * kBlockN + warp_n * 32 + thread_in_group * 2;
     const int a_row0 = warp_m * 64;  // + mt * 16 in the loop
     const int b_row0 = warp_n * 32;  // + nt * 8
-    const float sa = *p.scale_a;
-    const float sb = *p.scale_b;
+    const float scale = *p.scale;
     float acc[4][4][4] = {};  // [nt][mt][acc]
 
     // Both operands end up in the canonical [M][kK] / [N][kK] shared tiles
@@ -742,49 +623,25 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         }
     }
 
-    const float output_scale = sa * sb;
-    // Fused bias: BF16 raw values, or FP8 storage dequantized by its own
-    // scale (bias_scale != null selects the FP8 path; the format follows the
-    // kernel's Traits). Added in real units after the operand dequantization
-    // and before any output quantization.
-    const auto* bias16 = static_cast<const __nv_bfloat16*>(p.bias);
-    const auto* bias8 = static_cast<const T8*>(p.bias);
-    auto bias_val = [&](int64_t col) -> float {
-        if (p.bias == nullptr || col >= n) return 0.0f;
-        if (p.bias_scale == nullptr) return __bfloat162float(bias16[col]);
-        return __half2float(__half(bias8[col])) * *p.bias_scale;
-    };
+    const float output_scale = scale;
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt) {
         const int64_t col = output_col + nt * 8;
-        const float b0 = bias_val(col);
-        const float b1 = bias_val(col + 1);
         // Per-row store: FP8 packs two adjacent columns into one 16-bit
         // write, BF16 into one 32-bit __nv_bfloat162 (single cvt+pack
         // instruction); boundary or unaligned columns fall back to scalar
         // converts so a pack never crosses the row edge or misaligns.
         auto store_out = [&](int64_t row, float v0, float v1) {
             if (row >= m) return;
-            const float r0 = v0 * output_scale + b0;
-            const float r1 = v1 * output_scale + b1;
-            if constexpr (OutFp8) {
-                if (col + 1 < n) {
-                    *reinterpret_cast<unsigned short*>(out_fp8 + row * n + col) =
-                        static_cast<unsigned short>(__nv_cvt_float2_to_fp8x2(
-                            make_float2(r0 * *p.out_scale, r1 * *p.out_scale),
-                            __NV_SATFINITE, __NV_E4M3));
-                } else {
-                    out_fp8[row * n + col] = __nv_fp8_e4m3(r0 * *p.out_scale);
-                }
+            const float r0 = v0 * output_scale;
+            const float r1 = v1 * output_scale;
+            auto* dst = out_bf16 + row * n + col;
+            if (col + 1 < n && (reinterpret_cast<uintptr_t>(dst) & 3) == 0) {
+                *reinterpret_cast<__nv_bfloat162*>(dst) =
+                    __floats2bfloat162_rn(r0, r1);
             } else {
-                auto* dst = out_bf16 + row * n + col;
-                if (col + 1 < n && (reinterpret_cast<uintptr_t>(dst) & 3) == 0) {
-                    *reinterpret_cast<__nv_bfloat162*>(dst) =
-                        __floats2bfloat162_rn(r0, r1);
-                } else {
-                    dst[0] = __float2bfloat16(r0);
-                    if (col + 1 < n) dst[1] = __float2bfloat16(r1);
-                }
+                dst[0] = __float2bfloat16(r0);
+                if (col + 1 < n) dst[1] = __float2bfloat16(r1);
             }
         };
 #pragma unroll
@@ -802,16 +659,6 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
 // ---------------------------------------------------------------------------
 // Launchers — pure CUDA (no torch), usable from the binding and pure C tests.
 // ---------------------------------------------------------------------------
-
-template <FP8Format Fmt>
-void launch_fp8_quantize(const FP8QuantizeParams& p, cudaStream_t stream) {
-    constexpr int kThreads = 256;
-    // One block per 256 vectors (8 elements each); at least one block so the
-    // scalar tail of a tiny / misaligned tensor is still covered.
-    int64_t blocks = (p.total / 8 + kThreads - 1) / kThreads;
-    if (blocks < 1) blocks = 1;
-    fp8_quantize_kernel<Fmt><<<blocks, kThreads, 0, stream>>>(p);
-}
 
 // Launch one kernel instantiation with its shared-memory budget: stages live
 // in dynamic smem, so budgets beyond the 48KB static limit opt in once per
@@ -851,7 +698,7 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
 // dX ~39 TF staged vs ~38 direct).
 constexpr int64_t kCrossStageMinK = 8192;
 
-template <FP8Format Fmt, bool OutFp8 = false, typename LayoutA = RowMajor,
+template <FP8Format Fmt, typename LayoutA = RowMajor,
           typename LayoutB = RowMajor, int kK = 64, int Stages = 2,
           bool GroupRaster = std::is_same_v<LayoutA, ColMajor> || std::is_same_v<LayoutB, ColMajor>>
 void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
@@ -860,24 +707,24 @@ void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
     if (p.m <= 64) {
         using Traits = Fp8GemmTraits<Fmt, 64, 128, kK, Stages>;
         if (b_staged)
-            launch_with_smem<fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB,
+            launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
                                              GroupRaster, true>>(
                 Fp8GemmSmem<Traits, LayoutA, LayoutB, true>::kBytes, grid,
                 dim3(Traits::kCtaThreads), stream, p);
         else
-            launch_with_smem<fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB,
+            launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
                                              GroupRaster, false>>(
                 Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
                 dim3(Traits::kCtaThreads), stream, p);
     } else {
         using Traits = Fp8GemmTraits<Fmt, 128, 128, kK, Stages>;
         if (b_staged)
-            launch_with_smem<fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB,
+            launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
                                              GroupRaster, true>>(
                 Fp8GemmSmem<Traits, LayoutA, LayoutB, true>::kBytes, grid,
                 dim3(Traits::kCtaThreads), stream, p);
         else
-            launch_with_smem<fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB,
+            launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
                                              GroupRaster, false>>(
                 Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
                 dim3(Traits::kCtaThreads), stream, p);

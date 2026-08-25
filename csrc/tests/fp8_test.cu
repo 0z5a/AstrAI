@@ -175,15 +175,13 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
                           int k, int a_ld, int b_ld) {
     __nv_fp8_e4m3 *da, *db;
     __nv_bfloat16* dout;
-    float *dsa, *dsb;
+    float* dscale;
     cudaMalloc(&da, (size_t)m * k);
     cudaMalloc(&db, (size_t)n * k);
     cudaMalloc(&dout, (size_t)m * n * 2);
-    cudaMalloc(&dsa, 4);
-    cudaMalloc(&dsb, 4);
+    cudaMalloc(&dscale, 4);
     float one = 1.0f;
-    cudaMemcpy(dsa, &one, 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dsb, &one, 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dscale, &one, 4, cudaMemcpyHostToDevice);
     // quantize inputs to e4m3 on host and upload byte-by-byte
     std::vector<unsigned char> qa(m * k), qb(n * k);
     for (int i = 0; i < m * k; ++i) {
@@ -201,14 +199,13 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
     p.a_ptr = da;
     p.b_ptr = db;
     p.out_ptr = dout;
-    p.scale_a = dsa;
-    p.scale_b = dsb;
+    p.scale = dscale;
     p.m = m;
     p.n = n;
     p.k = k;
     p.a_ld = a_ld;
     p.b_ld = b_ld;
-    launch_fp8_gemm<FP8Format::E4M3, false, LA, LB, kK, Stages>(p, 0);
+    launch_fp8_gemm<FP8Format::E4M3, LA, LB, kK, Stages>(p, 0);
     cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         printf("  CUDA err: %s\n", cudaGetErrorString(e));
@@ -247,8 +244,7 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
     cudaFree(da);
     cudaFree(db);
     cudaFree(dout);
-    cudaFree(dsa);
-    cudaFree(dsb);
+    cudaFree(dscale);
     return ok;
 }
 

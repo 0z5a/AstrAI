@@ -47,16 +47,17 @@ style as attention, but split into **three** files:
 | File | Role |
 |------|------|
 | `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `FP8Params` POD — no torch |
-| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_quantize_kernel` (BF16→FP8 + amax), `fp8_gemm_kernel` (pre-quantized GEMM, 128×64 CTA / 64×16 warp / 3-stage cp.async) — no torch |
+| `fp8/quantize.cuh` | pure-CUDA device code: `fp8_quantize_kernel<Fmt, InT>` (bf16/fp16/fp32 → FP8 + amax, `quant_in_traits<InT>` vectorized unpack) — no torch |
+| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_gemm_kernel` (pre-quantized GEMM, 128×128 CTA / 64×32 warp / multi-stage cp.async, transposed-operand layouts) — no torch |
 | `fp8/ops.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_ops` |
 
-Scale semantics follow `torch._scaled_mm` (quantization step size: divide by
-`scale`; the kernel computes the reciprocal internally — the interface never
-takes `*_inv`). `amax` is always returned in the original bf16 domain.
+Scale semantics: `quantize` takes the quantization *multiplier*, `mm_fp8`
+takes the combined dequant scale (`sa * sb`); the strategy layer passes
+`scale.reciprocal()` / `sa * sb` respectively. `amax` is always returned in
+the original input domain.
 
 Python layer (two levels): `astrai/extension/ops/fp8.py` provides stateless
-primitives (`quantize_bf16` / `mm_fp8` / `linear_forward_fp8` /
-`linear_backward_fp8`) via `torch.library.custom_op`, and
+primitives (`quantize` / `mm_fp8`) via `torch.library.custom_op`, and
 `astrai/extension/fp8.py` is the strategy layer (`fp8_autocast`, delayed /
 dynamic scaling recipes, `fp8_linear_forward/backward` wiring `aten::linear`
 on CUDA). See the FP8 section in `AGENTS.md` for full detail.
