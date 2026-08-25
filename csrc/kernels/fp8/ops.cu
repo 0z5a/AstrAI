@@ -71,30 +71,34 @@ void pack_gemm_params(FP8Params& p, const void* a, const void* b, void* out,
     p.out_scale = out_scale ? out_scale->data_ptr<float>() : nullptr;
     p.bias = bias;
     p.bias_scale = bias_scale ? bias_scale->data_ptr<float>() : nullptr;
-    p.amax_a = nullptr;
-    p.amax_b = nullptr;
     p.m = static_cast<int>(m);
     p.n = static_cast<int>(n);
     p.k = static_cast<int>(k);
     p.a_ld = static_cast<int>(a_ld);
     p.b_ld = static_cast<int>(b_ld);
-    p.total = 0;
 }
 
-void pack_quantize_params(FP8Params& p, const void* x, void* x8,
+// Pack the quantize params, optionally wiring the delayed-scaling ring.
+// ring (may be null) packs [hist[len] | scale | counter]; len/margin come
+// from the active recipe and idx is the caller's slot for this step.
+void pack_quantize_params(FP8QuantizeParams& p, const void* x, void* x8,
                           const torch::Tensor& scale, torch::Tensor* amax,
-                          int64_t total) {
+                          const torch::Tensor* ring, int64_t ring_idx,
+                          int64_t ring_margin, int64_t total) {
     p.a_ptr = x;
-    p.b_ptr = nullptr;
     p.out_ptr = x8;
     p.scale_a = scale.data_ptr<float>();
-    p.scale_b = nullptr;
-    p.out_scale = nullptr;
-    p.bias = nullptr;
     p.amax_a = amax ? amax->data_ptr<float>() : nullptr;
-    p.amax_b = nullptr;
-    p.m = p.n = p.k = 0;
-    p.a_ld = p.b_ld = 0;
+    if (ring && ring->defined()) {
+        TORCH_CHECK(ring->is_cuda() && ring->scalar_type() == torch::kFloat32 &&
+                        ring->numel() >= 3 && ring->is_contiguous(),
+                    "ring must be a contiguous CUDA float32 tensor packing "
+                    "[hist | scale | counter]");
+        p.ring_state = ring->data_ptr<float>();
+        p.ring_len = static_cast<int>(ring->numel() - 2);
+        p.ring_idx = static_cast<int>(ring_idx);
+        p.ring_margin = static_cast<int>(ring_margin);
+    }
     p.total = static_cast<int>(total);
 }
 
@@ -152,11 +156,11 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_bf16(torch::Tensor x,
     auto x_c = x.contiguous();
     auto x8 = torch::empty_like(
         x_c, x_c.options().dtype(fmt ? torch::kFloat8_e5m2
-                                     : torch::kFloat8_e4m3fn));
+                                      : torch::kFloat8_e4m3fn));
     auto amax = torch::zeros({1}, x_c.options().dtype(torch::kFloat32));
-    FP8Params p;
+    FP8QuantizeParams p;
     pack_quantize_params(p, x_c.data_ptr(), x8.data_ptr(), scale, &amax,
-                         x_c.numel());
+                         nullptr, 0, 0, x_c.numel());
     if (fmt) {
         launch_fp8_quantize<FP8Format::E5M2>(p, stream.stream());
     } else {
@@ -228,14 +232,19 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor sa,
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
     torch::Tensor x, torch::Tensor w, torch::Tensor bias, torch::Tensor sx,
-    torch::Tensor sw, int64_t fmt,
-    c10::optional<torch::Tensor> bias_scale) {
+    torch::Tensor sw, int64_t fmt, c10::optional<torch::Tensor> bias_scale,
+    c10::optional<torch::Tensor> x_ring, int64_t x_ring_idx,
+    int64_t x_ring_margin, c10::optional<torch::Tensor> w_ring,
+    int64_t w_ring_idx, int64_t w_ring_margin) {
     // Pure FP8 forward: quantize x/w (fmt: 0 = E4M3, 1 = E5M2), then the
     // pre-quantized GEMM; the dequantized BF16 output gets the bias added.
     // amax_x / amax_w come from the quantize kernels (zero-initialized here;
     // a pre-quantized w reports amax_w = 0 — nothing to feed a delayed ring).
     // w may itself be pre-quantized fp8 storage matching fmt (static
     // inference weights): the weight quantize is skipped, amax_w stays 0.
+    // When x_ring / w_ring are given (delayed scaling), the quantize kernels
+    // finalize them in-kernel: the returned amax is already folded into the
+    // ring window and the next step's scale is published on device.
     TORCH_CHECK(x.is_cuda() && w.is_cuda(), "CUDA tensors required");
     const auto f8opt = fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn;
     const bool w_prequant = w.scalar_type() == f8opt;
@@ -272,9 +281,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
     auto out = torch::empty({m, n}, x_c.options());
 
     auto quantize = [&](const torch::Tensor& src, torch::Tensor& dst,
-                        const torch::Tensor& scale, torch::Tensor* amax) {
-        FP8Params qp;
+                        const torch::Tensor& scale, torch::Tensor* amax,
+                        const c10::optional<torch::Tensor>& ring,
+                        int64_t ring_idx, int64_t ring_margin) {
+        FP8QuantizeParams qp;
         pack_quantize_params(qp, src.data_ptr(), dst.data_ptr(), scale, amax,
+                             ring ? &*ring : nullptr, ring_idx, ring_margin,
                              src.numel());
         if (fmt) {
             launch_fp8_quantize<FP8Format::E5M2>(qp, stream.stream());
@@ -282,13 +294,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
             launch_fp8_quantize<FP8Format::E4M3>(qp, stream.stream());
         }
     };
-    quantize(x_c, x8, sx, &amax_x);
+    quantize(x_c, x8, sx, &amax_x, x_ring, x_ring_idx, x_ring_margin);
     // Static inference weights arrive pre-quantized (w8 storage + its scale);
     // only freshly-loaded bf16 weights quantize here.
     torch::Tensor w8 = w_prequant
                            ? w_c
                            : torch::empty({n, k}, x_c.options().dtype(f8opt));
-    if (!w_prequant) quantize(w_c, w8, sw, &amax_w);
+    if (!w_prequant)
+        quantize(w_c, w8, sw, &amax_w, w_ring, w_ring_idx, w_ring_margin);
 
     FP8Params p;
     // Forward is the NT layout: A = x8 [M,K] (a_ld = k), B = w8 [N,K]
@@ -315,10 +328,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
                     std::vector<int64_t> masks, torch::Tensor sg,
-                    torch::Tensor sw, torch::Tensor sx, int64_t fmt) {
+                    torch::Tensor sw, torch::Tensor sx, int64_t fmt,
+                    c10::optional<torch::Tensor> g_ring, int64_t g_ring_idx,
+                    int64_t g_ring_margin) {
     // Pre-quantized FP8 backward: grad is quantized once (E4M3 or E5M2 per
     // `fmt`), then dX / dW run as FP8 tensor-core GEMMs sharing g8.
-    // Returns (grad_input, grad_weight, grad_bias, amax_g).
+    // Returns (grad_input, grad_weight, grad_bias, amax_g). With g_ring
+    // (delayed scaling), the g quantize kernel finalizes the ring in-kernel
+    // (amax folded into the window, next step's scale published on device);
+    // the w/x quantizes for dX / dW never touch rings — each operand's ring
+    // is finalized exactly once per step (by the forward or this kernel).
     TORCH_CHECK(g.is_cuda() && x.is_cuda() && w.is_cuda(), "CUDA tensors required");
     TORCH_CHECK(g.scalar_type() == torch::kBFloat16 &&
                     x.scalar_type() == torch::kBFloat16 &&
@@ -346,9 +365,12 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
                      : g.options().dtype(torch::kFloat8_e4m3fn);
 
     auto quantize = [&](const torch::Tensor& src, torch::Tensor& dst,
-                        const torch::Tensor& scale, torch::Tensor* amax) {
-        FP8Params qp;
+                        const torch::Tensor& scale, torch::Tensor* amax,
+                        const c10::optional<torch::Tensor>& ring,
+                        int64_t ring_idx, int64_t ring_margin) {
+        FP8QuantizeParams qp;
         pack_quantize_params(qp, src.data_ptr(), dst.data_ptr(), scale, amax,
+                             ring ? &*ring : nullptr, ring_idx, ring_margin,
                              src.numel());
         if (fmt) {
             launch_fp8_quantize<FP8Format::E5M2>(qp, stream.stream());
@@ -375,13 +397,13 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     torch::Tensor g8;
     if (masks[0] || masks[1]) {
         g8 = torch::empty({m, n}, f8opt);
-        quantize(g_c, g8, sg, &amax_g);
+        quantize(g_c, g8, sg, &amax_g, g_ring, g_ring_idx, g_ring_margin);
     }
     // dX = g @ w: A = g8 [M,N] (contract over N), B = w8 [N,K] read transposed
     // (b[p*b_ld + n] = w[p,n]); out = [M,K], a_ld = N, b_ld = K, contract = N.
     if (masks[0]) {
         auto w8 = torch::empty({n, k}, f8opt);
-        quantize(w_c, w8, sw, nullptr);
+        quantize(w_c, w8, sw, nullptr, c10::nullopt, 0, 0);
         auto grad_input_2d = grad_input.reshape({m, k});
         FP8Params gp;
         pack_gemm_params(gp, g8.data_ptr(), w8.data_ptr(),
@@ -394,7 +416,7 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     // b_ld = K, contract = M.
     if (masks[1]) {
         auto x8 = torch::empty({m, k}, f8opt);
-        quantize(x_c, x8, sx, nullptr);
+        quantize(x_c, x8, sx, nullptr, c10::nullopt, 0, 0);
         FP8Params gp;
         pack_gemm_params(gp, g8.data_ptr(), x8.data_ptr(),
                          grad_weight.data_ptr(), sg, sx, nullptr, nullptr,
@@ -423,12 +445,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("linear_forward_fp8", &linear_forward_fp8, py::arg("x"),
           py::arg("w"), py::arg("bias"), py::arg("sx"), py::arg("sw"),
           py::arg("fmt") = 0, py::arg("bias_scale") = py::none(),
+          py::arg("x_ring") = py::none(), py::arg("x_ring_idx") = 0,
+          py::arg("x_ring_margin") = 0, py::arg("w_ring") = py::none(),
+          py::arg("w_ring_idx") = 0, py::arg("w_ring_margin") = 0,
           "Pure FP8 linear forward: quantize x/w, pre-quantized GEMM with the "
           "bias fused into the epilogue; w and bias may be pre-quantized fp8 "
           "matching fmt (static inference path; fp8 bias requires bias_scale);"
-          " returns (out, amax_x, amax_w)");
+          " x_ring/w_ring optionally finalize a delayed-scaling ring "
+          "([hist | scale | counter] float32 buffer) in-kernel; returns "
+          "(out, amax_x, amax_w)");
     m.def("linear_backward_fp8", &linear_backward_fp8, py::arg("g"),
           py::arg("x"), py::arg("w"), py::arg("masks"), py::arg("sg"),
           py::arg("sw"), py::arg("sx"), py::arg("fmt"),
-          "FP8 linear backward; returns (grad_input, grad_weight, grad_bias, amax_g)");
+          py::arg("g_ring") = py::none(), py::arg("g_ring_idx") = 0,
+          py::arg("g_ring_margin") = 0,
+          "FP8 linear backward; g_ring optionally finalizes the gradient's "
+          "delayed-scaling ring in-kernel; returns (grad_input, grad_weight, "
+          "grad_bias, amax_g)");
 }

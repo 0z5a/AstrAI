@@ -87,6 +87,51 @@ def test_quantize_bf16_e5m2_format():
 
 
 @skip_no_fp8
+def test_quantize_ring_in_kernel_finalize():
+    """The quantize kernel finalizes the delayed-scaling ring in-kernel: the
+    measured amax lands in hist[idx], the window reduces to the next step's
+    scale on device, and the counter re-arms for the next launch."""
+    from astrai.extension.fp8 import _ScaleRing
+
+    torch.manual_seed(21)
+    dev = torch.device("cuda")
+    ring = _ScaleRing(dev, DelayedScaling(history_len=4, margin=0))
+    x0 = torch.randn(256, 256, device=dev, dtype=torch.bfloat16)
+    w = torch.randn(256, 256, device=dev, dtype=torch.bfloat16)
+    sw = torch.tensor([1.0], device=dev)
+    ring.seed(x0, "e4m3")
+    hist0 = ring.hist.clone()
+
+    # Step over three fresh tensors: each launch folds its amax into
+    # hist[idx] and publishes max(hist)/448 as the next scale.
+    idx = 0
+    for _ in range(3):
+        x = torch.randn(256, 256, device=dev, dtype=torch.bfloat16) * (2.0 + 4.0 * _)
+        _ = linear_forward_fp8(
+            x,
+            w,
+            None,
+            ring.scale,
+            sw,
+            "e4m3",
+            None,
+            ring.state,
+            idx,
+            0,
+        )
+        torch.cuda.synchronize()
+        expected_hist = hist0.clone()
+        expected_hist[idx] = x.abs().amax().float()
+        torch.testing.assert_close(ring.hist, expected_hist)
+        expected_scale = (expected_hist.max() / 448.0).reshape(1)
+        torch.testing.assert_close(ring.scale, expected_scale, rtol=1e-6, atol=1e-12)
+        # counter re-armed to int32 zero
+        assert ring.state[-1].view(torch.int32).item() == 0
+        hist0 = expected_hist.clone()
+        idx = (idx + 1) % 4
+
+
+@skip_no_fp8
 def test_fp8_linear_forward_and_backward():
     torch.manual_seed(7)
     m, n, k = 19, 13, 37
@@ -196,9 +241,9 @@ def test_fp8_linear_backward_outside_autocast():
     calls = {"bwd": 0}
     orig = f8mod.linear_backward_fp8
 
-    def spy(g, xx, ww, masks, sg, sw, sx, fmt="e5m2"):
+    def spy(*args, **kwargs):
         calls["bwd"] += 1
-        return orig(g, xx, ww, masks, sg, sw, sx, fmt)
+        return orig(*args, **kwargs)
 
     f8mod.linear_backward_fp8 = spy
     try:
@@ -331,14 +376,20 @@ def test_fp8_autocast_context():
 
 
 def test_fp8_tensor_meta_delayed_update():
-    """Meta seeds from data and refreshes the scale from the amax ring."""
+    """Meta seeds from data; hist/scale are packed views of one state buffer."""
     meta = FP8TensorMeta(torch.device("cpu"), DelayedScaling(history_len=4, margin=0))
     w = torch.randn(8, 8)
     meta.w.seed(w, "e4m3")
     assert meta.w.initialized
     torch.testing.assert_close(meta.w.scale, (w.abs().amax() / 448.0).reshape(1))
-    meta.w.update(torch.tensor([4.0]), "e4m3")
-    torch.testing.assert_close(meta.w.scale, torch.tensor(4.0 / 448.0).reshape(1))
+    # [hist | scale | counter] packing: views alias the single state buffer.
+    assert meta.w.state.numel() == 4 + 2
+    assert meta.w.hist.data_ptr() == meta.w.state.data_ptr()
+    assert meta.w.scale.data_ptr() == meta.w.state[4:].data_ptr()
+    # counter slot stays int32-zero (float bits) between launches
+    assert meta.w.state[-1].view(torch.int32).item() == 0
+    meta.w.advance()
+    assert meta.w.idx == 1
 
 
 def test_quantize_bf16_cpu_fallback():

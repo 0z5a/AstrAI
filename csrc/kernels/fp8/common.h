@@ -63,16 +63,47 @@ struct Fp8GemmTraits {
     static constexpr float kFp8Max = kIsE5M2 ? 57344.0f : 448.0f;
 };
 
+// Quantize-kernel parameter POD: BF16 -> FP8 with fused amax and optional
+// delayed-scaling ring finalization. Separate from FP8Params so each
+// operator owns exactly the fields it touches (the GEMM never reads amax /
+// ring state). Same NSDMI rationale: amax / ring_state gate optional paths
+// via null checks. Still an aggregate, still trivially copyable.
+struct FP8QuantizeParams {
+    // BF16 input and FP8 output buffers; scale_a is the quantization step
+    // (device scalar). amax_a (may be null) is zero-initialized by the
+    // binding and receives the raw-domain absolute maximum.
+    const void* __restrict__ a_ptr = nullptr;
+    void* __restrict__ out_ptr = nullptr;
+    const float* __restrict__ scale_a = nullptr;
+    float* __restrict__ amax_a = nullptr;
+
+    // Optional delayed-scaling ring finalization. ring_state packs
+    // [hist[ring_len] | scale | counter] with ring_len = numel - 2. When
+    // non-null and amax_a is set, the last-finishing block records the
+    // measured amax into hist[ring_idx], reduces the window and publishes
+    // the next step's scale (max(hist) / fp8_max / 2^ring_margin) — the
+    // fused replacement for the eager hist-write / max / scale-write chain,
+    // at zero extra launches. The counter slot is a persistent zero-armed
+    // int32 (float bits) electing the last block each launch.
+    float* ring_state = nullptr;
+    int ring_len = 0;
+    int ring_idx = 0;
+    int ring_margin = 0;
+
+    // Element count (only the elementwise quantize kernel uses it).
+    int total = 0;
+};
+
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
-// through quantize / fused / pre-quantized kernels. Each kernel touches only
-// the fields it needs; buffers are raw pointers packed by the torch binding.
+// through the pre-quantized GEMM kernels. Each kernel touches only the
+// fields it needs; buffers are raw pointers packed by the torch binding.
 // Pointer members default to null (same NSDMI rationale as AttentionParams:
-// bias / amax / out_scale gate optional paths via null checks, so a partially
+// bias / out_scale gate optional paths via null checks, so a partially
 // packed struct must never hold garbage non-null pointers). Still an
 // aggregate, still trivially copyable.
 struct FP8Params {
-    // Inputs: a/b are BF16 for the fused (quantize-in-GEMM) path, FP8 for
-    // the pre-quantized path. Scales are quantization steps (device scalars).
+    // Inputs: a/b are FP8 for the pre-quantized path. Scales are
+    // quantization steps (device scalars).
     const void* __restrict__ a_ptr = nullptr;
     const void* __restrict__ b_ptr = nullptr;
     const void* __restrict__ bias = nullptr;
@@ -84,23 +115,16 @@ struct FP8Params {
     void* __restrict__ out_ptr = nullptr;
     const float* __restrict__ out_scale = nullptr;
 
-    // Fused forward extras: bias (may be null) and amax slots (may be null).
-    float* __restrict__ amax_a = nullptr;
-    float* __restrict__ amax_b = nullptr;
-
-    // Shapes. total is only used by the elementwise quantize kernel. `int`
-    // covers every realistic LLM shape; the kernels promote to int64 for all
-    // pointer arithmetic.
+    // Shapes. `int` covers every realistic LLM shape; the kernels promote
+    // to int64 for all pointer arithmetic.
     int m, n, k;
 
-    // Physical leading dimensions (column count, i.e. row stride) of A and B.
-    // For a non-transposed operand the stride equals the contract dim; for a
-    // transposed operand it is the operand's own column count. The binding
-    // packs these so the kernel reads both buffers either naturally or
-    // transposed depending on the LayoutA/LayoutB tags (see gemm.cuh).
+    // Physical leading dimensions (column count, i.e. row stride) of A and
+    // B. For a non-transposed operand the stride equals the contract dim;
+    // for a transposed operand it is the operand's own column count. The
+    // binding packs these so the kernel reads both buffers either naturally
+    // or transposed depending on the LayoutA/LayoutB tags (see gemm.cuh).
     int a_ld, b_ld;
-
-    int total;
 };
 
 }  // namespace fp8

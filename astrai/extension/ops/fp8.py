@@ -138,7 +138,21 @@ def mm_fp8(
     return fp8_gemm(a, b, sa, sb, int(out_dtype == "e4m3"), out_scale)
 
 
-def linear_forward_fp8(x, w, bias, sx, sw, fmt: str = "e4m3", bias_scale=None):
+def linear_forward_fp8(
+    x,
+    w,
+    bias,
+    sx,
+    sw,
+    fmt: str = "e4m3",
+    bias_scale=None,
+    x_ring=None,
+    x_ring_idx: int = 0,
+    x_ring_margin: int = 0,
+    w_ring=None,
+    w_ring_idx: int = 0,
+    w_ring_margin: int = 0,
+):
     """Pure FP8 linear forward: quantize x/w to ``fmt``, pre-quantized GEMM.
 
     Returns ``(out, amax_x, amax_w)``. ``bias`` may be ``None``. For static
@@ -146,6 +160,10 @@ def linear_forward_fp8(x, w, bias, sx, sw, fmt: str = "e4m3", bias_scale=None):
     (produced by :func:`quantize_bf16` with their scales as ``sw`` /
     ``bias_scale``); a pre-quantized ``bias`` requires ``bias_scale``, and
     its ``amax_w`` comes back 0. The bias is fused into the GEMM epilogue.
+    ``x_ring`` / ``w_ring`` (delayed scaling) are ``[hist | scale | counter]``
+    float32 buffers the quantize kernels finalize in-kernel: the measured
+    amax lands in ``hist[idx]`` and the next step's scale is published on
+    device, replacing the eager hist/max/scale update chain.
     """
     fmt8 = _fmt_dtype(fmt)
     if x.dtype != torch.bfloat16 or w.dtype not in (torch.bfloat16, fmt8):
@@ -155,16 +173,42 @@ def linear_forward_fp8(x, w, bias, sx, sw, fmt: str = "e4m3", bias_scale=None):
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
     return get_module("fp8_ops").linear_forward_fp8(
-        x, w, bias, sx, sw, _fmt_int(fmt), bias_scale
+        x,
+        w,
+        bias,
+        sx,
+        sw,
+        _fmt_int(fmt),
+        bias_scale,
+        x_ring,
+        x_ring_idx,
+        x_ring_margin,
+        w_ring,
+        w_ring_idx,
+        w_ring_margin,
     )
 
 
-def linear_backward_fp8(g, x, w, masks, sg, sw, sx, fmt: str = "e5m2"):
+def linear_backward_fp8(
+    g,
+    x,
+    w,
+    masks,
+    sg,
+    sw,
+    sx,
+    fmt: str = "e5m2",
+    g_ring=None,
+    g_ring_idx: int = 0,
+    g_ring_margin: int = 0,
+):
     """FP8 linear backward; returns ``(grad_input, grad_weight, grad_bias, amax_g)``.
 
     The gradient (and the transposed w/x operands) are quantized to ``fmt``
     (default E5M2 — larger dynamic range for gradients) and the two GEMMs run
     as FP8 tensor-core products sharing a single gradient quantization.
+    ``g_ring`` (delayed scaling) is a ``[hist | scale | counter]`` buffer the
+    g quantize kernel finalizes in-kernel (see :func:`linear_forward_fp8`).
     """
     if not (
         g.dtype == torch.bfloat16
@@ -175,5 +219,15 @@ def linear_backward_fp8(g, x, w, masks, sg, sw, sx, fmt: str = "e5m2"):
             f"fp8 backward requires bf16 inputs, got {g.dtype}/{x.dtype}/{w.dtype}"
         )
     return get_module("fp8_ops").linear_backward_fp8(
-        g, x, w, list(masks), sg, sw, sx, _fmt_int(fmt)
+        g,
+        x,
+        w,
+        list(masks),
+        sg,
+        sw,
+        sx,
+        _fmt_int(fmt),
+        g_ring,
+        g_ring_idx,
+        g_ring_margin,
     )

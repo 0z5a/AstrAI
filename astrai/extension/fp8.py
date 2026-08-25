@@ -105,26 +105,32 @@ class DynamicScaling(FP8Recipe):
 
 
 class _ScaleRing:
-    """One operand's delayed-scaling state: amax history ring + derived scale.
+    """One operand's delayed-scaling state, packed for in-kernel finalization.
 
-    The ring captures its recipe at construction; ``update`` records a fresh
-    amax and refreshes the scale for the *next* step (delayed one step).
+    ``state`` is a single float32 CUDA buffer ``[hist[n] | scale | counter]``
+    (``hist`` / ``scale`` are views). The quantize kernel's last-finishing
+    block records the freshly measured amax into ``hist[idx]``, reduces the
+    window and publishes the next step's scale entirely on device — the
+    Python-side hist-write / max / scale-write chain is gone. The counter
+    slot stays int32-zero (float bits) between launches. ``idx`` advances
+    host-side each step; ``margin`` is fixed by the recipe.
     """
 
-    __slots__ = ("recipe", "hist", "idx", "scale", "initialized")
+    __slots__ = ("recipe", "state", "hist", "scale", "idx", "initialized")
 
     def __init__(self, device: torch.device, recipe: FP8Recipe):
         self.recipe = recipe
         n = recipe.history_len
-        self.hist = torch.ones(n, device=device, dtype=torch.float32)
+        # [hist | scale | counter]; the counter slot must start at int 0.
+        self.state = torch.zeros(n + 2, device=device, dtype=torch.float32)
+        self.hist = self.state[:n]
+        self.scale = self.state[n : n + 1]
         self.idx = 0
-        self.scale = torch.ones(1, device=device, dtype=torch.float32)
         self.initialized = False
 
-    def update(self, amax: torch.Tensor, fmt: str) -> None:
-        self.hist[self.idx] = amax.reshape(())
+    def advance(self) -> None:
+        """Rotate to the next history slot after an in-kernel finalize."""
         self.idx = (self.idx + 1) % self.hist.numel()
-        self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
 
     def seed(self, t: torch.Tensor, fmt: str) -> None:
         amax = t.abs().amax().to(torch.float32).clamp_min(1e-12)
@@ -235,8 +241,9 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
     """Scaled fp8 linear forward (called from the aten::linear impl).
 
     Pure FP8 path for both recipes: quantize x/w with the active scales, run
-    the pre-quantized GEMM, and feed the freshly measured amax back into the
-    delayed-scaling ring (dynamic scaling measures the current amax itself).
+    the pre-quantized GEMM. With delayed scaling the rings finalize inside
+    the quantize kernels (amax folded into the window, next step's scale
+    published on device); dynamic scaling measures the current amax itself.
     """
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=x.dtype)
@@ -246,17 +253,34 @@ def fp8_linear_forward(x: torch.Tensor, w: torch.Tensor, bias=None):
         meta = None
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), state.recipe, fmt)
         sw = _dynamic_scale(w, state.recipe, fmt)
+        out, amax_x, amax_w = linear_forward_fp8(x, w, bias, sx, sw, fmt)
     else:
         meta = state.get_weight_meta(w)
         if not meta.w.initialized:
             meta.w.seed(w, fmt)
         if not meta.x.initialized:
             meta.x.seed(x, fmt)
-        sx, sw = meta.x.scale, meta.w.scale
-    out, amax_x, amax_w = linear_forward_fp8(x, w, bias, sx, sw, fmt)
-    if meta is not None:
-        meta.x.update(amax_x, fmt)
-        meta.w.update(amax_w, fmt)
+        # In-kernel ring finalization: the kernels write hist[idx] and the
+        # next scale; idx rotates host-side (the device counter self-rearms).
+        w_is_fp8 = w.dtype != torch.bfloat16
+        out, amax_x, amax_w = linear_forward_fp8(
+            x,
+            w,
+            bias,
+            meta.x.scale,
+            meta.w.scale,
+            fmt,
+            None,
+            meta.x.state,
+            meta.x.idx,
+            state.recipe.margin,
+            None if w_is_fp8 else meta.w.state,
+            meta.w.idx,
+            state.recipe.margin,
+        )
+        meta.x.advance()
+        if not w_is_fp8:
+            meta.w.advance()
     return out
 
 
@@ -290,18 +314,29 @@ class _LinearFp8(torch.autograd.Function):
             sg = _dynamic_scale(g, ctx.recipe, fmt)
             sw = _dynamic_scale(w, ctx.recipe, fmt)
             sx = _dynamic_scale(x, ctx.recipe, fmt)
+            grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
+                g, x, w, list(ctx.needs_input_grad), sg, sw, sx, fmt
+            )
         else:
             meta = ctx.meta
             if not meta.g.initialized:
                 meta.g.seed(g, fmt)
-            sg, sw, sx = meta.g.scale, meta.w.scale, meta.x.scale
-        masks = list(ctx.needs_input_grad)
-        grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
-            g, x, w, masks, sg, sw, sx, fmt
-        )
-        if not ctx.is_dynamic:
-            ctx.meta.g.update(amax_g, fmt)
-        return grad_x, grad_w, grad_b if masks[2] else None
+            # The g quantize kernel finalizes the gradient's ring in-kernel.
+            grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
+                g,
+                x,
+                w,
+                list(ctx.needs_input_grad),
+                meta.g.scale,
+                meta.w.scale,
+                meta.x.scale,
+                fmt,
+                meta.g.state,
+                meta.g.idx,
+                ctx.recipe.margin,
+            )
+            meta.g.advance()
+        return grad_x, grad_w, grad_b if ctx.needs_input_grad[2] else None
 
 
 # ---------------------------------------------------------------------------

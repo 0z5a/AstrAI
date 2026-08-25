@@ -70,7 +70,7 @@ __device__ __forceinline__ unsigned quantize2(unsigned pair, float inv,
 }
 
 template <FP8Format Fmt>
-__global__ void fp8_quantize_kernel(FP8Params p) {
+__global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
     const float inv = 1.0f / *p.scale_a;
     const auto* x = reinterpret_cast<const __nv_bfloat16*>(p.a_ptr);
     void* x8 = p.out_ptr;
@@ -120,6 +120,51 @@ __global__ void fp8_quantize_kernel(FP8Params p) {
             float v = 0.0f;
             for (int w = 0; w < (blockDim.x >> 5); ++w) v = fmaxf(v, slots[w]);
             atomic_max_float(amax, v);
+        }
+    }
+    if (p.ring_state && amax) {
+        // Delayed-scaling ring finalization as a last-block epilogue (the
+        // CUDA threadFenceReduction pattern): the fence + counter elect the
+        // final block once every block's atomic_max above is visible; warp 0
+        // folds the fresh amax into the window, reduces it and publishes the
+        // next step's scale, then re-arms the counter for the next launch.
+        // __fdiv_rn / ldexpf keep the scale bit-identical to the eager
+        // (peak / fp8_max) / 2^margin fp32 chain despite --use_fast_math.
+        __threadfence();
+        __shared__ bool ring_last;
+        if (threadIdx.x == 0)
+            ring_last = atomicAdd(reinterpret_cast<int*>(p.ring_state +
+                                                        p.ring_len + 1),
+                                  1) == gridDim.x - 1;
+        __syncthreads();
+        if (ring_last && threadIdx.x < 32) {
+            float* hist = p.ring_state;
+            const int lane = threadIdx.x;
+            float v = 0.0f;
+            if (lane < p.ring_len) v = hist[lane];
+            if (lane == p.ring_idx) {
+                v = *amax;  // the global amax is final now
+                hist[lane] = v;
+            }
+            // Windows longer than one warp (atypical) fold the tail.
+            for (int i = lane + 32; i < p.ring_len; i += 32) {
+                float h = hist[i];
+                if (i == p.ring_idx) {
+                    h = *amax;
+                    hist[i] = h;
+                }
+                v = fmaxf(v, h);
+            }
+            const float peak = warp_reduce_max(v);
+            if (lane == 0) {
+                constexpr float kFmtMax =
+                    Fmt == FP8Format::E5M2 ? 57344.0f : 448.0f;
+                p.ring_state[p.ring_len] = fmaxf(
+                    ldexpf(__fdiv_rn(peak, kFmtMax), -p.ring_margin), 1e-12f);
+                __threadfence();
+                // Re-arm the counter (0.0f bits == int32 0).
+                p.ring_state[p.ring_len + 1] = 0.0f;
+            }
         }
     }
 }
@@ -539,7 +584,7 @@ __global__ void
 // ---------------------------------------------------------------------------
 
 template <FP8Format Fmt>
-void launch_fp8_quantize(const FP8Params& p, cudaStream_t stream) {
+void launch_fp8_quantize(const FP8QuantizeParams& p, cudaStream_t stream) {
     constexpr int kThreads = 256;
     // One block per 256 vectors (8 elements each); at least one block so the
     // scalar tail of a tiny / misaligned tensor is still covered.
