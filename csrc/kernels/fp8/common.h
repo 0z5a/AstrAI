@@ -48,25 +48,36 @@ using transpose_layout_t = typename transpose_layout<Layout>::type;
 
 // Compile-time tile configuration, mirroring KernelTraits<HEAD_DIM, BC,
 // WARPS, STAGES> in the attention kernels. `Fmt` selects the FP8 conversion
-// and the MMA PTX mnemonic; the remaining parameters shape the CTA tile and
-// the cp.async pipeline depth.
-template <FP8Format Fmt, int BlockM, int BlockN, int K, int Stages>
+// and the MMA PTX mnemonic; the remaining parameters shape the CTA tile, the
+// warp tile (WarpM x WarpN — e.g. 64x32 on the 128x128 CTA, or 32x32 on the
+// cuBLAS-style 64x64 small CTA that lifts small-shape occupancy) and the
+// cp.async pipeline depth.
+template <FP8Format Fmt, int BlockM, int BlockN, int K, int Stages,
+          int WarpM = 64, int WarpN = 32>
 struct Fp8GemmTraits {
     static constexpr FP8Format kFormat = Fmt;
     static constexpr int kBlockM = BlockM;
     static constexpr int kBlockN = BlockN;
     static constexpr int kK = K;
     static constexpr int kStages = Stages;
+    static constexpr int kWarpM = WarpM;
+    static constexpr int kWarpN = WarpN;
     static constexpr bool kIsE5M2 = (Fmt == FP8Format::E5M2);
     static constexpr __nv_fp8_interpretation_t kNvFormat =
         kIsE5M2 ? __NV_E5M2 : __NV_E4M3;
     static constexpr float kFp8Max = kIsE5M2 ? 57344.0f : 448.0f;
 
-    // Derived launch geometry: 64x32 warp tiles give the CTA thread count.
-    // The shared-memory budget is layout-aware (crosswise operands add K-
-    // major staging + a canonical buffer), so it lives in Fp8GemmSmem in
-    // gemm.cuh together with the resident-CTA hint for __launch_bounds__.
-    static constexpr int kCtaThreads = (BlockM / 64) * (BlockN / 32) * 32;
+    // Derived launch geometry: WarpM x WarpN warp tiles tile the CTA. The
+    // shared-memory budget is layout-aware (crosswise operands add K-major
+    // staging + a canonical buffer), so it lives in Fp8GemmSmem in gemm.cuh
+    // together with the resident-CTA hint for __launch_bounds__.
+    static constexpr int kWarpsM = BlockM / WarpM;
+    static constexpr int kWarpsN = BlockN / WarpN;
+    static constexpr int kCtaThreads = kWarpsM * kWarpsN * 32;
+    static_assert(kWarpsM * WarpM == BlockM && kWarpsN * WarpN == BlockN,
+                  "warp tiles must exactly tile the CTA");
+    static_assert(WarpM % 16 == 0 && WarpN % 8 == 0,
+                  "warp tile must be a multiple of the m16n8 MMA shape");
 };
 
 // Quantize-kernel parameter POD: float input (bf16 / fp16 / fp32) -> FP8

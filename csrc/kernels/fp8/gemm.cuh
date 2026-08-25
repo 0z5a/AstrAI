@@ -290,16 +290,19 @@ transpose_crosswise_region(T8* tile, const T8* staging, int idx, int quad0) {
     }
 }
 
-// Layout-aware shared-memory budget and occupancy hint. A congruous operand
-// needs its kStages rotating canonical buffers; a staged-crosswise operand
-// (crosswise B with kBStaged) needs kStages K-major staging buffers plus ONE
-// canonical buffer (rewritten every tile by the in-kernel transpose); a
-// direct-crosswise operand rotates kStages+1 canonical buffers so its load
-// can run ahead of the compute phase (see the kernel's pipelining note).
+// Layout-aware shared-memory budget and occupancy hint. Canonic rings hold
+// kStages+1 buffers (LeanRing=false): the load for tile i+kStages targets
+// slot (i-1)%(kStages+1) — already consumed — so the pure-congruous path
+// needs no post-compute barrier (one __syncthreads per k-tile). LeanRing
+// keeps the ring at kStages buffers for small CTAs whose occupancy comes
+// from more resident CTAs (less smem) rather than a deeper rotation; it
+// brings back barrier 4. A staged-crosswise B always costs kStages K-major
+// staging buffers + one canonical buffer.
 // The 48KB static-smem watermark picks the resident-CTA hint for
 // __launch_bounds__ (sm_89: 100KB smem per SM, so two CTAs fit while each
 // stays within the static budget).
-template <typename Traits, typename LayoutA, typename LayoutB, bool StagedB>
+template <typename Traits, typename LayoutA, typename LayoutB, bool StagedB,
+          bool LeanRing = false>
 struct Fp8GemmSmem {
     // Crosswise = the stage-load's view: A's tag directly, B's transposed.
     // A-crosswise always loads direct (L2-typical activations); B-crosswise
@@ -309,11 +312,17 @@ struct Fp8GemmSmem {
     static constexpr bool kBStagePath = kCrossB && StagedB;
     static constexpr bool kDirectA = kCrossA;
     static constexpr bool kDirectB = kCrossB && !kBStagePath;
+    // LeanRing shrinks only the congruous (async) operand rings; a direct
+    // operand's ring stays kStages+1 deep (see the kernel's ring note).
+    static constexpr int kARing = kDirectA ? Traits::kStages + 1
+                                           : Traits::kStages + !LeanRing;
+    static constexpr int kBRing =
+        kBStagePath ? Traits::kStages + 1
+                    : (kDirectB ? Traits::kStages + 1
+                                : Traits::kStages + !LeanRing);
     static constexpr int kBytes =
-        (kDirectA ? Traits::kStages + 1 : Traits::kStages) *
-            Traits::kBlockM * Traits::kK +
-        (kDirectB || kBStagePath ? Traits::kStages + 1 : Traits::kStages) *
-            Traits::kBlockN * Traits::kK;
+        kARing * Traits::kBlockM * Traits::kK +
+        kBRing * Traits::kBlockN * Traits::kK;
     static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
 };
 
@@ -331,10 +340,10 @@ struct Fp8GemmSmem {
 // exists for small-M calls: m <= 64 wastes half of every 128-row CTA, so the
 // launcher dispatches to it there (see launch_fp8_gemm).
 template <typename Traits, typename LayoutA = RowMajor, typename LayoutB = RowMajor, bool kGroupRaster = false,
-        bool kBStaged = true>
+        bool kBStaged = true, bool kLeanRing = false>
 __global__ void __launch_bounds__(Traits::kCtaThreads,
                                   Fp8GemmSmem<Traits, LayoutA, LayoutB,
-                                              kBStaged>::kMinCtas) 
+                                              kBStaged, kLeanRing>::kMinCtas)
     fp8_gemm_kernel(FP8Params p) {
     using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
     constexpr int kBlockM = Traits::kBlockM;
@@ -357,19 +366,25 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // shared memory so deep pipelines (kStages * (kBlockM + kBlockN) * kK >
     // 48KB static limit) opt in via cudaFuncSetAttribute in the launcher.
     extern __shared__ __align__(16) char fp8_gemm_smem[];
-    // Per operand: congruous = kStages rotating canonical buffers; direct-
-    // crosswise = kStages+1 of them (the load for tile i+kStages targets
-    // buffer (i-1)%(kStages+1) — the one compute(i-1) finished reading at
-    // the previous barrier — so it issues right after barrier 1 and its
-    // global-load latency overlaps the MMA phase below); staged-crosswise
-    // (B) = kStages K-major staging buffers (filled by cp.async, one per
-    // tile in flight) followed by one canonical buffer the per-tile
-    // transpose rewrites.
+    // Per operand: congruous = kStages+1 rotating canonical buffers — the
+    // load for tile i+kStages targets slot (i-1)%(kStages+1), which compute
+    // finished reading before this iteration's barrier 1, so NO post-compute
+    // barrier is needed on the pure-congruous path (one __syncthreads per
+    // k-tile, the classic multistage rotation); direct-crosswise rotates the
+    // same kStages+1 ring for the same reason; staged-crosswise (B) keeps
+    // kStages K-major staging buffers (filled by cp.async) plus ONE canonical
+    // buffer the per-tile transpose rewrites (its barrier structure keeps
+    // barrier 4).
     constexpr int kAStageBytes = kBlockM * kK;
     constexpr int kBStageBytes = kBlockN * kK;
-    constexpr int kARing = kDirectA ? kStages + 1 : kStages;  // A canonic ring
-    constexpr int kBRing = kDirectB ? kStages + 1 : kStages;  // B canonic ring
-    constexpr int kStB = kStages;  // B staging ring size (see above)
+    // Direct-crosswise operands always rotate kStages+1 buffers: their
+    // prefetch issues right after barrier 1 (targeting the slot compute(i-1)
+    // released), so a kStages-deep lean ring would race the in-flight MMA
+    // reads. The lean ring applies only to congruous operands, whose cp.async
+    // prefetch sits behind the restored barrier 4.
+    constexpr int kARing = kDirectA ? kStages + 1 : kStages + !kLeanRing;
+    constexpr int kBRing = kDirectB ? kStages + 1 : kStages + !kLeanRing;
+    constexpr int kStB = kStages;  // B staging ring size
     T8* const a_base = reinterpret_cast<T8*>(fp8_gemm_smem);
     T8* const b_base =
         reinterpret_cast<T8*>(fp8_gemm_smem + kARing * kAStageBytes);
@@ -410,17 +425,24 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         block_m = blockIdx.y;
         block_n = blockIdx.x;
     }
-    // 128x128 CTA = 8 warps as 2x4 warp tiles of 64x32 (mt x nt = 4x4 MMA).
-    constexpr int warps_n = kBlockN / 32;
-    const int warp_m = warp / warps_n;
-    const int warp_n = warp % warps_n;
-    const int64_t row_base = (int64_t)block_m * kBlockM + warp_m * 64 + group;
-    const int64_t output_col =
-        (int64_t)block_n * kBlockN + warp_n * 32 + thread_in_group * 2;
-    const int a_row0 = warp_m * 64;  // + mt * 16 in the loop
-    const int b_row0 = warp_n * 32;  // + nt * 8
+    // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps of WarpM x WarpN tiles,
+    // each warp computing (WarpM/16) x (WarpN/8) m16n8k32 MMAs (mt x nt).
+    // The default 128x128 CTA runs 8 warps of 64x32 (mt x nt = 4x4); the
+    // small-shape path uses 64x64 CTAs of 32x32 warps (cuBLAS-style) so more
+    // CTAs fit per SM (see launch_fp8_gemm).
+    constexpr int kMt = Traits::kWarpM / 16;  // 16-row MMA tiles per warp
+    constexpr int kNt = Traits::kWarpN / 8;   // 8-col MMA tiles per warp
+    const int warp_m = warp / Traits::kWarpsN;
+    const int warp_n = warp % Traits::kWarpsN;
+    const int64_t row_base =
+        (int64_t)block_m * kBlockM + warp_m * Traits::kWarpM + group;
+    const int64_t output_col = (int64_t)block_n * kBlockN +
+                               warp_n * Traits::kWarpN +
+                               thread_in_group * 2;
+    const int a_row0 = warp_m * Traits::kWarpM;  // + mt * 16 in the loop
+    const int b_row0 = warp_n * Traits::kWarpN;  // + nt * 8
     const float scale = *p.scale;
-    float acc[4][4][4] = {};  // [nt][mt][acc]
+    float acc[kNt][kMt][4] = {};  // [nt][mt][acc]
 
     // Both operands end up in the canonical [M][kK] / [N][kK] shared tiles
     // the MMA fragments read, regardless of their global layout. A's tag
@@ -498,6 +520,45 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
     const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31; B uses rh8)
 
+    // Precomputed per-lane fragment offsets (stage-relative): the XOR
+    // swizzle inside tile_at depends only on (row, chunk) — never on the
+    // ring slot or tile_index — so every lane's ldmatrix address is its
+    // stage base plus one of these fixed offsets. Building the table once,
+    // outside the mainloop, removes the per-k_seg swizzle arithmetic
+    // (IMAD/LOP3 chains) from the innermost loop; the SASS compute window
+    // was ~36% integer address math before this.
+    constexpr int kSegs = kK / kMmaK;
+    unsigned a_off[kSegs][kMt];  // stage-relative byte offsets
+    unsigned b_off[kSegs][kNt];
+    {
+        // The probe addresses are converted and immediately rebased to the
+        // stage origin, so the table holds pure offsets to add to any ring
+        // slot's converted base (double-adding the base was the bug here).
+        const unsigned a0 = __cvta_generic_to_shared(a_base);
+#pragma unroll
+        for (int s = 0; s < kSegs; ++s) {
+#pragma unroll
+            for (int mt = 0; mt < kMt; ++mt)
+                a_off[s][mt] =
+                    __cvta_generic_to_shared(
+                        tile_at<kK>(a_base, a_row0 + mt * 16 + rh8 * 8 + r7,
+                                    (s * 2 + rh16) * 16)) -
+                    a0;
+        }
+        const T8* b_probe = kBStagePath ? b_canon : b_base;
+        const unsigned b0 = __cvta_generic_to_shared(b_probe);
+#pragma unroll
+        for (int s = 0; s < kSegs; ++s) {
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt)
+                b_off[s][nt] =
+                    __cvta_generic_to_shared(
+                        tile_at<kK>(b_probe, b_row0 + nt * 8 + r7,
+                                    (s * 2 + rh8) * 16)) -
+                    b0;
+        }
+    }
+
     // Prime the pipeline. Each committed group occupies one circular shared
     // memory stage; the loop also handles K dimensions smaller than kStages.
     // Direct loads run synchronously here (back to back with their commit);
@@ -532,7 +593,6 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         // a time so each region's transpose overlaps the previous region's
         // MMA sequence (the transposes are pure shared-memory traffic — B's
         // global path stayed fully asynchronous above).
-        constexpr int kSegs = kK / kMmaK;
         if constexpr (kBStagePath) {
             transpose_tile(tile_index, 0);
             // Barrier 2: region 0 visible to every thread before its
@@ -544,41 +604,35 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         const T8* b_tile = kBStagePath
                                ? b_canon
                                : b_base + (size_t)(tile_index % kBRing) * kBStageBytes;
+        const unsigned a_base_addr = __cvta_generic_to_shared(a_tile);
+        const unsigned b_base_addr = __cvta_generic_to_shared(b_tile);
 
-        // 4 ldmatrix.x2 (B) + 4 ldmatrix.x4 (A) feed 16 mma.sync per k_seg —
-        // 0.5 load instructions per MMA, versus 4.5 scalar LDS per MMA in
-        // the 128x64-tile version (the kernel was LSU-issue-bound there).
-        // B fragments double-buffer across k_segs while B is congruous (no
-        // region writes in flight); a crosswise B reloads per k_seg after
-        // the region's transpose became visible.
-        unsigned b_frag[2][4][2];
+        // kNt ldmatrix.x2 (B) + kMt ldmatrix.x4 (A) feed kMt*kNt*2 mma.sync
+        // per k_seg — 0.5 load instructions per MMA, versus 4.5 scalar LDS
+        // per MMA in the 128x64-tile version (the kernel was LSU-issue-bound
+        // there). B fragments double-buffer across k_segs while B is
+        // congruous (no region writes in flight); a crosswise B reloads per
+        // k_seg after the region's transpose became visible.
+        unsigned b_frag[2][kNt][2];
         if constexpr (!kBStagePath) {
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                const int row = b_row0 + nt * 8 + r7;
+            for (int nt = 0; nt < kNt; ++nt)
                 astrai::ldmatrix_x2_lane(b_frag[0][nt],
-                                         frag_addr<T8, kK>(b_tile, row, rh8));
-            }
+                                         b_base_addr + b_off[0][nt]);
         }
 #pragma unroll
         for (int k_seg = 0; k_seg < kSegs; ++k_seg) {
             const int bcur = k_seg & 1, bnext = bcur ^ 1;
             if constexpr (kBStagePath) {
 #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    const int row = b_row0 + nt * 8 + r7;
+                for (int nt = 0; nt < kNt; ++nt)
                     astrai::ldmatrix_x2_lane(
-                        b_frag[bcur][nt],
-                        frag_addr<T8, kK>(b_tile, row, k_seg * 2 + rh8));
-                }
+                        b_frag[bcur][nt], b_base_addr + b_off[k_seg][nt]);
             } else if (k_seg + 1 < kSegs) {
 #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    const int row = b_row0 + nt * 8 + r7;
+                for (int nt = 0; nt < kNt; ++nt)
                     astrai::ldmatrix_x2_lane(
-                        b_frag[bnext][nt],
-                        frag_addr<T8, kK>(b_tile, row, (k_seg + 1) * 2 + rh8));
-                }
+                        b_frag[bnext][nt], b_base_addr + b_off[k_seg + 1][nt]);
             }
             // Region k_seg+1's transpose overlaps this region's MMA work
             // (disjoint canonical regions, no race).
@@ -590,22 +644,17 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
             // is issued before the MMAs consuming row mt, so the LDS fixed
             // latency hides behind tensor-pipe work (cuts the `wait` stall,
             // ~2.3 cycles/issue before this). Costs 4 extra registers.
-            unsigned a_frag[5][4];
-            astrai::ldmatrix_x4_lane(
-                a_frag[0], frag_addr<T8, kK>(a_tile, a_row0 + rh8 * 8 + r7,
-                                             k_seg * 2 + rh16));
+            unsigned a_frag[kMt + 1][4];
+            astrai::ldmatrix_x4_lane(a_frag[0], a_base_addr + a_off[k_seg][0]);
 #pragma unroll
-            for (int mt = 0; mt < 4; ++mt) {
-                if (mt < 3)
+            for (int mt = 0; mt < kMt; ++mt) {
+                if (mt + 1 < kMt)
                     astrai::ldmatrix_x4_lane(
-                        a_frag[mt + 1],
-                        frag_addr<T8, kK>(a_tile,
-                                          a_row0 + (mt + 1) * 16 + rh8 * 8 + r7,
-                                          k_seg * 2 + rh16));
+                        a_frag[mt + 1], a_base_addr + a_off[k_seg][mt + 1]);
 #pragma unroll
-                for (int nt = 0; nt < 4; ++nt)
-                    astrai::mma_sync<T8>(acc[nt][mt], a_frag[mt], b_frag[bcur][nt],
-                                         acc[nt][mt]);
+                for (int nt = 0; nt < kNt; ++nt)
+                    astrai::mma_sync<T8>(acc[nt][mt], a_frag[mt],
+                                         b_frag[bcur][nt], acc[nt][mt]);
             }
             // Barrier 3: region k_seg+1's transposes complete and become
             // visible before the next k_seg reads them.
@@ -613,45 +662,84 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
                 if (k_seg + 1 < kSegs) __syncthreads();
             }
         }
-        // Barrier 4: every thread finished reading this stage's tiles before
-        // the prefetch for the (i+kStages)-th tile overwrites them (and the
-        // next iteration's transposes rewrite the canonical buffer).
-        __syncthreads();
+        // Barrier 4 (staged-B / lean-ring only): every thread finished
+        // reading this stage's tiles before the prefetch for the
+        // (i+kStages)-th tile overwrites them (and the next iteration's
+        // transposes rewrite the canonical buffer). With the kStages+1
+        // canonic rotation the prefetch targets the slot compute(i-1)
+        // released before barrier 1, so the pure-congruous path skips this
+        // barrier entirely — one __syncthreads per k-tile.
+        if constexpr (kBStagePath || kLeanRing) __syncthreads();
         if (tile_index + kStages < tile_count) {
             load_async(tile_index + kStages);
             astrai::cp_async_commit_group();
         }
     }
 
+    // Direct bf16 epilogue through the operand shared memory: the A/B rings
+    // are dead once the mainloop ends, so their space stages the output tile
+    // (kBlockM x kBlockN bf16, always <= the ring budget). Threads first
+    // scatter their accumulators into the tile (STS.32 of bf16x2 pairs), a
+    // barrier makes the tile coherent, then the whole CTA copies it out in
+    // fully-coalesced 16B chunks. The direct per-thread stores this replaces
+    // hit 8 disjoint 16B segments per warp (rows are n*2 bytes apart), ~50%
+    // write efficiency — measurable at 2048+ where the epilogue is ~8% of
+    // runtime. The 16B-chunk XOR swizzle (chunk index ^ row) keeps both the
+    // scatter and the gather conflict-free: a lane quad's chunk and the 8
+    // rows of one gather phase map to distinct 4-bank groups.
     const float output_scale = scale;
+    __nv_bfloat16* tile_out = reinterpret_cast<__nv_bfloat16*>(fp8_gemm_smem);
+    constexpr int kRowChunks = kBlockN / 8;  // 16B chunks per tile row
+    static_assert(kBlockM * kBlockN * 2 <=
+                      kARing * kBlockM * kK + kBRing * kBlockN * kK,
+                  "output tile must fit the reclaimed operand smem");
+    // Swizzled address of one 16B chunk (row r, chunk c) of the tile.
+    auto out_chunk = [&](int r, int c) -> __nv_bfloat16* {
+        return tile_out + (size_t)r * kBlockN +
+               ((c ^ (r & (kRowChunks - 1))) * 8);
+    };
+    const int local_col0 = warp_n * Traits::kWarpN + thread_in_group * 2;
 #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) {
-        const int64_t col = output_col + nt * 8;
-        // Per-row store: FP8 packs two adjacent columns into one 16-bit
-        // write, BF16 into one 32-bit __nv_bfloat162 (single cvt+pack
-        // instruction); boundary or unaligned columns fall back to scalar
-        // converts so a pack never crosses the row edge or misaligns.
-        auto store_out = [&](int64_t row, float v0, float v1) {
-            if (row >= m) return;
-            const float r0 = v0 * output_scale;
-            const float r1 = v1 * output_scale;
-            auto* dst = out_bf16 + row * n + col;
-            if (col + 1 < n && (reinterpret_cast<uintptr_t>(dst) & 3) == 0) {
-                *reinterpret_cast<__nv_bfloat162*>(dst) =
-                    __floats2bfloat162_rn(r0, r1);
-            } else {
-                dst[0] = __float2bfloat16(r0);
-                if (col + 1 < n) dst[1] = __float2bfloat16(r1);
-            }
-        };
+    for (int nt = 0; nt < kNt; ++nt) {
+        const int col = local_col0 + nt * 8;
 #pragma unroll
-        for (int mt = 0; mt < 4; ++mt) {
-            const int64_t row0 = row_base + mt * 16;
-            float* tile_acc = acc[nt][mt];
-            if (col < n) {
-                store_out(row0, tile_acc[0], tile_acc[1]);
-                store_out(row0 + 8, tile_acc[2], tile_acc[3]);
-            }
+        for (int mt = 0; mt < kMt; ++mt) {
+            const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
+            const float* tile_acc = acc[nt][mt];
+            // Two bf16x2 stores per accumulator tile: rows g and g+8 of the
+            // m16n8 output, columns tig*2 and tig*2+1 inside one 16B chunk.
+            const int off = col & 7;  // element offset within the chunk
+            *reinterpret_cast<__nv_bfloat162*>(out_chunk(r0, col >> 3) + off) =
+                __floats2bfloat162_rn(tile_acc[0] * output_scale,
+                                      tile_acc[1] * output_scale);
+            *reinterpret_cast<__nv_bfloat162*>(out_chunk(r0 + 8, col >> 3) +
+                                               off) =
+                __floats2bfloat162_rn(tile_acc[2] * output_scale,
+                                      tile_acc[3] * output_scale);
+        }
+    }
+    __syncthreads();
+    // Coalesced copy-out: thread -> one 16B chunk; consecutive threads walk
+    // a row so each global transaction covers a full 128B line.
+    const int64_t row0_global = (int64_t)block_m * kBlockM;
+    const int64_t col0_global = (int64_t)block_n * kBlockN;
+    constexpr int kTotalChunks = kBlockM * kRowChunks;
+    for (int idx = tid; idx < kTotalChunks; idx += kCtaThreads) {
+        const int r = idx / kRowChunks;
+        const int c = idx % kRowChunks;
+        const int64_t row = row0_global + r;
+        if (row >= m) break;  // rows are consecutive: nothing left in range
+        const int64_t col = col0_global + (int64_t)c * 8;
+        const uint4 v = *reinterpret_cast<const uint4*>(out_chunk(r, c));
+        auto* dst = out_bf16 + row * n + col;
+        if (col + 8 <= n && (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
+            *reinterpret_cast<uint4*>(dst) = v;
+        } else {
+            // N-tail chunk or an odd-n row base: spill the elements that
+            // survive the row edge (and stay aligned).
+            const __nv_bfloat16* elems =
+                reinterpret_cast<const __nv_bfloat16*>(&v);
+            for (int e = 0; e < 8 && col + e < n; ++e) dst[e] = elems[e];
         }
     }
 }
@@ -698,37 +786,66 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
 // dX ~39 TF staged vs ~38 direct).
 constexpr int64_t kCrossStageMinK = 8192;
 
+// Shape-based tile dispatch (grid-searched on the production shapes, see
+// csrc/tests/fp8_sweep.cu): small outputs — fewer than ~2 waves of 128x128
+// CTAs on a 24-SM part — take 64x64 CTAs of 32x32 warps with a lean
+// (kStages-deep) ring: 24KB of smem keeps 4 CTAs resident, and the extra
+// blocks fill the wave quantization gap (512^3: 64 vs 16 CTAs). Everything
+// larger takes the 128x128 CTA (8 warps x 64x32) with the kStages+1 ring —
+// one __syncthreads per k-tile. m <= 64 keeps the 64x128 CTA so a 128-row
+// tile never wastes half its MMA work on predicated-off rows.
+constexpr int64_t kSmallShapeMaxTiles = 48;
+
 template <FP8Format Fmt, typename LayoutA = RowMajor,
           typename LayoutB = RowMajor, int kK = 64, int Stages = 2,
-          bool GroupRaster = std::is_same_v<LayoutA, ColMajor> || std::is_same_v<LayoutB, ColMajor>>
+          bool GroupRaster = std::is_same_v<LayoutA, ColMajor> ||
+                             std::is_same_v<LayoutB, ColMajor>>
 void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
-    dim3 grid((p.n + 127) / 128, (p.m + 127) / 128);
     const bool b_staged = p.k >= kCrossStageMinK;
     if (p.m <= 64) {
         using Traits = Fp8GemmTraits<Fmt, 64, 128, kK, Stages>;
+        dim3 grid((p.n + 127) / 128, (p.m + 63) / 64);
         if (b_staged)
             launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
-                                             GroupRaster, true>>(
-                Fp8GemmSmem<Traits, LayoutA, LayoutB, true>::kBytes, grid,
-                dim3(Traits::kCtaThreads), stream, p);
+                                             GroupRaster, true, true>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, true, true>::kBytes,
+                grid, dim3(Traits::kCtaThreads), stream, p);
         else
             launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
-                                             GroupRaster, false>>(
-                Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
-                dim3(Traits::kCtaThreads), stream, p);
-    } else {
-        using Traits = Fp8GemmTraits<Fmt, 128, 128, kK, Stages>;
-        if (b_staged)
-            launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
-                                             GroupRaster, true>>(
-                Fp8GemmSmem<Traits, LayoutA, LayoutB, true>::kBytes, grid,
-                dim3(Traits::kCtaThreads), stream, p);
-        else
-            launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
-                                             GroupRaster, false>>(
-                Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
-                dim3(Traits::kCtaThreads), stream, p);
+                                             GroupRaster, false, true>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, false, true>::kBytes,
+                grid, dim3(Traits::kCtaThreads), stream, p);
+        return;
     }
+    const int64_t tiles_128 =
+        ((p.m + 127) / 128) * ((p.n + 127) / 128);
+    if (tiles_128 < kSmallShapeMaxTiles) {
+        using Traits = Fp8GemmTraits<Fmt, 64, 64, kK, 3, 32, 32>;
+        dim3 grid((p.n + 63) / 64, (p.m + 63) / 64);
+        if (b_staged)
+            launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
+                                             GroupRaster, true, true>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, true, true>::kBytes,
+                grid, dim3(Traits::kCtaThreads), stream, p);
+        else
+            launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
+                                             GroupRaster, false, true>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, false, true>::kBytes,
+                grid, dim3(Traits::kCtaThreads), stream, p);
+        return;
+    }
+    using Traits = Fp8GemmTraits<Fmt, 128, 128, kK, Stages>;
+    dim3 grid((p.n + 127) / 128, (p.m + 127) / 128);
+    if (b_staged)
+        launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
+                                         GroupRaster, true, false>>(
+            Fp8GemmSmem<Traits, LayoutA, LayoutB, true, false>::kBytes, grid,
+            dim3(Traits::kCtaThreads), stream, p);
+    else
+        launch_with_smem<fp8_gemm_kernel<Traits, LayoutA, LayoutB,
+                                         GroupRaster, false, false>>(
+            Fp8GemmSmem<Traits, LayoutA, LayoutB, false, false>::kBytes, grid,
+            dim3(Traits::kCtaThreads), stream, p);
 }
 
 }  // namespace fp8

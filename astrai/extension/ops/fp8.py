@@ -127,6 +127,18 @@ def quantize(
     ``scale`` is the quantization multiplier (device scalar); ``fmt`` selects
     E4M3 or E5M2. ``amax`` is a fresh 1-element float32 tensor.
     """
+    # Hot-path bypass of the torch.library dispatch (~5us/call, ~40% of a
+    # 512-wide GEMM): real CUDA tensors of a supported dtype go straight to
+    # the extension. Fake/subclass tensors and non-CUDA inputs keep the
+    # custom_op route so torch.compile / meta / fake-tensor tracing and the
+    # CPU fallback behave exactly as before.
+    if (
+        type(x) is torch.Tensor
+        and x.is_cuda
+        and x.dtype in _QUANT_INPUT_DTYPES
+        and fmt in _FMT_TO_INT
+    ):
+        return get_module("fp8_ops").quantize(x, scale, _FMT_TO_INT[fmt])
     return fp8_quantize(x, scale, _fmt_int(fmt))
 
 
@@ -143,4 +155,12 @@ def mm_fp8(
     combined dequantization scale. The result is BF16; FP8 output is a separate
     quantize operation.
     """
+    # Same hot-path bypass as quantize(): the binding's TORCH_CHECKs keep
+    # validation identical on the direct route.
+    if (
+        type(a) is torch.Tensor
+        and a.is_cuda
+        and a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    ):
+        return get_module("fp8_ops").mm_fp8(a, b, scale, int(trans_a), int(trans_b))
     return fp8_gemm(a, b, scale, trans_a, trans_b)
