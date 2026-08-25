@@ -6,15 +6,22 @@ policy-level tests (recipes, autocast context, per-tensor meta, CPU fallbacks
 of the custom ops) run without a GPU.
 """
 
+import threading
+
 import pytest
 import torch
+import torch.nn.functional as F
 
+import astrai.extension.fp8 as f8mod
 from astrai.extension.fp8 import (
     DelayedScaling,
     DynamicScaling,
     FP8Format,
     FP8TensorMeta,
+    _ScaleRing,
     fp8_autocast,
+    fp8_linear_enable,
+    fp8_linear_enabled,
     fp8_state,
 )
 from astrai.extension.ops.fp8 import (
@@ -91,8 +98,6 @@ def test_quantize_ring_in_kernel_finalize():
     """The quantize kernel finalizes the delayed-scaling ring in-kernel: the
     measured amax lands in hist[idx], the window reduces to the next step's
     scale on device, and the counter re-arms for the next launch."""
-    from astrai.extension.fp8 import _ScaleRing
-
     torch.manual_seed(21)
     dev = torch.device("cuda")
     ring = _ScaleRing(dev, DelayedScaling(history_len=4, margin=0))
@@ -141,7 +146,7 @@ def test_fp8_linear_forward_and_backward():
     bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
     scale_x, scale_w, scale_g = _scale(x), _scale(weight), _scale(grad)
 
-    out, amax_x, amax_w = linear_forward_fp8(x, weight, bias, scale_x, scale_w)
+    out, x8, w8, amax_x, amax_w = linear_forward_fp8(x, weight, bias, scale_x, scale_w)
     grad_x, grad_w, grad_b, amax_g = linear_backward_fp8(
         grad, x, weight, [1, 1, 1], scale_g, scale_w, scale_x, "e4m3"
     )
@@ -205,7 +210,7 @@ def test_fp8_linear_static_fp8_weight_and_bias():
 
     w8, _ = quantize_bf16(weight, sw, "e4m3")
     b8, _ = quantize_bf16(bias, sb, "e4m3")
-    out, amax_x, amax_w = linear_forward_fp8(x, w8, b8, sx, sw, "e4m3", sb)
+    out, x8, w8_back, amax_x, amax_w = linear_forward_fp8(x, w8, b8, sx, sw, "e4m3", sb)
 
     qx = _quantize(x, sx)
     qw = _quantize(weight, sw)
@@ -214,9 +219,10 @@ def test_fp8_linear_static_fp8_weight_and_bias():
     torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
     torch.testing.assert_close(amax_x, x.abs().amax().float().reshape(1))
     assert amax_w.item() == 0.0  # nothing measured on the static path
+    assert w8_back is w8  # pre-quantized w handed straight back
 
     # bf16 bias stays bf16 on the same fused-epilogue path
-    out_bf16bias, _, _ = linear_forward_fp8(x, w8, bias, sx, sw, "e4m3")
+    out_bf16bias, *_ = linear_forward_fp8(x, w8, bias, sx, sw, "e4m3")
     expected_b = (qx @ qw.t() * sx * sw + bias.float()).to(torch.bfloat16)
     torch.testing.assert_close(out_bf16bias, expected_b, atol=0.125, rtol=0.01)
 
@@ -226,10 +232,6 @@ def test_fp8_linear_backward_outside_autocast():
     """aten::linear records an fp8 autograd node inside fp8_autocast; the
     backward runs fp8 kernels even after the context exits (loss.backward()
     placement is free), instead of falling back to bf16 mm."""
-    import torch.nn.functional as F
-
-    import astrai.extension.fp8 as f8mod
-
     torch.manual_seed(5)
     x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(
@@ -424,3 +426,63 @@ def test_mm_fp8_fp8_output_cpu():
     assert out8.dtype == torch.float8_e4m3fn
     ref = (a8.float() @ b8.float() * 2.0 * 0.5 * 0.25).to(torch.float8_e4m3fn)
     assert torch.equal(out8, ref)
+
+
+# --------------------------------------------------------------------------
+# torch-autocast parity: context semantics (nesting, thread locality, switch)
+# --------------------------------------------------------------------------
+
+
+def _linear():
+    """Shared helper: a small bf16 linear operand set on CUDA (grad-tracking
+    so aten::linear records an autograd node)."""
+    torch.manual_seed(31)
+    x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    return x, w
+
+
+@skip_no_fp8
+def test_nested_disabled_region_redispatches_bf16():
+    """A nested fp8_autocast(enabled=False) region temporarily restores the
+    bf16 aten::linear path (torch's nested-disable semantics), and fp8
+    resumes when it exits."""
+    x, w = _linear()
+    with fp8_autocast(enabled=True):
+        out_fp8 = F.linear(x, w)
+        with fp8_autocast(enabled=False):
+            out_bf16 = F.linear(x, w)
+            assert type(out_bf16.grad_fn).__name__ != "_LinearFp8Backward"
+            assert out_bf16.dtype == torch.bfloat16
+        out_again = F.linear(x, w)
+        assert type(out_again.grad_fn).__name__ == "_LinearFp8Backward"
+
+
+@skip_no_fp8
+def test_global_switch_routes_without_region():
+    """fp8_linear_enable(True) routes aten::linear to fp8 outside any region
+    (the persistent default); disabling restores bf16."""
+    x, w = _linear()
+    state = fp8_state()
+    try:
+        fp8_linear_enable(True)
+        out = F.linear(x, w)
+        assert type(out.grad_fn).__name__ == "_LinearFp8Backward"
+        fp8_linear_enable(False)
+        out = F.linear(x, w)
+        assert type(out.grad_fn).__name__ != "_LinearFp8Backward"
+    finally:
+        state.reset()
+
+
+def test_autocast_state_is_thread_local():
+    """torch parity: the active config is thread-local — another thread does
+    not see an open region (CPU-only check of the flag, no kernels)."""
+    seen = {}
+    with fp8_autocast(enabled=True):
+        assert fp8_linear_enabled()
+        t = threading.Thread(target=lambda: seen.update(enabled=fp8_linear_enabled()))
+        t.start()
+        t.join()
+    assert seen["enabled"] is False
+    assert not fp8_linear_enabled()

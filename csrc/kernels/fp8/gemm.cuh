@@ -191,20 +191,11 @@ __device__ __forceinline__ T8* tile_at(T8* tile, int row, int col) {
            ((((col >> 4) ^ ((row >> kShift) & (kChunks - 1))) << 4) + (col & 15));
 }
 
-// Stage-load one GEMM operand into the canonical flat [rows * K] shared tile
-// (addressing via tile_at, so stores land in the swizzled layout). The
-// transpose is folded into the staging step via a CUTLASS-style crosswise
-// layout: RowMajor (stored [rows][contract]) copies 16-byte K-contiguous runs
-// with cp.async, while ColMajor (stored [contract][rows]) reads 16-byte runs
-// along the operand's contiguous non-contract dim and scatters them across
-// the tile's rows. Crosswise runs cannot use cp.async (the 16 destination
-// bytes land on 16 different rows), so their global loads are plain LDGs —
-// issued as one batch per row group before the first scatter so their
-// latencies overlap instead of serializing behind the shared stores.
-// RowsTile is the tile's row capacity (kBlockM / kBlockN) and kThreads the
-// CTA size; the runtime `rows` bound may be smaller (tail predication).
-// `block_row` is this block's origin in the operand's row dim.
-template <typename T8, int K, typename Layout, int RowsTile, int kThreads>
+// Stage-load a CONGRUOUS operand (stored [rows][contract], contract-
+// contiguous — the only cp.async-able shape for the canonical tile) into the
+// flat [rows * K] shared tile via tile_at's swizzle. Crosswise operands go
+// through stage_crosswise_tile + transpose_crosswise_tile instead.
+template <typename T8, int K, int RowsTile, int kThreads>
 __device__ __forceinline__ void
 load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
                   int64_t contract, int64_t ld, int tid, int64_t k_base,
@@ -213,101 +204,29 @@ load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
     static_assert(RowsTile * kChunks % kThreads == 0,
                   "tile chunks must divide evenly across threads");
     constexpr int kCpt = RowsTile * kChunks / kThreads;  // chunks per thread
-    if constexpr (std::is_same_v<Layout, ColMajor>) {
-        // Operand stored [contract][rows]: contiguous along the non-contract
-        // dim. Each thread scatters one 16-byte run per K/32 pass; when the
-        // tile has more 16-row groups than warps (RowsTile > kThreads/2),
-        // each thread covers several groups.
-        constexpr int kWarpsTile = kThreads / 32;
-        constexpr int kGroups = RowsTile / 16;
-        constexpr int kPasses = K / 32;
-        static_assert(kGroups % kWarpsTile == 0,
-                      "row groups must divide evenly across warps");
-        const int kl = tid & 31;  // byte column within a 32B pass
-        // r0 is always a multiple of 16 (block_row is a multiple of RowsTile
-        // and each group covers 16 rows), so every run shares the base+ld
-        // alignment: one uniform check instead of one per pass.
-        const bool run_aligned =
-            ((reinterpret_cast<uintptr_t>(operand) | ld) & 15) == 0;
+    // Linear chunk mapping: thread covers kCpt consecutive 16B chunks of
+    // one row (K=64: a contiguous 32B pair; K=32: a single chunk).
+    constexpr int kCpr = kChunks / kCpt;  // chunks per row slice
+    const int r = tid / kCpr;
+    const int c0 = (tid % kCpr) * kCpt * 16;
+    const int64_t row = block_row + r;
+    const bool row_ok = row < rows;
+    // k_base and every c are multiples of 16, so the per-chunk sources
+    // share the row base's alignment.
+    const auto* src = operand + row * ld + k_base;
+    const bool chunk_aligned = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
 #pragma unroll
-        for (int g = 0; g < kGroups / kWarpsTile; ++g) {
-            const int rg = (tid >> 5) + g * kWarpsTile;
-            const int64_t r0 = block_row + rg * 16;
-            const bool rows_full = r0 + 15 < rows;  // pass-invariant
-            // Batch every 16B run load of this row group before the first
-            // scatter: the LDGs are independent, and the byte-granular
-            // shared stores would otherwise serialize behind each one.
-            uint4 v[kPasses];
-            bool fast[kPasses];
+    for (int j = 0; j < kCpt; ++j) {
+        const int c = c0 + j * 16;
+        T8* dst = tile_at<K>(tile, r, c);
+        if (row_ok && chunk_aligned && k_base + c + 15 < contract) {
+            astrai::cp_async_16(dst, src + c, true);
+        } else {
+            // Tail chunk (or misaligned base): predicated scalar fill.
 #pragma unroll
-            for (int pass = 0; pass < kPasses; ++pass) {
-                const int64_t k_idx = k_base + kl + pass * 32;
-                fast[pass] = rows_full && run_aligned && k_idx < contract;
-                if (fast[pass])
-                    v[pass] =
-                        *reinterpret_cast<const uint4*>(operand + k_idx * ld + r0);
-            }
-#pragma unroll
-            for (int pass = 0; pass < kPasses; ++pass) {
-                const int col = kl + pass * 32;
-                if (fast[pass]) {
-                    const auto* bytes = reinterpret_cast<const T8*>(&v[pass]);
-                    // Scatter 16 bytes along the tile rows through tile_at's
-                    // swizzle. Rows sharing a physical chunk form groups of
-                    // (8 / kChunks) consecutive rows (see tile_at), so each
-                    // group is one tile_at address plus a K-byte row stride.
-                    constexpr int kGrp = 8 / kChunks;
-#pragma unroll
-                    for (int j = 0; j < 16 / kGrp; ++j) {
-                        T8* p = tile_at<K>(tile, rg * 16 + j * kGrp, col);
-#pragma unroll
-                        for (int i = 0; i < kGrp; ++i)
-                            p[i * K] = bytes[j * kGrp + i];
-                    }
-                } else if (k_base + col < contract) {
-                    // Row-tail or misaligned run: byte-granular gather with
-                    // per-row predication (the k column itself is in range).
-#pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        const int64_t r_idx = r0 + i;
-                        *tile_at<K>(tile, rg * 16 + i, col) =
-                            r_idx < rows ? operand[(k_base + col) * ld + r_idx]
-                                         : T8(0.0f);
-                    }
-                } else {
-                    // Contract tail: straight zero-fill, no global traffic.
-#pragma unroll
-                    for (int i = 0; i < 16; ++i)
-                        *tile_at<K>(tile, rg * 16 + i, col) = T8(0.0f);
-                }
-            }
-        }
-    } else {
-        // Operand stored [rows][contract]: contiguous along the contract dim.
-        // Linear chunk mapping: thread covers kCpt consecutive 16B chunks of
-        // one row (K=64: a contiguous 32B pair; K=32: a single chunk).
-        constexpr int kCpr = kChunks / kCpt;  // chunks per row slice
-        const int r = tid / kCpr;
-        const int c0 = (tid % kCpr) * kCpt * 16;
-        const int64_t row = block_row + r;
-        const bool row_ok = row < rows;
-        // k_base and every c are multiples of 16, so the per-chunk sources
-        // share the row base's alignment.
-        const auto* src = operand + row * ld + k_base;
-        const bool chunk_aligned = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
-#pragma unroll
-        for (int j = 0; j < kCpt; ++j) {
-            const int c = c0 + j * 16;
-            T8* dst = tile_at<K>(tile, r, c);
-            if (row_ok && chunk_aligned && k_base + c + 15 < contract) {
-                astrai::cp_async_16(dst, src + c, true);
-            } else {
-                // Tail chunk (or misaligned base): predicated scalar fill.
-#pragma unroll
-                for (int i = 0; i < 16; ++i)
-                    dst[i] =
-                        row_ok && k_base + c + i < contract ? src[c + i] : T8(0.0f);
-            }
+            for (int i = 0; i < 16; ++i)
+                dst[i] =
+                    row_ok && k_base + c + i < contract ? src[c + i] : T8(0.0f);
         }
     }
 }
@@ -320,14 +239,194 @@ load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
 // ---------------------------------------------------------------------------
 
 // Swizzled 16B-chunk address (tile_at's layout) as a raw shared-memory
-// pointer for ldmatrix. Valid for kK in {32, 64} (the swizzle itself lives
-// only in tile_at; this wrapper just converts the element address).
+// pointer for ldmatrix. Valid for kK in {32, 64, 128} (the swizzle itself
+// lives only in tile_at; this wrapper just converts the element address).
 template <typename T8, int kK>
 __device__ __forceinline__ unsigned frag_addr(const T8* tile, int row, int chunk) {
-    static_assert(kK == 32 || kK == 64,
-                  "fragment swizzle offsets assume kK in {32, 64}");
+    static_assert(kK == 32 || kK == 64 || kK == 128,
+                  "fragment swizzle offsets assume kK in {32, 64, 128}");
     return __cvta_generic_to_shared(tile_at<kK>(tile, row, chunk << 4));
 }
+
+// Crosswise operands (stored [contract][rows], rows-contiguous) cannot be
+// cp.async'd into the canonical [rows][contract] tile — a 16B global run
+// holds one contract byte for each of 16 rows. They stage K-major instead
+// (byte (p, r) at p*RowsTile + r), where the very same runs land contiguously
+// and cp.async applies unchanged; a per-tile smem->smem transpose (below)
+// then produces the canonical swizzled tile the MMA fragments read. This
+// keeps the whole global→shared path asynchronous — the synchronous
+// LDG+byte-scatter staging this replaces left the kernel long-scoreboard
+// bound (ncu: 4.6 stalled loads per issue vs 0.4 on the congruous path).
+template <typename T8, int K, int RowsTile, int kThreads>
+__device__ __forceinline__ void
+stage_crosswise_tile(T8* staging, const T8* __restrict__ operand, int64_t rows,
+                     int64_t contract, int64_t ld, int tid, int64_t k_base,
+                     int64_t block_row) {
+    constexpr int kRuns = K * RowsTile / 16;  // 16B runs per tile
+    // r0 is a multiple of 16 and p*ld keeps 16B alignment whenever ld has it,
+    // so one uniform verdict covers every run.
+    const bool run_aligned =
+        ((reinterpret_cast<uintptr_t>(operand) | ld) & 15) == 0;
+    for (int run = tid; run < kRuns; run += kThreads) {
+        const int pl = run % K;  // local contract byte (column of the run)
+        const int rg = run / K;  // 16-row group
+        const int64_t r0 = block_row + (int64_t)rg * 16;
+        T8* dst = staging + pl * RowsTile + rg * 16;
+        if (run_aligned && r0 + 15 < rows && k_base + pl < contract)
+            astrai::cp_async_16(dst, operand + (k_base + pl) * ld + r0, true);
+        else {
+            // Row tail, contract tail or misaligned base: predicated fill.
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int64_t r = r0 + i;
+                dst[i] = r < rows && k_base + pl < contract
+                             ? operand[(k_base + pl) * ld + r]
+                             : T8(0.0f);
+            }
+        }
+    }
+}
+
+// Direct (synchronous) crosswise load into a canonical rotating stage:
+// LDG.128 x4 (4 consecutive contract bytes x 16 rows) + in-register PRMT
+// transpose + 16 STS.32. Used for crosswise operands whose global data is
+// typically L2-resident (the A side of dW): the staging detour's extra
+// shared-memory round trip costs more than the latency it hides there,
+// while crosswise B operands (DRAM-streamed weights of dX) take the
+// asynchronous stage_crosswise_tile path instead.
+template <typename T8, int K, int RowsTile, int kThreads>
+__device__ __forceinline__ void
+load_crosswise_direct(T8* tile, const T8* __restrict__ operand, int64_t rows,
+                      int64_t contract, int64_t ld, int tid, int64_t k_base,
+                      int64_t block_row) {
+    constexpr int kQuads = K / 4;    // 4-byte contract quads per tile
+    constexpr int kGroups = RowsTile / 16;
+    constexpr int kTChunks = kQuads * kGroups;  // 64B chunks per tile
+    // r0 is always a multiple of 16 (block_row is a multiple of RowsTile and
+    // each group covers 16 rows), and p*ld keeps the base 16B-aligned
+    // whenever ld is, so every run of a chunk shares one alignment verdict.
+    const bool run_aligned =
+        ((reinterpret_cast<uintptr_t>(operand) | ld) & 15) == 0;
+    for (int chunk = tid; chunk < kTChunks; chunk += kThreads) {
+        const int quad = chunk / kGroups;
+        const int rg = chunk % kGroups;
+        const int64_t r0 = block_row + rg * 16;
+        const bool rows_full = r0 + 15 < rows;
+        if (rows_full && run_aligned) {
+            const int64_t p0 = k_base + quad * 4;
+            uint4 v[4];
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                // Contract tail: a run past k carries zero bytes; they flow
+                // through the PRMT transpose like any other value.
+                if (p0 + s < contract)
+                    v[s] = *reinterpret_cast<const uint4*>(
+                        operand + (p0 + s) * ld + r0);
+                else
+                    v[s] = make_uint4(0u, 0u, 0u, 0u);
+            }
+            const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                // word i = row r0+i's quad: byte i of each of the four runs
+                // [v0.b(i), v1.b(i), v2.b(i), v3.b(i)]. Byte i of a uint4
+                // lives in its (i>>2)-th 32-bit register.
+                const unsigned nib = i & 3;
+                const unsigned sel = nib | ((nib + 4) << 4);
+                const unsigned w01 =
+                    __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
+                const unsigned w23 =
+                    __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
+                *reinterpret_cast<unsigned*>(tile_at<K>(tile, rg * 16 + i,
+                                                        quad * 4)) =
+                    __byte_perm(w01, w23, 0x5410u);
+            }
+        } else {
+            // Row-tail or misaligned chunk: byte-granular gather with
+            // per-row predication; contract-tail columns zero-fill.
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const int col = quad * 4 + s;
+                if (k_base + col >= contract) {
+#pragma unroll
+                    for (int i = 0; i < 16; ++i)
+                        *tile_at<K>(tile, rg * 16 + i, col) = T8(0.0f);
+                    continue;
+                }
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const int64_t r_idx = r0 + i;
+                    *tile_at<K>(tile, rg * 16 + i, col) =
+                        r_idx < rows
+                            ? operand[(k_base + col) * ld + r_idx]
+                            : T8(0.0f);
+                }
+            }
+        }
+    }
+}
+
+// K-major staging -> canonical [rows][kK] swizzled tile, one chunk at a time.
+// Each chunk (indexed within a k_seg region of `quads_per_seg` quads) covers
+// 4 consecutive contract bytes x 16 rows: four LDS.128 grab the staging runs,
+// PRMT byte selects transpose them in registers, and sixteen STS.32 land the
+// row quads through tile_at's swizzle — 4x fewer store instructions than a
+// byte-granular scatter. Chunk-at-a-time lets the caller pool work across
+// operands; the region restriction lets the main loop overlap one region's
+// transpose with another region's MMAs (a whole-tile serial transpose put
+// the crosswise GEMMs at 25% tensor utilization).
+template <typename T8, int K, int RowsTile>
+__device__ __forceinline__ void
+transpose_crosswise_region(T8* tile, const T8* staging, int idx, int quad0) {
+    constexpr int kGroups = RowsTile / 16;
+    const int quad = quad0 + idx / kGroups;
+    const int rg = idx % kGroups;
+    // The four runs sit RowsTile bytes apart (one per contract byte of the
+    // quad); each run is 16 contiguous staging bytes = 16 rows.
+    const char* run0 = reinterpret_cast<const char*>(
+        staging + quad * 4 * RowsTile + rg * 16);
+    uint4 v[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+        v[s] = *reinterpret_cast<const uint4*>(run0 + s * RowsTile);
+    const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        // word i = row r0+i's quad: byte i of each of the four runs
+        // [v0.b(i), v1.b(i), v2.b(i), v3.b(i)]. Byte i of a uint4 lives in
+        // its (i>>2)-th 32-bit register.
+        const unsigned nib = i & 3;
+        const unsigned sel = nib | ((nib + 4) << 4);
+        const unsigned w01 =
+            __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
+        const unsigned w23 =
+            __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
+        *reinterpret_cast<unsigned*>(tile_at<K>(tile, rg * 16 + i, quad * 4)) =
+            __byte_perm(w01, w23, 0x5410u);
+    }
+}
+
+// Layout-aware shared-memory budget and occupancy hint. A congruous or
+// direct-crosswise operand needs its kStages rotating canonical buffers; a
+// staged-crosswise operand (crosswise B with kBStaged) needs kStages K-major
+// staging buffers plus ONE canonical buffer (rewritten every tile by the
+// in-kernel transpose). The 48KB static-smem watermark picks the resident-CTA
+// hint for __launch_bounds__ (sm_89: 100KB smem per SM, so two CTAs fit while
+// each stays within the static budget).
+template <typename Traits, typename LayoutA, typename LayoutB, bool StagedB>
+struct Fp8GemmSmem {
+    // Crosswise = the stage-load's view: A's tag directly, B's transposed.
+    // A-crosswise always loads direct (L2-typical activations); B-crosswise
+    // stages only when its contract dim is long enough to stream DRAM.
+    static constexpr bool kCrossA = std::is_same_v<LayoutA, ColMajor>;
+    static constexpr bool kCrossB = std::is_same_v<LayoutB, RowMajor>;
+    static constexpr bool kBStagePath = kCrossB && StagedB;
+    static constexpr int kBytes =
+        Traits::kStages * Traits::kBlockM * Traits::kK +
+        (kBStagePath ? Traits::kStages + 1 : Traits::kStages) *
+            Traits::kBlockN * Traits::kK;
+    static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
+};
 
 // LayoutA / LayoutB tag the operands' storage (CUTLASS-style, see common.h):
 // A RowMajor = [M][K] / ColMajor = [K][M]; B RowMajor = [K][N] /
@@ -342,25 +441,43 @@ __device__ __forceinline__ unsigned frag_addr(const T8* tile, int row, int chunk
 // (mt x nt = 4x4 MMA each). The 64x128 variant runs 4 warps / 128 threads and
 // exists for small-M calls: m <= 64 wastes half of every 128-row CTA, so the
 // launcher dispatches to it there (see launch_fp8_gemm).
-template <typename Traits, bool OutFp8 = false, typename LayoutA = RowMajor,
-          typename LayoutB = RowMajor>
-__global__ void
-    __launch_bounds__((Traits::kBlockM / 64) * (Traits::kBlockN / 32) * 32, 2)
+template <typename Traits, bool OutFp8 = false, 
+        typename LayoutA = RowMajor, typename LayoutB = RowMajor, bool kGroupRaster = false,
+        bool kBStaged = true>
+__global__ void __launch_bounds__(Traits::kCtaThreads,
+                                  Fp8GemmSmem<Traits, LayoutA, LayoutB,
+                                              kBStaged>::kMinCtas) 
     fp8_gemm_kernel(FP8Params p) {
     using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
     constexpr int kBlockM = Traits::kBlockM;
     constexpr int kBlockN = Traits::kBlockN;
     constexpr int kK = Traits::kK;
     constexpr int kStages = Traits::kStages;
-    constexpr int kCtaThreads = (kBlockM / 64) * (kBlockN / 32) * 32;
+    constexpr int kCtaThreads = Traits::kCtaThreads;
+    constexpr bool kCrossA = Fp8GemmSmem<Traits, LayoutA, LayoutB, kBStaged>::kCrossA;
+    constexpr bool kCrossB = Fp8GemmSmem<Traits, LayoutA, LayoutB, kBStaged>::kCrossB;
+    constexpr bool kBStagePath =
+        Fp8GemmSmem<Traits, LayoutA, LayoutB, kBStaged>::kBStagePath;
     static_assert(kStages >= 1 && kStages <= 8,
-                  "FP8 GEMM stages must be in the range [1, 8]");
+                  "FP8 GEMM stages must be in [1, 8]");
     // Tiles are flat [rows * kK] with a 16B-chunk XOR swizzle (tile_at):
     // ldmatrix reads whole 16B chunks through the same mapping the staging
     // writes, and the swizzle removes the bank conflict the unswizzled
-    // 8-word row stride caused (see tile_at).
-    __shared__ __align__(16) T8 a_smem[kStages][kBlockM * kK];
-    __shared__ __align__(16) T8 b_smem[kStages][kBlockN * kK];
+    // 8-word row stride caused (see tile_at). The stages live in dynamic
+    // shared memory so deep pipelines (kStages * (kBlockM + kBlockN) * kK >
+    // 48KB static limit) opt in via cudaFuncSetAttribute in the launcher.
+    extern __shared__ __align__(16) char fp8_gemm_smem[];
+    // Per operand: congruous or direct-crosswise = kStages rotating canonical
+    // buffers; staged-crosswise (B) = kStages K-major staging buffers (filled
+    // by cp.async, one per tile in flight) followed by one canonical buffer
+    // the per-tile transpose rewrites.
+    constexpr int kAStageBytes = kBlockM * kK;
+    constexpr int kBStageBytes = kBlockN * kK;
+    constexpr int kStB = kStages;  // B staging ring size (see above)
+    T8* const a_base = reinterpret_cast<T8*>(fp8_gemm_smem);
+    T8* const b_base =
+        reinterpret_cast<T8*>(fp8_gemm_smem + kStages * kAStageBytes);
+    T8* const b_canon = b_base + kStages * kBStageBytes;  // crosswise B only
 
     const auto* a = reinterpret_cast<const T8*>(p.a_ptr);
     const auto* b = reinterpret_cast<const T8*>(p.b_ptr);
@@ -379,12 +496,14 @@ __global__ void
     // before advancing along N. All CTAs of one group share the same B column
     // stripe, so B tiles stay hot in L2 across the wave (the default
     // N-fastest order makes each wave touch every B tile instead).
-    // Measured win for the A-crosswise layouts (10-21% at K>=2048) and loss
-    // for A-congruous (-17..20%, A's cp.async stream prefers the N-fastest
-    // order) — so the branch follows LayoutA.
+    // kGroupRaster is a template knob (the launcher defaults it to the
+    // measured best per layout: grouped for A-crosswise (dW) and for the
+    // congruous NT forward — whose big B operand gains the most from the
+    // shared stripe — plain for dX's crosswise-B layouts, where it measured
+    // neutral).
     constexpr int kGroupM = 8;
     int block_m, block_n;
-    if constexpr (std::is_same_v<LayoutA, ColMajor>) {
+    if constexpr (kGroupRaster) {
         const int blocks_m = gridDim.y;
         const int bid = blockIdx.y * gridDim.x + blockIdx.x;
         const int group_first_m = (bid / (kGroupM * gridDim.x)) * kGroupM;
@@ -409,18 +528,48 @@ __global__ void
     const float sb = *p.scale_b;
     float acc[4][4][4] = {};  // [nt][mt][acc]
 
-    // Both operands are staged into the canonical [M][kK] / [N][kK] shared
-    // tiles regardless of their global layout (see load_operand_tile), so the
-    // MMA fragment reads below stay unchanged across the four layout
-    // combinations. A's tag already names the operand view ([M][K] =
-    // [rows][contract]); B's tag is relative to the canonical [K][N], so the
-    // stage-load sees its transpose (transpose_layout_t, see common.h).
-    auto load_tile = [&](int stage, int64_t k_base) {
-        load_operand_tile<T8, kK, LayoutA, kBlockM, kCtaThreads>(
-            a_smem[stage], a, m, k, a_ld, tid, k_base, (int64_t)block_m * kBlockM);
-        load_operand_tile<T8, kK, transpose_layout_t<LayoutB>, kBlockN,
-                          kCtaThreads>(b_smem[stage], b, n, k, b_ld, tid, k_base,
-                                       (int64_t)block_n * kBlockN);
+    // Both operands end up in the canonical [M][kK] / [N][kK] shared tiles
+    // the MMA fragments read, regardless of their global layout. A's tag
+    // already names the operand view ([M][K] = [rows][contract]); B's tag is
+    // relative to the canonical [K][N], so the stage-load sees its transpose
+    // (transpose_layout_t, see common.h). Congruous operands cp.async
+    // straight into their rotating canonical buffers; crosswise operands
+    // cp.async into K-major staging (zero transformation) and get a per-tile
+    // smem->smem transpose below.
+    auto load_tile = [&](int tile, int stage, int64_t k_base) {
+        if constexpr (kCrossA) {
+            load_crosswise_direct<T8, kK, kBlockM, kCtaThreads>(
+                a_base + stage * kAStageBytes, a, m, k, a_ld, tid, k_base,
+                (int64_t)block_m * kBlockM);
+        } else {
+            load_operand_tile<T8, kK, kBlockM, kCtaThreads>(
+                a_base + stage * kAStageBytes, a, m, k, a_ld, tid, k_base,
+                (int64_t)block_m * kBlockM);
+        }
+        if constexpr (kBStagePath) {
+            stage_crosswise_tile<T8, kK, kBlockN, kCtaThreads>(
+                b_base + (tile % kStB) * kBStageBytes, b, n, k, b_ld, tid,
+                k_base, (int64_t)block_n * kBlockN);
+        } else if constexpr (kCrossB) {
+            load_crosswise_direct<T8, kK, kBlockN, kCtaThreads>(
+                b_base + stage * kBStageBytes, b, n, k, b_ld, tid, k_base,
+                (int64_t)block_n * kBlockN);
+        } else {
+            load_operand_tile<T8, kK, kBlockN, kCtaThreads>(
+                b_base + stage * kBStageBytes, b, n, k, b_ld, tid, k_base,
+                (int64_t)block_n * kBlockN);
+        }
+    };
+    // smem->smem transpose of one k_seg region (kSegQuads contract quads) of
+    // this tile's staged-crosswise B into its single canonical buffer.
+    auto transpose_tile = [&](int tile, int seg) {
+        if constexpr (!kBStagePath) return;
+        constexpr int kSegQuads = kK / 4 / (kK / kMmaK);  // quads per k_seg
+        constexpr int kBRegion = kSegQuads * (kBlockN / 16);
+        const T8* b_stg = b_base + (tile % kStB) * kBStageBytes;
+        for (int idx = tid; idx < kBRegion; idx += kCtaThreads)
+            transpose_crosswise_region<T8, kK, kBlockN>(b_canon, b_stg, idx,
+                                                        seg * kSegQuads);
     };
 
     const int64_t tile_count = (k + kK - 1) / kK;
@@ -445,7 +594,7 @@ __global__ void
 #pragma unroll
     for (int stage = 0; stage < kStages; ++stage) {
         if (stage < tile_count) {
-            load_tile(stage, static_cast<int64_t>(stage) * kK);
+            load_tile(stage, stage, static_cast<int64_t>(stage) * kK);
             astrai::cp_async_commit_group();
         }
     }
@@ -463,33 +612,62 @@ __global__ void
         // before any thread reads tiles written by other threads.
         __syncthreads();
 
+        // Staged-crosswise B: produce the canonical tile one k_seg region at
+        // a time so each region's transpose overlaps the previous region's
+        // MMA sequence (the transposes are pure shared-memory traffic — B's
+        // global path stayed fully asynchronous above).
+        constexpr int kSegs = kK / kMmaK;
+        if constexpr (kBStagePath) {
+            transpose_tile(tile_index, 0);
+            // Barrier 2: region 0 visible to every thread before its
+            // fragment loads. (Compiled out for congruous/direct layouts.)
+            __syncthreads();
+        }
+
+        const T8* a_tile = a_base + (size_t)stage * kAStageBytes;
+        const T8* b_tile =
+            kBStagePath ? b_canon : b_base + (size_t)stage * kBStageBytes;
+
         // 4 ldmatrix.x2 (B) + 4 ldmatrix.x4 (A) feed 16 mma.sync per k_seg —
         // 0.5 load instructions per MMA, versus 4.5 scalar LDS per MMA in
         // the 128x64-tile version (the kernel was LSU-issue-bound there).
-        constexpr int kSegs = kK / kMmaK;
-        // B fragments double-buffered across k_segs: the next k_seg's B load
-        // is issued before the current k_seg's MMA sequence, so its LDS
-        // latency hides behind the A pipeline + tensor-pipe work (same trick
-        // as the A mt+1 prefetch below; costs kSegs x 8 registers).
+        // B fragments double-buffer across k_segs while B is congruous (no
+        // region writes in flight); a crosswise B reloads per k_seg after
+        // the region's transpose became visible.
         unsigned b_frag[2][4][2];
+        if constexpr (!kBStagePath) {
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            const int row = b_row0 + nt * 8 + r7;
-            astrai::ldmatrix_x2_lane(b_frag[0][nt],
-                                     frag_addr<T8, kK>(b_smem[stage], row, rh8));
+            for (int nt = 0; nt < 4; ++nt) {
+                const int row = b_row0 + nt * 8 + r7;
+                astrai::ldmatrix_x2_lane(b_frag[0][nt],
+                                         frag_addr<T8, kK>(b_tile, row, rh8));
+            }
         }
 #pragma unroll
         for (int k_seg = 0; k_seg < kSegs; ++k_seg) {
             const int bcur = k_seg & 1, bnext = bcur ^ 1;
-            if (k_seg + 1 < kSegs) {
+            if constexpr (kBStagePath) {
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    const int row = b_row0 + nt * 8 + r7;
+                    astrai::ldmatrix_x2_lane(
+                        b_frag[bcur][nt],
+                        frag_addr<T8, kK>(b_tile, row, k_seg * 2 + rh8));
+                }
+            } else if (k_seg + 1 < kSegs) {
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     const int row = b_row0 + nt * 8 + r7;
                     astrai::ldmatrix_x2_lane(
                         b_frag[bnext][nt],
-                        frag_addr<T8, kK>(b_smem[stage], row,
-                                          (k_seg + 1) * 2 + rh8));
+                        frag_addr<T8, kK>(b_tile, row, (k_seg + 1) * 2 + rh8));
                 }
+            }
+            // Region k_seg+1's transpose overlaps this region's MMA work
+            // (disjoint canonical regions, no race).
+            if constexpr (kBStagePath) {
+                if (k_seg + 1 < kSegs)
+                    transpose_tile(tile_index, k_seg + 1);
             }
             // Software-pipelined A fragments: the ldmatrix.x4 for row mt+1
             // is issued before the MMAs consuming row mt, so the LDS fixed
@@ -497,14 +675,14 @@ __global__ void
             // ~2.3 cycles/issue before this). Costs 4 extra registers.
             unsigned a_frag[5][4];
             astrai::ldmatrix_x4_lane(
-                a_frag[0], frag_addr<T8, kK>(a_smem[stage], a_row0 + rh8 * 8 + r7,
+                a_frag[0], frag_addr<T8, kK>(a_tile, a_row0 + rh8 * 8 + r7,
                                              k_seg * 2 + rh16));
 #pragma unroll
             for (int mt = 0; mt < 4; ++mt) {
                 if (mt < 3)
                     astrai::ldmatrix_x4_lane(
                         a_frag[mt + 1],
-                        frag_addr<T8, kK>(a_smem[stage],
+                        frag_addr<T8, kK>(a_tile,
                                           a_row0 + (mt + 1) * 16 + rh8 * 8 + r7,
                                           k_seg * 2 + rh16));
 #pragma unroll
@@ -512,12 +690,19 @@ __global__ void
                     astrai::mma_sync<T8>(acc[nt][mt], a_frag[mt], b_frag[bcur][nt],
                                          acc[nt][mt]);
             }
+            // Barrier 3: region k_seg+1's transposes complete and become
+            // visible before the next k_seg reads them.
+            if constexpr (kBStagePath) {
+                if (k_seg + 1 < kSegs) __syncthreads();
+            }
         }
-        // Barrier 2: every thread finished reading this stage's tiles before
-        // the prefetch for the (i+kStages)-th tile overwrites them.
+        // Barrier 4: every thread finished reading this stage's tiles before
+        // the prefetch for the (i+kStages)-th tile overwrites them (and the
+        // next iteration's transposes rewrite the canonical buffer).
         __syncthreads();
         if (tile_index + kStages < tile_count) {
-            load_tile(stage, (tile_index + kStages) * kK);
+            load_tile(tile_index + kStages, stage,
+                      (tile_index + kStages) * kK);
             astrai::cp_async_commit_group();
         }
     }
@@ -593,26 +778,74 @@ void launch_fp8_quantize(const FP8QuantizeParams& p, cudaStream_t stream) {
     fp8_quantize_kernel<Fmt><<<blocks, kThreads, 0, stream>>>(p);
 }
 
+// Launch one kernel instantiation with its shared-memory budget: stages live
+// in dynamic smem, so budgets beyond the 48KB static limit opt in once per
+// instantiation via cudaFuncSetAttribute (see AGENTS.md "dynamic shared
+// memory"). Templated on the kernel *value* (auto NTTP) so every
+// instantiation owns its own armed flag — same-signature kernels must not
+// share it (the attribute is per-function).
+template <auto Kernel, typename... Args>
+void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
+                      cudaStream_t stream, Args... args) {
+    if (smem_bytes > 48 * 1024) {
+        static bool armed = false;  // per instantiation
+        if (!armed) {
+            cudaFuncSetAttribute(Kernel, 
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 smem_bytes);
+            armed = true;
+        }
+    }
+    Kernel<<<grid, block, smem_bytes, stream>>>(args...);
+}
+
 // Pre-quantized GEMM tile config: 128x128 CTA (8 warps x 64x32 warp tiles).
-// kK selects the K tile (32 or 64; 64 halves the __syncthreads count per K
-// and doubles the MMA work per stage, at 2x the smem per stage — measured
-// 10-35% across shapes, so 64 is the default). Stages=2 with kK=64 keeps the
-// pipeline at 32KB smem; deeper pipelines only win on K >= 4096 squares and
-// lose elsewhere. LayoutA/LayoutB mirror the kernel template (defaults keep
-// the NN layout: out = a @ b). m <= 64 dispatches to the 64x128 CTA — a
-// 128-row CTA would waste half its MMA work on predicated-off rows.
+// kK selects the K tile (32 / 64 / 128; larger kK halves the __syncthreads
+// count per K and doubles the MMA work per stage at more smem per stage).
+// Stages is the cp.async pipeline depth (smem = Stages * (BM + BN) * kK
+// bytes for congruous layouts; deep pipelines are dynamic-smem backed, 1
+// CTA/SM past 48KB). GroupRaster defaults to the historically-measured best
+// per LayoutA (grouped for A-crosswise, plain for A-congruous). m <= 64
+// dispatches to the 64x128 CTA — a 128-row CTA would waste half its MMA work
+// on predicated-off rows.
+// Crosswise B takes the asynchronous staging+transpose pipeline only when
+// the contract dim is long enough that B streams from DRAM (dX-class GEMMs,
+// k = N_ffn); short-K crosswise GEMMs (dW: k = M tokens) read L2-resident
+// operands, where the staging round trip costs more shared-memory traffic
+// than the latency it hides (measured: dW ~37 TF direct vs ~29 TF staged,
+// dX ~39 TF staged vs ~38 direct).
+constexpr int64_t kCrossStageMinK = 8192;
+
 template <FP8Format Fmt, bool OutFp8 = false, typename LayoutA = RowMajor,
-          typename LayoutB = RowMajor, int kK = 64, int Stages = 2>
+          typename LayoutB = RowMajor, int kK = 64, int Stages = 2,
+          bool GroupRaster = std::is_same_v<LayoutA, ColMajor> || std::is_same_v<LayoutB, ColMajor>>
 void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
     dim3 grid((p.n + 127) / 128, (p.m + 127) / 128);
+    const bool b_staged = p.k >= kCrossStageMinK;
     if (p.m <= 64) {
         using Traits = Fp8GemmTraits<Fmt, 64, 128, kK, Stages>;
-        fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB>
-            <<<grid, (64 / 64) * (128 / 32) * 32, 0, stream>>>(p);
+        if (b_staged)
+            launch_with_smem<fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB,
+                                             GroupRaster, true>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, true>::kBytes, grid,
+                dim3(Traits::kCtaThreads), stream, p);
+        else
+            launch_with_smem<fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB,
+                                             GroupRaster, false>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
+                dim3(Traits::kCtaThreads), stream, p);
     } else {
         using Traits = Fp8GemmTraits<Fmt, 128, 128, kK, Stages>;
-        fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB>
-            <<<grid, (128 / 64) * (128 / 32) * 32, 0, stream>>>(p);
+        if (b_staged)
+            launch_with_smem<fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB,
+                                             GroupRaster, true>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, true>::kBytes, grid,
+                dim3(Traits::kCtaThreads), stream, p);
+        else
+            launch_with_smem<fp8_gemm_kernel<Traits, OutFp8, LayoutA, LayoutB,
+                                             GroupRaster, false>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
+                dim3(Traits::kCtaThreads), stream, p);
     }
 }
 

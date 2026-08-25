@@ -157,7 +157,10 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_bf16(torch::Tensor x,
     auto x8 = torch::empty_like(
         x_c, x_c.options().dtype(fmt ? torch::kFloat8_e5m2
                                       : torch::kFloat8_e4m3fn));
-    auto amax = torch::zeros({1}, x_c.options().dtype(torch::kFloat32));
+    // amax feeds the cross-block atomic_max; zero it on the stream (empty +
+    // memset, not torch::zeros — the latter routes through a fill_ dispatcher).
+    auto amax = torch::empty({1}, x_c.options().dtype(torch::kFloat32));
+    cudaMemsetAsync(amax.data_ptr(), 0, sizeof(float), stream.stream());
     FP8QuantizeParams p;
     pack_quantize_params(p, x_c.data_ptr(), x8.data_ptr(), scale, &amax,
                          nullptr, 0, 0, x_c.numel());
@@ -230,18 +233,25 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor sa,
     return out;
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
-    torch::Tensor x, torch::Tensor w, torch::Tensor bias, torch::Tensor sx,
-    torch::Tensor sw, int64_t fmt, c10::optional<torch::Tensor> bias_scale,
-    c10::optional<torch::Tensor> x_ring, int64_t x_ring_idx,
-    int64_t x_ring_margin, c10::optional<torch::Tensor> w_ring,
-    int64_t w_ring_idx, int64_t w_ring_margin) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor>
+linear_forward_fp8(torch::Tensor x, torch::Tensor w, torch::Tensor bias,
+                   torch::Tensor sx, torch::Tensor sw, int64_t fmt,
+                   c10::optional<torch::Tensor> bias_scale,
+                   c10::optional<torch::Tensor> x_ring, int64_t x_ring_idx,
+                   int64_t x_ring_margin, c10::optional<torch::Tensor> w_ring,
+                   int64_t w_ring_idx, int64_t w_ring_margin) {
     // Pure FP8 forward: quantize x/w (fmt: 0 = E4M3, 1 = E5M2), then the
     // pre-quantized GEMM; the dequantized BF16 output gets the bias added.
-    // amax_x / amax_w come from the quantize kernels (zero-initialized here;
-    // a pre-quantized w reports amax_w = 0 — nothing to feed a delayed ring).
-    // w may itself be pre-quantized fp8 storage matching fmt (static
-    // inference weights): the weight quantize is skipped, amax_w stays 0.
+    // Returns (out, x8, w8, amax_x, amax_w): the quantized operands are
+    // handed back so the policy layer can cache the weight quantization
+    // (torch autocast's cached_cast analog — w8 is reused while the weight
+    // tensor is unchanged, and the backward can share x8/w8 when the fwd/bwd
+    // formats match). amax_x / amax_w come from the quantize kernels
+    // (zero-initialized here; a pre-quantized w reports amax_w = 0 — nothing
+    // to feed a delayed ring). w may itself be pre-quantized fp8 storage
+    // matching fmt (static inference weights): the weight quantize is
+    // skipped, amax_w stays 0, and w8 returns the passed-in w.
     // When x_ring / w_ring are given (delayed scaling), the quantize kernels
     // finalize them in-kernel: the returned amax is already folded into the
     // ring window and the next step's scale is published on device.
@@ -276,8 +286,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
         if (b_prequant) check_scale(*bias_scale, x, "bias_scale");
     }
     auto x8 = torch::empty({m, k}, x_c.options().dtype(f8opt));
-    auto amax_x = torch::zeros({1}, x.options().dtype(torch::kFloat32));
-    auto amax_w = torch::zeros({1}, x.options().dtype(torch::kFloat32));
+    // Each amax slot feeds a cross-block atomic_max, so it must start at 0.
+    // torch::zeros would route through a fill_ dispatcher (~50us CPU per call
+    // in the profile); a caching-allocator empty + cudaMemsetAsync is ~2us.
+    // Zero both up front: the pre-quantized-w path never quantizes w, so its
+    // amax_w is never atomically written and must not carry stale bytes. The
+    // returned values are the freshly measured (or 0) amax either way.
+    auto amax_x = torch::empty({1}, x.options().dtype(torch::kFloat32));
+    auto amax_w = torch::empty({1}, x.options().dtype(torch::kFloat32));
+    cudaMemsetAsync(amax_x.data_ptr(), 0, sizeof(float), stream.stream());
+    cudaMemsetAsync(amax_w.data_ptr(), 0, sizeof(float), stream.stream());
     auto out = torch::empty({m, n}, x_c.options());
 
     auto quantize = [&](const torch::Tensor& src, torch::Tensor& dst,
@@ -322,7 +340,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward_fp8(
 
     std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end() - 1);
     shape.push_back(n);
-    return {out.reshape(shape), amax_x, amax_w};
+    return {out.reshape(shape), x8, w8, amax_x, amax_w};
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -360,7 +378,13 @@ linear_backward_fp8(torch::Tensor g, torch::Tensor x, torch::Tensor w,
     auto grad_input = torch::empty_like(x);
     auto grad_weight = torch::empty_like(w);
     auto grad_bias = torch::empty({0}, g.options());
-    auto amax_g = torch::zeros({1}, g.options().dtype(torch::kFloat32));
+    // amax_g feeds a cross-block atomic_max in the g quantize kernel; zero it
+    // on the stream (empty + memset, not torch::zeros — see the forward).
+    // Only needed when a g quantize runs (mask[0]||mask[1]); the bias-only
+    // fallback below overwrites it via .copy_, so a wasted memset elsewhere
+    // is harmless.
+    auto amax_g = torch::empty({1}, g.options().dtype(torch::kFloat32));
+    cudaMemsetAsync(amax_g.data_ptr(), 0, sizeof(float), stream.stream());
     auto f8opt = fmt ? g.options().dtype(torch::kFloat8_e5m2)
                      : g.options().dtype(torch::kFloat8_e4m3fn);
 
@@ -453,7 +477,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "matching fmt (static inference path; fp8 bias requires bias_scale);"
           " x_ring/w_ring optionally finalize a delayed-scaling ring "
           "([hist | scale | counter] float32 buffer) in-kernel; returns "
-          "(out, amax_x, amax_w)");
+          "(out, x8, w8, amax_x, amax_w) — x8 is [M,K], w8 is [N,K] (the "
+          "passed-in w on the pre-quantized path)");
     m.def("linear_backward_fp8", &linear_backward_fp8, py::arg("g"),
           py::arg("x"), py::arg("w"), py::arg("masks"), py::arg("sg"),
           py::arg("sw"), py::arg("sx"), py::arg("fmt"),

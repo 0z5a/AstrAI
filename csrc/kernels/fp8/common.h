@@ -61,6 +61,12 @@ struct Fp8GemmTraits {
     static constexpr __nv_fp8_interpretation_t kNvFormat =
         kIsE5M2 ? __NV_E5M2 : __NV_E4M3;
     static constexpr float kFp8Max = kIsE5M2 ? 57344.0f : 448.0f;
+
+    // Derived launch geometry: 64x32 warp tiles give the CTA thread count.
+    // The shared-memory budget is layout-aware (crosswise operands add K-
+    // major staging + a canonical buffer), so it lives in Fp8GemmSmem in
+    // gemm.cuh together with the resident-CTA hint for __launch_bounds__.
+    static constexpr int kCtaThreads = (BlockM / 64) * (BlockN / 32) * 32;
 };
 
 // Quantize-kernel parameter POD: BF16 -> FP8 with fused amax and optional

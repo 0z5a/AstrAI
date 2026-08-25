@@ -4,7 +4,7 @@ Isolates the ``fp8_ops`` CUDA extension behind stable Python primitives:
 
 - ``quantize_bf16(x, scale, fmt) -> (x8, amax)`` — BF16 → FP8 with fused amax
 - ``mm_fp8(a8, b8, sa, sb) -> out`` — pre-quantized FP8 GEMM (BF16 output)
-- ``linear_forward_fp8(x, w, bias, sx, sw) -> (out, amax_x, amax_w)``
+- ``linear_forward_fp8(x, w, bias, sx, sw) -> (out, x8, w8, amax_x, amax_w)``
 - ``linear_backward_fp8(g, x, w, masks, sg, sw, sx, fmt) -> (gx, gw, gb, amax_g)``
 
 Scale semantics: scales are *quantization steps* — the value divided out when
@@ -15,6 +15,8 @@ never passed as output arguments. ``fmt`` is ``"e4m3"`` or ``"e5m2"``.
 Policy (scales, amax history, delayed scaling, autocast) lives in ``fp8.py``;
 this module is stateless.
 """
+
+from typing import List, Optional, Tuple
 
 import torch
 from torch.library import custom_op
@@ -39,7 +41,7 @@ def _fmt_dtype(fmt: str) -> torch.dtype:
 @custom_op("custom::fp8_quantize", mutates_args=())
 def fp8_quantize(
     x: torch.Tensor, scale: torch.Tensor, fmt: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """BF16 -> FP8 quantize with fused amax; returns ``(x8, amax)``."""
 
 
@@ -73,7 +75,7 @@ def fp8_gemm(
     sa: torch.Tensor,
     sb: torch.Tensor,
     out_dtype: int = 0,
-    out_scale: torch.Tensor | None = None,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP8 GEMM: ``a @ b * (sa * sb)`` with FP32 accumulation.
 
@@ -106,7 +108,9 @@ def _fp8_gemm_cpu(a, b, sa, sb, out_dtype=0, out_scale=None):
     return acc.to(torch.bfloat16)
 
 
-def quantize_bf16(x: torch.Tensor, scale: torch.Tensor, fmt: str = "e4m3"):
+def quantize_bf16(
+    x: torch.Tensor, scale: torch.Tensor, fmt: str = "e4m3"
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """BF16 -> FP8 quantize with fused amax; returns ``(x8, amax)``.
 
     ``scale`` is the quantization step (device scalar); ``fmt`` selects
@@ -122,7 +126,7 @@ def mm_fp8(
     sa: torch.Tensor,
     sb: torch.Tensor,
     out_dtype: str = "bf16",
-    out_scale: torch.Tensor | None = None,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pre-quantized FP8 GEMM: ``a @ b * (sa * sb)``.
 
@@ -139,24 +143,28 @@ def mm_fp8(
 
 
 def linear_forward_fp8(
-    x,
-    w,
-    bias,
-    sx,
-    sw,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    sx: torch.Tensor,
+    sw: torch.Tensor,
     fmt: str = "e4m3",
-    bias_scale=None,
-    x_ring=None,
+    bias_scale: Optional[torch.Tensor] = None,
+    x_ring: Optional[torch.Tensor] = None,
     x_ring_idx: int = 0,
     x_ring_margin: int = 0,
-    w_ring=None,
+    w_ring: Optional[torch.Tensor] = None,
     w_ring_idx: int = 0,
     w_ring_margin: int = 0,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pure FP8 linear forward: quantize x/w to ``fmt``, pre-quantized GEMM.
 
-    Returns ``(out, amax_x, amax_w)``. ``bias`` may be ``None``. For static
-    fp8 inference, ``w`` and ``bias`` may arrive pre-quantized to ``fmt``
+    Returns ``(out, x8, w8, amax_x, amax_w)`` — the quantized operands are
+    handed back so the policy layer can cache the weight quantization while
+    the weight tensor is unchanged (torch autocast's cached_cast analog).
+    ``x8`` is ``[M, K]`` and ``w8`` is ``[N, K]`` (the passed-in ``w`` itself
+    on the pre-quantized path). ``bias`` may be ``None``. For static fp8
+    inference, ``w`` and ``bias`` may arrive pre-quantized to ``fmt``
     (produced by :func:`quantize_bf16` with their scales as ``sw`` /
     ``bias_scale``); a pre-quantized ``bias`` requires ``bias_scale``, and
     its ``amax_w`` comes back 0. The bias is fused into the GEMM epilogue.
@@ -190,18 +198,18 @@ def linear_forward_fp8(
 
 
 def linear_backward_fp8(
-    g,
-    x,
-    w,
-    masks,
-    sg,
-    sw,
-    sx,
+    g: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    masks: List[bool],
+    sg: torch.Tensor,
+    sw: torch.Tensor,
+    sx: torch.Tensor,
     fmt: str = "e5m2",
-    g_ring=None,
+    g_ring: Optional[torch.Tensor] = None,
     g_ring_idx: int = 0,
     g_ring_margin: int = 0,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """FP8 linear backward; returns ``(grad_input, grad_weight, grad_bias, amax_g)``.
 
     The gradient (and the transposed w/x operands) are quantized to ``fmt``
