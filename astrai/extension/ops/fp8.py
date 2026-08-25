@@ -87,6 +87,7 @@ def fp8_gemm(
 ) -> torch.Tensor:
     """FP8 GEMM: ``a @ b * scale`` with FP32 accumulation.
 
+    2D or 3D (batched) operands; a size-1 batch broadcasts (matmul rules).
     The result is always BF16; FP8 output is a separate quantize operation.
     """
 
@@ -94,11 +95,11 @@ def fp8_gemm(
 @fp8_gemm.register_fake
 def _fp8_gemm_fake(a, b, scale, trans_a=0, trans_b=0):
     dtype = torch.bfloat16
-    return torch.empty(
-        (a.size(1) if trans_a else a.size(0), b.size(0) if trans_b else b.size(1)),
-        device=a.device,
-        dtype=dtype,
-    )
+    rows = a.size(2) if trans_a else a.size(1)
+    cols = b.size(1) if trans_b else b.size(2)
+    batches = [t.size(0) for t in (a, b) if t.dim() == 3]
+    shape = (max(batches), rows, cols) if batches else (rows, cols)
+    return torch.empty(shape, device=a.device, dtype=dtype)
 
 
 @fp8_gemm.register_kernel("cuda")
@@ -112,8 +113,8 @@ def _fp8_gemm_cuda(a, b, scale, trans_a=0, trans_b=0):
 
 @fp8_gemm.register_kernel("cpu")
 def _fp8_gemm_cpu(a, b, scale, trans_a=0, trans_b=0):
-    aa = a.float().t() if trans_a else a.float()
-    bb = b.float().t() if trans_b else b.float()
+    aa = a.float().transpose(-2, -1) if trans_a else a.float()
+    bb = b.float().transpose(-2, -1) if trans_b else b.float()
     acc = aa @ bb * scale
     return acc.to(torch.bfloat16)
 
@@ -151,8 +152,10 @@ def mm_fp8(
 ) -> torch.Tensor:
     """Pre-quantized FP8 GEMM: ``a @ b * scale``.
 
-    ``a``/``b`` must be FP8 tensors of the same format. ``scale`` is their
-    combined dequantization scale. The result is BF16; FP8 output is a separate
+    ``a``/``b`` must be FP8 tensors of the same format, 2D or 3D (batched,
+    matmul-style broadcast on the batch dim). Inner-transposed views (e.g.
+    ``x.t()``) fold into the layout at zero copy. ``scale`` is their combined
+    dequantization scale. The result is BF16; FP8 output is a separate
     quantize operation.
     """
     # Same hot-path bypass as quantize(): the binding's TORCH_CHECKs keep

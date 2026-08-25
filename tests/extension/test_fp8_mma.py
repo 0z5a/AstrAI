@@ -117,6 +117,80 @@ def test_mm_fp8_transposed_operands(trans_a, trans_b):
 
 
 @skip_no_fp8
+@pytest.mark.parametrize("trans_a", [False, True])
+@pytest.mark.parametrize("trans_b", [False, True])
+def test_mm_fp8_batched(trans_a, trans_b):
+    """3D operands run as one bmm launch: all four layouts, odd shapes."""
+    torch.manual_seed(23)
+    batch, m, n, k = 4, 19, 13, 37
+    a = torch.randn(batch, m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(batch, n, k, device="cuda", dtype=torch.bfloat16)
+    sa, sb = _scale(a), _scale(b)
+    a8, _ = quantize(a, sa.reciprocal(), "e4m3")
+    b8, _ = quantize(b, sb.reciprocal(), "e4m3")
+    a_op = a8.transpose(-2, -1).contiguous() if trans_a else a8
+    b_op = b8 if trans_b else b8.transpose(-2, -1).contiguous()
+
+    out = mm_fp8(a_op, b_op, sa * sb, trans_a=trans_a, trans_b=trans_b)
+    assert out.shape == (batch, m, n)
+    # flags + transposed buffers reconstruct the original operands: the math
+    # is always A_orig @ B_orig^T regardless of the layout combination.
+    expected = (_quantize(a, sa) @ _quantize(b, sb).transpose(-2, -1) * sa * sb).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
+
+
+@skip_no_fp8
+def test_mm_fp8_batched_broadcast():
+    """A size-1 batch broadcasts across the other operand (matmul rules),
+    and a 2D operand broadcasts across a 3D one."""
+    torch.manual_seed(29)
+    batch, m, n, k = 3, 16, 8, 32
+    a = torch.randn(batch, m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, n, k, device="cuda", dtype=torch.bfloat16)
+    sa, sb = _scale(a), _scale(b)
+    a8, _ = quantize(a, sa.reciprocal(), "e4m3")
+    b8, _ = quantize(b, sb.reciprocal(), "e4m3")
+
+    out = mm_fp8(a8, b8, sa * sb, trans_b=True)
+    assert out.shape == (batch, m, n)
+    expected = (_quantize(a, sa) @ _quantize(b, sb).transpose(-2, -1) * sa * sb).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
+
+    # 2D weight broadcast over 3D activations
+    w8 = b8[0]
+    out2 = mm_fp8(a8, w8, sa * sb, trans_b=True)
+    assert out2.shape == (batch, m, n)
+    torch.testing.assert_close(out2, expected, atol=0.125, rtol=0.01)
+
+
+@skip_no_fp8
+def test_mm_fp8_col_major_view_zero_copy():
+    """An inner-transposed view (.t() of a contiguous buffer) folds into the
+    layout tag with no device copy — the only allocation is the output."""
+    torch.manual_seed(31)
+    m, n, k = 64, 64, 64
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    sa, sb = _scale(a), _scale(b)
+    a8, _ = quantize(a, sa.reciprocal(), "e4m3")
+    b8, _ = quantize(b, sb.reciprocal(), "e4m3")
+
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    out = mm_fp8(a8.t(), b8, sa * sb, trans_a=True, trans_b=True)
+    torch.cuda.synchronize()
+    grew = torch.cuda.memory_allocated() - before
+    assert grew == out.numel() * out.element_size()  # no operand copy
+
+    expected = (_quantize(a, sa) @ _quantize(b, sb).t() * sa * sb).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
+
+
+@skip_no_fp8
 def test_delayed_scaling_forward_uses_snapshot_scale():
     """The delayed scale for step N is computed from amax(steps < N); the
     forward must snapshot the scale before the ring update, so a changing

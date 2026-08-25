@@ -408,22 +408,25 @@ class _LinearFp8(torch.autograd.Function):
     def backward(ctx, g):
         x, w, _sx_fwd, _sw_fwd = ctx.saved_tensors
         fmt = ctx.fmt_bwd
+        # Flatten leading dims (the forward GEMMs ran on [-1, N] / [-1, K]
+        # views; the kernels only accept 2D operands).
+        g2 = g.reshape(-1, g.size(-1))
         if ctx.is_dynamic:
-            sg = _dynamic_scale(g, ctx.recipe, fmt)
+            sg = _dynamic_scale(g2, ctx.recipe, fmt)
             sw = _dynamic_scale(w, ctx.recipe, fmt)
             sx = _dynamic_scale(x, ctx.recipe, fmt)
         else:
             meta = ctx.meta
             if not meta.g.initialized:
-                meta.g.seed(g, fmt)
+                meta.g.seed(g2, fmt)
             sg = meta.g.scale.clone()
             sw, sx = _sw_fwd, _sx_fwd
-        g8, amax_g = quantize(g, sg.reciprocal(), fmt)
-        x8, _ = quantize(x, sx.reciprocal(), fmt)
+        g8, amax_g = quantize(g2, sg.reciprocal(), fmt)
+        x8, _ = quantize(x.reshape(-1, x.size(-1)), sx.reciprocal(), fmt)
         w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
-        grad_x = mm_fp8(g8, w8, sg * sw)  # g8[m,n] @ w8[n,k] natural
+        grad_x = mm_fp8(g8, w8, sg * sw).reshape(x.shape)  # g8[m,n] @ w8[n,k]
         grad_w = mm_fp8(g8, x8, sg * sx, trans_a=True)  # g8.T @ x8
-        grad_b = g.sum(0).to(torch.bfloat16)
+        grad_b = g2.sum(0).to(torch.bfloat16)
         if not ctx.is_dynamic:
             meta.g.update(amax_g, fmt)
             meta.g.advance()

@@ -112,6 +112,13 @@ struct FP8Params {
     // to int64 for all pointer arithmetic.
     int m, n, k;
 
+    // Batched (bmm) geometry: grid.z slices step the operand/output pointers
+    // by these element strides (0 broadcasts the operand across batches).
+    int batch = 1;
+    int64_t a_batch_stride = 0;
+    int64_t b_batch_stride = 0;
+    int64_t out_batch_stride = 0;
+
     // Physical leading dimensions (column count, i.e. row stride) of A and
     // B. For a non-transposed operand the stride equals the contract dim;
     // for a transposed operand it is the operand's own column count. The

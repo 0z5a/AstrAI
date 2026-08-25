@@ -90,6 +90,31 @@ void dispatch_gemm(const FP8Params& p, cudaStream_t stream, bool trans_a,
     }
 }
 
+// Inner-layout resolution for one GEMM operand. The user flag names the
+// math (0 = tensor's last two dims are [rows][contract], 1 = transposed);
+// the storage may independently be a col-major view (.t() of a contiguous
+// buffer), which folds into the returned dispatch flag at zero copy — the
+// kernel's LayoutA/LayoutB tags cover both storages. m/n/k derive from the
+// user flag only; the fold never swaps them (see the layout table in
+// gemm.cuh). Tensors whose inner dims are neither natural layout fall back
+// to .contiguous().
+bool resolve_operand(const torch::Tensor& t_in, bool flag, int64_t& ld,
+                     int64_t& batch_stride, torch::Tensor& storage) {
+    torch::Tensor t = t_in;
+    bool col_major = false;
+    if (t.stride(-1) != 1) {
+        if (t.stride(-2) == 1) {
+            col_major = true;
+        } else {
+            t = t.contiguous();
+        }
+    }
+    storage = t;
+    ld = col_major ? t.stride(-1) : t.stride(-2);
+    batch_stride = t.dim() == 3 ? t.stride(0) : 0;
+    return flag ^ col_major;
+}
+
 }  // namespace
 
 std::tuple<torch::Tensor, torch::Tensor> quantize(torch::Tensor x,
@@ -145,30 +170,52 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
                     a.scalar_type() == torch::kFloat8_e5m2,
                 "a and b must be fp8");
     TORCH_CHECK(a.scalar_type() == b.scalar_type(), "a and b must share format");
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a and b must be 2D");
+    TORCH_CHECK((a.dim() == 2 || a.dim() == 3) &&
+                    (b.dim() == 2 || b.dim() == 3),
+                "a and b must be 2D or 3D (batched)");
     TORCH_CHECK(a.device() == b.device(), "a and b must share device");
     check_scale(scale, a);
     check_fp8_device(a);
     const at::cuda::OptionalCUDAGuard guard(a.device());
     auto stream = at::cuda::getCurrentCUDAStream();
-    auto a_c = a.contiguous();
-    auto b_c = b.contiguous();
-    const bool ta = trans_a != 0;
-    const bool tb = trans_b != 0;
-    const int64_t a_ld = a_c.size(1);
-    const int64_t b_ld = b_c.size(1);
-    const int64_t m = ta ? a_c.size(1) : a_c.size(0);
-    const int64_t k = ta ? a_c.size(0) : a_c.size(1);
-    const int64_t n = tb ? b_c.size(0) : b_c.size(1);
-    TORCH_CHECK(k == (tb ? b_c.size(1) : b_c.size(0)), "inner dim mismatch");
-    auto output = torch::empty({m, n}, a_c.options().dtype(torch::kBFloat16));
+
+    // Batched operands follow matmul broadcast rules: 2D acts as a batch
+    // of 1; a size-1 batch broadcasts across the other side (stride 0).
+    const int64_t batch_a = a.dim() == 3 ? a.size(0) : 1;
+    const int64_t batch_b = b.dim() == 3 ? b.size(0) : 1;
+    TORCH_CHECK(batch_a == batch_b || batch_a == 1 || batch_b == 1,
+                "batch dim mismatch (got ", batch_a, " and ", batch_b, ")");
+    const int64_t batch = std::max(batch_a, batch_b);
+    TORCH_CHECK(batch <= 65535, "batch dim exceeds the grid.z launch limit");
+
+    torch::Tensor a_st, b_st;
+    int64_t a_ld, b_ld, a_bstride, b_bstride;
+    const bool tag_a =
+        resolve_operand(a, trans_a != 0, a_ld, a_bstride, a_st);
+    const bool tag_b =
+        resolve_operand(b, trans_b != 0, b_ld, b_bstride, b_st);
+    // GEMM dims from the user flags; storage layout never swaps them.
+    const int64_t m = trans_a ? a.size(-1) : a.size(-2);
+    const int64_t k = trans_a ? a.size(-2) : a.size(-1);
+    const int64_t n = trans_b ? b.size(-2) : b.size(-1);
+    TORCH_CHECK(k == (trans_b ? b.size(-1) : b.size(-2)), "inner dim mismatch");
+
+    const bool batched_out = a.dim() == 3 || b.dim() == 3;
+    torch::Tensor output =
+        batched_out
+            ? torch::empty({batch, m, n}, a.options().dtype(torch::kBFloat16))
+            : torch::empty({m, n}, a.options().dtype(torch::kBFloat16));
     FP8Params p;
-    pack_gemm(p, a_c.data_ptr(), b_c.data_ptr(), output.data_ptr(), scale, m, n,
-              k, a_ld, b_ld);
+    pack_gemm(p, a_st.data_ptr(), b_st.data_ptr(), output.data_ptr(), scale,
+              m, n, k, a_ld, b_ld);
+    p.batch = static_cast<int>(batch);
+    p.a_batch_stride = (batch_a == 1 && batch > 1) ? 0 : a_bstride;
+    p.b_batch_stride = (batch_b == 1 && batch > 1) ? 0 : b_bstride;
+    p.out_batch_stride = m * n;
     if (a.scalar_type() == torch::kFloat8_e4m3fn)
-        dispatch_gemm<FP8Format::E4M3>(p, stream.stream(), ta, tb);
+        dispatch_gemm<FP8Format::E4M3>(p, stream.stream(), tag_a, tag_b);
     else
-        dispatch_gemm<FP8Format::E5M2>(p, stream.stream(), ta, tb);
+        dispatch_gemm<FP8Format::E5M2>(p, stream.stream(), tag_a, tag_b);
     C10_CUDA_CHECK(cudaGetLastError());
     return output;
 }

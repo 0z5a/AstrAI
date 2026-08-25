@@ -56,6 +56,12 @@ takes the combined dequant scale (`sa * sb`); the strategy layer passes
 `scale.reciprocal()` / `sa * sb` respectively. `amax` is always returned in
 the original input domain.
 
+`mm_fp8` also accepts 3D (batched) operands through the same signature:
+`grid.z` slices the operands by their batch strides, a size-1 batch
+broadcasts (stride 0), and inner-transposed views (e.g. `x.t()`) fold into
+the kernel's layout tag at zero copy — only genuinely strided operands pay
+a `.contiguous()` copy.
+
 Python layer (two levels): `astrai/extension/ops/fp8.py` provides stateless
 primitives (`quantize` / `mm_fp8`) via `torch.library.custom_op`, and
 `astrai/extension/fp8.py` is the strategy layer (`fp8_autocast`, delayed /
