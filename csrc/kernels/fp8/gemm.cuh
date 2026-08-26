@@ -357,6 +357,7 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // CTAs fit per SM (see launch_fp8_gemm).
     constexpr int kMt = Traits::kWarpM / 16;  // 16-row MMA tiles per warp
     constexpr int kNt = Traits::kWarpN / 8;   // 8-col MMA tiles per warp
+    constexpr int kSegs = kK / kMmaK;         // mma-sized k segments per tile
     const int warp_m = warp / Traits::kWarpsN;
     const int warp_n = warp % Traits::kWarpsN;
     const int a_row0 = warp_m * Traits::kWarpM;  // + mt * 16 in the loop
@@ -438,59 +439,41 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         ((reinterpret_cast<uintptr_t>(b) | (uint64_t)b_ld) & 15) == 0 &&
         (k % kK) == 0;
 
-    // Per-lane ldmatrix row/chunk selectors for common/mma.cuh's
-    // ldmatrix_*_lane (the fragment tiles are XOR-swizzled per 16B chunk, so
-    // each lane computes its own row/chunk address). Layout contract for fp8
-    // m16n8k32 (values packed two-per-b16 slot, K-contiguous rows):
-    //   x4 (A fragment): lane i points at tile row (i>>3 & 1)*8 + (i&7) of
-    //       chunk (k_seg*2 + (i>>4)); reg j = matrix j = [row g][tig*4..+3] in
-    //       the order (rows 0-7 c, rows 8-15 c, rows 0-7 c+1, rows 8-15 c+1) —
-    //       exactly the mma.sync A operand layout.
-    //   x2 (B fragment): lane i points at tile row (i&7) of chunk
-    //       (k_seg*2 + ((i>>3) & 1)); reg j = [row(n) g][tig*4..+3] chunk c/c+1
-    //       — exactly the mma.sync B operand layout (col operand, K-contiguous).
+    // Per-lane ldmatrix fragment addressing (base-pair scheme, mirrored from
+    // the cuBLAS SASS: one base register per operand per k_seg, every
+    // fragment offset an LDSM immediate — zero address arithmetic inside the
+    // MMA phase). The closure works because the XOR swizzle's source bits
+    // come only from the lane's row-within-matrix (r7): the 8- and 16-row
+    // fragment steps (nt*8, mt*16) never reach them, so
+    //   addr(s, mt) = lane_base + mt*(16*kK)  ^ (s<<5)     [A, x4 fragment]
+    //   addr(s, nt) = lane_base + nt*(8*kK)   ^ (s<<5)     [B, x2 fragment]
+    // where the ^ (s<<5) lands inside the 16B-chunk swizzle field (each k_seg
+    // advances the chunk index by 2 = 32B) and the step lands outside it.
+    //   kChunks=4 (K=64):  swizzle bits = row[2:1] = r7[2:1]
+    //   kChunks=8 (K=128): swizzle bits = row[2:0] = r7[2:0]
+    //   kChunks=2 (K=32):  swizzle bit  = row[2]   = r7[2]  (single k_seg)
+    // Replaces the former a_off[kSegs][kMt]/b_off[kSegs][kNt] runtime tables
+    // (16 registers + one IADD per LDSM): at 131 regs the tables spilled and
+    // ptxas rematerialized every address each k-tile (~55 of 146 hot-loop
+    // instructions were LOP3/IMAD address math; cuBLAS's inner loop has ~0).
     const int r7 = lane & 7;          // row within the 8-row matrix
     const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
     const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31; B uses rh8)
-
-    // Precomputed per-lane fragment offsets (stage-relative): the XOR
-    // swizzle inside tile_at depends only on (row, chunk) — never on the
-    // ring slot or tile_index — so every lane's ldmatrix address is its
-    // stage base plus one of these fixed offsets. Building the table once,
-    // outside the mainloop, removes the per-k_seg swizzle arithmetic
-    // (IMAD/LOP3 chains) from the innermost loop; the SASS compute window
-    // was ~36% integer address math before this.
-    constexpr int kSegs = kK / kMmaK;
-    unsigned a_off[kSegs][kMt];  // stage-relative byte offsets
-    unsigned b_off[kSegs][kNt];
-    {
-        // The probe addresses are converted and immediately rebased to the
-        // stage origin, so the table holds pure offsets to add to any ring
-        // slot's converted base (double-adding the base was the bug here).
-        const unsigned a0 = __cvta_generic_to_shared(a_base);
-#pragma unroll
-        for (int s = 0; s < kSegs; ++s) {
-#pragma unroll
-            for (int mt = 0; mt < kMt; ++mt)
-                a_off[s][mt] =
-                    __cvta_generic_to_shared(
-                        tile_at<kK>(a_base, a_row0 + mt * 16 + rh8 * 8 + r7,
-                                    (s * 2 + rh16) * 16)) -
-                    a0;
-        }
-        const T8* b_probe = b_base;
-        const unsigned b0 = __cvta_generic_to_shared(b_probe);
-#pragma unroll
-        for (int s = 0; s < kSegs; ++s) {
-#pragma unroll
-            for (int nt = 0; nt < kNt; ++nt)
-                b_off[s][nt] =
-                    __cvta_generic_to_shared(
-                        tile_at<kK>(b_probe, b_row0 + nt * 8 + r7,
-                                    (s * 2 + rh8) * 16)) -
-                    b0;
-        }
-    }
+    constexpr int kChunks = kK / 16;
+    constexpr int kShift = 3 - log2_const<kChunks>::value;  // tile_at's shift
+    const unsigned lswz =
+        static_cast<unsigned>((r7 >> kShift) & (kChunks - 1));
+    constexpr unsigned kMtStep = 16 * kK;  // bytes per m-tile row step
+    constexpr unsigned kNtStep = 8 * kK;   // bytes per n-tile row step
+    constexpr unsigned kSegXor = 32;       // chunk-index +2 per k_seg
+    // Stage-relative, loop-invariant per-lane bases (added to each ring
+    // slot's converted base once per k-tile). A's fragment row carries the
+    // +8-row half (rh8) and the +1-chunk half (rh16); B's carries rh8 as its
+    // chunk half — matching the m16n8k32 operand layouts above.
+    const unsigned a_lane_off = static_cast<unsigned>(
+        (a_row0 + rh8 * 8 + r7) * kK + ((rh16 ^ lswz) << 4));
+    const unsigned b_lane_off =
+        static_cast<unsigned>((b_row0 + r7) * kK + ((rh8 ^ lswz) << 4));
 
     // Prime the pipeline. Each committed group occupies one circular shared
     // memory stage; the loop also handles K dimensions smaller than kStages.
@@ -533,8 +516,17 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
 
         const T8* a_tile = a_base + (size_t)(tile_index % kARing) * kAStageBytes;
         const T8* b_tile = b_base + (size_t)(tile_index % kBRing) * kBStageBytes;
-        const unsigned a_base_addr = __cvta_generic_to_shared(a_tile);
-        const unsigned b_base_addr = __cvta_generic_to_shared(b_tile);
+        const unsigned a_addr = __cvta_generic_to_shared(a_tile) + a_lane_off;
+        const unsigned b_addr = __cvta_generic_to_shared(b_tile) + b_lane_off;
+        // Per-k_seg base pair (cuBLAS's scheme): seg s lives at the seg-0
+        // base XOR (s<<5) — one LOP3 per extra seg per k-tile, never per
+        // fragment. Every LDSM below addresses [base + immediate].
+        unsigned a_seg[kSegs], b_seg[kSegs];
+#pragma unroll
+        for (int s = 0; s < kSegs; ++s) {
+            a_seg[s] = a_addr ^ (unsigned)(s * kSegXor);
+            b_seg[s] = b_addr ^ (unsigned)(s * kSegXor);
+        }
 
         // kNt ldmatrix.x2 (B) + kMt ldmatrix.x4 (A) feed kMt*kNt*2 mma.sync
         // per k_seg — 0.5 load instructions per MMA, versus 4.5 scalar LDS
@@ -543,16 +535,15 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         unsigned b_frag[2][kNt][2];
 #pragma unroll
         for (int nt = 0; nt < kNt; ++nt)
-            astrai::ldmatrix_x2_lane(b_frag[0][nt],
-                                     b_base_addr + b_off[0][nt]);
+            astrai::ldmatrix_x2_lane(b_frag[0][nt], b_seg[0] + nt * kNtStep);
 #pragma unroll
         for (int k_seg = 0; k_seg < kSegs; ++k_seg) {
             const int bcur = k_seg & 1, bnext = bcur ^ 1;
             if (k_seg + 1 < kSegs) {
 #pragma unroll
                 for (int nt = 0; nt < kNt; ++nt)
-                    astrai::ldmatrix_x2_lane(
-                        b_frag[bnext][nt], b_base_addr + b_off[k_seg + 1][nt]);
+                    astrai::ldmatrix_x2_lane(b_frag[bnext][nt],
+                                             b_seg[k_seg + 1] + nt * kNtStep);
             }
         // Software-pipelined A fragments: the ldmatrix.x4 for row mt+1
         // is issued before the MMAs consuming row mt, so the LDS fixed
@@ -563,12 +554,12 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         // at 2048³; the tensor pipe is issue-bound and the seg-start LDS
         // already hides behind the b-fragment issue order.)
         unsigned a_frag[kMt + 1][4];
-        astrai::ldmatrix_x4_lane(a_frag[0], a_base_addr + a_off[k_seg][0]);
+        astrai::ldmatrix_x4_lane(a_frag[0], a_seg[k_seg]);
 #pragma unroll
         for (int mt = 0; mt < kMt; ++mt) {
             if (mt + 1 < kMt)
-                astrai::ldmatrix_x4_lane(
-                    a_frag[mt + 1], a_base_addr + a_off[k_seg][mt + 1]);
+                astrai::ldmatrix_x4_lane(a_frag[mt + 1],
+                                         a_seg[k_seg] + (mt + 1) * kMtStep);
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt)
                 astrai::mma_sync<T8>(acc[nt][mt], a_frag[mt],
@@ -591,6 +582,16 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         }
         }
     };  // mainloop
+    // NOTE: a cross-k-tile fragment pipeline (kAheadFrag — head-load the
+    // current tile's tail-seg fragments, tail-preload the next tile's
+    // seg-0 behind a tightened wait(kStages-2), mirroring cuBLAS's third
+    // SASS mechanism) was implemented and measured here: correct, but
+    // neutral-to-negative on L20 (-7% at 512³'s sub-wave grid, noise
+    // elsewhere). The shallower effective pipeline (kStages-1 groups in
+    // flight) costs what the LDSM spreading saves at these tile counts,
+    // and ptxas loses its within-iteration software pipelining across the
+    // iteration-boundary register handoff. Removed; see
+    // perf/fp8_gemm_optimization.md's reverted-experiments table.
     if constexpr (kFastLoop) {
         if (fast_cta)
             mainloop(std::true_type{});
@@ -773,13 +774,34 @@ void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
     const int64_t tiles_128 =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
     if (prefer_small_cta(tiles_128, p.m)) {
-        using Traits = Fp8GemmTraits<Fmt, 64, 64, kK, 3, 32, 32>;
         dim3 grid((p.n + 63) / 64, (p.m + 63) / 64, p.batch);
-        launch_with_smem<
-            fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, true,
-                            false, true>>(
-            Fp8GemmSmem<Traits, LayoutA, LayoutB, true>::kBytes, grid,
-            dim3(Traits::kCtaThreads), stream, p);
+        // Full-ring small CTAs — ONE __syncthreads per k-tile, cuBLAS's
+        // barrier structure (the lean ring traded a second barrier for a
+        // 4th resident CTA and measured slower: the barrier costs more
+        // than the residency buys, e.g. 1280³ +5..9%). Two depths by grid
+        // shape: the 24KB 3-slot s2 variant keeps 4 CTAs/SM while the
+        // whole grid stays resident (<= one 3-CTA wave); past that the
+        // 32KB s3 variant's deeper cp.async pipeline wins on multi-wave
+        // grids (measured 1280³: 107T vs 98T; sub-wave grids tie within
+        // +-1%). kFastLoop stays on: the predication-free interior load
+        // is where the small CTA's issue budget goes.
+        const int64_t tiles_64 =
+            (int64_t)p.batch * ((p.m + 63) / 64) * ((p.n + 63) / 64);
+        if (tiles_64 <= (int64_t)device_sm_count() * 3) {
+            using Traits = Fp8GemmTraits<Fmt, 64, 64, kK, 2, 32, 32>;
+            launch_with_smem<
+                fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false,
+                                false, true>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
+                dim3(Traits::kCtaThreads), stream, p);
+        } else {
+            using Traits = Fp8GemmTraits<Fmt, 64, 64, kK, 3, 32, 32>;
+            launch_with_smem<
+                fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false,
+                                false, true>>(
+                Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
+                dim3(Traits::kCtaThreads), stream, p);
+        }
         return;
     }
     using Traits = Fp8GemmTraits<Fmt, 128, 128, kK, Stages>;
