@@ -47,19 +47,21 @@ style as attention, but split into **three** files:
 | File | Role |
 |------|------|
 | `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `FP8Params` POD — no torch |
-| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_quantize_kernel` (BF16→FP8 + amax), `fp8_gemm_kernel` (pre-quantized GEMM, 128×64 CTA / 64×16 warp / 3-stage cp.async) — no torch |
+| `fp8/quantize.cuh` | pure-CUDA device code: `fp8_quantize_kernel<Fmt, InT>` (bf16/fp16/fp32 → FP8 + amax, `quant_in_traits<InT>` vectorized unpack) — no torch |
+| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_gemm_kernel` (pre-quantized GEMM; 64×64 / 128×128 CTA picked at runtime by `prefer_small_cta`, 64×32 warp tiles, multi-stage cp.async, transposed-operand layouts) — no torch |
 | `fp8/ops.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_ops` |
 
-Scale semantics follow `torch._scaled_mm` (quantization step size: divide by
-`scale`; the kernel computes the reciprocal internally — the interface never
-takes `*_inv`). `amax` is always returned in the original bf16 domain.
+Scale semantics: `quantize` takes the quantization *multiplier*; the
+strategy layer passes `scale.reciprocal()` and the kernel multiplies by it.
+`mm_fp8` takes the combined dequant scale (`sa * sb`). `amax` is always
+returned in the original input domain.
 
 Python layer (two levels): `astrai/extension/ops/fp8.py` provides stateless
-primitives (`quantize_bf16` / `mm_fp8` / `linear_forward_fp8` /
-`linear_backward_fp8`) via `torch.library.custom_op`, and
-`astrai/extension/fp8.py` is the strategy layer (`fp8_autocast`, delayed /
-dynamic scaling recipes, `fp8_linear_forward/backward` wiring `aten::linear`
-on CUDA). See the FP8 section in `AGENTS.md` for full detail.
+primitives (`fp8_quantize` / `fp8_gemm`) via `torch.library.custom_op`, with
+plain `quantize` / `mm_fp8` wrappers, and `astrai/extension/fp8.py` is the
+strategy layer (`fp8_autocast`, delayed / dynamic scaling recipes,
+`fp8_linear_forward/backward` wiring `aten::linear` on CUDA). See the FP8
+section in `AGENTS.md` for full detail.
 
 ## Build System
 
@@ -114,7 +116,7 @@ NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
              --ptxas-options=-O3,-v --extra-device-vectorization --threads=16
 ```
 
-Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all six kernel targets in parallel via `cmake --build -j N`. The target list is the **single source of truth**: `KERNEL_NAMES` and the parallel `KERNEL_SRCS` list in `csrc/CMakeLists.txt`; `astrai/extension/loader.py` auto-discovers the compiled `.so` files.
+Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all registered kernel targets in parallel via `cmake --build -j N` (the five base targets always; `fp8_ops` additionally on sm_89+). The target list is the **single source of truth**: `KERNEL_NAMES` and the parallel `KERNEL_SRCS` list in `csrc/CMakeLists.txt`; `astrai/extension/loader.py` auto-discovers the compiled `.so` files.
 
 ## Python Extension Architecture
 
