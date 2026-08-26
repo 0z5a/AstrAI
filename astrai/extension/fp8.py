@@ -412,11 +412,13 @@ class _LinearFp8(torch.autograd.Function):
         w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
         grad_x = mm_fp8(g8, w8, sg * sw).reshape(x.shape)  # g8[m,n] @ w8[n,k]
         grad_w = mm_fp8(g8, x8, sg * sx, trans_a=True)  # g8.T @ x8
-        grad_b = g2.sum(0).to(torch.bfloat16)
+        # bias-free linears must not pay the column-sum
+        # reduce: g2.sum(0) is another full read of the gradient.
+        grad_b = g2.sum(0).to(torch.bfloat16) if ctx.needs_input_grad[2] else None
         if not ctx.is_dynamic:
             meta.g.update(amax_g, fmt)
             meta.g.advance()
-        return grad_x, grad_w, grad_b if ctx.needs_input_grad[2] else None
+        return grad_x, grad_w, grad_b
 
 
 # ---------------------------------------------------------------------------
