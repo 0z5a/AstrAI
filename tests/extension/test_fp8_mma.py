@@ -117,6 +117,40 @@ def test_mm_fp8_transposed_operands(trans_a, trans_b):
 
 
 @skip_no_fp8
+@pytest.mark.parametrize("bias_on", [False, True])
+def test_mm_fp8_fused_bias(bias_on):
+    """Epilogue-fused bias matches the unfused out + bias reference (single
+    fp32 rounding vs the reference's double rounding keeps it within 1 ulp),
+    including N-tail columns and batched broadcast."""
+    torch.manual_seed(31)
+    m, n, k = 19, 13, 37  # odd n exercises the guarded bias loads
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    sa, sb = _scale(a), _scale(b)
+    a8, _ = quantize(a, sa.reciprocal(), "e4m3")
+    b8, _ = quantize(b, sb.reciprocal(), "e4m3")
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+
+    out = mm_fp8(a8, b8, sa * sb, trans_b=True, bias=bias if bias_on else None)
+    base = (_quantize(a, sa) @ _quantize(b, sb).t() * sa * sb).to(torch.bfloat16)
+    expected = base + bias if bias_on else base
+    # bias is O(1) against O(sqrt(k)) accumulators: absolute tolerance rules
+    torch.testing.assert_close(out, expected, atol=0.13, rtol=0.01)
+
+    # Batched broadcast: bias applies to every batch slice (each slice gets
+    # its own reference from its own operand values).
+    ab = torch.randn(3, m, k, device="cuda", dtype=torch.bfloat16)
+    ab8, _ = quantize(ab, sa.reciprocal(), "e4m3")
+    outb = mm_fp8(ab8, b8, sa * sb, trans_b=True, bias=bias)
+    assert outb.shape == (3, m, n)
+    for i in range(3):
+        expected_b = (_quantize(ab[i], sa) @ _quantize(b, sb).t() * sa * sb).to(
+            torch.bfloat16
+        ) + bias
+        torch.testing.assert_close(outb[i], expected_b, atol=0.13, rtol=0.01)
+
+
+@skip_no_fp8
 @pytest.mark.parametrize("trans_a", [False, True])
 @pytest.mark.parametrize("trans_b", [False, True])
 def test_mm_fp8_batched(trans_a, trans_b):

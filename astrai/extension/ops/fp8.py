@@ -14,7 +14,7 @@ Policy (scales, amax history, delayed scaling, autocast) lives in ``fp8.py``;
 this module is stateless.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch.library import custom_op
@@ -84,16 +84,19 @@ def fp8_gemm(
     scale: torch.Tensor,
     trans_a: int = 0,
     trans_b: int = 0,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """FP8 GEMM: ``a @ b * scale`` with FP32 accumulation.
+    """FP8 GEMM: ``a @ b * scale (+ bias)`` with FP32 accumulation.
 
     2D or 3D (batched) operands; a size-1 batch broadcasts (matmul rules).
-    The result is always BF16; FP8 output is a separate quantize operation.
+    ``bias`` (bf16, length n) fuses into the epilogue in fp32 before the
+    single bf16 rounding. The result is always BF16; FP8 output is a
+    separate quantize operation.
     """
 
 
 @fp8_gemm.register_fake
-def _fp8_gemm_fake(a, b, scale, trans_a=0, trans_b=0):
+def _fp8_gemm_fake(a, b, scale, trans_a=0, trans_b=0, bias=None):
     dtype = torch.bfloat16
     rows = a.size(2) if trans_a else a.size(1)
     cols = b.size(1) if trans_b else b.size(2)
@@ -103,19 +106,21 @@ def _fp8_gemm_fake(a, b, scale, trans_a=0, trans_b=0):
 
 
 @fp8_gemm.register_kernel("cuda")
-def _fp8_gemm_cuda(a, b, scale, trans_a=0, trans_b=0):
+def _fp8_gemm_cuda(a, b, scale, trans_a=0, trans_b=0, bias=None):
     if a.dtype != b.dtype or a.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         raise TypeError(
             f"fp8 GEMM requires matching fp8 inputs, got {a.dtype}/{b.dtype}"
         )
-    return get_module("fp8_ops").mm_fp8(a, b, scale, trans_a, trans_b)
+    return get_module("fp8_ops").mm_fp8(a, b, scale, trans_a, trans_b, bias)
 
 
 @fp8_gemm.register_kernel("cpu")
-def _fp8_gemm_cpu(a, b, scale, trans_a=0, trans_b=0):
+def _fp8_gemm_cpu(a, b, scale, trans_a=0, trans_b=0, bias=None):
     aa = a.float().transpose(-2, -1) if trans_a else a.float()
     bb = b.float().transpose(-2, -1) if trans_b else b.float()
     acc = aa @ bb * scale
+    if bias is not None and bias.numel() > 0:
+        acc = acc + bias.float()
     return acc.to(torch.bfloat16)
 
 
@@ -149,21 +154,26 @@ def mm_fp8(
     scale: torch.Tensor,
     trans_a: bool = False,
     trans_b: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Pre-quantized FP8 GEMM: ``a @ b * scale``.
+    """Pre-quantized FP8 GEMM: ``a @ b * scale (+ bias)``.
 
     ``a``/``b`` must be FP8 tensors of the same format, 2D or 3D (batched,
     matmul-style broadcast on the batch dim). Inner-transposed views (e.g.
     ``x.t()``) fold into the layout at zero copy. ``scale`` is their combined
-    dequantization scale. The result is BF16; FP8 output is a separate
-    quantize operation.
+    dequantization scale. ``bias`` (CUDA bf16 1D of length n) adds inside the
+    kernel epilogue in fp32 — no separate elementwise pass. The result is
+    BF16; FP8 output is a separate quantize operation.
     """
     # Same hot-path bypass as quantize(): the binding's TORCH_CHECKs keep
-    # validation identical on the direct route.
+    # validation identical on the direct route (bias may be None — the
+    # binding resolves it to the no-bias path).
     if (
         type(a) is torch.Tensor
         and a.is_cuda
         and a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     ):
-        return get_module("fp8_ops").mm_fp8(a, b, scale, int(trans_a), int(trans_b))
-    return fp8_gemm(a, b, scale, trans_a, trans_b)
+        return get_module("fp8_ops").mm_fp8(
+            a, b, scale, int(trans_a), int(trans_b), bias
+        )
+    return fp8_gemm(a, b, scale, trans_a, trans_b, bias)

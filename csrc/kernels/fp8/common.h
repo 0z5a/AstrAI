@@ -103,8 +103,12 @@ struct FP8QuantizeParams {
 struct FP8Params {
     // Inputs: a/b are FP8 for the pre-quantized path. Scales are
     // quantization steps (device scalars).
+    // Optional bf16 bias broadcast over output rows (fused into the epilogue
+    // before the bf16 rounding, so it adds in fp32 — one rounding fewer than
+    // the separate out + bias elementwise kernel it replaces). Null disables.
     const void* __restrict__ a_ptr = nullptr;
     const void* __restrict__ b_ptr = nullptr;
+    const void* __restrict__ bias_ptr = nullptr;
     void* __restrict__ out_ptr = nullptr;
 
     const float* __restrict__ scale = nullptr;

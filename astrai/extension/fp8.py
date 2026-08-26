@@ -315,27 +315,14 @@ def _is_fp8(dtype: torch.dtype) -> bool:
     return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
-_zero_bias: Dict[Optional[int], torch.Tensor] = {}
-
-
-def _empty_bias(x: torch.Tensor) -> torch.Tensor:
-    """Per-device cached 0-element bf16 bias (the binding only checks numel —
-    never mutated), saving a CUDA allocation per bias-less linear."""
-    key = x.device.index
-    t = _zero_bias.get(key)
-    if t is None:
-        t = torch.empty(0, device=x.device, dtype=torch.bfloat16)
-        _zero_bias[key] = t
-    return t
-
-
 def fp8_linear_forward(
     x: torch.Tensor, w: torch.Tensor, bias=None, cfg: Optional[_ActiveConfig] = None
 ):
     """Scaled fp8 linear forward (called from the aten::linear impl).
 
     Composed from the two stateless primitives: quantize x/w with the active
-    scales, run the pre-quantized GEMM, add the bias. Delayed scaling folds
+    scales, run the pre-quantized GEMM with the bias fused into its epilogue.
+    Delayed scaling folds
     the returned amax into the history ring and publishes the next scale;
     dynamic scaling measures the current amax itself. Training quantizes the
     weight every step (the optimizer bumps its version, so there is no cast
@@ -345,17 +332,18 @@ def fp8_linear_forward(
     if cfg is None:
         cfg = _current_config()
     fmt = cfg.fp8_format.fwd()
-    if bias is None:
-        bias = _empty_bias(x)
     if isinstance(cfg.recipe, DynamicScaling):
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), cfg.recipe, fmt)
         sw = _dynamic_scale(w, cfg.recipe, fmt)
         x8, _ = quantize(x, sx.reciprocal(), fmt)
         w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
-        out = mm_fp8(x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True).reshape(
-            *x.shape[:-1], w.size(0)
-        )
-        return (out + bias if bias.numel() else out), sx, sw
+        # Bias fuses into the GEMM epilogue (fp32 add before the single bf16
+        # rounding — one rounding fewer than the separate out + bias pass);
+        # None passes through to the kernel's no-bias path.
+        out = mm_fp8(
+            x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True, bias=bias
+        ).reshape(*x.shape[:-1], w.size(0))
+        return out, sx, sw
 
     meta = state.get_weight_meta(w)
     if not meta.w.initialized:
@@ -368,11 +356,9 @@ def fp8_linear_forward(
         w8, amax_w = w, None
     else:
         w8, amax_w = quantize(w, sw.reciprocal(), fmt)
-    out = mm_fp8(x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True).reshape(
-        *x.shape[:-1], w.size(0)
-    )
-    if bias.numel():
-        out = out + bias
+    out = mm_fp8(
+        x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True, bias=bias
+    ).reshape(*x.shape[:-1], w.size(0))
     meta.x.update(amax_x, fmt)
     if amax_w is not None:
         meta.w.update(amax_w, fmt)

@@ -613,6 +613,13 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // scatter and the gather conflict-free: a lane quad's chunk and the 8
     // rows of one gather phase map to distinct 4-bank groups.
     const float output_scale = scale;
+    // Fused bias (idea B): added to the fp32 accumulator before the single
+    // bf16 rounding — one fewer rounding than the out + bias elementwise
+    // pass this replaces, and no extra kernel launch / m*n round-trip. The
+    // per-lane loads (2 per nt, kMt-times re-read) are L1 broadcasts; rows
+    // past the N edge skip the load (their smem slots never copy out).
+    const __nv_bfloat16* bias =
+        reinterpret_cast<const __nv_bfloat16*>(p.bias_ptr);
     __nv_bfloat16* tile_out = reinterpret_cast<__nv_bfloat16*>(fp8_gemm_smem);
     constexpr int kRowChunks = kBlockN / 8;  // 16B chunks per tile row
     static_assert(kBlockM * kBlockN * 2 <=
@@ -624,9 +631,15 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
                ((c ^ (r & (kRowChunks - 1))) * 8);
     };
     const int local_col0 = warp_n * Traits::kWarpN + thread_in_group * 2;
+    const int64_t bias_col0 = (int64_t)block_n * kBlockN;
 #pragma unroll
     for (int nt = 0; nt < kNt; ++nt) {
         const int col = local_col0 + nt * 8;
+        const int64_t gcol = bias_col0 + col;
+        const float b0 =
+            bias && gcol < n ? __bfloat162float(bias[gcol]) : 0.0f;
+        const float b1 =
+            bias && gcol + 1 < n ? __bfloat162float(bias[gcol + 1]) : 0.0f;
 #pragma unroll
         for (int mt = 0; mt < kMt; ++mt) {
             const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
@@ -635,12 +648,12 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
             // m16n8 output, columns tig*2 and tig*2+1 inside one 16B chunk.
             const int off = col & 7;  // element offset within the chunk
             *reinterpret_cast<__nv_bfloat162*>(out_chunk(r0, col >> 3) + off) =
-                __floats2bfloat162_rn(tile_acc[0] * output_scale,
-                                      tile_acc[1] * output_scale);
+                __floats2bfloat162_rn(tile_acc[0] * output_scale + b0,
+                                      tile_acc[1] * output_scale + b1);
             *reinterpret_cast<__nv_bfloat162*>(out_chunk(r0 + 8, col >> 3) +
                                                off) =
-                __floats2bfloat162_rn(tile_acc[2] * output_scale,
-                                      tile_acc[3] * output_scale);
+                __floats2bfloat162_rn(tile_acc[2] * output_scale + b0,
+                                      tile_acc[3] * output_scale + b1);
         }
     }
     __syncthreads();
@@ -751,13 +764,15 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
 // congruous NT): the 128x128 CTA wins inside one full wave (81 tiles: big
 // +24%) and from ~1.5 waves up (144: +23%, 256: +39%, 2048^3 123->171 TF),
 // but loses inside the quantization dip just past one wave (100 tiles =
-// 1.09 waves: big -8%) where the finer 64x64 grid fills the tail. Below
-// 3/4 wave the small CTA's extra residency wins or ties (64 tiles: tie).
-// So: big CTA iff tiles are in [3/4, 1] wave or >= 7/5 waves.
+// 1.09 waves: big -8%) where the finer 64x64 grid fills the tail. With the
+// interior fast loop on the big CTA the sub-wave boundary moved down: 63-64
+// tiles already favor it (63-tile rect +8%, 1024^3 +2%) while 49 tiles
+// stays small-CTA territory, so the big band opens at 5/8 wave instead of
+// 3/4.
 inline bool prefer_small_cta(int64_t tiles_128, int64_t m) {
     if (m <= 64) return true;
     const int64_t waves = device_sm_count();
-    if (tiles_128 >= waves - waves / 4 && tiles_128 <= waves) return false;
+    if (tiles_128 >= waves * 5 / 8 && tiles_128 <= waves) return false;
     return tiles_128 < waves + waves * 2 / 5;
 }
 
@@ -806,8 +821,18 @@ void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
     }
     using Traits = Fp8GemmTraits<Fmt, 128, 128, kK, Stages>;
     dim3 grid((p.n + 127) / 128, (p.m + 127) / 128, p.batch);
+    // Interior-loop specialization on the big CTA as well: with the base-pair
+    // fragment addressing the doubled mainloop no longer spills, and the
+    // predication-free loads win across the band (measured, L20: 1024^3
+    // 98->103T, 2048^3 172->177T, 8192^3 201->205T, 896x1280 124->135T; the
+    // pre-base-pair attempt regressed ~3% at 131 regs). Only congruous
+    // layouts can enter fast_cta, so crosswise (TN) instantiations keep the
+    // single generic body — no dead second loop in their I-cache.
+    constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
+                              !std::is_same_v<LayoutB, RowMajor>;
     launch_with_smem<
-        fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false, false>>(
+        fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false, false,
+                        kBigFast>>(
         Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
         dim3(Traits::kCtaThreads), stream, p);
 }
