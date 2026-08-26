@@ -830,6 +830,20 @@ void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
     // single generic body — no dead second loop in their I-cache.
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
+    // Single-wave grids (tiles <= SM count) take one stage deeper: with no
+    // second wave to overlap the drain, latency hiding comes only from the
+    // pipeline (measured, L20, in-wave band: 1024^3 +1.5%, 1152^3 +1.2%,
+    // K=4096 rects +2%); multi-wave grids flip back — the shorter prologue
+    // wins once retiring CTAs overlap (4096^3: s2 196T vs s3 175T).
+    if (tiles_128 <= (int64_t)device_sm_count()) {
+        using TraitsS3 = Fp8GemmTraits<Fmt, 128, 128, kK, Stages + 1>;
+        launch_with_smem<
+            fp8_gemm_kernel<TraitsS3, LayoutA, LayoutB, GroupRaster, false,
+                            false, kBigFast>>(
+            Fp8GemmSmem<TraitsS3, LayoutA, LayoutB, false>::kBytes, grid,
+            dim3(TraitsS3::kCtaThreads), stream, p);
+        return;
+    }
     launch_with_smem<
         fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false, false,
                         kBigFast>>(
