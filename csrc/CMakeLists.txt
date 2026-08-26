@@ -52,13 +52,16 @@ set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH}")
 # globally unique across families) and their per-family source paths under
 # kernels/. `loader.py` auto-discovers the .so files in astrai/extension/lib/,
 # so this CMake registry is the single place to register a new kernel.
+#
+# FP8 MMA instructions require sm_89+. Keep the target out of the build on
+# older architectures instead of instantiating templates that cannot compile.
+# The remaining kernels are still useful on sm_80+ (including sm_86).
 set(KERNEL_NAMES
     attn_decode
     attn_prefill
     attn_paged_decode
     attn_paged_prefill
     rotary_emb
-    fp8_ops
 )
 set(KERNEL_SRCS
     attention/decode.cu
@@ -66,8 +69,16 @@ set(KERNEL_SRCS
     attention/paged_decode.cu
     attention/paged_prefill.cu
     rotary/rotary_emb.cu
-    fp8/ops.cu
 )
+
+if(ASTRAI_CUDA_ARCH GREATER_EQUAL 89)
+    list(APPEND KERNEL_NAMES fp8_ops)
+    list(APPEND KERNEL_SRCS fp8/ops.cu)
+else()
+    message(WARNING
+        "FP8 operator disabled: ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "
+        "requires compute capability 89 or newer")
+endif()
 
 list(LENGTH KERNEL_NAMES _kernel_count)
 math(EXPR _kernel_last "${_kernel_count} - 1")

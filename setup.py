@@ -6,7 +6,9 @@ import warnings
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext as _build_ext
+from setuptools.command.editable_wheel import editable_wheel as _editable_wheel
 
 sys.path.insert(0, str(Path(__file__).parent))
 os.makedirs("astrai/extension/lib", exist_ok=True)
@@ -93,9 +95,39 @@ class _CMakeBuildExt(_build_ext):
         if not arch:
             arch = _detect_cuda_arch()
         if arch:
+            try:
+                if int(str(arch)) < 89:
+                    warnings.warn(
+                        f"FP8 operator disabled: CUDA compute capability {arch} "
+                        "requires 89 or newer.",
+                        stacklevel=2,
+                    )
+            except ValueError:
+                warnings.warn(
+                    f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
+                    "FP8 capability will be decided by CMake.",
+                    stacklevel=2,
+                )
             cfg.append(f"-DASTRAI_CUDA_ARCH={arch}")
         subprocess.run(cfg, check=True)
         subprocess.run([cmake, "--build", str(build_dir), "-j", parallel], check=True)
+
+        # After compilation finishes, verify mandatory CUDA kernels to confirm build succeeded.
+        # CMake may report partial‑target success even if some architecture‑specific kernels are skipped.
+        # Prevent editable install from reporting success when critical kernel shared objects are missing.
+        lib_dir = src / "astrai" / "extension" / "lib"
+        required = (
+            "attn_decode",
+            "attn_prefill",
+            "attn_paged_decode",
+            "attn_paged_prefill",
+            "rotary_emb",
+        )
+        missing = [name for name in required if not any(lib_dir.glob(f"{name}.*.so"))]
+        if missing:
+            raise RuntimeError(
+                "CUDA build completed without some required kernel modules!"
+            )
 
 
 def _cuda_toolkit_version():
@@ -148,6 +180,24 @@ class _NullBuildExt(_build_ext):
         pass
 
 
+class _Build(_build):
+    """Run the CMake kernel build as part of setuptools' build lifecycle."""
+
+    def run(self):
+        if _should_build():
+            self.run_command("build_ext")
+        super().run()
+
+
+class _EditableWheel(_editable_wheel):
+    """Run the CMake kernel build for PEP 660 editable installations."""
+
+    def run(self):
+        if _should_build():
+            self.run_command("build_ext")
+        super().run()
+
+
 cmdclass = {}
 
 if _should_build():
@@ -155,4 +205,10 @@ if _should_build():
 else:
     cmdclass["build_ext"] = _NullBuildExt
 
-setup(ext_modules=[], cmdclass=cmdclass)
+cmdclass["build"] = _Build
+cmdclass["editable_wheel"] = _EditableWheel
+
+setup(
+    ext_modules=[],
+    cmdclass=cmdclass,
+)

@@ -47,23 +47,16 @@ style as attention, but split into **three** files:
 | File | Role |
 |------|------|
 | `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `FP8Params` POD — no torch |
-| `fp8/quantize.cuh` | pure-CUDA device code: `fp8_quantize_kernel<Fmt, InT>` (bf16/fp16/fp32 → FP8 + amax, `quant_in_traits<InT>` vectorized unpack) — no torch |
-| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_gemm_kernel` (pre-quantized GEMM, 128×128 CTA / 64×32 warp / multi-stage cp.async, transposed-operand layouts) — no torch |
+| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_quantize_kernel` (BF16→FP8 + amax), `fp8_gemm_kernel` (pre-quantized GEMM, 128×64 CTA / 64×16 warp / 3-stage cp.async) — no torch |
 | `fp8/ops.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_ops` |
 
-Scale semantics: `quantize` takes the quantization *multiplier*, `mm_fp8`
-takes the combined dequant scale (`sa * sb`); the strategy layer passes
-`scale.reciprocal()` / `sa * sb` respectively. `amax` is always returned in
-the original input domain.
-
-`mm_fp8` also accepts 3D (batched) operands through the same signature:
-`grid.z` slices the operands by their batch strides, a size-1 batch
-broadcasts (stride 0), and inner-transposed views (e.g. `x.t()`) fold into
-the kernel's layout tag at zero copy — only genuinely strided operands pay
-a `.contiguous()` copy.
+Scale semantics follow `torch._scaled_mm` (quantization step size: divide by
+`scale`; the kernel computes the reciprocal internally — the interface never
+takes `*_inv`). `amax` is always returned in the original bf16 domain.
 
 Python layer (two levels): `astrai/extension/ops/fp8.py` provides stateless
-primitives (`quantize` / `mm_fp8`) via `torch.library.custom_op`, and
+primitives (`quantize_bf16` / `mm_fp8` / `linear_forward_fp8` /
+`linear_backward_fp8`) via `torch.library.custom_op`, and
 `astrai/extension/fp8.py` is the strategy layer (`fp8_autocast`, delayed /
 dynamic scaling recipes, `fp8_linear_forward/backward` wiring `aten::linear`
 on CUDA). See the FP8 section in `AGENTS.md` for full detail.
@@ -105,7 +98,9 @@ unset, `setup.py` auto-detects the real GPU capability through
 - **sm_80+** (Ampere and later): enables the tensor-core MMA path
   (`mma.sync.m16n8k16.bf16` for bf16 attention, `mma.sync.m16n8k32` for FP8).
 - **sm_89+**: required for the FP8 family (`fp8_ops`) — FP8 tensor-core
-  instructions only exist on Ada/Hopper and newer.
+  instructions only exist on Ada/Hopper and newer. On older architectures,
+  CMake emits a warning and skips the `fp8_ops` target so the remaining CUDA
+  kernels still build successfully.
 - **`-DASTRAI_NO_MMA`** is a manual escape hatch only — the build never defines
   it automatically. To disable the MMA path, add it to `NVCC_FLAGS` yourself;
   all supported build targets are sm_80+.
