@@ -92,7 +92,7 @@ load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
         const int c = c0 + j * 16;
         T8* dst = tile_at<K>(tile, r, c);
         if (row_ok && chunk_aligned && k_base + c + 15 < contract) {
-            astrai::cp_async_16(dst, src + c, true);
+            astrai::cp_async_16(dst, src + c);
         } else {
             // Tail chunk (or misaligned base): predicated scalar fill.
 #pragma unroll
@@ -128,8 +128,73 @@ load_operand_tile_interior(T8* tile, const T8* __restrict__ operand,
 #pragma unroll
     for (int j = 0; j < kCpt; ++j)
         astrai::cp_async_16(reinterpret_cast<T8*>(dst ^ (j << 4)),
-                            src + j * 16, true);
+                            src + j * 16);
 }
+
+// Loop-carried prefetch state for one congruous operand ring (perf 6.2):
+// per-thread (r, c0) of the interior copy — the same mapping
+// load_operand_tile_interior uses — with the swizzled stage destination and
+// the global source pointer both carried across k-tiles, so each prefetch
+// chunk is one LDGSTS at [wr ^ (j << 4)] / [src + j*16] issued straight from
+// registers.
+//
+// Whether an operand has a carry is a property of its layout, so the guard
+// lives in the type: the false specialization (crosswise operand — direct
+// LDG+PRMT staging, no cp.async) is an empty no-op. Crosswise kernel
+// instantiations therefore compile no dead declarations and use sites need
+// no `if constexpr` and no [[maybe_unused]].
+template <bool kAsync, typename T8, int kK, int kRowsTile, int kThreads>
+struct PrefetchCarry;
+
+template <typename T8, int kK, int kRowsTile, int kThreads>
+struct PrefetchCarry<true, T8, kK, kRowsTile, kThreads> {
+    static constexpr int kCpt = kRowsTile * (kK / 16) / kThreads;
+    static constexpr int kCpr = (kK / 16) / kCpt;
+    unsigned wr = 0;    // current stage's swizzled destination offset
+    unsigned wr0 = 0;   // slot-0 wrap base
+    unsigned wrEnd = 0; // one-past-the-ring sentinel
+    const char* src = nullptr;  // current tile's global source bytes
+
+    __device__ __forceinline__ PrefetchCarry(
+        const T8* ring, int ringSlots, int stageElems, const T8* operand,
+        int64_t ld, int64_t blockRow, int tid, int firstTile) {
+        const int r = tid / kCpr;
+        const int c0 = (tid % kCpr) * kCpt * 16;
+        const T8* slot0 = ring + (firstTile % ringSlots) * stageElems;
+        const unsigned laneOff = static_cast<unsigned>(
+            (const char*)tile_at<kK>(slot0, r, c0) - (const char*)slot0);
+        const unsigned base = __cvta_generic_to_shared(ring) + laneOff;
+        wr = base + (unsigned)((firstTile % ringSlots) * stageElems);
+        wr0 = base;
+        wrEnd = base + (unsigned)(ringSlots * stageElems);
+        src = reinterpret_cast<const char*>(
+                  operand + (blockRow + r) * ld + c0) +
+              (int64_t)firstTile * kK;
+    }
+
+    // Emit this thread's chunks for the current tile. `pf` false (loop
+    // tail) zero-fills: src_size=0 reads nothing, and the destination is
+    // the slot compute(i-1) already released.
+    __device__ __forceinline__ void emit(bool pf) const {
+#pragma unroll
+        for (int j = 0; j < kCpt; ++j)
+            astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);
+    }
+
+    __device__ __forceinline__ void advance(int stageElems) {
+        wr += (unsigned)stageElems;
+        if (wr == wrEnd) wr = wr0;
+        src += kK;
+    }
+};
+
+template <typename T8, int kK, int kRowsTile, int kThreads>
+struct PrefetchCarry<false, T8, kK, kRowsTile, kThreads> {
+    __device__ __forceinline__ PrefetchCarry(
+        const T8*, int, int, const T8*, int64_t, int64_t, int, int) {}
+    __device__ __forceinline__ void emit(bool) const {}
+    __device__ __forceinline__ void advance(int) {}
+};
 
 // ---------------------------------------------------------------------------
 // Pre-quantized GEMM kernel: FP8 A/B read straight into shared memory, FP32
@@ -372,33 +437,37 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // (transpose_layout_t, see common.h). Congruous operands cp.async
     // straight into their rotating canonical buffers; crosswise operands
     // take load_direct's LDG+PRMT path below.
+    // Stage-slot helpers: the rings rotate one slot per k-tile, so callers
+    // either compute the slot from the tile index (prologue, generic loop)
+    // or carry an advancing pointer (steady-state fast loop below).
+    auto a_stage_of = [&](int64_t tile) -> T8* {
+        return a_base + (size_t)(tile % kARing) * kAStageBytes;
+    };
+    auto b_stage_of = [&](int64_t tile) -> T8* {
+        return b_base + (size_t)(tile % kBRing) * kBStageBytes;
+    };
     // Asynchronous loads for tile `tile`: congruous operands cp.async into
     // their canonical rings. Called after the post-compute barrier, alongside
     // the commit.
-    auto load_async = [&](int64_t tile) {
-        const int64_t k_base = tile * kK;
+    auto load_async = [&](T8* a_stage, T8* b_stage, int64_t k_base) {
         if constexpr (!kDirectA)
             load_operand_tile<T8, kK, kBlockM, kCtaThreads>(
-                a_base + (tile % kARing) * kAStageBytes, a, m, k, a_ld, tid,
-                k_base, (int64_t)block_m * kBlockM);
+                a_stage, a, m, k, a_ld, tid, k_base, (int64_t)block_m * kBlockM);
         if constexpr (!kDirectB)
             load_operand_tile<T8, kK, kBlockN, kCtaThreads>(
-                b_base + (tile % kBRing) * kBStageBytes, b, n, k, b_ld, tid,
-                k_base, (int64_t)block_n * kBlockN);
+                b_stage, b, n, k, b_ld, tid, k_base,
+                (int64_t)block_n * kBlockN);
     };
     // Predication-free interior variant of load_async: congruous operands
     // with full CTA rows, aligned (base | ld), k_base + kK <= k. fast_cta
     // admits only congruous operands, so no crosswise fallback is needed.
-    auto load_async_fast = [&](int64_t tile) {
-        const int64_t k_base = tile * kK;
+    auto load_async_fast = [&](T8* a_stage, T8* b_stage, int64_t k_base) {
         if constexpr (!kDirectA)
             load_operand_tile_interior<T8, kK, kBlockM, kCtaThreads>(
-                a_base + (tile % kARing) * kAStageBytes, a, a_ld, tid, k_base,
-                (int64_t)block_m * kBlockM);
+                a_stage, a, a_ld, tid, k_base, (int64_t)block_m * kBlockM);
         if constexpr (!kDirectB)
             load_operand_tile_interior<T8, kK, kBlockN, kCtaThreads>(
-                b_base + (tile % kBRing) * kBStageBytes, b, b_ld, tid, k_base,
-                (int64_t)block_n * kBlockN);
+                b_stage, b, b_ld, tid, k_base, (int64_t)block_n * kBlockN);
     };
     // Synchronous direct-crosswise loads for tile `tile` into the operand's
     // (kStages+1)-deep canonical ring. In the steady state this runs right
@@ -410,16 +479,15 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // (i-1)%(kStages+1), which compute(i-1) finished reading before the
     // previous barrier and compute(i+kStages) does not touch until several
     // barriers later.
-    auto load_direct = [&](int64_t tile) {
-        const int64_t k_base = tile * kK;
+    auto load_direct = [&](T8* a_stage, T8* b_stage, int64_t k_base) {
         if constexpr (kDirectA)
             load_crosswise_direct<T8, kK, kBlockM, kCtaThreads>(
-                a_base + (tile % kARing) * kAStageBytes, a, m, k, a_ld, tid,
-                k_base, (int64_t)block_m * kBlockM);
+                a_stage, a, m, k, a_ld, tid, k_base,
+                (int64_t)block_m * kBlockM);
         if constexpr (kDirectB)
             load_crosswise_direct<T8, kK, kBlockN, kCtaThreads>(
-                b_base + (tile % kBRing) * kBStageBytes, b, n, k, b_ld, tid,
-                k_base, (int64_t)block_n * kBlockN);
+                b_stage, b, n, k, b_ld, tid, k_base,
+                (int64_t)block_n * kBlockN);
     };
 
     const int64_t tile_count = (k + kK - 1) / kK;
@@ -490,20 +558,41 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     const unsigned b4_lane_off = b_lane_off + rh16 * kPairStep / 2;
 
     // Prime the pipeline. Each committed group occupies one circular shared
-    // memory stage; the loop also handles K dimensions smaller than kStages.
+    // memory stage. The commit is unconditional: when K is shorter than the
+    // pipeline (tile_count < kStages) the skipped stages commit empty groups
+    // so the group sequence stays tile-indexed — the steady-state
+    // wait_group<kStages-1> below is then correct for every iteration and
+    // no runtime wait-count dispatch is needed (the dispatch ladder cost 16
+    // instructions per k-tile: ISETP/SEL chains picking DEPBAR immediates).
     // Direct loads run synchronously here (back to back with their commit);
     // the steady state below overlaps them with the compute phase.
 #pragma unroll
     for (int stage = 0; stage < kStages; ++stage) {
         if (stage < tile_count) {
             if (fast_cta)
-                load_async_fast(stage);
+                load_async_fast(a_stage_of(stage), b_stage_of(stage),
+                                (int64_t)stage * kK);
             else
-                load_async(stage);
-            load_direct(stage);
-            astrai::cp_async_commit_group();
+                load_async(a_stage_of(stage), b_stage_of(stage),
+                           (int64_t)stage * kK);
+            load_direct(a_stage_of(stage), b_stage_of(stage),
+                        (int64_t)stage * kK);
         }
+        astrai::cp_async_commit_group();
     }
+
+    // Steady-state read carries: the LDSM base of the current k-tile's
+    // stage with the lane offset folded in, advanced one stage per
+    // iteration with an equality wrap (the add sequence is exact). This
+    // replaces the per-k-tile (tile % ring) * stage_bytes recomputation —
+    // its SASS form was a UIMAD.WIDE magic-division ladder, ~10
+    // uniform-pipe instructions per operand per k-tile (perf 6.2).
+    const unsigned a_rd0 = __cvta_generic_to_shared(a_base) + a_lane_off;
+    const unsigned b_rd0 = __cvta_generic_to_shared(b_base) +
+                           (kPairB ? b4_lane_off : b_lane_off);
+    const unsigned a_rd_end = a_rd0 + (unsigned)(kARing * kAStageBytes);
+    const unsigned b_rd_end = b_rd0 + (unsigned)(kBRing * kBStageBytes);
+    unsigned a_rd = a_rd0, b_rd = b_rd0;
 
     // Mainloop, compile-time specialized on fast_cta: the fast copy runs
     // predication-free loads; the generic copy keeps full predication.
@@ -511,28 +600,41 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // to the pre-peel kernel.
     auto mainloop = [&](auto fastc) {
         constexpr bool kFast = decltype(fastc)::value;
+        // Fast-path write carries: one per congruous operand (see
+        // PrefetchCarry; crosswise operands get the empty no-op type).
+        // Construction targets the first prefetched tile (kStages).
+        PrefetchCarry<!kDirectA, T8, kK, kBlockM, kCtaThreads> carry_a(
+            a_base, kARing, kAStageBytes, a, a_ld, (int64_t)block_m * kBlockM,
+            tid, kStages);
+        PrefetchCarry<!kDirectB, T8, kK, kBlockN, kCtaThreads> carry_b(
+            b_base, kBRing, kBStageBytes, b, b_ld, (int64_t)block_n * kBlockN,
+            tid, kStages);
+        // Interleaved prefetch (cuBLAS/CUTLASS loop shape): the next tile's
+        // LDGSTS chunks ride inside the MMA phase so their issue slots fill
+        // the tensor-pipe gaps ptxas otherwise pads with NOPs (23 NOPs per
+        // 32 QMMA here versus 0 in the cuBLAS loop). Full rings only: a lean
+        // ring's write slot is the one compute(i) is reading (barrier 4
+        // orders the end-of-loop prefetch), so it keeps that placement.
+        constexpr bool kInterleave = kFast && !kLeanRing;
         for (int64_t tile_index = 0; tile_index < tile_count; ++tile_index) {
-        const int64_t remaining = tile_count - tile_index - 1;
-
-        // Keep up to kStages - 1 younger groups in flight while making the
-        // oldest group (the current stage) ready for consumption.
-        const int keep_groups =
-            remaining < kStages - 1 ? static_cast<int>(remaining) : kStages - 1;
-        astrai::cp_async_wait_group_dispatch<kStages - 1>(keep_groups);
+        // In the steady state exactly kStages-1 younger groups are in flight
+        // when this fires; the tail's unconditional (possibly empty) commits
+        // keep that invariant true for every iteration.
+        const bool prefetch = tile_index + kStages < tile_count;
+        astrai::cp_async_wait_group<kStages - 1>();
         // Barrier 1: every thread's cp.async for this stage is complete
         // before any thread reads tiles written by other threads.
         __syncthreads();
 
         // Direct chunks for tile i+kStages: issue LDG+PRMT+STS now so the
         // global-load latency hides behind the MMA phase below.
-        if (tile_index + kStages < tile_count)
-            load_direct(tile_index + kStages);
+        if (prefetch)
+            load_direct(a_stage_of(tile_index + kStages),
+                        b_stage_of(tile_index + kStages),
+                        (tile_index + kStages) * kK);
 
-        const T8* a_tile = a_base + (size_t)(tile_index % kARing) * kAStageBytes;
-        const T8* b_tile = b_base + (size_t)(tile_index % kBRing) * kBStageBytes;
-        const unsigned a_addr = __cvta_generic_to_shared(a_tile) + a_lane_off;
-        const unsigned b_addr = __cvta_generic_to_shared(b_tile) +
-                                (kPairB ? b4_lane_off : b_lane_off);
+        const unsigned a_addr = a_rd;
+        const unsigned b_addr = b_rd;
         // Per-k_seg base pair (cuBLAS's scheme): seg s lives at the seg-0
         // base XOR (s<<5) — one LOP3 per extra seg per k-tile, never per
         // fragment. Every LDSM below addresses [base + immediate].
@@ -606,6 +708,12 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
                                      acc[nt][mt]);
             }
         }
+        // Next tile's LDGSTS chunks inside the MMA phase: A's after the
+        // first k_seg's MMA batch, B's after the last.
+        if constexpr (kInterleave) {
+            if (k_seg == 0) carry_a.emit(prefetch);
+            if (k_seg == kSegs - 1) carry_b.emit(prefetch);
+        }
         }
         // Barrier 4 (lean-ring only): every thread finished reading this
         // stage's tiles before the prefetch for the (i+kStages)-th tile
@@ -614,12 +722,32 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         // full-ring path skips this barrier entirely — one __syncthreads per
         // k-tile.
         if constexpr (kLeanRing) __syncthreads();
-        if (tile_index + kStages < tile_count) {
-            if constexpr (kFast)
-                load_async_fast(tile_index + kStages);
-            else
-                load_async(tile_index + kStages);
-            astrai::cp_async_commit_group();
+        if constexpr (!kInterleave) {
+            if (prefetch) {
+                if constexpr (kFast) {
+                    carry_a.emit(true);
+                    carry_b.emit(true);
+                } else {
+                    load_async(a_stage_of(tile_index + kStages),
+                               b_stage_of(tile_index + kStages),
+                               (tile_index + kStages) * kK);
+                }
+            }
+        }
+        // Unconditional commit: empty in the tail, it pads the group
+        // sequence so the fixed wait above stays correct (and the
+        // predicated-off chunks' zero-fill lands in the slot compute(i-1)
+        // released — nothing reads it again before the epilogue drain).
+        astrai::cp_async_commit_group();
+        // Advance the carries: one stage slot forward, wrapping on the
+        // exact ring boundary.
+        a_rd += (unsigned)kAStageBytes;
+        if (a_rd == a_rd_end) a_rd = a_rd0;
+        b_rd += (unsigned)kBStageBytes;
+        if (b_rd == b_rd_end) b_rd = b_rd0;
+        if constexpr (kFast) {
+            carry_a.advance(kAStageBytes);
+            carry_b.advance(kBStageBytes);
         }
         }
     };  // mainloop
@@ -641,6 +769,10 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     } else {
         mainloop(std::false_type{});
     }
+    // Drain the pipeline before the epilogue reclaims the operand rings for
+    // output staging: the loop's last commits (possibly only zero-filling
+    // predicated-off chunks) are nobody's wait target anymore.
+    astrai::cp_async_wait_all();
 
     // Direct bf16 epilogue through the operand shared memory: the A/B rings
     // are dead once the mainloop ends, so their space stages the output tile
@@ -805,16 +937,17 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
 // congruous NT): the 128x128 CTA wins inside one full wave (81 tiles: big
 // +24%) and from ~1.5 waves up (144: +23%, 256: +39%, 2048^3 123->171 TF),
 // but loses inside the quantization dip just past one wave (100 tiles =
-// 1.09 waves: big -8%) where the finer 64x64 grid fills the tail. With the
-// interior fast loop on the big CTA the sub-wave boundary moved down: 63-64
-// tiles already favor it (63-tile rect +8%, 1024^3 +2%) while 49 tiles
-// stays small-CTA territory, so the big band opens at 5/8 wave instead of
-// 3/4.
+// 1.09 waves) — with the OLD loop, whose big CTA stalled on the tail wave's
+// exposed pipeline drain. The interleaved-prefetch loop (perf 6.2) removed
+// that stall, and the trade flipped across the whole measured band: 1280^3
+// (1.09 waves) big 163T vs small 100T, 4096x512x4096 (1.4 waves) big 139T
+// vs small 113T. The small CTA now only serves the genuinely sub-wave band
+// below 5/8 of a wave (and m <= 64, where a 128-row CTA wastes half its
+// rows); inside [5/8, 1] waves the big CTA was already the measured winner
+// (63-tile rect +8%).
 inline bool prefer_small_cta(int64_t tiles_128, int64_t m) {
     if (m <= 64) return true;
-    const int64_t waves = device_sm_count();
-    if (tiles_128 >= waves * 5 / 8 && tiles_128 <= waves) return false;
-    return tiles_128 < waves + waves * 2 / 5;
+    return tiles_128 < device_sm_count() * 5 / 8;
 }
 
 template <FP8Format Fmt, typename LayoutA = RowMajor,
@@ -871,20 +1004,6 @@ void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
     // single generic body — no dead second loop in their I-cache.
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
-    // Single-wave grids (tiles <= SM count) take one stage deeper: with no
-    // second wave to overlap the drain, latency hiding comes only from the
-    // pipeline (measured, L20, in-wave band: 1024^3 +1.5%, 1152^3 +1.2%,
-    // K=4096 rects +2%); multi-wave grids flip back — the shorter prologue
-    // wins once retiring CTAs overlap (4096^3: s2 196T vs s3 175T).
-    if (tiles_128 <= (int64_t)device_sm_count()) {
-        using TraitsS3 = Fp8GemmTraits<Fmt, 128, 128, kK, Stages + 1>;
-        launch_with_smem<
-            fp8_gemm_kernel<TraitsS3, LayoutA, LayoutB, GroupRaster, false,
-                            false, kBigFast>>(
-            Fp8GemmSmem<TraitsS3, LayoutA, LayoutB, false>::kBytes, grid,
-            dim3(TraitsS3::kCtaThreads), stream, p);
-        return;
-    }
     launch_with_smem<
         fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false, false,
                         kBigFast>>(
