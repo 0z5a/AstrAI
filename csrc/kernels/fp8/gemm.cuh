@@ -942,11 +942,19 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
 // that stall, and the trade flipped across the whole measured band: 1280^3
 // (1.09 waves) big 163T vs small 100T, 4096x512x4096 (1.4 waves) big 139T
 // vs small 113T. The small CTA now only serves the genuinely sub-wave band
-// below 5/8 of a wave (and m <= 64, where a 128-row CTA wastes half its
-// rows); inside [5/8, 1] waves the big CTA was already the measured winner
-// (63-tile rect +8%).
-inline bool prefer_small_cta(int64_t tiles_128, int64_t m) {
-    if (m <= 64) return true;
+// below 5/8 of a wave, the narrow-M/N edge, and the divisibility rule below.
+inline bool prefer_small_cta(int64_t tiles_128, int64_t m, int64_t n) {
+    if (m <= 64 || n <= 64) return true;
+    const bool big_div = (m % 128 == 0) && (n % 128 == 0);
+    const bool small_div = (m % 64 == 0) && (n % 64 == 0);
+    // Divisibility: a 128x128 CTA that is NOT exactly tiled (m or n not a
+    // multiple of 128) runs its edge tiles on the predicated generic path,
+    // and with a single in-flight wave the runtime is the slowest CTA — the
+    // edge tiles drag the whole shape down (1088^3: 76T vs 93T with the
+    // 64x64 CTA, whose grid tiles exactly and overlaps waves; measured
+    // sweep, perf 5.1). When 64 divides both dims, the 64x64 small CTA
+    // wins the non-128-divisible band by 23..67%.
+    if (!big_div && small_div) return true;
     return tiles_128 < device_sm_count() * 5 / 8;
 }
 
@@ -962,7 +970,7 @@ void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
     // per-matrix tiles (see prefer_small_cta).
     const int64_t tiles_128 =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
-    if (prefer_small_cta(tiles_128, p.m)) {
+    if (prefer_small_cta(tiles_128, p.m, p.n)) {
         dim3 grid((p.n + 63) / 64, (p.m + 63) / 64, p.batch);
         // Full-ring small CTAs — ONE __syncthreads per k-tile, cuBLAS's
         // barrier structure (the lean ring traded a second barrier for a
