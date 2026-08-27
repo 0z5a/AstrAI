@@ -17,7 +17,7 @@ scripts/serve.sh             preflight, Compose wrapper, lifecycle
         └── server.py --config /run/astrai/serve.yaml
 ```
 
-`scripts/tools/serve_runtime.py` reads `runtime:` plus the two container-side
+`scripts/docker/serve_runtime.py` reads `runtime:` plus the two container-side
 values Compose needs (`server.port` for the port mapping, `server.device` for
 the preflight GPU check). `scripts/tools/server.py --config` reads `server:`.
 Explicit CLI arguments to `server.py` override `server:` YAML values.

@@ -46,7 +46,7 @@ load_config() {
         die "PyYAML is required on the host (install python3-yaml)"
 
     local exports
-    exports="$(python3 "${ROOT_DIR}/scripts/tools/serve_runtime.py" exports "${CONFIG_FILE}")" ||
+    exports="$(python3 "${ROOT_DIR}/scripts/docker/serve_runtime.py" exports "${CONFIG_FILE}")" ||
         die "Failed to load runtime configuration"
     eval "${exports}"
     if [[ -n "${SERVE_JOB_NAME}" ]]; then
@@ -113,7 +113,7 @@ runtime_environment_args() {
     local pair
     while IFS= read -r -d '' pair; do
         RUNTIME_ENV_ARGS+=(--env "${pair}")
-    done < <(python3 "${ROOT_DIR}/scripts/tools/serve_runtime.py" environment "${CONFIG_FILE}")
+    done < <(python3 "${ROOT_DIR}/scripts/docker/serve_runtime.py" environment "${CONFIG_FILE}")
 }
 
 start_server() {

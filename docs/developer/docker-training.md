@@ -18,7 +18,7 @@ scripts/train.sh             preflight, Compose wrapper, lifecycle, timer
               └── train.py --config /run/astrai/train.yaml
 ```
 
-The two parsers deliberately own different sections. `scripts/tools/train_runtime.py`
+The two parsers deliberately own different sections. `scripts/docker/train_runtime.py`
 reads only `runtime`; `scripts/tools/train.py` reads only
 `model/data/parallel/training/ckpt/log`. Explicit trainer arguments after `--`
 override training YAML values.

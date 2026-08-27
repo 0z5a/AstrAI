@@ -2,7 +2,7 @@
 
 import pytest
 
-from scripts.tools.serve_runtime import load_runtime
+from scripts.docker.serve_runtime import load_runtime
 
 
 def _write(tmp_path, body: str) -> str:
