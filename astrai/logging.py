@@ -1,11 +1,13 @@
 import logging
 import os
 
+from astrai.parallel.setup import get_rank, get_world_size
+
 
 class _DistributedContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.rank = os.environ.get("RANK", "0")
-        record.world_size = os.environ.get("WORLD_SIZE", "1")
+        record.rank = str(get_rank())
+        record.world_size = str(get_world_size())
         return True
 
 
