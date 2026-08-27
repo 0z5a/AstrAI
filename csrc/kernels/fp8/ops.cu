@@ -70,25 +70,9 @@ void pack_gemm(FP8Params& p, const void* a, const void* b, void* output,
     p.b_ld = static_cast<int>(b_ld);
 }
 
-template <FP8Format Fmt, int Variant>
-void launch_variant(const FP8Params& p, cudaStream_t stream) {
-    using LayoutA = std::conditional_t<(Variant & 2) != 0, ColMajor, RowMajor>;
-    using LayoutB = std::conditional_t<(Variant & 1) != 0, ColMajor, RowMajor>;
-    launch_fp8_gemm<Fmt, LayoutA, LayoutB>(p, stream);
-}
-
-template <FP8Format Fmt>
-void dispatch_gemm(const FP8Params& p, cudaStream_t stream, bool trans_a,
-                   bool trans_b) {
-    const int variant = (static_cast<int>(trans_a) << 1) |
-                        static_cast<int>(trans_b);
-    switch (variant) {
-        case 0: launch_variant<Fmt, 0>(p, stream); break;
-        case 1: launch_variant<Fmt, 1>(p, stream); break;
-        case 2: launch_variant<Fmt, 2>(p, stream); break;
-        case 3: launch_variant<Fmt, 3>(p, stream); break;
-    }
-}
+// Layout dispatch (the NN swap in canonicalize_gemm) and launch planning
+// (plan_gemm/launch_plan) live in gemm.cuh behind fp8::gemm — pure CUDA,
+// shared with the C test suite.
 
 // Inner-layout resolution for one GEMM operand. The user flag names the
 // math (0 = tensor's last two dims are [rows][contract], 1 = transposed);
@@ -223,9 +207,9 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
     p.b_batch_stride = (batch_b == 1 && batch > 1) ? 0 : b_bstride;
     p.out_batch_stride = m * n;
     if (a.scalar_type() == torch::kFloat8_e4m3fn)
-        dispatch_gemm<FP8Format::E4M3>(p, stream.stream(), tag_a, tag_b);
+        gemm<FP8Format::E4M3>(p, stream.stream(), tag_a, tag_b);
     else
-        dispatch_gemm<FP8Format::E5M2>(p, stream.stream(), tag_a, tag_b);
+        gemm<FP8Format::E5M2>(p, stream.stream(), tag_a, tag_b);
     C10_CUDA_CHECK(cudaGetLastError());
     return output;
 }

@@ -46,9 +46,9 @@ style as attention, but split into **three** files:
 
 | File | Role |
 |------|------|
-| `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `FP8Params` POD — no torch |
+| `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `Fp8GemmPolicy` (traits + layouts + scheduling knobs — the kernel's single template parameter), `FP8Params` POD — no torch |
 | `fp8/quantize.cuh` | pure-CUDA device code: `fp8_quantize_kernel<Fmt, InT>` (bf16/fp16/fp32 → FP8 + amax, `quant_in_traits<InT>` vectorized unpack) — no torch |
-| `fp8/gemm.cuh` | pure-CUDA device code: `fp8_gemm_kernel` (pre-quantized GEMM; 64×64 / 128×128 CTA picked at runtime by `prefer_small_cta`, 64×32 warp tiles, multi-stage cp.async, transposed-operand layouts) — no torch |
+| `fp8/gemm.cuh` | pure-CUDA device code: CUTLASS-style collectives (`Fp8GemmTileScheduler` / `Fp8CollectiveMainloop` / `Fp8CollectiveEpilogue`) around `fp8_gemm_kernel<Policy>` (pre-quantized GEMM; 64×64 / 128×64 / 128×128 CTA picked by `plan_gemm`, multi-stage cp.async, transposed-operand layouts, NN routed through a swap + out-transposed epilogue) — no torch. Entry: `gemm<Fmt>(params, stream, trans_a, trans_b)` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
 | `fp8/ops.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_ops` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the

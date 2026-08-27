@@ -170,9 +170,37 @@ static bool test_single_mma() {
 // Part 2: GEMM correctness — layouts x K-tiles vs fp32 CPU reference
 // ---------------------------------------------------------------------------
 
+// Naive fp32 reference on the GPU: same layout interpretation as the CPU
+// loop it replaces (O(m*n) to check instead of O(m*n*k) to compute).
+__global__ static void
+naive_gemm_ref(const __nv_fp8_e4m3* a, const __nv_fp8_e4m3* b, float* out,
+               int m, int n, int k, int a_ld, int b_ld, int a_rm, int b_rm) {
+    const int i = blockIdx.y * 32 + threadIdx.y;
+    const int j = blockIdx.x * 32 + threadIdx.x;
+    if (i >= m || j >= n) return;
+    float acc = 0.f;
+    for (int kk = 0; kk < k; ++kk) {
+        float av = a_rm ? (float)a[i * a_ld + kk] : (float)a[kk * a_ld + i];
+        float bv = b_rm ? (float)b[kk * b_ld + j] : (float)b[j * b_ld + kk];
+        acc += av * bv;
+    }
+    out[i * n + j] = acc;
+}
+
+// Big-CTA policies for the direct-layout cases: kK/Stages vary per case;
+// the fast interior loop follows the dual-congruous rule, grouped raster 8
+// matches the production dispatch.
+template <typename LA, typename LB>
+constexpr bool kCaseFast =
+    !std::is_same_v<LA, ColMajor> && !std::is_same_v<LB, RowMajor>;
+template <typename LA, typename LB, int kK, int Stages>
+using CasePolicy =
+    Fp8GemmPolicy<FP8Format::E4M3, 128, 128, LA, LB, 64, 32, kK, Stages, 8,
+                  false, false, kCaseFast<LA, LB>>;
+
 template <typename LA, typename LB, int kK, int Stages>
 static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
-                          int k, int a_ld, int b_ld) {
+                          int k, int a_ld, int b_ld, int dispatch = 0) {
     __nv_fp8_e4m3 *da, *db;
     __nv_bfloat16* dout;
     float* dscale;
@@ -205,7 +233,27 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
     p.k = k;
     p.a_ld = a_ld;
     p.b_ld = b_ld;
-    launch_fp8_gemm<FP8Format::E4M3, LA, LB, kK, Stages>(p, 0);
+    float* d_ref;
+    cudaMalloc(&d_ref, (size_t)m * n * 4);
+    naive_gemm_ref<<<dim3((n + 31) / 32, (m + 31) / 32), dim3(32, 32)>>>(
+        da, db, d_ref, m, n, k, a_ld, b_ld,
+        !std::is_same_v<LA, ColMajor>, !std::is_same_v<LB, ColMajor>);
+    std::vector<float> href((size_t)m * n);
+    cudaMemcpy(href.data(), d_ref, href.size() * 4, cudaMemcpyDeviceToHost);
+    cudaFree(d_ref);
+
+    if (dispatch == 1)
+        // Production route, NN: the dual-N-contiguous problem has no
+        // dedicated instantiation — canonicalize_gemm swaps to the
+        // transposed <ColMajor, ColMajor> kernel with its out-transposed
+        // epilogue (see gemm.cuh).
+        gemm<FP8Format::E4M3>(p, 0, false, false);
+    else if (dispatch == 2)
+        // Production route, NT: exercises plan_gemm's small/narrow/big
+        // selection for this shape.
+        gemm<FP8Format::E4M3>(p, 0, false, true);
+    else
+        launch_policy<CasePolicy<LA, LB, kK, Stages>>(p, 0);
     cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         printf("  CUDA err: %s\n", cudaGetErrorString(e));
@@ -218,20 +266,7 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
     bool ok = true;
     for (int i = 0; i < m && ok; ++i) {
         for (int j = 0; j < n && ok; ++j) {
-            float ref = 0;
-            for (int kk = 0; kk < k; ++kk) {
-                // A reference reads the actual uploaded buffer: LA ColMajor
-                // means the buffer is [K][M] (ha_t), else [M][K].
-                float av = std::is_same_v<LA, ColMajor>
-                               ? (float)__nv_fp8_e4m3(ha[kk * m + i])
-                               : (float)__nv_fp8_e4m3(ha[i * k + kk]);
-                float bv;
-                if (std::is_same_v<LB, ColMajor>)
-                    bv = (float)__nv_fp8_e4m3(hb[j * k + kk]);
-                else
-                    bv = (float)__nv_fp8_e4m3(hb[kk * n + j]);
-                ref += av * bv;
-            }
+            const float ref = href[(size_t)i * n + j];
             float got =
                 __bfloat162float(__ushort_as_bfloat16(hb16[i * n + j]));
             float err = fabsf(got - ref);
@@ -254,6 +289,7 @@ static bool test_gemm() {
     } cfgs[] = {
         {128, 128, 128}, {256, 128, 256}, {128, 256, 64},
         {100, 130, 96},  {64, 64, 160},   {300, 200, 320},
+        {2048, 256, 512}, {1024, 1024, 512},
     };
     bool all = true;
     for (auto& c : cfgs) {
@@ -274,12 +310,12 @@ static bool test_gemm() {
         printf(" NT K64:");
         all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(ha, hb_colmajor, c.m,
                                                         c.n, c.k, c.k, c.k);
-        printf(" NN K32:");
-        all &= run_gemm_case<RowMajor, RowMajor, 32, 3>(ha, hb_rowmajor, c.m,
-                                                        c.n, c.k, c.k, c.n);
-        printf(" NN K64:");
-        all &= run_gemm_case<RowMajor, RowMajor, 64, 2>(ha, hb_rowmajor, c.m,
-                                                        c.n, c.k, c.k, c.n);
+        printf(" NN swap:");
+        all &= run_gemm_case<RowMajor, RowMajor, 64, 2>(
+            ha, hb_rowmajor, c.m, c.n, c.k, c.k, c.n, /*dispatch=*/1);
+        printf(" NT disp:");
+        all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(
+            ha, hb_colmajor, c.m, c.n, c.k, c.k, c.k, /*dispatch=*/2);
         printf(" TN K32:");
         all &= run_gemm_case<ColMajor, ColMajor, 32, 3>(ha_t, hb_colmajor, c.m,
                                                         c.n, c.k, c.m, c.k);

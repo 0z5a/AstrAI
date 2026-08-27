@@ -313,6 +313,31 @@ struct Fp8GemmSmem {
     static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
 };
 
+// ---------------------------------------------------------------------------
+// Kernel policy: one type per kernel instantiation. The CTA/K-tile/pipeline
+// shape rides on Fp8GemmTraits and the operand layouts + scheduling knobs
+// hang beside them — this is the single template parameter fp8_gemm_kernel
+// (and both collectives) take, mirroring CUTLASS's kernel-policy
+// consolidation.
+template <FP8Format Fmt_, int BlockM_, int BlockN_, typename LayoutA_,
+          typename LayoutB_, int WarpM_, int WarpN_, int kK_, int Stages_,
+          int GroupRaster_, bool LeanRing_ = false, bool StreamOut_ = false,
+          bool FastLoop_ = false>
+struct Fp8GemmPolicy {
+    using Traits =
+        Fp8GemmTraits<Fmt_, BlockM_, BlockN_, kK_, Stages_, WarpM_, WarpN_>;
+    using LayoutTagA = LayoutA_;
+    using LayoutTagB = LayoutB_;
+    static constexpr int kGroupRaster = GroupRaster_;
+    static constexpr bool kLeanRing = LeanRing_;
+    static constexpr bool kStreamOut = StreamOut_;
+    static constexpr bool kFastLoop = FastLoop_;
+    // Flattened for __launch_bounds__, which takes no dependent type names.
+    static constexpr int kCtaThreads = Traits::kCtaThreads;
+    static constexpr int kMinCtas =
+        Fp8GemmSmem<Traits, LayoutA_, LayoutB_, kLeanRing>::kMinCtas;
+};
+
 // LayoutA / LayoutB tag the operands' storage (CUTLASS-style, see common.h):
 // A RowMajor = [M][K] / ColMajor = [K][M]; B RowMajor = [K][N] /
 // ColMajor = [N][K]. The kernel always computes
@@ -322,153 +347,173 @@ struct Fp8GemmSmem {
 // change how the stage-load gathers the operand from global memory:
 //   A ColMajor: tileA[m][p] = a[p*a_ld + m];  A RowMajor: a[m*a_ld + p]
 //   B RowMajor: tileB[n][p] = b[p*b_ld + n];  B ColMajor: b[n*b_ld + p]
+// With p.out_transposed set (the swap dispatch for NN problems, see
+// dispatch_fp8_gemm) the kernel runs the transposed problem E = B^T * A^T
+// over swapped operands and the epilogue scatters D[m][n] = E[n][m] into the
+// caller's [M][N] row-major buffer — bias then indexes D-cols, i.e. the
+// kernel's rows (see the epilogue).
 // BlockM x BlockN CTA as (BlockM/64) x (BlockN/32) warps of 64x32 warp tiles
-// (mt x nt = 4x4 MMA each). The 64x128 variant runs 4 warps / 128 threads and
-// exists for small-M calls: m <= 64 wastes half of every 128-row CTA, so the
-// launcher dispatches to it there (see launch_fp8_gemm).
-template <typename Traits, typename LayoutA = RowMajor, typename LayoutB = RowMajor, int kRasterGroup = 0,
-        bool kLeanRing = false, bool kStreamOut = false,
-        bool kFastLoop = false>
-__global__ void __launch_bounds__(Traits::kCtaThreads,
-                                  Fp8GemmSmem<Traits, LayoutA, LayoutB,
-                                              kLeanRing>::kMinCtas)
-    fp8_gemm_kernel(FP8Params p) {
+// (mt x nt = 4x4 MMA each).
+//
+// The kernel decomposes CUTLASS-style into three collectives below:
+//   Fp8GemmTileScheduler   — CTA id -> (block_m, block_n) raster order
+//   Fp8CollectiveMainloop  — stage rings, gmem->smem loads, mma.sync loop
+//   Fp8CollectiveEpilogue  — fused bias + bf16 scatter + coalesced copy-out
+// with fp8_gemm_kernel as the thin orchestrator.
+
+// ---------------------------------------------------------------------------
+// Tile scheduler: the linear CTA id maps to (block_m, block_n) in grouped
+// (L2-friendly, CUTLASS-style) or plain raster order — the grouped order
+// makes consecutive CTAs cover a group of kRasterGroup M-tiles before
+// advancing along N, so all CTAs of one group share the same B column
+// stripe and B tiles stay hot in L2 across the wave (the plain N-fastest
+// order makes each wave touch every B tile instead; kRasterGroup=0 selects
+// plain, the measured best for dX's crosswise-B layouts where grouping
+// measured neutral).
+// Persistent schedules (static round-robin and an atomic ticket dispenser,
+// grid capped at the resident CTAs) were both measured and rejected on L20:
+// the stride desynchronizes the in-flight window (-4..-8%), and the ticket
+// variant recovers the L2 locality but lands within noise of plain waves
+// (its loop-head barrier costs what the CTA-restart overlap saves). Keep
+// the classic retiring-wave launch.
+template <int kRasterGroup>
+struct Fp8GemmTileScheduler {
+    static __device__ int2 tile(const uint3& block, const dim3& blocks) {
+        if constexpr (kRasterGroup > 0) {
+            constexpr int kGroupM = kRasterGroup;
+            const int bid = int(block.y) * int(blocks.x) + int(block.x);
+            const int group_first_m = (bid / (kGroupM * int(blocks.x))) * kGroupM;
+            const int group_rows =
+                min(int(blocks.y) - group_first_m, kGroupM);  // M-tail group is short
+            return int2{group_first_m + bid % group_rows,
+                        (bid % (kGroupM * int(blocks.x))) / group_rows};
+        } else {
+            return int2{int(block.y), int(block.x)};
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Collective mainloop: shared-memory stage rings, the gmem->smem stage loads
+// (congruous cp.async / crosswise LDG+PRMT), the per-lane ldmatrix fragment
+// addressing and the software-pipelined mma.sync loop.
+template <typename Policy>
+struct Fp8CollectiveMainloop {
+    using Traits = typename Policy::Traits;
+    using LayoutA = typename Policy::LayoutTagA;
+    using LayoutB = typename Policy::LayoutTagB;
+    static constexpr bool kLeanRing = Policy::kLeanRing;
+    static constexpr bool kFastLoop = Policy::kFastLoop;
     using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
-    constexpr int kBlockM = Traits::kBlockM;
-    constexpr int kBlockN = Traits::kBlockN;
-    constexpr int kK = Traits::kK;
-    constexpr int kStages = Traits::kStages;
-    constexpr int kCtaThreads = Traits::kCtaThreads;
-    constexpr bool kDirectA =
-        Fp8GemmSmem<Traits, LayoutA, LayoutB, kLeanRing>::kDirectA;
-    constexpr bool kDirectB =
-        Fp8GemmSmem<Traits, LayoutA, LayoutB, kLeanRing>::kDirectB;
+    static constexpr int kBlockM = Traits::kBlockM;
+    static constexpr int kBlockN = Traits::kBlockN;
+    static constexpr int kK = Traits::kK;
+    static constexpr int kStages = Traits::kStages;
+    static constexpr int kCtaThreads = Traits::kCtaThreads;
+    static constexpr bool kDirectA = Fp8GemmSmem<Traits, LayoutA, LayoutB,
+                                                 kLeanRing>::kDirectA;
+    static constexpr bool kDirectB = Fp8GemmSmem<Traits, LayoutA, LayoutB,
+                                                 kLeanRing>::kDirectB;
     static_assert(kStages >= 1 && kStages <= 8,
                   "FP8 GEMM stages must be in [1, 8]");
-    // Tiles are flat [rows * kK] with a 16B-chunk XOR swizzle (tile_at):
-    // ldmatrix reads whole 16B chunks through the same mapping the staging
-    // writes, and the swizzle removes the bank conflict the unswizzled
-    // 8-word row stride caused (see tile_at). The stages live in dynamic
-    // shared memory so deep pipelines (kStages * (kBlockM + kBlockN) * kK >
-    // 48KB static limit) opt in via cudaFuncSetAttribute in the launcher.
-    extern __shared__ __align__(16) char fp8_gemm_smem[];
+    // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps of WarpM x WarpN tiles,
+    // each warp computing (WarpM/16) x (WarpN/8) m16n8k32 MMAs (mt x nt).
+    // The default 128x128 CTA runs 8 warps of 64x32 (mt x nt = 4x4); the
+    // small-shape path uses 64x64 CTAs of 32x32 warps (cuBLAS-style) so more
+    // CTAs fit per SM (see launch_fp8_gemm).
+    static constexpr int kMt = Traits::kWarpM / 16;  // 16-row MMA tiles per warp
+    static constexpr int kNt = Traits::kWarpN / 8;   // 8-col MMA tiles per warp
+    static constexpr int kSegs = kK / kMmaK;  // mma-sized k segments per tile
     // Per operand: congruous = kStages+1 rotating canonical buffers — the
     // load for tile i+kStages targets slot (i-1)%(kStages+1), which compute
     // finished reading before this iteration's barrier 1, so NO post-compute
     // barrier is needed on the pure-congruous path (one __syncthreads per
     // k-tile, the classic multistage rotation); direct-crosswise rotates the
     // same kStages+1 ring for the same reason.
-    constexpr int kAStageBytes = kBlockM * kK;
-    constexpr int kBStageBytes = kBlockN * kK;
+    static constexpr int kAStageBytes = kBlockM * kK;
+    static constexpr int kBStageBytes = kBlockN * kK;
     // Direct-crosswise operands always rotate kStages+1 buffers: their
     // prefetch issues right after barrier 1 (targeting the slot compute(i-1)
     // released), so a kStages-deep lean ring would race the in-flight MMA
     // reads. The lean ring applies only to congruous operands, whose cp.async
     // prefetch sits behind the restored barrier 4.
-    constexpr int kARing = kDirectA ? kStages + 1 : kStages + !kLeanRing;
-    constexpr int kBRing = kDirectB ? kStages + 1 : kStages + !kLeanRing;
-    T8* const a_base = reinterpret_cast<T8*>(fp8_gemm_smem);
-    T8* const b_base =
-        reinterpret_cast<T8*>(fp8_gemm_smem + kARing * kAStageBytes);
+    static constexpr int kARing = kDirectA ? kStages + 1 : kStages + !kLeanRing;
+    static constexpr int kBRing = kDirectB ? kStages + 1 : kStages + !kLeanRing;
 
-    // Batch slice (grid.z): broadcast operands carry a 0 stride, so the
-    // same pointer serves every batch.
-    const auto* a = reinterpret_cast<const T8*>(p.a_ptr) +
-                    (int64_t)blockIdx.z * p.a_batch_stride;
-    const auto* b = reinterpret_cast<const T8*>(p.b_ptr) +
-                    (int64_t)blockIdx.z * p.b_batch_stride;
-    auto* out_bf16 = reinterpret_cast<__nv_bfloat16*>(p.out_ptr) +
-                     (int64_t)blockIdx.z * p.out_batch_stride;
-    const int64_t m = p.m, n = p.n, k = p.k;
-    const int64_t a_ld = p.a_ld, b_ld = p.b_ld;
+    T8* const a_base;
+    T8* const b_base;
+    const T8* const a;
+    const T8* const b;
+    const int64_t m, n, k, a_ld, b_ld;
+    const int tid;
+    const int64_t block_m, block_n;
+    const int warp_m, warp_n;
+    const int a_row0;  // + mt * 16 in the loop
+    const int b_row0;  // + nt * 8
+    const int64_t tile_count;
+    // Interior-CTA peel (kFastLoop instantiations only): when both operands
+    // are congruous, whole-CTA, 16B-aligned and K has no tail, the mainloop
+    // runs a compile-time-specialized copy whose loads carry no predication
+    // — the per-chunk guards cost ~6 of ~100 instructions per warp per
+    // k-tile, and the small-CTA path is issue-bound there (measured
+    // +4.5..10% on 256³..1024³; the 128x128 kernel regressed ~3% with the
+    // same change, so only the small CTA opts in). All verdicts are uniform
+    // per CTA: one branch picks the loop copy.
+    const bool fast_cta;
 
-    const int tid = threadIdx.x;
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int group = lane >> 2;
-    const int thread_in_group = lane & 3;
-    // Tile scheduler: the linear CTA id maps to (block_m, block_n) in
-    // grouped (L2-friendly, CUTLASS-style) or plain raster order — the
-    // grouped order makes consecutive CTAs cover a group of kRasterGroup
-    // M-tiles before advancing along N, so all CTAs of one group share the
-    // same B column stripe and B tiles stay hot in L2 across the wave (the
-    // plain N-fastest order makes each wave touch every B tile instead;
-    // kRasterGroup=0 selects plain, the measured best for dX's crosswise-B
-    // layouts where grouping measured neutral).
-    // Persistent schedules (static round-robin and an atomic ticket
-    // dispenser, grid capped at the resident CTAs) were both measured and
-    // rejected on L20: the stride desynchronizes the in-flight window
-    // (-4..-8%), and the ticket variant recovers the L2 locality but lands
-    // within noise of plain waves (its loop-head barrier costs what the
-    // CTA-restart overlap saves). Keep the classic retiring-wave launch.
-    int block_m, block_n;
-    if constexpr (kRasterGroup > 0) {
-        constexpr int kGroupM = kRasterGroup;
-        const int blocks_m = gridDim.y;
-        const int bid = blockIdx.y * gridDim.x + blockIdx.x;
-        const int group_first_m = (bid / (kGroupM * gridDim.x)) * kGroupM;
-        const int group_rows =
-            min(blocks_m - group_first_m, kGroupM);  // M-tail group is short
-        block_m = group_first_m + bid % group_rows;
-        block_n = (bid % (kGroupM * gridDim.x)) / group_rows;
-    } else {
-        block_m = blockIdx.y;
-        block_n = blockIdx.x;
-    }
-    // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps of WarpM x WarpN tiles,
-    // each warp computing (WarpM/16) x (WarpN/8) m16n8k32 MMAs (mt x nt).
-    // The default 128x128 CTA runs 8 warps of 64x32 (mt x nt = 4x4); the
-    // small-shape path uses 64x64 CTAs of 32x32 warps (cuBLAS-style) so more
-    // CTAs fit per SM (see launch_fp8_gemm).
-    constexpr int kMt = Traits::kWarpM / 16;  // 16-row MMA tiles per warp
-    constexpr int kNt = Traits::kWarpN / 8;   // 8-col MMA tiles per warp
-    constexpr int kSegs = kK / kMmaK;         // mma-sized k segments per tile
-    const int warp_m = warp / Traits::kWarpsN;
-    const int warp_n = warp % Traits::kWarpsN;
-    const int a_row0 = warp_m * Traits::kWarpM;  // + mt * 16 in the loop
-    const int b_row0 = warp_n * Traits::kWarpN;  // + nt * 8
-    const float scale = *p.scale;
-    float acc[kNt][kMt][4] = {};  // [nt][mt][acc]
+    __device__ Fp8CollectiveMainloop(char* smem, const T8* a, const T8* b,
+                                     int64_t m, int64_t n, int64_t k,
+                                     int64_t a_ld, int64_t b_ld, int tid,
+                                     int2 block)
+        : a_base(reinterpret_cast<T8*>(smem)),
+          b_base(reinterpret_cast<T8*>(smem + kARing * kAStageBytes)),
+          a(a), b(b), m(m), n(n), k(k), a_ld(a_ld), b_ld(b_ld), tid(tid),
+          block_m(block.x), block_n(block.y),
+          warp_m((tid >> 5) / Traits::kWarpsN),
+          warp_n((tid >> 5) % Traits::kWarpsN),
+          a_row0(warp_m * Traits::kWarpM),
+          b_row0(warp_n * Traits::kWarpN),
+          tile_count((k + kK - 1) / kK),
+          fast_cta(kFastLoop && !kDirectA && !kDirectB &&
+                   ((int64_t)block.x * kBlockM + kBlockM <= m) &&
+                   ((int64_t)block.y * kBlockN + kBlockN <= n) &&
+                   ((reinterpret_cast<uintptr_t>(a) | (uint64_t)a_ld) & 15) == 0 &&
+                   ((reinterpret_cast<uintptr_t>(b) | (uint64_t)b_ld) & 15) == 0 &&
+                   (k % kK) == 0) {}
 
-    // Both operands end up in the canonical [M][kK] / [N][kK] shared tiles
-    // the MMA fragments read, regardless of their global layout. A's tag
-    // already names the operand view ([M][K] = [rows][contract]); B's tag is
-    // relative to the canonical [K][N], so the stage-load sees its transpose
-    // (transpose_layout_t, see common.h). Congruous operands cp.async
-    // straight into their rotating canonical buffers; crosswise operands
-    // take load_direct's LDG+PRMT path below.
     // Stage-slot helpers: the rings rotate one slot per k-tile, so callers
     // either compute the slot from the tile index (prologue, generic loop)
     // or carry an advancing pointer (steady-state fast loop below).
-    auto a_stage_of = [&](int64_t tile) -> T8* {
+    __device__ __forceinline__ T8* a_stage_of(int64_t tile) const {
         return a_base + (size_t)(tile % kARing) * kAStageBytes;
-    };
-    auto b_stage_of = [&](int64_t tile) -> T8* {
+    }
+    __device__ __forceinline__ T8* b_stage_of(int64_t tile) const {
         return b_base + (size_t)(tile % kBRing) * kBStageBytes;
-    };
+    }
     // Asynchronous loads for tile `tile`: congruous operands cp.async into
     // their canonical rings. Called after the post-compute barrier, alongside
     // the commit.
-    auto load_async = [&](T8* a_stage, T8* b_stage, int64_t k_base) {
+    __device__ __forceinline__ void load_async(T8* a_stage, T8* b_stage,
+                                               int64_t k_base) const {
         if constexpr (!kDirectA)
             load_operand_tile<T8, kK, kBlockM, kCtaThreads>(
-                a_stage, a, m, k, a_ld, tid, k_base, (int64_t)block_m * kBlockM);
+                a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (!kDirectB)
             load_operand_tile<T8, kK, kBlockN, kCtaThreads>(
-                b_stage, b, n, k, b_ld, tid, k_base,
-                (int64_t)block_n * kBlockN);
-    };
+                b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+    }
     // Predication-free interior variant of load_async: congruous operands
     // with full CTA rows, aligned (base | ld), k_base + kK <= k. fast_cta
     // admits only congruous operands, so no crosswise fallback is needed.
-    auto load_async_fast = [&](T8* a_stage, T8* b_stage, int64_t k_base) {
+    __device__ __forceinline__ void load_async_fast(T8* a_stage, T8* b_stage,
+                                                    int64_t k_base) const {
         if constexpr (!kDirectA)
             load_operand_tile_interior<T8, kK, kBlockM, kCtaThreads>(
-                a_stage, a, a_ld, tid, k_base, (int64_t)block_m * kBlockM);
+                a_stage, a, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (!kDirectB)
             load_operand_tile_interior<T8, kK, kBlockN, kCtaThreads>(
-                b_stage, b, b_ld, tid, k_base, (int64_t)block_n * kBlockN);
-    };
+                b_stage, b, b_ld, tid, k_base, block_n * kBlockN);
+    }
     // Synchronous direct-crosswise loads for tile `tile` into the operand's
     // (kStages+1)-deep canonical ring. In the steady state this runs right
     // after barrier 1, so the LDG latency and the PRMT transpose overlap the
@@ -479,83 +524,15 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // (i-1)%(kStages+1), which compute(i-1) finished reading before the
     // previous barrier and compute(i+kStages) does not touch until several
     // barriers later.
-    auto load_direct = [&](T8* a_stage, T8* b_stage, int64_t k_base) {
+    __device__ __forceinline__ void load_direct(T8* a_stage, T8* b_stage,
+                                                int64_t k_base) const {
         if constexpr (kDirectA)
             load_crosswise_direct<T8, kK, kBlockM, kCtaThreads>(
-                a_stage, a, m, k, a_ld, tid, k_base,
-                (int64_t)block_m * kBlockM);
+                a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (kDirectB)
             load_crosswise_direct<T8, kK, kBlockN, kCtaThreads>(
-                b_stage, b, n, k, b_ld, tid, k_base,
-                (int64_t)block_n * kBlockN);
-    };
-
-    const int64_t tile_count = (k + kK - 1) / kK;
-    // Interior-CTA peel (kFastLoop instantiations only): when both operands
-    // are congruous, whole-CTA, 16B-aligned and K has no tail, the mainloop
-    // runs a compile-time-specialized copy whose loads carry no predication
-    // — the per-chunk guards cost ~6 of ~100 instructions per warp per
-    // k-tile, and the small-CTA path is issue-bound there (measured
-    // +4.5..10% on 256³..1024³; the 128x128 kernel regressed ~3% with the
-    // same change, so only the small CTA opts in). All verdicts are uniform
-    // per CTA: one branch picks the loop copy.
-    const bool fast_cta =
-        kFastLoop && !kDirectA && !kDirectB &&
-        ((int64_t)block_m * kBlockM + kBlockM <= m) &&
-        ((int64_t)block_n * kBlockN + kBlockN <= n) &&
-        ((reinterpret_cast<uintptr_t>(a) | (uint64_t)a_ld) & 15) == 0 &&
-        ((reinterpret_cast<uintptr_t>(b) | (uint64_t)b_ld) & 15) == 0 &&
-        (k % kK) == 0;
-
-    // Per-lane ldmatrix fragment addressing (base-pair scheme, mirrored from
-    // the cuBLAS SASS: one base register per operand per k_seg, every
-    // fragment offset an LDSM immediate — zero address arithmetic inside the
-    // MMA phase). The closure works because the XOR swizzle's source bits
-    // come only from the lane's row-within-matrix (r7): the 8- and 16-row
-    // fragment steps (nt*8, mt*16) never reach them, so
-    //   addr(s, mt) = lane_base + mt*(16*kK)  ^ (s<<5)     [A, x4 fragment]
-    //   addr(s, nt) = lane_base + nt*(8*kK)   ^ (s<<5)     [B, x2 fragment]
-    // where the ^ (s<<5) lands inside the 16B-chunk swizzle field (each k_seg
-    // advances the chunk index by 2 = 32B) and the step lands outside it.
-    //   kChunks=4 (K=64):  swizzle bits = row[2:1] = r7[2:1]
-    //   kChunks=8 (K=128): swizzle bits = row[2:0] = r7[2:0]
-    //   kChunks=2 (K=32):  swizzle bit  = row[2]   = r7[2]  (single k_seg)
-    // Replaces the former a_off[kSegs][kMt]/b_off[kSegs][kNt] runtime tables
-    // (16 registers + one IADD per LDSM): at 131 regs the tables spilled and
-    // ptxas rematerialized every address each k-tile (~55 of 146 hot-loop
-    // instructions were LOP3/IMAD address math; cuBLAS's inner loop has ~0).
-    const int r7 = lane & 7;          // row within the 8-row matrix
-    const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
-    const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31; B uses rh8)
-    constexpr int kChunks = kK / 16;
-    constexpr int kShift = 3 - log2_const<kChunks>::value;  // tile_at's shift
-    const unsigned lswz =
-        static_cast<unsigned>((r7 >> kShift) & (kChunks - 1));
-    constexpr unsigned kMtStep = 16 * kK;  // bytes per m-tile row step
-    constexpr unsigned kNtStep = 8 * kK;   // bytes per n-tile row step
-    constexpr unsigned kSegXor = 32;       // chunk-index +2 per k_seg
-    // Stage-relative, loop-invariant per-lane bases (added to each ring
-    // slot's converted base once per k-tile). A's fragment row carries the
-    // +8-row half (rh8) and the +1-chunk half (rh16); B's carries rh8 as its
-    // chunk half — matching the m16n8k32 operand layouts above.
-    const unsigned a_lane_off = static_cast<unsigned>(
-        (a_row0 + rh8 * 8 + r7) * kK + ((rh16 ^ lswz) << 4));
-    const unsigned b_lane_off =
-        static_cast<unsigned>((b_row0 + r7) * kK + ((rh8 ^ lswz) << 4));
-    // x4-paired B loads (cuBLAS/CUTLASS loop shape): one ldmatrix.x4 feeds
-    // the two adjacent nt fragments — 2 x4 instead of 4 x2 per k_seg (12
-    // LDSM per k-tile instead of 16). Lane contract: lanes 0-7 address
-    // rows n0..n7 chunk c, lanes 8-15 rows n0..n7 chunk c+1, lanes 16-23
-    // rows n8..n15 chunk c, lanes 24-31 rows n8..n15 chunk c+1; regs
-    // {r0,r1} are the even nt's k-halves, {r2,r3} the odd nt's. The +8-row
-    // step never reaches the swizzle source bits for kK <= 64 (kChunks<=4:
-    // bits row[2:1]), so lanes 16-31 reuse the same lswz and each pair
-    // address is the even-nt base + p*(16*kK). kK=128 swizzles on row[2:0]
-    // where +8 flips bits — that config keeps the x2 loads.
-    constexpr bool kPairB = kK / 16 <= 4;
-    static_assert(!kPairB || kNt % 2 == 0, "B pairing needs even kNt");
-    constexpr unsigned kPairStep = 16 * kK;  // bytes per nt-pair row step
-    const unsigned b4_lane_off = b_lane_off + rh16 * kPairStep / 2;
+                b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+    }
 
     // Prime the pipeline. Each committed group occupies one circular shared
     // memory stage. The commit is unconditional: when K is shorter than the
@@ -566,49 +543,39 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // instructions per k-tile: ISETP/SEL chains picking DEPBAR immediates).
     // Direct loads run synchronously here (back to back with their commit);
     // the steady state below overlaps them with the compute phase.
+    __device__ __forceinline__ void prologue() const {
 #pragma unroll
-    for (int stage = 0; stage < kStages; ++stage) {
-        if (stage < tile_count) {
-            if (fast_cta)
-                load_async_fast(a_stage_of(stage), b_stage_of(stage),
-                                (int64_t)stage * kK);
-            else
-                load_async(a_stage_of(stage), b_stage_of(stage),
-                           (int64_t)stage * kK);
-            load_direct(a_stage_of(stage), b_stage_of(stage),
-                        (int64_t)stage * kK);
+        for (int stage = 0; stage < kStages; ++stage) {
+            if (stage < tile_count) {
+                if (fast_cta)
+                    load_async_fast(a_stage_of(stage), b_stage_of(stage),
+                                    (int64_t)stage * kK);
+                else
+                    load_async(a_stage_of(stage), b_stage_of(stage),
+                               (int64_t)stage * kK);
+                load_direct(a_stage_of(stage), b_stage_of(stage),
+                            (int64_t)stage * kK);
+            }
+            astrai::cp_async_commit_group();
         }
-        astrai::cp_async_commit_group();
     }
 
-    // Steady-state read carries: the LDSM base of the current k-tile's
-    // stage with the lane offset folded in, advanced one stage per
-    // iteration with an equality wrap (the add sequence is exact). This
-    // replaces the per-k-tile (tile % ring) * stage_bytes recomputation —
-    // its SASS form was a UIMAD.WIDE magic-division ladder, ~10
-    // uniform-pipe instructions per operand per k-tile (perf 6.2).
-    const unsigned a_rd0 = __cvta_generic_to_shared(a_base) + a_lane_off;
-    const unsigned b_rd0 = __cvta_generic_to_shared(b_base) +
-                           (kPairB ? b4_lane_off : b_lane_off);
-    const unsigned a_rd_end = a_rd0 + (unsigned)(kARing * kAStageBytes);
-    const unsigned b_rd_end = b_rd0 + (unsigned)(kBRing * kBStageBytes);
-    unsigned a_rd = a_rd0, b_rd = b_rd0;
-
-    // Mainloop, compile-time specialized on fast_cta: the fast copy runs
-    // predication-free loads; the generic copy keeps full predication.
-    // kFastLoop=false instantiates only the generic copy — codegen identical
-    // to the pre-peel kernel.
-    auto mainloop = [&](auto fastc) {
-        constexpr bool kFast = decltype(fastc)::value;
+    // Steady-state mainloop, compile-time specialized on fast_cta: the fast
+    // copy runs predication-free loads; the generic copy keeps full
+    // predication. kFastLoop=false instantiates only the generic copy —
+    // codegen identical to the pre-peel kernel.
+    template <bool kFast>
+    __device__ __forceinline__ void run_loop(float acc[kNt][kMt][4]) const {
+        const int lane = tid & 31;
         // Fast-path write carries: one per congruous operand (see
         // PrefetchCarry; crosswise operands get the empty no-op type).
         // Construction targets the first prefetched tile (kStages).
         PrefetchCarry<!kDirectA, T8, kK, kBlockM, kCtaThreads> carry_a(
-            a_base, kARing, kAStageBytes, a, a_ld, (int64_t)block_m * kBlockM,
-            tid, kStages);
+            a_base, kARing, kAStageBytes, a, a_ld, block_m * kBlockM, tid,
+            kStages);
         PrefetchCarry<!kDirectB, T8, kK, kBlockN, kCtaThreads> carry_b(
-            b_base, kBRing, kBStageBytes, b, b_ld, (int64_t)block_n * kBlockN,
-            tid, kStages);
+            b_base, kBRing, kBStageBytes, b, b_ld, block_n * kBlockN, tid,
+            kStages);
         // Interleaved prefetch (cuBLAS/CUTLASS loop shape): the next tile's
         // LDGSTS chunks ride inside the MMA phase so their issue slots fill
         // the tensor-pipe gaps ptxas otherwise pads with NOPs (23 NOPs per
@@ -616,6 +583,19 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         // ring's write slot is the one compute(i) is reading (barrier 4
         // orders the end-of-loop prefetch), so it keeps that placement.
         constexpr bool kInterleave = kFast && !kLeanRing;
+        // Steady-state read carries: the LDSM base of the current k-tile's
+        // stage with the lane offset folded in, advanced one stage per
+        // iteration with an equality wrap (the add sequence is exact). This
+        // replaces the per-k-tile (tile % ring) * stage_bytes recomputation —
+        // its SASS form was a UIMAD.WIDE magic-division ladder, ~10
+        // uniform-pipe instructions per operand per k-tile (perf 6.2).
+        const unsigned a_rd0 = __cvta_generic_to_shared(a_base) + a_lane_off(lane);
+        const unsigned b_rd0 =
+            __cvta_generic_to_shared(b_base) +
+            (kPairB ? b4_lane_off(lane) : b_lane_off(lane));
+        const unsigned a_rd_end = a_rd0 + (unsigned)(kARing * kAStageBytes);
+        const unsigned b_rd_end = b_rd0 + (unsigned)(kBRing * kBStageBytes);
+        unsigned a_rd = a_rd0, b_rd = b_rd0;
         for (int64_t tile_index = 0; tile_index < tile_count; ++tile_index) {
         // In the steady state exactly kStages-1 younger groups are in flight
         // when this fires; the tail's unconditional (possibly empty) commits
@@ -650,7 +630,7 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
         // per MMA in the 128x64-tile version (the kernel was LSU-issue-bound
         // there). B fragments double-buffer across k_segs. kPairB folds the
         // two adjacent nt fragments of one pair into a single x4 (see
-        // b4_lane_off above): kNt/2 x4 loads, regs {r0,r1}/{r2,r3} feeding
+        // b4_lane_off): kNt/2 x4 loads, regs {r0,r1}/{r2,r3} feeding
         // the even/odd nt MMAs respectively.
         unsigned b_frag[2][kNt][2];
         unsigned b_frag4[2][kNt / 2][4];
@@ -750,32 +730,135 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
             carry_b.advance(kBStageBytes);
         }
         }
-    };  // mainloop
-    // NOTE: a cross-k-tile fragment pipeline (kAheadFrag — head-load the
-    // current tile's tail-seg fragments, tail-preload the next tile's
-    // seg-0 behind a tightened wait(kStages-2), mirroring cuBLAS's third
-    // SASS mechanism) was implemented and measured here: correct, but
-    // neutral-to-negative on L20 (-7% at 512³'s sub-wave grid, noise
-    // elsewhere). The shallower effective pipeline (kStages-1 groups in
-    // flight) costs what the LDSM spreading saves at these tile counts,
-    // and ptxas loses its within-iteration software pipelining across the
-    // iteration-boundary register handoff. Removed; see
-    // perf/fp8_gemm_optimization.md's reverted-experiments table.
-    if constexpr (kFastLoop) {
-        if (fast_cta)
-            mainloop(std::true_type{});
-        else
-            mainloop(std::false_type{});
-    } else {
-        mainloop(std::false_type{});
     }
-    // Drain the pipeline before the epilogue reclaims the operand rings for
-    // output staging: the loop's last commits (possibly only zero-filling
-    // predicated-off chunks) are nobody's wait target anymore.
-    astrai::cp_async_wait_all();
 
-    // Direct bf16 epilogue through the operand shared memory: the A/B rings
-    // are dead once the mainloop ends, so their space stages the output tile
+    __device__ __forceinline__ void accumulate(float acc[kNt][kMt][4]) const {
+        if constexpr (kFastLoop) {
+            if (fast_cta)
+                run_loop<true>(acc);
+            else
+                run_loop<false>(acc);
+        } else {
+            run_loop<false>(acc);
+        }
+    }
+
+  private:
+    // Per-lane ldmatrix fragment addressing (base-pair scheme, mirrored from
+    // the cuBLAS SASS: one base register per operand per k_seg, every
+    // fragment offset an LDSM immediate — zero address arithmetic inside the
+    // MMA phase). The closure works because the XOR swizzle's source bits
+    // come only from the lane's row-within-matrix (r7): the 8- and 16-row
+    // fragment steps (nt*8, mt*16) never reach them, so
+    //   addr(s, mt) = lane_base + mt*(16*kK)  ^ (s<<5)     [A, x4 fragment]
+    //   addr(s, nt) = lane_base + nt*(8*kK)   ^ (s<<5)     [B, x2 fragment]
+    // where the ^ (s<<5) lands inside the 16B-chunk swizzle field (each k_seg
+    // advances the chunk index by 2 = 32B) and the step lands outside it.
+    //   kChunks=4 (K=64):  swizzle bits = row[2:1] = r7[2:1]
+    //   kChunks=8 (K=128): swizzle bits = row[2:0] = r7[2:0]
+    //   kChunks=2 (K=32):  swizzle bit  = row[2]   = r7[2]  (single k_seg)
+    // Replaces the former a_off[kSegs][kMt]/b_off[kSegs][kNt] runtime tables
+    // (16 registers + one IADD per LDSM): at 131 regs the tables spilled and
+    // ptxas rematerialized every address each k-tile (~55 of 146 hot-loop
+    // instructions were LOP3/IMAD address math; cuBLAS's inner loop has ~0).
+    __device__ __forceinline__ unsigned a_lane_off(int lane) const {
+        const int r7 = lane & 7;          // row within the 8-row matrix
+        const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
+        const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31)
+        constexpr int kChunks = kK / 16;
+        constexpr int kShift = 3 - log2_const<kChunks>::value;  // tile_at's shift
+        const unsigned lswz =
+            static_cast<unsigned>((r7 >> kShift) & (kChunks - 1));
+        // Stage-relative, loop-invariant per-lane base (added to each ring
+        // slot's converted base once per k-tile). A's fragment row carries
+        // the +8-row half (rh8) and the +1-chunk half (rh16) — matching the
+        // m16n8k32 operand layouts above.
+        return static_cast<unsigned>((a_row0 + rh8 * 8 + r7) * kK +
+                                     ((rh16 ^ lswz) << 4));
+    }
+    __device__ __forceinline__ unsigned b_lane_off(int lane) const {
+        const int r7 = lane & 7;
+        const int rh8 = (lane >> 3) & 1;  // +8 rows (B uses rh8 as its chunk half)
+        constexpr int kChunks = kK / 16;
+        constexpr int kShift = 3 - log2_const<kChunks>::value;
+        const unsigned lswz =
+            static_cast<unsigned>((r7 >> kShift) & (kChunks - 1));
+        return static_cast<unsigned>((b_row0 + r7) * kK + ((rh8 ^ lswz) << 4));
+    }
+    // x4-paired B loads (cuBLAS/CUTLASS loop shape): one ldmatrix.x4 feeds
+    // the two adjacent nt fragments — 2 x4 instead of 4 x2 per k_seg (12
+    // LDSM per k-tile instead of 16). Lane contract: lanes 0-7 address
+    // rows n0..n7 chunk c, lanes 8-15 rows n0..n7 chunk c+1, lanes 16-23
+    // rows n8..n15 chunk c, lanes 24-31 rows n8..n15 chunk c+1; regs
+    // {r0,r1} are the even nt's k-halves, {r2,r3} the odd nt's. The +8-row
+    // step never reaches the swizzle source bits for kK <= 64 (kChunks<=4:
+    // bits row[2:1]), so lanes 16-31 reuse the same lswz and each pair
+    // address is the even-nt base + p*(16*kK). kK=128 swizzles on row[2:0]
+    // where +8 flips bits — that config keeps the x2 loads.
+    static constexpr unsigned kMtStep = 16 * kK;  // bytes per m-tile row step
+    static constexpr unsigned kNtStep = 8 * kK;   // bytes per n-tile row step
+    static constexpr unsigned kSegXor = 32;       // chunk-index +2 per k_seg
+    static constexpr bool kPairB = kK / 16 <= 4;
+    static_assert(!kPairB || kNt % 2 == 0, "B pairing needs even kNt");
+    static constexpr unsigned kPairStep = 16 * kK;  // bytes per nt-pair row step
+    __device__ __forceinline__ unsigned b4_lane_off(int lane) const {
+        return b_lane_off(lane) + (lane >> 4) * kPairStep / 2;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Collective epilogue: fused bias, the bf16 scatter of the fp32 accumulators
+// through the reclaimed operand shared memory, and the coalesced copy-out.
+template <typename Policy>
+struct Fp8CollectiveEpilogue {
+    using Traits = typename Policy::Traits;
+    static constexpr bool kStreamOut = Policy::kStreamOut;
+    static constexpr int kBlockM = Traits::kBlockM;
+    static constexpr int kBlockN = Traits::kBlockN;
+    static constexpr int kMt = Traits::kWarpM / 16;
+    static constexpr int kNt = Traits::kWarpN / 8;
+
+    __nv_bfloat16* const tile_out;
+    const float output_scale;
+    const __nv_bfloat16* const bias;
+    const int64_t m, n;
+    const bool t_out;
+    const int row_elems, row_chunks;
+    const int warp_m, warp_n, group, thread_in_group;
+    const int64_t block_m, block_n;
+
+    __device__ Fp8CollectiveEpilogue(char* smem, const FP8Params& p,
+                                     int64_t block_m, int64_t block_n, int tid)
+        : tile_out(reinterpret_cast<__nv_bfloat16*>(smem)),
+          output_scale(*p.scale),
+          bias(reinterpret_cast<const __nv_bfloat16*>(p.bias_ptr)),
+          m(p.m), n(p.n), t_out(p.out_transposed != 0),
+          row_elems(t_out ? kBlockM : kBlockN),
+          row_chunks(row_elems / 8),
+          warp_m((tid >> 5) / Traits::kWarpsN),
+          warp_n((tid >> 5) % Traits::kWarpsN),
+          group((tid & 31) >> 2),
+          thread_in_group(tid & 3),
+          block_m(block_m), block_n(block_n) {}
+
+    // Swizzled address of one 16B chunk (row r, chunk c) of the staged tile.
+    // Plain orientation: D-local, kBlockM rows of kBlockN elems.
+    // Out-transposed (swap dispatch): the tile stages D-local rows over the
+    // swapped problem, so it has kBlockN rows of kBlockM — rows and row
+    // length trade places. Both row-chunk counts are powers of two, keeping
+    // the 16B-chunk XOR swizzle well-defined.
+    __device__ __forceinline__ __nv_bfloat16* out_chunk(int r, int c) const {
+        return tile_out + (size_t)r * row_elems +
+               ((c ^ (r & (row_chunks - 1))) * 8);
+    }
+    // Address of one element of the staged tile.
+    __device__ __forceinline__ __nv_bfloat16* out_elem(int r, int v) const {
+        return out_chunk(r, v >> 3) + (v & 7);
+    }
+
+    // Scatter the accumulators into the staging tile. The direct bf16
+    // epilogue goes through the operand shared memory: the A/B rings are
+    // dead once the mainloop ends, so their space stages the output tile
     // (kBlockM x kBlockN bf16, always <= the ring budget). Threads first
     // scatter their accumulators into the tile (STS.32 of bf16x2 pairs), a
     // barrier makes the tile coherent, then the whole CTA copies it out in
@@ -785,83 +868,172 @@ __global__ void __launch_bounds__(Traits::kCtaThreads,
     // runtime. The 16B-chunk XOR swizzle (chunk index ^ row) keeps both the
     // scatter and the gather conflict-free: a lane quad's chunk and the 8
     // rows of one gather phase map to distinct 4-bank groups.
-    const float output_scale = scale;
-    // Fused bias (idea B): added to the fp32 accumulator before the single
-    // bf16 rounding — one fewer rounding than the out + bias elementwise
-    // pass this replaces, and no extra kernel launch / m*n round-trip. The
-    // per-lane loads (2 per nt, kMt-times re-read) are L1 broadcasts; rows
-    // past the N edge skip the load (their smem slots never copy out).
-    const __nv_bfloat16* bias =
-        reinterpret_cast<const __nv_bfloat16*>(p.bias_ptr);
-    __nv_bfloat16* tile_out = reinterpret_cast<__nv_bfloat16*>(fp8_gemm_smem);
-    constexpr int kRowChunks = kBlockN / 8;  // 16B chunks per tile row
-    static_assert(kBlockM * kBlockN * 2 <=
-                      kARing * kBlockM * kK + kBRing * kBlockN * kK,
-                  "output tile must fit the reclaimed operand smem");
-    // Swizzled address of one 16B chunk (row r, chunk c) of the tile.
-    auto out_chunk = [&](int r, int c) -> __nv_bfloat16* {
-        return tile_out + (size_t)r * kBlockN +
-               ((c ^ (r & (kRowChunks - 1))) * 8);
-    };
-    const int local_col0 = warp_n * Traits::kWarpN + thread_in_group * 2;
-    const int64_t bias_col0 = (int64_t)block_n * kBlockN;
+    __device__ __forceinline__ void stage(float acc[kNt][kMt][4]) const {
+        // Fused bias (idea B): added to the fp32 accumulator before the
+        // single bf16 rounding — one fewer rounding than the out + bias
+        // elementwise pass this replaces, and no extra kernel launch / m*n
+        // round-trip. The per-lane loads (2 per nt, kMt-times re-read) are
+        // L1 broadcasts; rows past the N edge skip the load (their smem
+        // slots never copy out). Under out_transposed the bias indexes
+        // D-cols = the kernel's rows, so one load per r0 broadcasts across
+        // the row's cols instead.
+        const int local_col0 = warp_n * Traits::kWarpN + thread_in_group * 2;
+        const int64_t bias_col0 = block_n * kBlockN;
+        const int64_t bias_row0 = block_m * kBlockM;
+        if (!t_out) {
 #pragma unroll
-    for (int nt = 0; nt < kNt; ++nt) {
-        const int col = local_col0 + nt * 8;
-        const int64_t gcol = bias_col0 + col;
-        const float b0 =
-            bias && gcol < n ? __bfloat162float(bias[gcol]) : 0.0f;
-        const float b1 =
-            bias && gcol + 1 < n ? __bfloat162float(bias[gcol + 1]) : 0.0f;
+            for (int nt = 0; nt < kNt; ++nt) {
+                const int col = local_col0 + nt * 8;
+                const int64_t gcol = bias_col0 + col;
+                const float b0 =
+                    bias && gcol < n ? __bfloat162float(bias[gcol]) : 0.0f;
+                const float b1 =
+                    bias && gcol + 1 < n ? __bfloat162float(bias[gcol + 1])
+                                         : 0.0f;
 #pragma unroll
-        for (int mt = 0; mt < kMt; ++mt) {
-            const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
-            const float* tile_acc = acc[nt][mt];
-            // Two bf16x2 stores per accumulator tile: rows g and g+8 of the
-            // m16n8 output, columns tig*2 and tig*2+1 inside one 16B chunk.
-            const int off = col & 7;  // element offset within the chunk
-            *reinterpret_cast<__nv_bfloat162*>(out_chunk(r0, col >> 3) + off) =
-                __floats2bfloat162_rn(tile_acc[0] * output_scale + b0,
-                                      tile_acc[1] * output_scale + b1);
-            *reinterpret_cast<__nv_bfloat162*>(out_chunk(r0 + 8, col >> 3) +
-                                               off) =
-                __floats2bfloat162_rn(tile_acc[2] * output_scale + b0,
-                                      tile_acc[3] * output_scale + b1);
-        }
-    }
-    __syncthreads();
-    // Coalesced copy-out: thread -> one 16B chunk; consecutive threads walk
-    // a row so each global transaction covers a full 128B line.
-    const int64_t row0_global = (int64_t)block_m * kBlockM;
-    const int64_t col0_global = (int64_t)block_n * kBlockN;
-    constexpr int kTotalChunks = kBlockM * kRowChunks;
-    for (int idx = tid; idx < kTotalChunks; idx += kCtaThreads) {
-        const int r = idx / kRowChunks;
-        const int c = idx % kRowChunks;
-        const int64_t row = row0_global + r;
-        if (row >= m) break;  // rows are consecutive: nothing left in range
-        const int64_t col = col0_global + (int64_t)c * 8;
-        const uint4 v = *reinterpret_cast<const uint4*>(out_chunk(r, c));
-        auto* dst = out_bf16 + row * n + col;
-        if (col + 8 <= n && (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
-            if constexpr (kStreamOut) {
-                // Evict-first streaming store knob. Measured neutral on
-                // L20 squares and -3..4% on rects (the evict-first policy
-                // hurts more than the L2 B-tile protection helps at these
-                // sizes); kept as a template knob for other SKUs. Default
-                // off.
-                __stcs(reinterpret_cast<uint4*>(dst), v);
-            } else {
-                *reinterpret_cast<uint4*>(dst) = v;
+                for (int mt = 0; mt < kMt; ++mt) {
+                    const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
+                    const float* tile_acc = acc[nt][mt];
+                    // Two bf16x2 stores per accumulator tile: rows g and
+                    // g+8 of the m16n8 output, columns tig*2 and tig*2+1
+                    // inside one 16B chunk.
+                    const int off = col & 7;  // element offset in the chunk
+                    *reinterpret_cast<__nv_bfloat162*>(
+                        out_chunk(r0, col >> 3) + off) =
+                        __floats2bfloat162_rn(tile_acc[0] * output_scale + b0,
+                                              tile_acc[1] * output_scale + b1);
+                    *reinterpret_cast<__nv_bfloat162*>(
+                        out_chunk(r0 + 8, col >> 3) + off) =
+                        __floats2bfloat162_rn(tile_acc[2] * output_scale + b0,
+                                              tile_acc[3] * output_scale + b1);
+                }
             }
         } else {
-            // N-tail chunk or an odd-n row base: spill the elements that
-            // survive the row edge (and stay aligned).
-            const __nv_bfloat16* elems =
-                reinterpret_cast<const __nv_bfloat16*>(&v);
-            for (int e = 0; e < 8 && col + e < n; ++e) dst[e] = elems[e];
+            // Transposed scatter: accumulator (kernel row r0, col) is
+            // D[col0_global + col][row0_global + r0], staged at T[col][r0].
+            // The acc pair spans two staged rows, so these are scalar stores
+            // (4 per (nt, mt) vs the packed bf16x2 pair — the swap path is
+            // the rare NN layout); the row swizzle keeps the quad's stores
+            // bank-spread. OOB elements store dead lanes of the tile, never
+            // copied out.
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                const int col = local_col0 + nt * 8;
+#pragma unroll
+                for (int mt = 0; mt < kMt; ++mt) {
+                    const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
+                    const int64_t grow = bias_row0 + r0;
+                    const float b =
+                        bias && grow < m ? __bfloat162float(bias[grow]) : 0.0f;
+                    const float* tile_acc = acc[nt][mt];
+                    *out_elem(col, r0) =
+                        __float2bfloat16(tile_acc[0] * output_scale + b);
+                    *out_elem(col + 1, r0) =
+                        __float2bfloat16(tile_acc[1] * output_scale + b);
+                    *out_elem(col, r0 + 8) =
+                        __float2bfloat16(tile_acc[2] * output_scale + b);
+                    *out_elem(col + 1, r0 + 8) =
+                        __float2bfloat16(tile_acc[3] * output_scale + b);
+                }
+            }
         }
     }
+
+    // Coalesced copy-out: thread -> one 16B chunk; consecutive threads walk
+    // a row so each global transaction covers a full 128B line. Under the
+    // swap the staged rows are D-rows counted from block_n's stripe while
+    // the row length is kernel m', so row/stride flip to the swapped dims
+    // (D[row][col] = out[row * p.m + col]).
+    __device__ __forceinline__ void store(__nv_bfloat16* out_bf16) const {
+        constexpr int kTotalChunks =
+            kBlockM * (kBlockN / 8);  // == kBlockN * (kBlockM/8)
+        const int64_t row0_global = block_m * kBlockM;
+        const int64_t col0_global = block_n * kBlockN;
+        for (int idx = threadIdx.x; idx < kTotalChunks; idx += kCtaThreads) {
+            const int r = idx / row_chunks;
+            const int c = idx % row_chunks;
+            const uint4 v = *reinterpret_cast<const uint4*>(out_chunk(r, c));
+            const int64_t row = t_out ? (int64_t)block_n * kBlockN + r
+                                      : row0_global + r;
+            const int64_t col = t_out ? row0_global + (int64_t)c * 8
+                                      : col0_global + (int64_t)c * 8;
+            const int64_t rows_total = t_out ? n : m;
+            const int64_t row_stride = t_out ? m : n;
+            if (row >= rows_total) break;  // rows are consecutive: nothing left
+            auto* dst = out_bf16 + row * row_stride + col;
+            if (col + 8 <= row_stride &&
+                (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
+                if constexpr (kStreamOut) {
+                    // Evict-first streaming store knob. Measured neutral on
+                    // L20 squares and -3..4% on rects (the evict-first
+                    // policy hurts more than the L2 B-tile protection helps
+                    // at these sizes); kept as a template knob for other
+                    // SKUs. Default off.
+                    __stcs(reinterpret_cast<uint4*>(dst), v);
+                } else {
+                    *reinterpret_cast<uint4*>(dst) = v;
+                }
+            } else {
+                // Row-edge chunk or an odd-stride row base: spill the
+                // elements that survive the row edge (and stay aligned).
+                const __nv_bfloat16* elems =
+                    reinterpret_cast<const __nv_bfloat16*>(&v);
+                for (int e = 0; e < 8 && col + e < row_stride; ++e)
+                    dst[e] = elems[e];
+            }
+        }
+    }
+
+    __device__ __forceinline__ void run(float acc[kNt][kMt][4],
+                                        __nv_bfloat16* out_bf16) {
+        stage(acc);
+        __syncthreads();
+        store(out_bf16);
+    }
+
+  private:
+    static constexpr int kCtaThreads = Traits::kCtaThreads;
+};
+
+template <typename Policy>
+__global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
+    fp8_gemm_kernel(FP8Params p) {
+    using Traits = typename Policy::Traits;
+    using Mainloop = Fp8CollectiveMainloop<Policy>;
+    using Epilogue = Fp8CollectiveEpilogue<Policy>;
+    // Tiles are flat [rows * kK] with a 16B-chunk XOR swizzle (tile_at):
+    // ldmatrix reads whole 16B chunks through the same mapping the staging
+    // writes, and the swizzle removes the bank conflict the unswizzled
+    // 8-word row stride caused (see tile_at). The stages live in dynamic
+    // shared memory so deep pipelines (kStages * (kBlockM + kBlockN) * kK >
+    // 48KB static limit) opt in via cudaFuncSetAttribute in the launcher.
+    extern __shared__ __align__(16) char fp8_gemm_smem[];
+
+    // Batch slice (grid.z): broadcast operands carry a 0 stride, so the
+    // same pointer serves every batch.
+    using T8 = typename Mainloop::T8;
+    const T8* a = reinterpret_cast<const T8*>(p.a_ptr) +
+                  (int64_t)blockIdx.z * p.a_batch_stride;
+    const T8* b = reinterpret_cast<const T8*>(p.b_ptr) +
+                  (int64_t)blockIdx.z * p.b_batch_stride;
+    auto* out_bf16 = reinterpret_cast<__nv_bfloat16*>(p.out_ptr) +
+                     (int64_t)blockIdx.z * p.out_batch_stride;
+
+    static_assert(Mainloop::kBlockM * Mainloop::kBlockN * 2 <=
+                      Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK +
+                          Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK,
+                  "output tile must fit the reclaimed operand smem");
+    const int2 bn = Fp8GemmTileScheduler<Policy::kGroupRaster>::tile(blockIdx, gridDim);
+    Mainloop mainloop(fp8_gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
+                      threadIdx.x, bn);
+    float acc[Mainloop::kNt][Mainloop::kMt][4] = {};  // [nt][mt][acc]
+    mainloop.prologue();
+    mainloop.accumulate(acc);
+    // Drain the pipeline before the epilogue reclaims the operand rings for
+    // output staging: the loop's last commits (possibly only zero-filling
+    // predicated-off chunks) are nobody's wait target anymore.
+    astrai::cp_async_wait_all();
+    Epilogue(fp8_gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out_bf16);
 }
 
 // ---------------------------------------------------------------------------
@@ -894,17 +1066,19 @@ inline int device_sm_count() {
 // instantiation via cudaFuncSetAttribute (see AGENTS.md "dynamic shared
 // memory"). Templated on the kernel *value* (auto NTTP) so every
 // instantiation owns its own armed flag — same-signature kernels must not
-// share it (the attribute is per-function).
+// share it (the attribute is per-function). A failed opt-in arms nothing, so
+// the launch below fails loudly through the caller's error checks instead of
+// silently running with an undersized stage buffer.
 template <auto Kernel, typename... Args>
 void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
                       cudaStream_t stream, Args... args) {
     if (smem_bytes > 48 * 1024) {
         static bool armed = false;  // per instantiation
         if (!armed) {
-            cudaFuncSetAttribute(Kernel, 
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 smem_bytes);
-            armed = true;
+            const cudaError_t err = cudaFuncSetAttribute(
+                Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes);
+            armed = (err == cudaSuccess);
         }
     }
     Kernel<<<grid, block, smem_bytes, stream>>>(args...);
@@ -915,108 +1089,171 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
 // count per K and doubles the MMA work per stage at more smem per stage).
 // Stages is the cp.async pipeline depth (smem = Stages * (BM + BN) * kK
 // bytes for congruous layouts; deep pipelines are dynamic-smem backed, 1
-// CTA/SM past 48KB). GroupRaster defaults to the historically-measured best
-// per LayoutA (grouped for A-crosswise, plain for A-congruous).
+// CTA/SM past 48KB).
 // Crosswise operands always take load_crosswise_direct — the alternative
 // staging+transpose pipeline measured 15-20% slower everywhere probed
 // (contract k 2048..32768, DRAM-streaming B included) and was removed.
 
-// Shape-based tile dispatch (grid-searched on the production shapes, see
-// perf/fp8_sweep.cu): small outputs take 64x64 CTAs of 32x32 warps
-// with a lean (kStages-deep) ring: 24KB of smem keeps 4 CTAs resident, and
-// the extra blocks fill the wave quantization gap (512^3: 64 vs 16 CTAs).
-// The large-output path takes the 128x128 CTA (8 warps x 64x32) with the
-// kStages+1 ring — one __syncthreads per k-tile and ~200 TF at scale.
-// The threshold applies to the TOTAL tile count (batch x per-matrix tiles):
-// batched runs keep full per-matrix CTA efficiency once the aggregate grid
-// saturates the device (measured 64x512^3: big 160 vs small 123 TF — a
-// per-matrix-only threshold lost 30%). m <= 64 always takes the small CTA:
-// a 128-row CTA would waste half its MMA work on predicated-off rows.
-//
-// Wave-quantization makes the crossover non-monotonic (92-SM L20, cubes,
-// congruous NT): the 128x128 CTA wins inside one full wave (81 tiles: big
-// +24%) and from ~1.5 waves up (144: +23%, 256: +39%, 2048^3 123->171 TF),
-// but loses inside the quantization dip just past one wave (100 tiles =
-// 1.09 waves) — with the OLD loop, whose big CTA stalled on the tail wave's
-// exposed pipeline drain. The interleaved-prefetch loop (perf 6.2) removed
-// that stall, and the trade flipped across the whole measured band: 1280^3
-// (1.09 waves) big 163T vs small 100T, 4096x512x4096 (1.4 waves) big 139T
-// vs small 113T. The small CTA now only serves the genuinely sub-wave band
-// below 5/8 of a wave, the narrow-M/N edge, and the divisibility rule below.
-inline bool prefer_small_cta(int64_t tiles_128, int64_t m, int64_t n) {
+// Padding-driven small-CTA rule. m <= 64 (and n <= 64 symmetric): a 128-row
+// CTA would waste half its MMA work on predicated-off rows. Divisibility:
+// a 128x128 CTA that is NOT exactly tiled (m or n not a multiple of 128)
+// runs its edge tiles on the predicated generic path, and with a single
+// in-flight wave the runtime is the slowest CTA — the edge tiles drag the
+// whole shape down (1088^3: 76T vs 93T with the 64x64 CTA, whose grid tiles
+// exactly and overlaps waves; measured sweep, perf 5.1). When 64 divides
+// both dims, the 64x64 small CTA wins the non-128-divisible band by
+// 23..67%.
+inline bool small_cta_padding(int64_t m, int64_t n) {
     if (m <= 64 || n <= 64) return true;
     const bool big_div = (m % 128 == 0) && (n % 128 == 0);
     const bool small_div = (m % 64 == 0) && (n % 64 == 0);
-    // Divisibility: a 128x128 CTA that is NOT exactly tiled (m or n not a
-    // multiple of 128) runs its edge tiles on the predicated generic path,
-    // and with a single in-flight wave the runtime is the slowest CTA — the
-    // edge tiles drag the whole shape down (1088^3: 76T vs 93T with the
-    // 64x64 CTA, whose grid tiles exactly and overlaps waves; measured
-    // sweep, perf 5.1). When 64 divides both dims, the 64x64 small CTA
-    // wins the non-128-divisible band by 23..67%.
-    if (!big_div && small_div) return true;
-    return tiles_128 < device_sm_count() * 5 / 8;
+    return !big_div && small_div;
 }
 
-template <FP8Format Fmt, typename LayoutA = RowMajor,
-          typename LayoutB = RowMajor, int kK = 64, int Stages = 2,
-          int GroupRaster = (std::is_same_v<LayoutA, ColMajor> ||
-                             std::is_same_v<LayoutB, ColMajor>)
-                                ? 8
-                                : 0>
-void launch_fp8_gemm(const FP8Params& p, cudaStream_t stream) {
-    // m <= 64 and small total outputs share the 64x64 small CTA (with the
-    // predication-free interior loop); the predicate counts batch x
-    // per-matrix tiles (see prefer_small_cta).
+// Launch configuration — a pure function of the problem (unit-testable
+// without a GPU call; the measured crossover rules live in
+// prefer_small_cta's comment).
+struct Fp8GemmPlan {
+    enum class Cta { kSmall64, kNarrow128x64, kBig128 };
+    Cta cta;
+    bool small_s3;  // kSmall64 only: cp.async pipeline depth (2 vs 3 stages)
+    bool grouped;   // grouped raster order; else plain N-fastest
+};
+
+inline Fp8GemmPlan plan_gemm(const FP8Params& p, bool grouped) {
+    const int64_t sm = device_sm_count();
     const int64_t tiles_128 =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
-    if (prefer_small_cta(tiles_128, p.m, p.n)) {
-        dim3 grid((p.n + 63) / 64, (p.m + 63) / 64, p.batch);
-        // Full-ring small CTAs — ONE __syncthreads per k-tile, cuBLAS's
-        // barrier structure (the lean ring traded a second barrier for a
-        // 4th resident CTA and measured slower: the barrier costs more
-        // than the residency buys, e.g. 1280³ +5..9%). Two depths by grid
-        // shape: the 24KB 3-slot s2 variant keeps 4 CTAs/SM while the
-        // whole grid stays resident (<= one 3-CTA wave); past that the
-        // 32KB s3 variant's deeper cp.async pipeline wins on multi-wave
-        // grids (measured 1280³: 107T vs 98T; sub-wave grids tie within
-        // +-1%). kFastLoop stays on: the predication-free interior load
-        // is where the small CTA's issue budget goes.
-        const int64_t tiles_64 =
-            (int64_t)p.batch * ((p.m + 63) / 64) * ((p.n + 63) / 64);
-        if (tiles_64 <= (int64_t)device_sm_count() * 3) {
-            using Traits = Fp8GemmTraits<Fmt, 64, 64, kK, 2, 32, 32>;
-            launch_with_smem<
-                fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false,
-                                false, true>>(
-                Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
-                dim3(Traits::kCtaThreads), stream, p);
-        } else {
-            using Traits = Fp8GemmTraits<Fmt, 64, 64, kK, 3, 32, 32>;
-            launch_with_smem<
-                fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false,
-                                false, true>>(
-                Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
-                dim3(Traits::kCtaThreads), stream, p);
-        }
-        return;
-    }
-    using Traits = Fp8GemmTraits<Fmt, 128, 128, kK, Stages>;
-    dim3 grid((p.n + 127) / 128, (p.m + 127) / 128, p.batch);
-    // Interior-loop specialization on the big CTA as well: with the base-pair
-    // fragment addressing the doubled mainloop no longer spills, and the
-    // predication-free loads win across the band (measured, L20: 1024^3
-    // 98->103T, 2048^3 172->177T, 8192^3 201->205T, 896x1280 124->135T; the
-    // pre-base-pair attempt regressed ~3% at 131 regs). Only congruous
-    // layouts can enter fast_cta, so crosswise (TN) instantiations keep the
-    // single generic body — no dead second loop in their I-cache.
+    const auto small = [&](bool s3) {
+        return Fp8GemmPlan{Fp8GemmPlan::Cta::kSmall64, s3, grouped};
+    };
+    // Padding rules first: predication waste beats any wave-fill effect.
+    if (small_cta_padding(p.m, p.n)) return small(false);
+    // Past the sub-wave band the 128x128 CTA wins on operand reuse (each A
+    // element multiplies 128 B columns in-CTA) and per-CTA pipeline depth:
+    // forcing the 64x64 CTA there measured 2048^3 123->171 TF on L20 and
+    // 164 vs 308T on sm_120.
+    if (tiles_128 >= sm * 5 / 8)
+        return Fp8GemmPlan{Fp8GemmPlan::Cta::kBig128, false, grouped};
+    // Sub-wave band: the 128x64 narrow CTA (8 warps of 32x32) fills the
+    // wave with N-tiles at full warp depth — measured sm_120, it beats the
+    // small CTA by +7..77% across the band once the narrow grid passes ~3/8
+    // of a wave (128x4096 132 vs 123T, 1024^3 174 vs 131T, 4096x384 242 vs
+    // 147T, 8192x128 233 vs 131T); below that fill the plain 64x64 CTA's
+    // extra parallelism wins (2048x128: small 99 vs 87T).
+    const int64_t tiles_narrow =
+        (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 63) / 64);
+    if (tiles_narrow >= sm * 3 / 8)
+        return Fp8GemmPlan{Fp8GemmPlan::Cta::kNarrow128x64, false, grouped};
+    // Full-ring small CTAs — ONE __syncthreads per k-tile, cuBLAS's barrier
+    // structure. Two depths by grid shape: the 24KB 3-slot s2 variant keeps
+    // 4 CTAs/SM while the whole grid stays resident (<= one 3-CTA wave);
+    // past that the 32KB s3 variant's deeper cp.async pipeline wins on
+    // multi-wave grids (measured 1280³: 107T vs 98T; sub-wave grids tie
+    // within +-1%).
+    const int64_t tiles_64 =
+        (int64_t)p.batch * ((p.m + 63) / 64) * ((p.n + 63) / 64);
+    return small(tiles_64 > sm * 3);
+}
+
+// Grid + launch for one concrete Policy — the only place a GEMM kernel
+// goes to the wire.
+template <typename Policy>
+void launch_policy(const FP8Params& p, cudaStream_t stream) {
+    using Traits = typename Policy::Traits;
+    constexpr int kBM = Traits::kBlockM;
+    constexpr int kBN = Traits::kBlockN;
+    dim3 grid((p.n + kBN - 1) / kBN, (p.m + kBM - 1) / kBM, p.batch);
+    launch_with_smem<fp8_gemm_kernel<Policy>>(
+        Fp8GemmSmem<typename Policy::Traits, typename Policy::LayoutTagA,
+                    typename Policy::LayoutTagB, Policy::kLeanRing>::kBytes,
+        grid, dim3(Traits::kCtaThreads), stream, p);
+}
+
+// Plan -> Policy: the production-tuned configs. Big CTA: 128x128 of 8 warps
+// x 64x32, kK=64, 2-stage full ring, interior fast loop only for
+// dual-congruous layouts (crosswise instantiations keep the single generic
+// body — no dead second loop in their I-cache). Small CTA: 64x64 of 4 warps
+// x 32x32, kK=64, kFastLoop always on (the predication-free interior load
+// is where the small CTA's issue budget goes). Full rings everywhere: the
+// lean ring traded a second barrier for a 4th resident CTA and measured
+// slower (1280³ +5..9%).
+template <FP8Format Fmt, typename LayoutA, typename LayoutB, int GroupRaster>
+void launch_plan(const FP8Params& p, const Fp8GemmPlan& plan,
+                 cudaStream_t stream) {
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
-    launch_with_smem<
-        fp8_gemm_kernel<Traits, LayoutA, LayoutB, GroupRaster, false, false,
-                        kBigFast>>(
-        Fp8GemmSmem<Traits, LayoutA, LayoutB, false>::kBytes, grid,
-        dim3(Traits::kCtaThreads), stream, p);
+    switch (plan.cta) {
+    case Fp8GemmPlan::Cta::kBig128: {
+        using Policy =
+            Fp8GemmPolicy<Fmt, 128, 128, LayoutA, LayoutB, 64, 32, 64, 2,
+                          GroupRaster, false, false, kBigFast>;
+        launch_policy<Policy>(p, stream);
+        break;
+    }
+    case Fp8GemmPlan::Cta::kNarrow128x64: {
+        using Policy =
+            Fp8GemmPolicy<Fmt, 128, 64, LayoutA, LayoutB, 32, 32, 64, 2,
+                          GroupRaster, false, false, true>;
+        launch_policy<Policy>(p, stream);
+        break;
+    }
+    case Fp8GemmPlan::Cta::kSmall64: {
+        if (plan.small_s3) {
+            using Policy = Fp8GemmPolicy<Fmt, 64, 64, LayoutA, LayoutB, 32, 32,
+                                         64, 3, GroupRaster, false, false, true>;
+            launch_policy<Policy>(p, stream);
+        } else {
+            using Policy = Fp8GemmPolicy<Fmt, 64, 64, LayoutA, LayoutB, 32, 32,
+                                         64, 2, GroupRaster, false, false, true>;
+            launch_policy<Policy>(p, stream);
+        }
+        break;
+    }
+    }
+}
+
+// Pure problem rewrite: the dual-N-contiguous problem — trans_a/trans_b
+// both false — has no dedicated instantiation. It runs as its transpose
+// E[N][M] = B^T @ A^T (CUTLASS-sm90's is_swapAB): new A = B^T is
+// M'-contiguous (crosswise load), new B = A^T is K-contiguous (congruous
+// load), and p.out_transposed makes the epilogue scatter into the caller's
+// [M][N] row-major buffer. The rewritten trans flags become the layout tags
+// the launcher instantiates. One instantiation fewer per (format,
+// tile-config); the NN path pays a scalar-store scatter, which its rare
+// usage (no LLM-linear operand pair is dual-N-contiguous) makes the right
+// trade.
+inline void canonicalize_gemm(FP8Params& p, bool& trans_a, bool& trans_b) {
+    if (!trans_a && !trans_b) {
+        FP8Params s = p;  // E = B^T * A^T: swap roles, M <-> N
+        s.m = p.n;
+        s.n = p.m;
+        s.a_ptr = p.b_ptr;
+        s.b_ptr = p.a_ptr;
+        s.a_ld = p.b_ld;
+        s.b_ld = p.a_ld;
+        s.a_batch_stride = p.b_batch_stride;
+        s.b_batch_stride = p.a_batch_stride;
+        s.out_transposed = 1;
+        p = s;
+        trans_a = trans_b = true;
+    }
+}
+
+// Entry point: canonicalize the problem, plan the launch, wire the layout
+// tags through. (Every reachable tag combination is grouped-raster: the
+// plain-raster knob stays available through launch_plan for experiments.)
+template <FP8Format Fmt>
+void gemm(FP8Params p, cudaStream_t stream, bool trans_a, bool trans_b) {
+    canonicalize_gemm(p, trans_a, trans_b);
+    const bool grouped = trans_a || trans_b;
+    const Fp8GemmPlan plan = plan_gemm(p, grouped);
+    if (trans_a && trans_b)
+        launch_plan<Fmt, ColMajor, ColMajor, 8>(p, plan, stream);
+    else if (trans_b)
+        launch_plan<Fmt, RowMajor, ColMajor, 8>(p, plan, stream);
+    else
+        launch_plan<Fmt, ColMajor, RowMajor, 8>(p, plan, stream);
 }
 
 }  // namespace fp8

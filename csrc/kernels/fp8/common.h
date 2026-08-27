@@ -29,23 +29,6 @@ enum class FP8Format : int {
 struct RowMajor {};
 struct ColMajor {};
 
-// Transpose of a layout tag: the same buffer with the rows and contract dims
-// swapped. B's tag is relative to the canonical [K][N] GEMM matrix, so the
-// stage-load (which views any operand as [rows][contract]) sees the transposed
-// tag — this trait makes that inversion explicit.
-template <typename Layout>
-struct transpose_layout;
-template <>
-struct transpose_layout<RowMajor> {
-    using type = ColMajor;
-};
-template <>
-struct transpose_layout<ColMajor> {
-    using type = RowMajor;
-};
-template <typename Layout>
-using transpose_layout_t = typename transpose_layout<Layout>::type;
-
 // Compile-time tile configuration, mirroring KernelTraits<HEAD_DIM, BC,
 // WARPS, STAGES> in the attention kernels. `Fmt` selects the FP8 conversion
 // and the MMA PTX mnemonic; the remaining parameters shape the CTA tile, the
@@ -112,6 +95,13 @@ struct FP8Params {
     void* __restrict__ out_ptr = nullptr;
 
     const float* __restrict__ scale = nullptr;
+    // Transposed-output mode (set by dispatch_fp8_gemm's swap for NN
+    // problems): the kernel computes E[N'][M'] over swapped operands and the
+    // epilogue scatters into the caller's [M][N] row-major buffer, so
+    // D[row][col] lives at out[col * p.m + row] — p.m/p.n are the swapped
+    // problem's dims and the D row stride is p.m. Zero in the plain
+    // orientation.
+    int out_transposed = 0;
     // Shapes. `int` covers every realistic LLM shape; the kernels promote
     // to int64 for all pointer arithmetic.
     int m, n, k;
