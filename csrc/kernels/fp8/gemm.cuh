@@ -284,32 +284,25 @@ load_crosswise_direct(T8* tile, const T8* __restrict__ operand, int64_t rows,
     }
 }
 
-// Layout-aware shared-memory budget and occupancy hint. Canonic rings hold
-// kStages+1 buffers (LeanRing=false): the load for tile i+kStages targets
-// slot (i-1)%(kStages+1) — already consumed — so the pure-congruous path
-// needs no post-compute barrier (one __syncthreads per k-tile). LeanRing
-// keeps the ring at kStages buffers for small CTAs whose occupancy comes
-// from more resident CTAs (less smem) rather than a deeper rotation; it
-// brings back barrier 4.
+// Layout-aware shared-memory budget and occupancy hint. Every operand ring
+// holds kStages+1 buffers: the load for tile i+kStages targets slot
+// (i-1)%(kStages+1) — already consumed — so neither the congruous cp.async
+// path nor the direct-crosswise path needs a post-compute barrier (one
+// __syncthreads per k-tile). (A lean kStages-deep ring traded that barrier
+// for a 4th resident CTA and measured slower — 1280³ +5..9% — so the knob
+// was removed; see git history if a small-SKU variant is ever needed.)
 // The 48KB static-smem watermark picks the resident-CTA hint for
 // __launch_bounds__ (sm_89: 100KB smem per SM, so two CTAs fit while each
 // stays within the static budget).
-template <typename Traits, typename LayoutA, typename LayoutB,
-          bool LeanRing = false>
+template <typename Traits, typename LayoutA, typename LayoutB>
 struct Fp8GemmSmem {
     // Crosswise (direct-load) operands: A ColMajor storage, B RowMajor
     // storage (B's tag is relative to the canonical [K][N]).
     static constexpr bool kDirectA = std::is_same_v<LayoutA, ColMajor>;
     static constexpr bool kDirectB = std::is_same_v<LayoutB, RowMajor>;
-    // LeanRing shrinks only the congruous (async) operand rings; a direct
-    // operand's ring stays kStages+1 deep (see the kernel's ring note).
-    static constexpr int kARing = kDirectA ? Traits::kStages + 1
-                                           : Traits::kStages + !LeanRing;
-    static constexpr int kBRing = kDirectB ? Traits::kStages + 1
-                                           : Traits::kStages + !LeanRing;
+    static constexpr int kRingDepth = Traits::kStages + 1;
     static constexpr int kBytes =
-        kARing * Traits::kBlockM * Traits::kK +
-        kBRing * Traits::kBlockN * Traits::kK;
+        kRingDepth * (Traits::kBlockM + Traits::kBlockN) * Traits::kK;
     static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
 };
 
@@ -321,21 +314,19 @@ struct Fp8GemmSmem {
 // consolidation.
 template <FP8Format Fmt_, int BlockM_, int BlockN_, typename LayoutA_,
           typename LayoutB_, int WarpM_, int WarpN_, int kK_, int Stages_,
-          int GroupRaster_, bool LeanRing_ = false, bool StreamOut_ = false,
-          bool FastLoop_ = false>
+          int GroupRaster_, bool StreamOut_ = false, bool FastLoop_ = false>
 struct Fp8GemmPolicy {
     using Traits =
         Fp8GemmTraits<Fmt_, BlockM_, BlockN_, kK_, Stages_, WarpM_, WarpN_>;
     using LayoutTagA = LayoutA_;
     using LayoutTagB = LayoutB_;
     static constexpr int kGroupRaster = GroupRaster_;
-    static constexpr bool kLeanRing = LeanRing_;
     static constexpr bool kStreamOut = StreamOut_;
     static constexpr bool kFastLoop = FastLoop_;
     // Flattened for __launch_bounds__, which takes no dependent type names.
     static constexpr int kCtaThreads = Traits::kCtaThreads;
     static constexpr int kMinCtas =
-        Fp8GemmSmem<Traits, LayoutA_, LayoutB_, kLeanRing>::kMinCtas;
+        Fp8GemmSmem<Traits, LayoutA_, LayoutB_>::kMinCtas;
 };
 
 // LayoutA / LayoutB tag the operands' storage (CUTLASS-style, see common.h):
@@ -402,7 +393,7 @@ struct Fp8CollectiveMainloop {
     using Traits = typename Policy::Traits;
     using LayoutA = typename Policy::LayoutTagA;
     using LayoutB = typename Policy::LayoutTagB;
-    static constexpr bool kLeanRing = Policy::kLeanRing;
+    using Smem = Fp8GemmSmem<Traits, LayoutA, LayoutB>;
     static constexpr bool kFastLoop = Policy::kFastLoop;
     using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
     static constexpr int kBlockM = Traits::kBlockM;
@@ -410,10 +401,8 @@ struct Fp8CollectiveMainloop {
     static constexpr int kK = Traits::kK;
     static constexpr int kStages = Traits::kStages;
     static constexpr int kCtaThreads = Traits::kCtaThreads;
-    static constexpr bool kDirectA = Fp8GemmSmem<Traits, LayoutA, LayoutB,
-                                                 kLeanRing>::kDirectA;
-    static constexpr bool kDirectB = Fp8GemmSmem<Traits, LayoutA, LayoutB,
-                                                 kLeanRing>::kDirectB;
+    static constexpr bool kDirectA = Smem::kDirectA;
+    static constexpr bool kDirectB = Smem::kDirectB;
     static_assert(kStages >= 1 && kStages <= 8,
                   "FP8 GEMM stages must be in [1, 8]");
     // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps of WarpM x WarpN tiles,
@@ -424,21 +413,16 @@ struct Fp8CollectiveMainloop {
     static constexpr int kMt = Traits::kWarpM / 16;  // 16-row MMA tiles per warp
     static constexpr int kNt = Traits::kWarpN / 8;   // 8-col MMA tiles per warp
     static constexpr int kSegs = kK / kMmaK;  // mma-sized k segments per tile
-    // Per operand: congruous = kStages+1 rotating canonical buffers — the
-    // load for tile i+kStages targets slot (i-1)%(kStages+1), which compute
-    // finished reading before this iteration's barrier 1, so NO post-compute
-    // barrier is needed on the pure-congruous path (one __syncthreads per
-    // k-tile, the classic multistage rotation); direct-crosswise rotates the
-    // same kStages+1 ring for the same reason.
+    // Both operands rotate kStages+1 buffers: the load for tile i+kStages
+    // targets slot (i-1)%(kStages+1), which compute finished reading before
+    // this iteration's barrier 1 — the direct-crosswise prefetch (issued
+    // right after barrier 1) and the congruous cp.async prefetch alike —
+    // so NO post-compute barrier is needed (one __syncthreads per k-tile,
+    // the classic multistage rotation).
+    static constexpr int kARing = Smem::kRingDepth;
+    static constexpr int kBRing = Smem::kRingDepth;
     static constexpr int kAStageBytes = kBlockM * kK;
     static constexpr int kBStageBytes = kBlockN * kK;
-    // Direct-crosswise operands always rotate kStages+1 buffers: their
-    // prefetch issues right after barrier 1 (targeting the slot compute(i-1)
-    // released), so a kStages-deep lean ring would race the in-flight MMA
-    // reads. The lean ring applies only to congruous operands, whose cp.async
-    // prefetch sits behind the restored barrier 4.
-    static constexpr int kARing = kDirectA ? kStages + 1 : kStages + !kLeanRing;
-    static constexpr int kBRing = kDirectB ? kStages + 1 : kStages + !kLeanRing;
 
     T8* const a_base;
     T8* const b_base;
@@ -579,10 +563,7 @@ struct Fp8CollectiveMainloop {
         // Interleaved prefetch (cuBLAS/CUTLASS loop shape): the next tile's
         // LDGSTS chunks ride inside the MMA phase so their issue slots fill
         // the tensor-pipe gaps ptxas otherwise pads with NOPs (23 NOPs per
-        // 32 QMMA here versus 0 in the cuBLAS loop). Full rings only: a lean
-        // ring's write slot is the one compute(i) is reading (barrier 4
-        // orders the end-of-loop prefetch), so it keeps that placement.
-        constexpr bool kInterleave = kFast && !kLeanRing;
+        // 32 QMMA here versus 0 in the cuBLAS loop).
         // Steady-state read carries: the LDSM base of the current k-tile's
         // stage with the lane offset folded in, advanced one stage per
         // iteration with an equality wrap (the add sequence is exact). This
@@ -634,36 +615,13 @@ struct Fp8CollectiveMainloop {
         // the even/odd nt MMAs respectively.
         unsigned b_frag[2][kNt][2];
         unsigned b_frag4[2][kNt / 2][4];
-#pragma unroll
-        for (int p = 0; p < kNt / 2; ++p)
-            if constexpr (kPairB)
-                astrai::ldmatrix_x4_lane(b_frag4[0][p],
-                                         b_seg[0] + p * kPairStep);
-            else {
-                astrai::ldmatrix_x2_lane(b_frag[0][p * 2],
-                                         b_seg[0] + p * 2 * kNtStep);
-                astrai::ldmatrix_x2_lane(b_frag[0][p * 2 + 1],
-                                         b_seg[0] + (p * 2 + 1) * kNtStep);
-            }
+        load_b_frags(b_frag[0][0], b_frag4[0][0], b_seg[0]);
 #pragma unroll
         for (int k_seg = 0; k_seg < kSegs; ++k_seg) {
             const int bcur = k_seg & 1, bnext = bcur ^ 1;
-            if (k_seg + 1 < kSegs) {
-#pragma unroll
-                for (int p = 0; p < kNt / 2; ++p)
-                    if constexpr (kPairB)
-                        astrai::ldmatrix_x4_lane(
-                            b_frag4[bnext][p],
-                            b_seg[k_seg + 1] + p * kPairStep);
-                    else {
-                        astrai::ldmatrix_x2_lane(
-                            b_frag[bnext][p * 2],
-                            b_seg[k_seg + 1] + p * 2 * kNtStep);
-                        astrai::ldmatrix_x2_lane(
-                            b_frag[bnext][p * 2 + 1],
-                            b_seg[k_seg + 1] + (p * 2 + 1) * kNtStep);
-                    }
-            }
+            if (k_seg + 1 < kSegs)
+                load_b_frags(b_frag[bnext][0], b_frag4[bnext][0],
+                             b_seg[k_seg + 1]);
         // Software-pipelined A fragments: the ldmatrix.x4 for row mt+1
         // is issued before the MMAs consuming row mt, so the LDS fixed
         // latency hides behind tensor-pipe work (cuts the `wait` stall,
@@ -690,28 +648,19 @@ struct Fp8CollectiveMainloop {
         }
         // Next tile's LDGSTS chunks inside the MMA phase: A's after the
         // first k_seg's MMA batch, B's after the last.
-        if constexpr (kInterleave) {
+        if constexpr (kFast) {
             if (k_seg == 0) carry_a.emit(prefetch);
             if (k_seg == kSegs - 1) carry_b.emit(prefetch);
         }
         }
-        // Barrier 4 (lean-ring only): every thread finished reading this
-        // stage's tiles before the prefetch for the (i+kStages)-th tile
-        // overwrites them. With the kStages+1 canonic rotation the prefetch
-        // targets the slot compute(i-1) released before barrier 1, so the
-        // full-ring path skips this barrier entirely — one __syncthreads per
-        // k-tile.
-        if constexpr (kLeanRing) __syncthreads();
-        if constexpr (!kInterleave) {
+        // Generic loop (no interleaved prefetch): the next tile's predicated
+        // loads run after the MMA phase — the fast loop's carries already
+        // emitted inside it.
+        if constexpr (!kFast) {
             if (prefetch) {
-                if constexpr (kFast) {
-                    carry_a.emit(true);
-                    carry_b.emit(true);
-                } else {
-                    load_async(a_stage_of(tile_index + kStages),
-                               b_stage_of(tile_index + kStages),
-                               (tile_index + kStages) * kK);
-                }
+                load_async(a_stage_of(tile_index + kStages),
+                           b_stage_of(tile_index + kStages),
+                           (tile_index + kStages) * kK);
             }
         }
         // Unconditional commit: empty in the tail, it pads the group
@@ -803,6 +752,27 @@ struct Fp8CollectiveMainloop {
     static constexpr unsigned kPairStep = 16 * kK;  // bytes per nt-pair row step
     __device__ __forceinline__ unsigned b4_lane_off(int lane) const {
         return b_lane_off(lane) + (lane >> 4) * kPairStep / 2;
+    }
+
+    // One k_seg's B-fragment loads, shared by the initial fill and the
+    // double-buffer's next-seg fill: kNt/2 paired ldmatrix.x4 (kPairB) or
+    // kNt ldmatrix.x2 from the seg's base-pair address. frag2/frag4 are the
+    // flat bases of one b_frag / b_frag4 buffer (the unused one of the pair
+    // is never touched).
+    __device__ __forceinline__ void
+    load_b_frags(unsigned* frag2, unsigned* frag4, unsigned seg_base) const {
+#pragma unroll
+        for (int p = 0; p < kNt / 2; ++p) {
+            if constexpr (kPairB) {
+                astrai::ldmatrix_x4_lane(frag4 + p * 4,
+                                         seg_base + p * kPairStep);
+            } else {
+                astrai::ldmatrix_x2_lane(frag2 + p * 4,
+                                         seg_base + p * 2 * kNtStep);
+                astrai::ldmatrix_x2_lane(frag2 + p * 4 + 2,
+                                         seg_base + (p * 2 + 1) * kNtStep);
+            }
+        }
     }
 };
 
@@ -1047,17 +1017,14 @@ inline int device_sm_count() {
     static int cached[64] = {};
     int dev = 0;
     cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64) {
-        int sms = 0;
+    const bool cacheable = dev >= 0 && dev < 64;
+    int sms = cacheable ? cached[dev] : 0;
+    if (!sms) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        return sms > 0 ? sms : 1;
+        sms = sms > 0 ? sms : 1;
+        if (cacheable) cached[dev] = sms;
     }
-    if (!cached[dev]) {
-        int sms = 0;
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        cached[dev] = sms > 0 ? sms : 1;
-    }
-    return cached[dev];
+    return sms;
 }
 
 
@@ -1111,21 +1078,22 @@ inline bool small_cta_padding(int64_t m, int64_t n) {
 }
 
 // Launch configuration — a pure function of the problem (unit-testable
-// without a GPU call; the measured crossover rules live in
-// prefer_small_cta's comment).
+// without a GPU call; the measured crossover rules live in plan_gemm's
+// comments). Raster order is not a plan field: every canonical layout
+// runs grouped raster (see gemm); the plain-raster knob stays available
+// through launch_plan's GroupRaster template parameter for experiments.
 struct Fp8GemmPlan {
     enum class Cta { kSmall64, kNarrow128x64, kBig128 };
     Cta cta;
     bool small_s3;  // kSmall64 only: cp.async pipeline depth (2 vs 3 stages)
-    bool grouped;   // grouped raster order; else plain N-fastest
 };
 
-inline Fp8GemmPlan plan_gemm(const FP8Params& p, bool grouped) {
+inline Fp8GemmPlan plan_gemm(const FP8Params& p) {
     const int64_t sm = device_sm_count();
     const int64_t tiles_128 =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
     const auto small = [&](bool s3) {
-        return Fp8GemmPlan{Fp8GemmPlan::Cta::kSmall64, s3, grouped};
+        return Fp8GemmPlan{Fp8GemmPlan::Cta::kSmall64, s3};
     };
     // Padding rules first: predication waste beats any wave-fill effect.
     if (small_cta_padding(p.m, p.n)) return small(false);
@@ -1134,7 +1102,7 @@ inline Fp8GemmPlan plan_gemm(const FP8Params& p, bool grouped) {
     // forcing the 64x64 CTA there measured 2048^3 123->171 TF on L20 and
     // 164 vs 308T on sm_120.
     if (tiles_128 >= sm * 5 / 8)
-        return Fp8GemmPlan{Fp8GemmPlan::Cta::kBig128, false, grouped};
+        return Fp8GemmPlan{Fp8GemmPlan::Cta::kBig128, false};
     // Sub-wave band: the 128x64 narrow CTA (8 warps of 32x32) fills the
     // wave with N-tiles at full warp depth — measured sm_120, it beats the
     // small CTA by +7..77% across the band once the narrow grid passes ~3/8
@@ -1144,7 +1112,7 @@ inline Fp8GemmPlan plan_gemm(const FP8Params& p, bool grouped) {
     const int64_t tiles_narrow =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 63) / 64);
     if (tiles_narrow >= sm * 3 / 8)
-        return Fp8GemmPlan{Fp8GemmPlan::Cta::kNarrow128x64, false, grouped};
+        return Fp8GemmPlan{Fp8GemmPlan::Cta::kNarrow128x64, false};
     // Full-ring small CTAs — ONE __syncthreads per k-tile, cuBLAS's barrier
     // structure. Two depths by grid shape: the 24KB 3-slot s2 variant keeps
     // 4 CTAs/SM while the whole grid stays resident (<= one 3-CTA wave);
@@ -1166,7 +1134,7 @@ void launch_policy(const FP8Params& p, cudaStream_t stream) {
     dim3 grid((p.n + kBN - 1) / kBN, (p.m + kBM - 1) / kBM, p.batch);
     launch_with_smem<fp8_gemm_kernel<Policy>>(
         Fp8GemmSmem<typename Policy::Traits, typename Policy::LayoutTagA,
-                    typename Policy::LayoutTagB, Policy::kLeanRing>::kBytes,
+                    typename Policy::LayoutTagB>::kBytes,
         grid, dim3(Traits::kCtaThreads), stream, p);
 }
 
@@ -1175,9 +1143,9 @@ void launch_policy(const FP8Params& p, cudaStream_t stream) {
 // dual-congruous layouts (crosswise instantiations keep the single generic
 // body — no dead second loop in their I-cache). Small CTA: 64x64 of 4 warps
 // x 32x32, kK=64, kFastLoop always on (the predication-free interior load
-// is where the small CTA's issue budget goes). Full rings everywhere: the
-// lean ring traded a second barrier for a 4th resident CTA and measured
-// slower (1280³ +5..9%).
+// is where the small CTA's issue budget goes). Full rings everywhere — the
+// lean kStages-deep ring traded a second barrier for a 4th resident CTA and
+// measured slower (1280³ +5..9%), so the knob was removed.
 template <FP8Format Fmt, typename LayoutA, typename LayoutB, int GroupRaster>
 void launch_plan(const FP8Params& p, const Fp8GemmPlan& plan,
                  cudaStream_t stream) {
@@ -1187,25 +1155,25 @@ void launch_plan(const FP8Params& p, const Fp8GemmPlan& plan,
     case Fp8GemmPlan::Cta::kBig128: {
         using Policy =
             Fp8GemmPolicy<Fmt, 128, 128, LayoutA, LayoutB, 64, 32, 64, 2,
-                          GroupRaster, false, false, kBigFast>;
+                          GroupRaster, false, kBigFast>;
         launch_policy<Policy>(p, stream);
         break;
     }
     case Fp8GemmPlan::Cta::kNarrow128x64: {
         using Policy =
             Fp8GemmPolicy<Fmt, 128, 64, LayoutA, LayoutB, 32, 32, 64, 2,
-                          GroupRaster, false, false, true>;
+                          GroupRaster, false, true>;
         launch_policy<Policy>(p, stream);
         break;
     }
     case Fp8GemmPlan::Cta::kSmall64: {
         if (plan.small_s3) {
             using Policy = Fp8GemmPolicy<Fmt, 64, 64, LayoutA, LayoutB, 32, 32,
-                                         64, 3, GroupRaster, false, false, true>;
+                                         64, 3, GroupRaster, false, true>;
             launch_policy<Policy>(p, stream);
         } else {
             using Policy = Fp8GemmPolicy<Fmt, 64, 64, LayoutA, LayoutB, 32, 32,
-                                         64, 2, GroupRaster, false, false, true>;
+                                         64, 2, GroupRaster, false, true>;
             launch_policy<Policy>(p, stream);
         }
         break;
@@ -1246,8 +1214,7 @@ inline void canonicalize_gemm(FP8Params& p, bool& trans_a, bool& trans_b) {
 template <FP8Format Fmt>
 void gemm(FP8Params p, cudaStream_t stream, bool trans_a, bool trans_b) {
     canonicalize_gemm(p, trans_a, trans_b);
-    const bool grouped = trans_a || trans_b;
-    const Fp8GemmPlan plan = plan_gemm(p, grouped);
+    const Fp8GemmPlan plan = plan_gemm(p);
     if (trans_a && trans_b)
         launch_plan<Fmt, ColMajor, ColMajor, 8>(p, plan, stream);
     else if (trans_b)

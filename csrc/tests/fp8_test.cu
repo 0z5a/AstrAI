@@ -196,7 +196,7 @@ constexpr bool kCaseFast =
 template <typename LA, typename LB, int kK, int Stages>
 using CasePolicy =
     Fp8GemmPolicy<FP8Format::E4M3, 128, 128, LA, LB, 64, 32, kK, Stages, 8,
-                  false, false, kCaseFast<LA, LB>>;
+                  false, kCaseFast<LA, LB>>;
 
 template <typename LA, typename LB, int kK, int Stages>
 static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
