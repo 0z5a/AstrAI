@@ -72,8 +72,8 @@ runtime:
 | the selected YAML | `/run/astrai/train.yaml` | read-only |
 
 Training configuration must therefore use `data_root_path: /data`. The source
-code is baked into `/app`; `start` uses `--build`, so code changes rebuild the
-image when necessary.
+code is baked into `/app`; `start` reuses the existing image, so run
+`bash scripts/train.sh build [CONFIG]` after code changes.
 
 ## Operations
 

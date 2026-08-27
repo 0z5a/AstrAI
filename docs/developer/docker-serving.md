@@ -54,8 +54,9 @@ server:
 - `runtime.gpu.enabled: true` (default) selects the `server` service with an
   NVIDIA device reservation; `false` selects `server-cpu` (no GPU passthrough).
   When disabled, `server.device` must be `cpu`.
-- `runtime.gpu.devices` is either `all` or a single-device list such as `[0]`;
-  the list becomes `CUDA_VISIBLE_DEVICES`. Compose passes `count: 1`.
+- `runtime.gpu.devices` is `all` (default) or a single-device list such as `[0]`;
+  the list becomes `CUDA_VISIBLE_DEVICES`. Compose passes `count: all`; the
+  env var performs the only filtering.
 - `environment` values are explicitly passed to the serving container. Keep
   host-specific settings here; they are not universal defaults.
 - `server.device` must agree with `runtime.gpu.enabled`; `preflight` enforces it.
@@ -89,9 +90,9 @@ bash scripts/serve.sh status [CONFIG]
 
 `preflight` validates Docker, the model directory
 (`config.json` + `model.safetensors`), GPU/device consistency, and the
-rendered Compose configuration. `up` starts the container detached and
-rebuilds the image when the code changed (`--build`); `run` keeps it in the
-foreground. The wrapper manages a fixed container name
+rendered Compose configuration. `up` starts the container detached; `run`
+keeps it in the foreground. Both reuse the existing image; run
+`bash scripts/serve.sh build [CONFIG]` after code changes. The wrapper manages a fixed container name
 (`astrai-server` or `astrai-server-<job_name>`); the plain
 `docker compose up -d` / `docker compose --profile cpu up -d` path keeps
 working with defaults (port 8000, `./params`).
@@ -99,7 +100,7 @@ working with defaults (port 8000, `./params`).
 ## Hard Rules
 
 1. Keep Docker settings in `runtime` and server settings in `server`.
-2. Filter GPUs once: the `server` service reserves one device; a `devices`
+2. Filter GPUs once: Compose passes `count: all`; a `devices`
    list becomes `CUDA_VISIBLE_DEVICES`.
 3. `runtime.gpu.enabled: false` requires `server.device: cpu`.
 4. In Docker, `server.port` must match the published container port (default

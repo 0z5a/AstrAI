@@ -53,9 +53,9 @@ def load_runtime(config_path: str) -> dict[str, str]:
         )
 
     devices = gpu.get("devices", "all")
+    visible_devices = None
     if devices == "all":
         gpu_count = "all"
-        visible_devices = ""
     elif isinstance(devices, list) and devices:
         normalized = []
         for device in devices:
@@ -102,7 +102,6 @@ def load_runtime(config_path: str) -> dict[str, str]:
             paths.get("checkpoints"), "checkpoints", path.parent
         ),
         "TRAIN_GPU_COUNT": gpu_count,
-        "CUDA_VISIBLE_DEVICES": visible_devices,
         "TRAIN_PARALLEL_MODE": parallel_mode,
         "CUDA_TAG": str(container.get("cuda_tag", "cu128")),
         "TRAIN_IPC_MODE": str(container.get("ipc", "host")),
@@ -111,6 +110,8 @@ def load_runtime(config_path: str) -> dict[str, str]:
         "CHECKPOINT_KEEP_LAST": str(container.get("checkpoint_keep_last", 5)),
         "TRAIN_MAX_DURATION_SECONDS": str(max_seconds),
     }
+    if visible_devices is not None:
+        values["CUDA_VISIBLE_DEVICES"] = visible_devices
 
     for name, value in environment.items():
         if not isinstance(name, str) or not ENV_NAME.fullmatch(name):

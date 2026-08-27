@@ -26,7 +26,7 @@ def test_runtime_exports_defaults(tmp_path):
     assert runtime["SERVE_CONTAINER_PORT"] == "8000"
     assert runtime["SERVE_PARAM_DIR"] == str((tmp_path / "params").resolve())
     assert runtime["SERVE_GPU_ENABLED"] == "true"
-    assert runtime["CUDA_VISIBLE_DEVICES"] == ""
+    assert "CUDA_VISIBLE_DEVICES" not in runtime
     assert runtime["SERVE_DEVICE"] == "cuda"
     assert runtime["CUDA_TAG"] == "cu128"
     assert runtime["SERVE_JOB_NAME"] == ""

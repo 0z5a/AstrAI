@@ -78,9 +78,10 @@ def load_runtime(config_path: str) -> dict[str, str]:
         raise ValueError("runtime.gpu.enabled must be a boolean")
 
     devices = gpu.get("devices", "all")
+    visible_devices = None
     if gpu_enabled:
         if devices == "all":
-            visible_devices = ""
+            pass
         elif isinstance(devices, list) and len(devices) == 1:
             text = str(devices[0])
             if not text.isdigit():
@@ -93,7 +94,6 @@ def load_runtime(config_path: str) -> dict[str, str]:
                 "runtime.gpu.devices must be 'all' or a single-device list such as [0]"
             )
     else:
-        visible_devices = ""
         if devices != "all":
             raise ValueError(
                 "runtime.gpu.devices is ignored when runtime.gpu.enabled is false"
@@ -110,9 +110,10 @@ def load_runtime(config_path: str) -> dict[str, str]:
         "SERVE_PARAM_DIR": _path(paths.get("param", "./params"), "param", path.parent),
         "SERVE_GPU_ENABLED": "true" if gpu_enabled else "false",
         "SERVE_DEVICE": device,
-        "CUDA_VISIBLE_DEVICES": visible_devices,
         "CUDA_TAG": str(container.get("cuda_tag", "cu128")),
     }
+    if visible_devices is not None:
+        values["CUDA_VISIBLE_DEVICES"] = visible_devices
 
     for name, value in environment.items():
         if not isinstance(name, str) or not ENV_NAME.fullmatch(name):

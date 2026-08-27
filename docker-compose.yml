@@ -1,5 +1,6 @@
 services:
   server:
+    image: astrai:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -20,7 +21,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -31,6 +32,7 @@ services:
     restart: unless-stopped
 
   server-cpu:
+    image: astrai:latest
     profiles: [cpu]
     build:
       context: .
@@ -54,6 +56,7 @@ services:
     restart: unless-stopped
 
   trainer:
+    image: astrai:latest
     profiles: [train]
     build:
       context: .

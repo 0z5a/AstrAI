@@ -58,7 +58,12 @@ load_config() {
 }
 
 compose() {
-    ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" "${COMPOSE_BASE[@]}" "$@"
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" "${COMPOSE_BASE[@]}" "$@"
+    else
+        ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" \
+            env -u CUDA_VISIBLE_DEVICES "${COMPOSE_BASE[@]}" "$@"
+    fi
 }
 
 checkpoint_dir() {
@@ -164,9 +169,9 @@ start_training() {
         "${RUNTIME_ENV_ARGS[@]}"
     )
     if [[ "${foreground}" == "true" ]]; then
-        compose run --build --rm "${run_options[@]}" trainer "$@"
+        compose run --rm "${run_options[@]}" trainer "$@"
     else
-        compose run -d --build --name "${container}" "${run_options[@]}" trainer "$@"
+        compose run -d --name "${container}" "${run_options[@]}" trainer "$@"
         schedule_timer
         log_info "Training started; run scripts/train.sh logs ${CONFIG_FILE} to follow it"
     fi

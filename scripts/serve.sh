@@ -55,7 +55,12 @@ load_config() {
 }
 
 compose() {
-    ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" "${COMPOSE_BASE[@]}" "$@"
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" "${COMPOSE_BASE[@]}" "$@"
+    else
+        ASTRAI_UID="$(id -u)" ASTRAI_GID="$(id -g)" \
+            env -u CUDA_VISIBLE_DEVICES "${COMPOSE_BASE[@]}" "$@"
+    fi
 }
 
 container_name() {
@@ -129,11 +134,11 @@ start_server() {
         "${RUNTIME_ENV_ARGS[@]}"
     )
     if [[ "${foreground}" == "true" ]]; then
-        compose "${PROFILE_ARGS[@]}" run --build --rm --service-ports \
+        compose "${PROFILE_ARGS[@]}" run --rm --service-ports \
             "${run_options[@]}" "$(service_name)" \
             python -m scripts.tools.server --config /run/astrai/serve.yaml "$@"
     else
-        compose "${PROFILE_ARGS[@]}" run -d --build --service-ports \
+        compose "${PROFILE_ARGS[@]}" run -d --service-ports \
             --name "${container}" "${run_options[@]}" "$(service_name)" \
             python -m scripts.tools.server --config /run/astrai/serve.yaml "$@"
         log_info "Server started; run scripts/serve.sh logs ${CONFIG_FILE} to follow it"
