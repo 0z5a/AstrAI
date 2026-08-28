@@ -139,6 +139,18 @@ class InferenceWorkspace:
         self.input_ids[:b].copy_(pin[:b])
         return self.input_ids[:b]
 
+    def fill_input_ids_from_device(self, tokens: Tensor) -> Tensor:
+        """Copy device-resident ``[B]`` token ids into the device buffer.
+
+        Steady-state decode fast path: when the executor's cached task
+        signature still matches, the previous step's sampled tokens map
+        1:1 onto the current slots, so the ids transfer device-to-device
+        instead of round-tripping through the host staging buffers.
+        """
+        b = tokens.size(0)
+        self.input_ids[:b].copy_(tokens)
+        return self.input_ids[:b]
+
     def decode_mask(self, position_ids: Tensor, total_len: int) -> Tensor:
         """Return the ``[B, 1, total_len]`` validity mask for this step.
 

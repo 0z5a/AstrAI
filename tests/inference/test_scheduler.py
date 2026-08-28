@@ -393,7 +393,9 @@ def test_decode_does_not_reuse_previous_batch_state():
     old_info = object()
     new_info = object()
     executor._decode_cache = DecodeSteadyState(("old",), [2], old_info)
-    executor._sample_logits = MagicMock(return_value=[3])
+    executor._sample_logits = MagicMock(
+        return_value=([3], torch.tensor([3], dtype=torch.long))
+    )
 
     task = Task("new", list(range(8)), temperature=0)
     task.input_tokens = 8
@@ -412,3 +414,46 @@ def test_decode_does_not_reuse_previous_batch_state():
     args, kwargs = executor._sample_logits.call_args
     assert args[1:] == ([task], False)
     assert kwargs["info"] is new_info
+
+
+def test_decode_fills_input_ids_from_device_on_matching_signature():
+    """Steady-state decode copies cached device tokens, skipping the host."""
+    executor = object.__new__(Executor)
+    executor.device = torch.device("cpu")
+    executor.task_cache = MagicMock()
+    executor.task_cache.bind_was_steady = True
+    executor.task_cache.bind.return_value = MagicMock()
+    executor._graph_supported = False
+    executor._graph_ctx = SimpleNamespace(enabled=False)
+
+    workspace = MagicMock()
+    workspace.position_ids = torch.tensor([2], dtype=torch.long)
+    workspace.fill_input_ids_from_device.return_value = torch.tensor(
+        [9], dtype=torch.long
+    )
+    executor._workspace = workspace
+    executor.model = MagicMock(
+        return_value={"logits": torch.zeros(1, 1, 10, dtype=torch.float32)}
+    )
+
+    info = object()
+    tokens = torch.tensor([3], dtype=torch.long)
+    executor._decode_cache = DecodeSteadyState(("t1",), [2], info, last_tokens=tokens)
+    executor._sample_logits = MagicMock(return_value=([3], tokens))
+
+    task = Task("t1", list(range(8)), temperature=0)
+    task.input_tokens = 8
+    task.output_ids = [7]
+    task.mark_prefill_done()
+
+    with patch(
+        "astrai.inference.runtime.executor._build_sampling_batch_info",
+        return_value=info,
+    ):
+        assert executor.execute_decode([task]) == [3]
+
+    workspace.fill_input_ids.assert_not_called()
+    workspace.fill_input_ids_from_device.assert_called_once_with(tokens)
+    assert workspace.position_ids.tolist() == [3]
+    assert executor._decode_cache.task_sig == ("t1",)
+    assert executor._decode_cache.last_tokens is tokens

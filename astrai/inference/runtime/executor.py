@@ -67,11 +67,15 @@ class DecodeSteadyState:
 
     When the same ordered task set decodes one token per step, sampling
     params and task signature are reused; only positions advance by 1.
+    ``last_tokens`` keeps that step's sampled ids on-device so the next
+    step with an unchanged signature can fill ``input_ids`` via a
+    device-to-device copy.
     """
 
     task_sig: tuple
     positions: list[int]
     sampling_info: SamplingBatchInfo
+    last_tokens: Optional[Tensor] = None
 
 
 def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
@@ -250,6 +254,13 @@ class Executor:
         return_logprobs: bool = False,
         info: Optional[SamplingBatchInfo] = None,
     ):
+        """Sample from ``logits`` and return ``(host_payload, tokens)``.
+
+        ``host_payload`` is the scheduler-facing list (token ids, or
+        ``(token_id, logprob)`` tuples with ``return_logprobs``);
+        ``tokens`` is the ``[B]`` device tensor that produced it, kept
+        for the steady-state decode fast path.
+        """
         info = info or _build_sampling_batch_info(tasks, self.device)
         if info.has_freq:
             history_lists = [
@@ -284,14 +295,14 @@ class Executor:
             return_logprobs=return_logprobs,
         )
         if not return_logprobs:
-            return result.tolist()
+            return result.tolist(), result
 
         tokens, logprobs = result
         tokens_list = tokens.tolist()
         logprobs_list = logprobs.tolist()
         for task, logprob in zip(tasks, logprobs_list):
             task.output_logprobs.append(float(logprob))
-        return list(zip(tokens_list, logprobs_list))
+        return list(zip(tokens_list, logprobs_list)), tokens
 
     def execute_prefill(
         self,
@@ -336,7 +347,8 @@ class Executor:
                 torch.arange(1, batch_sz + 1, device=self.device) * q_len - 1
             ]
 
-        return tasks, self._sample_logits(logits, tasks, return_logprobs)
+        step_out, _ = self._sample_logits(logits, tasks, return_logprobs)
+        return tasks, step_out
 
     def execute_decode(
         self, tasks: List[Task], return_logprobs: bool = False
@@ -360,24 +372,30 @@ class Executor:
 
         b = len(tasks)
         ws = self._workspace
+        task_ids = [t.task_id for t in tasks]
+        cur_positions = [t.next_pos for t in tasks]
+        task_sig = tuple(task_ids)
 
         # ---- pre-replay: update input buffers in-place ----
 
-        input_ids = ws.fill_input_ids(
-            [t.output_ids[-1] if t.output_ids else t.prompt_ids[-1] for t in tasks]
-        )
-
-        task_ids = [t.task_id for t in tasks]
-        cur_positions = [t.next_pos for t in tasks]
+        # When the previous decode step ran this same ordered task set, its
+        # sampled tokens are still on-device and map 1:1 onto the current
+        # slots — fill input ids device-to-device.  inference_mode guards
+        # the read because the source was produced under sampling's
+        # inference-mode context.
+        cached = self._decode_cache
+        sig_match = cached is not None and cached.task_sig == task_sig
+        if sig_match and cached.last_tokens is not None:
+            with torch.inference_mode():
+                input_ids = ws.fill_input_ids_from_device(cached.last_tokens)
+        else:
+            input_ids = ws.fill_input_ids(
+                [t.output_ids[-1] if t.output_ids else t.prompt_ids[-1] for t in tasks]
+            )
 
         kv_cache = self.task_cache.bind(task_ids, ws)
 
-        task_sig = tuple(task_ids)
-        reuse_decode_state = (
-            self.task_cache.bind_was_steady
-            and self._decode_cache is not None
-            and self._decode_cache.task_sig == task_sig
-        )
+        reuse_decode_state = self.task_cache.bind_was_steady and sig_match
         if reuse_decode_state:
             info = self._decode_cache.sampling_info
             ws.position_ids[:b] += 1
@@ -418,4 +436,8 @@ class Executor:
                 )
             logits = outputs["logits"]
 
-        return self._sample_logits(logits, tasks, return_logprobs, info=info)
+        step_out, tokens_dev = self._sample_logits(
+            logits, tasks, return_logprobs, info=info
+        )
+        self._decode_cache.last_tokens = tokens_dev
+        return step_out
