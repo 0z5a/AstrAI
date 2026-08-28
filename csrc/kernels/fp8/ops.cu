@@ -120,7 +120,11 @@ py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
     auto input = x.contiguous();
     auto out_opts = input.options().dtype(
         fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn);
-    auto amax = torch::zeros({1}, input.options().dtype(torch::kFloat32));
+    // amax is reduced via atomicMax of non-negative values; a driver memset
+    // arms it cheaper than the zeros() fill kernel (one fewer tensor-op
+    // dispatch + kernel launch on every quantize call).
+    auto amax = torch::empty({1}, input.options().dtype(torch::kFloat32));
+    cudaMemsetAsync(amax.data_ptr(), 0, sizeof(float), stream.stream());
 
     FP8QuantizeParams p;
     p.input_ptr = input.data_ptr();
