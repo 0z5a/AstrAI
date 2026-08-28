@@ -63,6 +63,71 @@ def _fp8_quantize_fake(x, scale, fmt):
 _QUANT_INPUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
+@custom_op("custom::fp8_quantize_t", mutates_args=())
+def fp8_quantize_t(
+    x: torch.Tensor, scale: torch.Tensor, fmt: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Transposed-output variant of fp8_quantize: returns ``(x8T, amax)``
+    where ``x8T`` is the [cols][rows] row-major transpose of the quantized
+    input (the K-contiguous operand orientation for NT GEMMs)."""
+
+
+@fp8_quantize_t.register_fake
+def _fp8_quantize_t_fake(x, scale, fmt):
+    dtype = torch.float8_e5m2 if fmt == 1 else torch.float8_e4m3fn
+    rows, cols = x.shape[-2], x.shape[-1]
+    return (
+        torch.empty((*x.shape[:-2], cols, rows), device=x.device, dtype=dtype),
+        torch.empty(1, device=x.device, dtype=torch.float32),
+    )
+
+
+@fp8_quantize_t.register_kernel("cuda")
+def _fp8_quantize_t_cuda(x, scale, fmt):
+    if x.dtype not in _QUANT_INPUT_DTYPES:
+        raise TypeError(f"fp8 quantize requires bf16/fp16/fp32 input, got {x.dtype}")
+    return get_module("fp8_ops").quantize(x, scale, int(fmt), 1)
+
+
+@fp8_quantize_t.register_kernel("cpu")
+def _fp8_quantize_t_cpu(x, scale, fmt):
+    x8, amax = _fp8_quantize_cpu(x, scale, fmt)
+    return x8.transpose(-2, -1).contiguous(), amax
+
+
+@custom_op("custom::fp8_quantize_dual", mutates_args=())
+def fp8_quantize_dual(
+    x: torch.Tensor, scale: torch.Tensor, fmt: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dual-orientation quantize: one read of ``x`` produces both the
+    row-major ``x8`` and its transposed ``x8T`` (plus ``amax``), for tensors
+    consumed by GEMMs on both orientations (backward ``g``)."""
+
+
+@fp8_quantize_dual.register_fake
+def _fp8_quantize_dual_fake(x, scale, fmt):
+    dtype = torch.float8_e5m2 if fmt == 1 else torch.float8_e4m3fn
+    rows, cols = x.shape[-2], x.shape[-1]
+    return (
+        torch.empty(x.shape, device=x.device, dtype=dtype),
+        torch.empty((*x.shape[:-2], cols, rows), device=x.device, dtype=dtype),
+        torch.empty(1, device=x.device, dtype=torch.float32),
+    )
+
+
+@fp8_quantize_dual.register_kernel("cuda")
+def _fp8_quantize_dual_cuda(x, scale, fmt):
+    if x.dtype not in _QUANT_INPUT_DTYPES:
+        raise TypeError(f"fp8 quantize requires bf16/fp16/fp32 input, got {x.dtype}")
+    return get_module("fp8_ops").quantize(x, scale, int(fmt), 2)
+
+
+@fp8_quantize_dual.register_kernel("cpu")
+def _fp8_quantize_dual_cpu(x, scale, fmt):
+    x8, amax = _fp8_quantize_cpu(x, scale, fmt)
+    return x8, x8.transpose(-2, -1).contiguous(), amax
+
+
 @fp8_quantize.register_kernel("cuda")
 def _fp8_quantize_cuda(x, scale, fmt):
     if x.dtype not in _QUANT_INPUT_DTYPES:
@@ -125,13 +190,16 @@ def _fp8_gemm_cpu(a, b, scale, trans_a=0, trans_b=0, bias=None):
 
 
 def quantize(
-    x: torch.Tensor, scale: torch.Tensor, fmt: str = "e4m3"
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Float (bf16/fp16/fp32) -> FP8 quantize with fused amax; returns
-    ``(x8, amax)``.
+    x: torch.Tensor, scale: torch.Tensor, fmt: str = "e4m3", layout: int = 0
+) -> tuple:
+    """Float (bf16/fp16/fp32) -> FP8 quantize with fused amax.
 
     ``scale`` is the quantization multiplier (device scalar); ``fmt`` selects
-    E4M3 or E5M2. ``amax`` is a fresh 1-element float32 tensor.
+    E4M3 or E5M2. ``amax`` is a fresh 1-element float32 tensor. ``layout``
+    picks the output orientation: 0 = row-major ``(x8, amax)``; 1 =
+    transposed ``[cols][rows]`` ``(x8T, amax)`` — the K-contiguous operand
+    orientation NT GEMMs want; 2 = both from one read ``(x8, x8T, amax)``
+    (for tensors consumed in both orientations, e.g. backward ``g``).
     """
     # Hot-path bypass of the torch.library dispatch (~5us/call, ~40% of a
     # 512-wide GEMM): real CUDA tensors of a supported dtype go straight to
@@ -144,8 +212,12 @@ def quantize(
         and x.dtype in _QUANT_INPUT_DTYPES
         and fmt in _FMT_TO_INT
     ):
-        return get_module("fp8_ops").quantize(x, scale, _FMT_TO_INT[fmt])
-    return fp8_quantize(x, scale, _fmt_int(fmt))
+        return get_module("fp8_ops").quantize(x, scale, _FMT_TO_INT[fmt], layout)
+    if layout == 0:
+        return fp8_quantize(x, scale, _fmt_int(fmt))
+    if layout == 1:
+        return fp8_quantize_t(x, scale, _fmt_int(fmt))
+    return fp8_quantize_dual(x, scale, _fmt_int(fmt))
 
 
 def mm_fp8(

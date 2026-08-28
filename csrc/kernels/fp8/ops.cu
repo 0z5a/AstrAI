@@ -46,16 +46,6 @@ void check_scale(const torch::Tensor& scale, const torch::Tensor& input) {
                 "scale must be a CUDA float32 scalar on the input device");
 }
 
-void pack_quantize(FP8QuantizeParams& p, const void* input, void* output,
-                   const torch::Tensor& scale, torch::Tensor& amax,
-                   int64_t total) {
-    p.input_ptr = input;
-    p.output_ptr = output;
-    p.scale = scale.data_ptr<float>();
-    p.amax = amax.data_ptr<float>();
-    p.total = static_cast<int>(total);
-}
-
 void pack_gemm(FP8Params& p, const void* a, const void* b, void* output,
                const torch::Tensor& scale, int64_t m, int64_t n, int64_t k,
                int64_t a_ld, int64_t b_ld) {
@@ -99,11 +89,45 @@ bool resolve_operand(const torch::Tensor& t_in, bool flag, int64_t& ld,
     return flag ^ col_major;
 }
 
+// Dtype x format switch shared by both quantize kernels; Tiled selects the
+// transpose kernel (out_layout 1/2) over the vectorized elementwise one.
+template <bool Tiled, FP8Format Fmt, typename InT>
+void launch_one(const FP8QuantizeParams& p, cudaStream_t stream) {
+    if constexpr (Tiled)
+        launch_fp8_quantize_tiled<Fmt, InT>(p, stream);
+    else
+        launch_fp8_quantize<Fmt, InT>(p, stream);
+}
+
+template <bool Tiled>
+void launch_quantize_for(const torch::Tensor& x, const FP8QuantizeParams& p,
+                         bool e5m2, cudaStream_t stream) {
+    if (x.scalar_type() == torch::kHalf) {
+        if (e5m2)
+            launch_one<Tiled, FP8Format::E5M2, __half>(p, stream);
+        else
+            launch_one<Tiled, FP8Format::E4M3, __half>(p, stream);
+    } else if (x.scalar_type() == torch::kFloat32) {
+        if (e5m2)
+            launch_one<Tiled, FP8Format::E5M2, float>(p, stream);
+        else
+            launch_one<Tiled, FP8Format::E4M3, float>(p, stream);
+    } else {
+        if (e5m2)
+            launch_one<Tiled, FP8Format::E5M2, __nv_bfloat16>(p, stream);
+        else
+            launch_one<Tiled, FP8Format::E4M3, __nv_bfloat16>(p, stream);
+    }
+}
+
 }  // namespace
 
-std::tuple<torch::Tensor, torch::Tensor> quantize(torch::Tensor x,
-                                                  torch::Tensor scale,
-                                                  int64_t fmt) {
+// Output-layout dispatch: 0 = [rows][cols] row-major (the historic 2-tuple
+// return), 1 = transposed [cols][rows] only (2-tuple), 2 = both orientations
+// from a single read of the input (3-tuple). Layouts 1/2 feed the NT GEMM
+// fast path from crosswise consumers (backward grad_x / grad_w).
+py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
+                    int64_t layout) {
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 ||
                     x.scalar_type() == torch::kHalf ||
@@ -112,39 +136,44 @@ std::tuple<torch::Tensor, torch::Tensor> quantize(torch::Tensor x,
     TORCH_CHECK(fmt == static_cast<int64_t>(FP8Format::E4M3) ||
                     fmt == static_cast<int64_t>(FP8Format::E5M2),
                 "unsupported quantization type: expected E4M3 (0) or E5M2 (1)");
+    TORCH_CHECK(layout >= 0 && layout <= 2,
+                "layout must be 0 (row-major), 1 (transposed) or 2 (both)");
+    TORCH_CHECK(layout == 0 || x.dim() >= 2,
+                "transposed quantize layouts need a 2D+ tensor");
     check_scale(scale, x);
     check_fp8_device(x);
     const at::cuda::OptionalCUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     auto input = x.contiguous();
-    auto output = torch::empty_like(
-        input, input.options().dtype(fmt ? torch::kFloat8_e5m2
-                                          : torch::kFloat8_e4m3fn));
+    auto out_opts = input.options().dtype(
+        fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn);
     auto amax = torch::zeros({1}, input.options().dtype(torch::kFloat32));
+
     FP8QuantizeParams p;
-    pack_quantize(p, input.data_ptr(), output.data_ptr(), scale, amax,
-                  input.numel());
-    const bool e5m2 = fmt == static_cast<int64_t>(FP8Format::E5M2);
-    if (x.scalar_type() == torch::kHalf) {
-        if (e5m2)
-            launch_fp8_quantize<FP8Format::E5M2, __half>(p, stream.stream());
-        else
-            launch_fp8_quantize<FP8Format::E4M3, __half>(p, stream.stream());
-    } else if (x.scalar_type() == torch::kFloat32) {
-        if (e5m2)
-            launch_fp8_quantize<FP8Format::E5M2, float>(p, stream.stream());
-        else
-            launch_fp8_quantize<FP8Format::E4M3, float>(p, stream.stream());
-    } else {
-        if (e5m2)
-            launch_fp8_quantize<FP8Format::E5M2, __nv_bfloat16>(
-                p, stream.stream());
-        else
-            launch_fp8_quantize<FP8Format::E4M3, __nv_bfloat16>(
-                p, stream.stream());
+    p.input_ptr = input.data_ptr();
+    p.scale = scale.data_ptr<float>();
+    p.amax = amax.data_ptr<float>();
+    p.total = static_cast<int>(input.numel());
+    p.out_layout = static_cast<int>(layout);
+    p.rows = static_cast<int>(input.size(-2));
+    p.cols = static_cast<int>(input.size(-1));
+    torch::Tensor output, output_t;
+    if (layout == 0 || layout == 2) {
+        output = torch::empty_like(input, out_opts);
+        p.output_ptr = output.data_ptr();
     }
+    if (layout >= 1) {
+        output_t = torch::empty({input.size(-1), input.size(-2)}, out_opts);
+        p.output_transposed_ptr = output_t.data_ptr();
+    }
+    const bool e5m2 = fmt == static_cast<int64_t>(FP8Format::E5M2);
+    if (layout != 0)
+        launch_quantize_for<true>(input, p, e5m2, stream.stream());
+    else
+        launch_quantize_for<false>(input, p, e5m2, stream.stream());
     C10_CUDA_CHECK(cudaGetLastError());
-    return {output, amax};
+    if (layout == 2) return py::make_tuple(output, output_t, amax);
+    return py::make_tuple(layout == 1 ? output_t : output, amax);
 }
 
 torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
@@ -219,7 +248,7 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
 // bias argument through untouched instead of normalizing it host-side).
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"),
-          py::arg("fmt"));
+          py::arg("fmt"), py::arg("layout") = 0);
     m.def(
         "mm_fp8",
         [](torch::Tensor a, torch::Tensor b, torch::Tensor scale,

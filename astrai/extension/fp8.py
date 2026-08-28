@@ -407,11 +407,21 @@ class _LinearFp8(torch.autograd.Function):
                 meta.g.seed(g2, fmt)
             sg = meta.g.scale.clone()
             sw, sx = _sw_fwd, _sx_fwd
-        g8, amax_g = quantize(g2, sg.reciprocal(), fmt)
-        x8, _ = quantize(x.reshape(-1, x.size(-1)), sx.reciprocal(), fmt)
-        w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
-        grad_x = mm_fp8(g8, w8, sg * sw).reshape(x.shape)  # g8[m,n] @ w8[n,k]
-        grad_w = mm_fp8(g8, x8, sg * sx, trans_a=True)  # g8.T @ x8
+        # Backward GEMMs route through the NT fast path via transposed
+        # quantize outputs: g8 [m,n] with w8T [k,n] (trans_b=True) gives
+        # grad_x, g8T [n,m] with x8T [k,m] gives grad_w — no NN-swap or TT
+        # crosswise kernel in the training path. g is consumed in both
+        # orientations, so one dual-layout pass feeds both.
+        g8, g8T, amax_g = quantize(g2, sg.reciprocal(), fmt, layout=2)
+        x8T, _ = quantize(x.reshape(-1, x.size(-1)), sx.reciprocal(), fmt, layout=1)
+        if _is_fp8(w.dtype):
+            # Pre-quantized weight has no transposed copy: keep the swap
+            # path for grad_x (grad_w is unaffected).
+            grad_x = mm_fp8(g8, w, sg * sw).reshape(x.shape)
+        else:
+            w8T, _ = quantize(w, sw.reciprocal(), fmt, layout=1)
+            grad_x = mm_fp8(g8, w8T, sg * sw, trans_b=True).reshape(x.shape)
+        grad_w = mm_fp8(g8T, x8T, sg * sx, trans_b=True)  # g8.T @ x8
         # bias-free linears must not pay the column-sum
         # reduce: g2.sum(0) is another full read of the gradient.
         grad_b = g2.sum(0).to(torch.bfloat16) if ctx.needs_input_grad[2] else None

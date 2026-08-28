@@ -71,12 +71,24 @@ struct FP8QuantizeParams {
     // the binding and receives the raw-domain absolute maximum.
     const void* __restrict__ input_ptr = nullptr;
     void* __restrict__ output_ptr = nullptr;
+    void* __restrict__ output_transposed_ptr = nullptr;
+    // Transposed-output destination ([cols][rows]); the output-layout modes:
+    //   0 = row-major only (output_ptr; the vectorized elementwise kernel)
+    //   1 = transposed only (output_transposed_ptr; the tiled kernel)
+    //   2 = both destinations in one read of the input (the tiled kernel)
+    // Modes 1/2 exist so crosswise-layout GEMM operands (NN grad_x, TT
+    // grad_w) can be produced K-contiguous instead, routing every training
+    // GEMM through the dual-congruous NT fast path.
+    int out_layout = 0;
 
     const float* __restrict__ scale = nullptr;
     float* __restrict__ amax = nullptr;
 
-    // Element count (only the elementwise quantize kernel uses it).
+    // Element count (only the elementwise quantize kernel uses it); the
+    // tiled kernel views the same buffer as [rows][cols] row-major.
     int total = 0;
+    int rows = 0;
+    int cols = 0;
 };
 
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
