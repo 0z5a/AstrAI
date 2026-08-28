@@ -41,14 +41,20 @@ Standalone benchmark vs torch complex-multiply (48 calls = 24 layers × q+k): 6-
 
 The `fp8_ops` family (`csrc/kernels/fp8/`) accelerates bf16 linear layers by
 quantizing to FP8 and running tensor-core GEMMs (**requires sm_89+**; fp8
-`mma.sync.m16n8k32` only exists on Ada/Hopper). It follows the same three-layer
-style as attention, but split into **three** files:
+`mma.sync.m16n8k32` only exists on Ada/Hopper). Same three-layer style as
+attention; the GEMM device code is split humming/CUTLASS-style into one
+layered directory:
 
 | File | Role |
 |------|------|
-| `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `Fp8GemmPolicy` (traits + layouts + scheduling knobs — the kernel's single template parameter), `FP8Params` POD — no torch |
-| `fp8/quantize.cuh` | pure-CUDA device code: `fp8_quantize_kernel<Fmt, InT>` (bf16/fp16/fp32 → FP8 + amax, `quant_in_traits<InT>` vectorized unpack) — no torch |
-| `fp8/gemm.cuh` | pure-CUDA device code: CUTLASS-style collectives (`Fp8GemmTileScheduler` / `Fp8CollectiveMainloop` / `Fp8CollectiveEpilogue`) around `fp8_gemm_kernel<Policy>` (pre-quantized GEMM; 64×64 / 128×64 / 128×128 CTA picked by `plan_gemm`, multi-stage cp.async, transposed-operand layouts, NN routed through a swap + out-transposed epilogue) — no torch. Entry: `gemm<Fmt>(params, stream, trans_a, trans_b)` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
+| `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `FP8Params` / `FP8QuantizeParams` PODs, layout tags — no torch |
+| `fp8/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 32×32-tile transpose kernel (out_layout 0/1/2), `quant_in_traits<InT>` unpack — no torch |
+| `fp8/gemm/policy.cuh` | smem budget / occupancy hint (`Fp8GemmSmem`) + `Fp8GemmPolicy` (traits + layouts + knobs — the kernel's single template parameter) |
+| `fp8/gemm/load.cuh` | operand loaders: swizzle (`tile_at`), congruous cp.async (predicated + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load |
+| `fp8/gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster |
+| `fp8/gemm/mainloop.cuh` | `Fp8CollectiveMainloop`: stage rings, stage loads, fragment addressing, pipelined mma.sync loop |
+| `fp8/gemm/epilogue.cuh` | `Fp8CollectiveEpilogue`: fused bias + bf16 smem scatter + coalesced copy-out |
+| `fp8/gemm.cuh` | umbrella: `fp8_gemm_kernel<Policy>` orchestrator + host planning (`plan_gemm` / `launch_plan`; 64×64 / 128×64 / 128×128 CTA) + entry `gemm<Fmt>(params, stream, trans_a, trans_b)` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
 | `fp8/ops.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_ops` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
@@ -62,6 +68,72 @@ plain `quantize` / `mm_fp8` wrappers, and `astrai/extension/fp8.py` is the
 strategy layer (`fp8_autocast`, delayed / dynamic scaling recipes,
 `fp8_linear_forward/backward` wiring `aten::linear` on CUDA). See the FP8
 section in `AGENTS.md` for full detail.
+
+#### FP8 GEMM design notes
+
+The load-bearing invariants behind the kernel code (all measurements on
+L20/sm_89 unless noted):
+
+**Swizzle.** Staging tiles are flat `[rows * kK]`; `tile_at` XORs the 16B
+chunk index with row bits at `[3, 3+log2(kChunks))` so a warp's ldmatrix
+fragment load (8 consecutive rows × 16B) hits all 32 banks exactly once
+(the unswizzled row word-stride is `kK/4` words, so rows `r` and
+`r + 8/kChunks` collide mod 32). Chunks stay contiguous, so cp.async
+staging is unaffected.
+
+**Fragment addressing (base-pair scheme).** One base register per operand
+per k_seg, every fragment offset an LDSM immediate. The closure works
+because the XOR swizzle's source bits come only from the lane's
+row-within-matrix `r7`: the 8/16-row fragment steps never reach them, so
+`addr(s, mt) = lane_base + mt*(16*kK) ^ (s<<5)` for A and
+`addr(s, nt) = lane_base + nt*(8*kK) ^ (s<<5)` for B. This replaced
+runtime offset tables that spilled at 131 registers (~55 of 146 hot-loop
+instructions were address math; cuBLAS's inner loop has ~0). Steady-state
+read pointers advance one stage per iteration with an equality wrap,
+replacing the per-k-tile `(tile % ring) * stage_bytes` recomputation
+(UIMAD.WIDE magic-division ladder).
+
+**Pipeline depth and barriers.** Every operand ring holds `kStages+1`
+buffers: the load for tile `i+kStages` targets slot `(i-1)%(kStages+1)`,
+which compute(i-1) finished reading before this iteration's barrier — no
+post-compute barrier, one `__syncthreads` per k-tile. Prologue and tail
+commits are unconditional so the group sequence stays tile-indexed and the
+fixed `wait_group<kStages-1>` is iteration-invariant (a runtime
+wait-count dispatch ladder cost 16 instructions/k-tile). A lean
+`kStages`-deep ring trading the barrier for a 4th resident CTA measured
++5..9% slower at 1280³ and was removed.
+
+**Crosswise loads.** Crosswise operands (A `[K][M]` / B `[N][K]` storage)
+cannot cp.async into the canonical tile; they take the direct LDG.128×4 +
+in-register PRMT transpose + STS.32 path. A staged variant (cp.async into
+K-major staging + per-tile smem→smem transpose) measured 15-20% slower
+across every probed shape including DRAM-streaming B (git history 5745c2f).
+
+**Fast-loop peel.** When both operands are congruous, the whole CTA is
+interior, base|ld is 16B-aligned and K has no tail, the mainloop switches
+to a predication-free copy with loop-carried prefetch state: +4.5..10% on
+the issue-bound 64×64 CTA (256³..1024³), −3% on the 128×128 CTA, so only
+the small CTA opts in.
+
+**Launch planning crossovers** (L20, TFLOPS, big vs alternative):
+crosswise problems keep the 64×64 s3 CTA below ~1.5 waves of 128×128
+tiles (M=256: 129.7 vs 113.1; 1024³: 107.2 vs 94.8; the big CTA wins from
+M=640/1536³ on). Dual-congruous wave band picks narrow vs big by
+`ceil(tiles/sm) * T_tile` with `T_narrow ≈ 0.53 * T_big` (M=384: 134.3 vs
+114.4 narrow wins; M=1024: 202.5 vs 178.8 big wins). Sub-wave: narrow
+wins past ~3/8 of a wave (1024³ 174 vs 131T), the big CTA's operand reuse
+wins past ~5/8 (forcing 64×64 there cost 2048³ 123→171T). Non-128-divisible
+shapes with 64-divisibility take the 64×64 CTA (edge tiles otherwise drag
+the single wave; 1088³: 76 vs 93T). Persistent schedules (static
+round-robin and atomic ticket) both measured worse on L20 (−4..−8%; the
+ticket variant recovers L2 locality but its loop-head barrier costs what
+the CTA-restart overlap saves).
+
+**NN swap.** The dual-N-contiguous problem runs as its transpose
+`E = B^T @ A^T` over swapped operands with an out-transposed epilogue
+scatter (CUTLASS-sm90 `is_swapAB`): one instantiation fewer per tile
+config, at the cost of a scalar-store scatter on a path no LLM-linear
+operand pair hits.
 
 ## Build System
 
@@ -363,7 +435,9 @@ csrc/
 ├── kernels/
 │   ├── common/                       # cross-family pure-CUDA helpers (no torch)
 │   │   ├── device.cuh                #   sm_at_least(), kMinSmForFp8* constants
-│   │   └── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2/x4<T>
+│   │   ├── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2/x4<T>
+│   │   ├── cp_async.cuh              #   cp.async 16B primitives (predicated copy, commit/wait groups)
+│   │   └── reduce.cuh                #   warp_reduce_max, atomic_max_float
 │   ├── attention/                    # attention family (module names keep the attn_* prefix)
 │   │   ├── common.h                  #   AttentionParams POD, TensorLayout enum (BHLD/BLHD)
 │   │   ├── warp_utils.cuh            #   warp reduction helpers
@@ -382,14 +456,21 @@ csrc/
 │   ├── rotary/
 │   │   └── rotary_emb.cu             # rotary embedding (kernel + binding in one file) → module rotary_emb
 │   └── fp8/                          # FP8 family (module name fp8_ops)
-│       ├── common.h                  #   FP8Format enum, Fp8GemmTraits, FP8Params POD (no torch)
-│       ├── gemm.cuh                  #   FP8 device code: quantize + pre-quantized GEMM kernels (no torch)
-│       └── mm.cu                     #   binding only: validation, param packing, launch dispatch, pybind
+│       ├── common.h                  #   FP8Format enum, Fp8GemmTraits, FP8Params / FP8QuantizeParams PODs, layout tags (no torch)
+│       ├── quantize.cuh              #   quantize kernels: vectorized + 32×32-tile transpose (out_layout 0/1/2) (no torch)
+│       ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
+│       ├── gemm/                     #   GEMM device layers (humming/CUTLASS-style split)
+│       │   ├── policy.cuh            #     smem budget / occupancy hint + Fp8GemmPolicy
+│       │   ├── load.cuh              #     operand loaders (swizzle, congruous cp.async, crosswise direct)
+│       │   ├── scheduler.cuh         #     grouped/plain raster mapping
+│       │   ├── mainloop.cuh          #     stage rings + pipelined mma.sync mainloop
+│       │   └── epilogue.cuh          #     fused bias + bf16 scatter + copy-out
+│       └── ops.cu                    #   binding only: validation, param packing, launch dispatch, pybind
 └── tests/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
     ├── attn_test.cu                  # Decode + prefill kernels
     ├── attn_paged_test.cu            # Paged decode/prefill kernels
-    └── fp8_mma_test.cu               # BF16→FP8→BF16 MMA demo
+    └── fp8_test.cu                   # MMA demo + GEMM correctness across layouts/K tiles/ragged shapes
 ```
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
