@@ -11,30 +11,23 @@
 namespace astrai {
 namespace fp8 {
 
-// Compile-time FP8 format: E4M3 (forward / high precision, max 448) or
-// E5M2 (gradient / large dynamic range, max 57344).
+// Compile-time FP8 format: E4M3 (forward, max 448) or E5M2 (gradients,
+// max 57344).
 enum class FP8Format : int {
     E4M3 = 0,
     E5M2 = 1,
 };
 
-// Operand memory layouts as types (CUTLASS-style tags). The tag names the
-// storage order of the raw buffer relative to the operand's canonical GEMM
-// matrix — A is [M][K], B is [K][N]:
-//   A RowMajor = [M][K] storage (K-contiguous rows; the default)
-//   A ColMajor = [K][M] storage (M-contiguous; A^T)
-//   B RowMajor = [K][N] storage (N-contiguous; the plain a @ b operand)
-//   B ColMajor = [N][K] storage (K-contiguous; the nn.Linear weight layout)
-// Empty tags: selection happens by type at compile time (see load_operand_tile).
+// Operand storage tags (CUTLASS-style) relative to the canonical matrices
+// A [M][K] / B [K][N]: A RowMajor = [M][K] (default), A ColMajor = [K][M],
+// B RowMajor = [K][N], B ColMajor = [N][K] (the nn.Linear weight). Selection
+// is by type at compile time (see gemm.cuh's stage loads).
 struct RowMajor {};
 struct ColMajor {};
 
-// Compile-time tile configuration, mirroring KernelTraits<HEAD_DIM, BC,
-// WARPS, STAGES> in the attention kernels. `Fmt` selects the FP8 conversion
-// and the MMA PTX mnemonic; the remaining parameters shape the CTA tile, the
-// warp tile (WarpM x WarpN — e.g. 64x32 on the 128x128 CTA, or 32x32 on the
-// cuBLAS-style 64x64 small CTA that lifts small-shape occupancy) and the
-// cp.async pipeline depth.
+// Compile-time tile configuration, mirroring KernelTraits in the attention
+// kernels: CTA tile, warp tile (WarpM x WarpN — e.g. 64x32 on the 128x128
+// CTA, 32x32 on the 64x64 small CTA) and cp.async pipeline depth.
 template <FP8Format Fmt, int BlockM, int BlockN, int K, int Stages,
           int WarpM = 64, int WarpN = 32>
 struct Fp8GemmTraits {
@@ -50,10 +43,8 @@ struct Fp8GemmTraits {
         kIsE5M2 ? __NV_E5M2 : __NV_E4M3;
     static constexpr float kFp8Max = kIsE5M2 ? 57344.0f : 448.0f;
 
-    // Derived launch geometry: WarpM x WarpN warp tiles tile the CTA. The
-    // shared-memory budget is layout-aware (crosswise operands add K-major
-    // staging + a canonical buffer), so it lives in Fp8GemmSmem in gemm.cuh
-    // together with the resident-CTA hint for __launch_bounds__.
+    // Derived geometry: warp tiles tile the CTA. The smem budget is
+    // layout-aware, so it lives in Fp8GemmSmem (gemm.cuh).
     static constexpr int kWarpsM = BlockM / WarpM;
     static constexpr int kWarpsN = BlockN / WarpN;
     static constexpr int kCtaThreads = kWarpsM * kWarpsN * 32;
@@ -63,73 +54,54 @@ struct Fp8GemmTraits {
                   "warp tile must be a multiple of the m16n8 MMA shape");
 };
 
-// Quantize-kernel parameter POD: float input (bf16 / fp16 / fp32) -> FP8
-// with fused amax.
+// Quantize-kernel parameter POD: float input -> FP8 with fused amax.
 struct FP8QuantizeParams {
-    // Float input and FP8 output buffers; scale is the quantization
-    // multiplier (device scalar). amax (may be null) is zero-initialized by
-    // the binding and receives the raw-domain absolute maximum.
     const void* __restrict__ input_ptr = nullptr;
     void* __restrict__ output_ptr = nullptr;
-    void* __restrict__ output_transposed_ptr = nullptr;
-    // Transposed-output destination ([cols][rows]); the output-layout modes:
-    //   0 = row-major only (output_ptr; the vectorized elementwise kernel)
-    //   1 = transposed only (output_transposed_ptr; the tiled kernel)
-    //   2 = both destinations in one read of the input (the tiled kernel)
-    // Modes 1/2 exist so crosswise-layout GEMM operands (NN grad_x, TT
-    // grad_w) can be produced K-contiguous instead, routing every training
-    // GEMM through the dual-congruous NT fast path.
+    void* __restrict__ output_transposed_ptr = nullptr;  // [cols][rows]
+    // Output layout: 0 = row-major only, 1 = transposed only, 2 = both from
+    // a single read. Modes 1/2 produce K-contiguous operands so crosswise
+    // consumers (backward grad_x / grad_w) route through the NT fast path.
     int out_layout = 0;
 
-    const float* __restrict__ scale = nullptr;
-    float* __restrict__ amax = nullptr;
+    const float* __restrict__ scale = nullptr;  // device multiplier
+    float* __restrict__ amax = nullptr;         // raw-domain max out
 
-    // Element count (only the elementwise quantize kernel uses it); the
-    // tiled kernel views the same buffer as [rows][cols] row-major.
+    // Element count (elementwise kernel); the tiled kernel views the same
+    // buffer as [rows][cols] row-major.
     int total = 0;
     int rows = 0;
     int cols = 0;
 };
 
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
-// through the pre-quantized GEMM kernels. Each kernel touches only the
-// fields it needs; buffers are raw pointers packed by the torch binding.
-// Pointer members default to null so optional paths cannot hold garbage.
+// through the kernels; each kernel touches only the fields it needs.
 struct FP8Params {
-    // Inputs: a/b are FP8 for the pre-quantized path. Scales are
-    // quantization steps (device scalars).
-    // Optional bf16 bias broadcast over output rows (fused into the epilogue
-    // before the bf16 rounding, so it adds in fp32 — one rounding fewer than
-    // the separate out + bias elementwise kernel it replaces). Null disables.
+    // FP8 operands + output; scales are quantization steps (device
+    // scalars). Optional bf16 bias fuses into the epilogue (fp32 add before
+    // the single bf16 rounding); null disables.
     const void* __restrict__ a_ptr = nullptr;
     const void* __restrict__ b_ptr = nullptr;
     const void* __restrict__ bias_ptr = nullptr;
     void* __restrict__ out_ptr = nullptr;
 
     const float* __restrict__ scale = nullptr;
-    // Transposed-output mode (set by dispatch_fp8_gemm's swap for NN
-    // problems): the kernel computes E[N'][M'] over swapped operands and the
-    // epilogue scatters into the caller's [M][N] row-major buffer, so
-    // D[row][col] lives at out[col * p.m + row] — p.m/p.n are the swapped
-    // problem's dims and the D row stride is p.m. Zero in the plain
-    // orientation.
+    // NN-swap mode (canonicalize_gemm): the kernel computes the transposed
+    // problem and the epilogue scatters D[row][col] to out[col * p.m + row]
+    // in the caller's [M][N] buffer. Zero in the plain orientation.
     int out_transposed = 0;
-    // Shapes. `int` covers every realistic LLM shape; the kernels promote
-    // to int64 for all pointer arithmetic.
-    int m, n, k;
+    int m, n, k;  // int covers LLM shapes; kernels promote to int64
 
-    // Batched (bmm) geometry: grid.z slices step the operand/output pointers
-    // by these element strides (0 broadcasts the operand across batches).
+    // Batched (bmm) geometry: grid.z steps these element strides (0
+    // broadcasts the operand across batches).
     int batch = 1;
     int64_t a_batch_stride = 0;
     int64_t b_batch_stride = 0;
     int64_t out_batch_stride = 0;
 
-    // Physical leading dimensions (column count, i.e. row stride) of A and
-    // B. For a non-transposed operand the stride equals the contract dim;
-    // for a transposed operand it is the operand's own column count. The
-    // binding packs these so the kernel reads both buffers either naturally
-    // or transposed depending on the LayoutA/LayoutB tags (see gemm.cuh).
+    // Physical leading dims (row strides) of A and B; the binding packs
+    // them so the kernel reads each buffer naturally or transposed per the
+    // LayoutA/LayoutB tags.
     int a_ld, b_ld;
 };
 

@@ -1,10 +1,7 @@
 #pragma once
-// FP8 quantize device code — pure CUDA, no torch. Any float input element
-// type (bf16 / fp16 / fp32) converts to E4M3 or E5M2 with a fused amax over
-// the raw (unscaled) values. Mirrors the GEMM file's split: kernels take the
-// FP8QuantizeParams POD, formats and input types ride on template parameters,
-// and the launcher is a plain function usable from both the torch binding and
-// pure C tests.
+// FP8 quantize device code — pure CUDA, no torch: kernels take the
+// FP8QuantizeParams POD, format and input type ride on template parameters,
+// and the launcher is shared by the torch binding and the C tests.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -18,8 +15,8 @@
 namespace astrai {
 namespace fp8 {
 
-// Input element type traits: one element -> float, and the vectorized
-// unpack of one 16-byte load into kVecElems floats.
+// Input element type traits: one element -> float, and the unpack of one
+// 16-byte load into kVecElems floats.
 template <typename InT>
 struct quant_in_traits;
 
@@ -31,12 +28,13 @@ struct quant_in_traits<__nv_bfloat16> {
     }
     static __device__ __forceinline__ void load_vec(const uint4& raw,
                                                     float* f) {
-        const unsigned w[4] = {raw.x, raw.y, raw.z, raw.w};
+        const __nv_bfloat162* b2 =
+            reinterpret_cast<const __nv_bfloat162*>(&raw);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            f[2 * j] =
-                __bfloat162float(__ushort_as_bfloat16(w[j] & 0xffffu));
-            f[2 * j + 1] = __bfloat162float(__ushort_as_bfloat16(w[j] >> 16));
+            const float2 p = __bfloat1622float2(b2[j]);
+            f[2 * j] = p.x;
+            f[2 * j + 1] = p.y;
         }
     }
 };
@@ -65,15 +63,22 @@ struct quant_in_traits<float> {
     static __device__ __forceinline__ float to_float(float v) { return v; }
     static __device__ __forceinline__ void load_vec(const uint4& raw,
                                                     float* f) {
-        f[0] = __uint_as_float(raw.x);
-        f[1] = __uint_as_float(raw.y);
-        f[2] = __uint_as_float(raw.z);
-        f[3] = __uint_as_float(raw.w);
+        const unsigned* w = reinterpret_cast<const unsigned*>(&raw);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) f[j] = __uint_as_float(w[j]);
     }
 };
 
-// Convert one float pair to one packed fp8 pair. The stored bytes see
-// value * mult (round-nearest-even + satfinite).
+// One float -> one fp8 byte (round-nearest-even + satfinite).
+template <FP8Format Fmt>
+__device__ __forceinline__ uint8_t cvt_fp8(float v) {
+    if constexpr (Fmt == FP8Format::E5M2)
+        return __nv_fp8_e5m2(v).__x;
+    else
+        return __nv_fp8_e4m3(v).__x;
+}
+
+// One float pair -> one packed fp8x2 word (round-nearest-even + satfinite).
 template <FP8Format Fmt>
 __device__ __forceinline__ unsigned cvt_fp8x2(float a, float b) {
     constexpr __nv_fp8_interpretation_t kFmt =
@@ -82,23 +87,36 @@ __device__ __forceinline__ unsigned cvt_fp8x2(float a, float b) {
         make_float2(a, b), __NV_SATFINITE, kFmt));
 }
 
-// Quantize kernel: float input -> FP8 (E4M3 or E5M2), fused amax over raw
-// values.
+// Block-wide amax reduce -> one atomic per block: warp-reduce, park one
+// value per warp, thread 0 folds. kWarps must cover the block's warp count.
+template <int kWarps>
+__device__ __forceinline__ void publish_amax(float* amax, float v) {
+    v = warp_reduce_max(v);
+    __shared__ float slots[kWarps];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    if ((tid & 31) == 0) slots[tid >> 5] = v;
+    __syncthreads();
+    if (tid == 0) {
+#pragma unroll
+        for (int w = 1; w < kWarps; ++w) v = fmaxf(v, slots[w]);
+        atomic_max_float(amax, v);
+    }
+}
+
+// Elementwise quantize kernel (out_layout 0): vectorized 16B loads -> fp8
+// stores, fused amax over raw values.
 template <FP8Format Fmt, typename InT>
 __global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
     const float mult = *p.scale;
     const auto* x = static_cast<const InT*>(p.input_ptr);
-    void* x8 = p.output_ptr;
-    float* amax = p.amax;
+    uint8_t* x8 = static_cast<uint8_t*>(p.output_ptr);
     float local_amax = 0.0f;
     const int64_t stride = (int64_t)blockDim.x * gridDim.x;
 
-    // Vectorized body: one 16B load -> kVecElems fp8 bytes per step (8
-    // elements for 16-bit inputs, 4 for fp32). Torch allocations are >=16B
-    // aligned and the binding passes freshly allocated contiguous buffers,
-    // so element 0 keeps the uint4 access natural; a misaligned base
-    // (contiguous view with an odd storage offset) falls back to the scalar
-    // loop below via total_vec = 0.
+    // One 16B load -> kVecElems bytes per step. Torch allocations are >=16B
+    // aligned, so element 0 keeps the uint4 access natural; a misaligned
+    // base (odd storage offset view) falls to the scalar tail via
+    // total_vec = 0.
     constexpr int kVecElems = quant_in_traits<InT>::kVecElems;
     const bool aligned =
         ((reinterpret_cast<uintptr_t>(x) |
@@ -125,8 +143,7 @@ __global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
             packed[j] = (lo & 0xffffu) | (hi << 16);
         }
         if constexpr (kVecElems == 8)
-            reinterpret_cast<uint2*>(x8)[i] =
-                make_uint2(packed[0], packed[1]);
+            reinterpret_cast<uint2*>(x8)[i] = make_uint2(packed[0], packed[1]);
         else
             reinterpret_cast<unsigned*>(x8)[i] = packed[0];
     }
@@ -136,51 +153,20 @@ __global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
          i < p.total; i += stride) {
         const float v = quant_in_traits<InT>::to_float(x[i]);
         local_amax = fmaxf(local_amax, fabsf(v));
-        if constexpr (Fmt == FP8Format::E5M2) {
-            reinterpret_cast<__nv_fp8_e5m2*>(x8)[i] =
-                __nv_fp8_e5m2(v * mult);
-        } else {
-            reinterpret_cast<__nv_fp8_e4m3*>(x8)[i] =
-                __nv_fp8_e4m3(v * mult);
-        }
+        x8[i] = cvt_fp8<Fmt>(v * mult);
     }
-    if (amax) {
-        local_amax = warp_reduce_max(local_amax);
-        __shared__ float slots[32];
-        if ((threadIdx.x & 31) == 0) slots[threadIdx.x >> 5] = local_amax;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float v = 0.0f;
-            for (int w = 0; w < (blockDim.x >> 5); ++w)
-                v = fmaxf(v, slots[w]);
-            atomic_max_float(amax, v);
-        }
-    }
+    if (p.amax) publish_amax<8>(p.amax, local_amax);
 }
 
-template <FP8Format Fmt, typename InT>
-void launch_fp8_quantize(const FP8QuantizeParams& p, cudaStream_t stream) {
-    constexpr int kThreads = 256;
-    // One block per 256 vectors; at least one block so the scalar tail of a
-    // tiny / misaligned tensor is still covered.
-    constexpr int kVecElems = quant_in_traits<InT>::kVecElems;
-    int64_t blocks = (p.total / kVecElems + kThreads - 1) / kThreads;
-    if (blocks < 1) blocks = 1;
-    fp8_quantize_kernel<Fmt, InT><<<blocks, kThreads, 0, stream>>>(p);
-}
-
-// Tiled transpose quantize (out_layout 1/2): reads the [rows][cols]
-// row-major input once and writes the fp8 bytes transposed ([cols][rows],
-// so the contract dim lands K-contiguous for NT GEMM operands) and, in
-// mode 2, the plain row-major copy too. A 32x32 tile stages through shared
-// memory: input-row-major loads and output writes both stay coalesced, and
-// the byte-wide staging is conflict-free — the +4 pad makes the store
-// stride 9 (words) coprime with the 32 banks and the load is a 32-byte
-// broadcast segment. A 64x64 split-half variant (16 elems/thread, paired
-// 2-byte scatter stores) measured +21% on L2-resident shapes but -3..5%
-// on the DRAM-bound ones that carry the training traffic (occupancy and
-// memory-level parallelism, not instruction count, gate the DRAM regime);
-// weighted by the real step's mix the two tie, so the simpler tile stays.
+// Tiled transpose quantize (out_layout 1/2): reads the [rows][cols] input
+// once and writes the fp8 bytes transposed ([cols][rows], so the contract
+// dim lands K-contiguous for NT GEMM operands) and, in mode 2, the row-major
+// copy too. A 32x32 tile stages through shared memory: loads and writes
+// both stay coalesced, and the byte-wide staging is conflict-free — the +4
+// pad makes the store stride 9 words (coprime with the 32 banks) and the
+// read is a 32-byte broadcast segment. (A 64x64 split-half variant measured
+// +21% L2-resident but -3..5% DRAM-bound; the real step mix ties, so the
+// simpler tile stays.)
 template <FP8Format Fmt, typename InT>
 __global__ void fp8_quantize_tiled_kernel(FP8QuantizeParams p) {
     constexpr int kTile = 32;
@@ -201,10 +187,7 @@ __global__ void fp8_quantize_tiled_kernel(FP8QuantizeParams p) {
             const float v =
                 quant_in_traits<InT>::to_float(x[(int64_t)(r + j) * p.cols + c]);
             local_amax = fmaxf(local_amax, fabsf(v));
-            if constexpr (Fmt == FP8Format::E5M2)
-                q[j] = __nv_fp8_e5m2(v * mult).__x;
-            else
-                q[j] = __nv_fp8_e4m3(v * mult).__x;
+            q[j] = cvt_fp8<Fmt>(v * mult);
         }
     }
     if (p.out_layout == 2) {
@@ -218,9 +201,9 @@ __global__ void fp8_quantize_tiled_kernel(FP8QuantizeParams p) {
     for (int j = 0; j < 4; ++j) tile[threadIdx.x][threadIdx.y * 4 + j] = q[j];
     __syncthreads();
     // Transposed scatter: output element (c, r) lives at c * rows + r; r
-    // tracks threadIdx.x so each warp writes one contiguous run. The read
-    // swaps the staging indices — tile[col][row] was written, so the value
-    // for input (r0+tx, c0+ty*4+j) sits at tile[ty*4+j][tx].
+    // tracks threadIdx.x so each warp writes one contiguous run. tile was
+    // written as tile[col][row], so input (r0+tx, c0+ty*4+j) reads back
+    // from tile[ty*4+j][tx].
     uint8_t* out_t = static_cast<uint8_t*>(p.output_transposed_ptr);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -229,28 +212,27 @@ __global__ void fp8_quantize_tiled_kernel(FP8QuantizeParams p) {
             out_t[(int64_t)oc * p.rows + r0 + threadIdx.x] =
                 tile[threadIdx.y * 4 + j][threadIdx.x];
     }
-    if (p.amax) {
-        local_amax = warp_reduce_max(local_amax);
-        __shared__ float slots[8];
-        // blockDim.x is 32, so warp id == threadIdx.y; only complete warps
-        // exist (blockDim.y == 8).
-        if (threadIdx.x == 0) slots[threadIdx.y] = local_amax;
-        __syncthreads();
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            float v = 0.0f;
-            for (int w = 0; w < (int)blockDim.y; ++w) v = fmaxf(v, slots[w]);
-            atomic_max_float(p.amax, v);
-        }
-    }
+    if (p.amax) publish_amax<8>(p.amax, local_amax);
 }
 
-template <FP8Format Fmt, typename InT>
-void launch_fp8_quantize_tiled(const FP8QuantizeParams& p,
-                               cudaStream_t stream) {
-    const dim3 grid((p.cols + 31) / 32, (p.rows + 31) / 32);
-    if (grid.x == 0 || grid.y == 0) return;
-    fp8_quantize_tiled_kernel<Fmt, InT>
-        <<<grid, dim3(32, 8), 0, stream>>>(p);
+// Unified quantize launcher: Tiled selects the transpose kernel (out_layout
+// 1/2) over the vectorized elementwise one.
+template <FP8Format Fmt, typename InT, bool Tiled = false>
+void launch_fp8_quantize(const FP8QuantizeParams& p, cudaStream_t stream) {
+    if constexpr (Tiled) {
+        const dim3 grid((p.cols + 31) / 32, (p.rows + 31) / 32);
+        if (grid.x == 0 || grid.y == 0) return;
+        fp8_quantize_tiled_kernel<Fmt, InT>
+            <<<grid, dim3(32, 8), 0, stream>>>(p);
+    } else {
+        constexpr int kThreads = 256;
+        constexpr int kVecElems = quant_in_traits<InT>::kVecElems;
+        // One block per 256 vectors; at least one block so a tiny or
+        // misaligned tensor's scalar tail is still covered.
+        int64_t blocks = (p.total / kVecElems + kThreads - 1) / kThreads;
+        if (blocks < 1) blocks = 1;
+        fp8_quantize_kernel<Fmt, InT><<<blocks, kThreads, 0, stream>>>(p);
+    }
 }
 
 }  // namespace fp8

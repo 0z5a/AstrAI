@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <mutex>
-#include <tuple>
 #include <unordered_map>
 
 #include "../common/device.cuh"
@@ -46,32 +45,13 @@ void check_scale(const torch::Tensor& scale, const torch::Tensor& input) {
                 "scale must be a CUDA float32 scalar on the input device");
 }
 
-void pack_gemm(FP8Params& p, const void* a, const void* b, void* output,
-               const torch::Tensor& scale, int64_t m, int64_t n, int64_t k,
-               int64_t a_ld, int64_t b_ld) {
-    p.a_ptr = a;
-    p.b_ptr = b;
-    p.out_ptr = output;
-    p.scale = scale.data_ptr<float>();
-    p.m = static_cast<int>(m);
-    p.n = static_cast<int>(n);
-    p.k = static_cast<int>(k);
-    p.a_ld = static_cast<int>(a_ld);
-    p.b_ld = static_cast<int>(b_ld);
-}
-
-// Layout dispatch (the NN swap in canonicalize_gemm) and launch planning
-// (plan_gemm/launch_plan) live in gemm.cuh behind fp8::gemm — pure CUDA,
-// shared with the C test suite.
-
 // Inner-layout resolution for one GEMM operand. The user flag names the
-// math (0 = tensor's last two dims are [rows][contract], 1 = transposed);
-// the storage may independently be a col-major view (.t() of a contiguous
+// math (0 = last two dims are [rows][contract], 1 = transposed); the
+// storage may independently be a col-major view (.t() of a contiguous
 // buffer), which folds into the returned dispatch flag at zero copy — the
 // kernel's LayoutA/LayoutB tags cover both storages. m/n/k derive from the
-// user flag only; the fold never swaps them (see the layout table in
-// gemm.cuh). Tensors whose inner dims are neither natural layout fall back
-// to .contiguous().
+// user flag only. Tensors whose inner dims are neither natural layout fall
+// back to .contiguous().
 bool resolve_operand(const torch::Tensor& t_in, bool flag, int64_t& ld,
                      int64_t& batch_stride, torch::Tensor& storage) {
     torch::Tensor t = t_in;
@@ -89,43 +69,36 @@ bool resolve_operand(const torch::Tensor& t_in, bool flag, int64_t& ld,
     return flag ^ col_major;
 }
 
-// Dtype x format switch shared by both quantize kernels; Tiled selects the
-// transpose kernel (out_layout 1/2) over the vectorized elementwise one.
-template <bool Tiled, FP8Format Fmt, typename InT>
-void launch_one(const FP8QuantizeParams& p, cudaStream_t stream) {
-    if constexpr (Tiled)
-        launch_fp8_quantize_tiled<Fmt, InT>(p, stream);
-    else
-        launch_fp8_quantize<Fmt, InT>(p, stream);
+// Dtype dispatch over the unified quantize launcher.
+template <bool Tiled, FP8Format Fmt>
+void launch_for_dtype(const torch::Tensor& x, const FP8QuantizeParams& p,
+                      cudaStream_t stream) {
+    switch (x.scalar_type()) {
+    case torch::kHalf:
+        launch_fp8_quantize<Fmt, __half, Tiled>(p, stream);
+        break;
+    case torch::kFloat32:
+        launch_fp8_quantize<Fmt, float, Tiled>(p, stream);
+        break;
+    default:
+        launch_fp8_quantize<Fmt, __nv_bfloat16, Tiled>(p, stream);
+    }
 }
 
 template <bool Tiled>
 void launch_quantize_for(const torch::Tensor& x, const FP8QuantizeParams& p,
                          bool e5m2, cudaStream_t stream) {
-    if (x.scalar_type() == torch::kHalf) {
-        if (e5m2)
-            launch_one<Tiled, FP8Format::E5M2, __half>(p, stream);
-        else
-            launch_one<Tiled, FP8Format::E4M3, __half>(p, stream);
-    } else if (x.scalar_type() == torch::kFloat32) {
-        if (e5m2)
-            launch_one<Tiled, FP8Format::E5M2, float>(p, stream);
-        else
-            launch_one<Tiled, FP8Format::E4M3, float>(p, stream);
-    } else {
-        if (e5m2)
-            launch_one<Tiled, FP8Format::E5M2, __nv_bfloat16>(p, stream);
-        else
-            launch_one<Tiled, FP8Format::E4M3, __nv_bfloat16>(p, stream);
-    }
+    if (e5m2)
+        launch_for_dtype<Tiled, FP8Format::E5M2>(x, p, stream);
+    else
+        launch_for_dtype<Tiled, FP8Format::E4M3>(x, p, stream);
 }
 
 }  // namespace
 
-// Output-layout dispatch: 0 = [rows][cols] row-major (the historic 2-tuple
-// return), 1 = transposed [cols][rows] only (2-tuple), 2 = both orientations
-// from a single read of the input (3-tuple). Layouts 1/2 feed the NT GEMM
-// fast path from crosswise consumers (backward grad_x / grad_w).
+// Output-layout dispatch: 0 = [rows][cols] row-major (2-tuple return),
+// 1 = transposed [cols][rows] only (2-tuple), 2 = both orientations from a
+// single read (3-tuple). Layouts 1/2 feed the NT GEMM fast path.
 py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
                     int64_t layout) {
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
@@ -219,8 +192,15 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
             ? torch::empty({batch, m, n}, a.options().dtype(torch::kBFloat16))
             : torch::empty({m, n}, a.options().dtype(torch::kBFloat16));
     FP8Params p;
-    pack_gemm(p, a_st.data_ptr(), b_st.data_ptr(), output.data_ptr(), scale,
-              m, n, k, a_ld, b_ld);
+    p.a_ptr = a_st.data_ptr();
+    p.b_ptr = b_st.data_ptr();
+    p.out_ptr = output.data_ptr();
+    p.scale = scale.data_ptr<float>();
+    p.m = static_cast<int>(m);
+    p.n = static_cast<int>(n);
+    p.k = static_cast<int>(k);
+    p.a_ld = static_cast<int>(a_ld);
+    p.b_ld = static_cast<int>(b_ld);
     // Fused epilogue bias (bf16, broadcast over rows and batches). An
     // undefined or 0-element tensor keeps the plain scaled output.
     if (bias.defined() && bias.numel() > 0) {
@@ -243,9 +223,8 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
     return output;
 }
 
-// mm_fp8 binding: Python None and an omitted argument both mean "no bias"
-// (resolved to an undefined tensor here, so every Python layer can pass its
-// bias argument through untouched instead of normalizing it host-side).
+// mm_fp8 binding: Python None and an omitted argument both mean "no bias",
+// so every Python layer can pass its bias argument through untouched.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"),
           py::arg("fmt"), py::arg("layout") = 0);
