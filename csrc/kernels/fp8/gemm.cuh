@@ -1088,31 +1088,71 @@ struct Fp8GemmPlan {
     bool small_s3;  // kSmall64 only: cp.async pipeline depth (2 vs 3 stages)
 };
 
-inline Fp8GemmPlan plan_gemm(const FP8Params& p) {
+// crosswise_ops: how many operands take the direct crosswise load (A
+// ColMajor storage / B RowMajor storage, see Fp8GemmSmem). 0 = the
+// dual-congruous NT problem, 1 = TN and the NN swap, 2 = TT. The layout
+// shifts the crossovers: the small CTA hides the crosswise LDG+PRMT
+// latency far better (more resident CTAs, deeper pipeline), while the big
+// CTA's operand reuse mostly buys back load bandwidth the crosswise path
+// does not traffic in.
+inline Fp8GemmPlan plan_gemm(const FP8Params& p, int crosswise_ops = 0) {
     const int64_t sm = device_sm_count();
     const int64_t tiles_128 =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
     const auto small = [&](bool s3) {
         return Fp8GemmPlan{Fp8GemmPlan::Cta::kSmall64, s3};
     };
-    // Padding rules first: predication waste beats any wave-fill effect.
-    if (small_cta_padding(p.m, p.n)) return small(false);
-    // Past the sub-wave band the 128x128 CTA wins on operand reuse (each A
-    // element multiplies 128 B columns in-CTA) and per-CTA pipeline depth:
-    // forcing the 64x64 CTA there measured 2048^3 123->171 TF on L20 and
-    // 164 vs 308T on sm_120.
-    if (tiles_128 >= sm * 5 / 8)
+    const auto big = [] {
         return Fp8GemmPlan{Fp8GemmPlan::Cta::kBig128, false};
-    // Sub-wave band: the 128x64 narrow CTA (8 warps of 32x32) fills the
-    // wave with N-tiles at full warp depth — measured sm_120, it beats the
-    // small CTA by +7..77% across the band once the narrow grid passes ~3/8
-    // of a wave (128x4096 132 vs 123T, 1024^3 174 vs 131T, 4096x384 242 vs
-    // 147T, 8192x128 233 vs 131T); below that fill the plain 64x64 CTA's
-    // extra parallelism wins (2048x128: small 99 vs 87T).
+    };
+    const auto narrow = [] {
+        return Fp8GemmPlan{Fp8GemmPlan::Cta::kNarrow128x64, false};
+    };
+    // Padding rules first: predication waste beats any wave-fill effect.
+    if (small_cta_padding(p.m, p.n)) return small(crosswise_ops > 0);
+    if (crosswise_ops > 0) {
+        // Crosswise ladder (L20 measured, N=K=4096 band + squares): the
+        // narrow CTA never wins — below the wave band the small CTA beats
+        // it (M=128: 82.8 vs 72.3T), above it the big CTA does. The small
+        // s3 CTA holds ~3/4 of the big CTA's per-SM throughput but tiles 4x
+        // finer, so it owns the whole sub-wave band and past it: +15% at
+        // M=256 (129.7 vs 113.1), +17% at M=384, +13% at 1024^3 (107.2 vs
+        // 94.8). The big CTA takes over once its grid fills ~1.5 waves:
+        // +18% at 1536^3 (134.4 vs 114.0), +20% at M=640 (161.2 vs 134.4);
+        // the 1.5-wave boundary itself is within noise either way (M=512:
+        // 133.8 vs 129.7 small; M=768: 135.8 vs 132.8 small).
+        if (tiles_128 >= sm * 3 / 2) return big();
+        return small(true);
+    }
+    if (tiles_128 >= sm) {
+        // Wave band: pick by the wave-quantization cost ceil(tiles/sm) *
+        // T_tile. The narrow tile carries half the big tile's MMA work at
+        // ~94% of its per-SM efficiency, i.e. T_narrow ~= 0.53 * T_big
+        // (L20 measured; integer-scaled by 100 below). This formula
+        // reproduces every measured crossover: narrow wins the poor-fill
+        // big grids (M=384: 134.3 vs 114.4, M=512: 171.7 vs 152.5, M=768:
+        // 164.6 vs 153.7), the big CTA wins the well-filled ones (M=640:
+        // 187.7 vs 167.3, M=1024: 202.5 vs 178.8, 4096^3: 210.7 vs 192.5).
+        const int64_t tiles_narrow =
+            (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 63) / 64);
+        const auto waves = [sm](int64_t tiles) { return (tiles + sm - 1) / sm; };
+        if (waves(tiles_narrow) * 53 < waves(tiles_128) * 100) return narrow();
+        return big();
+    }
+    // Sub-wave band: the 128x64 narrow CTA fills the wave with N-tiles at
+    // full warp depth — measured sm_120, it beats the small CTA by +7..77%
+    // across the band once the narrow grid passes ~3/8 of a wave (128x4096
+    // 132 vs 123T, 1024^3 174 vs 131T, 4096x384 242 vs 147T, 8192x128 233
+    // vs 131T); below that fill the plain 64x64 CTA's extra parallelism
+    // wins (2048x128: small 99 vs 87T). Past ~5/8 of a wave of 128x128
+    // tiles the big CTA's operand reuse wins instead (each A element
+    // multiplies 128 B columns in-CTA; L20 M=256: 143.7 vs 135.0 narrow,
+    // 1024^3: 115.7 vs 113.3; forcing the 64x64 CTA there measured 2048^3
+    // 123->171 TF on L20 and 164 vs 308T on sm_120).
+    if (tiles_128 >= sm * 5 / 8) return big();
     const int64_t tiles_narrow =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 63) / 64);
-    if (tiles_narrow >= sm * 3 / 8)
-        return Fp8GemmPlan{Fp8GemmPlan::Cta::kNarrow128x64, false};
+    if (tiles_narrow >= sm * 3 / 8) return narrow();
     // Full-ring small CTAs — ONE __syncthreads per k-tile, cuBLAS's barrier
     // structure. Two depths by grid shape: the 24KB 3-slot s2 variant keeps
     // 4 CTAs/SM while the whole grid stays resident (<= one 3-CTA wave);
@@ -1214,7 +1254,10 @@ inline void canonicalize_gemm(FP8Params& p, bool& trans_a, bool& trans_b) {
 template <FP8Format Fmt>
 void gemm(FP8Params p, cudaStream_t stream, bool trans_a, bool trans_b) {
     canonicalize_gemm(p, trans_a, trans_b);
-    const Fp8GemmPlan plan = plan_gemm(p);
+    // Crosswise operand count for the plan: transposed-A storage (ColMajor)
+    // and plain-B storage (RowMajor) both take the direct crosswise load.
+    const int crosswise = (trans_a ? 1 : 0) + (trans_b ? 0 : 1);
+    const Fp8GemmPlan plan = plan_gemm(p, crosswise);
     if (trans_a && trans_b)
         launch_plan<Fmt, ColMajor, ColMajor, 8>(p, plan, stream);
     else if (trans_b)
