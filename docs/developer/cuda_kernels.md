@@ -305,7 +305,7 @@ cycle belong under `TYPE_CHECKING`.
 
 - **`AttentionBackend`** (ABC): `fwd_decode` / `fwd_prefill` abstract methods, `forward` dispatches by q_len
 - **`CudaBackend`**: CUDA kernel dispatch — decode via `attn_paged_decode` (page_size=1), prefill via `attn_paged_prefill` (ragged batch, `qo_indptr` + `kv_indptr`). Default on GPU.
-- **`FlashAttnBackend`**: Optional flash-attn dispatch with `flash_attn_with_kvcache` fast path.
+- **`FlashAttnBackend`**: Optional flash-attn dispatch via `flash_attn_varlen_func` over gathered flat K/V.
 - **`TorchNativeBackend`**: SDPA with indirect KV cache gather (always-available fallback)
 
 Default priority: cuda > flash > torch. Set ``ASTR_BACKEND=cuda|torch_native|flash``
@@ -415,7 +415,7 @@ nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
 Test files:
 - `attn_test.cu` — decode + prefill kernels (correctness tables + benchmarks)
 - `attn_paged_test.cu` — paged decode/prefill kernels
-- `fp8_mma_test.cu` — BF16→FP8→BF16 MMA demo (sm_89)
+- `fp8_test.cu` — single-warp bf16→fp8→mma.sync sanity check + full FP8 GEMM correctness (sm_89)
 
 ## Benchmarks
 
@@ -482,4 +482,4 @@ csrc/
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-> Document Update Time: 2026-08-22
+> Document Update Time: 2026-08-29

@@ -694,12 +694,13 @@ class CudaBackend(AttentionBackend):
 class FlashAttnBackend(AttentionBackend):
     """FlashAttention backend via the optional ``flash-attn`` package.
 
-    Decode (q_len=1, contiguous cache): uses ``flash_attn_with_kvcache``,
-    which reads K/V directly from the flat pool via cache_batch_idx +
-    cache_seqlens — no materialized KV gather.
+    Decode (q_len=1, contiguous cache): writes K/V to the pool, gathers
+    flat K/V via the ``req_to_token`` page table, and calls
+    ``flash_attn_varlen_func`` over the ragged batch
+    (``qo_indptr``/``kv_indptr``).
 
-    Prefill / non-contiguous decode: falls back to KV gather +
-    ``flash_attn_func``.
+    Prefill: packed 3-D calls share the ``flash_attn_varlen_func`` path;
+    dense 4-D calls go through ``flash_attn_func`` (mask-free only).
     """
 
     @classmethod

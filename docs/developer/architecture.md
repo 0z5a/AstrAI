@@ -4,7 +4,7 @@
 
 - [Class Diagram](#class-diagram) — Full Mermaid class diagram across 10+ namespaces
 - [Module Overview](#module-overview) — Component inventory per module
-- [Design Patterns](#design-patterns) — 15 documented patterns with classes
+- [Design Patterns](#design-patterns) — 16 documented patterns with classes
 - [Core Relationships](#core-relationships) — 11 key inter-component relationships
 
 ## Class Diagram
@@ -816,8 +816,8 @@ classDiagram
 
         class Executor {
             +AutoModel model
-            +AutoTokenizer tokenizer
             +PagePool kv_cache
+            +TaskCacheManager task_cache
             +InferenceWorkspace _workspace
             +Optional[str] device
             +Optional[torch.dtype] dtype
@@ -845,6 +845,7 @@ classDiagram
 
         class InferenceScheduler {
             +PagePool _cache
+            +TaskCacheManager _task_cache
             +Executor _executor
             +TaskManager _task_mgr
             +Event _stop_event
@@ -888,6 +889,24 @@ classDiagram
             +release(pages)
         }
 
+        class AllocationStrategy {
+            <<abstract>>
+            +alloc(state, prompt_ids) bool
+            +free(state)
+            +extend(state, pos) bool
+            +write_indices(state, prompt_ids)
+            +record_hashes(state, prompt_ids, start_logical_page)
+        }
+
+        class ContiguousStrategy {
+            +write_indices(state, prompt_ids)
+        }
+
+        class PagedStrategy {
+            -Allocator _alloc
+            -RadixCache _prefix
+        }
+
         class KVStorage {
             +int size
             +Tensor k_buffer
@@ -926,14 +945,21 @@ classDiagram
             +bool contiguous
             -KVStorage _storage
             -ReqToTokenPool _req_pool
-            -Allocator _alloc
-            -RadixCache _prefix
+            -AllocationStrategy _strategy
+            +strategy AllocationStrategy
+            +req_pool ReqToTokenPool
+            +bind_tasks(req_indices, seq_lens, workspace, device, start_pos, incremental) KVCache
+        }
+
+        class TaskCacheManager {
+            -PagePool _pool
+            -Dict _states
             +task_alloc(task_id, prompt_ids) bool
             +task_free(task_id)
             +task_extend(task_id, pos) bool
             +task_cached(task_id) int
             +task_record_hashes(task_id, prompt_ids, start_logical_page)
-            +bind_tasks(task_ids, workspace, device, start_pos) KVCache
+            +bind(task_ids, workspace) KVCache
         }
 
     class Task {
@@ -1316,17 +1342,22 @@ classDiagram
     PositionIdStrategy <|-- DocResetPositionId
     PositionIdStrategy <|-- ContinuousPositionId
     StoreWriter <|-- BinWriter
+    AllocationStrategy <|-- ContiguousStrategy
+    AllocationStrategy <|-- PagedStrategy
     RawRollout <|-- RolloutResult
     LaunchStrategy <|-- TorchrunStrategy
     LaunchStrategy <|-- LocalStrategy
     %% --- Composition (strong ownership, part destroyed with whole) ---
     PagePool *-- KVStorage
     PagePool *-- ReqToTokenPool
-    PagePool *-- Allocator
-    PagePool *-- RadixCache
+    PagePool *-- AllocationStrategy
+    PagedStrategy *-- Allocator
+    PagedStrategy *-- RadixCache
+    TaskCacheManager o-- PagePool
     RadixCache *-- RadixNode
     InferenceEngine *-- InferenceScheduler
     InferenceScheduler *-- PagePool
+    InferenceScheduler *-- TaskCacheManager
     InferenceScheduler *-- Executor
     Executor *-- InferenceWorkspace
     InferenceScheduler *-- TaskManager
@@ -1419,7 +1450,7 @@ classDiagram
     Task --> TaskStatus
     InferenceEngine --> AutoModel
     Executor --> AutoModel
-    Executor --> AutoTokenizer
+    Executor --> TaskCacheManager
     TaskManager --> AutoTokenizer
 
 ```
@@ -1436,7 +1467,7 @@ classDiagram
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, RolloutGenerator, RolloutRunner | Training workflow |
-| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, InferenceWorkspace, PagePool, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, Task, TaskManager, TaskStatus, StreamDecoder, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
+| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, InferenceWorkspace, PagePool, TaskCacheManager, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, AllocationStrategy, ContiguousStrategy, PagedStrategy, Task, TaskManager, TaskStatus, StreamDecoder, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
 | **astrai.extension** | `backend` policy package, `ops` kernel-wrapper package, `fp8.py` FP8 strategy layer, AttentionBackend, TorchNativeBackend, CudaBackend, FlashAttnBackend, attention, attn_backend, ATTN_BACKEND, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optim** | OptimizerFactory, MuonAdamW, NoraNadamW, ManoAdamW, composite_step/composite_zero_grad/composite_state_dict, partition_optimizer_parameters | Built-in optimizers (`muon_adamw` / `nora_nadamw` / `mano_adamw`) with shared composite-optimizer helpers |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler | Distributed parallel & gradient accumulation |
@@ -1478,4 +1509,4 @@ classDiagram
 10. **AutoModel**: `from_pretrained()` loads `config.json` + `model.safetensors`, `_disable_random_init` replaces `nn.init.*` with no-ops
 11. **Protocols**: `OptimizerProtocol` / `SchedulerProtocol` — structural subtyping for `AccumOptimizer` / `AccumScheduler` wrappers
 
-> Document Update Time: 2026-08-22
+> Document Update Time: 2026-08-29
