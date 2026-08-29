@@ -190,8 +190,9 @@ python scripts/tools/train.py \
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_P2P_DISABLE=1
-export NCCL_NET_GDR_LEVEL=0
+# Only if this host's NCCL transport is broken; see docs/guides/distributed.md:
+# export NCCL_P2P_DISABLE=1
+# export NCCL_NET_GDR_LEVEL=0
 
 python scripts/tools/train.py \
     --train_type=seq \
