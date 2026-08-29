@@ -2,8 +2,9 @@
 
 The kernel-level tests exercise the two stateless primitives (``quantize`` for
 bf16/fp16/fp32 -> FP8, ``mm_fp8`` for the pre-quantized GEMM with transposed
-operands); the policy-level tests (recipes, autocast context, per-tensor meta,
-CPU fallbacks of the custom ops) run without a GPU.
+operands); the policy-level tests (recipes, autocast context, per-tensor
+meta) run without a GPU. The primitives themselves are CUDA-only
+(attention-style direct wrappers — no torch.library dispatch layer).
 """
 
 import threading
@@ -24,7 +25,7 @@ from astrai.extension.fp8 import (
     fp8_linear_enabled,
     fp8_state,
 )
-from astrai.extension.ops.fp8 import mm_fp8, quantize
+from astrai.extension.ops.fp8 import mm_fp8, quantize, quantize_dual
 from tests.conftest import skip_no_fp8
 
 
@@ -448,37 +449,72 @@ def test_fp8_tensor_meta_delayed_update():
     meta.w.seed(w, "e4m3")
     assert meta.w.initialized
     torch.testing.assert_close(meta.w.scale, (w.abs().amax() / 448.0).reshape(1))
-    # [hist | scale] packing: views alias the single state buffer.
-    assert meta.w.state.numel() == 4 + 2
+    # [hist | scale | legacy | amax | done] packing: views alias one buffer.
+    assert meta.w.state.numel() == 4 + 4
     assert meta.w.hist.data_ptr() == meta.w.state.data_ptr()
     assert meta.w.scale.data_ptr() == meta.w.state[4:].data_ptr()
     meta.w.advance()
     assert meta.w.idx == 1
 
-    # update folds a fresh amax into the window and publishes the next scale
-    amax = torch.tensor([8.0])
-    meta.w.update(amax, "e4m3")
-    torch.testing.assert_close(meta.w.scale, torch.tensor([8.0 / 448.0]))
+    # fold_args hands the kernel the buffer, the slot and the recipe constants
+    args = meta.w.fold_args("e4m3")
+    assert args["ring_state"] is meta.w.state and args["hist_idx"] == 1
+    assert args["fp8_max"] == 448.0 and args["pow2_margin"] == 1.0
 
 
-def test_quantize_cpu_fallback():
-    """CPU fallback of the quantize primitive (scale semantics + amax)."""
-    x = torch.randn(16, 32, dtype=torch.bfloat16)
-    scale = torch.tensor([0.5])  # quantize multiplier
-    x8, amax = quantize(x, scale, "e4m3")
-    assert x8.dtype == torch.float8_e4m3fn
-    ref = (x.float() * 0.5).to(torch.float8_e4m3fn)
-    assert torch.equal(x8, ref)
+@skip_no_fp8
+@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
+def test_quantize_dual_and_transposed_orientations(fmt):
+    """quantize_dual yields both orientations from one read; quantize's
+    transposed switch keeps the 2-tuple arity with the [cols][rows] layout."""
+    torch.manual_seed(11)
+    x = torch.randn(37, 67, device="cuda", dtype=torch.bfloat16) * 3
+    mult = _scale(x).reciprocal()
+    x8, amax = quantize(x, mult, fmt)
+    x8T, _ = quantize(x, mult, fmt, transposed=True)
+    d8, d8T, _ = quantize_dual(x, mult, fmt)
+    assert x8T.shape == (67, 37)
+    assert torch.equal(x8.view(torch.uint8), d8.view(torch.uint8))
+    assert torch.equal(x8T.view(torch.uint8), d8T.view(torch.uint8))
+    assert torch.equal(x8T.t().contiguous().view(torch.uint8), x8.view(torch.uint8))
     torch.testing.assert_close(amax, x.abs().amax().float().reshape(1))
 
 
-def test_mm_fp8_cpu_fallback():
-    a8 = torch.tensor([[1.0, 2.0]], dtype=torch.float8_e4m3fn)
-    b8 = torch.tensor([[3.0], [4.0]], dtype=torch.float8_e4m3fn)
-    scale = torch.tensor([1.0])
-    out = mm_fp8(a8, b8, scale)
-    ref = (a8.float() @ b8.float() * 1.0).to(torch.bfloat16)
-    torch.testing.assert_close(out, ref)
+@skip_no_fp8
+@pytest.mark.parametrize("fmt,fmax", [("e4m3", 448.0), ("e5m2", 57344.0)])
+@pytest.mark.parametrize("margin", [0, 1])
+def test_quantize_ring_fold_matches_host_update(fmt, fmax, margin):
+    """The in-kernel delayed-scaling fold matches a host-side reference."""
+    dev = torch.device("cuda")
+    n, idx = 4, 2
+    torch.manual_seed(3)
+    x = torch.randn(128, 96, dtype=torch.bfloat16, device=dev) * 3
+    mult = torch.tensor([0.01], device=dev)
+    pow2m = float(2**margin)
+
+    # Reference: legacy quantize + the host fold it used to return amax for.
+    x8_ref, amax = quantize(x, mult, fmt)
+    hist = torch.full((n,), 1.0, device=dev)
+    hist[idx] = amax.to(torch.float32)
+    scale = (hist.max() / fmax / pow2m).clamp_min(1e-12).reshape(1)
+
+    # Fused: same window, fold inside the quantize kernel's last block.
+    ring = torch.zeros(n + 4, device=dev)
+    ring[:n].fill_(1.0)
+    x8, _ = quantize(
+        x,
+        mult,
+        fmt,
+        ring_state=ring,
+        hist_idx=idx,
+        fp8_max=fmax,
+        pow2_margin=pow2m,
+    )
+    assert torch.equal(x8.view(torch.uint8), x8_ref.view(torch.uint8))
+    torch.testing.assert_close(ring[:n], hist, rtol=0, atol=0)
+    torch.testing.assert_close(ring[n : n + 1], scale, rtol=0, atol=0)
+    assert float(ring[n + 2]) == 0.0  # amax slot self-cleaned
+    assert int(ring[n + 3].view(torch.int32)) == 0  # done counter reset
 
 
 # --------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-// CUDA bindings for the two stateless FP8 primitives.
+// CUDA bindings for the stateless FP8 quantize/GEMM primitives.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -94,13 +94,17 @@ void launch_quantize_for(const torch::Tensor& x, const FP8QuantizeParams& p,
         launch_for_dtype<Tiled, FP8Format::E4M3>(x, p, stream);
 }
 
-}  // namespace
-
-// Output-layout dispatch: 0 = [rows][cols] row-major (2-tuple return),
-// 1 = transposed [cols][rows] only (2-tuple), 2 = both orientations from a
-// single read (3-tuple). Layouts 1/2 feed the NT GEMM fast path.
-py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
-                    int64_t layout) {
+// Shared binding body for the two quantize entry points: RowMajor /
+// Transposed (single output) serve quantize(), Dual (both orientations from
+// one read) serves quantize_dual(). A ring tensor switches
+// on the in-kernel delayed-scaling fold: state layout
+// [hist n | scale | legacy | amax | done-as-int], and the returned amax is
+// the (self-cleaned) persistent slot. Without it, amax is reduced into a
+// fresh buffer armed by a driver memset — cheaper than the zeros() fill
+// kernel.
+py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
+                         QuantLayout layout, py::object ring, int64_t hist_idx,
+                         double fp8_max, double pow2_margin) {
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 ||
                     x.scalar_type() == torch::kHalf ||
@@ -109,9 +113,7 @@ py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
     TORCH_CHECK(fmt == static_cast<int64_t>(FP8Format::E4M3) ||
                     fmt == static_cast<int64_t>(FP8Format::E5M2),
                 "unsupported quantization type: expected E4M3 (0) or E5M2 (1)");
-    TORCH_CHECK(layout >= 0 && layout <= 2,
-                "layout must be 0 (row-major), 1 (transposed) or 2 (both)");
-    TORCH_CHECK(layout == 0 || x.dim() >= 2,
+    TORCH_CHECK(layout == QuantLayout::RowMajor || x.dim() >= 2,
                 "transposed quantize layouts need a 2D+ tensor");
     check_scale(scale, x);
     check_fp8_device(x);
@@ -120,41 +122,94 @@ py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
     auto input = x.contiguous();
     auto out_opts = input.options().dtype(
         fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn);
-    // amax is reduced via atomicMax of non-negative values; a driver memset
-    // arms it cheaper than the zeros() fill kernel (one fewer tensor-op
-    // dispatch + kernel launch on every quantize call).
-    auto amax = torch::empty({1}, input.options().dtype(torch::kFloat32));
-    cudaMemsetAsync(amax.data_ptr(), 0, sizeof(float), stream.stream());
+    torch::Tensor amax;
+    float *ring_hist = nullptr, *ring_scale_out = nullptr;
+    unsigned int* ring_done = nullptr;
+    int ring_len = 0;
+    if (!ring.is_none()) {
+        auto st = ring.cast<torch::Tensor>();
+        TORCH_CHECK(st.is_cuda() && st.dim() == 1 &&
+                        st.scalar_type() == torch::kFloat32,
+                    "ring state must be a 1D float32 CUDA tensor");
+        const int64_t n = st.numel() - 4;
+        TORCH_CHECK(n > 0 && hist_idx >= 0 && hist_idx < n,
+                    "ring state too small or hist_idx out of range");
+        float* base = st.data_ptr<float>();
+        amax = st.narrow(0, n + 2, 1);
+        ring_hist = base;
+        ring_scale_out = base + n;
+        ring_done = reinterpret_cast<unsigned int*>(base + n + 3);
+        ring_len = static_cast<int>(n);
+    } else {
+        amax = torch::empty({1}, input.options().dtype(torch::kFloat32));
+        cudaMemsetAsync(amax.data_ptr(), 0, sizeof(float), stream.stream());
+    }
 
     FP8QuantizeParams p;
     p.input_ptr = input.data_ptr();
     p.scale = scale.data_ptr<float>();
     p.amax = amax.data_ptr<float>();
+    if (ring_hist) {
+        p.fold_ring = true;
+        p.hist = ring_hist;
+        p.scale_out = ring_scale_out;
+        p.done = ring_done;
+        p.hist_len = ring_len;
+        p.hist_idx = static_cast<int>(hist_idx);
+        p.fp8_max = static_cast<float>(fp8_max);
+        p.pow2_margin = static_cast<float>(pow2_margin);
+    }
     p.total = static_cast<int>(input.numel());
-    p.out_layout = static_cast<int>(layout);
+    p.out_layout = layout;
     p.rows = static_cast<int>(input.size(-2));
     p.cols = static_cast<int>(input.size(-1));
     torch::Tensor output, output_t;
-    if (layout == 0 || layout == 2) {
+    if (layout != QuantLayout::Transposed) {
         output = torch::empty_like(input, out_opts);
         p.output_ptr = output.data_ptr();
     }
-    if (layout >= 1) {
+    if (layout != QuantLayout::RowMajor) {
         output_t = torch::empty({input.size(-1), input.size(-2)}, out_opts);
         p.output_transposed_ptr = output_t.data_ptr();
     }
     const bool e5m2 = fmt == static_cast<int64_t>(FP8Format::E5M2);
-    if (layout != 0)
-        launch_quantize_for<true>(input, p, e5m2, stream.stream());
-    else
+    if (layout == QuantLayout::RowMajor)
         launch_quantize_for<false>(input, p, e5m2, stream.stream());
+    else
+        launch_quantize_for<true>(input, p, e5m2, stream.stream());
     C10_CUDA_CHECK(cudaGetLastError());
-    if (layout == 2) return py::make_tuple(output, output_t, amax);
-    return py::make_tuple(layout == 1 ? output_t : output, amax);
+    if (layout == QuantLayout::Dual)
+        return py::make_tuple(output, output_t, amax);
+    return py::make_tuple(
+        layout == QuantLayout::Transposed ? output_t : output, amax);
+}
+
+}  // namespace
+
+// Single-orientation quantize binding: row-major x8, or its [cols][rows]
+// transpose when transposed is set — the K-contiguous operand orientation
+// NT GEMMs want. Returns (x8|x8T, amax).
+py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
+                    bool transposed, py::object ring, int64_t hist_idx,
+                    double fp8_max, double pow2_margin) {
+    const QuantLayout layout =
+        transposed ? QuantLayout::Transposed : QuantLayout::RowMajor;
+    return quantize_impl(x, scale, fmt, layout, ring, hist_idx, fp8_max,
+                         pow2_margin);
+}
+
+// Dual-orientation quantize binding: one read of x produces both the
+// row-major x8 and its transpose (plus amax), for tensors consumed by GEMMs
+// in both orientations (backward g). Returns (x8, x8T, amax).
+py::object quantize_dual(torch::Tensor x, torch::Tensor scale, int64_t fmt,
+                         py::object ring, int64_t hist_idx, double fp8_max,
+                         double pow2_margin) {
+    return quantize_impl(x, scale, fmt, QuantLayout::Dual, ring, hist_idx,
+                         fp8_max, pow2_margin);
 }
 
 torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
-                     int64_t trans_a, int64_t trans_b, torch::Tensor bias) {
+                     bool trans_a, bool trans_b, py::object bias) {
     TORCH_CHECK(a.is_cuda() && b.is_cuda(), "CUDA tensors required");
     TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn ||
                     a.scalar_type() == torch::kFloat8_e5m2,
@@ -164,6 +219,18 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
                     (b.dim() == 2 || b.dim() == 3),
                 "a and b must be 2D or 3D (batched)");
     TORCH_CHECK(a.device() == b.device(), "a and b must share device");
+    // Python None and an omitted argument both mean "no bias" — an undefined
+    // tensor below. (py::isinstance<torch::Tensor> is false for real tensors
+    // here — torch's caster registers no pybind type info — so validate by
+    // attempting the cast itself.)
+    torch::Tensor bias_t;
+    if (!bias.is_none()) {
+        try {
+            bias_t = bias.cast<torch::Tensor>();
+        } catch (const py::cast_error&) {
+            TORCH_CHECK(false, "bias must be a torch.Tensor or None");
+        }
+    }
     check_scale(scale, a);
     check_fp8_device(a);
     const at::cuda::OptionalCUDAGuard guard(a.device());
@@ -180,10 +247,8 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
 
     torch::Tensor a_st, b_st;
     int64_t a_ld, b_ld, a_bstride, b_bstride;
-    const bool tag_a =
-        resolve_operand(a, trans_a != 0, a_ld, a_bstride, a_st);
-    const bool tag_b =
-        resolve_operand(b, trans_b != 0, b_ld, b_bstride, b_st);
+    const bool tag_a = resolve_operand(a, trans_a, a_ld, a_bstride, a_st);
+    const bool tag_b = resolve_operand(b, trans_b, b_ld, b_bstride, b_st);
     // GEMM dims from the user flags; storage layout never swaps them.
     const int64_t m = trans_a ? a.size(-1) : a.size(-2);
     const int64_t k = trans_a ? a.size(-2) : a.size(-1);
@@ -207,13 +272,13 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
     p.b_ld = static_cast<int>(b_ld);
     // Fused epilogue bias (bf16, broadcast over rows and batches). An
     // undefined or 0-element tensor keeps the plain scaled output.
-    if (bias.defined() && bias.numel() > 0) {
-        TORCH_CHECK(bias.is_cuda() && bias.scalar_type() == torch::kBFloat16,
+    if (bias_t.defined() && bias_t.numel() > 0) {
+        TORCH_CHECK(bias_t.is_cuda() && bias_t.scalar_type() == torch::kBFloat16,
                     "fp8 gemm bias must be a CUDA bf16 tensor");
-        TORCH_CHECK(bias.dim() == 1 && bias.size(0) == n,
+        TORCH_CHECK(bias_t.dim() == 1 && bias_t.size(0) == n,
                     "fp8 gemm bias must be 1D of length n=", n);
-        TORCH_CHECK(bias.is_contiguous(), "fp8 gemm bias must be contiguous");
-        p.bias_ptr = bias.data_ptr();
+        TORCH_CHECK(bias_t.is_contiguous(), "fp8 gemm bias must be contiguous");
+        p.bias_ptr = bias_t.data_ptr();
     }
     p.batch = static_cast<int>(batch);
     p.a_batch_stride = (batch_a == 1 && batch > 1) ? 0 : a_bstride;
@@ -227,28 +292,16 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
     return output;
 }
 
-// mm_fp8 binding: Python None and an omitted argument both mean "no bias",
-// so every Python layer can pass its bias argument through untouched.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"),
-          py::arg("fmt"), py::arg("layout") = 0);
-    m.def(
-        "mm_fp8",
-        [](torch::Tensor a, torch::Tensor b, torch::Tensor scale,
-           int64_t trans_a, int64_t trans_b, py::object bias) {
-            torch::Tensor t;
-            if (!bias.is_none()) {
-                // (py::isinstance<torch::Tensor> is false for real tensors
-                // here — torch's caster registers no pybind type info — so
-                // validate by attempting the cast itself.)
-                try {
-                    t = bias.cast<torch::Tensor>();
-                } catch (const py::cast_error&) {
-                    TORCH_CHECK(false, "bias must be a torch.Tensor or None");
-                }
-            }
-            return mm_fp8(a, b, scale, trans_a, trans_b, t);
-        },
-        py::arg("a"), py::arg("b"), py::arg("scale"), py::arg("trans_a") = 0,
-        py::arg("trans_b") = 0, py::arg("bias") = py::none());
+          py::arg("fmt"), py::arg("transposed") = false,
+          py::arg("ring") = py::none(), py::arg("hist_idx") = 0,
+          py::arg("fp8_max") = 448.0, py::arg("pow2_margin") = 1.0);
+    m.def("quantize_dual", &quantize_dual, py::arg("x"), py::arg("scale"),
+          py::arg("fmt"), py::arg("ring") = py::none(),
+          py::arg("hist_idx") = 0, py::arg("fp8_max") = 448.0,
+          py::arg("pow2_margin") = 1.0);
+    m.def("mm_fp8", &mm_fp8, py::arg("a"), py::arg("b"), py::arg("scale"),
+          py::arg("trans_a") = false, py::arg("trans_b") = false,
+          py::arg("bias") = py::none());
 }

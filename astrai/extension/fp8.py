@@ -36,7 +36,7 @@ from typing import Dict, List, Optional
 import torch
 from torch.library import Library
 
-from astrai.extension.ops.fp8 import mm_fp8, quantize
+from astrai.extension.ops.fp8 import mm_fp8, quantize, quantize_dual
 
 # Max representable value per FP8 format (E4M3: 448, E5M2: 57344).
 FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -92,10 +92,12 @@ class DynamicScaling(FP8Recipe):
 
 class _ScaleRing:
     """One operand's delayed-scaling state: a float32 buffer
-    ``[hist[n] | scale | counter]`` (views). ``update`` folds the amax
-    returned by the quantize primitive into ``hist[idx]`` and publishes the
-    next scale from the window; ``idx`` advances host-side each step. The
-    trailing slot is a legacy counter kept for state-buffer compatibility.
+    ``[hist[n] | scale | legacy | amax | done]`` (views). The quantize
+    kernel folds its fused amax into ``hist[idx]`` and publishes the next
+    scale from the window in its own last block (``fold_args`` passes the
+    buffer + recipe constants); ``idx`` advances host-side each use. The
+    ``amax``/``done`` tail slots are kernel scratch (self-cleaning across
+    launches); the legacy slot keeps state-buffer compatibility.
     """
 
     __slots__ = ("recipe", "state", "hist", "scale", "idx", "initialized")
@@ -103,7 +105,7 @@ class _ScaleRing:
     def __init__(self, device: torch.device, recipe: FP8Recipe):
         self.recipe = recipe
         n = recipe.history_len
-        self.state = torch.zeros(n + 2, device=device, dtype=torch.float32)
+        self.state = torch.zeros(n + 4, device=device, dtype=torch.float32)
         self.hist = self.state[:n]
         self.scale = self.state[n : n + 1]
         self.idx = 0
@@ -119,9 +121,14 @@ class _ScaleRing:
         self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
         self.initialized = True
 
-    def update(self, amax: torch.Tensor, fmt: str) -> None:
-        self.hist[self.idx].copy_(amax.reshape(()))
-        self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
+    def fold_args(self, fmt: str) -> dict:
+        """Keyword arguments for quantize()'s in-kernel history fold."""
+        return {
+            "ring_state": self.state,
+            "hist_idx": self.idx,
+            "fp8_max": FP8_MAX[fmt],
+            "pow2_margin": float(2**self.recipe.margin),
+        }
 
 
 class FP8TensorMeta:
@@ -322,11 +329,11 @@ def fp8_linear_forward(
 
     Composed from the two stateless primitives: quantize x/w with the active
     scales, run the pre-quantized GEMM with the bias fused into its epilogue.
-    Delayed scaling folds
-    the returned amax into the history ring and publishes the next scale;
-    dynamic scaling measures the current amax itself. Training quantizes the
-    weight every step (the optimizer bumps its version, so there is no cast
-    cache, matching ``cached_cast``-less behavior).
+    Delayed scaling lets the quantize kernel fold the fused amax into the
+    history ring and publish the next scale in its own last block; dynamic
+    scaling measures the current amax itself. Training quantizes the weight
+    every step (the optimizer bumps its version, so there is no cast cache,
+    matching ``cached_cast``-less behavior).
     """
     state = fp8_state()
     if cfg is None:
@@ -351,19 +358,19 @@ def fp8_linear_forward(
     if not meta.x.initialized:
         meta.x.seed(x, fmt)
     sx, sw = meta.x.scale.clone(), meta.w.scale.clone()
-    x8, amax_x = quantize(x, sx.reciprocal(), fmt)
+    # The clones feed this call's kernels (stream-ordered before the in-kernel
+    # fold overwrites the ring scale slots); the fp8 quantize kernel folds the
+    # amax into the history window and publishes the next scale itself.
+    x8, _ = quantize(x, sx.reciprocal(), fmt, **meta.x.fold_args(fmt))
     if _is_fp8(w.dtype):
-        w8, amax_w = w, None
+        w8 = w
     else:
-        w8, amax_w = quantize(w, sw.reciprocal(), fmt)
+        w8, _ = quantize(w, sw.reciprocal(), fmt, **meta.w.fold_args(fmt))
     out = mm_fp8(
         x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True, bias=bias
     ).reshape(*x.shape[:-1], w.size(0))
-    meta.x.update(amax_x, fmt)
-    if amax_w is not None:
-        meta.w.update(amax_w, fmt)
     meta.x.advance()
-    if amax_w is not None:
+    if not _is_fp8(w.dtype):
         meta.w.advance()
     return out, sx, sw
 
@@ -411,22 +418,26 @@ class _LinearFp8(torch.autograd.Function):
         # quantize outputs: g8 [m,n] with w8T [k,n] (trans_b=True) gives
         # grad_x, g8T [n,m] with x8T [k,m] gives grad_w — no NN-swap or TT
         # crosswise kernel in the training path. g is consumed in both
-        # orientations, so one dual-layout pass feeds both.
-        g8, g8T, amax_g = quantize(g2, sg.reciprocal(), fmt, layout=2)
-        x8T, _ = quantize(x.reshape(-1, x.size(-1)), sx.reciprocal(), fmt, layout=1)
+        # orientations, so quantize_dual's single pass feeds both.
+        # The g quantize folds the gradient amax into its ring in-kernel;
+        # the x8T/w8T orientation copies discard amax (those rings were
+        # folded at forward time).
+        g8, g8T, _ = quantize_dual(g2, sg.reciprocal(), fmt, **meta.g.fold_args(fmt))
+        x8T, _ = quantize(
+            x.reshape(-1, x.size(-1)), sx.reciprocal(), fmt, transposed=True
+        )
         if _is_fp8(w.dtype):
             # Pre-quantized weight has no transposed copy: keep the swap
             # path for grad_x (grad_w is unaffected).
             grad_x = mm_fp8(g8, w, sg * sw).reshape(x.shape)
         else:
-            w8T, _ = quantize(w, sw.reciprocal(), fmt, layout=1)
+            w8T, _ = quantize(w, sw.reciprocal(), fmt, transposed=True)
             grad_x = mm_fp8(g8, w8T, sg * sw, trans_b=True).reshape(x.shape)
         grad_w = mm_fp8(g8T, x8T, sg * sx, trans_b=True)  # g8.T @ x8
         # bias-free linears must not pay the column-sum
         # reduce: g2.sum(0) is another full read of the gradient.
         grad_b = g2.sum(0).to(torch.bfloat16) if ctx.needs_input_grad[2] else None
         if not ctx.is_dynamic:
-            meta.g.update(amax_g, fmt)
             meta.g.advance()
         return grad_x, grad_w, grad_b
 

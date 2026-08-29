@@ -108,8 +108,13 @@ __device__ __forceinline__ unsigned cvt_fp8x2(float a, float b) {
 
 // Block-wide amax reduce -> one atomic per block: warp-reduce, park one
 // value per warp, thread 0 folds. kWarps must cover the block's warp count.
+// With p.fold_ring, the last-finishing block additionally folds the final
+// amax into the history window and publishes the next scale (atomicAdd
+// ticket + fences), re-zeroing the amax slot and the counter for the next
+// launch — the host-side delayed-scaling update chain disappears.
 template <int kWarps>
-__device__ __forceinline__ void publish_amax(float* amax, float v) {
+__device__ __forceinline__ void publish_amax(const FP8QuantizeParams& p,
+                                             float v) {
     v = warp_reduce_max(v);
     __shared__ float slots[kWarps];
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
@@ -118,12 +123,23 @@ __device__ __forceinline__ void publish_amax(float* amax, float v) {
     if (tid == 0) {
 #pragma unroll
         for (int w = 1; w < kWarps; ++w) v = fmaxf(v, slots[w]);
-        atomic_max_float(amax, v);
+        atomic_max_float(p.amax, v);
+        if (!p.fold_ring) return;
+        __threadfence();
+        const unsigned int ticket = atomicAdd(p.done, 1u);
+        __threadfence();
+        if (ticket != gridDim.x - 1u) return;
+        p.hist[p.hist_idx] = *p.amax;
+        float peak = p.hist[0];
+        for (int i = 1; i < p.hist_len; ++i) peak = fmaxf(peak, p.hist[i]);
+        *p.scale_out = fmaxf(peak / p.fp8_max / p.pow2_margin, 1e-12f);
+        *p.amax = 0.0f;
+        *p.done = 0u;
     }
 }
 
-// Elementwise quantize kernel (out_layout 0): vectorized 16B loads -> fp8
-// stores, fused amax over raw values.
+// Elementwise quantize kernel (QuantLayout::RowMajor): vectorized 16B loads
+// -> fp8 stores, fused amax over raw values.
 template <FP8Format Fmt, typename InT>
 __global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
     const float mult = *p.scale;
@@ -174,10 +190,11 @@ __global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
         local_amax = fmaxf(local_amax, fabsf(v));
         x8[i] = cvt_fp8<Fmt>(v * mult);
     }
-    if (p.amax) publish_amax<8>(p.amax, local_amax);
+    if (p.amax) publish_amax<8>(p, local_amax);
 }
 
-// Tiled transpose quantize (out_layout 1/2): reads the [rows][cols] input
+// Tiled transpose quantize (QuantLayout::Transposed/Dual): reads the
+// [rows][cols] input
 // once and writes the fp8 bytes transposed ([cols][rows], so the contract
 // dim lands K-contiguous for NT GEMM operands) and, in mode 2, the row-major
 // copy too. 64x32 tiles, one native pair load per row (a full 128B warp
@@ -233,7 +250,7 @@ __global__ void fp8_quantize_tiled_kernel(FP8QuantizeParams p) {
             }
         }
     }
-    if (p.out_layout == 2) {
+    if (p.out_layout == QuantLayout::Dual) {
         uint8_t* out = static_cast<uint8_t*>(p.output_ptr);
 #pragma unroll
         for (int j = 0; j < 4; ++j)
@@ -266,11 +283,12 @@ __global__ void fp8_quantize_tiled_kernel(FP8QuantizeParams p) {
             out_t[(int64_t)oc * p.rows + r0 + threadIdx.x] =
                 tile[threadIdx.y * 8 + i][threadIdx.x];
     }
-    if (p.amax) publish_amax<8>(p.amax, local_amax);
+    if (p.amax) publish_amax<8>(p, local_amax);
 }
 
-// Unified quantize launcher: Tiled selects the transpose kernel (out_layout
-// 1/2) over the vectorized elementwise one. The transpose kernel vectorizes
+// Unified quantize launcher: Tiled selects the transpose kernel
+// (QuantLayout::Transposed/Dual) over the vectorized elementwise one. The
+// transpose kernel vectorizes
 // pair loads in-kernel and falls back to scalar loads at unaligned/ragged
 // rows, so the host side picks only the grid.
 template <FP8Format Fmt, typename InT, bool Tiled = false>
