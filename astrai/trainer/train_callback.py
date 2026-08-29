@@ -116,6 +116,8 @@ class GradientCheckpointingCallback(TrainCallback):
             del module._original_forward
 
     def on_train_begin(self, context: TrainContext):
+        if not self.modules:
+            return
         context.model.apply(self._enable)
         logger.info("Gradient checkpointing enabled")
 
