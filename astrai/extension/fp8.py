@@ -31,7 +31,7 @@ import functools
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 import torch
 from torch.library import Library
@@ -56,38 +56,25 @@ class FP8Format(str, Enum):
         return "e5m2" if self is FP8Format.HYBRID else self.value
 
 
+@dataclass
 class FP8Recipe:
     """Scale-from-amax policy: ``scale = (amax / FP8_MAX[fmt]) / 2^margin``.
 
-    ``scale_from_history`` receives the operand's amax tensor (a ring window for
-    delayed scaling, the current amax for dynamic scaling) and returns the
-    quantization step. Subclasses set ``history_len`` / ``margin``.
+    ``dynamic=False`` (default) is TE-style delayed scaling: max over the
+    amax history window (amax from *previous* steps; the window trades
+    responsiveness against stability). ``dynamic=True`` is current-amax
+    scaling (torchao DYNAMIC): measure, then quantize — no history, at an
+    extra pass. ``scale_from_history`` receives the operand's amax tensor
+    (a ring window / the current amax) and returns the quantization step.
     """
 
     history_len: int = 16
     margin: int = 0
+    dynamic: bool = False
 
     def scale_from_history(self, amax: torch.Tensor, fmt: str) -> torch.Tensor:
         peak = amax.max()
         return ((peak / FP8_MAX[fmt]) / (2**self.margin)).clamp_min(1e-12)
-
-
-@dataclass
-class DelayedScaling(FP8Recipe):
-    """TE-style delayed scaling: max over the amax history window (amax from
-    *previous* steps; the window trades responsiveness against stability)."""
-
-    history_len: int = 16
-    margin: int = 0
-
-
-@dataclass
-class DynamicScaling(FP8Recipe):
-    """Current-amax scaling (torchao DYNAMIC): measure, then quantize. No
-    history — the scale is derived from the same-step amax, at an extra pass."""
-
-    history_len: int = 1
-    margin: int = 0
 
 
 class _ScaleRing:
@@ -131,18 +118,15 @@ class _ScaleRing:
         }
 
 
-class FP8TensorMeta:
-    """Per-weight delayed-scaling state for ``w``, ``x`` and ``g``.
+class FP8TensorMeta(NamedTuple):
+    """Per-weight delayed-scaling rings for ``w``, ``x`` and ``g``.
 
-    DynamicScaling never allocates a meta; it measures the current amax inline.
+    Dynamic scaling never allocates a meta; it measures the current amax inline.
     """
 
-    __slots__ = ("w", "x", "g")
-
-    def __init__(self, device: torch.device, recipe: FP8Recipe):
-        self.w = _ScaleRing(device, recipe)
-        self.x = _ScaleRing(device, recipe)
-        self.g = _ScaleRing(device, recipe)
+    w: _ScaleRing
+    x: _ScaleRing
+    g: _ScaleRing
 
 
 @dataclass(frozen=True)
@@ -166,55 +150,29 @@ _active_config: ContextVar[Optional[_ActiveConfig]] = ContextVar(
 class FP8State:
     """Global fp8 training state: per-tensor metas + out-of-region defaults.
 
-    The active ``(enabled, recipe, fp8_format)`` triple is a ``ContextVar`` set
-    by ``fp8_autocast``. The properties below read that active config when a
-    region is open and the global defaults otherwise; the setters (and
-    ``fp8_linear_enable``) write the global defaults — the persistent switch
-    applying outside any region. The metas registry is shared across threads
-    (GIL-protected); fp8 backward runs on autograd engine threads and only
-    touches metas captured on ``ctx`` at forward time.
+    The active ``(enabled, recipe, fp8_format)`` triple is a ``ContextVar``
+    set by ``fp8_autocast`` (see ``_active``/``_current_config``); these plain
+    attributes are the persistent defaults applied outside any region —
+    ``fp8_linear_enable`` writes ``default_enabled``. The metas registry is
+    shared across threads (GIL-protected); fp8 backward runs on autograd
+    engine threads and only touches metas captured on ``ctx`` at forward time.
     """
 
     def __init__(self):
         self.default_enabled = False
-        self.default_recipe: FP8Recipe = DelayedScaling()
+        self.default_recipe: FP8Recipe = FP8Recipe()
         self.default_format: FP8Format = FP8Format.HYBRID
         self._metas: Dict[tuple, FP8TensorMeta] = {}
 
-    # Active-config views (region config if open, else the defaults).
-    @property
-    def enabled(self) -> bool:
-        cfg = _active_config.get()
-        return cfg.enabled if cfg is not None else self.default_enabled
-
-    @property
-    def recipe(self) -> FP8Recipe:
-        cfg = _active_config.get()
-        return cfg.recipe if cfg is not None else self.default_recipe
-
-    @property
-    def fp8_format(self) -> FP8Format:
-        cfg = _active_config.get()
-        return cfg.fp8_format if cfg is not None else self.default_format
-
-    # Persistent (out-of-region) defaults.
-    @enabled.setter
-    def enabled(self, value: bool) -> None:
-        self.default_enabled = bool(value)
-
-    @recipe.setter
-    def recipe(self, value: FP8Recipe) -> None:
-        self.default_recipe = value
-
-    @fp8_format.setter
-    def fp8_format(self, value: FP8Format) -> None:
-        self.default_format = FP8Format(value)
-
-    def get_weight_meta(self, w: torch.Tensor) -> FP8TensorMeta:
+    def get_weight_meta(self, w: torch.Tensor, recipe: FP8Recipe) -> FP8TensorMeta:
         key = (w.data_ptr(), w.shape, w.dtype)
         meta = self._metas.get(key)
         if meta is None:
-            meta = FP8TensorMeta(w.device, self.recipe)
+            meta = FP8TensorMeta(
+                _ScaleRing(w.device, recipe),
+                _ScaleRing(w.device, recipe),
+                _ScaleRing(w.device, recipe),
+            )
             self._metas[key] = meta
         return meta
 
@@ -222,7 +180,7 @@ class FP8State:
         """Restore construction defaults (switch, recipe, format) and drop all
         per-weight metas — a full state reset for tests / reconfiguration."""
         self.default_enabled = False
-        self.default_recipe = DelayedScaling()
+        self.default_recipe = FP8Recipe()
         self.default_format = FP8Format.HYBRID
         self._metas.clear()
 
@@ -285,7 +243,7 @@ class fp8_autocast:
         margin: int = 0,
     ):
         if recipe is None:
-            recipe = DelayedScaling(history_len=update_interval, margin=margin)
+            recipe = FP8Recipe(history_len=update_interval, margin=margin)
         self._config = _ActiveConfig(bool(enabled), recipe, FP8Format(fp8_format))
         self._tokens: List[Token] = []
 
@@ -339,7 +297,7 @@ def fp8_linear_forward(
     if cfg is None:
         cfg = _current_config()
     fmt = cfg.fp8_format.fwd()
-    if isinstance(cfg.recipe, DynamicScaling):
+    if cfg.recipe.dynamic:
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), cfg.recipe, fmt)
         sw = _dynamic_scale(w, cfg.recipe, fmt)
         x8, _ = quantize(x, sx.reciprocal(), fmt)
@@ -352,7 +310,7 @@ def fp8_linear_forward(
         ).reshape(*x.shape[:-1], w.size(0))
         return out, sx, sw
 
-    meta = state.get_weight_meta(w)
+    meta = state.get_weight_meta(w, cfg.recipe)
     if not meta.w.initialized:
         meta.w.seed(w, fmt)
     if not meta.x.initialized:
@@ -392,8 +350,8 @@ class _LinearFp8(torch.autograd.Function):
         ctx.save_for_backward(x, w, sx, sw)
         ctx.fmt_bwd = cfg.fp8_format.bwd()
         ctx.recipe = cfg.recipe
-        ctx.is_dynamic = isinstance(cfg.recipe, DynamicScaling)
-        ctx.meta = None if ctx.is_dynamic else _state.get_weight_meta(w)
+        ctx.is_dynamic = cfg.recipe.dynamic
+        ctx.meta = None if ctx.is_dynamic else _state.get_weight_meta(w, cfg.recipe)
         return out
 
     @staticmethod

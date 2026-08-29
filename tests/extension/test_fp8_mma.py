@@ -15,9 +15,8 @@ import torch.nn.functional as F
 
 import astrai.extension.fp8 as f8mod
 from astrai.extension.fp8 import (
-    DelayedScaling,
-    DynamicScaling,
     FP8Format,
+    FP8Recipe,
     FP8TensorMeta,
     _ScaleRing,
     fp8_autocast,
@@ -234,7 +233,7 @@ def test_delayed_scaling_forward_uses_snapshot_scale():
     dev = torch.device("cuda")
     state = f8mod.fp8_state()
     state.reset()
-    state.default_recipe = DelayedScaling(history_len=1, margin=0)
+    state.default_recipe = FP8Recipe(history_len=1, margin=0)
     state.default_format = FP8Format.E4M3
     try:
         m, n, k = 32, 16, 64
@@ -273,7 +272,7 @@ def test_fp8_linear_forward_and_backward():
 
     state = f8mod.fp8_state()
     state.reset()
-    state.default_recipe = DynamicScaling()
+    state.default_recipe = FP8Recipe(dynamic=True)
     try:
         out, _, _ = f8mod.fp8_linear_forward(x, weight, bias)
 
@@ -400,13 +399,13 @@ def test_mm_fp8_matches_scaled_mm():
 def test_recipe_scale_from_history():
     """Delayed: max over the window + margin; dynamic: current amax."""
     hist = torch.tensor([1.0, 2.0, 0.5])
-    d = DelayedScaling(history_len=3, margin=0)
+    d = FP8Recipe(history_len=3, margin=0)
     assert torch.allclose(d.scale_from_history(hist, "e4m3"), torch.tensor(2.0 / 448.0))
-    d_m = DelayedScaling(history_len=3, margin=2)
+    d_m = FP8Recipe(history_len=3, margin=2)
     assert torch.allclose(
         d_m.scale_from_history(hist, "e4m3"), torch.tensor(2.0 / 448.0 / 4.0)
     )
-    dyn = DynamicScaling()
+    dyn = FP8Recipe(dynamic=True)
     amax = torch.tensor([0.25])
     assert torch.allclose(
         dyn.scale_from_history(amax, "e4m3"), torch.tensor(0.25 / 448.0)
@@ -424,27 +423,37 @@ def test_fp8_format_enum():
 
 
 def test_fp8_autocast_context():
-    """fp8_autocast sets and restores recipe + format on the global state."""
+    """fp8_autocast pushes and restores the thread-local active config."""
     state = fp8_state()
-    prev = (state.enabled, state.recipe, state.fp8_format)
+    state.reset()
     try:
         with fp8_autocast(enabled=True, fp8_format="hybrid", update_interval=8):
-            assert state.enabled
-            assert isinstance(state.recipe, DelayedScaling)
-            assert state.recipe.history_len == 8
-            assert state.fp8_format is FP8Format.HYBRID
-            with fp8_autocast(enabled=True, recipe=DynamicScaling(), fp8_format="e4m3"):
-                assert isinstance(state.recipe, DynamicScaling)
-                assert state.fp8_format is FP8Format.E4M3
-            assert state.fp8_format is FP8Format.HYBRID  # restored on exit
-        assert not state.enabled
+            cfg = f8mod._active_config.get()
+            assert cfg is not None and cfg.enabled
+            assert not cfg.recipe.dynamic
+            assert cfg.recipe.history_len == 8
+            assert cfg.fp8_format is FP8Format.HYBRID
+            with fp8_autocast(
+                enabled=True, recipe=FP8Recipe(dynamic=True), fp8_format="e4m3"
+            ):
+                inner = f8mod._active_config.get()
+                assert inner.recipe.dynamic
+                assert inner.fp8_format is FP8Format.E4M3
+            assert f8mod._active_config.get() is cfg  # restored on exit
+        assert f8mod._active_config.get() is None
+        assert not fp8_linear_enabled()
     finally:
-        state.enabled, state.recipe, state.fp8_format = prev
+        state.reset()
 
 
 def test_fp8_tensor_meta_delayed_update():
     """Meta seeds from data; hist/scale are packed views of one state buffer."""
-    meta = FP8TensorMeta(torch.device("cpu"), DelayedScaling(history_len=4, margin=0))
+    recipe = FP8Recipe(history_len=4, margin=0)
+    meta = FP8TensorMeta(
+        _ScaleRing(torch.device("cpu"), recipe),
+        _ScaleRing(torch.device("cpu"), recipe),
+        _ScaleRing(torch.device("cpu"), recipe),
+    )
     w = torch.randn(8, 8)
     meta.w.seed(w, "e4m3")
     assert meta.w.initialized
