@@ -56,6 +56,20 @@ struct DenseQSchedule {
         q_tile = blockIdx.x;
     }
 
+    // GQA-packed prefill mapping: HB q-heads of one kv-head group share a
+    // block's K/V stream, each head owning `rows` = BR*WPH consecutive q rows
+    // per block.  Dense tensors tile q_len directly, one block per range.
+    HOST_FORCEINLINE int packed_grid_x(
+        const AttentionParams<bf16>& p, int rows) {
+        return (p.q_len + rows - 1) / rows;
+    }
+
+    DEVICE_FORCEINLINE void map_packed_block(
+        const AttentionParams<bf16>&, int rows, int& batch, int& row_base) {
+        batch = blockIdx.z;
+        row_base = blockIdx.x * rows;
+    }
+
     DEVICE_FORCEINLINE int q_len(
         const AttentionParams<bf16>& p, int) {
         return p.q_len;
@@ -82,6 +96,23 @@ struct PackedQSchedule {
         const AttentionParams<bf16>& p, int& batch, int& q_tile) {
         batch = p.q_tile_to_batch[blockIdx.x];
         q_tile = p.q_tile_to_index[blockIdx.x];
+    }
+
+    // GQA-packed prefill mapping: the host tile maps are built in
+    // HOST_Q_TILE_ROWS granularity, so each host tile splits into
+    // HOST_Q_TILE_ROWS / rows packed blocks along blockIdx.x.
+    HOST_FORCEINLINE int packed_grid_x(
+        const AttentionParams<bf16>& p, int rows) {
+        return p.num_q_tiles * (HOST_Q_TILE_ROWS / rows);
+    }
+
+    DEVICE_FORCEINLINE void map_packed_block(
+        const AttentionParams<bf16>& p, int rows, int& batch, int& row_base) {
+        const int hb = HOST_Q_TILE_ROWS / rows;
+        const int host_tile = blockIdx.x / hb;
+        batch = p.q_tile_to_batch[host_tile];
+        row_base = p.q_tile_to_index[host_tile] * HOST_Q_TILE_ROWS
+            + (blockIdx.x - host_tile * hb) * rows;
     }
 
     DEVICE_FORCEINLINE int q_len(

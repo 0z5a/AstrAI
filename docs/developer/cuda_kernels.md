@@ -374,19 +374,26 @@ q_tile_to_batch = [0, 0, 1, 2, 2, 2]
 q_tile_to_index = [0, 1, 0, 0, 1, 2]
 ```
 
-Paged prefill launches:
+Paged prefill launches (MMA path, GQA head packing):
 
 ```text
-grid.x = num_q_tiles  # 6, exactly the valid ragged work items
-grid.y = q_heads
+grid.x = num_q_tiles * HB   # HB = min(G, WARPS): q heads packed per block
+grid.y = kv_heads * ceil(G / HB)
 grid.z = 1
 ```
 
-Each block resolves its request and request-local tile in O(1):
+The tensor-core prefill kernel packs `HB = min(G, WARPS)` query heads of one
+kv-head group into a block, so K/V tiles stream once per block instead of once
+per q head (~HB× less global K/V traffic). Warp `w` handles head slot `w / WPH`
+and 16-row chunk `w % WPH`, where `WPH = WARPS / HB`; `G = q_heads / kv_heads`
+and `G = 1` (MHA) degenerates to the historical one-head-per-block layout.
+Each host Q tile (64 rows, `Q_TILE_ROWS`) splits into `HB` packed blocks along
+`grid.x`. Each block resolves its request and request-local row range in O(1):
 
 ```cpp
-batch = q_tile_to_batch[blockIdx.x];
-q_tile = q_tile_to_index[blockIdx.x];
+host_tile = blockIdx.x / HB;
+batch = q_tile_to_batch[host_tile];
+row_base = q_tile_to_index[host_tile] * 64 + (blockIdx.x % HB) * (64 / HB);
 ```
 
 The kernel then uses `qo_indptr[batch]` for the packed Q base and adjacent
@@ -448,7 +455,7 @@ csrc/
 │   │   ├── decode_split_kv.cuh       #   decode kernel, scalar (split-KV)
 │   │   ├── decode_split_kv_mma.cuh   #   decode kernel, MMA + split-K
 │   │   ├── prefill_split_q.cuh       #   prefill kernel, scalar (split-Q)
-│   │   ├── prefill_split_q_mma.cuh   #   prefill kernel, MMA (split-Q, packed/ragged Q schedule)
+│   │   ├── prefill_split_q_mma.cuh   #   prefill kernel, MMA (split-Q, GQA head packing, packed/ragged Q schedule)
 │   │   ├── decode.cu                 #   → module attn_decode
 │   │   ├── prefill.cu                #   → module attn_prefill
 │   │   ├── paged_decode.cu           #   → module attn_paged_decode

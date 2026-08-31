@@ -16,6 +16,11 @@ enum TensorLayout : int {
 // Split-KV workspace cap: max decode splits per (batch, q_head).
 constexpr int MAX_SPLITS = 32;
 
+// Paged-prefill host Q-tile granularity in q rows: one q_tile_to_index unit
+// covers this many query rows of one request.  Must match Q_TILE_ROWS in
+// astrai/inference/workspace.py, which builds the device-side tile maps.
+constexpr int HOST_Q_TILE_ROWS = 64;
+
 
 // Unified attention params covering BOTH addressing modes:
 //   - Contiguous K/V: dense [batch, kv_head, kv_len, head_dim] tensors (k/v).

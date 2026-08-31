@@ -13,6 +13,13 @@ namespace attention {
 // One warp owns BR=16 query rows. S = Q@K^T and O = P@V run on bf16 tensor
 // cores via mma.sync.m16n8k16 (f32 accumulate).
 //
+// GQA head packing (FA2/FA3-style): HB = min(G, WARPS) query heads of one
+// kv-head group share a block's K/V tiles, so each K/V element is read from
+// global memory once per block instead of once per q head (~HB× less K/V
+// traffic).  WARPS = WPH × HB: warp w handles head slot w/WPH, chunk w%WPH;
+// all warps of a block cover the same token range, keeping the causal sweep
+// end block-uniform.  G=1 (MHA) degenerates to the unpadded layout.
+//
 // KV = ContigKV (dense [batch, kv_head, kv_len, head_dim]) or PagedKV
 //      (flat pool + req_to_token, ragged batches via qo_indptr/kv_indptr).
 // IsCausal and HasMask are compile-time bools — the compiler eliminates all
@@ -26,11 +33,23 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     const int gid = lane >> 2;   // 0..7
     const int tid4 = lane & 3;   // 0..3
 
-    const int q_head = blockIdx.y;
-    int batch, q_tile;
-    QSchedule::map_block(p, batch, q_tile);
-    const int kv_head = q_head / (p.q_head / p.kv_head);
-    const int qrow0 = (q_tile * Traits::WARPS + warp) * Traits::BR;
+    const int G = p.q_head / p.kv_head;
+    const int HB = min(G, Traits::WARPS);   // q heads packed per block
+    const int WPH = Traits::WARPS / HB;     // 16-row chunks per head
+    const int BPG = (G + HB - 1) / HB;      // blocks per GQA group
+    const int chunk = warp % WPH;
+
+    int batch, row_base;
+    QSchedule::map_packed_block(p, Traits::BR * WPH, batch, row_base);
+    const int kv_head = blockIdx.y / BPG;
+    const int slot = blockIdx.y - kv_head * BPG;
+    const int head_idx = slot * HB + warp / WPH;
+    // G % HB tail blocks have idle head slots: clamp to the last head so all
+    // warps do valid work (cp.async + __syncthreads stay block-uniform) and
+    // just skip the O store via `active`.
+    const bool active = head_idx < G;
+    const int q_head = kv_head * G + min(head_idx, G - 1);
+    const int qrow0 = row_base + chunk * Traits::BR;
 
     // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
     const int seq_len    = KV::kv_len(p, batch);
@@ -62,11 +81,11 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     const int qr0 = qrow0 + gid;
     const int qr1 = qrow0 + gid + 8;
 
-    // Causal tile-skip bounds (dead code when IsCausal == false)
+    // Causal tile-skip bounds (dead code when IsCausal == false).
+    // max_kv is per-warp (its own 16 rows); block_max_kv is the last row of
+    // the whole block's range and must be uniform for the shared sweep loop.
     const int max_kv = qrow0 + Traits::BR - 1 + causal_off;
-    const int block_max_kv =
-        q_tile * Traits::WARPS * Traits::BR + Traits::WARPS * Traits::BR - 1
-        + causal_off;
+    const int block_max_kv = row_base + WPH * Traits::BR - 1 + causal_off;
 
     int t_end = tiles - 1;
     if constexpr (IsCausal) {
@@ -144,13 +163,13 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     #pragma unroll
     for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
-        if (qr0 < q_len) {
+        if (active && qr0 < q_len) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][0] * rl0,
                                                       Oacc[dn8][1] * rl0);
             *reinterpret_cast<__nv_bfloat162*>(
                 &p.o_ptr[o_base + qr0 * p.q_l_stride + d * p.q_d_stride]) = v;
         }
-        if (qr1 < q_len) {
+        if (active && qr1 < q_len) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][2] * rl1,
                                                      Oacc[dn8][3] * rl1);
             *reinterpret_cast<__nv_bfloat162*>(

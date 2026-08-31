@@ -88,8 +88,17 @@ struct PrefillLauncherMMA {
     static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
         using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
         using Traits = KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES>;
-        constexpr int ROWS = Traits::BR * Config::WARPS;
-        dim3 grid(QSchedule::host_q_blocks(p, ROWS), p.q_head,
+        // GQA head packing: HB = min(G, WARPS) q-heads of one kv-head group
+        // share each block's K/V stream (~HB× less global K/V traffic).
+        // Each head gets WPH = WARPS/HB 16-row chunks per block, so per-head
+        // rows drop from 64 to BR*WPH while total mma work per K/V byte is
+        // unchanged.  G=1 (MHA) reproduces the historical grid exactly.
+        const int G = p.q_head / p.kv_head;
+        const int HB = std::min(G, Config::WARPS);
+        const int WPH = Config::WARPS / HB;
+        constexpr int BR = Traits::BR;
+        dim3 grid(QSchedule::packed_grid_x(p, BR * WPH),
+                  p.kv_head * ((G + HB - 1) / HB),
                   QSchedule::host_grid_batch(p));
         dim3 block(Traits::NUM_THREADS);
         attn_prefill_split_q_mma_kernel<Traits, QSchedule, KV, IsCausal, HasMask>
