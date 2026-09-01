@@ -10,7 +10,7 @@ AstrAI includes optional custom CUDA kernels for attention, rotary embedding, an
 | `attn_prefill` | `attention/prefill.cu` | GQA prefill attention (split-Q) |
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
-| `rotary_emb` | `rotary/rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
+| `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
 | `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
@@ -27,7 +27,7 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 ### Rotary Embedding Kernel
 
-The `rotary_emb` kernel (`csrc/kernels/rotary/rotary_emb.cu`) fuses cos/sin lookup and rotation into a single kernel:
+The `rotary_emb` kernel (`csrc/kernels/rotary_emb.cu`) fuses cos/sin lookup and rotation into a single kernel:
 
 - One thread per (head, dim-pair), vectorized `__nv_bfloat162` load/store
 - f32 cos/sin input, bf16 compute and output
@@ -460,8 +460,7 @@ csrc/
 │   │   ├── prefill.cu                #   → module attn_prefill
 │   │   ├── paged_decode.cu           #   → module attn_paged_decode
 │   │   └── paged_prefill.cu          #   → module attn_paged_prefill
-│   ├── rotary/
-│   │   └── rotary_emb.cu             # rotary embedding (kernel + binding in one file) → module rotary_emb
+│   ├── rotary_emb.cu                  # rotary embedding (kernel + binding in one file) → module rotary_emb
 │   └── fp8/                          # FP8 family (module name fp8_ops)
 │       ├── common.h                  #   FP8Format enum, Fp8GemmTraits, FP8Params / FP8QuantizeParams PODs, layout tags (no torch)
 │       ├── quantize.cuh              #   quantize kernels: vectorized + 32×32-tile transpose (out_layout 0/1/2) (no torch)

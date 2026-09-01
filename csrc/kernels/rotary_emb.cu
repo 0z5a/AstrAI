@@ -11,34 +11,41 @@ __global__ void rotary_emb_kernel(
     int n_heads,
     int head_dim
 ) {
-    const int half_dim = head_dim >> 1;
-    const int total = n_tokens * n_heads * half_dim;
+    // Each head tiles into exact 2-pair chunks: one 8B x access and one 16B
+    // cos/sin access per chunk (head_dim % 4 == 0 is enforced on the host).
+    const int chunks = head_dim >> 2;
+    const int total = n_tokens * n_heads * chunks;
 
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total;
-         idx += gridDim.x * blockDim.x) {
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x;
+         c < total;
+         c += gridDim.x * blockDim.x) {
+        const int chunk = c % chunks;
+        const int tmp = c / chunks;
+        const int head = tmp % n_heads;
+        const int token = tmp / n_heads;
 
-        int pair = idx % half_dim;
-        int tmp = idx / half_dim;
-        int head = tmp % n_heads;
-        tmp /= n_heads;
-        int token = tmp;
+        const int x_off = (tmp * head_dim) + (chunk << 2);
+        const int f_off = ((token * chunks) + chunk) << 2;
 
-        int x_offset = (token * n_heads + head) * head_dim + (pair << 1);
-        int cs_offset = (token * half_dim + pair) * 2;
+        const float4 f = *reinterpret_cast<const float4*>(freqs_cis + f_off);
+        const uint2 xr = *reinterpret_cast<const uint2*>(x + x_off);
+        __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(&xr.x);
+        __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(&xr.y);
 
-        __nv_bfloat162 x_pair = *reinterpret_cast<const __nv_bfloat162*>(x + x_offset);
-        float x_even = __bfloat162float(__low2bfloat16(x_pair));
-        float x_odd  = __bfloat162float(__high2bfloat16(x_pair));
+        const float e0 = __bfloat162float(__low2bfloat16(p0));
+        const float o0 = __bfloat162float(__high2bfloat16(p0));
+        const float e1 = __bfloat162float(__low2bfloat16(p1));
+        const float o1 = __bfloat162float(__high2bfloat16(p1));
 
-        float c = freqs_cis[cs_offset];
-        float s = freqs_cis[cs_offset + 1];
+        __nv_bfloat162 r0 = __floats2bfloat162_rn(
+            e0 * f.x - o0 * f.y, e0 * f.y + o0 * f.x);
+        __nv_bfloat162 r1 = __floats2bfloat162_rn(
+            e1 * f.z - o1 * f.w, e1 * f.w + o1 * f.z);
 
-        float out_even = x_even * c - x_odd * s;
-        float out_odd  = x_even * s + x_odd * c;
-
-        __nv_bfloat162 out_pair = __floats2bfloat162_rn(out_even, out_odd);
-        *reinterpret_cast<__nv_bfloat162*>(out + x_offset) = out_pair;
+        uint2 oraw;
+        *reinterpret_cast<__nv_bfloat162*>(&oraw.x) = r0;
+        *reinterpret_cast<__nv_bfloat162*>(&oraw.y) = r1;
+        *reinterpret_cast<uint2*>(out + x_off) = oraw;
     }
 }
 
@@ -64,7 +71,7 @@ torch::Tensor rotary_emb(
     int n_heads = x.size(x.dim() - 2);
     int head_dim = x.size(x.dim() - 1);
 
-    TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even");
+    TORCH_CHECK(head_dim % 4 == 0, "head_dim must be a multiple of 4");
     TORCH_CHECK(freqs_cis.numel() == (int64_t)n_tokens * head_dim,
                 "freqs_cis token or rotary dimension mismatch");
     TORCH_CHECK(freqs_cis.size(-2) == head_dim / 2, "freqs_cis dim/2 mismatch");
@@ -72,10 +79,9 @@ torch::Tensor rotary_emb(
 
     auto out = torch::empty_like(x);
 
-    int half_dim = head_dim / 2;
-    int total = n_tokens * n_heads * half_dim;
+    int work = n_tokens * n_heads * (head_dim / 4);
     int block = 256;
-    int grid = std::min((total + block - 1) / block, 1024);
+    int grid = std::min((work + block - 1) / block, 2048);
 
     rotary_emb_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),

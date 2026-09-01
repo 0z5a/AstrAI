@@ -68,7 +68,7 @@ set(KERNEL_SRCS
     attention/prefill.cu
     attention/paged_decode.cu
     attention/paged_prefill.cu
-    rotary/rotary_emb.cu
+    rotary_emb.cu
 )
 
 if(ASTRAI_CUDA_ARCH GREATER_EQUAL 89)
