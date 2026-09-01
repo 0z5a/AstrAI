@@ -1,8 +1,12 @@
+from pathlib import Path
+
 import torch
 
 from astrai.model.components.decoder_block import DecoderBlock
+from astrai.serialization import Checkpoint
 from astrai.trainer.train_callback import GradientCheckpointingCallback, TrainCallback
 from astrai.trainer.trainer import Trainer
+from tests.helpers import RandomTokenDataset
 
 
 def test_gradient_checkpointing_enable_disable(test_model):
@@ -135,3 +139,34 @@ def test_callback_integration(
     assert "on_train_begin" in callback_calls
     assert "on_batch_end" in callback_calls
     assert "on_epoch_end" in callback_calls
+
+
+def test_checkpoint_captures_completed_optimizer_step(
+    base_test_env, train_config_factory, device
+):
+    """Checkpoint state must include the update represented by its step number."""
+    model = base_test_env["model"]
+    initial_state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
+    train_config = train_config_factory(
+        model_fn=lambda: model,
+        dataset=RandomTokenDataset(length=2),
+        test_dir=base_test_env["test_dir"],
+        device=device,
+        batch_per_device=2,
+        ckpt_interval=1,
+    )
+
+    Trainer(train_config).train()
+
+    checkpoint = Checkpoint.load(
+        str(Path(base_test_env["test_dir"]) / "epoch_0_step_1")
+    )
+    assert any(
+        not torch.equal(checkpoint.state_dict[name].cpu(), initial_tensor)
+        for name, initial_tensor in initial_state.items()
+    )
+    assert checkpoint.extra["optimizer"]["state"]
+    assert checkpoint.extra["scheduler"]["last_epoch"] == 1

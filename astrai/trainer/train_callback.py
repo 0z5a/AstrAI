@@ -55,7 +55,10 @@ class TrainCallback(Protocol):
         """Called at the end of each batch."""
 
     def on_optimizer_step(self, context: TrainContext):
-        """Called on every optimizer step (sync step only)."""
+        """Called immediately before every optimizer step (sync step only)."""
+
+    def on_after_optimizer_step(self, context: TrainContext):
+        """Called after the optimizer and scheduler step (sync step only)."""
 
     def on_error(self, context: TrainContext):
         """Called when an error occurs during training."""
@@ -170,7 +173,7 @@ class CheckpointCallback(TrainCallback):
                 )
                 context.checkpoint.save(save_path)
 
-    def on_batch_end(self, context: TrainContext):
+    def on_after_optimizer_step(self, context: TrainContext):
         if context.optimizer_step - self.last_ckpt_step >= self.interval:
             self._save_checkpoint(context)
 

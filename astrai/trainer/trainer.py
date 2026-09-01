@@ -101,6 +101,8 @@ class Trainer:
                             if context.scheduler:
                                 context.scheduler.step()
 
+                            self._call_callbacks("on_after_optimizer_step", context)
+
                 self._call_callbacks("on_epoch_end", context)
 
             if context.stop_requested:
