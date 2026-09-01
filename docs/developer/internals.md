@@ -118,12 +118,13 @@ on_train_begin
         on_batch_end
 
         if executor.sync_gradients:
-          on_optimizer_step
+          before_optimizer_step
           optimizer.step()
           strategy.on_optimizer_step()
           optimizer.zero_grad()
           if scheduler:
             scheduler.step()
+          after_optimizer_step
     on_epoch_end
 on_train_end
 ```
@@ -139,8 +140,9 @@ Strategy metrics are detached and converted to Python `float` values before the
 | `on_train_begin` | Before training starts | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 | `on_epoch_begin` | Start of each epoch | `ProgressBarCallback` |
 | `on_batch_begin` | Every batch | — |
-| `on_optimizer_step` | Every accumulation window | `MetricCallback`, `ProgressBarCallback`, `GradientClippingCallback` |
-| `on_batch_end` | Every batch | `CheckpointCallback` |
+| `before_optimizer_step` | Every accumulation window, before `optimizer.step()` | `MetricCallback`, `ProgressBarCallback`, `GradientClippingCallback` |
+| `on_batch_end` | Every batch | — |
+| `after_optimizer_step` | Every accumulation window, after `optimizer.step()` and `scheduler.step()` | `CheckpointCallback` |
 | `on_epoch_end` | End of each epoch | `MetricCallback`, `ProgressBarCallback` |
 | `on_error` | On exception during training | `CheckpointCallback`, `MetricCallback` |
 | `on_train_end` | Training exits after `on_train_begin` completes (via `finally`) | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |

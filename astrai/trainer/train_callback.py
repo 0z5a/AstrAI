@@ -54,8 +54,11 @@ class TrainCallback(Protocol):
     def on_batch_end(self, context: TrainContext):
         """Called at the end of each batch."""
 
-    def on_optimizer_step(self, context: TrainContext):
-        """Called on every optimizer step (sync step only)."""
+    def before_optimizer_step(self, context: TrainContext):
+        """Called immediately before every optimizer step (sync step only)."""
+
+    def after_optimizer_step(self, context: TrainContext):
+        """Called after the optimizer and scheduler step (sync step only)."""
 
     def on_error(self, context: TrainContext):
         """Called when an error occurs during training."""
@@ -82,7 +85,7 @@ class GradientClippingCallback(TrainCallback):
     def __init__(self, max_grad_norm: float):
         self.max_grad_norm = max_grad_norm
 
-    def on_optimizer_step(self, context: TrainContext):
+    def before_optimizer_step(self, context: TrainContext):
         context.grad_norm = context.executor.clip_grad_norm(
             context.model, self.max_grad_norm
         )
@@ -170,7 +173,7 @@ class CheckpointCallback(TrainCallback):
                 )
                 context.checkpoint.save(save_path)
 
-    def on_batch_end(self, context: TrainContext):
+    def after_optimizer_step(self, context: TrainContext):
         if context.optimizer_step - self.last_ckpt_step >= self.interval:
             self._save_checkpoint(context)
 
@@ -216,7 +219,7 @@ class ProgressBarCallback(TrainCallback):
         )
 
     @only_on_rank(0)
-    def on_optimizer_step(self, context: TrainContext):
+    def before_optimizer_step(self, context: TrainContext):
         postfix = {
             "step": f"{context.optimizer_step:d}",
             "loss": f"{context.loss:.4f}",
@@ -343,7 +346,7 @@ class MetricCallback(TrainCallback):
             for log in self.log_cache:
                 f.write(json.dumps(log) + "\n")
 
-    def on_optimizer_step(self, context):
+    def before_optimizer_step(self, context):
         context.grad_snr_tracker.update(context.model)
 
         if (

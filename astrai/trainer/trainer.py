@@ -93,13 +93,15 @@ class Trainer:
                         self._call_callbacks("on_batch_end", context)
 
                         if executor.sync_gradients:
-                            self._call_callbacks("on_optimizer_step", context)
+                            self._call_callbacks("before_optimizer_step", context)
                             context.optimizer.step()
                             context.strategy.on_optimizer_step()
                             context.optimizer.zero_grad()
 
                             if context.scheduler:
                                 context.scheduler.step()
+
+                            self._call_callbacks("after_optimizer_step", context)
 
                 self._call_callbacks("on_epoch_end", context)
 
