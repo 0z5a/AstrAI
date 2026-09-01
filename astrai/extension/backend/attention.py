@@ -21,10 +21,15 @@ Usage — mirroring ``torch.nn.attention.sdpa_kernel``:
         ...
 
 Thread-safe via ``contextvars`` — each scheduler thread gets its own
-active backend. Backend resolution follows a strict precedence:
+active backend. Backend resolution is a thin facade over the generic
+operator dispatcher (``astrai.extension.dispatch``): the three backends
+are registered as the "attention" family and the decision table lives in
+``_attention_records``.  Resolution follows a strict precedence:
 
 1. explicit ``attn_backend(...)`` context (wins over everything),
-2. the process-wide ``ASTR_BACKEND`` environment override,
+2. the process-wide ``ASTR_BACKEND`` environment override
+   (or an ``ASTR_OPS`` ``attention=`` entry, which wins over the legacy
+   variable),
 3. an implicit default picked from the available backends
    (cuda > flash > torch).
 
@@ -40,12 +45,9 @@ Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 (blhd). The backend returns ``[batch, seq_len, n_heads * head_dim]``.
 """
 
-import contextvars
 import enum
 import functools
 import logging
-import os
-import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
@@ -54,6 +56,22 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from astrai.extension.dispatch import (
+    Axes,
+    ImplRecord,
+    Spec,
+    axis,
+    env_selection,
+    get_override,
+    register_env_alias,
+    register_family,
+    reset_override,
+    set_override,
+    tensor_axes,
+)
+from astrai.extension.dispatch import (
+    resolve as _dispatch_resolve,
+)
 from astrai.extension.loader import is_available
 from astrai.extension.ops.attention import (
     attn_paged_decode,
@@ -72,15 +90,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_default_backend_lock = threading.Lock()
-_env_backend_name: Optional[str] = None
-_env_backend: Optional["AttentionBackend"] = None
-_current_backend: contextvars.ContextVar[Optional["AttentionBackend"]] = (
-    contextvars.ContextVar("attn_backend", default=None)
-)
-
-# Backends are stateless — one canonical instance per class, created lazily
-# and reused everywhere (resolution, fallback, context managers).
 _singletons: Dict[type, "AttentionBackend"] = {}
 
 
@@ -157,28 +166,6 @@ def _resolve_default_backend() -> "AttentionBackend":
     return _priority_backends()[0]
 
 
-def _environment_backend() -> Optional["AttentionBackend"]:
-    """Resolve the process-wide ``ASTR_BACKEND`` override, if configured."""
-    global _env_backend, _env_backend_name
-    name = os.environ.get("ASTR_BACKEND", "").strip().lower()
-    if not name:
-        return None
-    if name != _env_backend_name:
-        with _default_backend_lock:
-            if name != _env_backend_name:
-                try:
-                    _env_backend = _resolve_backend(name)
-                except (ValueError, RuntimeError):
-                    _env_backend = None
-                    logger.warning(
-                        "ASTR_BACKEND=%r is not a registered attention backend; "
-                        "falling back to default resolution",
-                        name,
-                    )
-                _env_backend_name = name
-    return _env_backend
-
-
 def _resolve_backend(
     backend: Optional[Union[str, ATTN_BACKEND, "AttentionBackend", type]] = None,
 ) -> "AttentionBackend":
@@ -204,18 +191,44 @@ def _resolve_backend(
     return _resolve_default_backend()
 
 
+_ENV_WARNED: set = set()
+
+
+def _environment_backend() -> Optional["AttentionBackend"]:
+    """Resolve the process-wide env override (``ASTR_OPS`` or the legacy
+    ``ASTR_BACKEND``) to a backend instance, if it names a registered one.
+
+    Invalid names warn once and are ignored, falling back to default
+    resolution — the override is soft, never fatal.
+    """
+    name = env_selection("attention")
+    if name is None:
+        return None
+    try:
+        return _resolve_backend(name)
+    except (ValueError, RuntimeError):
+        message = (
+            f"ASTR_BACKEND/ASTR_OPS value {name!r} is not a registered "
+            f"attention backend; falling back to default resolution"
+        )
+        if message not in _ENV_WARNED:
+            _ENV_WARNED.add(message)
+            logger.warning(message)
+        return None
+
+
 def get_backend(
     use_default: bool = True,
 ) -> Optional["AttentionBackend"]:
     """Resolve the active backend: explicit context > env > default.
 
     An ``attn_backend(...)`` context is the caller's explicit choice and
-    always wins.  ``ASTR_BACKEND`` is a process-wide override consulted
-    only when no context is set.  Pass ``use_default=False`` at request
-    submission to retain only an environment override or the caller's
-    :func:`attn_backend` value.
+    always wins.  ``ASTR_BACKEND`` (or ``ASTR_OPS``) is a process-wide
+    override consulted only when no context is set.  Pass
+    ``use_default=False`` at request submission to retain only an
+    environment override or the caller's :func:`attn_backend` value.
     """
-    context_backend = _current_backend.get()
+    context_backend = get_override("attention")
     if context_backend is not None:
         return context_backend
     env_backend = _environment_backend()
@@ -241,11 +254,11 @@ def attn_backend(backend: Union[str, ATTN_BACKEND, "AttentionBackend", type]):
             ...
     """
     instance = _resolve_backend(backend)
-    token = _current_backend.set(instance)
+    token = set_override("attention", instance)
     try:
         yield instance
     finally:
-        _current_backend.reset(token)
+        reset_override(token)
 
 
 def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
@@ -257,6 +270,24 @@ def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
         x.unsqueeze(-2)
         .expand(*x.shape[:-2], n_heads, n_rep, head_dim)
         .reshape(*x.shape[:-2], n_heads * n_rep, head_dim)
+    )
+
+
+def _axes(
+    q: Tensor,
+    kv_cache: Optional["KVCache"],
+    attn_mask: Optional[Tensor],
+    is_causal: bool,
+    fwd: Optional[str],
+) -> Axes:
+    """Snapshot the axes the attention decision table depends on."""
+    return tensor_axes(
+        q,
+        fwd=fwd,
+        ndim=q.dim(),
+        head_dim=q.size(-1) if q.dim() >= 1 else None,
+        has_cache=kv_cache is not None,
+        has_mask=attn_mask is not None,
     )
 
 
@@ -300,37 +331,13 @@ def attention(
     Returns:
         [batch, q_len, n_heads * head_dim]
     """
-    if backend is not None:
-        selected = _resolve_backend(backend)
-        explicit = True
-    else:
-        context_backend = _current_backend.get()
-        explicit = context_backend is not None
-        # Resolve through the same chain as inference: explicit context >
-        # ASTR_BACKEND env > default.  Training calls (fwd=None, no cache)
-        # land on the CUDA backend and fall back by capability below —
-        # flash when it can handle the call, else torch SDPA.
-        selected = get_backend()
-        assert selected is not None
-
-    if not selected.supports_call(q, kv_cache, attn_mask, is_causal, fwd):
-        if explicit:
-            raise RuntimeError(
-                f"Explicitly-set backend {type(selected).__name__} cannot "
-                f"handle this attention call (shape={q.shape}, "
-                f"dtype={q.dtype}, kv_cache={'none' if kv_cache is None else 'present'}, "
-                f"attn_mask={'none' if attn_mask is None else 'present'}). "
-                f"Remove the attn_backend() context or switch to a compatible backend."
-            )
-        selected = next(
-            (
-                candidate
-                for candidate in _priority_backends()
-                if candidate.supports_call(q, kv_cache, attn_mask, is_causal, fwd)
-            ),
-            _instance(TorchNativeBackend),
-        )
-    return selected.forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal, fwd)
+    explicit = _resolve_backend(backend) if backend is not None else None
+    resolution = _dispatch_resolve(
+        "attention", q, kv_cache, attn_mask, is_causal, fwd, explicit=explicit
+    )
+    return resolution.record.obj.forward(
+        q, k, v, kv_cache, layer_id, attn_mask, is_causal, fwd
+    )
 
 
 class AttentionBackend(ABC):
@@ -362,11 +369,11 @@ class AttentionBackend(ABC):
     """
 
     def __enter__(self) -> "AttentionBackend":
-        self._token = _current_backend.set(self)
+        self._token = set_override("attention", self)
         return self
 
     def __exit__(self, *exc) -> None:
-        _current_backend.reset(self._token)
+        reset_override(self._token)
 
     @classmethod
     @abstractmethod
@@ -817,3 +824,78 @@ class FlashAttnBackend(AttentionBackend):
             causal=True,
         )
         return out
+
+
+# Family registration over the generic dispatcher: the "attention" decision
+# table.  The Specs mirror each backend's ``supports_call`` exactly (a unit
+# test asserts they never drift).  The provider is re-evaluated per
+# resolution, so monkeypatching ``flash_attn_available`` (plus clearing
+# ``_priority_backends``) is honored, as before.
+
+_CLASS_TO_NAME: Dict[type, str] = {
+    CudaBackend: ATTN_BACKEND.CUDA.value,
+    FlashAttnBackend: ATTN_BACKEND.FLASH.value,
+    TorchNativeBackend: ATTN_BACKEND.TORCH_NATIVE.value,
+}
+
+_SPEC_CUDA = (
+    axis("fwd").in_("prefill", "decode")
+    & axis("has_cache").truthy()
+    & axis("ndim").eq(3)
+    & axis("dtype").in_(torch.bfloat16)
+    & axis("head_dim").in_(*CudaBackend.HEAD_DIMS)
+    & Spec.of(
+        lambda ax: is_available(f"attn_paged_{ax.get('fwd')}"), "paged kernels loaded"
+    )
+)
+
+_SPEC_FLASH = (
+    axis("dtype").in_(torch.float16, torch.bfloat16)
+    & Spec.of(lambda ax: flash_attn_available(), "flash-attn available")
+    & (
+        (
+            axis("fwd").not_none()
+            & axis("ndim").eq(3)
+            & Spec.of(
+                lambda ax: (
+                    _flash_attn is not None
+                    and hasattr(_flash_attn, "flash_attn_varlen_func")
+                ),
+                "varlen api present",
+            )
+        )
+        | (axis("fwd").none() & axis("has_mask").falsy())
+    )
+)
+
+
+def _attention_records() -> list:
+    specs = {
+        CudaBackend: _SPEC_CUDA,
+        FlashAttnBackend: _SPEC_FLASH,
+        TorchNativeBackend: Spec.always(),
+    }
+    return [
+        ImplRecord(
+            family="attention",
+            name=_CLASS_TO_NAME[type(backend)],
+            obj=backend,
+            spec=specs[type(backend)],
+            priority=position,
+        )
+        for position, backend in enumerate(_priority_backends())
+    ]
+
+
+def _reference_record() -> ImplRecord:
+    return ImplRecord(
+        family="attention",
+        name=ATTN_BACKEND.TORCH_NATIVE.value,
+        obj=_instance(TorchNativeBackend),
+        spec=Spec.always(),
+        priority=999,
+    )
+
+
+register_family("attention", _axes, _attention_records, _reference_record)
+register_env_alias("attention", "ASTR_BACKEND")

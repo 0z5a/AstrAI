@@ -27,6 +27,22 @@ from astrai.extension.backend import (
     attn_backend,
     get_backend,
 )
+from astrai.extension.dispatch import (
+    Axes,
+    ExplicitSelectionError,
+    ImplRecord,
+    Resolution,
+    Spec,
+    axis,
+    explain,
+    explain_plan,
+    op_backend,
+    register_env_alias,
+    register_family,
+    resolve,
+    resolve_plan,
+    tensor_axes,
+)
 from astrai.extension.loader import KERNEL_NAMES, is_available
 from astrai.extension.ops import (
     TensorLayout,
@@ -52,4 +68,18 @@ __all__ = [
     "is_available",
     "KERNEL_NAMES",
     "apply_rotary_emb",
+    "Axes",
+    "ExplicitSelectionError",
+    "ImplRecord",
+    "Resolution",
+    "Spec",
+    "axis",
+    "explain",
+    "explain_plan",
+    "op_backend",
+    "register_env_alias",
+    "register_family",
+    "resolve",
+    "resolve_plan",
+    "tensor_axes",
 ]
