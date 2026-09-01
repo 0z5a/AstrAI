@@ -746,13 +746,14 @@ classDiagram
             +on_epoch_end(context)
             +on_batch_begin(context)
             +on_batch_end(context)
-            +on_optimizer_step(context)
+            +before_optimizer_step(context)
+            +after_optimizer_step(context)
             +on_error(context)
         }
 
         class GradientClippingCallback {
             +Optional[float] max_grad_norm
-            +on_optimizer_step(context)
+            +before_optimizer_step(context)
         }
 
         class GradientCheckpointingCallback {
@@ -767,7 +768,7 @@ classDiagram
             +bool weight_only
             +Callable save_extra_fn
             -_save_checkpoint(context)
-            +on_batch_end(context)
+            +after_optimizer_step(context)
             +on_train_end(context)
             +on_error(context)
             +save_extra(context) dict
@@ -779,7 +780,7 @@ classDiagram
             +IO file
             +tqdm progress_bar
             +on_epoch_begin(context)
-            +on_optimizer_step(context)
+            +before_optimizer_step(context)
             +on_epoch_end(context)
         }
 
@@ -788,7 +789,7 @@ classDiagram
             +int save_interval
             +List[str] metrics
             +int val_step
-            +on_optimizer_step(context)
+            +before_optimizer_step(context)
             +on_epoch_end(context)
             +on_train_end(context)
             +on_error(context)
