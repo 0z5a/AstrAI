@@ -3,8 +3,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "../common/cp_async.cuh"
-#include "../common/mma.cuh"
+#include "common/cp_async.cuh"
+#include "common/mma.cuh"
 
 // Predicated cp.async (4-operand form) requires CUDA 11.2+.
 // bf16 mma.sync requires sm_80+ (guarded at build time by ASTRAI_NO_MMA).

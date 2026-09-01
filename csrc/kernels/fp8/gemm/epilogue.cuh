@@ -2,7 +2,7 @@
 // Collective epilogue: fused bias, the bf16 scatter of the fp32 accumulators
 // through the reclaimed operand shared memory, and the coalesced copy-out.
 
-#include "../common.h"
+#include "fp8/common.h"
 #include "policy.cuh"
 
 namespace astrai {

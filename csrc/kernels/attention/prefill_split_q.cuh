@@ -2,8 +2,8 @@
 #include <cfloat>
 #include <cuda_bf16.h>
 #include "common.h"
+#include "common/reduce.cuh"
 #include "layout_policies.cuh"
-#include "../common/reduce.cuh"
 
 namespace astrai {
 namespace attention {

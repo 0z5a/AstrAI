@@ -5,7 +5,7 @@
 
 #include <type_traits>
 
-#include "../common.h"
+#include "fp8/common.h"
 
 namespace astrai {
 namespace fp8 {

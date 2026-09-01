@@ -8,7 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 
-#include "../common/device.cuh"
+#include "common/device.cuh"
 #include "gemm.cuh"
 #include "quantize.cuh"
 

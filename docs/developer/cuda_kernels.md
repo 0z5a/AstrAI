@@ -407,7 +407,7 @@ blocks.
 Each `csrc/tests/*.cu` file has the `nvcc` compile command in its header comment. Example:
 
 ```bash
-nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
+nvcc -I csrc/kernels -arch=sm_89 -O3 --use_fast_math \
      --ptxas-options=-O3,-v --extra-device-vectorization \
      -Xcompiler -fopenmp csrc/tests/attn_test.cu -o /tmp/test && /tmp/test
 ```
@@ -423,7 +423,7 @@ Hardware: NVIDIA L20 (sm_89, 46 GB), CUDA 12.8, driver 570.86.
 
 Reproduce (decode + prefill in `attn_test.cu`, paged in `attn_paged_test.cu`):
 ```bash
-nvcc -I csrc -arch=sm_89 -O3 --use_fast_math \
+nvcc -I csrc/kernels -arch=sm_89 -O3 --use_fast_math \
      --ptxas-options=-O3,-v --extra-device-vectorization \
      -Xcompiler -fopenmp csrc/tests/attn_test.cu -o /tmp/test && /tmp/test
 ```

@@ -5,8 +5,8 @@
 // The staging invariants and the swizzle derivation live in
 // docs/developer/cuda_kernels.md.
 
-#include "../../common/cp_async.cuh"
-#include "../common.h"
+#include "common/cp_async.cuh"
+#include "fp8/common.h"
 #include "policy.cuh"
 
 namespace astrai {

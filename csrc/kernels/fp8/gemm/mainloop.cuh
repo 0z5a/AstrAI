@@ -7,8 +7,8 @@
 
 #include <type_traits>
 
-#include "../../common/mma.cuh"
-#include "../common.h"
+#include "common/mma.cuh"
+#include "fp8/common.h"
 #include "load.cuh"
 #include "policy.cuh"
 

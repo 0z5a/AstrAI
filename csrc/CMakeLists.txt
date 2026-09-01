@@ -90,6 +90,7 @@ foreach(i RANGE ${_kernel_last})
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
 
     target_include_directories(${name} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernels"
         "${TORCH_HOME}/include"
         "${TORCH_HOME}/include/torch/csrc/api/include"
         "${PYTHON_INCLUDE_DIR}")

@@ -11,8 +11,8 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
-#include "../common/cp_async.cuh"
 #include "common.h"
+#include "common/cp_async.cuh"
 #include "gemm/epilogue.cuh"
 #include "gemm/load.cuh"
 #include "gemm/mainloop.cuh"

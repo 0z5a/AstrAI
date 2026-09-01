@@ -10,7 +10,7 @@
 #include <cstdint>
 
 #include "common.h"
-#include "../common/reduce.cuh"
+#include "common/reduce.cuh"
 
 namespace astrai {
 namespace fp8 {

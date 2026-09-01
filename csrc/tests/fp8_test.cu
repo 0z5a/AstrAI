@@ -6,7 +6,7 @@ Part 1 exercises one bf16 -> fp8 -> mma.sync m16n8k32 instruction pair
 Part 2 checks launch_fp8_gemm across all four operand layouts, both K
 tiles, and ragged shapes against an fp32 CPU reference.
 
-nvcc -I csrc -arch=sm_89 -std=c++17 -O3 csrc/tests/fp8_test.cu -o /tmp/fp8_test \
+nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/fp8_test.cu -o /tmp/fp8_test \
     && /tmp/fp8_test
 */
 
@@ -21,8 +21,8 @@ nvcc -I csrc -arch=sm_89 -std=c++17 -O3 csrc/tests/fp8_test.cu -o /tmp/fp8_test 
 #include <type_traits>
 #include <vector>
 
-#include "../kernels/common/mma.cuh"
-#include "../kernels/fp8/gemm.cuh"
+#include "common/mma.cuh"
+#include "fp8/gemm.cuh"
 
 using namespace astrai::fp8;
 
