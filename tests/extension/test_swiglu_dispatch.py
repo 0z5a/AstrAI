@@ -83,7 +83,10 @@ def test_mode_one_forces_supported_shape(monkeypatch):
 
 
 @skip_no_swiglu
-def test_auto_falls_back_until_shape_is_qualified(monkeypatch):
+def test_auto_uses_unfused_chain_until_shape_is_qualified(monkeypatch):
+    # The fusion table is empty, so auto keeps the unfused linear-backend
+    # chain. The linear backend may still dispatch its own GEMV for M=4,
+    # hence the relaxed tolerance versus the pure-torch reference.
     monkeypatch.setenv("ASTRAI_SWIGLU", "auto")
     x = torch.randn(4, 1536, device="cuda", dtype=torch.bfloat16)
     up_weight = torch.randn(6912, 1536, device="cuda", dtype=torch.bfloat16)
@@ -91,4 +94,4 @@ def test_auto_falls_back_until_shape_is_qualified(monkeypatch):
     with torch.no_grad():
         actual = swiglu(x, up_weight, gate_weight)
         expected = reference_swiglu(x, up_weight, gate_weight)
-    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.1)

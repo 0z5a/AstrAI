@@ -29,3 +29,6 @@ def rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     if not freqs_cis.is_contiguous():
         freqs_cis = freqs_cis.contiguous()
     return mod.rotary_emb(x, freqs_cis)
+
+
+__all__ = ["rotary_emb"]

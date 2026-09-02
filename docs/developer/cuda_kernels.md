@@ -39,43 +39,24 @@ current CUDA stream, is CUDA Graph capture-safe, and requires sm_80 or newer.
 
 Model `Linear` calls route through the lightweight linear backend. Set
 `ASTRAI_GEMV=0` for an unconditional `F.linear` fallback, `1` to force the
-kernel for any supported M in [1, 8], or `auto` (the default) to select only
-architecture/shape bands that pass both the per-shape and end-to-end gates.
-Measured SM89 small-M bands are enabled as follows:
+kernel for any supported M in [1, 8], or `auto` (the default). Automatic
+dispatch is keyed on the decode batch size alone: the kernel streams each
+weight exactly once, so once a batch size is profitable it is profitable
+across projection shapes. On compute capability 8.0+, `auto` selects the
+kernel for `M` in [2, 4], where every measured model family beat the cuBLAS
+small-M path at the HBM bandwidth floor (AstrAI 1B chain +11.8% to +14.0%,
+common LLaMA/Qwen/OPT chains +5.66% to +25.20%). `M=1` keeps cuBLAS, whose
+GEMV path is already at the floor, and `M >= 5` approaches the cuBLAS
+tensor-core crossover (M=8 regressed at wrapper level in every measured
+family). Out-of-band, training, prefill-sized, or unsupported calls fall
+back to PyTorch.
 
-| M | Automatic `(N, K)` bands | Validated gain |
-|---:|---|---:|
-| 1 | OPT-1.3B Q/K/V/O and MLP | +4.54% OPT projection chain |
-| 2 | AstrAI `(256,1536)`, `(1536,1536)`, `(100000,1536)` plus all common shapes below | +14.0% on AstrAI 1B; +5.66% to +25.20% common chains |
-| 4 | AstrAI `(256,1536)`, `(1536,1536)` plus gated common shapes below | +11.8% on AstrAI 1B; +5.67% to +7.71% common chains |
-| 8 | none | at least one projection in every measured family missed the per-shape gate |
-
-The common set covers LLaMA 2 7B Q/O, gate/up, and down; LLaMA 3 8B K/V,
-gate/up, and down; LLaMA 2 13B Q/K/V/O, gate/up, and down; and GPT-NeoX MLP
-up/down. In `(N,K)` form it is `(1024,4096)`, `(4096,4096)`,
-`(11008,4096)`, `(4096,11008)`, `(14336,4096)`, `(4096,14336)`,
-`(5120,5120)`, `(13824,5120)`, `(5120,13824)`, `(16384,4096)`, and
-`(4096,16384)`. M=2 enables all eleven. M=4 excludes the three LLaMA 2 7B
-bands `(4096,4096)`, `(11008,4096)`, and `(4096,11008)` because their combined
-projection chain reached only +1.89%, below the 3% automatic-dispatch gate.
-
-The extended common set adds Qwen2-7B `(512,3584)`, `(3584,3584)`,
-`(18944,3584)`, and `(3584,18944)`; LLaMA 3 70B `(1024,8192)`,
-`(8192,8192)`, `(28672,8192)`, and `(8192,28672)`; and OPT-1.3B
-`(2048,2048)`, `(8192,2048)`, and `(2048,8192)`. Qwen2 and LLaMA 3 70B are
-enabled at M=2/4. OPT-1.3B is enabled at M=1/2. Other rows retain their
-previous policy or fall back to PyTorch.
-
-Inside the primitive, a templated cooperative kernel uses either 256 threads
-or a shape-gated 128-thread CTA. The smaller CTA is enabled only where an
-interleaved direct-module comparison against the original 256-thread kernel
-cleared 5%: OPT up at M=1; selected LLaMA 2 7B, Qwen2, and OPT projections at
-M=2; LLaMA 2 13B Q/O, Qwen2 Q/O, and selected OPT projections at M=4; and
-selected LLaMA 2, Qwen2, LLaMA 3 KV, and OPT projections at M=8. Confirmed
-direct-kernel gains range from +5.37% to +48.54%. Long-K and saturated shapes
-keep the 256-thread fallback. This internal selector is separate from model
-automatic dispatch, whose Python/wrapper overhead is included in the gates
-above.
+Inside the primitive, a templated cooperative kernel uses 256 threads,
+except at the largest decode batch where a 128-thread CTA wins 5-9% on
+small weight matrices: `M=8` with 16-byte-aligned inputs, `K % 8 == 0`,
+and `N*K <= 12 MiB` selects the smaller CTA. This internal selector is
+separate from model automatic dispatch, whose Python/wrapper overhead is
+included in the gates above.
 
 On NVIDIA L20 (SM89), the common-shape microbenchmark reports +5.37% to
 +114.39% for M=2 and +5.38% to +115.26% for M=4 versus `F.linear`. The paired

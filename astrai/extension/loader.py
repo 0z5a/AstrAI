@@ -20,15 +20,19 @@ import glob
 import importlib
 import logging
 import os
+from functools import cache
+from typing import Dict, List
+
+import torch
 
 logger = logging.getLogger(__name__)
 
 _LIB_DIR = os.path.join(os.path.dirname(__file__), "lib")
 
 
-def _discover_kernel_names() -> list[str]:
+def _discover_kernel_names() -> List[str]:
     """Return the module names of the compiled kernel ``.so`` files in lib/."""
-    names: list[str] = []
+    names: List[str] = []
     for path in glob.glob(os.path.join(_LIB_DIR, "*.so")):
         # strip the "<soabi>.so" suffix, e.g. attn_decode.cpython-312-...so
         names.append(os.path.basename(path).split(".", 1)[0])
@@ -37,8 +41,8 @@ def _discover_kernel_names() -> list[str]:
 
 KERNEL_NAMES = _discover_kernel_names()
 
-_available: dict[str, bool] = {}
-_modules: dict[str, object] = {}
+_available: Dict[str, bool] = {}
+_modules: Dict[str, object] = {}
 
 
 def _try_load(name: str) -> object:
@@ -81,3 +85,10 @@ def get_module(name: str) -> object:
             f"Build with CSRC_KERNELS=true (or use the torch-native fallback)."
         )
     return mod
+
+
+__all__ = [
+    "KERNEL_NAMES",
+    "get_module",
+    "is_available",
+]

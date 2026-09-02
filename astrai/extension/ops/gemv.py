@@ -21,3 +21,6 @@ def bf16_gemv(
     fallback or model-level dispatch.
     """
     return get_module("bf16_gemv").bf16_gemv(x, weight, bias)
+
+
+__all__ = ["bf16_gemv"]

@@ -114,3 +114,6 @@ def mm_fp8(
     BF16; FP8 output is a separate quantize operation.
     """
     return get_module("fp8_ops").mm_fp8(a, b, scale, trans_a, trans_b, bias)
+
+
+__all__ = ["mm_fp8", "quantize", "quantize_dual"]

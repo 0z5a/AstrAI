@@ -34,8 +34,9 @@ The kernel suite compares the directly callable primitive with `F.linear`.
 Use repeatable `--shape-label` and `--chain-label` filters for a focused run.
 The synthetic-chain suite alternates `ASTRAI_GEMV=0` and `auto`, includes
 dependent MLP work and Python dispatch, and rotates through distinct weights.
-Pass `--candidate-mode 1` to characterize a family before adding it to the
-automatic shape table; the checked-in final evidence always uses `auto`.
+Automatic dispatch is keyed on the decode batch size alone (`M` in `[2, 4]` on
+compute capability 8.0+); use `--candidate-mode 1` to characterize a family
+before widening that band. The checked-in final evidence always uses `auto`.
 It is deliberately not labeled a whole-model throughput benchmark. Both
 suites report median/p90 CUDA-event latency plus maximum absolute error,
 relative L2 error, and row-wise argmax parity.
