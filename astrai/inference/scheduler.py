@@ -2,6 +2,7 @@ import logging
 import threading
 import uuid
 from contextlib import nullcontext
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -22,6 +23,15 @@ from astrai.tokenize.tokenizer import AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
+def _with_weight_lock(method):
+    @wraps(method)
+    def synchronized(self, *args, **kwargs):
+        with self._weight_lock:
+            return method(self, *args, **kwargs)
+
+    return synchronized
+
+
 class InferenceScheduler:
     """Continuous batching loop: cleanup -> refill -> prefill -> decode (all groups)."""
 
@@ -36,7 +46,14 @@ class InferenceScheduler:
         cache: Optional[PagePool] = None,
         enable_cuda_graph: bool = True,
         backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
+        policy_version: int = 0,
     ):
+        if (
+            isinstance(policy_version, bool)
+            or not isinstance(policy_version, int)
+            or policy_version < 0
+        ):
+            raise ValueError("policy_version must be a non-negative integer")
         config = model.config
 
         if max_seq_len is not None:
@@ -97,6 +114,44 @@ class InferenceScheduler:
 
         self._stop_event = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
+        self._weight_lock = threading.RLock()
+        self._policy_version = policy_version
+
+    @property
+    def policy_version(self) -> int:
+        """Version of the model weights used for subsequent generations."""
+        return self._policy_version
+
+    @_with_weight_lock
+    def update_weights(self, policy_version: int) -> int:
+        """Acknowledge an in-place weight update and invalidate stale KV state.
+
+        The scheduler owns the same model object as the in-process trainer, so
+        weights have already changed when this method is called.  The explicit
+        version update makes that lifecycle visible and prevents prefix KV
+        entries produced by older weights from being reused.
+        """
+        if (
+            isinstance(policy_version, bool)
+            or not isinstance(policy_version, int)
+            or policy_version < 0
+        ):
+            raise ValueError("policy_version must be a non-negative integer")
+        if policy_version < self._policy_version:
+            raise ValueError(
+                f"policy_version cannot move backwards from "
+                f"{self._policy_version} to {policy_version}"
+            )
+        if policy_version == self._policy_version:
+            return self._policy_version
+        if self._loop_thread is not None and self._loop_thread.is_alive():
+            raise RuntimeError("Stop the scheduler before updating model weights")
+        if self._task_mgr.get_active_tasks() or self._task_mgr.get_waiting_tasks():
+            raise RuntimeError("Cannot update model weights while tasks are queued")
+
+        self._task_cache.invalidate_cache()
+        self._policy_version = policy_version
+        return self._policy_version
 
     def add_task(self, prompt: str, **kwargs) -> str:
         return self._task_mgr.add_task(prompt, **kwargs)
@@ -106,7 +161,10 @@ class InferenceScheduler:
             self._task_cache.task_free(task.task_id)
 
     def get_stats(self) -> Dict[str, Any]:
-        return self._task_mgr.get_stats()
+        return {
+            **self._task_mgr.get_stats(),
+            "policy_version": self._policy_version,
+        }
 
     @property
     def backend_name(self) -> str:
@@ -306,6 +364,7 @@ class InferenceScheduler:
                 self._task_cache.task_free(task.task_id)
         self._task_mgr.clear_queues()
 
+    @_with_weight_lock
     def run_batch(
         self,
         prompt_ids_list: List[List[int]],

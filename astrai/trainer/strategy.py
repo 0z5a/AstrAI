@@ -239,6 +239,12 @@ class BaseStrategy(ABC):
         """Inject a :class:`RolloutRunner` to enable online rollout mode."""
         self._rollout_runner = runner
 
+    @property
+    def policy_version(self) -> Optional[int]:
+        if self._rollout_runner is None:
+            return None
+        return self._rollout_runner.policy_version
+
     def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
         """Map a :class:`RolloutResult` to the batch layout expected by
         :meth:`compute_loss`.
@@ -275,6 +281,7 @@ class BaseStrategy(ABC):
     def on_optimizer_step(self):
         """Advance online rollout state after a successful optimizer step."""
         if self._rollout_runner is not None:
+            self._rollout_runner.update_weights(self.policy_version + 1)
             self._rollout_runner.step()
 
     def __call__(self, batch: Dict[str, Tensor]) -> LossOutput:

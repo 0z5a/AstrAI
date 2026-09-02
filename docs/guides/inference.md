@@ -135,6 +135,12 @@ attention backends share the same rotary dispatch — it is backend-agnostic.
 4. Decode  → Run single-token forward for each same-position group
 ```
 
+For in-process training rollout, `InferenceScheduler.update_weights(version)`
+acknowledges that the shared model was updated in place. Versions are monotonic;
+the scheduler rejects updates while requests are queued and invalidates reusable
+prefix KV pages before exposing the new version. Synchronous `run_batch()` and
+weight updates are serialized so a generation cannot straddle two versions.
+
 ## Sampling (Strategy Pattern)
 
 ```

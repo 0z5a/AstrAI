@@ -360,6 +360,34 @@ def test_run_batch_empty_prompts(device):
         scheduler.stop()
 
 
+def test_scheduler_weight_versions_are_monotonic_and_acknowledged(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        assert scheduler.policy_version == 0
+        assert scheduler.update_weights(1) == 1
+        assert scheduler.policy_version == 1
+        assert scheduler.get_stats()["policy_version"] == 1
+        assert scheduler.update_weights(1) == 1
+        with pytest.raises(ValueError, match="cannot move backwards"):
+            scheduler.update_weights(0)
+        with pytest.raises(ValueError, match="non-negative integer"):
+            scheduler.update_weights(True)
+    finally:
+        scheduler.stop()
+
+
+def test_scheduler_rejects_weight_update_with_queued_tasks(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    task_id = scheduler.add_task("queued")
+    try:
+        with pytest.raises(RuntimeError, match="while tasks are queued"):
+            scheduler.update_weights(1)
+        scheduler.remove_task(task_id)
+        assert scheduler.update_weights(1) == 1
+    finally:
+        scheduler.stop()
+
+
 def test_run_batch_too_long_prompt_skipped(device):
     """A prompt longer than max_seq_len yields an empty result slot."""
     scheduler, _tok, _model = _make_real_scheduler(device)
