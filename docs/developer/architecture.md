@@ -673,6 +673,7 @@ classDiagram
             +Tensor responses
             +Tensor response_mask
             +Tensor logprobs_old
+            +int policy_version
             +List[str] prompt_texts
             +List[List[str]] response_texts
         }
@@ -695,10 +696,14 @@ classDiagram
             +float top_p
             +float frequency_penalty
             +int rep_window
+            +int policy_version
+            +update_weights(policy_version) int
             +generate(batch) RawRollout
         }
 
         class RolloutRunner {
+            +int policy_version
+            +update_weights(policy_version) int
             +step()
             +clear_cache()
             +__call__(batch) Tuple[RolloutResult, bool]
@@ -854,11 +859,13 @@ classDiagram
             +int max_seq_len
             +str device
             +torch.dtype dtype
+            +int policy_version
             +add_task(prompt, **kwargs) str
             +remove_task(task_id)
             +start()
             +stop()
             +get_stats() Dict
+            +update_weights(policy_version) int
             +run_batch(prompt_ids_list, max_tokens, temperature, top_p, top_k, frequency_penalty, rep_window, return_logprobs) Union[List[List[int]], List[Tuple[List[int], List[float]]]]
         }
 
@@ -871,6 +878,7 @@ classDiagram
             +inc_ref(idx)
             +touch(idx)
             +ref_count(idx) int
+            +clear_cached() int
         }
 
         class RadixNode {
@@ -897,6 +905,7 @@ classDiagram
             +extend(state, pos) bool
             +write_indices(state, prompt_ids)
             +record_hashes(state, prompt_ids, start_logical_page)
+            +invalidate_cache() int
         }
 
         class ContiguousStrategy {
@@ -960,6 +969,7 @@ classDiagram
             +task_extend(task_id, pos) bool
             +task_cached(task_id) int
             +task_record_hashes(task_id, prompt_ids, start_logical_page)
+            +invalidate_cache() int
             +bind(task_ids, workspace) KVCache
         }
 

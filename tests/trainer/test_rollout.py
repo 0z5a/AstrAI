@@ -65,6 +65,7 @@ def test_raw_rollout_fields():
     )
     assert r.prompts.shape == (2, 4)
     assert r.responses.shape == (2, 3, 5)
+    assert r.policy_version == 0
     assert r.prompt_texts == []
     assert r.response_texts == []
 
@@ -131,6 +132,7 @@ def test_rollout_generator_shapes(device):
     assert len(r.prompt_texts) == 2
     assert len(r.response_texts) == 2
     assert len(r.response_texts[0]) == 3
+    assert r.policy_version == 0
 
 
 def test_rollout_generator_uses_eval_and_restores_mode(device):
@@ -273,6 +275,26 @@ def test_rollout_runner_cache_returns_stale_flag(device):
     assert r1 is r2
     assert fresh1 is True
     assert fresh2 is False
+
+
+def test_rollout_runner_tags_generation_version_and_preserves_cached_behavior(device):
+    runner, _ = _make_runner(device, rollout_interval=100)
+    batch = _make_instruction_batch(n=1)
+
+    first, first_fresh = runner(batch)
+    assert first_fresh is True
+    assert first.policy_version == 0
+
+    assert runner.update_weights(1) == 1
+    cached, cached_fresh = runner(batch)
+    assert cached is first
+    assert cached_fresh is False
+    assert cached.policy_version == 0
+
+    runner.clear_cache()
+    refreshed, refreshed_fresh = runner(batch)
+    assert refreshed_fresh is True
+    assert refreshed.policy_version == 1
 
 
 def test_rollout_runner_refreshes_for_different_batch(device):

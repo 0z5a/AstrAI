@@ -1,5 +1,6 @@
 """Unit tests for inference cache components."""
 
+import pytest
 import torch
 
 from astrai.inference.cache import (
@@ -433,6 +434,26 @@ def test_page_pool_prefix_hit_populates_request_mapping():
         pool.req_pool.req_to_token[second_state.req_idx, : len(prompt)].tolist()
         == expected
     )
+
+
+def test_task_cache_invalidation_drops_cross_version_prefix_hits():
+    pool = _make_paged_pool_ps64(page_size=2, max_seq_len=8, n_tokens=16)
+    task_cache = _make_task_cache(pool)
+    prompt = [11, 12, 13, 14]
+
+    assert task_cache.task_alloc("first", prompt)
+    task_cache.task_record_hashes("first", prompt)
+    task_cache.task_free("first")
+    assert task_cache.task_alloc("cached", prompt)
+    assert task_cache.task_cached("cached") == len(prompt)
+
+    with pytest.raises(RuntimeError, match="while tasks are active"):
+        task_cache.invalidate_cache()
+
+    task_cache.task_free("cached")
+    assert task_cache.invalidate_cache() == 2
+    assert task_cache.task_alloc("after_update", prompt)
+    assert task_cache.task_cached("after_update") == 0
 
 
 def test_page_pool_paged_ps64_bind_roundtrip():

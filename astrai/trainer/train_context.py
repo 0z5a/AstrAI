@@ -318,6 +318,11 @@ class TrainContextBuilder:
             tokenizer=tokenizer,
             max_batch_size=group_size * max(1, cfg.batch_per_device),
             max_seq_len=getattr(context.model.config, "max_position_embeddings", None),
+            policy_version=(
+                context.checkpoint.meta.get("policy_version", context.optimizer_step)
+                if context.checkpoint is not None
+                else context.optimizer_step
+            ),
         )
         generator = RolloutGenerator(
             scheduler=scheduler,

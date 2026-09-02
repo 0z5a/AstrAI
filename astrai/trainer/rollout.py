@@ -13,6 +13,7 @@ Provides:
   so callers do not need to rely on object identity to detect refreshes.
 """
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -53,6 +54,7 @@ class RawRollout:
     responses: Tensor
     response_mask: Tensor
     logprobs_old: Tensor
+    policy_version: int = 0
     prompt_texts: List[str] = field(default_factory=list)
     response_texts: List[List[str]] = field(default_factory=list)
 
@@ -129,6 +131,16 @@ class RolloutGenerator:
         self.top_p = top_p
         self.frequency_penalty = frequency_penalty
         self.rep_window = rep_window
+        self._weight_lock = threading.RLock()
+
+    @property
+    def policy_version(self) -> int:
+        return self.scheduler.policy_version
+
+    def update_weights(self, policy_version: int) -> int:
+        """Acknowledge shared-model weights and invalidate older scheduler KV."""
+        with self._weight_lock:
+            return self.scheduler.update_weights(policy_version)
 
     @torch.no_grad()
     def generate(self, batch: Dict) -> RawRollout:
@@ -146,13 +158,14 @@ class RolloutGenerator:
         ``add_generation_prompt=True`` so rollout prompts match the
         format the policy was SFT-trained on.
         """
-        model = self.scheduler._executor.model
-        was_training = model.training
-        model.eval()
-        try:
-            return self._generate_eval(batch)
-        finally:
-            model.train(was_training)
+        with self._weight_lock:
+            model = self.scheduler._executor.model
+            was_training = model.training
+            model.eval()
+            try:
+                return self._generate_eval(batch)
+            finally:
+                model.train(was_training)
 
     def _generate_eval(self, batch: Dict) -> RawRollout:
         prompt_texts, flat_prompt_ids = self._prepare_prompts(batch)
@@ -245,6 +258,7 @@ class RolloutGenerator:
             responses=responses,
             response_mask=response_mask,
             logprobs_old=logprobs_old,
+            policy_version=self.policy_version,
             prompt_texts=prompt_texts,
             response_texts=response_texts,
         )
@@ -370,6 +384,14 @@ class RolloutRunner:
         self._cache_key = None
         self._steps_since_rollout: int = 0
 
+    @property
+    def policy_version(self) -> int:
+        return self.generator.policy_version
+
+    def update_weights(self, policy_version: int) -> int:
+        """Publish the shared policy's new version to the rollout backend."""
+        return self.generator.update_weights(policy_version)
+
     def step(self):
         """Advance the internal counter (call once per optimizer step)."""
         self._steps_since_rollout += 1
@@ -415,6 +437,7 @@ class RolloutRunner:
             response_mask=raw.response_mask,
             rewards=rewards.to(device=device),
             logprobs_old=raw.logprobs_old,
+            policy_version=raw.policy_version,
             prompt_texts=raw.prompt_texts,
             response_texts=raw.response_texts,
         )

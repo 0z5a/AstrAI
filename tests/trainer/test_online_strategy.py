@@ -43,6 +43,8 @@ class _RecordingRunner:
         self.calls = 0
         self.step_calls = 0
         self._fresh = True
+        self.policy_version = result.policy_version
+        self.weight_updates = []
 
     def __call__(self, batch):
         self.calls += 1
@@ -52,6 +54,11 @@ class _RecordingRunner:
 
     def step(self):
         self.step_calls += 1
+
+    def update_weights(self, policy_version):
+        self.policy_version = policy_version
+        self.weight_updates.append(policy_version)
+        return policy_version
 
     def swap_result(self, result):
         self.result = result
@@ -302,6 +309,8 @@ def test_step_called_when_sync_gradients_true(device):
     strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
     strat.on_optimizer_step()
     assert runner.step_calls == 1
+    assert runner.weight_updates == [1]
+    assert strat.policy_version == 1
 
 
 def test_loss_is_differentiable_dpo(device):

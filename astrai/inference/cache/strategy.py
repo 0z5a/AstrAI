@@ -89,6 +89,19 @@ class Allocator:
             if idx in self._lru:
                 self._lru.move_to_end(idx)
 
+    def clear_cached(self) -> int:
+        """Release every unreferenced LRU page back to the free pool."""
+        with self._lock:
+            cached = list(self._lru)
+            self._lru.clear()
+            for idx in cached:
+                if self._refs[idx] != 0:
+                    raise RuntimeError("Cannot invalidate a referenced cache page")
+                if self.on_evict:
+                    self.on_evict(idx)
+                self._free_mask |= 1 << idx
+            return len(cached)
+
 
 class RadixNode:
     """A page-aligned edge in the CPU-side prefix radix trie."""
@@ -199,6 +212,10 @@ class AllocationStrategy(ABC):
         prompt_ids: List[int],
         start: int,
     ) -> None: ...
+
+    def invalidate_cache(self) -> int:
+        """Drop reusable KV entries after an inference weight update."""
+        return 0
 
 
 class ContiguousStrategy(AllocationStrategy):
@@ -316,3 +333,8 @@ class PagedStrategy(AllocationStrategy):
         full = len(prompt_ids) // self._page_size
         for i in range(start, min(full, len(state.pages))):
             self._prefix.record(state.pages[i], prompt_ids, i)
+
+    def invalidate_cache(self) -> int:
+        if self._prefix is None:
+            return 0
+        return self._alloc.clear_cached()

@@ -338,6 +338,14 @@ class TaskCacheManager:
         if state is not None:
             self._strategy.record_hashes(state, prompt_ids, start_logical_page)
 
+    def invalidate_cache(self) -> int:
+        """Drop reusable KV entries once all task-owned entries are released."""
+        if self._states:
+            raise RuntimeError("Cannot invalidate KV cache while tasks are active")
+        self._bind_state = None
+        self._bind_was_steady = False
+        return self._strategy.invalidate_cache()
+
     @staticmethod
     def task_cacheable_ids(task_id: str, prompt_ids: List[int], output_ids: List[int]):
         return list(prompt_ids) + list(output_ids[:-1])
