@@ -788,12 +788,6 @@ class GRPOStrategy(BaseStrategy):
         )
         per_token_policy_loss = -torch.min(surr1, surr2)
         policy_loss = self._reduce_token_loss(per_token_policy_loss, token_masks)
-        clip_fraction = self._reduce_token_loss(
-            (
-                (ratio < 1 - self.clip_eps_low) | (ratio > 1 + self.clip_eps_high)
-            ).float(),
-            token_masks,
-        )
 
         # KL penalty to frozen reference model with k1 estimator (non-negative):
         # k1 = π_ref / π_θ - log(π_ref / π_θ) - 1, where π_ref / π_θ = exp(log_ref - log_policy).
@@ -806,7 +800,6 @@ class GRPOStrategy(BaseStrategy):
         metrics = {
             "policy_loss": policy_loss,
             "kl_loss": kl_penalty,
-            "clip_fraction": clip_fraction,
         }
         if overlong_penalty is not None:
             metrics["overlong_penalty_mean"] = overlong_penalty.mean()
