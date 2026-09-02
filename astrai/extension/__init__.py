@@ -26,6 +26,7 @@ from astrai.extension.backend import (
     attention,
     attn_backend,
     get_backend,
+    linear,
 )
 from astrai.extension.dispatch import (
     Axes,
@@ -63,6 +64,7 @@ __all__ = [
     "attention",
     "attn_backend",
     "get_backend",
+    "linear",
     "attn_decode",
     "attn_paged_decode",
     "attn_prefill",

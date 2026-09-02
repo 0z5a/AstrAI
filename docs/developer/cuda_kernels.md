@@ -2,8 +2,8 @@
 
 AstrAI includes optional custom CUDA kernels for attention, rotary embedding,
 BF16 GEMV, and FP8 GEMM. These are built when `nvcc` is available and CUDA is
-detected. BF16 GEMV is a directly callable primitive and does not change model
-linear dispatch.
+detected. BF16 GEMV is directly callable and can be selected by the guarded
+model linear dispatcher described below.
 
 ## Overview
 
@@ -25,9 +25,17 @@ each output row using vectorized `__nv_bfloat162` loads and FP32 accumulation;
 the optional BF16 bias is fused before the BF16 store. The launcher uses the
 current CUDA stream, is CUDA Graph capture-safe, and requires sm_80 or newer.
 
-The primitive is inference-only and deliberately has no `F.linear` fallback or
-model-level dispatch. Dispatch is added separately only for shape bands with a
-measured win over each architecture's own cuBLAS baseline.
+Model `Linear` calls route through the lightweight linear backend. Set
+`ASTRAI_GEMV=0` for an unconditional `F.linear` fallback, `1` to force the
+kernel for any supported M=1 call, or `auto` (the default) to select only
+architecture/shape bands that pass both the per-shape and end-to-end gates.
+No SM89 band is automatic yet: isolated L20 winners did not reach the required
+3% stable whole-graph decode improvement, so `auto` currently falls back to
+PyTorch there. Use `1` only for explicit A/B runs. Training, prefill, and
+unsupported calls always remain on PyTorch.
+
+The primitive remains directly callable and deliberately has no internal
+`F.linear` fallback. The model-level backend owns fallback and dispatch policy.
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
