@@ -153,7 +153,12 @@ expectations are over valid response tokens. The KL term regularises
 $\pi_\theta$ towards a frozen reference model (`ref_model`, typically
 the SFT checkpoint).
 
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. External sync of `old_model` weights via `sync_old_model()` between data-generation rounds.
+Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. The optional
+`clip_eps_low` and `clip_eps_high` parameters replace the symmetric interval
+with $[1-\epsilon_{low}, 1+\epsilon_{high}]$. Leaving both unset preserves the
+existing symmetric objective. DAPO Clip-Higher can be selected explicitly, for
+example with `clip_eps_low=0.2` and `clip_eps_high=0.28`. External sync of
+`old_model` weights via `sync_old_model()` between data-generation rounds.
 
 Keys: `prompts`, `responses`, `masks`, `rewards`.
 

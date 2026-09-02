@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import astrai.trainer.strategy as strategy_module
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.strategy import GRPOStrategy
 from tests.helpers import FakeExecutor, make_frozen, make_model
@@ -69,6 +70,77 @@ def test_grpo_loss_backward(grpo_strategy):
         for p in strategy.model.parameters()
     )
     assert has_grad
+
+
+def test_grpo_symmetric_clip_is_backward_compatible(grpo_strategy):
+    strategy, _device = grpo_strategy
+    assert strategy.clip_eps == pytest.approx(0.2)
+    assert strategy.clip_eps_low == pytest.approx(0.2)
+    assert strategy.clip_eps_high == pytest.approx(0.2)
+
+
+def test_grpo_dapo_clip_higher_changes_positive_advantage_bound(
+    grpo_strategy, monkeypatch
+):
+    strategy, device = grpo_strategy
+    batch = {
+        "prompts": torch.tensor([[5]], device=device),
+        "responses": torch.tensor([[[6], [7]]], device=device),
+        "masks": torch.ones(1, 2, 1, device=device),
+        "rewards": torch.tensor([[1.0, -1.0]], device=device),
+    }
+    policy_logprobs = torch.log(
+        torch.tensor([[1.25], [0.75]], device=device, dtype=torch.float32)
+    )
+    zeros = torch.zeros_like(policy_logprobs)
+
+    def policy_loss(clip_eps_high):
+        strategy.clip_eps_high = clip_eps_high
+        outputs = iter(
+            [
+                policy_logprobs,
+                zeros,
+                policy_logprobs,
+            ]
+        )
+
+        def fake_get_logprobs(*_args, **_kwargs):
+            return {
+                "logprobs": next(outputs),
+                "aux_loss": None,
+                "router_stats": None,
+            }
+
+        monkeypatch.setattr(strategy_module, "get_logprobs", fake_get_logprobs)
+        return strategy.compute_loss_output(batch)["metrics"]["policy_loss"]
+
+    assert policy_loss(0.2) == pytest.approx(-0.2, abs=1e-6)
+    assert policy_loss(0.28) == pytest.approx(-0.225, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"clip_eps_low": 1.0}, "clip_eps_low"),
+        ({"clip_eps_high": float("nan")}, "clip_eps_high"),
+        (
+            {"clip_eps_low": 0.3, "clip_eps_high": 0.2},
+            "greater than or equal",
+        ),
+    ],
+)
+def test_grpo_rejects_invalid_asymmetric_clip(grpo_strategy, kwargs, match):
+    strategy, device = grpo_strategy
+    with pytest.raises(ValueError, match=match):
+        GRPOStrategy(
+            model=strategy.model,
+            device=device,
+            old_model=strategy.old_model,
+            ref_model=strategy.ref_model,
+            clip_eps=0.2,
+            executor=FakeExecutor(),
+            **kwargs,
+        )
 
 
 @pytest.mark.parametrize("model_name", ["ref_model", "old_model"])
