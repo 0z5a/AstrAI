@@ -14,25 +14,39 @@ model linear dispatcher described below.
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
-| `bf16_gemv` | `gemv/bf16_gemv.cu` | M=1 BF16 linear with FP32 accumulation (sm_80+) |
+| `bf16_gemv` | `gemv/bf16_gemv.cu` | M=1/2/4/8 BF16 linear with FP32 accumulation (sm_80+) |
 | `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
 
 ### BF16 GEMV primitive
 
 `astrai.extension.bf16_gemv(x, weight, bias=None)` accepts a contiguous BF16
-input shaped `[K]` or `[1, K]` and row-major weights `[N, K]`. One CTA reduces
-each output row using vectorized `__nv_bfloat162` loads and FP32 accumulation;
-the optional BF16 bias is fused before the BF16 store. The launcher uses the
-current CUDA stream, is CUDA Graph capture-safe, and requires sm_80 or newer.
+input shaped `[K]` or `[M, K]`, with `M` in `{1, 2, 4, 8}`, and row-major
+weights `[N, K]`. One CTA reduces each output row and computes all M results
+together, reusing the weight row across tokens. It uses vectorized
+`__nv_bfloat162` loads and FP32 accumulation; the optional BF16 bias is fused
+before the BF16 store. The launcher uses the current CUDA stream, is CUDA
+Graph capture-safe, and requires sm_80 or newer.
 
 Model `Linear` calls route through the lightweight linear backend. Set
 `ASTRAI_GEMV=0` for an unconditional `F.linear` fallback, `1` to force the
-kernel for any supported M=1 call, or `auto` (the default) to select only
+kernel for any supported M=1/2/4/8 call, or `auto` (the default) to select only
 architecture/shape bands that pass both the per-shape and end-to-end gates.
-No SM89 band is automatic yet: isolated L20 winners did not reach the required
-3% stable whole-graph decode improvement, so `auto` currently falls back to
-PyTorch there. Use `1` only for explicit A/B runs. Training, prefill, and
-unsupported calls always remain on PyTorch.
+M=1 has no automatic SM89 band because isolated winners did not reach the 3%
+whole-graph gate. Measured SM89 small-M bands are enabled as follows:
+
+| M | Automatic `(N, K)` bands | Engine throughput |
+|---:|---|---:|
+| 2 | `(256,1536)`, `(1536,1536)`, `(100000,1536)` | +14.0% |
+| 4 | `(256,1536)`, `(1536,1536)` | +11.8% |
+
+These A→B→B→A results use the real `InferenceEngine`, including scheduler,
+sampling, and CUDA Graph. M=8 stays on PyTorch because its remaining
+greedy-stable winners missed the 3% end-to-end gate. Long-K MLP-down bands are
+also excluded because their valid BF16 error changed a checkpoint greedy
+argmax; the enabled M=2/4 bands matched the baseline greedy output exactly.
+
+Training, prefill, unmeasured architectures, and losing shape bands always
+remain on PyTorch. Use mode `1` only for explicit A/B runs outside this table.
 
 The primitive remains directly callable and deliberately has no internal
 `F.linear` fallback. The model-level backend owns fallback and dispatch policy.

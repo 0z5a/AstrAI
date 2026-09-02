@@ -31,10 +31,24 @@ logger = logging.getLogger(__name__)
 
 # Shape keys are (N, K) for Y[M, N] = X[M, K] @ W[N, K].T. A band is
 # automatic only after both the per-shape >=5% and end-to-end decode >=3%
-# gates pass. L20 micro-winners did not produce a stable whole-graph win, so
-# SM89 intentionally has no automatic entries yet. Mode 1 remains available
-# for explicit A/B runs without weakening the default.
-_AUTO_GEMV_SHAPES: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
+# gates pass and checkpoint greedy output remains stable. M=1 and M=8 remain
+# empty on SM89; the safe M=2/4 bands improve real-engine throughput by
+# 11.8-14.0%.
+_AUTO_GEMV_SHAPES: dict[tuple[int, int], dict[int, frozenset[tuple[int, int]]]] = {
+    (8, 9): {
+        2: frozenset(
+            {
+                (256, 1536),
+                (1536, 1536),
+                (100000, 1536),
+            }
+        ),
+        4: frozenset({(256, 1536), (1536, 1536)}),
+    }
+}
+_AUTO_GEMV_M = frozenset(
+    m for architecture in _AUTO_GEMV_SHAPES.values() for m in architecture
+)
 
 _VALID_MODES = {"0", "1", "auto"}
 _WARNED_MODES: set[str] = set()
@@ -58,7 +72,8 @@ def _axes(
 ) -> dict[str, object]:
     x_shape = tuple(x.shape)
     weight_shape = tuple(weight.shape)
-    single_row = x.ndim == 1 or (x.ndim == 2 and x.shape[0] == 1)
+    m = 1 if x.ndim == 1 else (x.shape[0] if x.ndim == 2 else None)
+    supported_m = m in (1, 2, 4, 8)
     shape_matches = (
         weight.ndim == 2
         and x.ndim in (1, 2)
@@ -84,7 +99,8 @@ def _axes(
         capability=capability,
         n=n,
         k=k,
-        single_row=single_row,
+        m=m,
+        supported_m=supported_m,
         shape_matches=shape_matches,
         same_device=same_device,
         weight_dtype=weight.dtype,
@@ -100,7 +116,7 @@ _SPEC_CAPABLE = (
     & axis("dtype").in_(torch.bfloat16)
     & axis("weight_dtype").in_(torch.bfloat16)
     & axis("grad_enabled").eq(False)
-    & axis("single_row").truthy()
+    & axis("supported_m").truthy()
     & axis("shape_matches").truthy()
     & axis("same_device").truthy()
     & axis("x_contiguous").truthy()
@@ -111,7 +127,8 @@ _SPEC_CAPABLE = (
 
 _SPEC_AUTO = _SPEC_CAPABLE & Spec.of(
     lambda ax: (
-        (ax.get("n"), ax.get("k")) in _AUTO_GEMV_SHAPES.get(ax.get("capability"), ())
+        (ax.get("n"), ax.get("k"))
+        in _AUTO_GEMV_SHAPES.get(ax.get("capability"), {}).get(ax.get("m"), ())
     ),
     "shape is a measured winner for this architecture",
 )
@@ -147,7 +164,7 @@ def _gemv_capable(x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> bool:
         or weight.dtype != torch.bfloat16
         or weight.ndim != 2
         or x.ndim not in (1, 2)
-        or (x.ndim == 2 and x.shape[0] != 1)
+        or (x.ndim == 2 and x.shape[0] not in (1, 2, 4, 8))
         or x.shape[-1] != weight.shape[1]
         or weight.shape[1] % 2 != 0
         or x.device != weight.device
@@ -167,7 +184,10 @@ def _gemv_capable(x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> bool:
 
 def _auto_gemv_shape(x: Tensor, weight: Tensor) -> bool:
     capability = _device_capability(x.get_device())
-    return (weight.shape[0], weight.shape[1]) in _AUTO_GEMV_SHAPES.get(capability, ())
+    m = 1 if x.ndim == 1 else x.shape[0]
+    return (weight.shape[0], weight.shape[1]) in _AUTO_GEMV_SHAPES.get(
+        capability, {}
+    ).get(m, ())
 
 
 def _linear_records() -> list[ImplRecord]:
@@ -219,8 +239,8 @@ def linear(x: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
     """Apply a linear projection with safe inference-only GEMV dispatch.
 
     ``ASTRAI_GEMV=0`` always uses PyTorch, ``1`` forces GEMV whenever the
-    primitive can safely handle the call, and ``auto`` (the default) uses
-    only architecture/shape bands backed by benchmark evidence.
+    primitive can safely handle an M in ``{1, 2, 4, 8}``, and ``auto`` (the
+    default) uses only architecture/shape bands backed by benchmark evidence.
     """
     # Preserve the shared dispatcher for explicit/context selection and
     # ASTR_OPS diagnostics, while keeping the default per-layer hot path free
@@ -231,6 +251,10 @@ def linear(x: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
     mode = _gemv_mode()
     if mode == "0" or (mode == "auto" and not _AUTO_GEMV_SHAPES):
         return _torch_linear(x, weight, bias)
+    if mode == "auto":
+        m = 1 if x.ndim == 1 else (x.shape[0] if x.ndim == 2 else None)
+        if m not in _AUTO_GEMV_M:
+            return _torch_linear(x, weight, bias)
     if mode != "0" and _gemv_capable(x, weight, bias):
         if mode == "1" or _auto_gemv_shape(x, weight):
             return _inference_bf16_gemv(x, weight, bias)

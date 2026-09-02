@@ -80,7 +80,20 @@ def test_mode_one_forces_capable_unmeasured_shape(monkeypatch):
 
 
 @skip_no_gemv
-def test_auto_falls_back_until_end_to_end_gate_passes(monkeypatch):
+@pytest.mark.parametrize("m", [2, 4, 8])
+def test_mode_one_dispatches_supported_small_batches(monkeypatch, m):
+    monkeypatch.setenv("ASTRAI_GEMV", "1")
+    x = torch.randn(m, 1536, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, 1536, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        assert "=> gemv" in explain("linear", x, weight)
+        torch.testing.assert_close(
+            linear(x, weight), F.linear(x, weight), rtol=0.02, atol=0.25
+        )
+
+
+@skip_no_gemv
+def test_auto_m1_falls_back_until_end_to_end_gate_passes(monkeypatch):
     monkeypatch.setenv("ASTRAI_GEMV", "auto")
     x = torch.randn(1, 1536, device="cuda", dtype=torch.bfloat16)
     winning = torch.randn(
@@ -96,7 +109,42 @@ def test_auto_falls_back_until_end_to_end_gate_passes(monkeypatch):
 
 
 @skip_no_gemv
-def test_grad_enabled_and_multirow_always_fall_back(monkeypatch):
+def test_auto_selects_measured_sm89_small_batch_winner(monkeypatch):
+    monkeypatch.setenv("ASTRAI_GEMV", "auto")
+    x = torch.randn(4, 1536, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, 1536, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        trace = explain("linear", x, weight)
+        if torch.cuda.get_device_capability() == (8, 9):
+            assert "=> auto_gemv" in trace
+        else:
+            assert "=> torch" in trace
+        torch.testing.assert_close(
+            linear(x, weight), F.linear(x, weight), rtol=0.02, atol=0.5
+        )
+
+
+@skip_no_gemv
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (2, 6912, 1536),  # up/gate loses at every measured M
+        (2, 1536, 6912),  # long-K accumulation changed checkpoint greedy output
+        (4, 100000, 1536),  # LM head misses the 5% M=4 gate
+        (4, 1536, 6912),  # long-K accumulation changed checkpoint greedy output
+        (8, 256, 1536),  # remaining M=8 winners miss the 3% end-to-end gate
+    ],
+)
+def test_auto_rejects_measured_small_batch_losers(monkeypatch, m, n, k):
+    monkeypatch.setenv("ASTRAI_GEMV", "auto")
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        assert "=> torch" in explain("linear", x, weight)
+
+
+@skip_no_gemv
+def test_grad_enabled_and_unsupported_multirow_always_fall_back(monkeypatch):
     monkeypatch.setenv("ASTRAI_GEMV", "1")
     x = torch.randn(1, 1536, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(
@@ -104,7 +152,7 @@ def test_grad_enabled_and_multirow_always_fall_back(monkeypatch):
     )
     assert "=> torch" in explain("linear", x, weight)
     with torch.no_grad():
-        multirow = x.expand(2, -1).contiguous()
+        multirow = x.expand(3, -1).contiguous()
         assert "=> torch" in explain("linear", multirow, weight)
 
 
