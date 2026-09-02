@@ -148,14 +148,18 @@ $$
 
 where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the
 per-token importance sampling ratio against the behaviour policy
-(`old_model`, synced externally between data-generation rounds) and the
-expectations are over valid response tokens. The KL term regularises
-$\pi_\theta$ towards a frozen reference model (`ref_model`, typically
-the SFT checkpoint).
+and the expectations are over valid response tokens. Online GRPO reuses the
+per-token `logprobs_old` captured by the rollout sampler, avoiding an
+`old_model` copy and a repeated forward pass. Offline GRPO keeps `old_model` as
+a compatibility fallback. The KL term regularises $\pi_\theta$ towards a frozen
+reference model (`ref_model`, typically the SFT checkpoint).
 
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. External sync of `old_model` weights via `sync_old_model()` between data-generation rounds.
+Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. Offline callers that
+do not provide `logprobs_old` must sync `old_model` weights via
+`sync_old_model()` between data-generation rounds.
 
-Keys: `prompts`, `responses`, `masks`, `rewards`.
+Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
+`logprobs_old` (required when `old_model` is not configured).
 
 ### Online Rollout
 
@@ -163,8 +167,9 @@ Keys: `prompts`, `responses`, `masks`, `rewards`.
 a `RolloutRunner`. The runner renders prompts through the tokenizer chat
 template, generates grouped responses through `InferenceScheduler`, then scores
 them with a `BaseRewardModel`. It refreshes cached rollouts every
-`rollout_interval` optimizer steps. `online_grpo` synchronizes `old_model` when
-a fresh rollout is produced.
+`rollout_interval` optimizer steps. `online_grpo` carries the sampler's aligned
+behaviour log-probabilities into the loss, so it does not allocate or synchronize
+a separate old-policy model.
 
 Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward

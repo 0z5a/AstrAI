@@ -535,12 +535,12 @@ class GRPOStrategy(BaseStrategy):
     broadcast across all response tokens.  The loss is computed **only on
     response tokens** — prompt tokens are masked out.
 
-    Three model roles are distinguished:
+    Three policy roles are distinguished:
 
     * **Policy** ``self.model`` — the model being trained.
-    * **Old policy** ``self.old_model`` — the behaviour policy that generated
-      the responses.  Used for the importance sampling ratio
-      ``ρ = π_θ / π_old``.  Synced externally after each data-generation round.
+    * **Behaviour policy** — represented by per-token ``logprobs_old`` captured
+      during online rollout.  Offline batches may instead use ``self.old_model``
+      as a compatibility fallback.
     * **Reference model** ``self.ref_model`` — a frozen copy of the initial
       policy (typically the SFT checkpoint) used **only** for the KL
       regularisation term.  It is never updated during training.
@@ -550,7 +550,7 @@ class GRPOStrategy(BaseStrategy):
         self,
         model: nn.Module,
         device: str,
-        old_model: nn.Module,
+        old_model: Optional[nn.Module],
         ref_model: nn.Module,
         clip_eps: float = 0.2,
         kl_coef: float = 0.01,
@@ -566,6 +566,8 @@ class GRPOStrategy(BaseStrategy):
 
     def sync_old_model(self):
         """Copy current policy weights to old model."""
+        if self.old_model is None:
+            raise RuntimeError("Cannot sync an unconfigured old policy model")
         state_dict = self.executor.unwrap_model(self.model)
         if self.executor.use_distributed:
             state_dict = broadcast_state_dict(state_dict)
@@ -580,6 +582,22 @@ class GRPOStrategy(BaseStrategy):
         rewards = batch["rewards"]
 
         batch_size, group_size, response_len = responses.shape
+        behavior_logprobs = batch.get("logprobs_old")
+        if behavior_logprobs is not None:
+            if behavior_logprobs.shape != responses.shape:
+                raise ValueError(
+                    "logprobs_old shape must match responses: "
+                    f"got {tuple(behavior_logprobs.shape)}, "
+                    f"expected {tuple(responses.shape)}"
+                )
+            if not torch.isfinite(behavior_logprobs).all():
+                raise ValueError("logprobs_old must contain only finite values")
+            behavior_logprobs = behavior_logprobs.detach().float()
+        elif self.old_model is None:
+            raise ValueError(
+                "GRPO batches must provide logprobs_old when no old_model is configured"
+            )
+
         responses_flat = responses.view(-1, response_len)
         masks_flat = masks.view(-1, response_len)
         prompt_expanded = prompts.unsqueeze(1).repeat(1, group_size, 1).flatten(0, 1)
@@ -620,11 +638,14 @@ class GRPOStrategy(BaseStrategy):
         aux_loss = policy_output["aux_loss"]
         token_log_probs_policy = token_log_probs_policy[:, prompt_len - 1 :]
         with torch.no_grad():
-            old_output = get_logprobs(
-                self.old_model, full_sequences, attn_mask, full_masks, "none"
-            )
-            token_log_probs_old = old_output["logprobs"]
-            token_log_probs_old = token_log_probs_old[:, prompt_len - 1 :]
+            if behavior_logprobs is None:
+                old_output = get_logprobs(
+                    self.old_model, full_sequences, attn_mask, full_masks, "none"
+                )
+                token_log_probs_old = old_output["logprobs"]
+                token_log_probs_old = token_log_probs_old[:, prompt_len - 1 :]
+            else:
+                token_log_probs_old = behavior_logprobs
             ref_output = get_logprobs(
                 self.ref_model, full_sequences, attn_mask, full_masks, "none"
             )
@@ -680,11 +701,8 @@ class GRPOStrategy(BaseStrategy):
             "responses": result.responses,
             "masks": result.response_mask,
             "rewards": result.rewards,
+            "logprobs_old": result.logprobs_old,
         }
-
-    def _on_rollout_refresh(self):
-        """Sync the behaviour policy whenever a fresh rollout arrives."""
-        self.sync_old_model()
 
 
 # Factory aliases: online variants use the same strategy class; the

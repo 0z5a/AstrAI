@@ -287,13 +287,15 @@ class TrainContextBuilder:
                 model=context.model,
                 device=get_current_device(),
             )
-        if cfg.strategy in ("grpo", "online_grpo"):
+        if cfg.strategy == "grpo":
             kwargs["old_model"] = create_ref_model(
                 cfg.model_fn,
                 executor=executor,
                 model=context.model,
                 device=get_current_device(),
             )
+        elif cfg.strategy == "online_grpo":
+            kwargs["old_model"] = None
         context.strategy = StrategyFactory.create(
             cfg.strategy,
             model=context.model,
