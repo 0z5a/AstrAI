@@ -307,30 +307,39 @@ class Executor:
     def execute_prefill(
         self,
         tasks: List[Task],
-        prompt_len: int,
         start_pos: int = 0,
         return_logprobs: bool = False,
     ):
-        if start_pos >= prompt_len:
-            return []
-
         tasks = sorted(tasks, key=lambda t: t.task_id)
         batch_sz = len(tasks)
+        prompt_lens = [len(t.prompt_ids) for t in tasks]
+        if any(start_pos >= prompt_len for prompt_len in prompt_lens):
+            raise ValueError("prefill start_pos must precede every prompt end")
+        q_lens = [prompt_len - start_pos for prompt_len in prompt_lens]
 
         input_ids = torch.tensor(
-            [token for t in tasks for token in t.prompt_ids[start_pos:prompt_len]],
+            [token for t in tasks for token in t.prompt_ids[start_pos:]],
             dtype=torch.long,
             device=self.device,
         )
 
         task_ids = [t.task_id for t in tasks]
-        position_ids = torch.arange(
-            start_pos, prompt_len, dtype=torch.long, device=self.device
-        ).repeat(batch_sz)
+        position_ids = torch.cat(
+            [
+                torch.arange(
+                    start_pos, prompt_len, dtype=torch.long, device=self.device
+                )
+                for prompt_len in prompt_lens
+            ]
+        )
 
         with (
             torch.inference_mode(),
-            timed(f"execute_prefill b={batch_sz} prompt_len={prompt_len}", logger),
+            timed(
+                f"execute_prefill b={batch_sz} tokens={sum(q_lens)} "
+                f"q_len={min(q_lens)}..{max(q_lens)}",
+                logger,
+            ),
         ):
             outputs = self.model(
                 input_ids,
@@ -342,10 +351,10 @@ class Executor:
                 ),
                 fwd="prefill",
             )
-            q_len = prompt_len - start_pos
-            logits = outputs["logits"][
-                torch.arange(1, batch_sz + 1, device=self.device) * q_len - 1
-            ]
+            last_token_indices = (
+                torch.tensor(q_lens, dtype=torch.long, device=self.device).cumsum(0) - 1
+            )
+            logits = outputs["logits"][last_token_indices]
 
         step_out, _ = self._sample_logits(logits, tasks, return_logprobs)
         return tasks, step_out

@@ -142,6 +142,67 @@ def test_step_splits_decode_batch_by_request_backend():
     ]
 
 
+def test_step_batches_ragged_prefill_with_shared_cache_start():
+    scheduler = object.__new__(InferenceScheduler)
+    scheduler._cache = SimpleNamespace(page_size=64)
+    scheduler._task_cache = MagicMock()
+    scheduler._task_cache.task_cached.return_value = 0
+    scheduler._metrics = MetricsCollector()
+    scheduler._executor = MagicMock()
+
+    short = Task("short", [1, 2, 3])
+    long = Task("long", [4, 5, 6, 7, 8])
+    for task in (short, long):
+        scheduler._metrics.register(task.task_id)
+
+    scheduler._executor.execute_prefill.return_value = (
+        [long, short],
+        [11, 12],
+    )
+
+    produced, aborted = scheduler._step([short, long])
+
+    assert aborted == []
+    assert produced == [long, short]
+    scheduler._executor.execute_prefill.assert_called_once_with(
+        [short, long], start_pos=0, return_logprobs=False
+    )
+    assert long.output_ids == [11]
+    assert short.output_ids == [12]
+
+
+def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
+    executor = object.__new__(Executor)
+    executor.device = torch.device("cpu")
+    executor.task_cache = MagicMock()
+    executor.task_cache.bind.return_value = MagicMock()
+    executor._workspace = MagicMock()
+    all_logits = torch.arange(42, dtype=torch.float32).reshape(6, 7)
+    executor.model = MagicMock(return_value={"logits": all_logits})
+    executor._sample_logits = MagicMock(
+        return_value=([101, 102], torch.tensor([101, 102]))
+    )
+
+    task_b = Task("b", [20, 21, 22, 23, 24])
+    task_a = Task("a", [10, 11, 12])
+
+    tasks, output = executor.execute_prefill([task_b, task_a], start_pos=1)
+
+    assert tasks == [task_a, task_b]
+    assert output == [101, 102]
+    model_args, model_kwargs = executor.model.call_args
+    assert model_args[0].tolist() == [11, 12, 21, 22, 23, 24]
+    assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
+    executor.task_cache.bind.assert_called_once_with(
+        ["a", "b"], executor._workspace, start_pos=1
+    )
+    sample_args, sample_kwargs = executor._sample_logits.call_args
+    torch.testing.assert_close(sample_args[0], all_logits[[1, 5]])
+    assert sample_args[1] == [task_a, task_b]
+    assert sample_args[2] is False
+    assert sample_kwargs == {}
+
+
 def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
     """Test concurrent add and remove task operations."""
     mock_model, mock_tokenizer = mock_model_and_tokenizer
@@ -414,6 +475,31 @@ def test_run_batch_return_logprobs_aligned(device):
         token_ids, logprobs = results[0]
         assert len(token_ids) == len(logprobs)
         assert all(lp <= 1e-5 for lp in logprobs)  # logprobs ≤ 0
+    finally:
+        scheduler.stop()
+
+
+def test_ragged_prefill_matches_sequential_greedy_tokens_and_logprobs(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    prompts = [
+        [10, 20, 30],
+        [5, 6, 7, 8],
+        [40, 41, 42, 43, 44],
+    ]
+    try:
+        ragged = scheduler.run_batch(
+            prompts, max_tokens=1, temperature=0, return_logprobs=True
+        )
+        sequential = [
+            scheduler.run_batch(
+                [prompt], max_tokens=1, temperature=0, return_logprobs=True
+            )[0]
+            for prompt in prompts
+        ]
+
+        assert [result[0] for result in ragged] == [result[0] for result in sequential]
+        for ragged_result, sequential_result in zip(ragged, sequential):
+            assert ragged_result[1] == pytest.approx(sequential_result[1], abs=1e-6)
     finally:
         scheduler.stop()
 

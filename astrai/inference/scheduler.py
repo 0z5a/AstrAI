@@ -177,16 +177,14 @@ class InferenceScheduler:
             for t in to_prefill:
                 t.input_tokens = len(t.prompt_ids)
 
-            groups: Dict[Tuple[int, int, Optional[AttentionBackend]], List[Task]] = {}
+            groups: Dict[Tuple[int, Optional[AttentionBackend]], List[Task]] = {}
             for t in to_prefill:
                 start_pos = min(
                     self._task_cache.task_cached(t.task_id), len(t.prompt_ids) - 1
                 )
-                groups.setdefault((len(t.prompt_ids), start_pos, t.backend), []).append(
-                    t
-                )
+                groups.setdefault((start_pos, t.backend), []).append(t)
 
-            for (prompt_len, start_pos, _), group in groups.items():
+            for (start_pos, _), group in groups.items():
                 backend = group[0].backend
                 backend_context = (
                     attn_backend(backend) if backend is not None else nullcontext()
@@ -196,7 +194,7 @@ class InferenceScheduler:
                     self._metrics.record([t.task_id for t in group], "prefill"),
                 ):
                     prefilled, step_out = self._executor.execute_prefill(
-                        group, prompt_len, start_pos, return_logprobs=return_logprobs
+                        group, start_pos=start_pos, return_logprobs=return_logprobs
                     )
 
                 for t, out in zip(prefilled, step_out):

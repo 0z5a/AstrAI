@@ -822,7 +822,7 @@ classDiagram
             +InferenceWorkspace _workspace
             +Optional[str] device
             +Optional[torch.dtype] dtype
-            +execute_prefill(tasks, prompt_len, start_pos=0)
+            +execute_prefill(tasks, start_pos=0)
             +execute_decode(tasks, return_logprobs=False) Union[List[int], List[Tuple[int, float]]]
         }
 
