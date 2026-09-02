@@ -1,7 +1,11 @@
 """Model checkpoint serialization helpers."""
 
+import hashlib
 import io
 import json
+import os
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +20,8 @@ from astrai.parallel.setup import get_rank
 _META_FILE = "meta.json"
 _CONFIG_FILE = "config.json"
 _WEIGHTS_FILE = "model.safetensors"
+_MANIFEST_FILE = "manifest.json"
+_CHECKPOINT_FORMAT_VERSION = 1
 
 
 def save_safetensors(state_dict: dict, path: Union[str, Path]):
@@ -77,6 +83,85 @@ def load_torch(path: Union[str, Path], broadcast: bool = False) -> Any:
 
     buf = io.BytesIO(data_tensor.numpy().tobytes())
     return torch.load(buf, map_location="cpu", weights_only=False)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sync_file(path: Path):
+    with path.open("rb") as file:
+        os.fsync(file.fileno())
+
+
+def _sync_directory(path: Path):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _checkpoint_manifest(
+    save_path: Path,
+    state_dict: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    files = {}
+    for path in sorted(save_path.iterdir()):
+        if path.is_file() and path.name != _MANIFEST_FILE:
+            files[path.name] = {
+                "size": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+    return {
+        "format_version": _CHECKPOINT_FORMAT_VERSION,
+        "created_at": meta["timestamp"],
+        "optimizer_step": meta.get("optimizer_step"),
+        "policy_version": meta.get("policy_version"),
+        "tensors": sorted(state_dict),
+        "files": files,
+    }
+
+
+def _validate_manifest(
+    save_path: Path,
+    verify_checksums: bool = False,
+    broadcast: bool = False,
+) -> dict:
+    def validate() -> dict:
+        manifest = load_json(save_path / _MANIFEST_FILE)
+        if manifest.get("format_version") != _CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported checkpoint format version: "
+                f"{manifest.get('format_version')}"
+            )
+
+        files = manifest.get("files")
+        if not isinstance(files, dict):
+            raise ValueError("Checkpoint manifest has no file table")
+        for required in (_META_FILE, _CONFIG_FILE, _WEIGHTS_FILE):
+            if required not in files:
+                raise ValueError(f"Checkpoint manifest is missing {required}")
+
+        for name, descriptor in files.items():
+            if Path(name).name != name or not isinstance(descriptor, dict):
+                raise ValueError(f"Invalid checkpoint manifest entry: {name!r}")
+            path = save_path / name
+            if not path.is_file():
+                raise ValueError(f"Checkpoint file is missing: {name}")
+            if path.stat().st_size != descriptor.get("size"):
+                raise ValueError(f"Checkpoint file size mismatch: {name}")
+            if verify_checksums and _sha256(path) != descriptor.get("sha256"):
+                raise ValueError(f"Checkpoint file checksum mismatch: {name}")
+        return manifest
+
+    return _broadcast_load(validate, broadcast)
 
 
 def save_model(config: dict, state_dict: dict, save_directory: str):
@@ -151,7 +236,18 @@ class Checkpoint:
 
     def save(self, save_dir: str):
         save_path = Path(save_dir)
-        save_path.mkdir(parents=True, exist_ok=True)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        if save_path.exists() and not save_path.is_dir():
+            raise FileExistsError(
+                f"Checkpoint path exists and is not a directory: {save_path}"
+            )
+
+        staging_path = Path(
+            tempfile.mkdtemp(
+                prefix=f".{save_path.name}.tmp-",
+                dir=save_path.parent,
+            )
+        )
 
         meta = {
             "epoch": self.epoch,
@@ -159,15 +255,59 @@ class Checkpoint:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             **self.meta,
         }
-        save_json(meta, save_path / _META_FILE)
-        save_json(self.config, save_path / _CONFIG_FILE)
-        save_safetensors(self.state_dict, save_path / _WEIGHTS_FILE)
-        for key, value in self.extra.items():
-            save_torch(value, save_path / f"{key}.pt")
+        retired_path: Optional[Path] = None
+        try:
+            save_json(meta, staging_path / _META_FILE)
+            save_json(self.config, staging_path / _CONFIG_FILE)
+            save_safetensors(self.state_dict, staging_path / _WEIGHTS_FILE)
+            for key, value in self.extra.items():
+                save_torch(value, staging_path / f"{key}.pt")
+
+            manifest = _checkpoint_manifest(staging_path, self.state_dict, meta)
+            save_json(manifest, staging_path / _MANIFEST_FILE)
+            for path in staging_path.iterdir():
+                if path.is_file():
+                    _sync_file(path)
+            _sync_directory(staging_path)
+
+            # Re-publishing an existing step (re-runs into the same output
+            # directory) atomically retires the old payload first; a crash
+            # between the two renames leaves the previous checkpoint hidden
+            # under the retired name instead of a partial directory.
+            retired_path = None
+            if save_path.exists():
+                retired_path = Path(
+                    tempfile.mkdtemp(
+                        prefix=f".{save_path.name}.retired-",
+                        dir=save_path.parent,
+                    )
+                )
+                retired_path.rmdir()
+                os.replace(save_path, retired_path)
+            os.replace(staging_path, save_path)
+            _sync_directory(save_path.parent)
+        except BaseException:
+            shutil.rmtree(staging_path, ignore_errors=True)
+            raise
+        finally:
+            if retired_path is not None:
+                shutil.rmtree(retired_path, ignore_errors=True)
 
     @classmethod
-    def load(cls, save_dir: str, broadcast: bool = False) -> "Checkpoint":
+    def load(
+        cls,
+        save_dir: str,
+        broadcast: bool = False,
+        verify_checksums: bool = False,
+    ) -> "Checkpoint":
         save_path = Path(save_dir)
+
+        if (save_path / _MANIFEST_FILE).exists():
+            _validate_manifest(
+                save_path,
+                verify_checksums=verify_checksums,
+                broadcast=broadcast,
+            )
 
         meta = load_json(save_path / _META_FILE, broadcast)
         config = load_json(save_path / _CONFIG_FILE, broadcast)
@@ -188,13 +328,22 @@ class Checkpoint:
         )
 
     @classmethod
-    def load_any(cls, save_dir: str, broadcast: bool = False) -> Optional["Checkpoint"]:
+    def load_any(
+        cls,
+        save_dir: str,
+        broadcast: bool = False,
+        verify_checksums: bool = False,
+    ) -> Optional["Checkpoint"]:
         save_path = Path(save_dir)
         meta_path = save_path / _META_FILE
         weights_path = save_path / _WEIGHTS_FILE
 
         if meta_path.exists():
-            return cls.load(save_dir, broadcast=broadcast)
+            return cls.load(
+                save_dir,
+                broadcast=broadcast,
+                verify_checksums=verify_checksums,
+            )
 
         weights_path = save_path / _WEIGHTS_FILE
         index_path = save_path / "model.safetensors.index.json"

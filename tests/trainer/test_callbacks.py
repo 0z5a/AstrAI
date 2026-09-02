@@ -170,3 +170,7 @@ def test_checkpoint_captures_completed_optimizer_step(
     )
     assert checkpoint.extra["optimizer"]["state"]
     assert checkpoint.extra["scheduler"]["last_epoch"] == 1
+    assert checkpoint.meta["optimizer_step"] == 1
+    assert (
+        Path(base_test_env["test_dir"]) / "epoch_0_step_1" / "metric.jsonl"
+    ).is_file()

@@ -153,8 +153,6 @@ class CheckpointCallback(TrainCallback):
         self.last_ckpt_step = context.optimizer_step
 
     def _save_checkpoint(self, context: TrainContext):
-        self.last_ckpt_step = context.optimizer_step
-
         with context.executor.checkpoint_context(context.model) as state_dict:
             if state_dict is not None:
                 save_path = os.path.join(
@@ -162,7 +160,10 @@ class CheckpointCallback(TrainCallback):
                     f"epoch_{context.epoch}_step_{context.optimizer_step}",
                 )
                 extra = self.save_extra_fn(context)
-                meta = context.config.to_dict()
+                meta = {
+                    **context.config.to_dict(),
+                    "optimizer_step": context.optimizer_step,
+                }
                 context.checkpoint = Checkpoint(
                     state_dict=state_dict,
                     epoch=context.epoch,
@@ -172,6 +173,7 @@ class CheckpointCallback(TrainCallback):
                     meta=meta,
                 )
                 context.checkpoint.save(save_path)
+        self.last_ckpt_step = context.optimizer_step
 
     def after_optimizer_step(self, context: TrainContext):
         if context.optimizer_step - self.last_ckpt_step >= self.interval:
@@ -182,7 +184,8 @@ class CheckpointCallback(TrainCallback):
             self._save_checkpoint(context)
 
     def on_error(self, context: TrainContext):
-        self._save_checkpoint(context)
+        if context.optimizer_step != self.last_ckpt_step:
+            self._save_checkpoint(context)
 
     @staticmethod
     def save_extra(context: TrainContext) -> dict:
@@ -361,6 +364,7 @@ class MetricCallback(TrainCallback):
         step_metrics = [m for m in self.metrics if m != "val_loss"]
         self._append("step", context, **self._metrics(context, step_metrics))
 
+    def after_optimizer_step(self, context):
         if context.optimizer_step - self.last_log_flush_step >= self.save_interval:
             self._flush(context.epoch, context.optimizer_step)
             self.last_log_flush_step = context.optimizer_step

@@ -259,8 +259,8 @@ classDiagram
             +dict meta
             +dict config
             +save(save_dir)
-            +load(save_dir, broadcast) Checkpoint
-            +load_any(save_dir, broadcast) Optional[Checkpoint]
+            +load(save_dir, broadcast, verify_checksums) Checkpoint
+            +load_any(save_dir, broadcast, verify_checksums) Optional[Checkpoint]
         }
     }
 
