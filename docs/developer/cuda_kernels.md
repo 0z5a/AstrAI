@@ -125,12 +125,14 @@ BF16 inputs with `M` in `[1, 8]` and K divisible by 8. It preserves the BF16
 rounding boundaries of the two projection outputs, SiLU output, and final
 product while accumulating dot products in FP32.
 
-The kernel contains two output-row tilings. A CTA-reuse path reads each up/gate
-weight chunk once and applies it to all M rows. The native AstrAI 1B shape
-`(N,K)=(6912,1536)` uses one warp per decode row for M=2/4/8; on L20 this
-removes the shared reductions and barrier and reduces M=4 CUDA-Graph latency
-from 0.0324 ms to 0.0181 ms. Wider LLaMA/GPT-NeoX matrices keep CTA reuse,
-because duplicating their weight reads across row warps regressed 1.3-4.2%.
+The kernel is a single CTA-reuse tiling: one CTA per output column reads each
+up/gate weight chunk once and applies it to all M rows. Block size is 256
+threads for M in [1, 7] and 128 for M=8, where the shorter shared-memory
+reduction tree wins under cold-HBM decode traffic. An earlier per-shape
+`(6912,1536)` warp-per-row variant and its dispatch table were removed: HBM
+measurements with rotated weights showed the table was tuned against L2-cache
+regime timing and was up to 6% slower than CTA reuse at M=2/4; the kernel is
+bandwidth-bound, so finer variant selection is noise.
 
 Dense `MLP` modules route through the SwiGLU backend. `ASTRAI_SWIGLU=0` keeps
 the unfused linear backend, and `1` explicitly forces the fused primitive.

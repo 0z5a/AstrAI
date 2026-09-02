@@ -1,4 +1,8 @@
 // Fused small-M BF16 SwiGLU primitive for decode-time dense MLP layers.
+// One CTA per output column; each weight pair is read once and reused across
+// all decode rows. Bandwidth-bound in the cold-HBM decode regime, so variant
+// selection beyond the M=8 block-size rule is noise (see
+// docs/developer/swiglu_benchmark.md).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -11,9 +15,7 @@
 
 namespace {
 
-constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
-constexpr int kWarps = kThreads / kWarpSize;
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -27,7 +29,7 @@ __device__ __forceinline__ float round_bf16(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
 }
 
-template <int Rows>
+template <int Threads, int Rows>
 __global__ void bf16_swiglu_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ up_weight,
@@ -36,6 +38,7 @@ __global__ void bf16_swiglu_kernel(
     int n,
     int k
 ) {
+    constexpr int kWarps = Threads / kWarpSize;
     const int output_index = blockIdx.x;
     const int lane = threadIdx.x & (kWarpSize - 1);
     const int warp = threadIdx.x / kWarpSize;
@@ -120,7 +123,7 @@ __global__ void bf16_swiglu_kernel(
     }
 }
 
-template <int Rows>
+template <int Threads, int Rows>
 void launch_bf16_swiglu(
     const __nv_bfloat16* x,
     const __nv_bfloat16* up_weight,
@@ -130,85 +133,7 @@ void launch_bf16_swiglu(
     int k,
     cudaStream_t stream
 ) {
-    bf16_swiglu_kernel<Rows><<<n, kThreads, 0, stream>>>(
-        x, up_weight, gate_weight, output, n, k
-    );
-}
-
-template <int Rows>
-__global__ void bf16_swiglu_warp_rows_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ up_weight,
-    const __nv_bfloat16* __restrict__ gate_weight,
-    __nv_bfloat16* __restrict__ output,
-    int n,
-    int k
-) {
-    const int output_index = blockIdx.x;
-    const int row = threadIdx.x / kWarpSize;
-    const int lane = threadIdx.x & (kWarpSize - 1);
-    const int vector_count = k / 8;
-
-    float up_sum = 0.0f;
-    float gate_sum = 0.0f;
-    const auto* x4 = reinterpret_cast<const uint4*>(
-        x + static_cast<int64_t>(row) * k
-    );
-    const auto* up4 = reinterpret_cast<const uint4*>(
-        up_weight + static_cast<int64_t>(output_index) * k
-    );
-    const auto* gate4 = reinterpret_cast<const uint4*>(
-        gate_weight + static_cast<int64_t>(output_index) * k
-    );
-
-    // A warp owns one decode row. Same-address weight reads from sibling
-    // warps are served through the read-only/L1 path, while each row avoids
-    // CTA-wide shared-memory reductions and synchronization.
-    for (int vector_index = lane;
-         vector_index < vector_count;
-         vector_index += kWarpSize) {
-        const uint4 x_raw = x4[vector_index];
-        const uint4 up_raw = up4[vector_index];
-        const uint4 gate_raw = gate4[vector_index];
-        const auto* x_values = reinterpret_cast<const __nv_bfloat162*>(&x_raw);
-        const auto* up_values =
-            reinterpret_cast<const __nv_bfloat162*>(&up_raw);
-        const auto* gate_values =
-            reinterpret_cast<const __nv_bfloat162*>(&gate_raw);
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-            const float2 xv = __bfloat1622float2(x_values[pair]);
-            const float2 uv = __bfloat1622float2(up_values[pair]);
-            const float2 gv = __bfloat1622float2(gate_values[pair]);
-            up_sum = fmaf(xv.x, uv.x, up_sum);
-            up_sum = fmaf(xv.y, uv.y, up_sum);
-            gate_sum = fmaf(xv.x, gv.x, gate_sum);
-            gate_sum = fmaf(xv.y, gv.y, gate_sum);
-        }
-    }
-    up_sum = warp_sum(up_sum);
-    gate_sum = warp_sum(gate_sum);
-    if (lane == 0) {
-        up_sum = round_bf16(up_sum);
-        gate_sum = round_bf16(gate_sum);
-        const float silu =
-            round_bf16(gate_sum / (1.0f + expf(-gate_sum)));
-        output[static_cast<int64_t>(row) * n + output_index] =
-            __float2bfloat16_rn(up_sum * silu);
-    }
-}
-
-template <int Rows>
-void launch_bf16_swiglu_warp_rows(
-    const __nv_bfloat16* x,
-    const __nv_bfloat16* up_weight,
-    const __nv_bfloat16* gate_weight,
-    __nv_bfloat16* output,
-    int n,
-    int k,
-    cudaStream_t stream
-) {
-    bf16_swiglu_warp_rows_kernel<Rows><<<n, Rows * kWarpSize, 0, stream>>>(
+    bf16_swiglu_kernel<Threads, Rows><<<n, Threads, 0, stream>>>(
         x, up_weight, gate_weight, output, n, k
     );
 }
@@ -288,66 +213,51 @@ torch::Tensor bf16_swiglu(
         reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
     const int n_int = static_cast<int>(n);
     const int k_int = static_cast<int>(k);
-    const bool use_warp_rows = n_int == 6912 && k_int == 1536;
 
+    // Block size 256 keeps the weight streams at the HBM bandwidth floor for
+    // M in [1, 7]; M=8 halves the CTA so each thread owns more of the row
+    // and the shared-memory reduction tree shrinks (measured on L20 with
+    // rotated cold weights; larger CTAs only add idle warps).
     switch (m) {
         case 1:
-            launch_bf16_swiglu<1>(
+            launch_bf16_swiglu<256, 1>(
                 x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
             );
             break;
         case 2:
-            if (use_warp_rows) {
-                launch_bf16_swiglu_warp_rows<2>(
-                    x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
-                );
-            } else {
-                launch_bf16_swiglu<2>(
-                    x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
-                );
-            }
+            launch_bf16_swiglu<256, 2>(
+                x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
+            );
             break;
         case 3:
-            launch_bf16_swiglu<3>(
+            launch_bf16_swiglu<256, 3>(
                 x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
             );
             break;
         case 4:
-            if (use_warp_rows) {
-                launch_bf16_swiglu_warp_rows<4>(
-                    x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
-                );
-            } else {
-                launch_bf16_swiglu<4>(
-                    x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
-                );
-            }
+            launch_bf16_swiglu<256, 4>(
+                x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
+            );
             break;
         case 5:
-            launch_bf16_swiglu<5>(
+            launch_bf16_swiglu<256, 5>(
                 x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
             );
             break;
         case 6:
-            launch_bf16_swiglu<6>(
+            launch_bf16_swiglu<256, 6>(
                 x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
             );
             break;
         case 7:
-            launch_bf16_swiglu<7>(
+            launch_bf16_swiglu<256, 7>(
                 x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
             );
             break;
         case 8:
-            if (use_warp_rows) {
-                launch_bf16_swiglu_warp_rows<8>(
-                    x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
-                );
-            } else {
-                launch_bf16_swiglu<8>(
-                    x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
-                );
-            }
+            launch_bf16_swiglu<128, 8>(
+                x_ptr, up_ptr, gate_ptr, output_ptr, n_int, k_int, stream.stream()
+            );
             break;
     }
     C10_CUDA_CHECK(cudaGetLastError());
