@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "commit": "8aa8e175d9e848dcb85250ca5106e978f012a6df",
+  "environment": {
+    "gpu": "NVIDIA L20",
+    "torch": "2.11.0+cu128",
+    "cuda": "12.8",
+    "dtype": "bfloat16"
+  },
+  "config": {
+    "preset": "astrai-1b",
+    "batch_size": 4,
+    "max_seq_len": 2048,
+    "prompt_len": 128,
+    "max_tokens": 4,
+    "trials": 5,
+    "cuda_graph": false
+  },
+  "memory_mib": {
+    "model_only": 2300.0810546875,
+    "initial_runtime_resident": 2501.05322265625,
+    "released_samples": [
+      2308.2060546875,
+      2308.2060546875,
+      2308.2060546875,
+      2308.2060546875,
+      2308.2060546875
+    ],
+    "resumed_samples": [
+      2501.05322265625,
+      2501.05322265625,
+      2501.05322265625,
+      2501.05322265625,
+      2501.05322265625
+    ],
+    "runtime_footprint": 200.97216796875,
+    "reclaimed": 192.84716796875,
+    "reclaimed_fraction": 0.9595715163839831
+  },
+  "latency_ms": {
+    "release": {
+      "samples": [
+        108.646955,
+        83.549314,
+        83.595113,
+        84.869031,
+        83.56665
+      ],
+      "median": 83.595113,
+      "p99": 108.646955
+    },
+    "resume": {
+      "samples": [
+        6.864924,
+        1.34156,
+        1.345346,
+        1.336576,
+        1.342952
+      ],
+      "median": 1.342952,
+      "p99": 6.864924
+    }
+  },
+  "correctness": {
+    "greedy_match": true,
+    "cycles": 5,
+    "reference_tokens": [
+      [50608, 10205, 40348, 96095],
+      [78180, 1510, 78184, 88741],
+      [1102, 86877, 3877, 89105],
+      [11603, 50532, 86049, 18276]
+    ]
+  }
+}
