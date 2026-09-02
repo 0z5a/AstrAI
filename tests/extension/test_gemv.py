@@ -44,6 +44,66 @@ def test_bf16_gemv_matches_small_decode_batches(m, n, k):
 
 
 @skip_no_gemv
+@pytest.mark.parametrize("m", [2, 4])
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (1024, 4096),
+        (4096, 4096),
+        (11008, 4096),
+        (4096, 11008),
+        (14336, 4096),
+        (4096, 14336),
+        (5120, 5120),
+        (13824, 5120),
+        (5120, 13824),
+        (16384, 4096),
+        (4096, 16384),
+        (512, 3584),
+        (3584, 3584),
+        (18944, 3584),
+        (3584, 18944),
+        (1024, 8192),
+        (8192, 8192),
+        (28672, 8192),
+        (8192, 28672),
+        (2048, 2048),
+        (8192, 2048),
+        (2048, 8192),
+    ],
+)
+def test_bf16_gemv_matches_common_transformer_shapes(m, n, k):
+    torch.manual_seed(2026 + m + n + k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.empty(n, k, device="cuda", dtype=torch.bfloat16)
+    weight.normal_(mean=0.0, std=0.02)
+    actual = bf16_gemv(x, weight)
+    expected = F.linear(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.25)
+
+
+@skip_no_gemv
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 8192, 2048),
+        (8, 4096, 11008),
+        (8, 512, 3584),
+        (8, 1024, 8192),
+        (8, 2048, 8192),
+    ],
+)
+def test_bf16_gemv_matches_half_cta_edge_bands(m, n, k):
+    torch.manual_seed(2026 + m + n + k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.empty(n, k, device="cuda", dtype=torch.bfloat16)
+    weight.normal_(mean=0.0, std=0.02)
+    actual = bf16_gemv(x, weight)
+    expected = F.linear(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.25)
+
+
+@skip_no_gemv
 def test_bf16_gemv_preserves_singleton_batch_and_fuses_bias():
     torch.manual_seed(23)
     x = torch.randn(1, 1536, device="cuda", dtype=torch.bfloat16)

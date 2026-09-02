@@ -62,6 +62,7 @@ set(KERNEL_NAMES
     attn_paged_decode
     attn_paged_prefill
     bf16_gemv
+    bf16_swiglu
     rotary_emb
 )
 set(KERNEL_SRCS
@@ -70,6 +71,7 @@ set(KERNEL_SRCS
     attention/paged_decode.cu
     attention/paged_prefill.cu
     gemv/bf16_gemv.cu
+    gemv/bf16_swiglu.cu
     rotary_emb.cu
 )
 
