@@ -15,7 +15,13 @@ from astrai.extension import (
 from astrai.inference.cache import PagePool, TaskCacheManager
 from astrai.inference.metrics import MetricsCollector
 from astrai.inference.runtime.executor import Executor
-from astrai.inference.task import STOP, Task, TaskManager, TaskStatus
+from astrai.inference.task import (
+    STOP,
+    GenerationResult,
+    Task,
+    TaskManager,
+    TaskStatus,
+)
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
 
@@ -317,7 +323,8 @@ class InferenceScheduler:
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
         return_logprobs: bool = False,
-    ) -> List[List[int]]:
+        return_details: bool = False,
+    ) -> List[Any]:
         """Synchronous batch generation without the scheduler thread.
 
         Accepts already-tokenized prompts (no string round-trip) and runs
@@ -333,20 +340,25 @@ class InferenceScheduler:
                 parameters (uniform across the batch).
             return_logprobs: If ``True``, return ``(token_ids, logprobs)``
                 tuples per prompt (logprobs aligned 1-to-1 with token_ids).
+            return_details: If ``True``, return a structured result per prompt
+                with terminal and error reasons. Logprobs are populated when
+                ``return_logprobs`` is also ``True``.
 
         Returns:
-            ``List[List[int]]`` of generated token IDs per prompt, or —
-            when ``return_logprobs`` is ``True`` —
-            ``List[Tuple[List[int], List[float]]]``.
+            Structured results when ``return_details`` is ``True``;
+            otherwise generated token IDs per prompt, or token/logprob tuples
+            when ``return_logprobs`` is ``True``.
         """
         stop_ids = self._task_mgr.tokenizer.stop_ids
         seq_cap = self.max_seq_len
         request_backend = get_backend(use_default=False)
 
-        tasks: List[Task] = []
+        tasks: List[Optional[Task]] = []
+        error_reasons: List[Optional[str]] = []
         for ids in prompt_ids_list:
             if len(ids) >= seq_cap:
                 tasks.append(None)
+                error_reasons.append("prompt_too_long")
                 continue
             t_max = max_tokens
             if t_max is None:
@@ -355,6 +367,7 @@ class InferenceScheduler:
                 t_max = min(t_max, seq_cap - len(ids))
             if t_max <= 0:
                 tasks.append(None)
+                error_reasons.append("max_tokens_non_positive")
                 continue
             task = Task(
                 task_id=f"batch_{uuid.uuid4().hex[:8]}",
@@ -369,17 +382,22 @@ class InferenceScheduler:
             )
             if not self._task_cache.task_alloc(task.task_id, task.prompt_ids):
                 tasks.append(None)
+                error_reasons.append("kv_cache_allocation_failed")
                 continue
             task.input_tokens = len(task.prompt_ids)
             self._metrics.register(task.task_id)
             tasks.append(task)
+            error_reasons.append(None)
 
+        runtime_errors: Dict[str, str] = {}
         try:
             live = [t for t in tasks if t is not None]
 
             with self._backend_context():
                 while live:
-                    decoded, _ = self._step(live, return_logprobs=return_logprobs)
+                    decoded, aborted = self._step(live, return_logprobs=return_logprobs)
+                    for task in aborted:
+                        runtime_errors[task.task_id] = "kv_cache_extension_failed"
                     live = [t for t in decoded if not t.is_finished(stop_ids)]
         finally:
             for t in tasks:
@@ -389,12 +407,37 @@ class InferenceScheduler:
                     )
                     self._task_cache.task_free(t.task_id)
 
-        results: List[Any] = []
-        for t in tasks:
+        details: List[GenerationResult] = []
+        for t, setup_error in zip(tasks, error_reasons):
             if t is None:
-                results.append(([], []) if return_logprobs else [])
-            elif return_logprobs:
-                results.append((list(t.output_ids), list(t.output_logprobs)))
+                details.append(
+                    GenerationResult(
+                        token_ids=[],
+                        logprobs=[],
+                        finish_reason="rejected",
+                        error_reason=setup_error,
+                    )
+                )
             else:
-                results.append(list(t.output_ids))
-        return results
+                runtime_error = runtime_errors.get(t.task_id)
+                stopped = bool(t.output_ids and t.output_ids[-1] in stop_ids)
+                if runtime_error:
+                    finish_reason = "rejected"
+                elif stopped:
+                    finish_reason = "stop"
+                else:
+                    finish_reason = "length"
+                details.append(
+                    GenerationResult(
+                        token_ids=list(t.output_ids),
+                        logprobs=list(t.output_logprobs),
+                        finish_reason=finish_reason,
+                        error_reason=runtime_error,
+                    )
+                )
+
+        if return_details:
+            return details
+        if return_logprobs:
+            return [(result.token_ids, result.logprobs) for result in details]
+        return [result.token_ids for result in details]

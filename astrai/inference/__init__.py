@@ -17,11 +17,12 @@ from astrai.inference.network import get_app, run_server
 from astrai.inference.runtime.executor import Executor
 from astrai.inference.runtime.sample import sample
 from astrai.inference.scheduler import InferenceScheduler
-from astrai.inference.task import STOP, Task, TaskManager, TaskStatus
+from astrai.inference.task import STOP, GenerationResult, Task, TaskManager, TaskStatus
 
 __all__ = [
     "InferenceEngine",
     "InferenceScheduler",
+    "GenerationResult",
     "Executor",
     "STOP",
     "Task",
