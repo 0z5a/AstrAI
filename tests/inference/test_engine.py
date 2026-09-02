@@ -157,6 +157,28 @@ def test_engine_generate_streaming_yields_tokens():
         assert tokens == ["t1", "t2"]
 
 
+def test_engine_stream_close_cancels_unfinished_task():
+    mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
+    callbacks_saved = []
+
+    def capture_cb(prompt, **kwargs):
+        callbacks_saved.append(kwargs["stream_callback"])
+        return "task-1"
+
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        instance = MockSched.return_value
+        instance.add_task.side_effect = capture_cb
+
+        engine = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
+        stream = engine.generate("hello", stream=True)
+
+        callbacks_saved[0]("t1")
+        assert next(stream) == "t1"
+        stream.close()
+
+        instance.cancel_task.assert_called_once_with("task-1")
+
+
 def test_engine_generate_async_yields_tokens_until_stop():
     mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
     callbacks_saved = []
@@ -184,6 +206,31 @@ def test_engine_generate_async_yields_tokens_until_stop():
         cb(STOP)
 
         assert asyncio.run(collect()) == ["t1", "t2"]
+
+
+def test_engine_async_close_cancels_unfinished_task():
+    mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
+    callbacks_saved = []
+
+    def capture_cb(prompt, **kwargs):
+        callbacks_saved.append(kwargs["stream_callback"])
+        return "task-1"
+
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        instance = MockSched.return_value
+        instance.add_task.side_effect = capture_cb
+
+        engine = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
+        stream = engine.generate_async("hello")
+        callbacks_saved[0]("t1")
+
+        async def consume_then_close():
+            assert await anext(stream) == "t1"
+            await stream.aclose()
+
+        asyncio.run(consume_then_close())
+
+        instance.cancel_task.assert_called_once_with("task-1")
 
 
 def test_engine_generate_non_streaming_batch():

@@ -101,12 +101,25 @@ class InferenceScheduler:
     def add_task(self, prompt: str, **kwargs) -> str:
         return self._task_mgr.add_task(prompt, **kwargs)
 
-    def remove_task(self, task_id: str):
-        for task in self._task_mgr.remove_task(task_id):
-            self._task_cache.task_free(task.task_id)
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancel a waiting or active task without freeing in-use KV state."""
+        immediate, cancelled = self._task_mgr.cancel_task(task_id)
+        for task in immediate:
+            self._metrics.mark_finished(
+                task.task_id, task.input_tokens, task.output_tokens
+            )
+        if cancelled:
+            self._task_mgr.wake()
+        return cancelled
+
+    def remove_task(self, task_id: str) -> bool:
+        """Backward-compatible alias for cancellation."""
+        return self.cancel_task(task_id)
 
     def get_stats(self) -> Dict[str, Any]:
-        return self._task_mgr.get_stats()
+        stats = self._task_mgr.get_stats()
+        stats["kv_cache_tasks"] = self._task_cache.task_count
+        return stats
 
     @property
     def backend_name(self) -> str:
@@ -248,7 +261,13 @@ class InferenceScheduler:
                             if self._task_cache.task_alloc(
                                 task.task_id, task.prompt_ids
                             ):
-                                self._task_mgr.activate(task)
+                                if not self._task_mgr.activate(task):
+                                    self._task_cache.task_free(task.task_id)
+                                    self._metrics.mark_finished(
+                                        task.task_id,
+                                        task.input_tokens,
+                                        task.output_tokens,
+                                    )
                             else:
                                 failed.append(task)
                         if failed:
@@ -258,7 +277,11 @@ class InferenceScheduler:
                         self._task_mgr.wait_for_tasks(timeout=1.0)
                         continue
 
-                    active = self._task_mgr.get_active_tasks()
+                    active = [
+                        task
+                        for task in self._task_mgr.get_active_tasks()
+                        if task.status != TaskStatus.ABORTED
+                    ]
 
                     decoded, aborted = self._step(active)
 
@@ -266,6 +289,8 @@ class InferenceScheduler:
                         self._task_mgr.invoke_callback(t.task_id, STOP)
 
                     for t in decoded:
+                        if t.status == TaskStatus.ABORTED:
+                            continue
                         new_text = t.decode_new_token(self._task_mgr.tokenizer)
                         if new_text:
                             self._task_mgr.invoke_callback(t.task_id, new_text)
@@ -297,13 +322,21 @@ class InferenceScheduler:
 
     def _abort_and_clear(self, free_waiting: bool):
         """Invoke STOP callbacks, release cache slots, and clear task queues."""
-        for task in self._task_mgr.get_active_tasks():
+        active = self._task_mgr.get_active_tasks()
+        waiting = self._task_mgr.get_waiting_tasks()
+        for task in active:
             self._task_mgr.invoke_callback(task.task_id, STOP)
             self._task_cache.task_free(task.task_id)
-        for task in self._task_mgr.get_waiting_tasks():
+            self._metrics.mark_finished(
+                task.task_id, task.input_tokens, task.output_tokens
+            )
+        for task in waiting:
             self._task_mgr.invoke_callback(task.task_id, STOP)
             if free_waiting:
                 self._task_cache.task_free(task.task_id)
+            self._metrics.mark_finished(
+                task.task_id, task.input_tokens, task.output_tokens
+            )
         self._task_mgr.clear_queues()
 
     def run_batch(

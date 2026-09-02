@@ -1,6 +1,7 @@
 """Tests for scheduler concurrency."""
 
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -257,6 +258,104 @@ def _make_real_scheduler(device):
         max_seq_len=64,
     )
     return scheduler, tokenizer, model
+
+
+def test_cancel_waiting_task_storm_returns_to_baseline(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        task_ids = [
+            scheduler.add_task(f"waiting-{index}", max_tokens=32) for index in range(32)
+        ]
+
+        assert all(scheduler.cancel_task(task_id) for task_id in task_ids)
+        stats = scheduler.get_stats()
+        assert stats["active_tasks"] == 0
+        assert stats["waiting_tasks"] == 0
+        assert stats["in_flight_tasks"] == 0
+        assert stats["kv_cache_tasks"] == 0
+        assert stats["cancelled_total"] == len(task_ids)
+    finally:
+        scheduler.stop()
+
+
+def test_cancel_active_task_releases_metrics_and_kv(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        task_id = scheduler.add_task("active", max_tokens=32)
+        task = scheduler._task_mgr.pull_candidates(1)[0]
+        assert scheduler._task_cache.task_alloc(task.task_id, task.prompt_ids)
+        assert scheduler._task_mgr.activate(task)
+
+        before = scheduler.get_stats()
+        assert before["active_tasks"] == 1
+        assert before["in_flight_tasks"] == 1
+        assert before["kv_cache_tasks"] == 1
+
+        assert scheduler.cancel_task(task_id)
+        scheduler.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            after = scheduler.get_stats()
+            if (
+                after["active_tasks"] == 0
+                and after["in_flight_tasks"] == 0
+                and after["kv_cache_tasks"] == 0
+            ):
+                break
+            time.sleep(0.01)
+
+        assert after["active_tasks"] == 0
+        assert after["waiting_tasks"] == 0
+        assert after["in_flight_tasks"] == 0
+        assert after["kv_cache_tasks"] == 0
+        assert after["cancelled_total"] == 1
+    finally:
+        scheduler.stop()
+
+
+def test_cancel_during_kv_allocation_releases_metrics_and_kv(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    allocation_started = threading.Event()
+    continue_allocation = threading.Event()
+    original_alloc = scheduler._task_cache.task_alloc
+
+    def blocking_alloc(*args, **kwargs):
+        allocation_started.set()
+        assert continue_allocation.wait(timeout=5)
+        return original_alloc(*args, **kwargs)
+
+    try:
+        with patch.object(
+            scheduler._task_cache,
+            "task_alloc",
+            side_effect=blocking_alloc,
+        ):
+            scheduler.start()
+            task_id = scheduler.add_task("allocation-race", max_tokens=32)
+            assert allocation_started.wait(timeout=5)
+            assert scheduler.cancel_task(task_id)
+            continue_allocation.set()
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                stats = scheduler.get_stats()
+                if (
+                    stats["active_tasks"] == 0
+                    and stats["waiting_tasks"] == 0
+                    and stats["in_flight_tasks"] == 0
+                    and stats["kv_cache_tasks"] == 0
+                ):
+                    break
+                time.sleep(0.01)
+
+        assert stats["active_tasks"] == 0
+        assert stats["waiting_tasks"] == 0
+        assert stats["in_flight_tasks"] == 0
+        assert stats["kv_cache_tasks"] == 0
+        assert stats["cancelled_total"] == 1
+    finally:
+        continue_allocation.set()
+        scheduler.stop()
 
 
 def test_run_batch_returns_token_sequences(device):
