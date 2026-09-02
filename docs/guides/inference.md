@@ -211,7 +211,9 @@ InferenceEngine
 ```
 
 Use `scripts/tools/benchmark_inference_lifecycle.py` to measure reclaimed memory,
-release/resume latency, and greedy-output parity for the AstrAI 1B preset.
+release/resume latency, and greedy-output parity for the AstrAI 1B preset. The
+[L20 results](../benchmarks/inference_release_resume_l20.md) include raw JSON for
+2K, 8K, and 32K context bounds.
 
 `GenerateResult` uses `Condition` for non-streaming (`wait_completion()`) and `Event` for streaming (`wait()`). Stream callback is `cb(token)`.
 
