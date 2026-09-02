@@ -32,7 +32,7 @@ rationales are stored in
 Digest construction is deterministic:
 
 - target/baseline: SHA-256 of target commit
-  `92e3cdf0443a0815c6bf8a1d9a121ab94e6f37a1`;
+  `88c06db096f197acac2a66953bde445c3d720121`;
 - candidate: SHA-256 of the sorted per-file SHA-256 list for implementation,
   tests, benchmark tool, and lifecycle documentation;
 - acceptance: the corresponding engine, scheduler, and rollout test files;
@@ -41,6 +41,6 @@ Digest construction is deterministic:
   `nvidia-l20-sm89-single-gpu-bf16`.
 
 The benchmark source identifier is implementation commit
-`8aa8e175d9e848dcb85250ca5106e978f012a6df`. Across 2K, 8K, and 32K context
+`5900c786322b522162af0bef0674464806f1628a`. Across 2K, 8K, and 32K context
 capacities, five release/resume cycles retained greedy-output parity while
 reclaiming 95.96% to 99.74% of scheduler-owned runtime memory.

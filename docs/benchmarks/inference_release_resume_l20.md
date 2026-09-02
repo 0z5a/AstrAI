@@ -1,6 +1,6 @@
 # Inference runtime release/resume on NVIDIA L20
 
-Implementation commit: `8aa8e175d9e848dcb85250ca5106e978f012a6df`
+Implementation commit: `5900c786322b522162af0bef0674464806f1628a`
 
 Environment: NVIDIA L20, PyTorch 2.11.0+cu128, CUDA 12.8, BF16. The
 `astrai-1b` preset used 24 layers, hidden size 1536, four KV heads, batch size
@@ -10,9 +10,9 @@ was measured across five complete release/resume/output-parity cycles.
 
 | Max context | Runtime footprint | Reclaimed | Reclaimed % | Release median | Resume median | Greedy parity |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2,048 | 200.97 MiB | 192.85 MiB | 95.96% | 83.60 ms | 1.34 ms | 5/5 |
-| 8,192 | 777.14 MiB | 769.01 MiB | 98.95% | 96.22 ms | 5.04 ms | 5/5 |
-| 32,768 | 3,081.81 MiB | 3,073.68 MiB | 99.74% | 90.79 ms | 5.10 ms | 5/5 |
+| 2,048 | 200.97 MiB | 192.85 MiB | 95.96% | 105.62 ms | 2.01 ms | 5/5 |
+| 8,192 | 777.14 MiB | 769.01 MiB | 98.95% | 90.16 ms | 5.09 ms | 5/5 |
+| 32,768 | 3,081.81 MiB | 3,073.68 MiB | 99.74% | 89.27 ms | 5.10 ms | 5/5 |
 
 `release()` includes scheduler stop, Python reference collection, and CUDA
 allocator cache release. `resume()` reconstructs the cache and executor; the

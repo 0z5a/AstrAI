@@ -2,7 +2,7 @@
   "schema_version": "0.5.1",
   "score_kind": "diagnostic-project-fit",
   "score_is_official": false,
-  "candidate_revision": "sha256:2758cbda9cee1ef9ca4760661c7c9b41388afd3c946e7d0494b0e02eea0a71a7",
+  "candidate_revision": "sha256:b6423c916b48d8eead00eb3f2250143c7945223c4fa77daad965040e65bcc9d6",
   "formula_template_id": "project-fit-system-path-v0.5.1",
   "diagnostic_project_fit_100": 92.2938210486744,
   "component_values": {
@@ -101,9 +101,9 @@
     "infraswe_commit": "811bc775ed5b3a6ec853219245f3469f78818020",
     "comparison_cell_validation": "pass",
     "infraswe_engine_tests": "53 passed",
-    "astrai_implementation_commit": "8aa8e175d9e848dcb85250ca5106e978f012a6df",
-    "astrai_local_tests": "624 passed, 103 skipped",
-    "astrai_l20_focused_tests": "71 passed in 5.33s",
+    "astrai_implementation_commit": "5900c786322b522162af0bef0674464806f1628a",
+    "astrai_local_tests": "628 passed, 103 skipped",
+    "astrai_l20_focused_tests": "71 passed in 2.27s",
     "astrai_lint": "passed"
   }
 }
