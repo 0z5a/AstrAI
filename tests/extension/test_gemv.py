@@ -31,6 +31,19 @@ def test_bf16_gemv_matches_linear_shape_families(n, k):
 
 
 @skip_no_gemv
+@pytest.mark.parametrize("m", [2, 4, 8])
+@pytest.mark.parametrize("n,k", [(256, 1536), (1536, 1536), (1536, 6912)])
+def test_bf16_gemv_matches_small_decode_batches(m, n, k):
+    torch.manual_seed(19 + m)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    actual = bf16_gemv(x, weight)
+    expected = F.linear(x, weight)
+    assert actual.shape == (m, n)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.5)
+
+
+@skip_no_gemv
 def test_bf16_gemv_preserves_singleton_batch_and_fuses_bias():
     torch.manual_seed(23)
     x = torch.randn(1, 1536, device="cuda", dtype=torch.bfloat16)
@@ -39,6 +52,17 @@ def test_bf16_gemv_preserves_singleton_batch_and_fuses_bias():
     actual = bf16_gemv(x, weight, bias)
     expected = F.linear(x, weight, bias)
     assert actual.shape == (1, 1536)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.25)
+
+
+@skip_no_gemv
+def test_bf16_gemv_small_batch_fuses_bias():
+    torch.manual_seed(25)
+    x = torch.randn(4, 1536, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, 1536, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    actual = bf16_gemv(x, weight, bias)
+    expected = F.linear(x, weight, bias)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.25)
 
 
@@ -73,15 +97,33 @@ def test_bf16_gemv_cuda_graph_replay():
 
 
 @skip_no_gemv
+def test_bf16_gemv_small_batch_cuda_graph_replay():
+    torch.manual_seed(31)
+    x = torch.randn(8, 1536, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(1536, 1536, device="cuda", dtype=torch.bfloat16)
+    for _ in range(3):
+        bf16_gemv(x, weight)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = bf16_gemv(x, weight)
+
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    expected = F.linear(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.25)
+
+
+@skip_no_gemv
 @pytest.mark.parametrize(
     "make_args,error",
     [
         (
             lambda: (
-                torch.randn(2, 16, device="cuda", dtype=torch.bfloat16),
+                torch.randn(3, 16, device="cuda", dtype=torch.bfloat16),
                 torch.randn(8, 16, device="cuda", dtype=torch.bfloat16),
             ),
-            "shape",
+            "M must",
         ),
         (
             lambda: (
