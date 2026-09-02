@@ -165,7 +165,9 @@ Checkpoints are saved by **rank-0 only**. The flow:
    - `ddp`: `model.module.state_dict()`
    - `fsdp`: `unshard()` → `full_tensor()` → `reshard()` (collective on all ranks, result kept only on rank-0)
 3. Non-rank-0 ranks get `None` — the save is skipped.
-4. Rank-0 writes `meta.json`, `config.json`, `model.safetensors`, and optional `{key}.pt` (optimizer/scheduler state).
+4. Rank-0 writes metadata, weights, optional optimizer/scheduler state, and a
+   checksum manifest to a hidden sibling directory, then atomically renames the
+   complete checkpoint into place.
 
 > **FSDP note**: Even though only rank-0 saves, all ranks must participate in `unwrap_model` because `unshard()` and `full_tensor()` are collective operations. The barriers in `checkpoint_context` keep all ranks in lockstep.
 

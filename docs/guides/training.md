@@ -196,11 +196,19 @@ Callback wraps each `DecoderBlock.forward` with `torch.utils.checkpoint.checkpoi
 
 ```
 Checkpoint(state_dict, epoch, consumed_samples, extra, meta, config)
-  ├── save(save_dir)    meta.json (epoch/consumed_samples/timestamp) + config.json (model config) + model.safetensors + optional {key}.pt (optimizer.pt, scheduler.pt)
-  └── load(save_dir, broadcast=False)    loads from local disk; set broadcast=True to broadcast metadata from rank-0
+  ├── save(save_dir)    atomically publishes manifest.json + metadata + weights + optional {key}.pt
+  └── load(save_dir, broadcast=False, verify_checksums=False)    loads locally or broadcasts from rank-0
 ```
 
-`Checkpoint.save()` writes whenever it is called. During training, `CheckpointCallback` uses the executor checkpoint context so only rank 0 receives a state dict and calls `save()`.
+`Checkpoint.save()` writes to a hidden sibling staging directory, records file
+sizes and SHA-256 checksums in `manifest.json`, flushes the files, and atomically
+renames the completed directory into place. Published checkpoint directories are
+immutable: saving to an existing non-empty path raises `FileExistsError`. Legacy
+checkpoints without a manifest remain loadable. Pass `verify_checksums=True` when
+loading to hash every published file.
+
+During training, `CheckpointCallback` uses the executor checkpoint context so
+only rank 0 receives a state dict and calls `save()`.
 
 Optimizer/scheduler state persisted by default via `Checkpoint.extra`.  
 Model config (`context.model_config`) saved into `config.json` during training via `CheckpointCallback`.

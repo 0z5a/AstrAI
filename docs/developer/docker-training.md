@@ -183,7 +183,13 @@ config.json
 model.safetensors
 optimizer.pt
 scheduler.pt
+manifest.json
 ```
+
+New checkpoints write `manifest.json` after every payload file, sync the complete
+staging directory, and then atomically rename that directory into place. Legacy
+checkpoints without a manifest remain resumable when the original required files
+are complete.
 
 `start` resumes the latest complete checkpoint and ignores partial writes. If no
 complete checkpoint exists, `/models/base/config.json` and
