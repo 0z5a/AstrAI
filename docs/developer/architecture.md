@@ -259,8 +259,8 @@ classDiagram
             +dict meta
             +dict config
             +save(save_dir)
-            +load(save_dir, broadcast) Checkpoint
-            +load_any(save_dir, broadcast) Optional[Checkpoint]
+            +load(save_dir, broadcast, verify_checksums) Checkpoint
+            +load_any(save_dir, broadcast, verify_checksums) Optional[Checkpoint]
         }
     }
 
@@ -827,7 +827,7 @@ classDiagram
             +InferenceWorkspace _workspace
             +Optional[str] device
             +Optional[torch.dtype] dtype
-            +execute_prefill(tasks, prompt_len, start_pos=0)
+            +execute_prefill(tasks, start_pos=0)
             +execute_decode(tasks, return_logprobs=False) Union[List[int], List[Tuple[int, float]]]
         }
 

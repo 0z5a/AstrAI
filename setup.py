@@ -121,6 +121,7 @@ class _CMakeBuildExt(_build_ext):
             "attn_prefill",
             "attn_paged_decode",
             "attn_paged_prefill",
+            "bf16_gemv",
             "rotary_emb",
         )
         missing = [name for name in required if not any(lib_dir.glob(f"{name}.*.so"))]

@@ -166,11 +166,15 @@ def test_messages_with_system(client, loaded_model):
 
 def test_chat_completions_stop_sequence(client, loaded_model):
     """POST /v1/chat/completions with stop parameter truncates at stop sequence."""
+    closed = []
 
     async def async_gen():
-        yield "Hello"
-        yield "X"
-        yield "world"
+        try:
+            yield "Hello"
+            yield "X"
+            yield "world"
+        finally:
+            closed.append(True)
 
     get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
@@ -188,15 +192,20 @@ def test_chat_completions_stop_sequence(client, loaded_model):
     content = data["choices"][0]["message"]["content"]
     assert "X" in content
     assert "world" not in content
+    assert closed == [True]
 
 
 def test_chat_completions_stop_sequence_stream(client, loaded_model):
     """POST /v1/chat/completions with stop parameter truncates SSE stream."""
+    closed = []
 
     async def async_gen():
-        yield "Hello"
-        yield "X"
-        yield "world"
+        try:
+            yield "Hello"
+            yield "X"
+            yield "world"
+        finally:
+            closed.append(True)
 
     get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
@@ -217,6 +226,7 @@ def test_chat_completions_stop_sequence_stream(client, loaded_model):
     assert any(
         "finish_reason" in line for line in content.split("\n") if "stop" in line
     )
+    assert closed == [True]
 
 
 def test_chat_completions_real_engine(tmp_path, client):

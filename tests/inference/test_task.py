@@ -73,15 +73,21 @@ def test_task_manager_remove_task():
     assert len(tm.waiting_queue) == 0
 
 
-def test_task_manager_remove_active_task():
+def test_task_manager_cancel_active_task_defers_removal():
     tm = TaskManager(tokenizer=_make_mock_tokenizer())
     tid = tm.add_task("test")
     tasks = tm.pull_candidates(1)
     tm.activate(tasks[0])
     assert len(tm.active_tasks) == 1
-    removed = tm.remove_task(tid)
-    assert len(removed) == 1
+    immediate, cancelled = tm.cancel_task(tid)
+    assert cancelled is True
+    assert immediate == []
+    assert tm.active_tasks[0].status == TaskStatus.ABORTED
+
+    removed = tm.remove_finished_tasks([])
+    assert removed == tasks
     assert len(tm.active_tasks) == 0
+    assert tm.get_stats()["cancelled_total"] == 1
 
 
 def test_task_manager_pull_candidates_fifo():

@@ -429,13 +429,23 @@ class DPOStrategy(BaseStrategy):
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
         chosen_ids, rejected_ids = batch["chosen"], batch["rejected"]
-        chosen_mask, rejected_mask = batch["chosen_mask"], batch["rejected_mask"]
+        chosen_loss_mask = batch["chosen_mask"]
+        rejected_loss_mask = batch["rejected_mask"]
+        chosen_attention_mask = batch.get("chosen_attention_mask")
+        rejected_attention_mask = batch.get("rejected_attention_mask")
+        if chosen_attention_mask is None:
+            chosen_attention_mask = chosen_ids.ne(0)
+        if rejected_attention_mask is None:
+            rejected_attention_mask = rejected_ids.ne(0)
 
         concat_ids = torch.cat([chosen_ids, rejected_ids], dim=0)
-        concat_loss_mask = torch.cat([chosen_mask, rejected_mask], dim=0)
+        concat_loss_mask = torch.cat([chosen_loss_mask, rejected_loss_mask], dim=0)
+        concat_attention_mask = torch.cat(
+            [chosen_attention_mask, rejected_attention_mask], dim=0
+        )
 
         # Build full attention mask: key-padding + causal
-        key_pad = concat_ids.bool()[:, None, None, :]  # [B*2, 1, 1, S]
+        key_pad = concat_attention_mask.bool()[:, None, None, :]
         S = key_pad.shape[-1]
         causal = torch.tril(
             torch.ones(S, S, dtype=torch.bool, device=concat_ids.device)
@@ -484,23 +494,42 @@ class DPOStrategy(BaseStrategy):
         return True
 
     def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
-        """Pick best/worst response per prompt by reward as chosen/rejected."""
+        """Build prompt-conditioned chosen/rejected sequences from rollout.
+
+        DPO scores each response conditioned on its original prompt.  The
+        prompt remains visible to attention while the loss mask covers only
+        valid response tokens.
+        """
         rewards = result.rewards
+        prompts = result.prompts
+        prompt_mask = result.prompt_mask.bool()
         responses = result.responses
-        masks = result.response_mask
+        response_masks = result.response_mask.bool()
         best = rewards.argmax(dim=-1)
         worst = rewards.argmin(dim=-1)
         B = responses.shape[0]
         idx = torch.arange(B, device=responses.device)
-        chosen = responses[idx, best]
-        chosen_mask = masks[idx, best].float()
-        rejected = responses[idx, worst]
-        rejected_mask = masks[idx, worst].float()
+        chosen_response = responses[idx, best]
+        chosen_response_mask = response_masks[idx, best]
+        rejected_response = responses[idx, worst]
+        rejected_response_mask = response_masks[idx, worst]
+
+        chosen = torch.cat([prompts, chosen_response], dim=-1)
+        rejected = torch.cat([prompts, rejected_response], dim=-1)
+        prompt_loss_mask = torch.zeros_like(prompt_mask)
+        chosen_mask = torch.cat([prompt_loss_mask, chosen_response_mask], dim=-1)
+        rejected_mask = torch.cat([prompt_loss_mask, rejected_response_mask], dim=-1)
+        chosen_attention_mask = torch.cat([prompt_mask, chosen_response_mask], dim=-1)
+        rejected_attention_mask = torch.cat(
+            [prompt_mask, rejected_response_mask], dim=-1
+        )
         return {
             "chosen": chosen,
             "chosen_mask": chosen_mask,
+            "chosen_attention_mask": chosen_attention_mask,
             "rejected": rejected,
             "rejected_mask": rejected_mask,
+            "rejected_attention_mask": rejected_attention_mask,
         }
 
 

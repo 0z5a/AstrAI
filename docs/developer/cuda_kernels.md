@@ -1,6 +1,9 @@
 # CUDA Kernels
 
-AstrAI includes optional custom CUDA kernels for attention, rotary embedding, and FP8 GEMM. These are built when `nvcc` is available and CUDA is detected, and are dispatched via the `CudaBackend` attention backend, auto-dispatched for rotary, or invoked through the FP8 linear primitives.
+AstrAI includes optional custom CUDA kernels for attention, rotary embedding,
+BF16 GEMV, and FP8 GEMM. These are built when `nvcc` is available and CUDA is
+detected. BF16 GEMV is directly callable and can be selected by the guarded
+model linear dispatcher described below.
 
 ## Overview
 
@@ -11,7 +14,46 @@ AstrAI includes optional custom CUDA kernels for attention, rotary embedding, an
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
+| `bf16_gemv` | `gemv/bf16_gemv.cu` | M=1..8 BF16 linear with FP32 accumulation (sm_80+) |
 | `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
+
+### BF16 GEMV primitive
+
+`astrai.extension.bf16_gemv(x, weight, bias=None)` accepts a contiguous BF16
+input shaped `[K]` or `[M, K]`, with `M` in `[1, 8]` and any positive `K`, and
+row-major weights `[N, K]`. One CTA reduces each output row and computes all M
+results together, reusing the weight row across tokens. The weight stream uses
+128-bit vectorized loads anchored at each row's first 16-byte-aligned address
+with scalar head/tail sweeps for unaligned remainders, so arbitrary `K` and
+storage offsets stay correct; x loads are vectorized when every row base is
+16-byte aligned (always true for K % 8 == 0 with allocator-aligned tensors)
+and scalar otherwise. Accumulation is FP32; the optional BF16 bias is fused
+before the BF16 store. The launcher uses the current CUDA stream, is CUDA
+Graph capture-safe, and requires sm_80 or newer.
+
+Model `Linear` calls route through the lightweight linear backend. Set
+`ASTRAI_GEMV=0` for an unconditional `F.linear` fallback, `1` to force the
+kernel for any supported M in [1, 8], or `auto` (the default) to select only
+architecture/shape bands that pass both the per-shape and end-to-end gates.
+M=1 has no automatic SM89 band because isolated winners did not reach the 3%
+whole-graph gate. Measured SM89 small-M bands are enabled as follows:
+
+| M | Automatic `(N, K)` bands | Engine throughput |
+|---:|---|---:|
+| 2 | `(256,1536)`, `(1536,1536)`, `(100000,1536)` | +14.0% |
+| 4 | `(256,1536)`, `(1536,1536)` | +11.8% |
+
+These A→B→B→A results use the real `InferenceEngine`, including scheduler,
+sampling, and CUDA Graph. M=8 stays on PyTorch because its remaining
+greedy-stable winners missed the 3% end-to-end gate. Long-K MLP-down bands are
+also excluded because their valid BF16 error changed a checkpoint greedy
+argmax; the enabled M=2/4 bands matched the baseline greedy output exactly.
+
+Training, prefill, unmeasured architectures, and losing shape bands always
+remain on PyTorch. Use mode `1` only for explicit A/B runs outside this table.
+
+The primitive remains directly callable and deliberately has no internal
+`F.linear` fallback. The model-level backend owns fallback and dispatch policy.
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -202,6 +244,7 @@ astrai/extension/
 ├── ops/
 │   ├── attention.py        # Stateless attention kernel wrappers
 │   ├── rotary.py           # Stateless rotary kernel wrapper
+│   ├── gemv.py             # Stateless BF16 GEMV primitive
 │   └── fp8.py              # Stateless FP8 primitives (custom_op)
 ├── fp8.py                  # FP8 strategy layer (fp8_autocast, recipes)
 └── backend/

@@ -2,8 +2,19 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+)
 
 from tokenizers.decoders import DecodeStream
 
@@ -14,6 +25,16 @@ if TYPE_CHECKING:
     from astrai.extension import AttentionBackend
 
 STOP = object()
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    """Structured terminal result for one synchronous generation request."""
+
+    token_ids: List[int]
+    logprobs: List[float]
+    finish_reason: Literal["stop", "length", "cancelled", "rejected"]
+    error_reason: Optional[str] = None
 
 
 class StreamDecoder:
@@ -139,12 +160,14 @@ class TaskManager:
         self.waiting_queue: Deque[Task] = deque()
         self.active_tasks: List[Task] = []
         self._callbacks: Dict[str, Callable[[str], None]] = {}
+        self._tasks: Dict[str, Task] = {}
 
         self._task_event = threading.Event()
         self._lock = threading.Lock()
 
         self._total_tasks = 0
         self._total_tokens = 0
+        self._cancelled_total = 0
 
         self._metrics = metrics
 
@@ -184,6 +207,7 @@ class TaskManager:
 
         with self._lock:
             self.waiting_queue.append(task)
+            self._tasks[task_id] = task
             self._total_tasks += 1
             if stream_callback:
                 self._callbacks[task_id] = stream_callback
@@ -194,28 +218,49 @@ class TaskManager:
         self._task_event.set()
         return task_id
 
-    def remove_task(self, task_id: str) -> List[Task]:
+    def cancel_task(self, task_id: str) -> Tuple[List[Task], bool]:
+        """Mark a task cancelled and return tasks safe to clean immediately."""
         with self._lock:
-            removed_active = [t for t in self.active_tasks if t.task_id == task_id]
-            self.waiting_queue = deque(
-                t for t in self.waiting_queue if t.task_id != task_id
-            )
-            self.active_tasks = [t for t in self.active_tasks if t.task_id != task_id]
+            task = self._tasks.get(task_id)
             self._callbacks.pop(task_id, None)
-        return removed_active
+            if task is None or task.status in (
+                TaskStatus.FINISHED,
+                TaskStatus.ABORTED,
+            ):
+                return [], False
+
+            task.status = TaskStatus.ABORTED
+            self._cancelled_total += 1
+            if task in self.waiting_queue:
+                self.waiting_queue = deque(
+                    waiting for waiting in self.waiting_queue if waiting is not task
+                )
+                self._tasks.pop(task_id, None)
+                return [task], True
+            return [], True
+
+    def remove_task(self, task_id: str) -> List[Task]:
+        """Backward-compatible alias for cancellation."""
+        immediate, _ = self.cancel_task(task_id)
+        return immediate
 
     def invoke_callback(self, task_id: str, token: str):
-        cb = self._callbacks.get(task_id)
+        with self._lock:
+            cb = self._callbacks.get(task_id)
         if cb:
             cb(token)
 
     def get_stats(self) -> Dict[str, Any]:
-        stats: Dict[str, Any] = {
-            "total_tasks": self._total_tasks,
-            "total_tokens": self._total_tokens,
-            "active_tasks": len(self.active_tasks),
-            "waiting_queue": len(self.waiting_queue),
-        }
+        with self._lock:
+            waiting = len(self.waiting_queue)
+            stats: Dict[str, Any] = {
+                "total_tasks": self._total_tasks,
+                "total_tokens": self._total_tokens,
+                "active_tasks": len(self.active_tasks),
+                "waiting_tasks": waiting,
+                "waiting_queue": waiting,
+                "cancelled_total": self._cancelled_total,
+            }
         if self._metrics is not None:
             stats.update(self._metrics.get_stats())
         return stats
@@ -231,18 +276,21 @@ class TaskManager:
                     finished.append(task)
                     self._total_tokens += task.output_tokens
 
-            if self._metrics is not None:
-                for task in finished:
-                    self._metrics.mark_finished(
-                        task.task_id, task.input_tokens, task.output_tokens
-                    )
-
             self.active_tasks = [
                 t
                 for t in self.active_tasks
                 if t.status not in (TaskStatus.FINISHED, TaskStatus.ABORTED)
             ]
-            return finished
+            for task in finished:
+                self._tasks.pop(task.task_id, None)
+                self._callbacks.pop(task.task_id, None)
+
+        if self._metrics is not None:
+            for task in finished:
+                self._metrics.mark_finished(
+                    task.task_id, task.input_tokens, task.output_tokens
+                )
+        return finished
 
     def pull_candidates(self, n: int) -> List[Task]:
         to_add: List[Task] = []
@@ -252,18 +300,35 @@ class TaskManager:
                 to_add.append(self.waiting_queue.popleft())
         return to_add
 
-    def activate(self, task: Task):
-        task.status = TaskStatus.RUNNING
+    def activate(self, task: Task) -> bool:
         with self._lock:
+            if task.status == TaskStatus.ABORTED:
+                self._tasks.pop(task.task_id, None)
+                self._callbacks.pop(task.task_id, None)
+                return False
+            task.status = TaskStatus.RUNNING
             self.active_tasks.append(task)
+            return True
 
     def return_to_waiting(self, tasks: List[Task]):
+        cancelled = []
         with self._lock:
             for task in reversed(tasks):
-                self.waiting_queue.appendleft(task)
+                if task.status == TaskStatus.ABORTED:
+                    self._tasks.pop(task.task_id, None)
+                    self._callbacks.pop(task.task_id, None)
+                    cancelled.append(task)
+                else:
+                    self.waiting_queue.appendleft(task)
+        if self._metrics is not None:
+            for task in cancelled:
+                self._metrics.mark_finished(
+                    task.task_id, task.input_tokens, task.output_tokens
+                )
 
     def has_work(self) -> bool:
-        return bool(self.active_tasks or self.waiting_queue)
+        with self._lock:
+            return bool(self.active_tasks or self.waiting_queue)
 
     def wait_for_tasks(self, timeout: float = 1.0):
         with self._lock:
@@ -285,6 +350,7 @@ class TaskManager:
             self.waiting_queue.clear()
             self.active_tasks.clear()
             self._callbacks.clear()
+            self._tasks.clear()
 
     def wake(self):
         self._task_event.set()

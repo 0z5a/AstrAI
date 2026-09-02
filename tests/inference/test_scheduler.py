@@ -1,6 +1,7 @@
 """Tests for scheduler concurrency."""
 
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
-from astrai.inference import InferenceScheduler
+from astrai.inference import GenerationResult, InferenceScheduler
 from astrai.inference.metrics import MetricsCollector
 from astrai.inference.runtime.executor import DecodeSteadyState, Executor
 from astrai.inference.task import Task
@@ -141,6 +142,67 @@ def test_step_splits_decode_batch_by_request_backend():
     ]
 
 
+def test_step_batches_ragged_prefill_with_shared_cache_start():
+    scheduler = object.__new__(InferenceScheduler)
+    scheduler._cache = SimpleNamespace(page_size=64)
+    scheduler._task_cache = MagicMock()
+    scheduler._task_cache.task_cached.return_value = 0
+    scheduler._metrics = MetricsCollector()
+    scheduler._executor = MagicMock()
+
+    short = Task("short", [1, 2, 3])
+    long = Task("long", [4, 5, 6, 7, 8])
+    for task in (short, long):
+        scheduler._metrics.register(task.task_id)
+
+    scheduler._executor.execute_prefill.return_value = (
+        [long, short],
+        [11, 12],
+    )
+
+    produced, aborted = scheduler._step([short, long])
+
+    assert aborted == []
+    assert produced == [long, short]
+    scheduler._executor.execute_prefill.assert_called_once_with(
+        [short, long], start_pos=0, return_logprobs=False
+    )
+    assert long.output_ids == [11]
+    assert short.output_ids == [12]
+
+
+def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
+    executor = object.__new__(Executor)
+    executor.device = torch.device("cpu")
+    executor.task_cache = MagicMock()
+    executor.task_cache.bind.return_value = MagicMock()
+    executor._workspace = MagicMock()
+    all_logits = torch.arange(42, dtype=torch.float32).reshape(6, 7)
+    executor.model = MagicMock(return_value={"logits": all_logits})
+    executor._sample_logits = MagicMock(
+        return_value=([101, 102], torch.tensor([101, 102]))
+    )
+
+    task_b = Task("b", [20, 21, 22, 23, 24])
+    task_a = Task("a", [10, 11, 12])
+
+    tasks, output = executor.execute_prefill([task_b, task_a], start_pos=1)
+
+    assert tasks == [task_a, task_b]
+    assert output == [101, 102]
+    model_args, model_kwargs = executor.model.call_args
+    assert model_args[0].tolist() == [11, 12, 21, 22, 23, 24]
+    assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
+    executor.task_cache.bind.assert_called_once_with(
+        ["a", "b"], executor._workspace, start_pos=1
+    )
+    sample_args, sample_kwargs = executor._sample_logits.call_args
+    torch.testing.assert_close(sample_args[0], all_logits[[1, 5]])
+    assert sample_args[1] == [task_a, task_b]
+    assert sample_args[2] is False
+    assert sample_kwargs == {}
+
+
 def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
     """Test concurrent add and remove task operations."""
     mock_model, mock_tokenizer = mock_model_and_tokenizer
@@ -259,6 +321,104 @@ def _make_real_scheduler(device):
     return scheduler, tokenizer, model
 
 
+def test_cancel_waiting_task_storm_returns_to_baseline(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        task_ids = [
+            scheduler.add_task(f"waiting-{index}", max_tokens=32) for index in range(32)
+        ]
+
+        assert all(scheduler.cancel_task(task_id) for task_id in task_ids)
+        stats = scheduler.get_stats()
+        assert stats["active_tasks"] == 0
+        assert stats["waiting_tasks"] == 0
+        assert stats["in_flight_tasks"] == 0
+        assert stats["kv_cache_tasks"] == 0
+        assert stats["cancelled_total"] == len(task_ids)
+    finally:
+        scheduler.stop()
+
+
+def test_cancel_active_task_releases_metrics_and_kv(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        task_id = scheduler.add_task("active", max_tokens=32)
+        task = scheduler._task_mgr.pull_candidates(1)[0]
+        assert scheduler._task_cache.task_alloc(task.task_id, task.prompt_ids)
+        assert scheduler._task_mgr.activate(task)
+
+        before = scheduler.get_stats()
+        assert before["active_tasks"] == 1
+        assert before["in_flight_tasks"] == 1
+        assert before["kv_cache_tasks"] == 1
+
+        assert scheduler.cancel_task(task_id)
+        scheduler.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            after = scheduler.get_stats()
+            if (
+                after["active_tasks"] == 0
+                and after["in_flight_tasks"] == 0
+                and after["kv_cache_tasks"] == 0
+            ):
+                break
+            time.sleep(0.01)
+
+        assert after["active_tasks"] == 0
+        assert after["waiting_tasks"] == 0
+        assert after["in_flight_tasks"] == 0
+        assert after["kv_cache_tasks"] == 0
+        assert after["cancelled_total"] == 1
+    finally:
+        scheduler.stop()
+
+
+def test_cancel_during_kv_allocation_releases_metrics_and_kv(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    allocation_started = threading.Event()
+    continue_allocation = threading.Event()
+    original_alloc = scheduler._task_cache.task_alloc
+
+    def blocking_alloc(*args, **kwargs):
+        allocation_started.set()
+        assert continue_allocation.wait(timeout=5)
+        return original_alloc(*args, **kwargs)
+
+    try:
+        with patch.object(
+            scheduler._task_cache,
+            "task_alloc",
+            side_effect=blocking_alloc,
+        ):
+            scheduler.start()
+            task_id = scheduler.add_task("allocation-race", max_tokens=32)
+            assert allocation_started.wait(timeout=5)
+            assert scheduler.cancel_task(task_id)
+            continue_allocation.set()
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                stats = scheduler.get_stats()
+                if (
+                    stats["active_tasks"] == 0
+                    and stats["waiting_tasks"] == 0
+                    and stats["in_flight_tasks"] == 0
+                    and stats["kv_cache_tasks"] == 0
+                ):
+                    break
+                time.sleep(0.01)
+
+        assert stats["active_tasks"] == 0
+        assert stats["waiting_tasks"] == 0
+        assert stats["in_flight_tasks"] == 0
+        assert stats["kv_cache_tasks"] == 0
+        assert stats["cancelled_total"] == 1
+    finally:
+        continue_allocation.set()
+        scheduler.stop()
+
+
 def test_run_batch_returns_token_sequences(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
@@ -315,6 +475,31 @@ def test_run_batch_return_logprobs_aligned(device):
         token_ids, logprobs = results[0]
         assert len(token_ids) == len(logprobs)
         assert all(lp <= 1e-5 for lp in logprobs)  # logprobs ≤ 0
+    finally:
+        scheduler.stop()
+
+
+def test_ragged_prefill_matches_sequential_greedy_tokens_and_logprobs(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    prompts = [
+        [10, 20, 30],
+        [5, 6, 7, 8],
+        [40, 41, 42, 43, 44],
+    ]
+    try:
+        ragged = scheduler.run_batch(
+            prompts, max_tokens=1, temperature=0, return_logprobs=True
+        )
+        sequential = [
+            scheduler.run_batch(
+                [prompt], max_tokens=1, temperature=0, return_logprobs=True
+            )[0]
+            for prompt in prompts
+        ]
+
+        assert [result[0] for result in ragged] == [result[0] for result in sequential]
+        for ragged_result, sequential_result in zip(ragged, sequential):
+            assert ragged_result[1] == pytest.approx(sequential_result[1], abs=1e-6)
     finally:
         scheduler.stop()
 
@@ -396,6 +581,74 @@ def test_run_batch_too_long_prompt_skipped(device):
         results = scheduler.run_batch([long, [10, 20]], max_tokens=2)
         assert results[0] == []
         assert len(results[1]) <= 2
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_details_distinguish_rejection_from_success(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        long_prompt = list(range(100))
+        results = scheduler.run_batch(
+            [long_prompt, [10, 20]],
+            max_tokens=2,
+            temperature=0,
+            return_logprobs=True,
+            return_details=True,
+        )
+
+        assert results[0] == GenerationResult(
+            token_ids=[],
+            logprobs=[],
+            finish_reason="rejected",
+            error_reason="prompt_too_long",
+        )
+        assert results[1].finish_reason in ("stop", "length")
+        assert results[1].error_reason is None
+        assert len(results[1].token_ids) == len(results[1].logprobs)
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_details_report_non_positive_max_tokens(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        result = scheduler.run_batch([[10, 20]], max_tokens=0, return_details=True)[0]
+        assert result.finish_reason == "rejected"
+        assert result.error_reason == "max_tokens_non_positive"
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_details_report_allocation_failure(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        with patch.object(scheduler._task_cache, "task_alloc", return_value=False):
+            result = scheduler.run_batch([[10, 20]], max_tokens=2, return_details=True)[
+                0
+            ]
+        assert result.finish_reason == "rejected"
+        assert result.error_reason == "kv_cache_allocation_failed"
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_details_report_extension_failure_and_cleanup(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        with patch.object(
+            scheduler,
+            "_step",
+            side_effect=lambda tasks, **_kwargs: ([], list(tasks)),
+        ):
+            result = scheduler.run_batch([[10, 20]], max_tokens=2, return_details=True)[
+                0
+            ]
+
+        assert result.finish_reason == "rejected"
+        assert result.error_reason == "kv_cache_extension_failed"
+        assert scheduler._task_cache._states == {}
+        assert scheduler._metrics._timings == {}
     finally:
         scheduler.stop()
 

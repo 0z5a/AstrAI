@@ -143,19 +143,58 @@ def test_grpo_prepare_from_rollout_mapping(device):
     assert batch["rewards"] is r.rewards
 
 
-def test_dpo_prepare_from_rollout_picks_best_worst(device):
+def test_dpo_prepare_from_rollout_conditions_responses_on_prompt(device):
     strat = _make_dpo(device)
-    r = _make_rollout_result(B=3, G=4, R=5, device=device)
+    r = _make_rollout_result(B=3, G=4, P=6, R=5, device=device)
+    r.prompt_mask[0, :2] = False
+    r.prompts[0, :2] = 0
+    r.response_mask[1, :, -2:] = False
+    r.responses[1, :, -2:] = 0
     batch = strat.prepare_from_rollout(r)
-    assert batch["chosen"].shape == (3, 5)
-    assert batch["rejected"].shape == (3, 5)
-    assert batch["chosen_mask"].shape == (3, 5)
-    assert batch["rejected_mask"].shape == (3, 5)
+
+    assert batch["chosen"].shape == (3, 11)
+    assert batch["rejected"].shape == (3, 11)
+    assert batch["chosen_mask"].shape == (3, 11)
+    assert batch["rejected_mask"].shape == (3, 11)
     idx = torch.arange(3, device=device)
     expected_best = r.responses[idx, r.rewards.argmax(dim=-1)]
     expected_worst = r.responses[idx, r.rewards.argmin(dim=-1)]
-    assert torch.equal(batch["chosen"], expected_best)
-    assert torch.equal(batch["rejected"], expected_worst)
+    expected_best_mask = r.response_mask[idx, r.rewards.argmax(dim=-1)]
+    expected_worst_mask = r.response_mask[idx, r.rewards.argmin(dim=-1)]
+
+    assert torch.equal(batch["chosen"][:, :6], r.prompts)
+    assert torch.equal(batch["rejected"][:, :6], r.prompts)
+    assert torch.equal(batch["chosen"][:, 6:], expected_best)
+    assert torch.equal(batch["rejected"][:, 6:], expected_worst)
+    assert not batch["chosen_mask"][:, :6].any()
+    assert not batch["rejected_mask"][:, :6].any()
+    assert torch.equal(batch["chosen_mask"][:, 6:], expected_best_mask)
+    assert torch.equal(batch["rejected_mask"][:, 6:], expected_worst_mask)
+    assert torch.equal(batch["chosen_attention_mask"][:, :6], r.prompt_mask)
+    assert torch.equal(batch["rejected_attention_mask"][:, :6], r.prompt_mask)
+    assert torch.equal(batch["chosen_attention_mask"][:, 6:], expected_best_mask)
+    assert torch.equal(batch["rejected_attention_mask"][:, 6:], expected_worst_mask)
+
+
+def test_dpo_prepare_from_rollout_same_response_keeps_distinct_prompts():
+    strat = _make_dpo("cpu")
+    r = _make_rollout_result(B=2, G=2, P=3, R=2, device="cpu")
+    r.prompts = torch.tensor([[0, 11, 12], [21, 22, 23]])
+    r.prompt_mask = torch.tensor([[False, True, True], [True, True, True]])
+    shared_response = torch.tensor([101, 102])
+    r.responses[:] = shared_response
+    r.response_mask[:] = True
+    r.rewards = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+
+    batch = strat.prepare_from_rollout(r)
+
+    assert torch.equal(batch["chosen"][:, 3:], shared_response.expand(2, -1))
+    assert torch.equal(batch["rejected"][:, 3:], shared_response.expand(2, -1))
+    assert torch.equal(batch["chosen"][:, :3], r.prompts)
+    assert torch.equal(batch["rejected"][:, :3], r.prompts)
+    assert not torch.equal(batch["chosen"][0], batch["chosen"][1])
+    assert not batch["chosen_mask"][:, :3].any()
+    assert not batch["rejected_mask"][:, :3].any()
 
 
 def test_call_without_runner_falls_back_to_compute_loss_grpo(device):

@@ -322,6 +322,11 @@ class TaskCacheManager:
         state.length = pos + 1
         return True
 
+    @property
+    def task_count(self) -> int:
+        """Number of tasks currently holding KV request state."""
+        return len(self._states)
+
     def task_cached(self, task_id: str) -> int:
         state = self._states.get(task_id)
         return state.cached if state is not None else 0
