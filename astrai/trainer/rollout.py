@@ -21,6 +21,7 @@ import torch
 from torch import Tensor
 
 from astrai.inference.scheduler import InferenceScheduler
+from astrai.inference.task import GenerationResult
 
 
 @dataclass(kw_only=True)
@@ -171,21 +172,37 @@ class RolloutGenerator:
             frequency_penalty=self.frequency_penalty,
             rep_window=self.rep_window,
             return_logprobs=True,
+            return_details=True,
         )
         if len(results) != B * G:
             raise RuntimeError(
                 f"Rollout scheduler returned {len(results)} results, expected {B * G}"
             )
-        for token_ids, logprobs in results:
-            if len(token_ids) != len(logprobs):
+        for result in results:
+            if not isinstance(result, GenerationResult):
+                raise RuntimeError("Rollout scheduler returned an invalid result type")
+
+        failures = [
+            (index, result)
+            for index, result in enumerate(results)
+            if result.error_reason is not None
+            or result.finish_reason in ("cancelled", "rejected")
+        ]
+        if failures:
+            reasons = ", ".join(
+                f"request {index}: {result.error_reason or result.finish_reason}"
+                for index, result in failures
+            )
+            raise RuntimeError(f"Rollout generation failed: {reasons}")
+
+        for result in results:
+            if len(result.token_ids) != len(result.logprobs):
                 raise RuntimeError(
                     "Rollout scheduler returned misaligned token IDs and logprobs"
                 )
 
-        # Each element is (token_ids, logprobs); pad to max length.
-        max_len = 0
-        for token_ids, _lp in results:
-            max_len = max(max_len, len(token_ids))
+        # Pad successful structured results to a uniform response length.
+        max_len = max((len(result.token_ids) for result in results), default=0)
         max_len = max(max_len, 1)
 
         device = self.scheduler.device
@@ -206,7 +223,8 @@ class RolloutGenerator:
         response_texts: List[List[str]] = [[] for _ in range(B)]
         for i in range(B):
             for g in range(G):
-                token_ids, lps = results[flat_idx]
+                result = results[flat_idx]
+                token_ids, lps = result.token_ids, result.logprobs
                 flat_idx += 1
                 n = len(token_ids)
                 if n:

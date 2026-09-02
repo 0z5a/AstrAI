@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from astrai.inference.scheduler import InferenceScheduler
+from astrai.inference.task import GenerationResult
 from astrai.trainer.rollout import (
     BaseRewardModel,
     RawRollout,
@@ -171,6 +172,25 @@ def test_rollout_generator_logprobs_are_nonpositive(device):
             mask = r.response_mask[i, g]
             lp = r.logprobs_old[i, g][mask]
             assert torch.all(lp <= 1e-5)
+
+
+def test_rollout_generator_rejects_failed_requests(device):
+    gen, _ = _make_generator(device, group_size=2, max_tokens=4)
+
+    def failed_run_batch(*_args, **kwargs):
+        assert kwargs["return_details"] is True
+        return [
+            GenerationResult([1], [-0.1], "length"),
+            GenerationResult([], [], "rejected", "kv_cache_allocation_failed"),
+        ]
+
+    gen.scheduler.run_batch = failed_run_batch
+
+    with pytest.raises(
+        RuntimeError,
+        match="Rollout generation failed: request 1: kv_cache_allocation_failed",
+    ):
+        gen.generate(_make_instruction_batch(n=1))
 
 
 def test_rollout_generator_instruction_role_mapping(device):
