@@ -1,6 +1,8 @@
 """Training strategy implementations with factory pattern."""
 
+import math
 from abc import ABC
+from numbers import Real
 from typing import Callable, Dict, List, Optional, TypedDict, Union
 
 import torch
@@ -560,6 +562,8 @@ class GRPOStrategy(BaseStrategy):
         old_model: Optional[nn.Module],
         ref_model: nn.Module,
         clip_eps: float = 0.2,
+        clip_eps_low: Optional[float] = None,
+        clip_eps_high: Optional[float] = None,
         kl_coef: float = 0.01,
         group_size: int = 4,
         **kwargs,
@@ -567,9 +571,32 @@ class GRPOStrategy(BaseStrategy):
         super().__init__(model, device, **kwargs)
         self.old_model = old_model
         self.ref_model = ref_model
-        self.clip_eps = clip_eps
+        self.clip_eps = self._validate_clip_epsilon(clip_eps, "clip_eps", upper=True)
+        self.clip_eps_low = self._validate_clip_epsilon(
+            self.clip_eps if clip_eps_low is None else clip_eps_low,
+            "clip_eps_low",
+            upper=True,
+        )
+        self.clip_eps_high = self._validate_clip_epsilon(
+            self.clip_eps if clip_eps_high is None else clip_eps_high,
+            "clip_eps_high",
+        )
+        if self.clip_eps_high < self.clip_eps_low:
+            raise ValueError(
+                "clip_eps_high must be greater than or equal to clip_eps_low"
+            )
         self.kl_coef = kl_coef
         self.group_size = group_size
+
+    @staticmethod
+    def _validate_clip_epsilon(value: float, name: str, upper: bool = False) -> float:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError(f"{name} must be a real number")
+        value = float(value)
+        if not math.isfinite(value) or value < 0 or (upper and value >= 1):
+            interval = "[0, 1)" if upper else "[0, infinity)"
+            raise ValueError(f"{name} must be finite and in {interval}")
+        return value
 
     def sync_old_model(self):
         """Copy current policy weights to old model."""
@@ -678,7 +705,14 @@ class GRPOStrategy(BaseStrategy):
         ratio = torch.exp(log_ratio)
 
         surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        surr2 = (
+            torch.clamp(
+                ratio,
+                1 - self.clip_eps_low,
+                1 + self.clip_eps_high,
+            )
+            * advantages
+        )
         per_token_policy_loss = -torch.min(surr1, surr2)
         token_count = token_masks.sum().clamp(min=1.0)
         policy_loss = (per_token_policy_loss * token_masks).sum() / token_count

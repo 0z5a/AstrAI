@@ -306,6 +306,20 @@ _START_METHODS = sorted(START_METHODS)
     help="GRPO clip epsilon.",
 )
 @opt(
+    "--grpo_clip_eps_low",
+    type=float,
+    default=None,
+    group="Algorithm",
+    help="Optional lower GRPO clip epsilon; defaults to --grpo_clip_eps.",
+)
+@opt(
+    "--grpo_clip_eps_high",
+    type=float,
+    default=None,
+    group="Algorithm",
+    help="Optional upper GRPO clip epsilon for DAPO Clip-Higher.",
+)
+@opt(
     "--grpo_kl_coef",
     type=float,
     default=0.01,
@@ -679,6 +693,8 @@ def train(
         "beta": kwargs.pop("dpo_beta"),
         "label_smoothing": kwargs.pop("label_smoothing"),
         "clip_eps": kwargs.pop("grpo_clip_eps"),
+        "clip_eps_low": kwargs.pop("grpo_clip_eps_low"),
+        "clip_eps_high": kwargs.pop("grpo_clip_eps_high"),
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
     }
