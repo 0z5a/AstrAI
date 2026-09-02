@@ -52,77 +52,98 @@ class InferenceWorkspace:
         self.device = device
         self.dtype = dtype
 
-        # ``position_ids[:, None, None] >= arange`` RHS, reused every step.
-        self.arange = torch.arange(max_seq_len, device=device)
-        # Decode validity mask: [max_batch, 1, max_seq_len] bool.
-        self.input_mask = torch.empty(
-            (max_batch_size, 1, max_seq_len), dtype=torch.bool, device=device
-        )
+        # Invariant: all workspace buffers are plain (non-inference)
+        # tensors.  The scheduler's loop thread mutates them in-place every
+        # step without any ambient inference-mode context — the mode is
+        # thread-local and the loop runs on its own thread.  Inference
+        # identity is fixed at construction and cannot be revoked later,
+        # so allocation must force the mode off: callers that build the
+        # engine inside ``torch.inference_mode()`` (e.g.
+        # ``scripts/tools/generate.py``) would otherwise create inference
+        # tensors that reject off-thread in-place updates.
+        with torch.inference_mode(False):
+            # ``position_ids[:, None, None] >= arange`` RHS, reused every step.
+            self.arange = torch.arange(max_seq_len, device=device)
+            # Decode validity mask: [max_batch, 1, max_seq_len] bool.
+            self.input_mask = torch.empty(
+                (max_batch_size, 1, max_seq_len), dtype=torch.bool, device=device
+            )
 
-        # Per-step token IDs.  Values come from host Python lists every
-        # step, so the device buffer is pre-allocated (stable address for
-        # CUDA-graph capture) and filled via a host staging buffer.  A
-        # double buffer keeps a copy in flight from being overwritten by
-        # the next fill.
-        self.input_ids = torch.empty((max_batch_size,), dtype=torch.long, device=device)
-        self._pin = [
-            torch.empty((max_batch_size,), dtype=torch.long),
-            torch.empty((max_batch_size,), dtype=torch.long),
-        ]
-        self._pin_idx = 0
+            # Per-step token IDs.  Values come from host Python lists every
+            # step, so the device buffer is pre-allocated (stable address for
+            # CUDA-graph capture) and filled via a host staging buffer.  A
+            # double buffer keeps a copy in flight from being overwritten by
+            # the next fill.
+            self.input_ids = torch.empty(
+                (max_batch_size,), dtype=torch.long, device=device
+            )
+            self._pin = [
+                torch.empty((max_batch_size,), dtype=torch.long),
+                torch.empty((max_batch_size,), dtype=torch.long),
+            ]
+            self._pin_idx = 0
 
-        # KV-cache bind metadata (fixed shape, written by ``PagePool.bind_tasks``
-        # when the Executor passes this workspace).  Stable addresses make the
-        # decode forward CUDA-graph capturable.
-        self.req_pool_indices = torch.empty(
-            (max_batch_size,), dtype=torch.int32, device=device
-        )
-        self.seq_lens = torch.empty((max_batch_size,), dtype=torch.long, device=device)
-        self.kv_indptr = torch.empty(
-            (max_batch_size + 1,), dtype=torch.int32, device=device
-        )
-        self.qo_indptr = torch.empty(
-            (max_batch_size + 1,), dtype=torch.int32, device=device
-        )
-        max_q_tiles = max_batch_size * ((max_seq_len + Q_TILE_ROWS - 1) // Q_TILE_ROWS)
-        self.q_tile_to_batch = torch.empty(
-            (max_q_tiles,), dtype=torch.int32, device=device
-        )
-        self.q_tile_to_index = torch.empty(
-            (max_q_tiles,), dtype=torch.int32, device=device
-        )
-        self.inc = torch.arange(max_batch_size + 1, dtype=torch.int32, device=device)
-        self.out_cache_loc = torch.empty(
-            (max_batch_size, 1), dtype=torch.int32, device=device
-        )
+            # KV-cache bind metadata (fixed shape, written by
+            # ``PagePool.bind_tasks`` when the Executor passes this
+            # workspace).  Stable addresses make the decode forward
+            # CUDA-graph capturable.
+            self.req_pool_indices = torch.empty(
+                (max_batch_size,), dtype=torch.int32, device=device
+            )
+            self.seq_lens = torch.empty(
+                (max_batch_size,), dtype=torch.long, device=device
+            )
+            self.kv_indptr = torch.empty(
+                (max_batch_size + 1,), dtype=torch.int32, device=device
+            )
+            self.qo_indptr = torch.empty(
+                (max_batch_size + 1,), dtype=torch.int32, device=device
+            )
+            max_q_tiles = max_batch_size * (
+                (max_seq_len + Q_TILE_ROWS - 1) // Q_TILE_ROWS
+            )
+            self.q_tile_to_batch = torch.empty(
+                (max_q_tiles,), dtype=torch.int32, device=device
+            )
+            self.q_tile_to_index = torch.empty(
+                (max_q_tiles,), dtype=torch.int32, device=device
+            )
+            self.inc = torch.arange(
+                max_batch_size + 1, dtype=torch.int32, device=device
+            )
+            self.out_cache_loc = torch.empty(
+                (max_batch_size, 1), dtype=torch.int32, device=device
+            )
 
-        # Per-step position IDs (must be at a fixed address for CUDA-graph capture).
-        self.position_ids = torch.empty(
-            (max_batch_size,), dtype=torch.long, device=device
-        )
+            # Per-step position IDs (must be at a fixed address for
+            # CUDA-graph capture).
+            self.position_ids = torch.empty(
+                (max_batch_size,), dtype=torch.long, device=device
+            )
 
-        # Split-KV partial-result buffers for decode (persistent, one global
-        # alloc per process — mirrors FlashInfer's workspace pattern).
-        # Shape: [max_batch_size, max_q_heads, _MAX_SPLITS, head_dim] (o_part)
-        #        [max_batch_size, max_q_heads, _MAX_SPLITS, 2]     (ml_part)
-        self.decode_o_part = torch.empty(
-            (max_batch_size, max_q_heads, _MAX_SPLITS, head_dim),
-            dtype=torch.float32,
-            device=device,
-        )
-        self.decode_ml_part = torch.empty(
-            (max_batch_size, max_q_heads, _MAX_SPLITS, 2),
-            dtype=torch.float32,
-            device=device,
-        )
+            # Split-KV partial-result buffers for decode (persistent, one
+            # global alloc per process — mirrors FlashInfer's workspace
+            # pattern).  Shape:
+            # [max_batch_size, max_q_heads, _MAX_SPLITS, head_dim] (o_part)
+            # [max_batch_size, max_q_heads, _MAX_SPLITS, 2]     (ml_part)
+            self.decode_o_part = torch.empty(
+                (max_batch_size, max_q_heads, _MAX_SPLITS, head_dim),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.decode_ml_part = torch.empty(
+                (max_batch_size, max_q_heads, _MAX_SPLITS, 2),
+                dtype=torch.float32,
+                device=device,
+            )
 
-        # Decode output buffer (graph-safe pre-alloc).  Shape matches the
-        # decode kernel's output: [batch, q_head, head_dim].
-        self.decode_out = torch.empty(
-            (max_batch_size, max_q_heads, head_dim),
-            dtype=dtype,
-            device=device,
-        )
+            # Decode output buffer (graph-safe pre-alloc).  Shape matches the
+            # decode kernel's output: [batch, q_head, head_dim].
+            self.decode_out = torch.empty(
+                (max_batch_size, max_q_heads, head_dim),
+                dtype=dtype,
+                device=device,
+            )
 
     def fill_input_ids(self, ids: "list[int]") -> Tensor:
         """Write ``ids`` into the device buffer and return ``[B]``.
