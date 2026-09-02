@@ -27,6 +27,7 @@ from astrai.extension.backend import (
     attn_backend,
     get_backend,
     linear,
+    swiglu,
 )
 from astrai.extension.dispatch import (
     Axes,
@@ -51,6 +52,7 @@ from astrai.extension.ops import (
     attn_paged_decode,
     attn_prefill,
     bf16_gemv,
+    bf16_swiglu,
 )
 
 __all__ = [
@@ -65,10 +67,12 @@ __all__ = [
     "attn_backend",
     "get_backend",
     "linear",
+    "swiglu",
     "attn_decode",
     "attn_paged_decode",
     "attn_prefill",
     "bf16_gemv",
+    "bf16_swiglu",
     "is_available",
     "KERNEL_NAMES",
     "apply_rotary_emb",

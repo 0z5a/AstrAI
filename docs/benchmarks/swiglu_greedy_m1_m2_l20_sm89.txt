@@ -1,0 +1,12 @@
+CASE batch=1 swiglu=0
+sha256=78054b6bb6ab3bad5e551894b5b9ae5f33282145aef151e87ae259362852d9b3
+["\n\nIn this paper, we propose a new method to determine the probability of a test result. We use the method to determine the probability of a test result. We show that the method is effective in detecting the probability of a test result. We also show that the method is effective in detecting the"]
+CASE batch=1 swiglu=1
+sha256=5db1a291cfbd349b81896d7e16c9adff32d09bd9d5c8bda18152e51aae8ce2f6
+["\n\nThe purpose of this paper is to show that the existence of deterministic tests is not a problem of the existence of deterministic tests. The purpose of this paper is to show that the existence of deterministic tests is not a problem of the existence of deterministic tests. The purpose of this paper is"]
+CASE batch=2 swiglu=0
+sha256=9f6b4e4b6bffe4afa947d798a19e12b2440e0562cc4be60bc9cebf526c1889a7
+["\n\nIn this paper, we propose a new approach to the problem of determining the optimal value of a function. We show that the optimal value of a function is determined by the set of all possible values of the function. We show that the optimal value of a function is determined by the set of all", "\n\nIn this paper, we propose a new approach to the problem of determining the optimal value of a function. We show that the optimal value of a function is determined by the set of all possible values of the function. We show that the optimal value of a function is determined by the set of all"]
+CASE batch=2 swiglu=1
+sha256=0c7664d3878cd32914079844eeb3a1ddde6fe4547f47490a130e362e15c65cac
+["\n\nIn this paper, we propose a new method to determine the probability of a test result. We use the method to determine the probability of a test result. We show that the method is effective in determining the probability of a test result. We also show that the method is effective in determining the", "\n\nIn this paper, we propose a new method to determine the probability of a test result. We use the method to determine the probability of a test result. We show that the method is effective in determining the probability of a test result. We also show that the method is effective in determining the"]

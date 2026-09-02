@@ -1,0 +1,125 @@
+{
+  "schema_version": "0.5",
+  "score_kind": "diagnostic-project-fit",
+  "score_is_official": false,
+  "draft_id": "astrai-fused-bf16-swiglu-v1",
+  "draft_state": "D3-contract-proposed",
+  "formula_template_id": "project-fit-kernel-v0.5",
+  "diagnostic_project_fit_100": 90.95413824540499,
+  "component_values": {
+    "evolutionary_maintainability": 0.8714777841652558,
+    "project_contract_fit": 0.9872585449014338,
+    "performance_reuse_utilization": 0.8828492869148136,
+    "operational_fit": 0.8956400538635493
+  },
+  "component_floors": {
+    "evolutionary_maintainability": 0.6,
+    "project_contract_fit": 0.6,
+    "performance_reuse_utilization": 0.4,
+    "operational_fit": 0.6
+  },
+  "subcomponent_inputs": {
+    "evolutionary_maintainability": {
+      "evolution": 0.75,
+      "locality": 0.9,
+      "tests": 1.0,
+      "failure": 1.0,
+      "contract": 0.9
+    },
+    "project_contract_fit": {
+      "integration": 1.0,
+      "interface": 0.95,
+      "lifecycle": 1.0,
+      "buildtest": 1.0,
+      "policy": 1.0
+    },
+    "performance_reuse_utilization": {
+      "attainment": 0.9,
+      "coverage": 0.75,
+      "retention": 1.0,
+      "family": 0.9,
+      "compile": 1.0
+    },
+    "operational_fit": {
+      "replay": 0.9,
+      "load": 1.0,
+      "resource": 0.9,
+      "coldsteady": 0.75
+    }
+  },
+  "input_rationale": {
+    "evolution": "The primitive extends AstrAI's existing GEMV extension stack with two measured output-row tilings, but has no upstream maintenance history yet.",
+    "locality": "The implementation is isolated to one CUDA target plus wrapper/backend integration; MLP, build, tests, benchmark, and documentation changes are explicit.",
+    "tests": "The complete CPU-capable suite passed locally (623 passed, 123 skipped), the complete built L20 suite passed (746 passed), and the focused L20 SwiGLU suite passed 23 tests.",
+    "failure": "Unsupported inputs and training fall back to the existing path. Automatic dispatch is intentionally empty because the deterministic greedy checkpoint gate changed output at M=1, M=2, and M=4.",
+    "contract": "Source, acceptance tests, probes, and benchmark evidence are digest-bound, but the D3 acceptance contract has not received maintainer review or a seal.",
+    "integration": "Dense MLPs route through a backend that preserves AstrAI's existing linear dispatcher whenever fusion is not explicitly selected.",
+    "interface": "The public primitive and ASTRAI_SWIGLU opt-in are additive; the default auto mode remains behaviorally equivalent to the unfused path.",
+    "lifecycle": "The primitive is inference-only, uses the current CUDA stream, supports CUDA Graph capture, and fails closed outside contiguous BF16 M=1..8 inputs.",
+    "buildtest": "The SM89 extension rebuilt successfully, Ruff format/import checks passed, and both local and L20 test suites passed.",
+    "policy": "The candidate adds no dependency and enables no automatic production band without a passing checkpoint-output gate.",
+    "attainment": "At the native AstrAI 1B shape, forced fusion improves CUDA-Graph operator latency at M=1/2/4 and real checkpoint step latency by 3.95-5.10%; slower M=8 and wide-shape cells are excluded from auto.",
+    "coverage": "The required NVIDIA L20/SM89 cell was tested across five transformer MLP shapes and M=1/2/4/8; optional A100/SM80 and H100/SM90 cells remain untested.",
+    "retention": "The default path is unchanged, direct correctness is recorded, and the complete L20 regression suite passed.",
+    "family": "AstrAI 1B, LLaMA 2 7B/13B, LLaMA 3 8B, and GPT-NeoX 20B operator shapes are present, plus an actual 24-layer AstrAI checkpoint engine run.",
+    "compile": "AOT CUDA compilation completed before timed cases; no compilation occurred in steady-state timing.",
+    "replay": "Operator trials use A-B-C-C-B-A with 20 samples per implementation; engine trials use A-B-B-A, but the evidence does not contain the required fresh-process replay count.",
+    "load": "The system-level measurement uses AstrAI InferenceEngine with scheduler, sampling, and CUDA Graph on a real 24-layer checkpoint.",
+    "resource": "GPU5 memory/utilization was checked and the co-resident idle AstrAI service remained allocated; no process or container was stopped.",
+    "coldsteady": "Precompile and steady-state phases are separated, but cold-start latency is not included in the checked-in result."
+  },
+  "benchmark_trust": {
+    "formula_version": "benchmark-trust-v0.5",
+    "status": "scored",
+    "score_100": 95.87315155141826,
+    "components": {
+      "reproducibility": 1.0,
+      "evidence": 1.0,
+      "statistics": 0.9,
+      "environment": 0.9
+    },
+    "evidence_sha256": "sha256:74e6b77320b9cd1bcd238359363ddd2392d4929d37b50decd00875806a873932",
+    "failure_codes": [
+      "DRAFT_UNSEALED",
+      "FRESH_PROCESS_REPLAY_INCOMPLETE",
+      "OPTIONAL_CELLS_UNTESTED"
+    ]
+  },
+  "official_project_fit": {
+    "status": "unresolved",
+    "score_100": null,
+    "failure_codes": [
+      "DRAFT_SEAL_MISSING",
+      "FRESH_PROCESS_REPLAYS_BELOW_MINIMUM",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED"
+    ]
+  },
+  "comparison_cell": {
+    "target_project_profile_sha256": "sha256:953067c47f5298f06846c8fe873db55afae49b6588a81926e49d9ef6b0994e08",
+    "target_repository_or_baseline_sha256": "sha256:c5595986ba7ef004333b86c1227fd8223e965971489002f0bbbe47ce4090b342",
+    "change_intent": "add-fastpath",
+    "semantic_contract_sha256": "sha256:578c2e70a8e2bb63a62222bd3d7e6f45c7e839d5f5d546b1f0e1c4f7bf4bc895",
+    "acceptance_contract_sha256": "sha256:fb633cfc6be32041d5e6a37707c6074a3d35931cb5d2b04b7aa4348783783f2a",
+    "probe_set_sha256": "sha256:3203ce8b46a789afb7cb332b71b01554f5a9f6278d705a4e4b8ce05b236d9d87",
+    "workload_portfolio_sha256": "sha256:608dbaf05d1f0e45f4cc5697b2e8a3460865753a6c9fefb48f57ea736e0e8540",
+    "performance_target_sha256": "sha256:b2312952e3b6cf61a527a61806eb39278a1490758e5356436b3b2c36ddffae67",
+    "required_deployment_cell_set_sha256": "sha256:6c00c84e931a5ad6fdaa5b4f7d4497c872530c75f8510431aff883006a4a2779",
+    "formula_template_id": "project-fit-kernel-v0.5",
+    "evidence_policy_id": "v0.4-evidence-ladder-plus-seal-v0.5",
+    "project_season": "astrai-2026q3",
+    "cross_project_ranking_allowed": false
+  },
+  "execution": {
+    "infraswe_commit": "811bc775ed5b3a6ec853219245f3469f78818020",
+    "draft_validation": "pass",
+    "draft_resolution_sha256": "abe7a6fc56f72ca9bb911794aa86819014aa082f2aece789f7b1207a97d9871b",
+    "infraswe_draft_engine_tests": "53 passed",
+    "astrai_local_tests": "623 passed, 123 skipped",
+    "astrai_l20_tests": "746 passed",
+    "astrai_l20_focused_swiglu_tests": "23 passed",
+    "astrai_lint": "ruff format and import-order checks passed",
+    "sm89_build": "bf16_swiglu target built successfully; CTA-reuse variants used 36-64 registers and one barrier, warp-row variants used 42 registers and zero barriers, with zero spills"
+  }
+}

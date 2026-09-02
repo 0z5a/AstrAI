@@ -1,0 +1,144 @@
+CASE batch=1 swiglu=0
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=1, SeqLen=64
+  Throughput : 243.6 tokens/s
+  Latency    : 4.11 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=1 swiglu=1
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=1, SeqLen=64
+  Throughput : 255.0 tokens/s
+  Latency    : 3.92 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=1 swiglu=1
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=1, SeqLen=64
+  Throughput : 254.3 tokens/s
+  Latency    : 3.93 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=1 swiglu=0
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=1, SeqLen=64
+  Throughput : 241.8 tokens/s
+  Latency    : 4.14 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=2 swiglu=0
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=2, SeqLen=64
+  Throughput : 460.8 tokens/s
+  Latency    : 4.34 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=2 swiglu=1
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=2, SeqLen=64
+  Throughput : 503.5 tokens/s
+  Latency    : 3.97 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=2 swiglu=1
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=2, SeqLen=64
+  Throughput : 483.6 tokens/s
+  Latency    : 4.14 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=2 swiglu=0
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=2, SeqLen=64
+  Throughput : 481.5 tokens/s
+  Latency    : 4.15 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=4 swiglu=0
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=4, SeqLen=64
+  Throughput : 881.8 tokens/s
+  Latency    : 4.54 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=4 swiglu=1
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=4, SeqLen=64
+  Throughput : 916.0 tokens/s
+  Latency    : 4.37 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=4 swiglu=1
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=4, SeqLen=64
+  Throughput : 943.2 tokens/s
+  Latency    : 4.24 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------
+CASE batch=4 swiglu=0
+Loading model from /home/kxqandccx/kxq/AstrAI/params ...
+Benchmark: device=cuda dtype=bfloat16 backend=cuda
+--------------------------------------------------------------------------------
+DECODE — Batch=4, SeqLen=64
+  Throughput : 906.2 tokens/s
+  Latency    : 4.41 ms/step
+  Num Trials: 3
+  Prompt Length: 64
+  Backend: CudaBackend
+  Cuda Graph: True
+--------------------------------------------------------------------------------

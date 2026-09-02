@@ -9,6 +9,7 @@ from astrai.extension.ops.attention import (
 )
 from astrai.extension.ops.gemv import bf16_gemv
 from astrai.extension.ops.rotary import rotary_emb
+from astrai.extension.ops.swiglu import bf16_swiglu
 
 __all__ = [
     "TensorLayout",
@@ -17,5 +18,6 @@ __all__ = [
     "attn_paged_prefill",
     "attn_prefill",
     "bf16_gemv",
+    "bf16_swiglu",
     "rotary_emb",
 ]

@@ -1,9 +1,9 @@
 # CUDA Kernels
 
 AstrAI includes optional custom CUDA kernels for attention, rotary embedding,
-BF16 GEMV, and FP8 GEMM. These are built when `nvcc` is available and CUDA is
-detected. BF16 GEMV is directly callable and can be selected by the guarded
-model linear dispatcher described below.
+BF16 GEMV/SwiGLU, and FP8 GEMM. These are built when `nvcc` is available and
+CUDA is detected. BF16 GEMV and SwiGLU are directly callable and can be
+selected by guarded model dispatchers described below.
 
 ## Overview
 
@@ -15,6 +15,7 @@ model linear dispatcher described below.
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
 | `bf16_gemv` | `gemv/bf16_gemv.cu` | M=1..8 BF16 linear with FP32 accumulation (sm_80+) |
+| `bf16_swiglu` | `gemv/bf16_swiglu.cu` | Fused M=1..8 BF16 up/gate projections and SwiGLU epilogue (sm_80+) |
 | `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
 
 ### BF16 GEMV primitive
@@ -54,6 +55,30 @@ remain on PyTorch. Use mode `1` only for explicit A/B runs outside this table.
 
 The primitive remains directly callable and deliberately has no internal
 `F.linear` fallback. The model-level backend owns fallback and dispatch policy.
+
+### BF16 SwiGLU primitive
+
+`astrai.extension.bf16_swiglu(x, up_weight, gate_weight)` fuses the two dense
+MLP projections with `up * silu(gate)` into one CUDA launch for contiguous
+BF16 inputs with `M` in `[1, 8]` and K divisible by 8. It preserves the BF16
+rounding boundaries of the two projection outputs, SiLU output, and final
+product while accumulating dot products in FP32.
+
+The kernel contains two output-row tilings. A CTA-reuse path reads each up/gate
+weight chunk once and applies it to all M rows. The native AstrAI 1B shape
+`(N,K)=(6912,1536)` uses one warp per decode row for M=2/4/8; on L20 this
+removes the shared reductions and barrier and reduces M=4 CUDA-Graph latency
+from 0.0324 ms to 0.0181 ms. Wider LLaMA/GPT-NeoX matrices keep CTA reuse,
+because duplicating their weight reads across row warps regressed 1.3-4.2%.
+
+Dense `MLP` modules route through the SwiGLU backend. `ASTRAI_SWIGLU=0` keeps
+the unfused linear backend, and `1` explicitly forces the fused primitive.
+`auto` is the default but currently has no enabled bands: although direct
+errors are small (maximum absolute error at most 2.4e-4 in the L20 matrix),
+the different FP32 reduction order changed greedy checkpoint output for
+M=1/2/4. Automatic dispatch therefore remains numerically identical to the
+existing path. See [the benchmark protocol](./swiglu_benchmark.md) for raw
+operator, engine, and checkpoint evidence.
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -245,10 +270,12 @@ astrai/extension/
 │   ├── attention.py        # Stateless attention kernel wrappers
 │   ├── rotary.py           # Stateless rotary kernel wrapper
 │   ├── gemv.py             # Stateless BF16 GEMV primitive
+│   ├── swiglu.py           # Stateless fused BF16 SwiGLU primitive
 │   └── fp8.py              # Stateless FP8 primitives (custom_op)
 ├── fp8.py                  # FP8 strategy layer (fp8_autocast, recipes)
 └── backend/
     ├── attention.py        # Backend selection, KV cache I/O, and fallback
+    ├── swiglu.py           # Inference-only fused/unfused SwiGLU policy
     └── rotary.py           # Per-call CUDA/torch rotary dispatch
 ```
 

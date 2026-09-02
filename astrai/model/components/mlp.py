@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from astrai.extension.backend.swiglu import swiglu
 from astrai.factory import BaseFactory
 from astrai.model.components.linear import Linear
 
@@ -38,7 +39,7 @@ class MLP(nn.Module):
         self.down = Linear(dim_ffn, dim, init_std=down_init_std)
 
     def forward(self, x: Tensor) -> FFNOutput:
-        gated = self.up(x) * F.silu(self.gate(x))
+        gated = swiglu(x, self.up.weight, self.gate.weight)
         out = self.down(gated)
         return {"hidden_states": out, "aux_loss": None, "router_stats": None}
 

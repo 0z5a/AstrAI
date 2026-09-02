@@ -1,0 +1,104 @@
+{
+  "schema_version": "0.5",
+  "draft": {
+    "id": "astrai-fused-bf16-swiglu-v1",
+    "revision": 1,
+    "state": "D3-contract-proposed",
+    "created_by": "0z5a"
+  },
+  "target": {
+    "mode": "repository",
+    "repository": "https://github.com/ViperEkura/AstrAI",
+    "revision": "sha256:c5595986ba7ef004333b86c1227fd8223e965971489002f0bbbe47ce4090b342",
+    "project_profile_sha256": "sha256:953067c47f5298f06846c8fe873db55afae49b6588a81926e49d9ef6b0994e08"
+  },
+  "candidate": {
+    "kind": "git-diff",
+    "revision": "sha256:d6634a630de7aa4fc7946567acfa1964270673458d27e5173c6d4a17c8c6362f",
+    "intent": "add-fastpath",
+    "implementation_kind": "cuda-native",
+    "entrypoints": [
+      "astrai.extension.bf16_swiglu",
+      "astrai.extension.backend.swiglu",
+      "astrai.model.components.mlp.MLP.forward",
+      "scripts/tools/benchmark_swiglu.py"
+    ],
+    "operator_family": "dense-gemm",
+    "phase": "inference",
+    "backend": "cuda",
+    "primary_host_candidate": "astrai"
+  },
+  "baseline": {
+    "mode": "target-head",
+    "revision": "sha256:c5595986ba7ef004333b86c1227fd8223e965971489002f0bbbe47ce4090b342"
+  },
+  "deployment": {
+    "workload_portfolio": {
+      "id": "astrai-swiglu-l20-v1",
+      "sha256": "sha256:608dbaf05d1f0e45f4cc5697b2e8a3460865753a6c9fefb48f57ea736e0e8540",
+      "path": "docs/benchmarks/swiglu_l20_sm89.json"
+    },
+    "required_cells": [
+      "cuda-sm89-nvidia-l20"
+    ],
+    "optional_cells": [
+      "cuda-sm80-a100",
+      "cuda-sm90-h100"
+    ],
+    "request_or_step_protocol": {
+      "id": "astrai-swiglu-benchmark-v1",
+      "sha256": "sha256:578c2e70a8e2bb63a62222bd3d7e6f45c7e839d5f5d546b1f0e1c4f7bf4bc895",
+      "path": "docs/developer/swiglu_benchmark.md"
+    }
+  },
+  "retrieval": {
+    "enabled": true,
+    "corpus_cutoff": "2026-09-02T11:41:02Z",
+    "sources": [
+      "target-code",
+      "merged-prs",
+      "rejected-prs",
+      "review-comments",
+      "ci-failures"
+    ],
+    "precedent_set_sha256": "sha256:2914315eadee8b5e7cf0c35666d4639156d7744d14ec19e11b19caf4d9a1c49c"
+  },
+  "acceptance_contract": {
+    "status": "proposed",
+    "path": "tests/extension/test_swiglu.py,tests/extension/test_swiglu_dispatch.py",
+    "sha256": "sha256:fb633cfc6be32041d5e6a37707c6074a3d35931cb5d2b04b7aa4348783783f2a",
+    "probe_set_sha256": "sha256:3203ce8b46a789afb7cb332b71b01554f5a9f6278d705a4e4b8ce05b236d9d87",
+    "hidden_probe_policy_sha256": "sha256:e181380d1b2435c18569629904153feb91bf0494d12d05e353e50c71ebab90bd"
+  },
+  "project_objectives": {
+    "edge_ecosystem_policy": "experimental",
+    "profile_set_sha256": "sha256:b2312952e3b6cf61a527a61806eb39278a1490758e5356436b3b2c36ddffae67"
+  },
+  "benchmark_loop": {
+    "fast_stage_max_official_fraction": 0.05,
+    "affected_stage_max_official_fraction": 0.2,
+    "official_replays": 7,
+    "early_exit_on_hard_gate": true,
+    "affected_case_selection": "required",
+    "benchmark_budget_policy_id": "draft-staged-budget-v0.5",
+    "evidence_policy_id": "v0.4-evidence-ladder-plus-seal-v0.5",
+    "precompile": {
+      "mode": "auto",
+      "trigger": "when-compilation-required",
+      "cache_policy": "content-addressed-evidence-identity",
+      "cache_miss_action": "precompile-before-timed-cases",
+      "timing_phases": [
+        "precompile",
+        "cold-start",
+        "steady-state"
+      ],
+      "steady_state_compile_allowed": false
+    }
+  },
+  "scoring": {
+    "formula_template_id": "project-fit-kernel-v0.5",
+    "provisional_scoring_allowed": true,
+    "official_scoring_requires_seal": true,
+    "project_season": "astrai-2026q3"
+  }
+}
