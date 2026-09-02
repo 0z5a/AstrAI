@@ -45,6 +45,8 @@ server:
   dtype: bfloat16   # bfloat16 | float16 | float32
   max_batch_size: 16
   max_seq_len: null # falls back to model config
+  kv_cache_tokens: null    # set to enable paged allocation
+  kv_cache_page_size: 1    # values above 1 enable prefix caching
 ```
 
 - Relative paths resolve from the YAML file's directory, not the current shell.

@@ -288,6 +288,21 @@ def test_engine_passes_backend_to_scheduler():
     assert MockSched.call_args.kwargs["backend"] == "torch_native"
 
 
+def test_engine_passes_paged_cache_settings_to_scheduler():
+    mock_model, mock_tokenizer = _make_engine_mocks()
+
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        InferenceEngine(
+            mock_model,
+            mock_tokenizer,
+            kv_cache_tokens=4096,
+            kv_cache_page_size=64,
+        )
+
+    assert MockSched.call_args.kwargs["kv_cache_tokens"] == 4096
+    assert MockSched.call_args.kwargs["kv_cache_page_size"] == 64
+
+
 def test_generate_captures_calling_backend_context():
     mock_model, mock_tokenizer = _make_engine_mocks()
     captured = []

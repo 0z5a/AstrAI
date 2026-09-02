@@ -1,5 +1,6 @@
 """Unit tests for inference cache components."""
 
+import pytest
 import torch
 
 from astrai.inference.cache import (
@@ -229,6 +230,30 @@ def _make_contiguous_pool(**kwargs):
     )
     defaults.update(kwargs)
     return PagePool(**defaults)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        ({"page_size": 0}, ValueError, "page_size must be positive"),
+        ({"page_size": True}, TypeError, "page_size must be an integer"),
+        ({"n_tokens": 0}, ValueError, "n_tokens must be positive"),
+        ({"n_tokens": True}, TypeError, "n_tokens must be an integer"),
+        (
+            {"page_size": 8, "n_tokens": 10},
+            ValueError,
+            "n_tokens must be divisible by page_size",
+        ),
+        (
+            {"page_size": 8},
+            ValueError,
+            "page_size requires n_tokens in paged mode",
+        ),
+    ],
+)
+def test_page_pool_rejects_invalid_capacity_settings(kwargs, error, message):
+    with pytest.raises(error, match=message):
+        _make_contiguous_pool(**kwargs)
 
 
 def test_page_pool_contiguous_task_alloc_free():

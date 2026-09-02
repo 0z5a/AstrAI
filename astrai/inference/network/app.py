@@ -111,6 +111,8 @@ def _create_engine(
     dtype: torch.dtype = torch.bfloat16,
     max_batch_size: int = 16,
     max_seq_len: Optional[int] = None,
+    kv_cache_tokens: Optional[int] = None,
+    kv_cache_page_size: int = 1,
 ) -> InferenceEngine:
     if not param_path.exists():
         raise FileNotFoundError(f"Parameter directory not found: {param_path}")
@@ -125,8 +127,18 @@ def _create_engine(
         tokenizer=tokenizer,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        kv_cache_tokens=kv_cache_tokens,
+        kv_cache_page_size=kv_cache_page_size,
     )
-    logger.info(f"Inference engine initialized with max_batch_size={max_batch_size}")
+    cache_mode = "paged" if kv_cache_tokens is not None else "contiguous"
+    logger.info(
+        "Inference engine initialized with max_batch_size=%s, "
+        "kv_cache_mode=%s, kv_cache_tokens=%s, kv_cache_page_size=%s",
+        max_batch_size,
+        cache_mode,
+        kv_cache_tokens,
+        kv_cache_page_size,
+    )
     return engine
 
 
@@ -189,6 +201,8 @@ def run_server(
     dtype: torch.dtype = torch.bfloat16,
     max_batch_size: int = 16,
     max_seq_len: Optional[int] = None,
+    kv_cache_tokens: Optional[int] = None,
+    kv_cache_page_size: int = 1,
 ):
     app = get_app()
     app.state.server_config = {
@@ -197,6 +211,8 @@ def run_server(
         "param_path": param_path,
         "max_batch_size": max_batch_size,
         "max_seq_len": max_seq_len,
+        "kv_cache_tokens": kv_cache_tokens,
+        "kv_cache_page_size": kv_cache_page_size,
     }
     uvicorn.run(
         app,

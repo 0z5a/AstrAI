@@ -246,6 +246,28 @@ def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
         assert stats["total_tasks"] >= 0
 
 
+def test_scheduler_exposes_paged_cache_settings(mock_model_and_tokenizer):
+    mock_model, mock_tokenizer = mock_model_and_tokenizer
+
+    scheduler = InferenceScheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        max_batch_size=4,
+        max_seq_len=64,
+        device="cpu",
+        kv_cache_tokens=512,
+        kv_cache_page_size=8,
+    )
+    try:
+        stats = scheduler.get_stats()
+        assert stats["kv_cache_mode"] == "paged"
+        assert stats["kv_cache_tokens"] == 512
+        assert stats["kv_cache_page_size"] == 8
+        assert stats["kv_cache_prefix_caching"] is True
+    finally:
+        scheduler.stop()
+
+
 def _make_real_scheduler(device):
     """Build a scheduler backed by a tiny real model for run_batch tests."""
     cfg = make_rollout_config(max_position_embeddings=64)

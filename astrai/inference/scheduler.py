@@ -42,6 +42,8 @@ class InferenceScheduler:
         cache: Optional[PagePool] = None,
         enable_cuda_graph: bool = True,
         backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
+        kv_cache_page_size: int = 1,
+        kv_cache_tokens: Optional[int] = None,
     ):
         config = model.config
 
@@ -60,6 +62,11 @@ class InferenceScheduler:
         head_dim = config.hidden_size // config.num_attention_heads
 
         if cache is not None:
+            if kv_cache_tokens is not None or kv_cache_page_size != 1:
+                raise ValueError(
+                    "cache cannot be combined with kv_cache_tokens or "
+                    "kv_cache_page_size"
+                )
             self._cache = cache
         else:
             self._cache = PagePool(
@@ -70,6 +77,8 @@ class InferenceScheduler:
                 max_seq_len=self.max_seq_len,
                 device=self.device,
                 dtype=self.dtype,
+                page_size=kv_cache_page_size,
+                n_tokens=kv_cache_tokens,
             )
 
         self._metrics = MetricsCollector()
@@ -125,6 +134,12 @@ class InferenceScheduler:
     def get_stats(self) -> Dict[str, Any]:
         stats = self._task_mgr.get_stats()
         stats["kv_cache_tasks"] = self._task_cache.task_count
+        stats["kv_cache_mode"] = "contiguous" if self._cache.contiguous else "paged"
+        stats["kv_cache_tokens"] = self._cache.n_tokens
+        stats["kv_cache_page_size"] = self._cache.page_size
+        stats["kv_cache_prefix_caching"] = (
+            not self._cache.contiguous and self._cache.page_size > 1
+        )
         return stats
 
     @property

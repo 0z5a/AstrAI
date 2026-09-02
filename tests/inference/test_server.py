@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from astrai.inference import get_app
-from astrai.inference.network.app import _create_engine
+from astrai.inference.network.app import _create_engine, run_server
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.serialization import save_model
 from tests.helpers import CHAT_TEMPLATE, build_test_tokenizer, make_tiny_config
@@ -29,6 +29,24 @@ def test_health_with_model(client, loaded_model):
     data = response.json()
     assert data["status"] == "ok"
     assert data["model_loaded"] is True
+
+
+def test_run_server_records_paged_cache_settings(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_uvicorn_run(app, **kwargs):
+        captured.update(app.state.server_config)
+
+    monkeypatch.setattr("astrai.inference.network.app.uvicorn.run", fake_uvicorn_run)
+    run_server(
+        tmp_path,
+        device="cpu",
+        kv_cache_tokens=4096,
+        kv_cache_page_size=64,
+    )
+
+    assert captured["kv_cache_tokens"] == 4096
+    assert captured["kv_cache_page_size"] == 64
 
 
 def test_chat_completions_non_stream(client, loaded_model):
@@ -244,9 +262,14 @@ def test_chat_completions_real_engine(tmp_path, client):
         dtype=torch.float32,
         max_batch_size=1,
         max_seq_len=64,
+        kv_cache_tokens=128,
+        kv_cache_page_size=8,
     )
     try:
         get_app().state.engine = engine
+        stats = engine.get_stats()
+        assert stats["kv_cache_mode"] == "paged"
+        assert stats["kv_cache_prefix_caching"] is True
         response = client.post(
             "/v1/chat/completions",
             json={

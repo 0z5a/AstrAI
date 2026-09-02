@@ -104,6 +104,20 @@ class PagePool:
         page_size: int = 1,
         n_tokens: Optional[int] = None,
     ):
+        if isinstance(page_size, bool) or not isinstance(page_size, int):
+            raise TypeError("page_size must be an integer")
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        if n_tokens is not None:
+            if isinstance(n_tokens, bool) or not isinstance(n_tokens, int):
+                raise TypeError("n_tokens must be an integer")
+            if n_tokens <= 0:
+                raise ValueError("n_tokens must be positive")
+            if n_tokens % page_size:
+                raise ValueError("n_tokens must be divisible by page_size")
+        elif page_size != 1:
+            raise ValueError("page_size requires n_tokens in paged mode")
+
         self.page_size = page_size
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len

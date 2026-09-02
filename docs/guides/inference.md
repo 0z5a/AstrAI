@@ -39,6 +39,11 @@ PagePool (top-level manager, orchestrates all layers)
 - **Contiguous (default)**: pre-allocates `max_batch_size * max_seq_len` token slots. `req_to_token` is a trivial linear mapping (`slot = req_idx * max_seq_len + pos`). No dynamic allocation.
 - **Paged** (`page_size=1` or `>1` with `n_tokens` set): shared token pool with on-demand allocation. `Allocator` provides ref-counted allocation and LRU eviction. When `page_size > 1`, `RadixCache` also enables prefix sharing.
 
+The server exposes the same choice as `kv_cache_tokens` and
+`kv_cache_page_size`. Leaving `kv_cache_tokens` unset preserves contiguous
+allocation. Setting it enables paged allocation; a page size above 1 also
+enables prefix caching. The token capacity must be divisible by the page size.
+
 `RadixCache` indexes complete token pages as parent-linked radix edges. Lookup walks from the root and compares each page's exact token tuple, so an identical page can only be reused under the same parent prefix. Hash values are retained for introspection, but never determine a match.
 
 Only fully materialized KV pages enter the radix. A partial final page remains private to its request and is released when the request ends. On completion, the scheduler records the prompt plus generated tokens already decoded into KV; it excludes the final sampled token because that token has not yet passed through the model. A later request resumes prefill immediately after the longest complete-page hit.
@@ -192,12 +197,17 @@ server:
   dtype: bfloat16
   max_batch_size: 16
   max_seq_len: null
+  kv_cache_tokens: 131072   # enables paged allocation
+  kv_cache_page_size: 64    # values above 1 enable prefix caching
 ```
 
 ```bash
 python scripts/tools/server.py --config serve.yaml
 python scripts/tools/server.py --config serve.yaml --port 9000  # CLI wins
 ```
+
+`GET /stats` reports the effective `kv_cache_mode`, token capacity, page size,
+and whether prefix caching is active.
 
 In Docker, `scripts/serve.sh` drives the same YAML (a `runtime:` section
 controls ports/GPU/mounts); see

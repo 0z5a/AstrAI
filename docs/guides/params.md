@@ -211,6 +211,8 @@ nohup python scripts/tools/train.py \
 | `--dtype` | str | `bfloat16` | Model weights dtype (`bfloat16`, `float16`, `float32`) |
 | `--max_batch_size` | int | `16` | Maximum batch size for continuous batching |
 | `--max_seq_len` | int | model config `max_position_embeddings` | Maximum sequence length (KV cache size + prompt truncation) |
+| `--kv_cache_tokens` | int | `None` | Shared KV token capacity; setting it enables paged allocation |
+| `--kv_cache_page_size` | int | `1` | Paged allocation size; values above 1 enable prefix caching |
 | `--reload` | flag | `False` | Enable auto-reload for development |
 
 Usage:
@@ -230,7 +232,11 @@ server:
   dtype: bfloat16
   max_batch_size: 16
   max_seq_len: null
+  kv_cache_tokens: 131072
+  kv_cache_page_size: 64
 ```
+`kv_cache_tokens` must be positive and divisible by `kv_cache_page_size`.
+Leave it unset to retain the contiguous cache default.
 `serve.yaml` also carries a `runtime:` section for the Docker wrapper; see
 [Docker Serving](../developer/docker-serving.md).
 

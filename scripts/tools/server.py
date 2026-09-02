@@ -17,6 +17,8 @@ _SERVER_KEYS = (
     "dtype",
     "max_batch_size",
     "max_seq_len",
+    "kv_cache_tokens",
+    "kv_cache_page_size",
 )
 
 
@@ -62,6 +64,25 @@ def _as_int(value, name: str) -> int | None:
         raise click.UsageError(f"{name} must be an integer, got {value!r}") from None
 
 
+def _validate_kv_cache_config(
+    kv_cache_tokens: int | None, kv_cache_page_size: int
+) -> None:
+    if kv_cache_page_size <= 0:
+        raise click.UsageError("server.kv_cache_page_size must be positive")
+    if kv_cache_tokens is None:
+        if kv_cache_page_size != 1:
+            raise click.UsageError(
+                "server.kv_cache_page_size requires server.kv_cache_tokens"
+            )
+        return
+    if kv_cache_tokens <= 0:
+        raise click.UsageError("server.kv_cache_tokens must be positive")
+    if kv_cache_tokens % kv_cache_page_size:
+        raise click.UsageError(
+            "server.kv_cache_tokens must be divisible by server.kv_cache_page_size"
+        )
+
+
 def _resolve_server_config(
     config_path: str,
     passed_kwargs: dict,
@@ -79,11 +100,21 @@ def _resolve_server_config(
         _as_int(resolved["max_batch_size"], "server.max_batch_size") or 16
     )
     resolved["max_seq_len"] = _as_int(resolved["max_seq_len"], "server.max_seq_len")
+    resolved["kv_cache_tokens"] = _as_int(
+        resolved.get("kv_cache_tokens"), "server.kv_cache_tokens"
+    )
+    page_size = _as_int(
+        resolved.get("kv_cache_page_size", 1), "server.kv_cache_page_size"
+    )
+    resolved["kv_cache_page_size"] = 1 if page_size is None else page_size
     resolved["reload"] = bool(resolved["reload"])
     if resolved["dtype"] not in _DTYPES:
         raise click.UsageError(
             f"server.dtype must be one of {', '.join(_DTYPES)}, got {resolved['dtype']!r}"
         )
+    _validate_kv_cache_config(
+        resolved["kv_cache_tokens"], resolved["kv_cache_page_size"]
+    )
     return resolved
 
 
@@ -126,6 +157,18 @@ def _resolve_server_config(
     default=None,
     help="Maximum sequence length (KV cache size + prompt truncation). Uses model config if not set.",
 )
+@click.option(
+    "--kv_cache_tokens",
+    type=int,
+    default=None,
+    help="Shared KV token capacity. Setting it enables paged allocation.",
+)
+@click.option(
+    "--kv_cache_page_size",
+    type=int,
+    default=1,
+    help="Paged KV allocation size. Values above 1 enable prefix caching.",
+)
 @click.pass_context
 def server_command(
     ctx,
@@ -138,6 +181,8 @@ def server_command(
     dtype,
     max_batch_size,
     max_seq_len,
+    kv_cache_tokens,
+    kv_cache_page_size,
 ):
     """Launch inference server (OpenAI-compatible API)."""
     if config_path:
@@ -150,6 +195,8 @@ def server_command(
             "dtype": dtype,
             "max_batch_size": max_batch_size,
             "max_seq_len": max_seq_len,
+            "kv_cache_tokens": kv_cache_tokens,
+            "kv_cache_page_size": kv_cache_page_size,
         }
         explicit_keys = {
             key
@@ -165,7 +212,11 @@ def server_command(
         dtype = resolved["dtype"]
         max_batch_size = resolved["max_batch_size"]
         max_seq_len = resolved["max_seq_len"]
+        kv_cache_tokens = resolved["kv_cache_tokens"]
+        kv_cache_page_size = resolved["kv_cache_page_size"]
         click.echo(f"Config: {config_path}")
+
+    _validate_kv_cache_config(kv_cache_tokens, kv_cache_page_size)
 
     dtype_map = {
         "bfloat16": torch.bfloat16,
@@ -186,6 +237,8 @@ def server_command(
         param_path=Path(param_path),
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        kv_cache_tokens=kv_cache_tokens,
+        kv_cache_page_size=kv_cache_page_size,
     )
 
 

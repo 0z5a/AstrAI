@@ -76,6 +76,8 @@ class InferenceEngine:
         cache: Optional[PagePool] = None,
         enable_cuda_graph: bool = True,
         backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
+        kv_cache_page_size: int = 1,
+        kv_cache_tokens: Optional[int] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -87,6 +89,8 @@ class InferenceEngine:
             cache=cache,
             enable_cuda_graph=enable_cuda_graph,
             backend=backend,
+            kv_cache_page_size=kv_cache_page_size,
+            kv_cache_tokens=kv_cache_tokens,
         )
 
         self.scheduler.start()

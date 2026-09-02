@@ -22,6 +22,8 @@ def _passed() -> dict:
         "dtype": "bfloat16",
         "max_batch_size": 16,
         "max_seq_len": None,
+        "kv_cache_tokens": None,
+        "kv_cache_page_size": 1,
     }
 
 
@@ -62,6 +64,29 @@ def test_resolve_config_rejects_bad_dtype(tmp_path):
         _resolve_server_config(str(config_path), _passed())
 
 
+@pytest.mark.parametrize(
+    ("yaml_body", "message"),
+    [
+        ("kv_cache_tokens: 0", "server.kv_cache_tokens must be positive"),
+        ("kv_cache_page_size: 0", "server.kv_cache_page_size must be positive"),
+        (
+            "kv_cache_page_size: 64",
+            "server.kv_cache_page_size requires server.kv_cache_tokens",
+        ),
+        (
+            "kv_cache_tokens: 100\n  kv_cache_page_size: 64",
+            "server.kv_cache_tokens must be divisible",
+        ),
+    ],
+)
+def test_resolve_config_rejects_invalid_kv_cache_settings(tmp_path, yaml_body, message):
+    config_path = tmp_path / "serve.yaml"
+    config_path.write_text(f"server:\n  {yaml_body}\n", encoding="utf-8")
+
+    with pytest.raises(click.UsageError, match=message):
+        _resolve_server_config(str(config_path), _passed())
+
+
 def test_server_command_rejects_bad_yaml_dtype(tmp_path):
     config_path = tmp_path / "serve.yaml"
     config_path.write_text("server:\n  dtype: fp8\n", encoding="utf-8")
@@ -76,7 +101,12 @@ def test_server_command_merges_yaml_and_cli(tmp_path, monkeypatch):
     """Full CLI path: YAML values apply, explicit CLI flags override, args reach run_server."""
     config_path = tmp_path / "serve.yaml"
     config_path.write_text(
-        "server:\n  device: cpu\n  dtype: float16\n  max_batch_size: 8\n",
+        "server:\n"
+        "  device: cpu\n"
+        "  dtype: float16\n"
+        "  max_batch_size: 8\n"
+        "  kv_cache_tokens: 4096\n"
+        "  kv_cache_page_size: 64\n",
         encoding="utf-8",
     )
     captured = {}
@@ -95,6 +125,18 @@ def test_server_command_merges_yaml_and_cli(tmp_path, monkeypatch):
     assert captured["dtype"] == torch.float16
     assert captured["max_batch_size"] == 32
     assert captured["port"] == 8000
+    assert captured["kv_cache_tokens"] == 4096
+    assert captured["kv_cache_page_size"] == 64
+
+
+def test_server_command_rejects_invalid_cli_cache_settings():
+    result = CliRunner().invoke(
+        server_command,
+        ["--kv_cache_tokens", "100", "--kv_cache_page_size", "64"],
+    )
+
+    assert result.exit_code == 2
+    assert "server.kv_cache_tokens must be divisible" in result.output
 
 
 def test_config_option_rejects_missing_file(tmp_path):
