@@ -213,8 +213,17 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
-        if self.strategy.startswith("online_") and self.reward_model_fn is None:
-            raise ValueError(
-                f"reward_model_fn is required for online RL strategy {self.strategy!r}"
-            )
+        if self.strategy.startswith("online_"):
+            if self.reward_model_fn is None:
+                raise ValueError(
+                    f"reward_model_fn is required for online RL strategy "
+                    f"{self.strategy!r}"
+                )
+            if self.nprocs > 1:
+                raise ValueError(
+                    f"online RL strategy {self.strategy!r} requires single-process "
+                    f"training (nprocs=1): per-rank rollouts issue different "
+                    f"numbers of forward passes and desynchronize the "
+                    f"ddp/fsdp collectives, deadlocking NCCL"
+                )
         return self

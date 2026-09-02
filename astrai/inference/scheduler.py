@@ -444,6 +444,10 @@ class InferenceScheduler:
         tasks: List[Optional[Task]] = []
         error_reasons: List[Optional[str]] = []
         for ids in prompt_ids_list:
+            if not ids:
+                tasks.append(None)
+                error_reasons.append("prompt_empty")
+                continue
             if len(ids) >= seq_cap:
                 tasks.append(None)
                 error_reasons.append("prompt_too_long")

@@ -2,7 +2,9 @@
 
 from unittest.mock import MagicMock
 
-from astrai.inference import Task, TaskManager, TaskStatus
+import pytest
+
+from astrai.inference import STOP, Task, TaskManager, TaskStatus
 
 
 def _make_mock_tokenizer():
@@ -178,3 +180,40 @@ def test_task_manager_get_stats():
     assert stats["total_tasks"] == 1
     assert stats["waiting_queue"] == 1
     assert stats["active_tasks"] == 0
+
+
+def test_task_manager_add_task_rejects_empty_prompt():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    tm.tokenizer.encode.return_value = []
+
+    with pytest.raises(ValueError, match="zero tokens"):
+        tm.add_task("")
+
+
+def test_task_manager_cancel_delivers_stop_callback():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    received = []
+    tm.add_task("test", stream_callback=received.append)
+
+    immediate, cancelled = tm.cancel_task("does-not-exist")
+    assert not cancelled and immediate == [] and received == []
+
+    task_id = next(iter(tm._tasks))
+    immediate, cancelled = tm.cancel_task(task_id)
+    assert cancelled
+    assert len(immediate) == 1
+    assert received == [STOP]
+
+
+def test_task_manager_cancel_active_task_delivers_stop_callback():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    received = []
+    task_id = tm.add_task("test", stream_callback=received.append)
+    task = tm._tasks[task_id]
+    tm.waiting_queue.clear()
+    tm.active_tasks.append(task)
+    task.status = TaskStatus.RUNNING
+
+    immediate, cancelled = tm.cancel_task(task_id)
+    assert cancelled and immediate == []
+    assert received == [STOP]

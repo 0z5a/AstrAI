@@ -289,8 +289,8 @@ class SamplingPipeline(BaseSamplingStrategy):
             input_mask: Boolean mask for ``input_ids`` padding.
             return_logprobs: If ``True``, return ``(tokens, logprobs)``
                 where ``logprobs[i]`` is the log-probability of
-                ``tokens[i]`` under the (post-strategy) sampling
-                distribution.
+                ``tokens[i]`` under the raw (pre-strategy) model
+                distribution, matching training-side policy logprobs.
 
         Returns:
             Sampled token IDs ``[batch]``, or — when ``return_logprobs``
@@ -310,18 +310,32 @@ class SamplingPipeline(BaseSamplingStrategy):
         ).squeeze(-1)
         if not return_logprobs:
             return tokens
-        log_probs = torch.log_softmax(transformed.float(), dim=-1)
+        # Log-probabilities of the raw (pre-strategy) model distribution,
+        # matching the training-side policy logprobs exactly: the behaviour
+        # logprobs recorded for online RL must live in the same
+        # distribution the trainer differentiates, not the
+        # temperature/top-p filtered one tokens were drawn from.
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
         chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
         return tokens, chosen
 
     def _is_greedy_pipeline(self) -> bool:
-        """True if the first strategy is greedy temperature (temp=0)."""
+        """True if sampling reduces to argmax over the raw logits.
+
+        A greedy temperature with only top-k/top-p strategies does: the
+        filters always keep the argmax token.  A frequency penalty can
+        change the argmax, so those pipelines must run the full
+        transformation even at ``temperature=0``.
+        """
         if not self.strategies:
             return False
         first = self.strategies[0]
-        return isinstance(first, TemperatureStrategy) and self._is_greedy(
-            first.temperature
-        )
+        if not (
+            isinstance(first, TemperatureStrategy)
+            and self._is_greedy(first.temperature)
+        ):
+            return False
+        return not any(isinstance(s, FrequencyPenaltyStrategy) for s in self.strategies)
 
 
 @torch.inference_mode()
@@ -354,9 +368,9 @@ def sample(
         input_ids: Previously generated token IDs ``[batch, seq_len]``.
         input_mask: Boolean mask for ``input_ids`` padding.
         return_logprobs: If ``True``, also return the log-probability
-            of each sampled token under the (post-strategy) sampling
-            distribution — useful for RL rollout (PPO/GRPO importance
-            ratios).
+            of each sampled token under the raw (pre-strategy) model
+            distribution — usable directly for RL rollout (PPO/GRPO
+            importance ratios against the training-side policy logprobs).
 
     Returns:
         Sampled token IDs ``[batch]``, or — when ``return_logprobs`` is
@@ -369,13 +383,19 @@ def sample(
         else frequency_penalty != 0
     )
 
-    strategies: List[BaseSamplingStrategy] = [
-        TemperatureStrategy(temperature),
-        TopKStrategy(top_k),
-        TopPStrategy(top_p),
-    ]
+    strategies: List[BaseSamplingStrategy] = []
     if has_freq:
+        # Penalty first, on the raw logits (OpenAI semantics): applying it
+        # after a temperature scaling would shrink it by the temperature
+        # and annihilate it entirely at temperature=0.
         strategies.append(FrequencyPenaltyStrategy(frequency_penalty))
+    strategies.extend(
+        [
+            TemperatureStrategy(temperature),
+            TopKStrategy(top_k),
+            TopPStrategy(top_p),
+        ]
+    )
 
     return SamplingPipeline(strategies).sample(
         logits,

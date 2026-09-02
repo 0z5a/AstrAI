@@ -13,7 +13,12 @@ from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.model.components.lora import inject_lora
-from astrai.parallel.executor import BaseExecutor, ExecutorFactory, create_ref_model
+from astrai.parallel.executor import (
+    BaseExecutor,
+    ExecutorFactory,
+    create_ref_model,
+    strip_compile_prefix,
+)
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import (
@@ -145,6 +150,7 @@ class TrainContextBuilder:
                         checkpoint.state_dict,
                         ConfigFactory.load(checkpoint.config or state.model_config),
                     )
+                checkpoint.state_dict = strip_compile_prefix(checkpoint.state_dict)
                 state.state_dict = checkpoint.state_dict
                 state.model_config = checkpoint.config or state.model_config
                 if self._resume:
@@ -192,7 +198,16 @@ class TrainContextBuilder:
                     target_modules=set(cfg.lora.target_modules),
                 )
             if state.state_dict is not None:
-                model.load_state_dict(state.state_dict, strict=False)
+                result = model.load_state_dict(state.state_dict, strict=False)
+                if result.missing_keys or result.unexpected_keys:
+                    logger.warning(
+                        "preloaded state dict mismatch: %d missing, %d unexpected "
+                        "(first missing: %s, first unexpected: %s)",
+                        len(result.missing_keys),
+                        len(result.unexpected_keys),
+                        result.missing_keys[:3],
+                        result.unexpected_keys[:3],
+                    )
             return model
 
         def after_wrap(model):

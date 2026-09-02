@@ -185,6 +185,11 @@ class TaskManager:
     ) -> str:
         task_id = f"task_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         prompt_ids = self.tokenizer.encode(prompt)
+        if not prompt_ids:
+            # An empty prompt never completes prefill (``prefill_done`` stays
+            # False) and would crash the decode path on ``prompt_ids[-1]``;
+            # rejecting it here keeps the scheduling loop alive.
+            raise ValueError("prompt encoded to zero tokens; refusing to schedule")
         if len(prompt_ids) > self.max_seq_len:
             prompt_ids = prompt_ids[-self.max_seq_len :]
 
@@ -219,10 +224,19 @@ class TaskManager:
         return task_id
 
     def cancel_task(self, task_id: str) -> Tuple[List[Task], bool]:
-        """Mark a task cancelled and return tasks safe to clean immediately."""
+        """Mark a task cancelled and return tasks safe to clean immediately.
+
+        Registered stream callbacks receive the terminal ``STOP`` sentinel
+        for every live cancellation: the scheduling loop drains ABORTED
+        tasks without invoking callbacks, so skipping it here would leave
+        consumers (e.g. ``GenerateResult.wait_completion``) waiting forever.
+        """
+        callback = None
+        cancelled = False
+        immediate: List[Task] = []
         with self._lock:
             task = self._tasks.get(task_id)
-            self._callbacks.pop(task_id, None)
+            callback = self._callbacks.pop(task_id, None)
             if task is None or task.status in (
                 TaskStatus.FINISHED,
                 TaskStatus.ABORTED,
@@ -231,13 +245,17 @@ class TaskManager:
 
             task.status = TaskStatus.ABORTED
             self._cancelled_total += 1
+            cancelled = True
             if task in self.waiting_queue:
                 self.waiting_queue = deque(
                     waiting for waiting in self.waiting_queue if waiting is not task
                 )
                 self._tasks.pop(task_id, None)
-                return [task], True
-            return [], True
+                immediate = [task]
+
+        if cancelled and callback is not None:
+            callback(STOP)
+        return immediate, cancelled
 
     def remove_task(self, task_id: str) -> List[Task]:
         """Backward-compatible alias for cancellation."""

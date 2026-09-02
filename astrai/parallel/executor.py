@@ -23,6 +23,27 @@ from astrai.parallel.setup import get_rank, get_world_size
 
 logger = logging.getLogger(__name__)
 
+_COMPILE_PREFIX = "_orig_mod."
+
+
+def strip_compile_prefix(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Drop the ``_orig_mod.`` key prefix ``torch.compile`` adds.
+
+    ``OptimizedModule.state_dict()`` prefixes every key, so checkpoints or
+    reference-model copies taken from a compiled model fail to load into a
+    plain module (strict) or silently load nothing (non-strict).  Stripping
+    here, at the single source every consumer reads from, keeps saved keys
+    canonical regardless of compile mode.
+    """
+    if any(key.startswith(_COMPILE_PREFIX) for key in state_dict):
+        state_dict = {
+            key.removeprefix(_COMPILE_PREFIX): value
+            for key, value in state_dict.items()
+        }
+    return state_dict
+
 
 def broadcast_state_dict(
     state_dict: Optional[Dict[str, torch.Tensor]],
@@ -91,6 +112,7 @@ def create_ref_model(
     if state_dict is None:
         return None
 
+    state_dict = strip_compile_prefix(state_dict)
     ref_model = model_fn()
     ref_model.load_state_dict(state_dict)
     ref_model.requires_grad_(False)
@@ -206,7 +228,7 @@ class BaseExecutor:
         loss.backward()
 
     def unwrap_model(self, model: nn.Module):
-        return model.state_dict()
+        return strip_compile_prefix(model.state_dict())
 
     @contextmanager
     def checkpoint_context(self, model: nn.Module):
@@ -308,8 +330,8 @@ class DDPExecutor(BaseExecutor):
 
     def unwrap_model(self, model: nn.Module):
         if isinstance(model, DDP):
-            return model.module.state_dict()
-        return model.state_dict()
+            return strip_compile_prefix(model.module.state_dict())
+        return strip_compile_prefix(model.state_dict())
 
 
 @ExecutorFactory.register("fsdp")
@@ -411,6 +433,7 @@ class FSDPExecutor(BaseExecutor):
         state_dict = model.state_dict()
         result = {}
         for k, v in state_dict.items():
+            k = k.removeprefix(_COMPILE_PREFIX)
             if isinstance(v, DTensor):
                 full = v.full_tensor()
                 if get_rank() == 0:
