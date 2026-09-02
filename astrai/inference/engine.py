@@ -43,8 +43,7 @@ class GenerateResult:
         with self._cond:
             out = self.tokens.copy()
             self.tokens.clear()
-            if not out:
-                self._event.clear()
+            self._event.clear()
             return out
 
     def wait(self, timeout: Optional[float] = None) -> bool:
@@ -141,25 +140,34 @@ class InferenceEngine:
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
     ) -> AsyncGenerator[str, None]:
-        sync_gen = self._generate(
-            [prompt],
-            False,
-            True,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            frequency_penalty,
-            rep_window,
+        request_backend = get_backend(use_default=False)
+        result = GenerateResult()
+        task_id = self.scheduler.add_task(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            rep_window=rep_window,
+            backend=request_backend,
+            stream_callback=result.append,
         )
 
         async def _agen():
-            loop = asyncio.get_event_loop()
-            while True:
-                token = await loop.run_in_executor(None, next, sync_gen, None)
-                if token is None:
-                    break
-                yield token
+            finished = False
+            try:
+                while not finished:
+                    for _idx, token in result.pop_all():
+                        if token is STOP:
+                            finished = True
+                            break
+                        yield token
+                    if not finished:
+                        await asyncio.to_thread(result.wait, 0.05)
+            finally:
+                if not finished:
+                    self.scheduler.cancel_task(task_id)
 
         return _agen()
 
@@ -198,10 +206,8 @@ class InferenceEngine:
                 result.wait_completion()
             except TimeoutError:
                 for tid in task_ids:
-                    self.scheduler.remove_task(tid)
+                    self.scheduler.cancel_task(tid)
                 raise
-            for tid in task_ids:
-                self.scheduler.remove_task(tid)
             res = result.get_results()
             return res if is_batch else res[0]
 
@@ -210,17 +216,22 @@ class InferenceEngine:
 
         def gen():
             nonlocal remaining
-            while remaining > 0:
-                items = result.pop_all()
-                for idx, token in items:
-                    if token is STOP:
-                        if not finished[idx]:
-                            finished[idx] = True
-                            remaining -= 1
-                    else:
-                        yield (idx, token) if is_batch else token
-                if remaining > 0:
-                    result.wait(timeout=0.05)
+            try:
+                while remaining > 0:
+                    items = result.pop_all()
+                    for idx, token in items:
+                        if token is STOP:
+                            if not finished[idx]:
+                                finished[idx] = True
+                                remaining -= 1
+                        else:
+                            yield (idx, token) if is_batch else token
+                    if remaining > 0:
+                        result.wait(timeout=0.05)
+            finally:
+                for idx, task_id in enumerate(task_ids):
+                    if not finished[idx]:
+                        self.scheduler.cancel_task(task_id)
 
         return gen()
 
