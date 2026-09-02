@@ -73,7 +73,7 @@ def _axes(
     x_shape = tuple(x.shape)
     weight_shape = tuple(weight.shape)
     m = 1 if x.ndim == 1 else (x.shape[0] if x.ndim == 2 else None)
-    supported_m = m in (1, 2, 4, 8)
+    supported_m = m is not None and 1 <= m <= 8
     shape_matches = (
         weight.ndim == 2
         and x.ndim in (1, 2)
@@ -164,7 +164,7 @@ def _gemv_capable(x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> bool:
         or weight.dtype != torch.bfloat16
         or weight.ndim != 2
         or x.ndim not in (1, 2)
-        or (x.ndim == 2 and x.shape[0] not in (1, 2, 4, 8))
+        or (x.ndim == 2 and not 1 <= x.shape[0] <= 8)
         or x.shape[-1] != weight.shape[1]
         or weight.shape[1] % 2 != 0
         or x.device != weight.device
@@ -239,7 +239,7 @@ def linear(x: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
     """Apply a linear projection with safe inference-only GEMV dispatch.
 
     ``ASTRAI_GEMV=0`` always uses PyTorch, ``1`` forces GEMV whenever the
-    primitive can safely handle an M in ``{1, 2, 4, 8}``, and ``auto`` (the
+    primitive can safely handle any M in ``{1, ..., 8}``, and ``auto`` (the
     default) uses only architecture/shape bands backed by benchmark evidence.
     """
     # Preserve the shared dispatcher for explicit/context selection and

@@ -14,7 +14,7 @@ def bf16_gemv(
 ) -> torch.Tensor:
     """Compute ``F.linear(x, weight, bias)`` for up to eight BF16 rows.
 
-    ``x`` must have shape ``[K]`` or ``[M, K]`` with M in ``{1, 2, 4, 8}``,
+    ``x`` must have shape ``[K]`` or ``[M, K]`` with M in ``[1, 8]``,
     and ``weight`` must be a contiguous row-major ``[N, K]`` tensor. The CUDA
     kernel reuses each weight row across M, accumulates in FP32, and returns
     BF16. This primitive is inference-only and intentionally performs no

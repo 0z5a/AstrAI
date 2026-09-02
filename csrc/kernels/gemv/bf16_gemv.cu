@@ -34,27 +34,64 @@ __global__ void bf16_gemv_kernel(
     const int output_index = blockIdx.x;
     const int lane = threadIdx.x & (kWarpSize - 1);
     const int warp = threadIdx.x / kWarpSize;
-    const int pairs = k / 2;
-    const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
-    const auto* w2 =
-        reinterpret_cast<const __nv_bfloat162*>(weight) + output_index * pairs;
 
     float sums[Rows] = {};
-    for (int pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
-        const __nv_bfloat162 wv = w2[pair];
+    if (k % 8 == 0) {
+        // 128-bit vectorized loads: eight bf16 elements per access halve the
+        // per-thread iteration count on bandwidth-bound decode shapes.
+        const int vecs = k / 8;
+        const auto* x4 = reinterpret_cast<const uint4*>(x);
+        const auto* w4 = reinterpret_cast<const uint4*>(weight) +
+            static_cast<int64_t>(output_index) * vecs;
+        for (int v = threadIdx.x; v < vecs; v += blockDim.x) {
+            const uint4 wv_raw = w4[v];
+            const auto* wv =
+                reinterpret_cast<const __nv_bfloat162*>(&wv_raw);
+            uint4 xv_raw[Rows];
 #pragma unroll
-        for (int row = 0; row < Rows; ++row) {
-            const __nv_bfloat162 xv = x2[row * pairs + pair];
-            sums[row] = fmaf(
-                __bfloat162float(__low2bfloat16(xv)),
-                __bfloat162float(__low2bfloat16(wv)),
-                sums[row]
-            );
-            sums[row] = fmaf(
-                __bfloat162float(__high2bfloat16(xv)),
-                __bfloat162float(__high2bfloat16(wv)),
-                sums[row]
-            );
+            for (int row = 0; row < Rows; ++row) {
+                xv_raw[row] = x4[static_cast<int64_t>(row) * vecs + v];
+            }
+#pragma unroll
+            for (int row = 0; row < Rows; ++row) {
+                const auto* xv =
+                    reinterpret_cast<const __nv_bfloat162*>(&xv_raw[row]);
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    sums[row] = fmaf(
+                        __bfloat162float(__low2bfloat16(xv[p])),
+                        __bfloat162float(__low2bfloat16(wv[p])),
+                        sums[row]
+                    );
+                    sums[row] = fmaf(
+                        __bfloat162float(__high2bfloat16(xv[p])),
+                        __bfloat162float(__high2bfloat16(wv[p])),
+                        sums[row]
+                    );
+                }
+            }
+        }
+    } else {
+        const int pairs = k / 2;
+        const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
+        const auto* w2 =
+            reinterpret_cast<const __nv_bfloat162*>(weight) + output_index * pairs;
+        for (int pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
+            const __nv_bfloat162 wv = w2[pair];
+#pragma unroll
+            for (int row = 0; row < Rows; ++row) {
+                const __nv_bfloat162 xv = x2[row * pairs + pair];
+                sums[row] = fmaf(
+                    __bfloat162float(__low2bfloat16(xv)),
+                    __bfloat162float(__low2bfloat16(wv)),
+                    sums[row]
+                );
+                sums[row] = fmaf(
+                    __bfloat162float(__high2bfloat16(xv)),
+                    __bfloat162float(__high2bfloat16(wv)),
+                    sums[row]
+                );
+            }
         }
     }
 
@@ -129,8 +166,8 @@ torch::Tensor bf16_gemv(
     const int64_t k = x.size(-1);
     const int64_t n = weight.size(0);
     TORCH_CHECK(
-        m == 1 || m == 2 || m == 4 || m == 8,
-        "M must be one of 1, 2, 4, or 8"
+        m >= 1 && m <= 8,
+        "M must be in [1, 8]"
     );
     TORCH_CHECK(weight.size(1) == k, "weight K must match x K");
     TORCH_CHECK(k > 0 && n > 0, "N and K must be positive");
@@ -160,6 +197,8 @@ torch::Tensor bf16_gemv(
     auto output = x.dim() == 1 ? torch::empty({n}, x.options())
                                : torch::empty({m, n}, x.options());
 
+    // Small-N decode shapes (GQA k/v projections) cannot fill the GPU with
+    // one block per output row; split K across extra blocks and reduce.
     const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
     const auto* weight_ptr =
         reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr());
@@ -177,8 +216,28 @@ torch::Tensor bf16_gemv(
                 x_ptr, weight_ptr, bias_ptr, output_ptr, n_int, k_int, stream.stream()
             );
             break;
+        case 3:
+            launch_bf16_gemv<3>(
+                x_ptr, weight_ptr, bias_ptr, output_ptr, n_int, k_int, stream.stream()
+            );
+            break;
         case 4:
             launch_bf16_gemv<4>(
+                x_ptr, weight_ptr, bias_ptr, output_ptr, n_int, k_int, stream.stream()
+            );
+            break;
+        case 5:
+            launch_bf16_gemv<5>(
+                x_ptr, weight_ptr, bias_ptr, output_ptr, n_int, k_int, stream.stream()
+            );
+            break;
+        case 6:
+            launch_bf16_gemv<6>(
+                x_ptr, weight_ptr, bias_ptr, output_ptr, n_int, k_int, stream.stream()
+            );
+            break;
+        case 7:
+            launch_bf16_gemv<7>(
                 x_ptr, weight_ptr, bias_ptr, output_ptr, n_int, k_int, stream.stream()
             );
             break;
@@ -201,6 +260,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("x"),
         py::arg("weight"),
         py::arg("bias") = py::none(),
-        "M in {1,2,4,8} BF16 GEMV with FP32 accumulation and optional fused bias"
+        "M in [1, 8] BF16 GEMV with FP32 accumulation and optional fused bias"
     );
 }

@@ -152,8 +152,8 @@ def test_grad_enabled_and_unsupported_multirow_always_fall_back(monkeypatch):
     )
     assert "=> torch" in explain("linear", x, weight)
     with torch.no_grad():
-        multirow = x.expand(3, -1).contiguous()
-        assert "=> torch" in explain("linear", multirow, weight)
+        oversized = torch.randn(9, 1536, device="cuda", dtype=torch.bfloat16)
+        assert "=> torch" in explain("linear", oversized, weight)
 
 
 @skip_no_gemv

@@ -31,7 +31,7 @@ def test_bf16_gemv_matches_linear_shape_families(n, k):
 
 
 @skip_no_gemv
-@pytest.mark.parametrize("m", [2, 4, 8])
+@pytest.mark.parametrize("m", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("n,k", [(256, 1536), (1536, 1536), (1536, 6912)])
 def test_bf16_gemv_matches_small_decode_batches(m, n, k):
     torch.manual_seed(19 + m)
@@ -120,7 +120,7 @@ def test_bf16_gemv_small_batch_cuda_graph_replay():
     [
         (
             lambda: (
-                torch.randn(3, 16, device="cuda", dtype=torch.bfloat16),
+                torch.randn(9, 16, device="cuda", dtype=torch.bfloat16),
                 torch.randn(8, 16, device="cuda", dtype=torch.bfloat16),
             ),
             "M must",
