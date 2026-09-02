@@ -11,6 +11,7 @@ from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.schedule import SchedulerFactory
+from astrai.trainer.train_context import TrainContextBuilder
 from astrai.trainer.trainer import Trainer
 from tests.helpers import CHAT_TEMPLATE
 
@@ -85,19 +86,26 @@ _ONLINE_STRATEGIES = [
 ]
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize(("strategy", "strategy_kwargs"), _ONLINE_STRATEGIES)
-def test_online_rollout_end_to_end(base_test_env, strategy, strategy_kwargs):
-    """Run one epoch of online RL rollout with KV-cache-backed generation."""
-    test_dir = base_test_env["test_dir"]
-    device = base_test_env["device"]
-    tokenizer = base_test_env["tokenizer"]
-    model_config = base_test_env["transformer_config"]
+_PARALLEL_CONFIGS = [
+    pytest.param("none", 1, "nccl", None, id="single"),
+    pytest.param("ddp", 1, "nccl", None, id="ddp-single"),
+    pytest.param("ddp", 2, "gloo", "cpu", id="ddp-cpu"),
+]
 
-    tokenizer.set_chat_template(CHAT_TEMPLATE)
-    tokenizer.save_pretrained(test_dir)
 
-    train_config = TrainConfig(
+def _make_train_config(
+    *,
+    test_dir,
+    model_config,
+    strategy,
+    strategy_kwargs,
+    parallel_mode="none",
+    nprocs=1,
+    backend="nccl",
+    device_type="cpu",
+    compile_mode=None,
+):
+    return TrainConfig(
         strategy=strategy,
         model_fn=partial(_model_fn, model_config),
         dataset=InstructionDataset(),
@@ -109,9 +117,11 @@ def test_online_rollout_end_to_end(base_test_env, strategy, strategy_kwargs):
         ckpt_interval=100,
         grad_accum_steps=1,
         random_seed=42,
-        device_type=device,
-        nprocs=1,
-        parallel_mode="none",
+        device_type=device_type,
+        nprocs=nprocs,
+        backend=backend,
+        parallel_mode=parallel_mode,
+        compile_mode=compile_mode,
         strategy_kwargs=strategy_kwargs,
         rollout_interval=1,
         rollout_temperature=1.0,
@@ -122,7 +132,75 @@ def test_online_rollout_end_to_end(base_test_env, strategy, strategy_kwargs):
         collate_fn=instruction_collate_fn,
     )
 
+
+@pytest.mark.integration
+@pytest.mark.parametrize(("strategy", "strategy_kwargs"), _ONLINE_STRATEGIES)
+@pytest.mark.parametrize(
+    ("parallel_mode", "nprocs", "backend", "runtime_device"), _PARALLEL_CONFIGS
+)
+def test_online_rollout_end_to_end(
+    base_test_env,
+    strategy,
+    strategy_kwargs,
+    parallel_mode,
+    nprocs,
+    backend,
+    runtime_device,
+):
+    """Run one epoch of online RL rollout with KV-cache-backed generation."""
+    test_dir = base_test_env["test_dir"]
+    device = base_test_env["device"]
+    tokenizer = base_test_env["tokenizer"]
+    model_config = base_test_env["transformer_config"]
+
+    tokenizer.set_chat_template(CHAT_TEMPLATE)
+    tokenizer.save_pretrained(test_dir)
+
+    train_config = _make_train_config(
+        test_dir=test_dir,
+        model_config=model_config,
+        strategy=strategy,
+        strategy_kwargs=strategy_kwargs,
+        parallel_mode=parallel_mode,
+        nprocs=nprocs,
+        backend=backend,
+        device_type=runtime_device or device,
+    )
+
     trainer = Trainer(train_config)
     trainer.train(param_path=test_dir)
 
     assert os.path.isdir(os.path.join(test_dir, "ckpt"))
+
+
+@pytest.mark.parametrize(
+    ("parallel_mode", "compile_mode", "match"),
+    [
+        pytest.param(
+            "fsdp",
+            None,
+            "Online rollout is not supported.*parallel_mode='fsdp'",
+            id="fsdp",
+        ),
+        pytest.param(
+            "none",
+            "default",
+            "Online rollout with torch.compile is not supported",
+            id="compile",
+        ),
+    ],
+)
+def test_online_rollout_fails_fast_for_unsupported_execution(
+    base_test_env, parallel_mode, compile_mode, match
+):
+    config = _make_train_config(
+        test_dir=base_test_env["test_dir"],
+        model_config=base_test_env["transformer_config"],
+        strategy="online_grpo",
+        strategy_kwargs={"group_size": 2},
+        parallel_mode=parallel_mode,
+        compile_mode=compile_mode,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        TrainContextBuilder(config).build()

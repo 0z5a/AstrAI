@@ -97,11 +97,13 @@ class TrainContextBuilder:
         return self
 
     def build(self) -> TrainContext:
+        executor = self._create_executor()
+        self._validate_rollout_execution(executor)
+
         # Resolve persisted state.
         preloaded_state = self._load_preloaded_state()
 
         # Build the core training components and restore their persisted state.
-        executor = self._create_executor()
         context = self._create_context(preloaded_state, executor)
         self._prepare_model(context, executor, preloaded_state)
         self._restore_optimizer_state(context)
@@ -123,6 +125,24 @@ class TrainContextBuilder:
             grad_accum_steps=cfg.grad_accum_steps,
             **cfg.executor_kwargs,
         )
+
+    def _validate_rollout_execution(self, executor: BaseExecutor) -> None:
+        cfg = self.config
+        if not cfg.strategy.startswith("online_"):
+            return
+
+        capabilities = executor.rollout_capabilities()
+        if not capabilities.supported:
+            detail = f": {capabilities.reason}" if capabilities.reason else ""
+            raise ValueError(
+                "Online rollout is not supported with "
+                f"parallel_mode='{cfg.parallel_mode}'{detail}"
+            )
+        if cfg.compile_mode is not None and not capabilities.supports_compile:
+            raise ValueError(
+                "Online rollout with torch.compile is not supported with "
+                f"parallel_mode='{cfg.parallel_mode}'"
+            )
 
     def _load_preloaded_state(self) -> _PreloadedState:
         cfg = self.config
@@ -312,12 +332,13 @@ class TrainContextBuilder:
                 f"Strategy '{cfg.strategy}' does not support online rollout"
             )
         tokenizer = AutoTokenizer.from_pretrained(self._param_path)
+        rollout_model = context.executor.model_for_inference()
         group_size = strategy_kwargs.get("group_size", 1)
         scheduler = InferenceScheduler(
-            model=context.model,
+            model=rollout_model,
             tokenizer=tokenizer,
             max_batch_size=group_size * max(1, cfg.batch_per_device),
-            max_seq_len=getattr(context.model.config, "max_position_embeddings", None),
+            max_seq_len=getattr(rollout_model.config, "max_position_embeddings", None),
         )
         generator = RolloutGenerator(
             scheduler=scheduler,

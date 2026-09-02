@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -158,9 +159,20 @@ class AccumScheduler:
         return self.scheduler.get_last_lr()
 
 
+@dataclass(frozen=True)
+class RolloutCapabilities:
+    """Executor capabilities required by online rollout."""
+
+    supported: bool
+    supports_compile: bool = False
+    reason: Optional[str] = None
+
+
 class BaseExecutor:
     def __init__(self, grad_accum_steps: int = 1):
         self.gradient_state = GradientState(grad_accum_steps)
+        self._training_model: Optional[nn.Module] = None
+        self._inference_model: Optional[nn.Module] = None
 
     def prepare(
         self,
@@ -174,8 +186,11 @@ class BaseExecutor:
         if before_wrap is not None:
             model = before_wrap(model)
         model = self._prepare_model(model)
+        inference_model = self._prepare_inference_model(model)
         if after_wrap is not None:
             model = after_wrap(model)
+        self._training_model = model
+        self._inference_model = inference_model
         optimizer = None
         scheduler = None
         if optimizer_fn is not None:
@@ -189,6 +204,30 @@ class BaseExecutor:
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
         return model
+
+    def _prepare_inference_model(self, model: nn.Module) -> nn.Module:
+        return model
+
+    def rollout_capabilities(self) -> RolloutCapabilities:
+        return RolloutCapabilities(supported=True)
+
+    def model_for_training(self) -> nn.Module:
+        """Return the executor-owned model used for loss/backward."""
+        if self._training_model is None:
+            raise RuntimeError("Executor model has not been prepared")
+        return self._training_model
+
+    def model_for_inference(self) -> nn.Module:
+        """Return the supported model view used by online rollout."""
+        capabilities = self.rollout_capabilities()
+        if not capabilities.supported:
+            detail = f": {capabilities.reason}" if capabilities.reason else ""
+            raise RuntimeError(
+                f"{type(self).__name__} does not support online rollout{detail}"
+            )
+        if self._inference_model is None:
+            raise RuntimeError("Executor model has not been prepared")
+        return self._inference_model
 
     def _no_sync(self, model: nn.Module):
         return contextlib.nullcontext()
@@ -292,13 +331,25 @@ class DDPExecutor(BaseExecutor):
             logger.warning("DDP backend selected but world_size=1, model not wrapped")
             return model
         local_rank = int(os.environ.get("LOCAL_RANK", get_rank()))
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            **self._ddp_kwargs,
-        )
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+        if device.type == "cpu":
+            model = DDP(model, **self._ddp_kwargs)
+        else:
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                **self._ddp_kwargs,
+            )
         logger.info("Model wrapped with DDP (world_size=%d)", get_world_size())
+        return model
+
+    def _prepare_inference_model(self, model: nn.Module) -> nn.Module:
+        if isinstance(model, DDP):
+            return model.module
         return model
 
     def _no_sync(self, model: nn.Module):
@@ -334,6 +385,15 @@ class FSDPExecutor(BaseExecutor):
         self._mesh = mesh
         self._mp_policy = mp_policy
         self._reshard_after_forward = reshard_after_forward
+
+    def rollout_capabilities(self) -> RolloutCapabilities:
+        return RolloutCapabilities(
+            supported=False,
+            reason=(
+                "FSDP-sharded parameters are not supported by the local "
+                "InferenceScheduler"
+            ),
+        )
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
         if not self.use_distributed:
