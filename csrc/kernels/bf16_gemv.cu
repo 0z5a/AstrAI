@@ -14,7 +14,6 @@ namespace {
 constexpr int kThreads = 256;
 constexpr int kHalfCtaThreads = 128;
 constexpr int kWarpSize = 32;
-constexpr int kWarpTiledThreads = 128;
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -160,120 +159,6 @@ __global__ void bf16_gemv_kernel(
 }
 
 template <int Rows>
-__global__ void bf16_gemv_aligned_warp_tiled_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ weight,
-    const __nv_bfloat16* __restrict__ bias,
-    __nv_bfloat16* __restrict__ output,
-    int n,
-    int k
-) {
-    constexpr int kWarpsPerBlock = kWarpTiledThreads / kWarpSize;
-    const int lane = threadIdx.x & (kWarpSize - 1);
-    const int warp = threadIdx.x / kWarpSize;
-    const int output_index = blockIdx.x * kWarpsPerBlock + warp;
-    if (output_index >= n) {
-        return;
-    }
-
-    // The launcher selects this path only when each row is 16-byte aligned.
-    // Four independent output rows per CTA remove the block-wide reduction
-    // barrier and improve occupancy for the medium LLaMA projection bands.
-    const int vectors = k / 8;
-    const auto* x4 = reinterpret_cast<const uint4*>(x);
-    const auto* w4 = reinterpret_cast<const uint4*>(weight) +
-        static_cast<int64_t>(output_index) * vectors;
-    float sums[Rows] = {};
-    for (int vector = lane; vector < vectors; vector += kWarpSize) {
-        const uint4 wv_raw = w4[vector];
-        const auto* wv = reinterpret_cast<const __nv_bfloat162*>(&wv_raw);
-#pragma unroll
-        for (int row = 0; row < Rows; ++row) {
-            const uint4 xv_raw =
-                x4[static_cast<int64_t>(row) * vectors + vector];
-            const auto* xv = reinterpret_cast<const __nv_bfloat162*>(&xv_raw);
-#pragma unroll
-            for (int pair = 0; pair < 4; ++pair) {
-                sums[row] = fmaf(
-                    __bfloat162float(__low2bfloat16(xv[pair])),
-                    __bfloat162float(__low2bfloat16(wv[pair])),
-                    sums[row]
-                );
-                sums[row] = fmaf(
-                    __bfloat162float(__high2bfloat16(xv[pair])),
-                    __bfloat162float(__high2bfloat16(wv[pair])),
-                    sums[row]
-                );
-            }
-        }
-    }
-
-#pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-        sums[row] = warp_sum(sums[row]);
-        if (lane == 0) {
-            if (bias != nullptr) {
-                sums[row] += __bfloat162float(bias[output_index]);
-            }
-            output[row * n + output_index] = __float2bfloat16_rn(sums[row]);
-        }
-    }
-}
-
-template <int Rows>
-constexpr bool use_warp_tiled_kernel(int n, int k) {
-    // These bands are intentionally narrow and are validated by the common
-    // transformer benchmark. The 256-thread cooperative kernel remains the
-    // fallback for arbitrary K, larger projections, and M=2 (where the
-    // single-warp reduction regresses the current vectorized kernel).
-    if constexpr (Rows == 4) {
-        return (n == 1024 && k == 4096) ||
-            (n == 4096 && k == 4096) ||
-            (n == 11008 && k == 4096) ||
-            (n == 4096 && k == 11008);
-    }
-    return false;
-}
-
-template <int Rows>
-constexpr bool use_half_cta_kernel(int n, int k) {
-    // A 128-thread CTA reduces synchronization and scheduling overhead for
-    // selected medium decode projections. Keep the selector exact: long-K
-    // and bandwidth-saturated shapes regress, and the winning bands differ
-    // materially with the number of reused input rows.
-    if constexpr (Rows == 1) {
-        return n == 8192 && k == 2048;
-    }
-    if constexpr (Rows == 2) {
-        return (n == 4096 && k == 4096) ||
-            (n == 11008 && k == 4096) ||
-            (n == 3584 && k == 3584) ||
-            (n == 2048 && k == 2048) ||
-            (n == 8192 && k == 2048);
-    }
-    if constexpr (Rows == 4) {
-        return (n == 5120 && k == 5120) ||
-            (n == 3584 && k == 3584) ||
-            (n == 2048 && k == 2048) ||
-            (n == 8192 && k == 2048);
-    }
-    if constexpr (Rows == 8) {
-        return (n == 4096 && k == 4096) ||
-            (n == 11008 && k == 4096) ||
-            (n == 4096 && k == 11008) ||
-            (n == 1024 && k == 4096) ||
-            (n == 5120 && k == 5120) ||
-            (n == 512 && k == 3584) ||
-            (n == 3584 && k == 3584) ||
-            (n == 1024 && k == 8192) ||
-            (n == 2048 && k == 2048) ||
-            (n == 8192 && k == 2048) ||
-            (n == 2048 && k == 8192);
-    }
-    return false;
-}
-
-template <int Rows>
 void launch_bf16_gemv(
     const __nv_bfloat16* x,
     const __nv_bfloat16* weight,
@@ -283,26 +168,22 @@ void launch_bf16_gemv(
     int k,
     cudaStream_t stream
 ) {
-    const bool aligned_rows = k % 8 == 0 &&
-        (reinterpret_cast<uintptr_t>(x) & 15u) == 0u &&
-        (reinterpret_cast<uintptr_t>(weight) & 15u) == 0u;
-    if constexpr (Rows == 4) {
-        if (aligned_rows && use_warp_tiled_kernel<Rows>(n, k)) {
-            constexpr int kWarpsPerBlock = kWarpTiledThreads / kWarpSize;
-            const int blocks = (n + kWarpsPerBlock - 1) / kWarpsPerBlock;
-            bf16_gemv_aligned_warp_tiled_kernel<Rows>
-                <<<blocks, kWarpTiledThreads, 0, stream>>>(
+    // Decode is HBM weight-streaming bound: with weights rotated through L2,
+    // 128/256-thread CTAs measure within noise on L20 except for small
+    // weight matrices at the largest decode batch, where the smaller CTA
+    // wins 5-9% (see docs/developer/decode_linear_benchmark.md).
+    constexpr int64_t kSmallWeightLimit = int64_t{12} << 20;
+    if constexpr (Rows == 8) {
+        if (k % 8 == 0 &&
+            (reinterpret_cast<uintptr_t>(x) & 15u) == 0u &&
+            (reinterpret_cast<uintptr_t>(weight) & 15u) == 0u &&
+            static_cast<int64_t>(n) * k <= kSmallWeightLimit) {
+            bf16_gemv_kernel<Rows, kHalfCtaThreads>
+                <<<n, kHalfCtaThreads, 0, stream>>>(
                     x, weight, bias, output, n, k
                 );
             return;
         }
-    }
-    if (aligned_rows && use_half_cta_kernel<Rows>(n, k)) {
-        bf16_gemv_kernel<Rows, kHalfCtaThreads>
-            <<<n, kHalfCtaThreads, 0, stream>>>(
-                x, weight, bias, output, n, k
-            );
-        return;
     }
     bf16_gemv_kernel<Rows, kThreads><<<n, kThreads, 0, stream>>>(
         x, weight, bias, output, n, k
@@ -366,8 +247,6 @@ torch::Tensor bf16_gemv(
     auto output = x.dim() == 1 ? torch::empty({n}, x.options())
                                : torch::empty({m, n}, x.options());
 
-    // Small-N decode shapes (GQA k/v projections) cannot fill the GPU with
-    // one block per output row; split K across extra blocks and reduce.
     const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
     const auto* weight_ptr =
         reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr());

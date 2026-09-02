@@ -14,27 +14,28 @@ selected by guarded model dispatchers described below.
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
-| `bf16_gemv` | `gemv/bf16_gemv.cu` | M=1..8 BF16 linear with FP32 accumulation (sm_80+) |
-| `bf16_swiglu` | `gemv/bf16_swiglu.cu` | Fused M=1..8 BF16 up/gate projections and SwiGLU epilogue (sm_80+) |
+| `bf16_gemv` | `bf16_gemv.cu` | M=1..8 BF16 linear with FP32 accumulation (sm_80+) |
+| `bf16_swiglu` | `bf16_swiglu.cu` | Fused M=1..8 BF16 up/gate projections and SwiGLU epilogue (sm_80+) |
 | `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
 
 ### BF16 GEMV primitive
 
 `astrai.extension.bf16_gemv(x, weight, bias=None)` accepts a contiguous BF16
 input shaped `[K]` or `[M, K]`, with `M` in `[1, 8]` and any positive `K`, and
-row-major weights `[N, K]`. The general path assigns one 256-thread CTA to an
-output row and computes all M results together, reusing the weight row across
-tokens. For measured aligned M=4 medium projections, a 128-thread CTA instead
-assigns one output to each of four warps. That removes the CTA-wide reduction
-barrier and exposes four neighboring outputs without changing accumulation.
+row-major weights `[N, K]`. One CTA computes an output row for all M tokens
+together, reusing the weight row across tokens. CTA size is 256 threads,
+except for small weight matrices (`N*K <= 12 MiB`) at `M=8`, where a
+128-thread CTA measured 5-9% faster on L20. Variant selection is otherwise
+intentionally shape-free: under HBM-streaming conditions (weights rotated
+through L2, as in real decode) the kernel is bandwidth-bound and block-size
+choice measures within noise, so earlier per-shape variant tables were
+removed along with the warp-tiled kernel.
 
 The weight stream uses 128-bit vectorized loads anchored at each row's first
 16-byte-aligned address with scalar head/tail sweeps for unaligned remainders,
-so arbitrary `K` and storage offsets stay correct. The warp-tiled path is used
-only when both tensors and every row are 16-byte aligned; all other calls keep
-the general arbitrary-K path. Accumulation is FP32; the optional BF16 bias is
-fused before the BF16 store. The launcher uses the current CUDA stream, is
-CUDA Graph capture-safe, and requires sm_80 or newer.
+so arbitrary `K` and storage offsets stay correct. Accumulation is FP32; the
+optional BF16 bias is fused before the BF16 store. The launcher uses the
+current CUDA stream, is CUDA Graph capture-safe, and requires sm_80 or newer.
 
 Model `Linear` calls route through the lightweight linear backend. Set
 `ASTRAI_GEMV=0` for an unconditional `F.linear` fallback, `1` to force the

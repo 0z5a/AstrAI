@@ -93,7 +93,7 @@ def test_bf16_gemv_matches_common_transformer_shapes(m, n, k):
         (8, 2048, 8192),
     ],
 )
-def test_bf16_gemv_matches_half_cta_edge_bands(m, n, k):
+def test_bf16_gemv_matches_m8_edge_bands(m, n, k):
     torch.manual_seed(2026 + m + n + k)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     weight = torch.empty(n, k, device="cuda", dtype=torch.bfloat16)

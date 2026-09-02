@@ -70,8 +70,8 @@ set(KERNEL_SRCS
     attention/prefill.cu
     attention/paged_decode.cu
     attention/paged_prefill.cu
-    gemv/bf16_gemv.cu
-    gemv/bf16_swiglu.cu
+    bf16_gemv.cu
+    bf16_swiglu.cu
     rotary_emb.cu
 )
 
