@@ -1,0 +1,103 @@
+{
+  "schema_version": "0.5",
+  "draft": {
+    "id": "astrai-common-shape-bf16-gemv-v1",
+    "revision": 1,
+    "state": "D3-contract-proposed",
+    "created_by": "0z5a"
+  },
+  "target": {
+    "mode": "repository",
+    "repository": "https://github.com/ViperEkura/AstrAI",
+    "revision": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74",
+    "project_profile_sha256": "sha256:953067c47f5298f06846c8fe873db55afae49b6588a81926e49d9ef6b0994e08"
+  },
+  "candidate": {
+    "kind": "git-diff",
+    "revision": "sha256:51e8f7630ff67a623cbb41f055648cd7f5fc1c9650a7da5f9ecbb817d48f88d5",
+    "intent": "add-fastpath",
+    "implementation_kind": "cuda-native",
+    "entrypoints": [
+      "astrai.extension.bf16_gemv",
+      "astrai.extension.backend.linear",
+      "scripts/tools/benchmark_gemv_common.py"
+    ],
+    "operator_family": "dense-gemm",
+    "phase": "inference",
+    "backend": "cuda",
+    "primary_host_candidate": "astrai"
+  },
+  "baseline": {
+    "mode": "target-head",
+    "revision": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74"
+  },
+  "deployment": {
+    "workload_portfolio": {
+      "id": "astrai-common-shape-gemv-chains-v1",
+      "sha256": "sha256:b5752a012369bd216ac45611c91e6ba140f36113be703c44e02240988e6ec089",
+      "path": "docs/benchmarks/gemv_common_chain_l20_sm89.json"
+    },
+    "required_cells": [
+      "cuda-sm89-nvidia-l20"
+    ],
+    "optional_cells": [
+      "cuda-sm80-a100",
+      "cuda-sm90-h100"
+    ],
+    "request_or_step_protocol": {
+      "id": "astrai-gemv-common-benchmark-v1",
+      "sha256": "sha256:113db75a413d558d7cab3de71c72b56ca1932f0a1f5bb790585b07c08a31f42d",
+      "path": "docs/developer/decode_linear_benchmark.md"
+    }
+  },
+  "retrieval": {
+    "enabled": true,
+    "corpus_cutoff": "2026-09-02T09:45:00Z",
+    "sources": [
+      "target-code",
+      "merged-prs",
+      "rejected-prs",
+      "review-comments",
+      "ci-failures"
+    ],
+    "precedent_set_sha256": "sha256:9034271948fd791fb53d5099c2bc246acfd4e27e45926857220b48fd841389b9"
+  },
+  "acceptance_contract": {
+    "status": "proposed",
+    "path": "tests/extension/test_gemv.py,tests/extension/test_linear_dispatch.py",
+    "sha256": "sha256:253af102dda5a2673efaf9bc4d35491d46a52e3fee6baa606a80bc54e0c77cbc",
+    "probe_set_sha256": "sha256:835ff89893c9dc5aefe6b0f3e0c5fddba452b4467745308ac5fe98a5b8238a4d",
+    "hidden_probe_policy_sha256": "sha256:e181380d1b2435c18569629904153feb91bf0494d12d05e353e50c71ebab90bd"
+  },
+  "project_objectives": {
+    "edge_ecosystem_policy": "experimental",
+    "profile_set_sha256": "sha256:b2312952e3b6cf61a527a61806eb39278a1490758e5356436b3b2c36ddffae67"
+  },
+  "benchmark_loop": {
+    "fast_stage_max_official_fraction": 0.05,
+    "affected_stage_max_official_fraction": 0.2,
+    "official_replays": 7,
+    "early_exit_on_hard_gate": true,
+    "affected_case_selection": "required",
+    "benchmark_budget_policy_id": "draft-staged-budget-v0.5",
+    "evidence_policy_id": "v0.4-evidence-ladder-plus-seal-v0.5",
+    "precompile": {
+      "mode": "auto",
+      "trigger": "when-compilation-required",
+      "cache_policy": "content-addressed-evidence-identity",
+      "cache_miss_action": "precompile-before-timed-cases",
+      "timing_phases": [
+        "precompile",
+        "cold-start",
+        "steady-state"
+      ],
+      "steady_state_compile_allowed": false
+    }
+  },
+  "scoring": {
+    "formula_template_id": "project-fit-kernel-v0.5",
+    "provisional_scoring_allowed": true,
+    "official_scoring_requires_seal": true,
+    "project_season": "astrai-2026q3"
+  }
+}

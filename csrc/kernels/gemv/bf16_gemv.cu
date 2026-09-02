@@ -13,6 +13,7 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
+constexpr int kWarpTiledThreads = 128;
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -159,6 +160,82 @@ __global__ void bf16_gemv_kernel(
 }
 
 template <int Rows>
+__global__ void bf16_gemv_aligned_warp_tiled_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output,
+    int n,
+    int k
+) {
+    constexpr int kWarpsPerBlock = kWarpTiledThreads / kWarpSize;
+    const int lane = threadIdx.x & (kWarpSize - 1);
+    const int warp = threadIdx.x / kWarpSize;
+    const int output_index = blockIdx.x * kWarpsPerBlock + warp;
+    if (output_index >= n) {
+        return;
+    }
+
+    // The launcher selects this path only when each row is 16-byte aligned.
+    // Four independent output rows per CTA remove the block-wide reduction
+    // barrier and improve occupancy for the medium LLaMA projection bands.
+    const int vectors = k / 8;
+    const auto* x4 = reinterpret_cast<const uint4*>(x);
+    const auto* w4 = reinterpret_cast<const uint4*>(weight) +
+        static_cast<int64_t>(output_index) * vectors;
+    float sums[Rows] = {};
+    for (int vector = lane; vector < vectors; vector += kWarpSize) {
+        const uint4 wv_raw = w4[vector];
+        const auto* wv = reinterpret_cast<const __nv_bfloat162*>(&wv_raw);
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            const uint4 xv_raw =
+                x4[static_cast<int64_t>(row) * vectors + vector];
+            const auto* xv = reinterpret_cast<const __nv_bfloat162*>(&xv_raw);
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                sums[row] = fmaf(
+                    __bfloat162float(__low2bfloat16(xv[pair])),
+                    __bfloat162float(__low2bfloat16(wv[pair])),
+                    sums[row]
+                );
+                sums[row] = fmaf(
+                    __bfloat162float(__high2bfloat16(xv[pair])),
+                    __bfloat162float(__high2bfloat16(wv[pair])),
+                    sums[row]
+                );
+            }
+        }
+    }
+
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        sums[row] = warp_sum(sums[row]);
+        if (lane == 0) {
+            if (bias != nullptr) {
+                sums[row] += __bfloat162float(bias[output_index]);
+            }
+            output[row * n + output_index] = __float2bfloat16_rn(sums[row]);
+        }
+    }
+}
+
+template <int Rows>
+constexpr bool use_warp_tiled_kernel(int n, int k) {
+    // These bands are intentionally narrow and are validated by the common
+    // transformer benchmark. The 256-thread cooperative kernel remains the
+    // fallback for arbitrary K, larger projections, and M=2 (where the
+    // single-warp reduction regresses the current vectorized kernel).
+    if constexpr (Rows == 4) {
+        return (n == 1024 && k == 4096) ||
+            (n == 4096 && k == 4096) ||
+            (n == 11008 && k == 4096) ||
+            (n == 4096 && k == 11008);
+    }
+    return false;
+}
+
+template <int Rows>
 void launch_bf16_gemv(
     const __nv_bfloat16* x,
     const __nv_bfloat16* weight,
@@ -168,6 +245,20 @@ void launch_bf16_gemv(
     int k,
     cudaStream_t stream
 ) {
+    const bool aligned_rows = k % 8 == 0 &&
+        (reinterpret_cast<uintptr_t>(x) & 15u) == 0u &&
+        (reinterpret_cast<uintptr_t>(weight) & 15u) == 0u;
+    if constexpr (Rows == 4) {
+        if (aligned_rows && use_warp_tiled_kernel<Rows>(n, k)) {
+            constexpr int kWarpsPerBlock = kWarpTiledThreads / kWarpSize;
+            const int blocks = (n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+            bf16_gemv_aligned_warp_tiled_kernel<Rows>
+                <<<blocks, kWarpTiledThreads, 0, stream>>>(
+                    x, weight, bias, output, n, k
+                );
+            return;
+        }
+    }
     bf16_gemv_kernel<Rows><<<n, kThreads, 0, stream>>>(
         x, weight, bias, output, n, k
     );

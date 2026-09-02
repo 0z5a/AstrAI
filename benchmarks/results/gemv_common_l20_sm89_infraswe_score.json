@@ -1,0 +1,122 @@
+{
+  "schema_version": "0.5",
+  "score_kind": "diagnostic-project-fit",
+  "score_is_official": false,
+  "draft_id": "astrai-common-shape-bf16-gemv-v1",
+  "draft_state": "D3-contract-proposed",
+  "formula_template_id": "project-fit-kernel-v0.5",
+  "diagnostic_project_fit_100": 91.68455150382596,
+  "component_values": {
+    "evolutionary_maintainability": 0.8833373508742498,
+    "project_contract_fit": 1.0,
+    "performance_reuse_utilization": 0.9160131161571949,
+    "operational_fit": 0.8215838362577492
+  },
+  "component_floors": {
+    "evolutionary_maintainability": 0.6,
+    "project_contract_fit": 0.6,
+    "performance_reuse_utilization": 0.4,
+    "operational_fit": 0.6
+  },
+  "subcomponent_inputs": {
+    "evolutionary_maintainability": {
+      "evolution": 0.75,
+      "locality": 0.95,
+      "tests": 1.0,
+      "failure": 1.0,
+      "contract": 0.9
+    },
+    "project_contract_fit": {
+      "integration": 1.0,
+      "interface": 1.0,
+      "lifecycle": 1.0,
+      "buildtest": 1.0,
+      "policy": 1.0
+    },
+    "performance_reuse_utilization": {
+      "attainment": 1.0,
+      "coverage": 0.75,
+      "retention": 1.0,
+      "family": 0.9,
+      "compile": 1.0
+    },
+    "operational_fit": {
+      "replay": 0.9,
+      "load": 0.75,
+      "resource": 0.9,
+      "coldsteady": 0.75
+    }
+  },
+  "input_rationale": {
+    "evolution": "The candidate builds on the merged AstrAI GEMV stack and records a rejected M=2 warp-tiling experiment, but has no upstream maintenance history yet.",
+    "locality": "The CUDA change is isolated to one exact-shape M=4 launcher branch; dispatcher, benchmark, tests, and documentation are separately scoped.",
+    "tests": "The complete CPU-capable AstrAI suite passed (613 passed, 141 skipped) and the built L20 extension passed 96 GPU tests.",
+    "failure": "Unaligned K, unsupported M, training/autograd, unmeasured shapes, other architectures, and the sub-threshold LLaMA 2 7B M=4 chain fail closed to the existing path.",
+    "contract": "The benchmark and tests are digest-bound, but the D3 acceptance contract has not received maintainer review or a seal.",
+    "integration": "The fast path remains behind AstrAI's existing bf16_gemv primitive and linear backend.",
+    "interface": "No public signature or environment-variable contract changes; ASTRAI_GEMV modes remain compatible.",
+    "lifecycle": "The path remains inference-only, uses the current CUDA stream, fuses optional bias, and is CUDA Graph safe.",
+    "buildtest": "The SM89 extension built without spills in the added kernel, Ruff format/import checks passed, and both local and L20 tests passed.",
+    "policy": "The candidate adds no dependency and enables automatic dispatch only for measured architecture/M/(N,K) cells.",
+    "attainment": "Every enabled common-shape chain exceeds the 3% gate; the only sub-threshold M=4 family is explicitly excluded.",
+    "coverage": "The required NVIDIA L20/SM89 cell was tested; optional A100/SM80 and H100/SM90 cells remain untested and fall back in auto mode.",
+    "retention": "The exact-shape launcher avoids AstrAI's pre-existing shape bands; their direct benchmark and the regression suite passed.",
+    "family": "Eleven LLaMA 2/3 and GPT-NeoX matrix shapes plus four dependent synthetic chains cover M=2 and M=4, without claiming a whole-model benchmark.",
+    "compile": "AOT CUDA compilation completed before timed cases; no compilation is permitted in steady-state timing.",
+    "replay": "Paired order alternation, warmup, 21 samples, median and p90 are captured, but not seven fresh processes.",
+    "load": "Distinct-weight dependent chains include Python dispatch; a real LLaMA/GPT service workload was not run.",
+    "resource": "GPU5 memory and utilization were checked before and after; the co-resident idle AstrAI service remained allocated and is disclosed.",
+    "coldsteady": "Precompile and steady-state phases are separated, but cold-start latency is not part of the checked-in result."
+  },
+  "benchmark_trust": {
+    "formula_version": "benchmark-trust-v0.5",
+    "status": "scored",
+    "score_100": 95.87315155141826,
+    "components": {
+      "reproducibility": 1.0,
+      "evidence": 1.0,
+      "statistics": 0.9,
+      "environment": 0.9
+    },
+    "failure_codes": [
+      "DRAFT_UNSEALED",
+      "FRESH_PROCESS_REPLAY_INCOMPLETE",
+      "OPTIONAL_CELLS_UNTESTED"
+    ]
+  },
+  "official_project_fit": {
+    "status": "unresolved",
+    "score_100": null,
+    "failure_codes": [
+      "DRAFT_SEAL_MISSING",
+      "FRESH_PROCESS_REPLAYS_BELOW_MINIMUM",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED"
+    ]
+  },
+  "comparison_cell": {
+    "target_project_profile_sha256": "sha256:953067c47f5298f06846c8fe873db55afae49b6588a81926e49d9ef6b0994e08",
+    "target_repository_or_baseline_sha256": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74",
+    "change_intent": "add-fastpath",
+    "semantic_contract_sha256": "sha256:113db75a413d558d7cab3de71c72b56ca1932f0a1f5bb790585b07c08a31f42d",
+    "acceptance_contract_sha256": "sha256:253af102dda5a2673efaf9bc4d35491d46a52e3fee6baa606a80bc54e0c77cbc",
+    "probe_set_sha256": "sha256:835ff89893c9dc5aefe6b0f3e0c5fddba452b4467745308ac5fe98a5b8238a4d",
+    "workload_portfolio_sha256": "sha256:b5752a012369bd216ac45611c91e6ba140f36113be703c44e02240988e6ec089",
+    "performance_target_sha256": "sha256:b2312952e3b6cf61a527a61806eb39278a1490758e5356436b3b2c36ddffae67",
+    "required_deployment_cell_set_sha256": "sha256:6c00c84e931a5ad6fdaa5b4f7d4497c872530c75f8510431aff883006a4a2779",
+    "formula_template_id": "project-fit-kernel-v0.5",
+    "evidence_policy_id": "v0.4-evidence-ladder-plus-seal-v0.5",
+    "project_season": "astrai-2026q3",
+    "cross_project_ranking_allowed": false
+  },
+  "execution": {
+    "infraswe_commit": "811bc775ed5b3a6ec853219245f3469f78818020",
+    "draft_resolution_sha256": "869fa79df766d8499ae3a6c1e4dacfe9f354f6444f4dc8df7dc7684cc177bdf3",
+    "infraswe_draft_engine_tests": "53 passed",
+    "astrai_tests": "613 passed, 141 skipped",
+    "astrai_l20_gpu_tests": "96 passed",
+    "astrai_lint": "ruff format and import-order checks passed",
+    "sm89_build": "bf16_gemv target built successfully; added M=4 kernel used 42 registers, zero barriers, and zero spills"
+  }
+}

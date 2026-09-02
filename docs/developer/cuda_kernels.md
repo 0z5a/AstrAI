@@ -21,15 +21,19 @@ model linear dispatcher described below.
 
 `astrai.extension.bf16_gemv(x, weight, bias=None)` accepts a contiguous BF16
 input shaped `[K]` or `[M, K]`, with `M` in `[1, 8]` and any positive `K`, and
-row-major weights `[N, K]`. One CTA reduces each output row and computes all M
-results together, reusing the weight row across tokens. The weight stream uses
-128-bit vectorized loads anchored at each row's first 16-byte-aligned address
-with scalar head/tail sweeps for unaligned remainders, so arbitrary `K` and
-storage offsets stay correct; x loads are vectorized when every row base is
-16-byte aligned (always true for K % 8 == 0 with allocator-aligned tensors)
-and scalar otherwise. Accumulation is FP32; the optional BF16 bias is fused
-before the BF16 store. The launcher uses the current CUDA stream, is CUDA
-Graph capture-safe, and requires sm_80 or newer.
+row-major weights `[N, K]`. The general path assigns one 256-thread CTA to an
+output row and computes all M results together, reusing the weight row across
+tokens. For measured aligned M=4 medium projections, a 128-thread CTA instead
+assigns one output to each of four warps. That removes the CTA-wide reduction
+barrier and exposes four neighboring outputs without changing accumulation.
+
+The weight stream uses 128-bit vectorized loads anchored at each row's first
+16-byte-aligned address with scalar head/tail sweeps for unaligned remainders,
+so arbitrary `K` and storage offsets stay correct. The warp-tiled path is used
+only when both tensors and every row are 16-byte aligned; all other calls keep
+the general arbitrary-K path. Accumulation is FP32; the optional BF16 bias is
+fused before the BF16 store. The launcher uses the current CUDA stream, is
+CUDA Graph capture-safe, and requires sm_80 or newer.
 
 Model `Linear` calls route through the lightweight linear backend. Set
 `ASTRAI_GEMV=0` for an unconditional `F.linear` fallback, `1` to force the
@@ -38,12 +42,45 @@ architecture/shape bands that pass both the per-shape and end-to-end gates.
 M=1 has no automatic SM89 band because isolated winners did not reach the 3%
 whole-graph gate. Measured SM89 small-M bands are enabled as follows:
 
-| M | Automatic `(N, K)` bands | Engine throughput |
+| M | Automatic `(N, K)` bands | Validated gain |
 |---:|---|---:|
-| 2 | `(256,1536)`, `(1536,1536)`, `(100000,1536)` | +14.0% |
-| 4 | `(256,1536)`, `(1536,1536)` | +11.8% |
+| 2 | AstrAI `(256,1536)`, `(1536,1536)`, `(100000,1536)` plus all common shapes below | +14.0% on AstrAI 1B; +5.66% to +8.50% common chains |
+| 4 | AstrAI `(256,1536)`, `(1536,1536)` plus gated common shapes below | +11.8% on AstrAI 1B; +5.67% to +6.44% common chains |
 
-These A→B→B→A results use the real `InferenceEngine`, including scheduler,
+The common set covers LLaMA 2 7B Q/O, gate/up, and down; LLaMA 3 8B K/V,
+gate/up, and down; LLaMA 2 13B Q/K/V/O, gate/up, and down; and GPT-NeoX MLP
+up/down. In `(N,K)` form it is `(1024,4096)`, `(4096,4096)`,
+`(11008,4096)`, `(4096,11008)`, `(14336,4096)`, `(4096,14336)`,
+`(5120,5120)`, `(13824,5120)`, `(5120,13824)`, `(16384,4096)`, and
+`(4096,16384)`. M=2 enables all eleven. M=4 excludes the three LLaMA 2 7B
+bands `(4096,4096)`, `(11008,4096)`, and `(4096,11008)` because their combined
+projection chain reached only +1.89%, below the 3% automatic-dispatch gate.
+
+On NVIDIA L20 (SM89), the common-shape microbenchmark reports +5.37% to
++114.39% for M=2 and +5.38% to +115.26% for M=4 versus `F.linear`. The paired
+main-versus-warp-tiling run used identical interleaved settings; for the four
+M=4 selected shapes, candidate latency changed from 0.016292 to 0.016108 ms
+for `(4096,4096)`, 0.037939 to 0.028539 ms for `(11008,4096)`, 0.043407 to
+0.039803 ms for `(4096,11008)`, and 0.006697 to 0.006390 ms for
+`(1024,4096)`.
+
+The dependent projection-chain gate, which includes Python dispatch and
+rotates through distinct weights instead of repeatedly warming one matrix,
+measured:
+
+| Synthetic chain | M=2 | M=4 | Row argmax parity |
+|---|---:|---:|---|
+| LLaMA 2 7B | +8.49% | fallback (M=4 bands excluded) | exact |
+| LLaMA 3 8B | +8.50% | +6.44% | exact |
+| LLaMA 2 13B | +5.66% | +5.67% | exact |
+| GPT-NeoX 20B | +6.95% | +5.93% | exact |
+
+These are synthetic projection-chain measurements, not whole-model throughput
+claims. Reproduce them with `scripts/tools/benchmark_gemv_common.py`; the raw
+L20 environment, parameters, timings, and numerical diagnostics live in
+`docs/benchmarks/gemv_common_{kernel,chain}_l20_sm89.json`.
+
+The AstrAI 1B A→B→B→A results use the real `InferenceEngine`, including scheduler,
 sampling, and CUDA Graph. M=8 stays on PyTorch because its remaining
 greedy-stable winners missed the 3% end-to-end gate. Long-K MLP-down bands are
 also excluded because their valid BF16 error changed a checkpoint greedy

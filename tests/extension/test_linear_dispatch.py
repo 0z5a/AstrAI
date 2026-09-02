@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from astrai.extension import explain, is_available, linear, op_backend
 from astrai.extension.backend import linear as public_linear
+from astrai.extension.backend.linear import _AUTO_GEMV_SHAPES
 from astrai.model.components.linear import Linear
 
 GEMV_AVAILABLE = (
@@ -21,6 +22,27 @@ skip_no_gemv = pytest.mark.skipif(
 
 def test_linear_backend_is_public():
     assert linear is public_linear
+
+
+def test_sm89_common_shape_policy_keeps_subthreshold_m4_family_disabled():
+    common = {
+        (1024, 4096),
+        (4096, 4096),
+        (11008, 4096),
+        (4096, 11008),
+        (14336, 4096),
+        (4096, 14336),
+        (5120, 5120),
+        (13824, 5120),
+        (5120, 13824),
+        (16384, 4096),
+        (4096, 16384),
+    }
+    subthreshold_m4 = {(4096, 4096), (11008, 4096), (4096, 11008)}
+    policy = _AUTO_GEMV_SHAPES[(8, 9)]
+    assert common <= policy[2]
+    assert common - subthreshold_m4 <= policy[4]
+    assert subthreshold_m4.isdisjoint(policy[4])
 
 
 def test_model_linear_routes_through_backend(monkeypatch):
@@ -109,10 +131,27 @@ def test_auto_m1_falls_back_until_end_to_end_gate_passes(monkeypatch):
 
 
 @skip_no_gemv
-def test_auto_selects_measured_sm89_small_batch_winner(monkeypatch):
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (4, 256, 1536),
+        (2, 1024, 4096),
+        (2, 11008, 4096),
+        (2, 4096, 11008),
+        (2, 14336, 4096),
+        (4, 4096, 14336),
+        (2, 5120, 5120),
+        (4, 13824, 5120),
+        (2, 5120, 13824),
+        (4, 16384, 4096),
+        (2, 4096, 16384),
+    ],
+)
+def test_auto_selects_measured_sm89_small_batch_winner(monkeypatch, m, n, k):
     monkeypatch.setenv("ASTRAI_GEMV", "auto")
-    x = torch.randn(4, 1536, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(256, 1536, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.empty(n, k, device="cuda", dtype=torch.bfloat16)
+    weight.normal_(mean=0.0, std=0.02)
     with torch.no_grad():
         trace = explain("linear", x, weight)
         if torch.cuda.get_device_capability() == (8, 9):
@@ -133,6 +172,12 @@ def test_auto_selects_measured_sm89_small_batch_winner(monkeypatch):
         (4, 100000, 1536),  # LM head misses the 5% M=4 gate
         (4, 1536, 6912),  # long-K accumulation changed checkpoint greedy output
         (8, 256, 1536),  # remaining M=8 winners miss the 3% end-to-end gate
+        (1, 4096, 4096),  # isolated M=1 winner misses the projection-chain gate
+        (8, 1024, 4096),  # isolated M=8 winner misses the projection-chain gate
+        (4, 12288, 4096),  # GPT-NeoX fused QKV was not measured as a winner
+        (4, 4096, 4096),  # LLaMA 2 7B M=4 chain misses the 3% gate
+        (4, 11008, 4096),
+        (4, 4096, 11008),
     ],
 )
 def test_auto_rejects_measured_small_batch_losers(monkeypatch, m, n, k):
