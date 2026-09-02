@@ -11,6 +11,7 @@ from astrai.extension.backend.attention import (
     attn_backend,
     get_backend,
 )
+from astrai.extension.backend.linear import linear
 from astrai.extension.backend.rotary import apply_rotary_emb
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "attention",
     "attn_backend",
     "get_backend",
+    "linear",
 ]
