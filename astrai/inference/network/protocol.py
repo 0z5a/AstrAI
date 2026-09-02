@@ -146,25 +146,28 @@ class ProtocolHandler:
             yielded = ""
             matched = None
             token_ids: List[int] = []
-            async for token in agen:
-                body += token
+            try:
+                async for token in agen:
+                    body += token
 
-                new_ids = self.engine.tokenizer.encode(token)
-                token_ids.extend(new_ids)
+                    new_ids = self.engine.tokenizer.encode(token)
+                    token_ids.extend(new_ids)
 
-                matched = checker.check(body)
-                if matched:
-                    break
+                    matched = checker.check(body)
+                    if matched:
+                        break
 
-                ctx.completion_tokens += 1
-                for event in self.builder.format_chunk(
-                    token,
-                    body=body,
-                    current_token_ids=token_ids,
-                    delta_token_ids=new_ids,
-                ):
-                    yield event
-                yielded += token
+                    ctx.completion_tokens += 1
+                    for event in self.builder.format_chunk(
+                        token,
+                        body=body,
+                        current_token_ids=token_ids,
+                        delta_token_ids=new_ids,
+                    ):
+                        yield event
+                    yielded += token
+            finally:
+                await agen.aclose()
 
             stop = StopInfo(matched=matched, body=body, yielded=yielded)
             for event in self.builder.format_stream_end(ctx, stop):
@@ -184,14 +187,17 @@ class ProtocolHandler:
         body = ""
         matched = None
 
-        async for token in agen:
-            body += token
+        try:
+            async for token in agen:
+                body += token
 
-            matched = checker.check(body)
-            if matched:
-                break
+                matched = checker.check(body)
+                if matched:
+                    break
 
-            ctx.completion_tokens += 1
+                ctx.completion_tokens += 1
+        finally:
+            await agen.aclose()
 
         stop = StopInfo(matched=matched, body=body)
         return self.builder.format_response(ctx, body, stop)

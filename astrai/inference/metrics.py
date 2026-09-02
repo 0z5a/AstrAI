@@ -1,5 +1,6 @@
 """Unified per-task perf/stats: timing records, context-manager scopes, aggregate reporting."""
 
+import threading
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -125,6 +126,7 @@ class MetricsCollector:
     def __init__(self, max_recent: int = 128):
         self._timings: Dict[str, TaskTiming] = {}
         self._completed: Deque[TaskTiming] = deque(maxlen=max_recent)
+        self._lock = threading.Lock()
 
         self._ttft_ms_sum = 0.0
         self._ttft_ms_count = 0
@@ -135,18 +137,22 @@ class MetricsCollector:
 
     def register(self, task_id: str):
         """Create a timing record for a newly-created task."""
-        self._timings[task_id] = TaskTiming(task_id=task_id, arrival_time=time.time())
+        with self._lock:
+            self._timings[task_id] = TaskTiming(
+                task_id=task_id, arrival_time=time.time()
+            )
 
     def mark_finished(self, task_id: str, input_tokens: int, output_tokens: int):
         """Close timing for a finished/aborted task and move it to completed."""
-        timing = self._timings.pop(task_id, None)
-        if timing is None:
-            return
-        timing.finish_time = time.time()
-        timing.input_tokens = input_tokens
-        timing.output_tokens = output_tokens
-        self._completed.append(timing)
-        self._accumulate(timing)
+        with self._lock:
+            timing = self._timings.pop(task_id, None)
+            if timing is None:
+                return
+            timing.finish_time = time.time()
+            timing.input_tokens = input_tokens
+            timing.output_tokens = output_tokens
+            self._completed.append(timing)
+            self._accumulate(timing)
 
     # timing scopes
 
@@ -158,34 +164,36 @@ class MetricsCollector:
         yield
         toc = time.time()
         dt = toc - tic
-        for tid in task_ids:
-            t = self._timings.get(tid)
-            if t is None:
-                continue
-            if phase == "prefill":
-                t.prefill_start_time = tic
-                t.first_token_time = toc
-            elif phase == "decode":
-                t._decode_steps += 1
-                t._decode_total_s += dt
+        with self._lock:
+            for tid in task_ids:
+                t = self._timings.get(tid)
+                if t is None:
+                    continue
+                if phase == "prefill":
+                    t.prefill_start_time = tic
+                    t.first_token_time = toc
+                elif phase == "decode":
+                    t._decode_steps += 1
+                    t._decode_total_s += dt
 
     # aggregate stats
 
     def get_stats(self) -> Dict[str, Any]:
-        stats: Dict[str, Any] = {}
-        if self._ttft_ms_count > 0:
-            stats["avg_ttft_ms"] = round(self._ttft_ms_sum / self._ttft_ms_count, 2)
-        if self._decode_tps_count > 0:
-            stats["avg_decode_tps"] = round(
-                self._decode_tps_sum / self._decode_tps_count, 2
-            )
-        if self._e2e_ms_count > 0:
-            stats["avg_e2e_latency_ms"] = round(
-                self._e2e_ms_sum / self._e2e_ms_count, 2
-            )
-        if self._completed:
-            stats["recent_tasks"] = [t.to_dict() for t in self._completed]
-        return stats
+        with self._lock:
+            stats: Dict[str, Any] = {"in_flight_tasks": len(self._timings)}
+            if self._ttft_ms_count > 0:
+                stats["avg_ttft_ms"] = round(self._ttft_ms_sum / self._ttft_ms_count, 2)
+            if self._decode_tps_count > 0:
+                stats["avg_decode_tps"] = round(
+                    self._decode_tps_sum / self._decode_tps_count, 2
+                )
+            if self._e2e_ms_count > 0:
+                stats["avg_e2e_latency_ms"] = round(
+                    self._e2e_ms_sum / self._e2e_ms_count, 2
+                )
+            if self._completed:
+                stats["recent_tasks"] = [t.to_dict() for t in self._completed]
+            return stats
 
     # internal
 
