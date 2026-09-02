@@ -187,49 +187,47 @@ class FrequencyPenaltyStrategy(BaseSamplingStrategy):
 
         p = self.penalty
         if isinstance(p, Tensor):
-            p = p.to(logits.device, non_blocking=True).view(-1, 1)
+            p = p.to(logits.device, non_blocking=True).view(-1)
             if (p == 0.0).all():
                 return logits
         elif p == 0.0:
             return logits
 
         input_ids = input_ids.to(logits.device, non_blocking=True)
-
         if input_mask is not None:
             input_mask = input_mask.to(logits.device, non_blocking=True)
-            masked_ids = input_ids.clone()
-            masked_ids[~input_mask] = -1
-        else:
-            masked_ids = input_ids
 
-        batch_sz, seq_len = masked_ids.shape
+        batch_sz = input_ids.shape[0]
         vocab_size = logits.size(-1)
 
-        if isinstance(p, Tensor):
-            penalty_per_row = p.expand(batch_sz, 1)
-        else:
-            penalty_per_row = torch.full(
-                (batch_sz, 1), float(p), device=logits.device, dtype=logits.dtype
-            )
-
-        counts = torch.zeros(
-            batch_sz, vocab_size, device=logits.device, dtype=logits.dtype
+        # Sync-free update: map each history token to a flat
+        # ``row * vocab + token`` bucket (padding to one trailing sentinel
+        # bucket), count with ``index_add_``, and subtract in one
+        # elementwise pass. No nonzero/unique/boolean-mask indexing, so the
+        # hot path never forces a device-host synchronization.
+        row_offsets = (
+            torch.arange(batch_sz, device=logits.device, dtype=torch.long).unsqueeze(1)
+            * vocab_size
         )
-        valid_mask = masked_ids >= 0
-        if valid_mask.any():
-            valid_ids = masked_ids[valid_mask]
-            row_indices = (
-                torch.arange(batch_sz, device=logits.device)
-                .unsqueeze(1)
-                .expand_as(masked_ids)[valid_mask]
+        if input_mask is not None:
+            flat = torch.where(
+                input_mask,
+                row_offsets + input_ids,
+                torch.full_like(input_ids, batch_sz * vocab_size),
             )
-            counts.index_put_(
-                (row_indices, valid_ids),
-                torch.ones_like(valid_ids, dtype=logits.dtype),
-                accumulate=True,
-            )
-
-        return logits - penalty_per_row * counts
+        else:
+            flat = row_offsets + input_ids
+        flat = flat.reshape(-1)
+        counts = torch.zeros(
+            batch_sz * vocab_size + 1, device=logits.device, dtype=torch.float32
+        )
+        counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
+        counts = counts[: batch_sz * vocab_size].view(batch_sz, vocab_size)
+        if isinstance(p, Tensor):
+            deltas = counts * p.to(torch.float32).view(-1, 1)
+        else:
+            deltas = counts * float(p)
+        return logits - deltas.to(logits.dtype)
 
 
 class SamplingPipeline(BaseSamplingStrategy):
