@@ -25,10 +25,13 @@ documentation, and raw benchmark evidence. The required comparison cell is one
 NVIDIA L20 (`sm_89`); optional A100 and H100 cells are explicitly untested.
 Compilation happens before timed cases. The checked-in kernel suite uses 21
 paired/interleaved samples, while the distinct-weight synthetic chains include
-the guarded Python dispatcher. Neither is presented as whole-model throughput.
+the guarded Python dispatcher. The extended portfolio adds Qwen2-7B, LLaMA 3
+70B, and OPT-1.3B shapes at M=1/2/4/8, plus an interleaved
+128-thread-versus-256-thread CTA comparison. Neither suite is presented as
+whole-model throughput.
 
 Applying InfraSWE's frozen `project-fit-kernel-v0.5` formula to the visible
-evidence yields a diagnostic ProjectFit of **91.68/100** and BenchmarkTrust of
+evidence yields a diagnostic ProjectFit of **92.64/100** and BenchmarkTrust of
 **95.87/100**. The machine-readable rationale is
 `benchmarks/results/gemv_common_l20_sm89_infraswe_score.json`. Both numbers are
 non-official: official ProjectFit remains unresolved until the Draft is sealed,

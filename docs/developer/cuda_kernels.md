@@ -39,13 +39,14 @@ Model `Linear` calls route through the lightweight linear backend. Set
 `ASTRAI_GEMV=0` for an unconditional `F.linear` fallback, `1` to force the
 kernel for any supported M in [1, 8], or `auto` (the default) to select only
 architecture/shape bands that pass both the per-shape and end-to-end gates.
-M=1 has no automatic SM89 band because isolated winners did not reach the 3%
-whole-graph gate. Measured SM89 small-M bands are enabled as follows:
+Measured SM89 small-M bands are enabled as follows:
 
 | M | Automatic `(N, K)` bands | Validated gain |
 |---:|---|---:|
-| 2 | AstrAI `(256,1536)`, `(1536,1536)`, `(100000,1536)` plus all common shapes below | +14.0% on AstrAI 1B; +5.66% to +8.50% common chains |
-| 4 | AstrAI `(256,1536)`, `(1536,1536)` plus gated common shapes below | +11.8% on AstrAI 1B; +5.67% to +6.44% common chains |
+| 1 | OPT-1.3B Q/K/V/O and MLP | +4.54% OPT projection chain |
+| 2 | AstrAI `(256,1536)`, `(1536,1536)`, `(100000,1536)` plus all common shapes below | +14.0% on AstrAI 1B; +5.66% to +25.20% common chains |
+| 4 | AstrAI `(256,1536)`, `(1536,1536)` plus gated common shapes below | +11.8% on AstrAI 1B; +5.67% to +7.71% common chains |
+| 8 | none | at least one projection in every measured family missed the per-shape gate |
 
 The common set covers LLaMA 2 7B Q/O, gate/up, and down; LLaMA 3 8B K/V,
 gate/up, and down; LLaMA 2 13B Q/K/V/O, gate/up, and down; and GPT-NeoX MLP
@@ -55,6 +56,24 @@ up/down. In `(N,K)` form it is `(1024,4096)`, `(4096,4096)`,
 `(4096,16384)`. M=2 enables all eleven. M=4 excludes the three LLaMA 2 7B
 bands `(4096,4096)`, `(11008,4096)`, and `(4096,11008)` because their combined
 projection chain reached only +1.89%, below the 3% automatic-dispatch gate.
+
+The extended common set adds Qwen2-7B `(512,3584)`, `(3584,3584)`,
+`(18944,3584)`, and `(3584,18944)`; LLaMA 3 70B `(1024,8192)`,
+`(8192,8192)`, `(28672,8192)`, and `(8192,28672)`; and OPT-1.3B
+`(2048,2048)`, `(8192,2048)`, and `(2048,8192)`. Qwen2 and LLaMA 3 70B are
+enabled at M=2/4. OPT-1.3B is enabled at M=1/2. Other rows retain their
+previous policy or fall back to PyTorch.
+
+Inside the primitive, a templated cooperative kernel uses either 256 threads
+or a shape-gated 128-thread CTA. The smaller CTA is enabled only where an
+interleaved direct-module comparison against the original 256-thread kernel
+cleared 5%: OPT up at M=1; selected LLaMA 2 7B, Qwen2, and OPT projections at
+M=2; LLaMA 2 13B Q/O, Qwen2 Q/O, and selected OPT projections at M=4; and
+selected LLaMA 2, Qwen2, LLaMA 3 KV, and OPT projections at M=8. Confirmed
+direct-kernel gains range from +5.37% to +48.54%. Long-K and saturated shapes
+keep the 256-thread fallback. This internal selector is separate from model
+automatic dispatch, whose Python/wrapper overhead is included in the gates
+above.
 
 On NVIDIA L20 (SM89), the common-shape microbenchmark reports +5.37% to
 +114.39% for M=2 and +5.38% to +115.26% for M=4 versus `F.linear`. The paired
@@ -74,11 +93,20 @@ measured:
 | LLaMA 3 8B | +8.50% | +6.44% | exact |
 | LLaMA 2 13B | +5.66% | +5.67% | exact |
 | GPT-NeoX 20B | +6.95% | +5.93% | exact |
+| Qwen2 7B | +7.48% | +7.48% | exact |
+| LLaMA 3 70B | +7.77% | +7.69% | exact |
+| OPT 1.3B | +25.20% | fallback (M=4 up projection regresses) | exact |
+
+OPT 1.3B M=1 is +4.54%. Qwen2 and LLaMA 3 70B M=1, and all three new
+families at M=8, remain exact PyTorch fallbacks.
 
 These are synthetic projection-chain measurements, not whole-model throughput
 claims. Reproduce them with `scripts/tools/benchmark_gemv_common.py`; the raw
 L20 environment, parameters, timings, and numerical diagnostics live in
-`docs/benchmarks/gemv_common_{kernel,chain}_l20_sm89.json`.
+`docs/benchmarks/gemv_common_{kernel,chain}_l20_sm89.json`. Extended-shape and
+CTA-selection evidence is in
+`gemv_common_extended_{kernel,chain}_l20_sm89.json` and
+`gemv_common_halfcta_vs_256cta_l20_sm89.json` in the same directory.
 
 The AstrAI 1B A→B→B→A results use the real `InferenceEngine`, including scheduler,
 sampling, and CUDA Graph. M=8 stays on PyTorch because its remaining

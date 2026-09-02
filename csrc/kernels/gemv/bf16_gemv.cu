@@ -12,6 +12,7 @@
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kHalfCtaThreads = 128;
 constexpr int kWarpSize = 32;
 constexpr int kWarpTiledThreads = 128;
 
@@ -23,7 +24,7 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
-template <int Rows>
+template <int Rows, int Threads>
 __global__ void bf16_gemv_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ weight,
@@ -37,7 +38,7 @@ __global__ void bf16_gemv_kernel(
     const int warp = threadIdx.x / kWarpSize;
 
     float sums[Rows] = {};
-    __shared__ float warp_sums[Rows][kThreads / kWarpSize];
+    __shared__ float warp_sums[Rows][Threads / kWarpSize];
     // Weight row: scalar head/tail around a 16-byte-aligned uint4 middle so
     // any K is accepted while keeping 128-bit weight loads, which dominate
     // bandwidth on decode shapes. x pairs with scalar loads: it is a tiny
@@ -130,7 +131,6 @@ __global__ void bf16_gemv_kernel(
         }
     }
 
-    
 #pragma unroll
     for (int row = 0; row < Rows; ++row) {
         sums[row] = warp_sum(sums[row]);
@@ -147,7 +147,7 @@ __global__ void bf16_gemv_kernel(
 #pragma unroll
         for (int row = 0; row < Rows; ++row) {
             float sum =
-                lane < (kThreads / kWarpSize) ? warp_sums[row][lane] : 0.0f;
+                lane < (Threads / kWarpSize) ? warp_sums[row][lane] : 0.0f;
             sum = warp_sum(sum);
             if (lane == 0) {
                 if (bias != nullptr) {
@@ -236,6 +236,44 @@ constexpr bool use_warp_tiled_kernel(int n, int k) {
 }
 
 template <int Rows>
+constexpr bool use_half_cta_kernel(int n, int k) {
+    // A 128-thread CTA reduces synchronization and scheduling overhead for
+    // selected medium decode projections. Keep the selector exact: long-K
+    // and bandwidth-saturated shapes regress, and the winning bands differ
+    // materially with the number of reused input rows.
+    if constexpr (Rows == 1) {
+        return n == 8192 && k == 2048;
+    }
+    if constexpr (Rows == 2) {
+        return (n == 4096 && k == 4096) ||
+            (n == 11008 && k == 4096) ||
+            (n == 3584 && k == 3584) ||
+            (n == 2048 && k == 2048) ||
+            (n == 8192 && k == 2048);
+    }
+    if constexpr (Rows == 4) {
+        return (n == 5120 && k == 5120) ||
+            (n == 3584 && k == 3584) ||
+            (n == 2048 && k == 2048) ||
+            (n == 8192 && k == 2048);
+    }
+    if constexpr (Rows == 8) {
+        return (n == 4096 && k == 4096) ||
+            (n == 11008 && k == 4096) ||
+            (n == 4096 && k == 11008) ||
+            (n == 1024 && k == 4096) ||
+            (n == 5120 && k == 5120) ||
+            (n == 512 && k == 3584) ||
+            (n == 3584 && k == 3584) ||
+            (n == 1024 && k == 8192) ||
+            (n == 2048 && k == 2048) ||
+            (n == 8192 && k == 2048) ||
+            (n == 2048 && k == 8192);
+    }
+    return false;
+}
+
+template <int Rows>
 void launch_bf16_gemv(
     const __nv_bfloat16* x,
     const __nv_bfloat16* weight,
@@ -259,7 +297,14 @@ void launch_bf16_gemv(
             return;
         }
     }
-    bf16_gemv_kernel<Rows><<<n, kThreads, 0, stream>>>(
+    if (aligned_rows && use_half_cta_kernel<Rows>(n, k)) {
+        bf16_gemv_kernel<Rows, kHalfCtaThreads>
+            <<<n, kHalfCtaThreads, 0, stream>>>(
+                x, weight, bias, output, n, k
+            );
+        return;
+    }
+    bf16_gemv_kernel<Rows, kThreads><<<n, kThreads, 0, stream>>>(
         x, weight, bias, output, n, k
     );
 }

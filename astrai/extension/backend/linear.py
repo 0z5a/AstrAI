@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 
 # Shape keys are (N, K) for Y[M, N] = X[M, K] @ W[N, K].T. A band is
 # automatic only after both the per-shape >=5% and projection-chain/engine
-# >=3% gates pass and output argmax remains stable. M=1 and M=8 remain empty
-# on SM89; their isolated winners do not consistently survive the chain gate.
+# >=3% gates pass and output argmax remains stable. M=1 is limited to OPT 1.3B;
+# M=8 remains empty because at least one projection in each measured family
+# misses the per-shape gate even when its aggregate chain result is positive.
 _COMMON_TRANSFORMER_SM89_SHAPES = frozenset(
     {
         (1024, 4096),  # LLaMA 3 8B K/V
@@ -53,10 +54,37 @@ _COMMON_TRANSFORMER_SM89_M4_SHAPES = _COMMON_TRANSFORMER_SM89_SHAPES - {
     (11008, 4096),
     (4096, 11008),
 }
+_QWEN2_7B_SM89_SHAPES = frozenset(
+    {
+        (512, 3584),  # K/V
+        (3584, 3584),  # Q/O
+        (18944, 3584),  # gate/up
+        (3584, 18944),  # down
+    }
+)
+_LLAMA3_70B_SM89_SHAPES = frozenset(
+    {
+        (1024, 8192),  # K/V
+        (8192, 8192),  # Q/O
+        (28672, 8192),  # gate/up
+        (8192, 28672),  # down
+    }
+)
+_OPT_1_3B_SM89_SHAPES = frozenset(
+    {
+        (2048, 2048),  # Q/K/V/O
+        (8192, 2048),  # MLP up
+        (2048, 8192),  # MLP down
+    }
+)
 
 _AUTO_GEMV_SHAPES: dict[tuple[int, int], dict[int, frozenset[tuple[int, int]]]] = {
     (8, 9): {
+        1: _OPT_1_3B_SM89_SHAPES,
         2: _COMMON_TRANSFORMER_SM89_SHAPES
+        | _QWEN2_7B_SM89_SHAPES
+        | _LLAMA3_70B_SM89_SHAPES
+        | _OPT_1_3B_SM89_SHAPES
         | frozenset(
             {
                 (256, 1536),
@@ -64,7 +92,10 @@ _AUTO_GEMV_SHAPES: dict[tuple[int, int], dict[int, frozenset[tuple[int, int]]]] 
                 (100000, 1536),
             }
         ),
-        4: _COMMON_TRANSFORMER_SM89_M4_SHAPES | frozenset({(256, 1536), (1536, 1536)}),
+        4: _COMMON_TRANSFORMER_SM89_M4_SHAPES
+        | _QWEN2_7B_SM89_SHAPES
+        | _LLAMA3_70B_SM89_SHAPES
+        | frozenset({(256, 1536), (1536, 1536)}),
     }
 }
 _AUTO_GEMV_M = frozenset(

@@ -24,7 +24,7 @@ def test_linear_backend_is_public():
     assert linear is public_linear
 
 
-def test_sm89_common_shape_policy_keeps_subthreshold_m4_family_disabled():
+def test_sm89_common_shape_policy_keeps_only_validated_families_enabled():
     common = {
         (1024, 4096),
         (4096, 4096),
@@ -39,10 +39,28 @@ def test_sm89_common_shape_policy_keeps_subthreshold_m4_family_disabled():
         (4096, 16384),
     }
     subthreshold_m4 = {(4096, 4096), (11008, 4096), (4096, 11008)}
+    qwen2_7b = {
+        (512, 3584),
+        (3584, 3584),
+        (18944, 3584),
+        (3584, 18944),
+    }
+    llama3_70b = {
+        (1024, 8192),
+        (8192, 8192),
+        (28672, 8192),
+        (8192, 28672),
+    }
+    opt_1_3b = {(2048, 2048), (8192, 2048), (2048, 8192)}
     policy = _AUTO_GEMV_SHAPES[(8, 9)]
+    assert policy[1] == opt_1_3b
     assert common <= policy[2]
+    assert qwen2_7b | llama3_70b | opt_1_3b <= policy[2]
     assert common - subthreshold_m4 <= policy[4]
+    assert qwen2_7b | llama3_70b <= policy[4]
     assert subthreshold_m4.isdisjoint(policy[4])
+    assert opt_1_3b.isdisjoint(policy[4])
+    assert 8 not in policy
 
 
 def test_model_linear_routes_through_backend(monkeypatch):
@@ -115,7 +133,7 @@ def test_mode_one_dispatches_supported_small_batches(monkeypatch, m):
 
 
 @skip_no_gemv
-def test_auto_m1_falls_back_until_end_to_end_gate_passes(monkeypatch):
+def test_auto_unmeasured_m1_falls_back(monkeypatch):
     monkeypatch.setenv("ASTRAI_GEMV", "auto")
     x = torch.randn(1, 1536, device="cuda", dtype=torch.bfloat16)
     winning = torch.randn(
@@ -145,6 +163,17 @@ def test_auto_m1_falls_back_until_end_to_end_gate_passes(monkeypatch):
         (2, 5120, 13824),
         (4, 16384, 4096),
         (2, 4096, 16384),
+        (2, 512, 3584),
+        (4, 3584, 3584),
+        (2, 18944, 3584),
+        (4, 3584, 18944),
+        (2, 1024, 8192),
+        (4, 8192, 8192),
+        (2, 28672, 8192),
+        (4, 8192, 28672),
+        (1, 2048, 2048),
+        (2, 8192, 2048),
+        (1, 2048, 8192),
     ],
 )
 def test_auto_selects_measured_sm89_small_batch_winner(monkeypatch, m, n, k):
@@ -178,6 +207,12 @@ def test_auto_selects_measured_sm89_small_batch_winner(monkeypatch, m, n, k):
         (4, 4096, 4096),  # LLaMA 2 7B M=4 chain misses the 3% gate
         (4, 11008, 4096),
         (4, 4096, 11008),
+        (1, 3584, 3584),  # Qwen2 M=1 chain misses the 3% gate
+        (8, 3584, 3584),  # Qwen2 Q/O misses the M=8 per-shape gate
+        (1, 8192, 8192),  # LLaMA 3 70B M=1 projections miss the per-shape gate
+        (8, 1024, 8192),  # LLaMA 3 70B K/V loses at wrapper level for M=8
+        (4, 8192, 2048),  # OPT up loses at wrapper level for M=4
+        (8, 2048, 2048),  # OPT M=8 chain and Q/K/V/O both regress
     ],
 )
 def test_auto_rejects_measured_small_batch_losers(monkeypatch, m, n, k):

@@ -36,6 +36,7 @@ class Chain:
     kv: int
     intermediate: int
     fused_qkv: bool = False
+    gated_mlp: bool = True
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,17 @@ TRADITIONAL_SHAPES = (
     Shape("llama2_13b_down", 5120, 13824),
     Shape("gpt_neox_up", 16384, 4096),
     Shape("gpt_neox_down", 4096, 16384),
+    Shape("qwen2_7b_kv", 512, 3584),
+    Shape("qwen2_7b_qo", 3584, 3584),
+    Shape("qwen2_7b_up_gate", 18944, 3584),
+    Shape("qwen2_7b_down", 3584, 18944),
+    Shape("llama3_70b_kv", 1024, 8192),
+    Shape("llama3_70b_qo", 8192, 8192),
+    Shape("llama3_70b_up_gate", 28672, 8192),
+    Shape("llama3_70b_down", 8192, 28672),
+    Shape("opt_1_3b_qkvo", 2048, 2048),
+    Shape("opt_1_3b_up", 8192, 2048),
+    Shape("opt_1_3b_down", 2048, 8192),
 )
 
 CHAINS = (
@@ -71,6 +83,9 @@ CHAINS = (
     Chain("llama3_8b", 4096, 1024, 14336),
     Chain("llama2_13b", 5120, 5120, 13824),
     Chain("gpt_neox_20b", 4096, 4096, 16384, fused_qkv=True),
+    Chain("qwen2_7b", 3584, 512, 18944),
+    Chain("llama3_70b", 8192, 1024, 28672),
+    Chain("opt_1_3b", 2048, 2048, 8192, gated_mlp=False),
 )
 
 
@@ -197,6 +212,12 @@ def benchmark_kernels(
         shapes = TRADITIONAL_SHAPES
     else:
         shapes = ASTRAI_SHAPES + TRADITIONAL_SHAPES
+    if args.shape_label:
+        requested = set(args.shape_label)
+        shapes = tuple(shape for shape in shapes if shape.label in requested)
+        missing = requested - {shape.label for shape in shapes}
+        if missing:
+            raise ValueError(f"unknown shape labels: {', '.join(sorted(missing))}")
 
     results: list[dict[str, object]] = []
     for shape in shapes:
@@ -254,27 +275,31 @@ def _chain_weights(
                 "q": _weight(spec.hidden, spec.hidden, device, std),
                 "k": _weight(spec.kv, spec.hidden, device, std),
                 "v": _weight(spec.kv, spec.hidden, device, std),
-                "gate": _weight(spec.intermediate, spec.hidden, device, std),
             }
         )
+        if spec.gated_mlp:
+            weights["gate"] = _weight(spec.intermediate, spec.hidden, device, std)
     return weights
 
 
 def _chain_fn(
-    x: torch.Tensor, weights: dict[str, torch.Tensor], fused_qkv: bool
+    x: torch.Tensor, weights: dict[str, torch.Tensor], spec: Chain
 ) -> Callable[[], torch.Tensor]:
     def run() -> torch.Tensor:
         output_projection = linear(x, weights["o"])
         up = linear(x, weights["up"])
-        if fused_qkv:
+        if spec.fused_qkv:
             attention_projection = linear(x, weights["qkv"])[..., : x.shape[-1]]
             hidden = F.gelu(up)
         else:
             attention_projection = linear(x, weights["q"])
             linear(x, weights["k"])
             linear(x, weights["v"])
-            gate = linear(x, weights["gate"])
-            hidden = F.silu(gate) * up
+            if spec.gated_mlp:
+                gate = linear(x, weights["gate"])
+                hidden = F.silu(gate) * up
+            else:
+                hidden = F.gelu(up)
         down = linear(hidden, weights["down"])
         return attention_projection + output_projection + down
 
@@ -285,15 +310,22 @@ def benchmark_chains(
     args: argparse.Namespace, device: torch.device
 ) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
-    for spec in CHAINS:
+    chains = CHAINS
+    if args.chain_label:
+        requested = set(args.chain_label)
+        chains = tuple(chain for chain in chains if chain.label in requested)
+        missing = requested - {chain.label for chain in chains}
+        if missing:
+            raise ValueError(f"unknown chain labels: {', '.join(sorted(missing))}")
+    for spec in chains:
         weights = _chain_weights(spec, device, args.weight_std)
         for m in args.m:
             x = torch.randn((m, spec.hidden), device=device, dtype=torch.bfloat16)
-            run = _chain_fn(x, weights, spec.fused_qkv)
+            run = _chain_fn(x, weights, spec)
             with torch.inference_mode():
                 _set_mode("0")
                 reference = run()
-                _set_mode("auto")
+                _set_mode(args.candidate_mode)
                 actual = run()
                 baseline, candidate = _measure_pair(
                     run,
@@ -302,7 +334,7 @@ def benchmark_chains(
                     samples=args.samples,
                     inner=args.chain_inner,
                     prepare_baseline=lambda: _set_mode("0"),
-                    prepare_candidate=lambda: _set_mode("auto"),
+                    prepare_candidate=lambda: _set_mode(args.candidate_mode),
                 )
             results.append(
                 _print_result(
@@ -333,11 +365,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--m", type=int, nargs="+", choices=(1, 2, 4, 8), default=(1, 2, 4, 8)
     )
+    parser.add_argument(
+        "--shape-label",
+        action="append",
+        help="limit the kernel suite to one or more named shape labels",
+    )
+    parser.add_argument(
+        "--chain-label",
+        action="append",
+        help="limit the chain suite to one or more named model families",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--samples", type=int, default=9)
     parser.add_argument("--inner", type=int, default=100)
     parser.add_argument("--chain-inner", type=int, default=20)
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("auto", "1"),
+        default="auto",
+        help="dispatcher mode for the candidate side of the chain suite",
+    )
     parser.add_argument("--weight-std", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=20260902)
     parser.add_argument(
@@ -379,6 +427,12 @@ def main() -> None:
                 "cuda": torch.version.cuda,
             },
             "parameters": {
+                "suite": args.suite,
+                "family": args.family,
+                "m": args.m,
+                "shape_labels": args.shape_label,
+                "chain_labels": args.chain_label,
+                "candidate_mode": args.candidate_mode,
                 "seed": args.seed,
                 "weight_std": args.weight_std,
                 "warmup": args.warmup,

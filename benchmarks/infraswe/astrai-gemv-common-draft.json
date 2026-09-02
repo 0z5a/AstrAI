@@ -2,19 +2,19 @@
   "schema_version": "0.5",
   "draft": {
     "id": "astrai-common-shape-bf16-gemv-v1",
-    "revision": 1,
+    "revision": 2,
     "state": "D3-contract-proposed",
     "created_by": "0z5a"
   },
   "target": {
     "mode": "repository",
     "repository": "https://github.com/ViperEkura/AstrAI",
-    "revision": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74",
+    "revision": "sha256:59c45de7cb0356e9661cfb73d38bd11c888a8b8d564e9123a90c9fa3910cc498",
     "project_profile_sha256": "sha256:953067c47f5298f06846c8fe873db55afae49b6588a81926e49d9ef6b0994e08"
   },
   "candidate": {
     "kind": "git-diff",
-    "revision": "sha256:51e8f7630ff67a623cbb41f055648cd7f5fc1c9650a7da5f9ecbb817d48f88d5",
+    "revision": "sha256:d9ae3993caf937517b121d4fe855f2c5172cf38f69aa4bda10bbb8daad52a730",
     "intent": "add-fastpath",
     "implementation_kind": "cuda-native",
     "entrypoints": [
@@ -29,13 +29,13 @@
   },
   "baseline": {
     "mode": "target-head",
-    "revision": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74"
+    "revision": "sha256:59c45de7cb0356e9661cfb73d38bd11c888a8b8d564e9123a90c9fa3910cc498"
   },
   "deployment": {
     "workload_portfolio": {
       "id": "astrai-common-shape-gemv-chains-v1",
-      "sha256": "sha256:b5752a012369bd216ac45611c91e6ba140f36113be703c44e02240988e6ec089",
-      "path": "docs/benchmarks/gemv_common_chain_l20_sm89.json"
+      "sha256": "sha256:c3cf734200844d7b8308a4803f456cd9a3f0d7e19839e7d3e74778f6d1307e4d",
+      "path": "docs/benchmarks/gemv_common_extended_chain_l20_sm89.json"
     },
     "required_cells": [
       "cuda-sm89-nvidia-l20"
@@ -46,7 +46,7 @@
     ],
     "request_or_step_protocol": {
       "id": "astrai-gemv-common-benchmark-v1",
-      "sha256": "sha256:113db75a413d558d7cab3de71c72b56ca1932f0a1f5bb790585b07c08a31f42d",
+      "sha256": "sha256:74808a77e551ffa5f77e3256930f2647ebd080828cfdbdcc2770f9d1fa298ff6",
       "path": "docs/developer/decode_linear_benchmark.md"
     }
   },
@@ -65,13 +65,13 @@
   "acceptance_contract": {
     "status": "proposed",
     "path": "tests/extension/test_gemv.py,tests/extension/test_linear_dispatch.py",
-    "sha256": "sha256:253af102dda5a2673efaf9bc4d35491d46a52e3fee6baa606a80bc54e0c77cbc",
-    "probe_set_sha256": "sha256:835ff89893c9dc5aefe6b0f3e0c5fddba452b4467745308ac5fe98a5b8238a4d",
-    "hidden_probe_policy_sha256": "sha256:e181380d1b2435c18569629904153feb91bf0494d12d05e353e50c71ebab90bd"
+    "sha256": "sha256:15ffa9e1378d7cb1b06f018f9e1aac16bf56f14446271d51129f86c13f3827bb",
+    "probe_set_sha256": "sha256:beafc95a2a4aaa587079f1938db8c0fb115d63c2b0c3b185debc9a6132397653",
+    "hidden_probe_policy_sha256": "sha256:e6bdf6b5a307c9ebdaf643d18ae88b51c6e554d7d9df4427c2f7ba0eb5cc8e93"
   },
   "project_objectives": {
     "edge_ecosystem_policy": "experimental",
-    "profile_set_sha256": "sha256:b2312952e3b6cf61a527a61806eb39278a1490758e5356436b3b2c36ddffae67"
+    "profile_set_sha256": "sha256:22da954f941ba912f60d79b7a58121436d4ba97e64f0182f66b8274080c3a75a"
   },
   "benchmark_loop": {
     "fast_stage_max_official_fraction": 0.05,
