@@ -2,8 +2,9 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Literal, Optional
 
 from tokenizers.decoders import DecodeStream
 
@@ -14,6 +15,16 @@ if TYPE_CHECKING:
     from astrai.extension import AttentionBackend
 
 STOP = object()
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    """Structured terminal result for one synchronous generation request."""
+
+    token_ids: List[int]
+    logprobs: List[float]
+    finish_reason: Literal["stop", "length", "cancelled", "rejected"]
+    error_reason: Optional[str] = None
 
 
 class StreamDecoder:
