@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
+import astrai.trainer.train_context as train_context
 from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.rollout import BaseRewardModel
@@ -87,8 +88,19 @@ _ONLINE_STRATEGIES = [
 
 @pytest.mark.integration
 @pytest.mark.parametrize(("strategy", "strategy_kwargs"), _ONLINE_STRATEGIES)
-def test_online_rollout_end_to_end(base_test_env, strategy, strategy_kwargs):
+def test_online_rollout_end_to_end(
+    base_test_env, strategy, strategy_kwargs, monkeypatch
+):
     """Run one epoch of online RL rollout with KV-cache-backed generation."""
+    created_reference_models = []
+    create_ref_model = train_context.create_ref_model
+
+    def track_reference_model(*args, **kwargs):
+        created_reference_models.append(strategy)
+        return create_ref_model(*args, **kwargs)
+
+    monkeypatch.setattr(train_context, "create_ref_model", track_reference_model)
+
     test_dir = base_test_env["test_dir"]
     device = base_test_env["device"]
     tokenizer = base_test_env["tokenizer"]
@@ -126,3 +138,4 @@ def test_online_rollout_end_to_end(base_test_env, strategy, strategy_kwargs):
     trainer.train(param_path=test_dir)
 
     assert os.path.isdir(os.path.join(test_dir, "ckpt"))
+    assert len(created_reference_models) == 1
