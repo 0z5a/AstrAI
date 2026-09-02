@@ -105,6 +105,10 @@ handle the call, inference raises an error rather than silently switching.
 
 `CudaBackend` prefill path: writes K/V, then calls `attn_paged_prefill` — a ragged-batch (paged) prefill kernel that reads K/V directly from the flat pool via `req_to_token`, addressing each request's `q_len`/`kv_len` through `qo_indptr` and `kv_indptr`. No explicit K/V gather needed.
 
+The scheduler packs requests with the same prefix-cache start position and
+attention backend into one prefill forward even when their prompt lengths differ.
+Requests with different prefix hit lengths remain separate batches.
+
 Fallback: when `CudaBackend` cannot handle an input (wrong dtype or head_dim), `FlashAttnBackend` is tried next (if installed), then `TorchNativeBackend`.
 
 This fallback is performed by the public `attention(...)` policy entry point
