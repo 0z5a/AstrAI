@@ -162,6 +162,17 @@ example with `clip_eps_low=0.2` and `clip_eps_high=0.28`. Offline callers that
 do not provide `logprobs_old` must sync `old_model` weights via
 `sync_old_model()` between data-generation rounds.
 
+`loss_aggregation="token"` (the default) divides by the total number of valid
+response tokens, matching DAPO's token-level policy-gradient loss. Set it to
+`"sequence"` to first average each response and then weight responses equally,
+matching the original GRPO reduction for controlled ablations.
+
+DAPO soft overlong shaping is enabled by setting `overlong_max_len` and a
+positive `overlong_buffer_len`. If $L$ is the valid response length, the added
+reward is zero through $L_{max}-L_{buffer}$, falls linearly to -1 at $L_{max}$,
+and is multiplied by `overlong_penalty_scale`. It is disabled by default and
+does not alter the reward-model output in place.
+
 Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
 `logprobs_old` (required when `old_model` is not configured).
 

@@ -566,6 +566,10 @@ class GRPOStrategy(BaseStrategy):
         clip_eps_high: Optional[float] = None,
         kl_coef: float = 0.01,
         group_size: int = 4,
+        loss_aggregation: str = "token",
+        overlong_max_len: Optional[int] = None,
+        overlong_buffer_len: int = 0,
+        overlong_penalty_scale: float = 1.0,
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
@@ -585,6 +589,15 @@ class GRPOStrategy(BaseStrategy):
             raise ValueError(
                 "clip_eps_high must be greater than or equal to clip_eps_low"
             )
+        if loss_aggregation not in {"token", "sequence"}:
+            raise ValueError("loss_aggregation must be 'token' or 'sequence'")
+        self.loss_aggregation = loss_aggregation
+        self.overlong_max_len, self.overlong_buffer_len = (
+            self._validate_overlong_window(overlong_max_len, overlong_buffer_len)
+        )
+        self.overlong_penalty_scale = self._validate_non_negative_real(
+            overlong_penalty_scale, "overlong_penalty_scale"
+        )
         self.kl_coef = kl_coef
         self.group_size = group_size
 
@@ -597,6 +610,65 @@ class GRPOStrategy(BaseStrategy):
             interval = "[0, 1)" if upper else "[0, infinity)"
             raise ValueError(f"{name} must be finite and in {interval}")
         return value
+
+    @staticmethod
+    def _validate_non_negative_real(value: float, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError(f"{name} must be a real number")
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
+        return value
+
+    @staticmethod
+    def _validate_overlong_window(
+        max_len: Optional[int], buffer_len: int
+    ) -> tuple[Optional[int], int]:
+        if max_len is None:
+            if buffer_len != 0:
+                raise ValueError(
+                    "overlong_buffer_len requires overlong_max_len to be set"
+                )
+            return None, 0
+        if isinstance(max_len, bool) or not isinstance(max_len, int) or max_len <= 0:
+            raise ValueError("overlong_max_len must be a positive integer or None")
+        if (
+            isinstance(buffer_len, bool)
+            or not isinstance(buffer_len, int)
+            or buffer_len <= 0
+            or buffer_len > max_len
+        ):
+            raise ValueError(
+                "overlong_buffer_len must be a positive integer no greater "
+                "than overlong_max_len"
+            )
+        return max_len, buffer_len
+
+    def _reduce_token_loss(self, loss: Tensor, mask: Tensor) -> Tensor:
+        """Reduce response-token losses with GRPO or DAPO weighting."""
+        mask = mask.float()
+        if self.loss_aggregation == "token":
+            return (loss * mask).sum() / mask.sum().clamp(min=1.0)
+
+        lengths = mask.sum(dim=-1)
+        valid_sequences = lengths > 0
+        per_sequence = (loss * mask).sum(dim=-1) / lengths.clamp(min=1.0)
+        return (per_sequence * valid_sequences).sum() / valid_sequences.sum().clamp(
+            min=1
+        )
+
+    def _shape_overlong_rewards(
+        self, rewards: Tensor, token_masks: Tensor
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        if self.overlong_max_len is None:
+            return rewards, None
+
+        lengths = token_masks.sum(dim=-1)
+        penalty_start = self.overlong_max_len - self.overlong_buffer_len
+        penalty = ((penalty_start - lengths) / self.overlong_buffer_len).clamp(
+            min=-1.0, max=0.0
+        )
+        return rewards + self.overlong_penalty_scale * penalty, penalty
 
     def sync_old_model(self):
         """Copy current policy weights to old model."""
@@ -694,6 +766,7 @@ class GRPOStrategy(BaseStrategy):
 
         # Group-normalized advantages from scalar per-response rewards.
         eps = 1e-8
+        rewards, overlong_penalty = self._shape_overlong_rewards(rewards, token_masks)
         mean = rewards.mean(dim=-1, keepdim=True)
         std = rewards.std(dim=-1, keepdim=True, unbiased=False)
         advantages = (rewards - mean) / (std + eps)
@@ -714,20 +787,33 @@ class GRPOStrategy(BaseStrategy):
             * advantages
         )
         per_token_policy_loss = -torch.min(surr1, surr2)
-        token_count = token_masks.sum().clamp(min=1.0)
-        policy_loss = (per_token_policy_loss * token_masks).sum() / token_count
+        policy_loss = self._reduce_token_loss(per_token_policy_loss, token_masks)
+        clip_fraction = self._reduce_token_loss(
+            (
+                (ratio < 1 - self.clip_eps_low) | (ratio > 1 + self.clip_eps_high)
+            ).float(),
+            token_masks,
+        )
 
         # KL penalty to frozen reference model with k1 estimator (non-negative):
         # k1 = π_ref / π_θ - log(π_ref / π_θ) - 1, where π_ref / π_θ = exp(log_ref - log_policy).
         log_ref_ratio = token_log_probs_ref - token_log_probs_policy
         r = torch.exp(log_ref_ratio)
         kl_per_token = r - torch.log(r + eps) - 1.0
-        kl_penalty = self.kl_coef * (kl_per_token * token_masks).sum() / token_count
+        kl_penalty = self.kl_coef * self._reduce_token_loss(kl_per_token, token_masks)
 
         task_loss = policy_loss + kl_penalty
+        metrics = {
+            "policy_loss": policy_loss,
+            "kl_loss": kl_penalty,
+            "clip_fraction": clip_fraction,
+        }
+        if overlong_penalty is not None:
+            metrics["overlong_penalty_mean"] = overlong_penalty.mean()
+            metrics["overlong_fraction"] = (overlong_penalty < 0).float().mean()
         return self._loss_output(
             task_loss,
-            {"policy_loss": policy_loss, "kl_loss": kl_penalty},
+            metrics,
             aux_loss,
             policy_output.get("router_stats"),
         )

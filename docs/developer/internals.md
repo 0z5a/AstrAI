@@ -89,6 +89,9 @@ Where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the per-toke
 Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. Optional
 `clip_eps_low`/`clip_eps_high` values enable DAPO-style asymmetric clipping;
 unset values inherit `clip_eps` for backward-compatible symmetric clipping.
+The `loss_aggregation` switch selects token-level DAPO weighting or equal
+sequence weighting. Optional `overlong_max_len`/`overlong_buffer_len` settings
+add the DAPO linear soft-overlong penalty before group advantage normalization.
 
 ### MoE Load Balancing
 
