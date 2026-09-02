@@ -26,6 +26,7 @@ from astrai.extension.backend import (
     attention,
     attn_backend,
     get_backend,
+    linear,
 )
 from astrai.extension.dispatch import (
     Axes,
@@ -49,6 +50,7 @@ from astrai.extension.ops import (
     attn_decode,
     attn_paged_decode,
     attn_prefill,
+    bf16_gemv,
 )
 
 __all__ = [
@@ -62,9 +64,11 @@ __all__ = [
     "attention",
     "attn_backend",
     "get_backend",
+    "linear",
     "attn_decode",
     "attn_paged_decode",
     "attn_prefill",
+    "bf16_gemv",
     "is_available",
     "KERNEL_NAMES",
     "apply_rotary_emb",
