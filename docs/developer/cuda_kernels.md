@@ -1,6 +1,9 @@
 # CUDA Kernels
 
-AstrAI includes optional custom CUDA kernels for attention, rotary embedding, and FP8 GEMM. These are built when `nvcc` is available and CUDA is detected, and are dispatched via the `CudaBackend` attention backend, auto-dispatched for rotary, or invoked through the FP8 linear primitives.
+AstrAI includes optional custom CUDA kernels for attention, rotary embedding,
+BF16 GEMV, and FP8 GEMM. These are built when `nvcc` is available and CUDA is
+detected. BF16 GEMV is a directly callable primitive and does not change model
+linear dispatch.
 
 ## Overview
 
@@ -11,7 +14,20 @@ AstrAI includes optional custom CUDA kernels for attention, rotary embedding, an
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
+| `bf16_gemv` | `gemv/bf16_gemv.cu` | M=1 BF16 linear with FP32 accumulation (sm_80+) |
 | `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
+
+### BF16 GEMV primitive
+
+`astrai.extension.bf16_gemv(x, weight, bias=None)` accepts a contiguous BF16
+input shaped `[K]` or `[1, K]` and row-major weights `[N, K]`. One CTA reduces
+each output row using vectorized `__nv_bfloat162` loads and FP32 accumulation;
+the optional BF16 bias is fused before the BF16 store. The launcher uses the
+current CUDA stream, is CUDA Graph capture-safe, and requires sm_80 or newer.
+
+The primitive is inference-only and deliberately has no `F.linear` fallback or
+model-level dispatch. Dispatch is added separately only for shape bands with a
+measured win over each architecture's own cuBLAS baseline.
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -202,6 +218,7 @@ astrai/extension/
 ├── ops/
 │   ├── attention.py        # Stateless attention kernel wrappers
 │   ├── rotary.py           # Stateless rotary kernel wrapper
+│   ├── gemv.py             # Stateless BF16 GEMV primitive
 │   └── fp8.py              # Stateless FP8 primitives (custom_op)
 ├── fp8.py                  # FP8 strategy layer (fp8_autocast, recipes)
 └── backend/
