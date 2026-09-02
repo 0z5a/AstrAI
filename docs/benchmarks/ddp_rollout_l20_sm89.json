@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "astrai-ddp-online-rollout-l20-sm89-v2",
+  "benchmark_type": "correctness-deadlock-and-regression",
+  "candidate": "multi-process DDP online rollout through DDPExecutor.model_for_inference",
+  "baseline_revision": "d4a292b36b32614030c4fb9bc6937684320b1a87",
+  "environment": {
+    "accelerator": "NVIDIA L20",
+    "gpu_indices": [0, 1],
+    "accelerator_count": 2,
+    "compute_capability": "8.9",
+    "memory_mib_per_gpu": 46068,
+    "driver": "570.86.10",
+    "cuda_runtime": "12.8",
+    "pytorch": "2.11.0+cu128",
+    "python": "3.12.3",
+    "process_group": "NCCL",
+    "world_size": 2
+  },
+  "build": {
+    "status": "not_run",
+    "reason": "The cu128 runtime image did not contain nvcc or a native build toolchain, so the source-mounted native extensions could not be rebuilt in this isolated worktree.",
+    "scope_used_for_regression": "Python and torch-native paths; tests/extension excluded from the clean L20 regression run"
+  },
+  "multi_rank_correctness_probe": {
+    "status": "pass",
+    "test": "tests/trainer/test_rollout_executor_boundary.py::test_l20_multi_rank_rollout_can_diverge_before_ddp_training",
+    "wrapper": "torch.nn.parallel.DistributedDataParallel",
+    "backend": "torch_native",
+    "cuda_graph": false,
+    "rollout_forwards": "deliberately divergent across ranks (2 generated tokens on rank 0, 3 on rank 1)",
+    "assertions": [
+      "rollout uses each rank's collective-free DDP.module inference view",
+      "the following wrapped DDP forward/backward/optimizer step completes",
+      "parameters change and remain bitwise-identical across both replicas",
+      "post-update deterministic generation agrees across ranks"
+    ]
+  },
+  "online_grpo_workload": {
+    "status": "pass",
+    "test": "tests/trainer/test_online_e2e.py::test_ddp_online_grpo_end_to_end",
+    "batch_per_device": 1,
+    "group_size": 2,
+    "max_new_tokens": 4,
+    "optimizer_steps_per_rank": 20,
+    "checkpoint_assertion": "epoch_0_step_20 exists"
+  },
+  "fresh_process_replays_seconds": [9.23, 9.18, 8.66, 9.06, 9.34],
+  "fresh_process_replay_statistics": {
+    "count": 5,
+    "mean_seconds": 9.094,
+    "median_seconds": 9.18,
+    "sample_standard_deviation_seconds": 0.2626404,
+    "coefficient_of_variation_percent": 2.888,
+    "minimum_seconds": 8.66,
+    "maximum_seconds": 9.34,
+    "interpretation": "Stability evidence only; no throughput or latency improvement is claimed."
+  },
+  "test_results": {
+    "l20_focused": "9 passed in 26.96s",
+    "l20_multi_rank_core": "1 passed in 5.62s",
+    "l20_non_extension_regression": "577 passed in 59.26s",
+    "l20_source_mount_full_attempt": "646 passed, 191 skipped, 9 failed in 84.70s; all 9 failures were native-extension imports unavailable in the unbuilt source mount",
+    "local_full": "638 passed, 208 skipped, 1 warning in 12.02s"
+  },
+  "negative_contracts": [
+    "multi-process online rollout without parallel_mode='ddp' is rejected during TrainConfig validation",
+    "online rollout with torch.compile is rejected before scheduler construction",
+    "distributed FSDP online rollout is rejected because its parameters are sharded"
+  ],
+  "limitations": [
+    "No throughput or latency improvement is claimed by this correctness change.",
+    "The test model and 20-step GRPO workload are intentionally small and validate lifecycle correctness rather than production-model scaling.",
+    "Distributed FSDP rollout remains explicitly unsupported rather than materializing a replicated inference copy.",
+    "The isolated cu128 runtime image could not rebuild native extensions; the clean L20 regression result therefore excludes tests/extension."
+  ]
+}
