@@ -107,7 +107,6 @@ def _axes(
         x_contiguous=x.is_contiguous(),
         weight_contiguous=weight.is_contiguous(),
         bias_supported=bias_supported,
-        k_even=k is not None and k % 2 == 0,
     )
 
 
@@ -122,7 +121,6 @@ _SPEC_CAPABLE = (
     & axis("x_contiguous").truthy()
     & axis("weight_contiguous").truthy()
     & axis("bias_supported").truthy()
-    & axis("k_even").truthy()
 )
 
 _SPEC_AUTO = _SPEC_CAPABLE & Spec.of(
@@ -166,7 +164,6 @@ def _gemv_capable(x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> bool:
         or x.ndim not in (1, 2)
         or (x.ndim == 2 and not 1 <= x.shape[0] <= 8)
         or x.shape[-1] != weight.shape[1]
-        or weight.shape[1] % 2 != 0
         or x.device != weight.device
         or not x.is_contiguous()
         or not weight.is_contiguous()

@@ -97,6 +97,21 @@ def test_bf16_gemv_cuda_graph_replay():
 
 
 @skip_no_gemv
+@pytest.mark.parametrize("n,k", [(64, 7), (64, 12), (33, 100), (256, 1534)])
+def test_bf16_gemv_handles_unaligned_k(n, k):
+    torch.manual_seed(29)
+    x = torch.randn(k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    actual = bf16_gemv(x, weight)
+    expected = F.linear(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.25)
+
+    x3 = torch.randn(3, k, device="cuda", dtype=torch.bfloat16)
+    actual3 = bf16_gemv(x3, weight)
+    torch.testing.assert_close(actual3, F.linear(x3, weight), rtol=0.02, atol=0.5)
+
+
+@skip_no_gemv
 def test_bf16_gemv_small_batch_cuda_graph_replay():
     torch.manual_seed(31)
     x = torch.randn(8, 1536, device="cuda", dtype=torch.bfloat16)
@@ -124,13 +139,6 @@ def test_bf16_gemv_small_batch_cuda_graph_replay():
                 torch.randn(8, 16, device="cuda", dtype=torch.bfloat16),
             ),
             "M must",
-        ),
-        (
-            lambda: (
-                torch.randn(15, device="cuda", dtype=torch.bfloat16),
-                torch.randn(8, 15, device="cuda", dtype=torch.bfloat16),
-            ),
-            "even",
         ),
         (
             lambda: (
