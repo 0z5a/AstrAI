@@ -459,7 +459,7 @@ def test_rollout_runner_publishes_cache_before_concurrent_policy_update(device):
         nonlocal validation_calls
         validation_calls += 1
         original_validate(result, live_version=live_version)
-        if validation_calls == 2:
+        if validation_calls == 3:
             final_validation_started.set()
             assert allow_final_validation_to_finish.wait(timeout=5)
 
@@ -501,6 +501,58 @@ def test_rollout_runner_publishes_cache_before_concurrent_policy_update(device):
 def test_rollout_runner_derives_default_policy_lag_from_interval(device):
     runner, _ = _make_runner(device, rollout_interval=4)
     assert runner.max_policy_lag == 3
+
+
+def _interleave_before_snapshot(runner, callback):
+    """Wrap ``with_policy_snapshot`` so ``callback`` runs just before a
+    named snapshot callback enters the generator/scheduler locks."""
+    original_snapshot = runner.generator.with_policy_snapshot
+
+    def wrapper(inspect):
+        if inspect.__name__ == "reuse":
+            callback()
+        return original_snapshot(inspect)
+
+    runner.generator.with_policy_snapshot = wrapper
+
+
+def test_rollout_runner_reuse_reads_cache_inside_the_snapshot(device):
+    """The reuse decision must observe the cache under the policy snapshot
+    (regression: the cache was read outside the lock, so a concurrent
+    commit between the read and the lock silently handed the trainer a
+    stale rollout — a lost update)."""
+    import dataclasses
+
+    runner, _ = _make_runner(device, rollout_interval=100)
+    batch = _make_instruction_batch(n=1)
+    first, _ = runner(batch)
+    assert first.policy_version == 0
+
+    def concurrent_refresh():
+        runner.update_weights(1)
+        runner._cache = dataclasses.replace(first, policy_version=1)
+        runner._steps_since_rollout = 0
+
+    _interleave_before_snapshot(runner, concurrent_refresh)
+    result, fresh = runner(batch)
+    assert fresh is False
+    assert result is not first
+    assert result.policy_version == 1
+
+
+def test_rollout_runner_recovers_when_cache_cleared_before_reuse_snapshot(device):
+    """A cache clear between the reuse decision and the snapshot must
+    trigger a fresh rollout instead of an assertion failure (regression:
+    ``assert cached is not None`` fired because the object was captured
+    outside the lock)."""
+    runner, _ = _make_runner(device, rollout_interval=100)
+    batch = _make_instruction_batch(n=1)
+    first, _ = runner(batch)
+
+    _interleave_before_snapshot(runner, runner.clear_cache)
+    result, fresh = runner(batch)
+    assert fresh is True
+    assert result is not first
 
 
 @pytest.mark.parametrize(

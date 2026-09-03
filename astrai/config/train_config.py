@@ -234,4 +234,15 @@ class TrainConfig(BaseConfig):
                     f"numbers of forward passes and desynchronize the "
                     f"ddp/fsdp collectives, deadlocking NCCL"
                 )
+            if (
+                self.rollout_max_policy_lag is not None
+                and self.rollout_max_policy_lag < self.rollout_interval - 1
+            ):
+                raise ValueError(
+                    f"rollout_max_policy_lag={self.rollout_max_policy_lag} "
+                    f"cannot be below rollout_interval - 1 = "
+                    f"{self.rollout_interval - 1}: the replay cache reuses "
+                    f"rollouts up to that lag, so a tighter bound guarantees "
+                    f"a fatal RolloutVersionError mid-training"
+                )
         return self

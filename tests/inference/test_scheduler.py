@@ -583,6 +583,32 @@ def test_scheduler_applies_weight_mutation_and_version_atomically(device):
         with pytest.raises(RuntimeError, match="optimizer failed"):
             scheduler.apply_weight_update(2, failed_mutation)
         assert scheduler.policy_version == 1
+
+        # None derives live+1 under the lock: no read-compute-write race
+        # on the current version for advance-by-one callers.
+        assert scheduler.apply_weight_update(None, mutate) == "updated"
+        assert scheduler.policy_version == 2
+    finally:
+        scheduler.stop()
+
+
+def test_scheduler_atomic_advance_survives_interleaved_publish(device):
+    """A concurrent publish between reading the live version and applying
+    the update must not fail ``require_advance`` (regression: callers
+    computed live+1 outside the lock, a TOCTOU that raised spuriously)."""
+    scheduler, _tok, _model = _make_real_scheduler(device)
+
+    try:
+        # Simulate the race directly: a version read that goes stale before
+        # apply_weight_update acquires the lock. With None the scheduler
+        # re-derives live+1 inside the critical section.
+        stale_read = scheduler.policy_version + 1
+        scheduler.update_weights(1)
+        assert stale_read == 1  # now equals live -> explicit form would raise
+        with pytest.raises(ValueError, match="must advance"):
+            scheduler.apply_weight_update(stale_read, lambda: "ok")
+        assert scheduler.apply_weight_update(None, lambda: "ok") == "ok"
+        assert scheduler.policy_version == 2
     finally:
         scheduler.stop()
 

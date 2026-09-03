@@ -170,6 +170,26 @@ torch::Tensor bf16_swiglu(
             gate_weight.is_contiguous(),
         "x and weights must be contiguous"
     );
+    // The kernel loads all three streams as uint4; contiguous-but-offset
+    // views would fault with an opaque "misaligned address" CUDA error, so
+    // reject them here with an actionable message.
+    TORCH_CHECK(
+        (reinterpret_cast<uintptr_t>(x.data_ptr()) & 15u) == 0u,
+        "bf16_swiglu requires 16-byte aligned x (storage_offset must keep "
+        "data_ptr divisible by 16); clone the tensor or use the torch path"
+    );
+    TORCH_CHECK(
+        (reinterpret_cast<uintptr_t>(up_weight.data_ptr()) & 15u) == 0u,
+        "bf16_swiglu requires 16-byte aligned up_weight (storage_offset "
+        "must keep data_ptr divisible by 16); clone the tensor or use the "
+        "torch path"
+    );
+    TORCH_CHECK(
+        (reinterpret_cast<uintptr_t>(gate_weight.data_ptr()) & 15u) == 0u,
+        "bf16_swiglu requires 16-byte aligned gate_weight (storage_offset "
+        "must keep data_ptr divisible by 16); clone the tensor or use the "
+        "torch path"
+    );
     TORCH_CHECK(
         !x.requires_grad() && !up_weight.requires_grad() &&
             !gate_weight.requires_grad(),

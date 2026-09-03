@@ -40,6 +40,11 @@ def _swiglu_capable(x: Tensor, up_weight: Tensor, gate_weight: Tensor) -> bool:
         or not x.is_contiguous()
         or not up_weight.is_contiguous()
         or not gate_weight.is_contiguous()
+        # The fused kernel reads all streams as uint4; contiguous-but-offset
+        # views are routed to the unfused chain instead of failing.
+        or (x.data_ptr() & 15) != 0
+        or (up_weight.data_ptr() & 15) != 0
+        or (gate_weight.data_ptr() & 15) != 0
         or not is_available("bf16_swiglu")
     )
 

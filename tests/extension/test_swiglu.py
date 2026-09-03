@@ -97,3 +97,16 @@ def test_bf16_swiglu_uses_current_stream_and_cuda_graph():
 def test_bf16_swiglu_rejects_unsupported_inputs(make_args, error):
     with pytest.raises(RuntimeError, match=error):
         bf16_swiglu(*make_args())
+
+
+@skip_no_swiglu
+def test_bf16_swiglu_rejects_misaligned_storage_with_clear_error():
+    """Contiguous-but-offset views must fail the wrapper's TORCH_CHECK with
+    an actionable message instead of a sticky CUDA misaligned-address error
+    (regression: the kernel casts x directly to uint4 without checking)."""
+    k = 1536
+    base = torch.randn(k + 1, device="cuda", dtype=torch.bfloat16)
+    x = base[1:]  # +2 bytes: contiguous but not 16B-aligned
+    weights = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        bf16_swiglu(x, weights, weights)

@@ -144,3 +144,38 @@ def test_online_rollout_end_to_end(
     checkpoint = Checkpoint.load(checkpoint_dir)
     assert checkpoint.meta["policy_version"] == 2
     assert len(created_reference_models) == 1
+
+
+def _minimal_online_config(**overrides):
+    """A TrainConfig for online GRPO that only needs field overrides."""
+    defaults = dict(
+        strategy="online_grpo",
+        model_fn=lambda: torch.nn.Linear(2, 2),
+        dataset=InstructionDataset(),
+        optimizer_fn=lambda m: torch.optim.SGD(m.parameters(), lr=0.0),
+        scheduler_fn=lambda o: SchedulerFactory.create(
+            "cosine", o, warmup_steps=1, lr_decay_steps=4, min_rate=0.05
+        ),
+        reward_model_fn=LengthRewardModel,
+    )
+    defaults.update(overrides)
+    return TrainConfig(**defaults)
+
+
+def test_online_config_rejects_contradictory_policy_lag():
+    """rollout_max_policy_lag below rollout_interval - 1 guarantees a fatal
+    RolloutVersionError mid-training; it must fail at config time instead."""
+    with pytest.raises(ValueError, match="rollout_max_policy_lag=0"):
+        _minimal_online_config(rollout_interval=3, rollout_max_policy_lag=0)
+
+    # lag == interval - 1 (including the derived default) stays valid.
+    config = _minimal_online_config(rollout_interval=3, rollout_max_policy_lag=2)
+    assert config.rollout_max_policy_lag == 2
+    config = _minimal_online_config(rollout_interval=3)
+    assert config.rollout_max_policy_lag is None
+
+    # Offline strategies never consult the rollout window.
+    config = _minimal_online_config(
+        strategy="sft", rollout_interval=3, rollout_max_policy_lag=0
+    )
+    assert config.rollout_max_policy_lag == 0

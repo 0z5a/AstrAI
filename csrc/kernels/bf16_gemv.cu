@@ -52,15 +52,18 @@ __global__ void bf16_gemv_kernel(
     const int wtail_start = whead + wvecs * 8;
     const uint4* __restrict__ w4 = reinterpret_cast<const uint4*>(wrow + whead);
 
-    // x chunks pair element-for-element with the aligned weight middle. When
-    // K % 8 == 0 every x row base shares the weight alignment, so one pure
-    // uint4 loop covers all rows (the production case: head/tail empty, no
-    // branching inside the loop). Otherwise per-row uint4 loads are not
-    // 16-byte addressable, and scalar x pairing keeps the kernel correct for
-    // any K while the weight stream stays vectorized.
+    // x chunks pair element-for-element with the aligned weight middle:
+    // the uint4 view is rooted at ``x + whead`` (16-byte aligned by the
+    // branch guard), and each row strides by ``k / 8`` vectors because its
+    // first middle element sits ``whead`` scalars past ``row * k``. When
+    // K % 8 == 0 and the weight row is already aligned (whead == 0, the
+    // production case) this reduces to one pure uint4 loop with an empty
+    // head/tail. Otherwise per-row uint4 loads are not 16-byte addressable,
+    // and scalar x pairing keeps the kernel correct for any K while the
+    // weight stream stays vectorized.
     if (k % 8 == 0 &&
         ((reinterpret_cast<uintptr_t>(x) + 2u * static_cast<unsigned>(whead)) & 15u) == 0u) {
-        const auto* x4 = reinterpret_cast<const uint4*>(x);
+        const auto* x4 = reinterpret_cast<const uint4*>(x + whead);
         for (int v = threadIdx.x; v < wvecs; v += blockDim.x) {
             const uint4 wv_raw = w4[v];
             const auto* wv =
@@ -68,7 +71,7 @@ __global__ void bf16_gemv_kernel(
 #pragma unroll
             for (int row = 0; row < Rows; ++row) {
                 const uint4 xv_raw =
-                    x4[(static_cast<int64_t>(row) * wvecs) + v];
+                    x4[(static_cast<int64_t>(row) * (k / 8)) + v];
                 const auto* xv =
                     reinterpret_cast<const __nv_bfloat162*>(&xv_raw);
 #pragma unroll

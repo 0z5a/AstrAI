@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from astrai.extension import is_available, linear
 from astrai.extension.backend import linear as public_linear
+from astrai.extension.dispatch import explain, op_backend, resolve
 
 # The package attribute ``linear`` is the dispatched function; reach the
 # module object explicitly for monkeypatching its private helpers.
@@ -166,3 +167,60 @@ def test_dispatched_linear_cuda_graph_replay(monkeypatch):
         graph.replay()
         expected = F.linear(x, weight)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.25)
+
+
+def test_linear_family_is_registered_with_shared_dispatcher():
+    from astrai.extension.dispatch import _FAMILIES
+
+    assert "linear" in _FAMILIES
+    x = torch.randn(2, 8)
+    weight = torch.randn(4, 8)
+    resolution = resolve("linear", x, weight)
+    assert resolution.record.family == "linear"
+    assert resolution.origin in ("chain", "fallback")
+    assert "linear" in explain("linear", x, weight)
+
+
+@skip_no_gemv
+def test_ops_env_override_forces_torch_for_capable_call(monkeypatch):
+    """ASTR_OPS=linear=torch must keep working after the M-band rewrite
+    (regression: the family was silently dropped from the dispatcher, so
+    the override warned, fell through, and the gemv kernel still ran)."""
+    monkeypatch.setenv("ASTR_OPS", "linear=torch")
+    x = torch.randn(2, 1536, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(1536, 1536, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        assert not _routes_to_gemv(monkeypatch, x, weight)
+        torch.testing.assert_close(
+            linear(x, weight), F.linear(x, weight), rtol=0.02, atol=0.25
+        )
+
+
+@skip_no_gemv
+def test_ops_env_override_forces_gemv(monkeypatch):
+    monkeypatch.setenv("ASTR_OPS", "linear=gemv")
+    x = torch.randn(1, 1536, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, 1536, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        # M=1 is outside the auto band but inside the forced gemv record.
+        assert _routes_to_gemv(monkeypatch, x, weight)
+
+
+@skip_no_gemv
+def test_op_backend_context_selects_torch(monkeypatch):
+    monkeypatch.setenv("ASTRAI_GEMV", "1")
+    x = torch.randn(2, 1536, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, 1536, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad(), op_backend(linear="torch"):
+        assert not _routes_to_gemv(monkeypatch, x, weight)
+        torch.testing.assert_close(
+            linear(x, weight), F.linear(x, weight), rtol=0.02, atol=0.25
+        )
+    # The override is scoped: the forced mode applies again afterwards.
+    with torch.no_grad():
+        assert _routes_to_gemv(monkeypatch, x, weight)
+
+
+def test_op_backend_rejects_unknown_linear_handle():
+    with pytest.raises(ValueError, match="Unknown linear implementation"):
+        op_backend(linear="nonexistent").__enter__()

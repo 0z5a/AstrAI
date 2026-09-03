@@ -95,3 +95,22 @@ def test_auto_uses_unfused_chain_until_shape_is_qualified(monkeypatch):
         actual = swiglu(x, up_weight, gate_weight)
         expected = reference_swiglu(x, up_weight, gate_weight)
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.1)
+
+
+@skip_no_swiglu
+def test_mode_one_falls_back_for_misaligned_storage(monkeypatch):
+    """Contiguous-but-offset views must route to the unfused torch chain
+    even with ASTRAI_SWIGLU=1 instead of reaching the uint4-only kernel
+    (regression: the fused primitive faulted with a misaligned-address
+    CUDA error for such inputs)."""
+    monkeypatch.setenv("ASTRAI_SWIGLU", "1")
+    k = 1536
+    x_base = torch.randn(2 * k + 8, device="cuda", dtype=torch.bfloat16) * 0.1
+    x = x_base[1 : 1 + 2 * k].view(2, k)
+    assert x.is_contiguous() and (x.data_ptr() & 15) != 0
+    up_weight = torch.randn(64, k, device="cuda", dtype=torch.bfloat16) * 0.02
+    gate_weight = torch.randn_like(up_weight)
+    with torch.no_grad():
+        actual = swiglu(x, up_weight, gate_weight)
+        expected = reference_swiglu(x, up_weight, gate_weight)
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.01)

@@ -147,8 +147,15 @@ class RolloutGenerator:
         with self._weight_lock:
             return self.scheduler.update_weights(policy_version)
 
-    def apply_weight_update(self, policy_version: int, update: Callable[[], T]) -> T:
-        """Apply a shared-model mutation at an atomic generation boundary."""
+    def apply_weight_update(
+        self, policy_version: Optional[int], update: Callable[[], T]
+    ) -> T:
+        """Apply a shared-model mutation at an atomic generation boundary.
+
+        ``policy_version=None`` lets the scheduler derive ``live + 1`` under
+        the policy lock, closing the read-compute-write race for callers
+        that only need to advance by one.
+        """
         with self._weight_lock:
             return self.scheduler.apply_weight_update(policy_version, update)
 
@@ -424,7 +431,9 @@ class RolloutRunner:
         """Publish the shared policy's new version to the rollout backend."""
         return self.generator.update_weights(policy_version)
 
-    def apply_weight_update(self, policy_version: int, update: Callable[[], T]) -> T:
+    def apply_weight_update(
+        self, policy_version: Optional[int], update: Callable[[], T]
+    ) -> T:
         """Apply a model update and publish its version as one operation."""
         return self.generator.apply_weight_update(policy_version, update)
 
@@ -502,35 +511,43 @@ class RolloutRunner:
         """Return ``(cached or fresh) RolloutResult`` plus an ``is_fresh`` flag.
 
         Triggers a new rollout when ``_steps_since_rollout >= rollout_interval``
-        or when the cache is empty.
+        or when the cache is empty. The reuse decision, its version
+        validation, and the returned object are all captured inside one
+        policy snapshot, so a concurrent commit, refresh, or cache clear
+        can never hand out an object the snapshot has already invalidated.
         """
         cache_key = self._batch_key(batch)
-        if (
-            self._cache is None
-            or cache_key != self._cache_key
-            or self._steps_since_rollout >= self.rollout_interval
-        ):
-            raw = self.generator.generate(batch)
-            self._validate_policy_version(raw)
-            scored = self._score(raw)
 
-            def commit(live_version: int) -> Tuple[RolloutResult, bool]:
-                self._validate_policy_version(scored, live_version=live_version)
-                self._cache = scored
-                self._cache_key = cache_key
-                self._steps_since_rollout = 0
-                return scored, True
-
-            # A weight update cannot land between the final version check and
-            # cache publication. Reward scoring itself intentionally remains
-            # outside the policy lock because it may call an external service.
-            return self.generator.with_policy_snapshot(commit)
-
-        cached = self._cache
-        assert cached is not None
-
-        def reuse(live_version: int) -> Tuple[RolloutResult, bool]:
+        def reuse(live_version: int) -> Optional[Tuple[RolloutResult, bool]]:
+            cached = self._cache
+            if (
+                cached is None
+                or self._cache_key != cache_key
+                or self._steps_since_rollout >= self.rollout_interval
+            ):
+                return None
             self._validate_policy_version(cached, live_version=live_version)
             return cached, False
 
-        return self.generator.with_policy_snapshot(reuse)
+        outcome = self.generator.with_policy_snapshot(reuse)
+        if outcome is not None:
+            return outcome
+
+        raw = self.generator.generate(batch)
+        self._validate_policy_version(raw)
+        scored = self._score(raw)
+        # Post-scoring check: reward scoring may call slow external services;
+        # surface an over-lag policy move before the commit critical section.
+        self._validate_policy_version(scored)
+
+        def commit(live_version: int) -> Tuple[RolloutResult, bool]:
+            self._validate_policy_version(scored, live_version=live_version)
+            self._cache = scored
+            self._cache_key = cache_key
+            self._steps_since_rollout = 0
+            return scored, True
+
+        # A weight update cannot land between the final version check and
+        # cache publication. Reward scoring itself intentionally remains
+        # outside the policy lock because it may call an external service.
+        return self.generator.with_policy_snapshot(commit)

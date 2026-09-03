@@ -176,11 +176,21 @@ class InferenceScheduler:
         return self._commit_weight_version(policy_version)
 
     @_with_weight_lock
-    def apply_weight_update(self, policy_version: int, update: Callable[[], T]) -> T:
-        """Mutate shared weights and publish their version without generation."""
+    def apply_weight_update(
+        self, policy_version: Optional[int], update: Callable[[], T]
+    ) -> T:
+        """Mutate shared weights and publish their version without generation.
+
+        ``policy_version=None`` derives ``live + 1`` under the same lock, for
+        callers that only need "advance by one" (e.g. ``optimizer.step()``)
+        without a read-compute-write race on the current version.
+        """
         if not callable(update):
             raise TypeError("update must be callable")
-        self._validate_weight_version(policy_version, require_advance=True)
+        if policy_version is None:
+            policy_version = self._policy_version + 1
+        else:
+            self._validate_weight_version(policy_version, require_advance=True)
         self._ensure_weight_update_ready()
 
         result = update()

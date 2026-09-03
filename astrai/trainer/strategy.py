@@ -292,8 +292,9 @@ class BaseStrategy(ABC):
         if self._rollout_runner is None:
             return optimizer.step()
 
-        next_version = self.policy_version + 1
-        result = self._rollout_runner.apply_weight_update(next_version, optimizer.step)
+        # None lets the scheduler derive live+1 under the policy lock,
+        # avoiding a read-compute-write race on policy_version.
+        result = self._rollout_runner.apply_weight_update(None, optimizer.step)
         self._rollout_runner.step()
         return result
 

@@ -130,6 +130,7 @@ def test_bf16_gemv_small_batch_fuses_bias():
 def test_bf16_gemv_uses_current_stream():
     x = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(256, 1536, device="cuda", dtype=torch.bfloat16)
+    torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         actual = bf16_gemv(x, weight)
@@ -169,6 +170,43 @@ def test_bf16_gemv_handles_unaligned_k(n, k):
     x3 = torch.randn(3, k, device="cuda", dtype=torch.bfloat16)
     actual3 = bf16_gemv(x3, weight)
     torch.testing.assert_close(actual3, F.linear(x3, weight), rtol=0.02, atol=0.5)
+
+
+@skip_no_gemv
+@pytest.mark.parametrize("m", [1, 2, 3, 4])
+def test_bf16_gemv_accepts_complementary_misalignment(m):
+    """Misaligned weight rows plus an x base chosen so the vectorized branch
+    is entered with a non-16B-aligned ``x`` pointer (regression: the branch
+    guard checked ``x + whead`` alignment but the uint4 view was rooted at
+    ``x`` itself, faulting with a misaligned-address CUDA error)."""
+    torch.manual_seed(37)
+    n, k = 256, 1536
+    # offset 5 elements = +10 bytes: weight rows land at 10 % 16 (whead=3)
+    # and x at 10 % 16, so (x + 2*whead) % 16 == 0 selects the fast path.
+    big_w = torch.randn(n * k + 8, device="cuda", dtype=torch.bfloat16)
+    weight = big_w[5 : 5 + n * k].view(n, k)
+    big_x = torch.randn(m * k + 8, device="cuda", dtype=torch.bfloat16)
+    x = big_x[5 : 5 + m * k].view(m, k) if m > 1 else big_x[5 : 5 + k]
+    assert (x.data_ptr() & 15) == 10 and (weight.data_ptr() & 15) == 10
+
+    actual = bf16_gemv(x, weight)
+    expected = F.linear(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.5 if m > 1 else 0.25)
+
+
+@skip_no_gemv
+def test_bf16_gemv_scalar_path_handles_misaligned_weight_only():
+    """Weight rows misaligned while x stays 16B-aligned take the scalar-x
+    middle and must stay exact."""
+    torch.manual_seed(41)
+    n, k = 256, 1536
+    big_w = torch.randn(n * k + 8, device="cuda", dtype=torch.bfloat16)
+    weight = big_w[5 : 5 + n * k].view(n, k)
+    x = torch.randn(2, k, device="cuda", dtype=torch.bfloat16)
+    assert (weight.data_ptr() & 15) == 10 and (x.data_ptr() & 15) == 0
+
+    actual = bf16_gemv(x, weight)
+    torch.testing.assert_close(actual, F.linear(x, weight), rtol=0.02, atol=0.5)
 
 
 @skip_no_gemv

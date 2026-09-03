@@ -62,6 +62,9 @@ class _RecordingRunner:
 
     def apply_weight_update(self, policy_version, update):
         result = update()
+        if policy_version is None:
+            # Mirror the scheduler: None derives live+1 under the lock.
+            policy_version = self.policy_version + 1
         self.update_weights(policy_version)
         return result
 
