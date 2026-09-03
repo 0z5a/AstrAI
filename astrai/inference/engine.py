@@ -2,7 +2,9 @@
 
 import asyncio
 import gc
+import logging
 import threading
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Tuple, Union
 
 import torch
@@ -12,7 +14,10 @@ from astrai.extension import ATTN_BACKEND, AttentionBackend, get_backend
 from astrai.inference.cache import PagePool
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.task import STOP
+from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class GenerateResult:
@@ -251,3 +256,53 @@ class InferenceEngine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
+
+
+def build_engine(
+    param_path: Optional[Union[str, Path]] = None,
+    *,
+    model: Optional[nn.Module] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
+    device: Optional[str] = "cuda",
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    max_batch_size: int = 16,
+    max_seq_len: Optional[int] = None,
+    **engine_kwargs: Any,
+) -> InferenceEngine:
+    """Composition root for inference assembly.
+
+    Loads model and tokenizer from *param_path*, or accepts preloaded
+    objects, places the model, and returns a started InferenceEngine.
+    Extra *engine_kwargs* (cache, enable_cuda_graph, backend) pass
+    through to InferenceEngine. Placement parts left as None are skipped.
+    """
+    if param_path is not None:
+        if model is not None or tokenizer is not None:
+            raise ValueError("pass either param_path or model+tokenizer, not both")
+        path = Path(param_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Parameter directory not found: {path}")
+        tokenizer = AutoTokenizer.from_pretrained(path)
+        model = AutoModel.from_pretrained(path)
+    elif model is None or tokenizer is None:
+        raise ValueError("build_engine requires param_path or both model and tokenizer")
+
+    placement: Dict[str, Any] = {}
+    if device is not None:
+        placement["device"] = device
+    if dtype is not None:
+        placement["dtype"] = dtype
+    if placement:
+        model.to(**placement)
+        logger.info(
+            f"Model placed on {placement.get('device')} "
+            f"with dtype {placement.get('dtype')}"
+        )
+
+    return InferenceEngine(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        **engine_kwargs,
+    )

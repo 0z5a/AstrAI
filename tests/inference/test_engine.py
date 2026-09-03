@@ -4,9 +4,12 @@ import asyncio
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from astrai.extension import TorchNativeBackend, attn_backend
 from astrai.inference import STOP
-from astrai.inference.engine import GenerateResult, InferenceEngine
+from astrai.inference.engine import GenerateResult, InferenceEngine, build_engine
+from tests.helpers import FakeTokenizer, make_model
 
 
 def _make_engine_mocks(decode=None):
@@ -301,3 +304,62 @@ def test_generate_captures_calling_backend_context():
 
     assert len(captured) == 1
     assert isinstance(captured[0], TorchNativeBackend)
+
+
+def test_build_engine_from_live_objects_starts_scheduler():
+    model, _ = make_model("cpu", max_position_embeddings=64)
+    tokenizer = FakeTokenizer()
+    engine = build_engine(
+        model=model,
+        tokenizer=tokenizer,
+        device=None,
+        dtype=None,
+        max_batch_size=2,
+    )
+    try:
+        assert isinstance(engine, InferenceEngine)
+        assert engine.tokenizer is tokenizer
+        assert engine.scheduler._stop_event.is_set() is False
+    finally:
+        engine.shutdown()
+
+
+def test_build_engine_passes_engine_kwargs_through():
+    model, _ = make_model("cpu", max_position_embeddings=64)
+    backend = TorchNativeBackend()
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        MockSched.return_value.add_task.side_effect = lambda *args, **k: (
+            k["stream_callback"](STOP) or "task"
+        )
+        engine = build_engine(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            device=None,
+            dtype=None,
+            cache=object(),
+            enable_cuda_graph=False,
+            backend=backend,
+        )
+        engine.generate("hi")
+
+    kwargs = MockSched.call_args.kwargs
+    assert kwargs["cache"] is not None
+    assert kwargs["enable_cuda_graph"] is False
+    assert kwargs["backend"] is backend
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        (
+            {"param_path": "x", "model": object()},
+            ValueError,
+            "not both",
+        ),
+        ({}, ValueError, "requires param_path"),
+        ({"param_path": "/nonexistent-dir-xyz"}, FileNotFoundError, "not found"),
+    ],
+)
+def test_build_engine_rejects_invalid_arguments(kwargs, error, message):
+    with pytest.raises(error, match=message):
+        build_engine(**kwargs)

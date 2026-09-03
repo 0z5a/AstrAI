@@ -12,7 +12,7 @@ Modules:
   - engine.py:     Facade (InferenceEngine)
 """
 
-from astrai.inference.engine import InferenceEngine
+from astrai.inference.engine import InferenceEngine, build_engine
 from astrai.inference.network import get_app, run_server
 from astrai.inference.runtime.executor import Executor
 from astrai.inference.runtime.sample import sample
@@ -21,6 +21,7 @@ from astrai.inference.task import STOP, GenerationResult, Task, TaskManager, Tas
 
 __all__ = [
     "InferenceEngine",
+    "build_engine",
     "InferenceScheduler",
     "GenerationResult",
     "Executor",
