@@ -30,9 +30,11 @@ case, while the BF16-before-top-k baseline changes expert sets for 0.05% to
 | 8,192 | 64 | 8 | 0.0666 ms | 0.0604 ms | -9.23% |
 | 32,768 | 64 | 8 | 0.1413 ms | 0.1382 ms | -2.17% |
 
-Raw timings and mismatch rates are stored in
-`benchmarks/results/moe_router_l20_sm89.json`. The largest measured shape keeps
-4 MiB of additional probability storage.
+Reproduce the timings and mismatch rates with
+`python benchmarks/training_consistency/benchmark_moe_router.py`; the script
+prints machine-readable JSON to standard output without adding generated
+results to the repository. The largest measured shape keeps 4 MiB of
+additional probability storage.
 
 ## Evidence scope
 
