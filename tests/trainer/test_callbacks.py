@@ -23,9 +23,9 @@ def test_gradient_checkpointing_enable_disable(test_model):
     for layer in model.layers:
         callback._enable(layer)
 
-    for layer in model.layers:
+    for i, layer in enumerate(model.layers):
         assert hasattr(layer, "_original_forward")
-        assert layer.forward is not originals[0]
+        assert layer.forward is not originals[i]
 
     for layer in model.layers:
         callback._disable(layer)
@@ -110,6 +110,10 @@ def test_gradient_checkpointing_trainer_integration(
     )
 
     trainer = Trainer(train_config)
+    gc_callbacks = [
+        c for c in trainer.callbacks if isinstance(c, GradientCheckpointingCallback)
+    ]
+    assert gc_callbacks and gc_callbacks[0].modules == (DecoderBlock,)
     trainer.train()
 
 

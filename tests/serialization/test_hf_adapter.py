@@ -113,6 +113,44 @@ def to_hf_keys(state_dict, head_dim=None):
     return out
 
 
+MOE_KWARGS = {
+    "ffn_type": "moe",
+    "n_routed_experts": 2,
+    "n_shared_experts": 1,
+    "n_activated_experts": 1,
+    "moe_intermediate_size": 16,
+    "shared_expert_intermediate_size": 16,
+}
+
+
+def _hf_keyed_state_dict(model, cfg):
+    return to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads)
+
+
+def _assert_hf_roundtrip(cfg, convert_cfg=None):
+    """HF-keyed weights of a fresh model must convert back exactly."""
+    model = AutoRegressiveLM(cfg)
+    sd = model.state_dict()
+    converted = convert_hf_weights(_hf_keyed_state_dict(model, cfg), convert_cfg or cfg)
+    assert_state_dicts_equal(converted, sd)
+
+
+def _assert_hf_directory_load(tmp_path, cfg, raw_config):
+    """Save HF-format weights and check from_pretrained reproduces logits."""
+    model = AutoRegressiveLM(cfg).eval()
+    save_model(
+        config=raw_config,
+        state_dict=_hf_keyed_state_dict(model, cfg),
+        save_directory=str(tmp_path),
+    )
+    loaded = AutoModel.from_pretrained(tmp_path).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
+    with torch.no_grad():
+        torch.testing.assert_close(
+            loaded(input_ids)["logits"], model(input_ids)["logits"]
+        )
+
+
 def test_convert_hf_config_llama():
     cfg = convert_hf_config(LLAMA_RAW)
     assert cfg["model_type"] == "autoregressive_lm"
@@ -168,31 +206,14 @@ def test_adapt_config_passthrough():
 
 
 def test_convert_hf_weights_dense_roundtrip():
-    cfg = make_tiny_config()
-    model = AutoRegressiveLM(cfg)
-    converted = convert_hf_weights(
-        to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads), cfg
-    )
-    assert_state_dicts_equal(converted, model.state_dict())
+    _assert_hf_roundtrip(make_tiny_config())
 
 
 def test_convert_hf_weights_moe_roundtrip():
-    cfg = make_tiny_config(
-        ffn_type="moe",
-        n_routed_experts=2,
-        n_shared_experts=1,
-        n_activated_experts=1,
-        moe_intermediate_size=16,
-        shared_expert_intermediate_size=16,
-    )
-    model = AutoRegressiveLM(cfg)
+    cfg = make_tiny_config(**MOE_KWARGS)
     hf_raw = convert_hf_config(MOE_RAW)
     hf_cfg = ConfigFactory.load(hf_raw)
-    converted = convert_hf_weights(
-        to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads),
-        hf_cfg,
-    )
-    assert_state_dicts_equal(converted, model.state_dict())
+    _assert_hf_roundtrip(cfg, convert_cfg=hf_cfg)
 
 
 def test_convert_hf_weights_keeps_astrai_keys():
@@ -239,66 +260,28 @@ def test_convert_hf_config_gemma_enables_qk_norm():
 
 
 def test_convert_hf_weights_moe_with_dense_layers_roundtrip():
-    cfg = make_tiny_config(
-        ffn_type="moe",
-        n_routed_experts=2,
-        n_shared_experts=1,
-        n_activated_experts=1,
-        moe_intermediate_size=16,
-        shared_expert_intermediate_size=16,
-        mlp_only_layers=[0],
-        decoder_sparse_step=1,
+    _assert_hf_roundtrip(
+        make_tiny_config(**MOE_KWARGS, mlp_only_layers=[0], decoder_sparse_step=1)
     )
-    model = AutoRegressiveLM(cfg)
-    converted = convert_hf_weights(
-        to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads), cfg
-    )
-    assert_state_dicts_equal(converted, model.state_dict())
 
 
 def test_convert_hf_weights_qwen2_moe_singular_shared_expert_roundtrip():
-    cfg = make_tiny_config(
-        ffn_type="moe",
-        n_routed_experts=2,
-        n_shared_experts=1,
-        n_activated_experts=1,
-        moe_intermediate_size=16,
-        shared_expert_intermediate_size=16,
-    )
+    cfg = make_tiny_config(**MOE_KWARGS)
     model = AutoRegressiveLM(cfg)
-    hf_sd = to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads)
     hf_sd = {
-        k.replace("shared_experts.", "shared_expert.", 1): v for k, v in hf_sd.items()
+        k.replace("shared_experts.", "shared_expert.", 1): v
+        for k, v in _hf_keyed_state_dict(model, cfg).items()
     }
     converted = convert_hf_weights(hf_sd, cfg)
     assert_state_dicts_equal(converted, model.state_dict())
 
 
 def test_convert_hf_weights_gemma_qk_norm_roundtrip():
-    cfg = make_tiny_config(use_qk_norm=True)
-    model = AutoRegressiveLM(cfg)
-    converted = convert_hf_weights(
-        to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads), cfg
-    )
-    assert_state_dicts_equal(converted, model.state_dict())
+    _assert_hf_roundtrip(make_tiny_config(use_qk_norm=True))
 
 
 def test_from_pretrained_hf_directory(tmp_path):
-    cfg = make_tiny_config()
-    model = AutoRegressiveLM(cfg).eval()
-    save_model(
-        config=LLAMA_RAW,
-        state_dict=to_hf_keys(
-            model.state_dict(), cfg.hidden_size // cfg.num_attention_heads
-        ),
-        save_directory=str(tmp_path),
-    )
-    loaded = AutoModel.from_pretrained(tmp_path).eval()
-    input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
-    with torch.no_grad():
-        torch.testing.assert_close(
-            loaded(input_ids)["logits"], model(input_ids)["logits"]
-        )
+    _assert_hf_directory_load(tmp_path, make_tiny_config(), LLAMA_RAW)
 
 
 def test_from_pretrained_astrai_directory(tmp_path):
@@ -332,9 +315,7 @@ def test_from_pretrained_weights_format_astrai_rejects_hf(tmp_path):
     model = AutoRegressiveLM(cfg)
     save_model(
         config=LLAMA_RAW,
-        state_dict=to_hf_keys(
-            model.state_dict(), cfg.hidden_size // cfg.num_attention_heads
-        ),
+        state_dict=_hf_keyed_state_dict(model, cfg),
         save_directory=str(tmp_path),
     )
     with pytest.raises(ValueError):
@@ -355,7 +336,7 @@ def test_from_pretrained_invalid_weights_format(tmp_path):
 def test_from_pretrained_hf_directory_sharded(tmp_path):
     cfg = make_tiny_config()
     model = AutoRegressiveLM(cfg).eval()
-    hf_sd = to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads)
+    hf_sd = _hf_keyed_state_dict(model, cfg)
     keys = sorted(hf_sd)
     split = len(keys) // 2
     shard_a = {k: hf_sd[k] for k in keys[:split]}
@@ -507,25 +488,4 @@ def test_hf_import_qk_norm_matches_norm_before_rope_reference():
 
 
 def test_from_pretrained_hf_directory_with_moe(tmp_path):
-    cfg = make_tiny_config(
-        ffn_type="moe",
-        n_routed_experts=2,
-        n_shared_experts=1,
-        n_activated_experts=1,
-        moe_intermediate_size=16,
-        shared_expert_intermediate_size=16,
-    )
-    model = AutoRegressiveLM(cfg).eval()
-    save_model(
-        config=MOE_RAW,
-        state_dict=to_hf_keys(
-            model.state_dict(), cfg.hidden_size // cfg.num_attention_heads
-        ),
-        save_directory=str(tmp_path),
-    )
-    loaded = AutoModel.from_pretrained(tmp_path).eval()
-    input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
-    with torch.no_grad():
-        torch.testing.assert_close(
-            loaded(input_ids)["logits"], model(input_ids)["logits"]
-        )
+    _assert_hf_directory_load(tmp_path, make_tiny_config(**MOE_KWARGS), MOE_RAW)

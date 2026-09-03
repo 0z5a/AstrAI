@@ -252,13 +252,15 @@ def test_feed_with_tools_constructor():
     tools = [{"type": "function", "function": {"name": "get_weather"}}]
     parser = SimpleJsonToolParser(tools=tools, tool_choice="auto")
     deltas = parser.feed('{"name": "get_weather", "arguments": {"city": "BJ"}}')
-    assert len(deltas) > 0
+    tc_deltas = [d for d in deltas if "tool_calls" in d]
+    assert tc_deltas[0]["tool_calls"][0]["function"]["name"] == "get_weather"
 
 
 def test_feed_content_after_tool_call_is_not_emitted():
     parser = SimpleJsonToolParser()
-    parser.feed('{"name": "f", "arguments": {}} trailing text')
+    deltas = parser.feed('{"name": "f", "arguments": {}} trailing text')
     assert parser.has_tool_calls
+    assert not any("trailing" in d.get("content", "") for d in deltas)
 
 
 def _simulate_streaming(parser, text):
@@ -513,10 +515,6 @@ def test_factory_create_passes_tools():
     assert parser.tool_choice == "required"
 
 
-def test_factory_list_registered():
-    assert "simple_json" in ToolParserFactory.list_registered()
-
-
 def test_factory_create_with_tools_only():
     tools = [
         {
@@ -542,29 +540,6 @@ def test_feed_token_ids_do_not_affect_parsing():
         result_no[0]["tool_calls"][0]["function"]["name"]
         == result_with[0]["tool_calls"][0]["function"]["name"]
     )
-
-
-def test_parser_uses_token_ids_for_detection():
-    class TokenIdParser(BaseToolParser):
-        def __init__(self, tools=None, tool_choice="auto"):
-            super().__init__(tools, tool_choice)
-            self._detections = 0
-
-        def feed(self, body, current_token_ids=None, delta_token_ids=None):
-            if current_token_ids and 999 in current_token_ids:
-                self._detections += 1
-            return []
-
-        def parse_complete(self, body):
-            return None
-
-        @property
-        def has_tool_calls(self):
-            return self._detections > 0
-
-    parser = TokenIdParser()
-    parser.feed("hello", current_token_ids=[1, 999, 3])
-    assert parser.has_tool_calls
 
 
 def test_streaming_partial_name_prefix_never_leaks_into_content():

@@ -38,10 +38,13 @@ def test_cpu_and_training_calls_fall_back_with_gradients(monkeypatch):
 
 def test_invalid_mode_warns_and_uses_auto(monkeypatch, caplog):
     monkeypatch.setenv("ASTRAI_SWIGLU", "invalid-test-mode")
+    x = torch.randn(2, 8)
+    up_weight = torch.randn(4, 8)
+    gate_weight = torch.randn(4, 8)
     with caplog.at_level(logging.WARNING):
-        actual = swiglu(torch.randn(2, 8), torch.randn(4, 8), torch.randn(4, 8))
-    assert actual.shape == (2, 4)
+        actual = swiglu(x, up_weight, gate_weight)
     assert "using auto" in caplog.text
+    torch.testing.assert_close(actual, reference_swiglu(x, up_weight, gate_weight))
 
 
 def test_mlp_routes_through_swiglu_backend(monkeypatch):

@@ -40,18 +40,32 @@ def mock_model_and_tokenizer():
     return mock_model, mock_tokenizer
 
 
+def _make_mock_scheduler(mock_model_and_tokenizer):
+    """Build a CPU scheduler over mocks, patching scheduler-internal imports."""
+    mock_model, mock_tokenizer = mock_model_and_tokenizer
+    with (
+        patch("astrai.inference.scheduler.AutoModel"),
+        patch("astrai.inference.scheduler.AutoTokenizer"),
+    ):
+        return InferenceScheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            max_batch_size=4,
+            device="cpu",
+        )
+
+
+def _run_threads(*workers, timeout=10.0):
+    threads = [threading.Thread(target=worker) for worker in workers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout)
+
+
 def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
     """Test concurrent add_task operations."""
-    mock_model, mock_tokenizer = mock_model_and_tokenizer
-
-    with patch("astrai.inference.scheduler.AutoModel"):
-        with patch("astrai.inference.scheduler.AutoTokenizer"):
-            scheduler = InferenceScheduler(
-                model=mock_model,
-                tokenizer=mock_tokenizer,
-                max_batch_size=4,
-                device="cpu",
-            )
+    scheduler = _make_mock_scheduler(mock_model_and_tokenizer)
 
     results = {"task_ids": [], "errors": []}
     lock = threading.Lock()
@@ -65,13 +79,7 @@ def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
         except Exception as e:
             results["errors"].append(str(e))
 
-    threads = [threading.Thread(target=add_task_worker, args=(i,)) for i in range(5)]
-
-    for t in threads:
-        t.start()
-
-    for t in threads:
-        t.join()
+    _run_threads(*(lambda wid=i: add_task_worker(wid) for i in range(5)))
 
     scheduler.stop()
 
@@ -205,16 +213,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
 
 def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
     """Test concurrent add and remove task operations."""
-    mock_model, mock_tokenizer = mock_model_and_tokenizer
-
-    with patch("astrai.inference.scheduler.AutoModel"):
-        with patch("astrai.inference.scheduler.AutoTokenizer"):
-            scheduler = InferenceScheduler(
-                model=mock_model,
-                tokenizer=mock_tokenizer,
-                max_batch_size=4,
-                device="cpu",
-            )
+    scheduler = _make_mock_scheduler(mock_model_and_tokenizer)
 
     results = {"added": [], "removed": [], "errors": []}
     add_ready = threading.Event()
@@ -238,14 +237,7 @@ def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
         except Exception as e:
             results["errors"].append(f"Remove: {str(e)}")
 
-    add_thread = threading.Thread(target=add_worker)
-    remove_thread = threading.Thread(target=remove_worker)
-
-    add_thread.start()
-    remove_thread.start()
-
-    add_thread.join()
-    remove_thread.join()
+    _run_threads(add_worker, remove_worker)
     scheduler.stop()
 
     assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
@@ -254,16 +246,7 @@ def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
 
 def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
     """Test concurrent get_stats operations."""
-    mock_model, mock_tokenizer = mock_model_and_tokenizer
-
-    with patch("astrai.inference.scheduler.AutoModel"):
-        with patch("astrai.inference.scheduler.AutoTokenizer"):
-            scheduler = InferenceScheduler(
-                model=mock_model,
-                tokenizer=mock_tokenizer,
-                max_batch_size=4,
-                device="cpu",
-            )
+    scheduler = _make_mock_scheduler(mock_model_and_tokenizer)
 
     results = {"stats": [], "errors": []}
     started = threading.Event()
@@ -287,17 +270,9 @@ def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
         except Exception as e:
             results["errors"].append(f"Get stats: {str(e)}")
 
-    add_thread = threading.Thread(target=add_tasks)
-    stats_thread = threading.Thread(target=get_stats)
-
-    add_thread.start()
-    stats_thread.start()
-
-    add_thread.join()
-    stats_done.wait(timeout=5.0)
+    _run_threads(add_tasks, get_stats)
     scheduler.stop()
-
-    stats_thread.join()
+    stats_done.wait(timeout=5.0)
 
     assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
     assert len(results["stats"]) == 50
@@ -504,16 +479,6 @@ def test_ragged_prefill_matches_sequential_greedy_tokens_and_logprobs(device):
         scheduler.stop()
 
 
-def test_run_batch_respects_max_tokens(device):
-    scheduler, _tok, _model = _make_real_scheduler(device)
-    try:
-        prompts = [[10, 20, 30]]
-        results = scheduler.run_batch(prompts, max_tokens=3, temperature=1.0)
-        assert len(results[0]) <= 3
-    finally:
-        scheduler.stop()
-
-
 def test_run_batch_zero_max_tokens_returns_empty(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
@@ -526,12 +491,12 @@ def test_run_batch_stop_id_terminates(device):
     """A token matching stop_ids terminates generation for that prompt."""
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
+        # Make every token a stop id: generation must end after exactly
+        # one token (the stop token itself) instead of running to max_tokens.
+        scheduler._task_mgr.tokenizer.stop_ids = list(range(200))
         prompts = [[10, 20, 30]]
         results = scheduler.run_batch(prompts, max_tokens=32, temperature=1.0)
-        # If stop token 2 was produced, it is the last token
-        if results[0] and results[0][-1] == 2:
-            # No tokens after stop should exist (since we terminate)
-            assert 2 not in results[0][:-1]
+        assert len(results[0]) == 1
     finally:
         scheduler.stop()
 

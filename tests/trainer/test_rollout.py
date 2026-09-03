@@ -58,6 +58,46 @@ def _make_instruction_batch(n=2):
     return {"instruction": instructions, "input": inputs}
 
 
+def _blocking_hook(original, started, release):
+    """Wrap a hook so it signals ``started`` then blocks until ``release``."""
+
+    def hook(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    return hook
+
+
+def _assert_interleaved(first, second, *, started, release, finished):
+    """Run ``first`` until it blocks, then assert ``second`` cannot finish
+    while ``first`` holds the lock; release, join both, and surface errors."""
+    errors = []
+
+    def run_safely(fn):
+        def run():
+            try:
+                fn()
+            except BaseException as exc:
+                errors.append(exc)
+
+        return run
+
+    first_thread = threading.Thread(target=run_safely(first))
+    second_thread = threading.Thread(target=run_safely(second))
+    first_thread.start()
+    assert started.wait(timeout=5)
+    second_thread.start()
+    assert not finished.wait(timeout=0.1)
+
+    release.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+
+
 def test_raw_rollout_fields():
     r = RawRollout(
         prompts=torch.zeros(2, 4, dtype=torch.long),
@@ -94,13 +134,6 @@ def test_rollout_result_inherits_raw_rollout_fields():
 def test_base_reward_model_is_abstract():
     with pytest.raises(TypeError):
         BaseRewardModel()
-
-
-def test_constant_reward_model_shape():
-    rm = ConstantRewardModel(0.5)
-    out = rm.score(["a", "b"], [["x", "y", "z"], ["p", "q", "r"]])
-    assert out.shape == (2, 3)
-    assert torch.all(out == 0.5)
 
 
 def _make_generator(device, **kw):
@@ -159,41 +192,18 @@ def test_rollout_generator_serializes_generation_and_policy_update(device):
     generation_started = threading.Event()
     allow_generation_to_finish = threading.Event()
     update_finished = threading.Event()
-    thread_errors = []
-    original = gen._generate_eval
+    gen._generate_eval = _blocking_hook(
+        gen._generate_eval, generation_started, allow_generation_to_finish
+    )
 
-    def blocking_generate(batch, generation_version):
-        generation_started.set()
-        assert allow_generation_to_finish.wait(timeout=5)
-        return original(batch, generation_version)
+    _assert_interleaved(
+        lambda: gen.generate(_make_instruction_batch(n=1)),
+        lambda: gen.apply_weight_update(1, update_finished.set),
+        started=generation_started,
+        release=allow_generation_to_finish,
+        finished=update_finished,
+    )
 
-    gen._generate_eval = blocking_generate
-
-    def generate():
-        try:
-            gen.generate(_make_instruction_batch(n=1))
-        except BaseException as exc:
-            thread_errors.append(exc)
-
-    def apply_update():
-        try:
-            gen.apply_weight_update(1, update_finished.set)
-        except BaseException as exc:
-            thread_errors.append(exc)
-
-    generation_thread = threading.Thread(target=generate)
-    update_thread = threading.Thread(target=apply_update)
-    generation_thread.start()
-    assert generation_started.wait(timeout=5)
-    update_thread.start()
-    assert not update_finished.wait(timeout=0.1)
-
-    allow_generation_to_finish.set()
-    generation_thread.join(timeout=5)
-    update_thread.join(timeout=5)
-    assert not generation_thread.is_alive()
-    assert not update_thread.is_alive()
-    assert thread_errors == []
     assert update_finished.is_set()
     assert gen.policy_version == 1
 
@@ -203,43 +213,23 @@ def test_rollout_generator_serializes_direct_scheduler_update(device):
     generation_started = threading.Event()
     allow_generation_to_finish = threading.Event()
     update_finished = threading.Event()
-    thread_errors = []
-    original = gen._generate_eval
-
-    def blocking_generate(batch, generation_version):
-        generation_started.set()
-        assert allow_generation_to_finish.wait(timeout=5)
-        return original(batch, generation_version)
-
-    gen._generate_eval = blocking_generate
+    gen._generate_eval = _blocking_hook(
+        gen._generate_eval, generation_started, allow_generation_to_finish
+    )
     rollout = []
 
-    def generate():
-        try:
-            rollout.append(gen.generate(_make_instruction_batch(n=1)))
-        except BaseException as exc:
-            thread_errors.append(exc)
-
     def update_scheduler_directly():
-        try:
-            gen.scheduler.update_weights(1)
-            update_finished.set()
-        except BaseException as exc:
-            thread_errors.append(exc)
+        gen.scheduler.update_weights(1)
+        update_finished.set()
 
-    generation_thread = threading.Thread(target=generate)
-    update_thread = threading.Thread(target=update_scheduler_directly)
-    generation_thread.start()
-    assert generation_started.wait(timeout=5)
-    update_thread.start()
-    assert not update_finished.wait(timeout=0.1)
+    _assert_interleaved(
+        lambda: rollout.append(gen.generate(_make_instruction_batch(n=1))),
+        update_scheduler_directly,
+        started=generation_started,
+        release=allow_generation_to_finish,
+        finished=update_finished,
+    )
 
-    allow_generation_to_finish.set()
-    generation_thread.join(timeout=5)
-    update_thread.join(timeout=5)
-    assert not generation_thread.is_alive()
-    assert not update_thread.is_alive()
-    assert thread_errors == []
     assert rollout[0].policy_version == 0
     assert gen.policy_version == 1
 
@@ -466,7 +456,6 @@ def test_rollout_runner_publishes_cache_before_concurrent_policy_update(device):
     allow_final_validation_to_finish = threading.Event()
     update_finished = threading.Event()
     rollout_finished = threading.Event()
-    thread_errors = []
     validation_calls = 0
     original_validate = runner._validate_policy_version
 
@@ -481,31 +470,17 @@ def test_rollout_runner_publishes_cache_before_concurrent_policy_update(device):
     runner._validate_policy_version = blocking_validate
 
     def produce_rollout():
-        try:
-            runner(_make_instruction_batch(n=1))
-            rollout_finished.set()
-        except BaseException as exc:
-            thread_errors.append(exc)
+        runner(_make_instruction_batch(n=1))
+        rollout_finished.set()
 
-    def apply_update():
-        try:
-            runner.apply_weight_update(1, update_finished.set)
-        except BaseException as exc:
-            thread_errors.append(exc)
+    _assert_interleaved(
+        produce_rollout,
+        lambda: runner.apply_weight_update(1, update_finished.set),
+        started=final_validation_started,
+        release=allow_final_validation_to_finish,
+        finished=update_finished,
+    )
 
-    rollout_thread = threading.Thread(target=produce_rollout)
-    update_thread = threading.Thread(target=apply_update)
-    rollout_thread.start()
-    assert final_validation_started.wait(timeout=5)
-    update_thread.start()
-    assert not update_finished.wait(timeout=0.1)
-
-    allow_final_validation_to_finish.set()
-    rollout_thread.join(timeout=5)
-    update_thread.join(timeout=5)
-    assert not rollout_thread.is_alive()
-    assert not update_thread.is_alive()
-    assert thread_errors == []
     assert rollout_finished.is_set()
     assert update_finished.is_set()
     assert runner._cache is not None

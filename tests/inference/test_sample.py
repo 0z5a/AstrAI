@@ -62,8 +62,9 @@ def test_top_p_nucleus_filtering():
     logits = torch.tensor([[10.0, 1.0, 1.0, 1.0, 1.0]])
     s = TopPStrategy(top_p=0.5)
     result = s.apply(logits.clone(), filter_value=-1e9)
+    # The dominant logit alone exceeds the nucleus mass; the rest are filtered.
     kept = (result > -1e9).sum().item()
-    assert kept >= 1
+    assert kept == 1
 
 
 def test_top_p_skip_when_one():

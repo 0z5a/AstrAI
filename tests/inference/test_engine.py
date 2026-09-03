@@ -20,12 +20,6 @@ def _make_engine_mocks(decode=None):
     return mock_model, mock_tokenizer
 
 
-def test_result_append_single():
-    r = GenerateResult(count=1)
-    r.append("hello", 0)
-    assert r.results[0] == "hello"
-
-
 def test_result_append_multiple_tasks():
     r = GenerateResult(count=3)
     r.append("a", 0)

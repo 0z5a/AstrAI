@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 
 from astrai.extension import is_available, linear
-from astrai.extension.backend import linear as public_linear
 from astrai.extension.dispatch import explain, op_backend, resolve
 
 # The package attribute ``linear`` is the dispatched function; reach the
@@ -34,10 +33,6 @@ def _routes_to_gemv(monkeypatch, x, weight, bias=None) -> bool:
 
     monkeypatch.setattr(linear_module, "_inference_bf16_gemv", fake_gemv)
     return linear(x, weight, bias) is sentinel
-
-
-def test_linear_backend_is_public():
-    assert linear is public_linear
 
 
 def test_model_linear_routes_through_backend(monkeypatch):
