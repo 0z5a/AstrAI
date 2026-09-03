@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.0",
+  "recorded_at": "2026-09-03T10:59:43+08:00",
+  "candidate_source_commit": "904be94",
+  "environment": {
+    "gpu": "NVIDIA L20",
+    "accelerator_count": 3,
+    "torch": "2.11.0+cu128",
+    "cuda": "12.8",
+    "dtype": "bfloat16"
+  },
+  "world_size": 3,
+  "cases": [
+    {
+      "tokens": 128,
+      "experts": 8,
+      "top_k": 2,
+      "trials": 20,
+      "mismatch_total": 0,
+      "checkpoint_route_observations": 40,
+      "trial_ms_p50": 58.74296569824219,
+      "trial_ms_p95": 477.430908203125,
+      "allocated_mib": 18.52001953125,
+      "reserved_mib": 24.0,
+      "route_sha256": "780eaa4a89d2548a763f1246f32d932c8c8828ca6e45429d3dc151b1938177b9",
+      "router_logits_sha256": "0a138ee6c3b0e5d365be1d4b717643533e920083ecaf4d6f63ee518c0b70180b",
+      "router_probs_sha256": "4743a7c5e6b89e2827768dc662e0943c433170922e2470dc082625d57464180a"
+    },
+    {
+      "tokens": 512,
+      "experts": 64,
+      "top_k": 8,
+      "trials": 20,
+      "mismatch_total": 0,
+      "checkpoint_route_observations": 40,
+      "trial_ms_p50": 152.23192596435547,
+      "trial_ms_p95": 299.4957580566406,
+      "allocated_mib": 33.09765625,
+      "reserved_mib": 60.0,
+      "route_sha256": "4155b99656bfe4035afdabb61ce61bed997cfcc7703041242d3c0f5b5c482b20",
+      "router_logits_sha256": "11037998ff8846fc69b88ca1eaef80e6bad3cf3d86a04dc8495af0c7d7bf486a",
+      "router_probs_sha256": "aee8280409e52f159d464e14e9c1763c56a8ec9598b04a25e1a0c4277641ce96"
+    }
+  ],
+  "validated_paths": [
+    "rollout/eval dispatch",
+    "training forward/backward",
+    "gradient-checkpoint forward and recompute",
+    "checkpoint reload"
+  ],
+  "result": "All route indices, router logits, router probabilities, and expert token counts matched across all three ranks."
+}
