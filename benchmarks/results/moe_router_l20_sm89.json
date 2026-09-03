@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.0",
+  "candidate_source_commit": "d783e4f963316bda4f839ba697ec5b5fe5678a31",
+  "baseline_commit": "ce2f9d13b32f729c561d0175fd46927a37d9b0a2",
+  "recorded_at": "2026-09-03T08:02:46+08:00",
+  "gpu": "NVIDIA L20",
+  "gpu_index": 5,
+  "torch": "2.11.0+cu128",
+  "cuda": "12.8",
+  "dtype": "bfloat16",
+  "seed": 3407,
+  "warmup": 20,
+  "repeats": 100,
+  "cases": [
+    {
+      "tokens": 2048,
+      "experts": 8,
+      "top_k": 2,
+      "baseline_median_ms": 0.05119999870657921,
+      "baseline_p99_ms": 0.06860800087451935,
+      "candidate_median_ms": 0.050175998359918594,
+      "candidate_p99_ms": 0.05632000043988228,
+      "median_delta_percent": -2.0000007275957743,
+      "standard_logits_baseline_mismatch_percent": 0.048828125,
+      "near_tie_baseline_mismatch_percent": 95.947265625,
+      "candidate_mismatch_percent": 0.0,
+      "additional_probability_storage_mib": 0.03125
+    },
+    {
+      "tokens": 8192,
+      "experts": 8,
+      "top_k": 2,
+      "baseline_median_ms": 0.05427199974656105,
+      "baseline_p99_ms": 0.062463998794555664,
+      "candidate_median_ms": 0.05113599821925163,
+      "candidate_p99_ms": 0.05632000043988228,
+      "median_delta_percent": -5.7783047279516,
+      "standard_logits_baseline_mismatch_percent": 0.146484375,
+      "near_tie_baseline_mismatch_percent": 96.22802734375,
+      "candidate_mismatch_percent": 0.0,
+      "additional_probability_storage_mib": 0.125
+    },
+    {
+      "tokens": 8192,
+      "experts": 64,
+      "top_k": 8,
+      "baseline_median_ms": 0.06656000018119812,
+      "baseline_p99_ms": 0.08601599931716919,
+      "candidate_median_ms": 0.060416001826524734,
+      "candidate_p99_ms": 0.06656000018119812,
+      "median_delta_percent": -9.230766733695027,
+      "standard_logits_baseline_mismatch_percent": 0.10986328125,
+      "near_tie_baseline_mismatch_percent": 100.0,
+      "candidate_mismatch_percent": 0.0,
+      "additional_probability_storage_mib": 1.0
+    },
+    {
+      "tokens": 32768,
+      "experts": 64,
+      "top_k": 8,
+      "baseline_median_ms": 0.14131200313568115,
+      "baseline_p99_ms": 0.14950400590896606,
+      "candidate_median_ms": 0.1382399946451187,
+      "candidate_p99_ms": 0.14233599603176117,
+      "median_delta_percent": -2.1739190036198397,
+      "standard_logits_baseline_mismatch_percent": 0.1190185546875,
+      "near_tie_baseline_mismatch_percent": 100.0,
+      "candidate_mismatch_percent": 0.0,
+      "additional_probability_storage_mib": 4.0
+    }
+  ]
+}

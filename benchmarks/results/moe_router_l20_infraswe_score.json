@@ -1,0 +1,109 @@
+{
+  "schema_version": "0.5.1",
+  "score_kind": "diagnostic-project-fit",
+  "score_is_official": false,
+  "candidate_revision": "sha256:10f8f94822296d6ab77cb3839c743db7c0ed1ad5a9a51cde30b424cd63363399",
+  "formula_template_id": "project-fit-system-path-v0.5.1",
+  "diagnostic_project_fit_100": 93.1558769195059,
+  "component_values": {
+    "evolutionary_maintainability": 0.9163008937795992,
+    "project_contract_fit": 0.9771823686607837,
+    "performance_reuse_utilization": 0.9451290407777138,
+    "operational_fit": 0.8376084703380043
+  },
+  "component_floors": {
+    "evolutionary_maintainability": 0.6,
+    "project_contract_fit": 0.6,
+    "performance_reuse_utilization": 0.4,
+    "operational_fit": 0.6
+  },
+  "subcomponent_inputs": {
+    "evolutionary_maintainability": {
+      "evolution": 0.82,
+      "locality": 0.95,
+      "tests": 1.0,
+      "failure": 1.0,
+      "contract": 0.95
+    },
+    "project_contract_fit": {
+      "integration": 1.0,
+      "interface": 0.95,
+      "lifecycle": 0.95,
+      "buildtest": 1.0,
+      "policy": 1.0
+    },
+    "performance_reuse_utilization": {
+      "attainment": 1.0,
+      "coverage": 0.85,
+      "retention": 1.0,
+      "family": 0.9,
+      "compile": 1.0
+    },
+    "operational_fit": {
+      "replay": 0.85,
+      "load": 0.75,
+      "resource": 0.9,
+      "coldsteady": 0.9
+    }
+  },
+  "input_rationale": {
+    "evolution": "The change adds an explicit FP32 routing contract but has no upstream maintenance history yet.",
+    "locality": "Implementation is confined to MoE configuration and routing, with focused tests and a reproducible probe.",
+    "tests": "The complete local suite passed 638 tests with 171 environment-dependent skips.",
+    "failure": "Invalid routed, shared, and activated expert counts and unsupported routing methods fail explicitly at configuration and component construction boundaries.",
+    "contract": "Implementation, tests, benchmark tooling, and raw L20 output are digest-bound, but the artifact is not sealed or maintainer-reviewed.",
+    "integration": "The FP32 decision is applied at the shared DeepSeekMoE routing boundary used by training and inference.",
+    "interface": "No public runtime interface changes; accepted configurations retain their existing output and dispatch dtypes.",
+    "lifecycle": "Expert selection, load-balancing probabilities, and selected dispatch weights now have explicit precision boundaries.",
+    "buildtest": "The full local suite, Ruff checks, InfraSWE engine tests, and L20 probe passed.",
+    "policy": "No dependency is added and unsupported routing modes fail closed.",
+    "attainment": "All candidate expert selections matched the FP32 reference and all four measured L20 medians improved by 2.00% to 9.23%.",
+    "coverage": "Four 8/64-expert shapes cover ordinary and near-tie logits; a distributed training soak is not included.",
+    "retention": "The complete regression suite passed after the routing change.",
+    "family": "Validation applies to config-driven and direct DeepSeekMoE construction paths.",
+    "compile": "The framework routing change introduces no compilation step and does not compile during timed operations.",
+    "replay": "Each case uses 20 warmups and 100 timed iterations, but only one fresh process was recorded.",
+    "load": "The probe uses real BF16 CUDA tensors but is a router microbenchmark rather than a sustained MoE training load.",
+    "resource": "The short probe used only GPU5's free memory without stopping or changing the existing vLLM service.",
+    "coldsteady": "Warm steady-state router latency is reported; cold startup is deliberately excluded."
+  },
+  "benchmark_trust": {
+    "formula_version": "benchmark-trust-v0.5",
+    "status": "scored",
+    "score_100": 97.40037464252967,
+    "components": {
+      "reproducibility": 1.0,
+      "evidence": 1.0,
+      "statistics": 0.9,
+      "environment": 1.0
+    },
+    "failure_codes": [
+      "DRAFT_UNSEALED",
+      "FRESH_PROCESS_REPLAY_INCOMPLETE",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED"
+    ]
+  },
+  "official_project_fit": {
+    "status": "unresolved",
+    "score_100": null,
+    "failure_codes": [
+      "DRAFT_SEAL_MISSING",
+      "FRESH_PROCESS_REPLAYS_BELOW_MINIMUM",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED"
+    ]
+  },
+  "comparison_cell_path": "benchmarks/infraswe/astrai-moe-router-comparison-cell.json",
+  "execution": {
+    "infraswe_commit": "811bc775ed5b3a6ec853219245f3469f78818020",
+    "comparison_cell_validation": "pass",
+    "infraswe_engine_tests": "41 passed",
+    "astrai_implementation_commit": "d783e4f963316bda4f839ba697ec5b5fe5678a31",
+    "astrai_local_tests": "638 passed, 171 skipped",
+    "astrai_l20_router_probe": "4 cases passed; candidate mismatch 0%",
+    "astrai_lint": "passed"
+  }
+}
