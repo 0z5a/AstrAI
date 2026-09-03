@@ -37,3 +37,19 @@ Raw results:
 - `inference_release_resume_l20_2048.json`
 - `inference_release_resume_l20_8192.json`
 - `inference_release_resume_l20_32768.json`
+
+## 100-cycle stability soak
+
+A separate three-GPU soak ran the tiny deterministic preset concurrently on
+three L20s so that every context bound completed 100 release/resume/output
+parity cycles. This is lifecycle-stability evidence; its memory footprint is
+not comparable to the `astrai-1b` table above.
+
+| Max context | Cycles | Reclaimed | Reclaimed % | Release median / p99 | Resume median / p99 | Greedy parity |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2,048 | 100 | 0.572 MiB | 6.58% | 72.201 / 88.869 ms | 0.410 / 0.553 ms | 100/100 |
+| 8,192 | 100 | 2.239 MiB | 21.61% | 74.530 / 100.495 ms | 0.581 / 6.293 ms | 100/100 |
+| 32,768 | 100 | 8.907 MiB | 52.30% | 68.257 / 93.089 ms | 0.441 / 0.557 ms | 100/100 |
+
+The summarized machine-readable result is
+`inference_release_resume_l20_100_cycles.json`.
