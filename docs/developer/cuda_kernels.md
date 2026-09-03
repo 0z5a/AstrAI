@@ -84,7 +84,7 @@ OPT 1.3B M=1 is +4.54%. Qwen2 and LLaMA 3 70B M=1, and all three new
 families at M=8, remain exact PyTorch fallbacks.
 
 These are synthetic projection-chain measurements, not whole-model throughput
-claims. Reproduce them with `scripts/tools/benchmark_gemv_common.py`.
+claims. Reproduce them with `csrc/bench/benchmark_gemv_common.py`.
 
 The AstrAI 1B A→B→B→A results use the real `InferenceEngine`, including scheduler,
 sampling, and CUDA Graph. M=8 stays on PyTorch because its remaining

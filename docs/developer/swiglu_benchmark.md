@@ -1,12 +1,12 @@
 # Fused SwiGLU benchmark
 
-`scripts/tools/benchmark_swiglu.py` compares the directly callable fused BF16
+`csrc/bench/benchmark_swiglu.py` compares the directly callable fused BF16
 SwiGLU primitive with both `F.linear` and the existing two-GEMV chain. It covers
 the native AstrAI 1B MLP plus LLaMA 2 7B/13B, LLaMA 3 8B, and GPT-NeoX 20B
 up/gate shapes at M=1/2/4/8 in eager and CUDA Graph modes.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/tools/benchmark_swiglu.py \
+CUDA_VISIBLE_DEVICES=0 python csrc/bench/benchmark_swiglu.py \
   --output results/swiglu.json \
   --markdown-output results/swiglu.md \
   --m-values 1,2,4,8 --mode both \

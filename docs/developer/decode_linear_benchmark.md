@@ -1,6 +1,6 @@
 # Decode linear shape benchmark
 
-`scripts/tools/benchmark_gemv.py` records the `F.linear` baseline used to decide
+`csrc/bench/benchmark_gemv.py` records the `F.linear` baseline used to decide
 whether a BF16 GEMV or small-M kernel should enter automatic inference dispatch.
 It does not change model execution or select a custom kernel.
 
@@ -10,7 +10,7 @@ modes. Results include device-event latency samples, p50/p90/p99, estimated
 effective IO bandwidth, and CUDA kernel launches per call.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/tools/benchmark_gemv.py \
+CUDA_VISIBLE_DEVICES=0 python csrc/bench/benchmark_gemv.py \
   --output results/decode_linear.json \
   --markdown-output results/decode_linear.md
 ```
@@ -25,7 +25,7 @@ For direct A/B coverage of the custom kernel and guarded dispatcher across
 traditional LLaMA and GPT-NeoX decode shapes, use:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python scripts/tools/benchmark_gemv_common.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python csrc/bench/benchmark_gemv_common.py \
   --suite all --family traditional --m 2 4 \
   --output results/gemv_common.json
 ```
