@@ -175,6 +175,7 @@ class CheckpointCallback(TrainCallback):
         self.weight_only = weight_only
         self.save_extra_fn = save_extra_fn or CheckpointCallback.save_extra
         self.last_ckpt_step = None
+        self._saved = False
 
     def on_train_begin(self, context: TrainContext):
         self.last_ckpt_step = context.optimizer_step
@@ -205,6 +206,7 @@ class CheckpointCallback(TrainCallback):
                 context.checkpoint.save(save_path)
                 _copy_tokenizer_files(context.param_path, save_path)
         self.last_ckpt_step = context.optimizer_step
+        self._saved = True
 
     def after_optimizer_step(self, context: TrainContext):
         if context.optimizer_step - self.last_ckpt_step >= self.interval:
@@ -215,7 +217,11 @@ class CheckpointCallback(TrainCallback):
             self._save_checkpoint(context)
 
     def on_error(self, context: TrainContext):
-        if context.optimizer_step != self.last_ckpt_step:
+        # An interrupted run must always leave at least one checkpoint
+        # behind: on a slow start the signal can be handled before the
+        # first optimizer step, where optimizer_step == last_ckpt_step
+        # and the change-based guard alone would skip the save entirely.
+        if not self._saved or context.optimizer_step != self.last_ckpt_step:
             self._save_checkpoint(context)
 
     @staticmethod

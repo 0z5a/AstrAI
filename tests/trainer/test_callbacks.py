@@ -10,7 +10,7 @@ from astrai.trainer.train_callback import (
     _copy_tokenizer_files,
 )
 from astrai.trainer.trainer import Trainer
-from tests.helpers import RandomTokenDataset
+from tests.helpers import RandomTokenDataset, load_checkpoint_meta
 
 
 def test_gradient_checkpointing_enable_disable(test_model):
@@ -213,3 +213,31 @@ def test_copy_tokenizer_files_skips_missing_and_none(tmp_path):
     _copy_tokenizer_files(None, str(tmp_path))
     _copy_tokenizer_files(str(tmp_path), str(tmp_path / "out"))
     assert not (tmp_path / "out").exists() or not any((tmp_path / "out").iterdir())
+
+
+def test_interrupt_before_first_step_still_checkpoints(
+    base_test_env, train_config_factory, device
+):
+    """A graceful interrupt handled before the first optimizer step must
+    still leave a checkpoint (regression: optimizer_step == last_ckpt_step
+    skipped the emergency save entirely)."""
+
+    class _ImmediateStop(TrainCallback):
+        def on_epoch_begin(self, context):
+            context.request_stop()
+
+    train_config = train_config_factory(
+        model_fn=lambda: base_test_env["model"],
+        dataset=RandomTokenDataset(length=2),
+        test_dir=base_test_env["test_dir"],
+        device=device,
+        batch_per_device=2,
+        ckpt_interval=1000,
+    )
+
+    trainer = Trainer(train_config)
+    trainer.callbacks.insert(0, _ImmediateStop())
+    trainer.train()
+
+    meta = load_checkpoint_meta(base_test_env["test_dir"])
+    assert meta["optimizer_step"] == 0
