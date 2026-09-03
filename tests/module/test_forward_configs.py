@@ -372,6 +372,103 @@ def test_moe_component_forward_returns_ffn_output():
     assert output["aux_loss"] is not None
 
 
+def test_moe_router_selects_experts_from_fp32_probabilities():
+    """BF16 storage must not collapse close router probabilities before top-k."""
+
+    class FixedRouter(torch.nn.Module):
+        def __init__(self, logits):
+            super().__init__()
+            self.register_buffer("logits", logits)
+
+        def forward(self, x):
+            return self.logits.expand(x.size(0), -1)
+
+    class IdentityExpert(torch.nn.Module):
+        def forward(self, x):
+            return {"hidden_states": x, "aux_loss": None, "router_stats": None}
+
+    moe = DeepSeekMoE(
+        dim=2,
+        dim_ffn=4,
+        n_routed_experts=8,
+        n_shared_experts=0,
+        n_activated_experts=2,
+    )
+    logits = (torch.arange(8, dtype=torch.float32) * 0.001).to(torch.bfloat16)
+    moe.router = FixedRouter(logits)
+    moe.routed_experts = torch.nn.ModuleList([IdentityExpert() for _ in range(8)])
+
+    routed = moe._routed_forward(torch.ones(1, 2, dtype=torch.bfloat16), True)
+    stats = routed["router_stats"]
+    expected = torch.topk(logits.float().softmax(-1), 2, sorted=False).indices
+
+    assert stats is not None
+    assert stats["probs"].dtype == torch.float32
+    assert routed["hidden_states"].dtype == torch.bfloat16
+    assert routed["aux_loss"].dtype == torch.float32
+    actual = torch.sort(stats["topk_indices"], dim=-1).values
+    expected = torch.sort(expected.unsqueeze(0), dim=-1).values
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"n_routed_experts": 0}, "n_routed_experts must be positive"),
+        ({"n_shared_experts": -1}, "n_shared_experts must be non-negative"),
+        ({"n_activated_experts": 0}, "n_activated_experts must be positive"),
+        (
+            {"n_routed_experts": 2, "n_activated_experts": 3},
+            "cannot exceed n_routed_experts",
+        ),
+        ({"topk_method": "group_limited_greedy"}, "unsupported topk_method"),
+    ],
+)
+def test_moe_rejects_inconsistent_expert_topology(overrides, message):
+    from pydantic import ValidationError
+
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    kwargs = {
+        **TINY_CONFIG,
+        "ffn_type": "moe",
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "n_activated_experts": 2,
+        "topk_method": "greedy",
+        **overrides,
+    }
+    with pytest.raises(ValidationError, match=message):
+        AutoRegressiveLMConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"n_routed_experts": 0}, "n_routed_experts must be positive"),
+        ({"n_shared_experts": -1}, "n_shared_experts must be non-negative"),
+        ({"n_activated_experts": 0}, "n_activated_experts must be positive"),
+        (
+            {"n_routed_experts": 2, "n_activated_experts": 3},
+            "cannot exceed n_routed_experts",
+        ),
+        ({"topk_method": "group_limited_greedy"}, "unsupported topk_method"),
+    ],
+)
+def test_moe_component_rejects_inconsistent_expert_topology(overrides, message):
+    kwargs = {
+        "dim": 8,
+        "dim_ffn": 16,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "n_activated_experts": 2,
+        "topk_method": "greedy",
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=message):
+        DeepSeekMoE(**kwargs)
+
+
 @pytest.mark.parametrize("decoder_sparse_step", [0, -1])
 def test_moe_rejects_invalid_decoder_sparse_step(decoder_sparse_step):
     from pydantic import ValidationError
