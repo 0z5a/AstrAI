@@ -89,6 +89,8 @@ _ONLINE_STRATEGIES = [
     pytest.param("online_dpo", {"beta": 0.1, "group_size": 2}, id="dpo"),
 ]
 
+_DDP_TEST_WORLD_SIZE = int(os.environ.get("ASTRAI_DDP_TEST_WORLD_SIZE", "2"))
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize(("strategy", "strategy_kwargs"), _ONLINE_STRATEGIES)
@@ -147,10 +149,11 @@ def test_online_rollout_end_to_end(
 
 @pytest.mark.integration
 @pytest.mark.skipif(
-    torch.cuda.device_count() < 2, reason="two CUDA devices are required"
+    torch.cuda.device_count() < _DDP_TEST_WORLD_SIZE,
+    reason=f"{_DDP_TEST_WORLD_SIZE} CUDA devices are required",
 )
 def test_ddp_online_grpo_end_to_end(base_test_env):
-    """Run real rollout and optimizer steps on two DDP replicas."""
+    """Run real rollout and optimizer steps on the requested DDP replicas."""
     test_dir = base_test_env["test_dir"]
     tokenizer = base_test_env["tokenizer"]
     model_config = base_test_env["transformer_config"]
@@ -158,10 +161,11 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
     tokenizer.set_chat_template(CHAT_TEMPLATE)
     tokenizer.save_pretrained(test_dir)
 
+    dataset = InstructionDataset(repeats=10)
     train_config = TrainConfig(
         strategy="online_grpo",
         model_fn=partial(_model_fn, model_config),
-        dataset=InstructionDataset(repeats=10),
+        dataset=dataset,
         optimizer_fn=_optimizer_fn,
         scheduler_fn=_scheduler_fn,
         ckpt_dir=os.path.join(test_dir, "ckpt"),
@@ -171,7 +175,7 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
         grad_accum_steps=1,
         random_seed=42,
         device_type="cuda",
-        nprocs=2,
+        nprocs=_DDP_TEST_WORLD_SIZE,
         parallel_mode="ddp",
         strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
         rollout_interval=1,
@@ -185,4 +189,5 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
 
     Trainer(train_config).train(param_path=test_dir)
 
-    assert Path(test_dir, "ckpt", "epoch_0_step_20").is_dir()
+    expected_steps = (len(dataset) + _DDP_TEST_WORLD_SIZE - 1) // _DDP_TEST_WORLD_SIZE
+    assert Path(test_dir, "ckpt", f"epoch_0_step_{expected_steps}").is_dir()

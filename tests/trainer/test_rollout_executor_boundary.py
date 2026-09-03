@@ -20,6 +20,9 @@ from astrai.trainer.train_context import TrainContextBuilder
 from tests.helpers import FakeTokenizer, make_rollout_config
 
 
+_DDP_TEST_WORLD_SIZE = int(os.environ.get("ASTRAI_DDP_TEST_WORLD_SIZE", "2"))
+
+
 class _ConfigModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -322,11 +325,12 @@ def _multi_rank_rollout_then_train_worker():
 
 @pytest.mark.integration
 @pytest.mark.skipif(
-    torch.cuda.device_count() < 2, reason="two CUDA devices are required"
+    torch.cuda.device_count() < _DDP_TEST_WORLD_SIZE,
+    reason=f"{_DDP_TEST_WORLD_SIZE} CUDA devices are required",
 )
 def test_l20_multi_rank_rollout_can_diverge_before_ddp_training():
     spawn_parallel_fn(
         _multi_rank_rollout_then_train_worker,
-        world_size=2,
+        world_size=_DDP_TEST_WORLD_SIZE,
         backend="nccl",
     )
