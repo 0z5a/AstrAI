@@ -127,6 +127,19 @@ class DeepSeekMoE(nn.Module):
             / self.n_shared_experts
         )
 
+    def _select_experts(self, router_logits: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Return FP32 probabilities and the actual dispatch decision."""
+        router_probs = torch.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_indices = torch.topk(
+            router_probs,
+            self.n_activated_experts,
+            dim=-1,
+            sorted=False,
+        )
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        return router_probs, topk_weights, topk_indices
+
     def _routed_forward(self, x: Tensor, include_aux_loss: bool) -> FFNOutput:
         N, D = x.shape
         K = self.n_activated_experts
@@ -136,11 +149,7 @@ class DeepSeekMoE(nn.Module):
         # Select experts from FP32 probabilities. Casting the full distribution
         # to BF16 first can collapse close candidates into ties and change the
         # selected expert set.
-        router_probs = torch.softmax(router_logits.float(), dim=-1)
-
-        topk_weights, topk_indices = torch.topk(router_probs, K, dim=-1, sorted=False)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        router_probs, topk_weights, topk_indices = self._select_experts(router_logits)
 
         aux_loss = None
         router_stats = None

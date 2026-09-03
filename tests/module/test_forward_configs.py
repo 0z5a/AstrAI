@@ -411,6 +411,81 @@ def test_moe_router_selects_experts_from_fp32_probabilities():
     assert torch.equal(actual, expected)
 
 
+def test_moe_routing_replays_across_forward_recompute_and_reload(tmp_path):
+    """Actual expert dispatch stays stable across online-RL replay boundaries."""
+    from astrai.trainer.train_callback import GradientCheckpointingCallback
+
+    kwargs = {
+        "dim": 8,
+        "dim_ffn": 16,
+        "n_routed_experts": 8,
+        "n_shared_experts": 1,
+        "n_activated_experts": 2,
+    }
+    torch.manual_seed(3407)
+    moe = DeepSeekMoE(**kwargs).to(dtype=torch.bfloat16)
+    moe.apply(
+        lambda module: (
+            module.reset_parameters() if hasattr(module, "reset_parameters") else None
+        )
+    )
+    hidden_states = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+    routes = []
+    original_select = moe._select_experts
+
+    def record_selection(router_logits):
+        selected = original_select(router_logits)
+        routes.append(torch.sort(selected[2].detach(), dim=-1).values.clone())
+        return selected
+
+    moe._select_experts = record_selection
+
+    moe.eval()
+    with torch.no_grad():
+        rollout_output = moe(hidden_states)["hidden_states"].clone()
+    rollout_route = routes[-1]
+
+    moe.train()
+    train_input = hidden_states.clone().requires_grad_(True)
+    train_output = moe(train_input)["hidden_states"]
+    train_output.float().sum().backward()
+    training_route = routes[-1]
+    assert torch.equal(training_route, rollout_route)
+
+    moe.zero_grad(set_to_none=True)
+    checkpointing = GradientCheckpointingCallback(modules=[DeepSeekMoE])
+    checkpointing._enable(moe)
+    recompute_start = len(routes)
+    recompute_input = hidden_states.clone().requires_grad_(True)
+    recompute_output = moe(recompute_input)["hidden_states"]
+    recompute_output.float().sum().backward()
+    recompute_routes = routes[recompute_start:]
+    checkpointing._disable(moe)
+
+    assert len(recompute_routes) >= 2
+    assert all(torch.equal(route, rollout_route) for route in recompute_routes)
+
+    checkpoint = tmp_path / "moe-router.pt"
+    torch.save(moe.state_dict(), checkpoint)
+    resumed = DeepSeekMoE(**kwargs).to(dtype=torch.bfloat16)
+    resumed.load_state_dict(torch.load(checkpoint, weights_only=True))
+    resumed.eval()
+    resumed_routes = []
+    resumed_select = resumed._select_experts
+
+    def record_resumed_selection(router_logits):
+        selected = resumed_select(router_logits)
+        resumed_routes.append(torch.sort(selected[2].detach(), dim=-1).values.clone())
+        return selected
+
+    resumed._select_experts = record_resumed_selection
+    with torch.no_grad():
+        resumed_output = resumed(hidden_states)["hidden_states"]
+
+    assert torch.equal(resumed_routes[-1], rollout_route)
+    torch.testing.assert_close(resumed_output, rollout_output, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
