@@ -1,7 +1,7 @@
 """Training strategy implementations with factory pattern."""
 
 from abc import ABC
-from typing import Callable, Dict, List, Optional, TypedDict, Union
+from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
 import torch
 import torch.nn as nn
@@ -201,6 +201,21 @@ class BaseStrategy(ABC):
 
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         return self._normalize_output(self.compute_loss(batch))
+
+    def validate_online(self, batch: Dict[str, Any]) -> Optional[LossOutput]:
+        """Validate one batch through a one-off rollout.
+
+        Online strategies with an injected rollout runner evaluate a
+        fresh, throw-away rollout so the training replay cache and its
+        cadence stay untouched. Returns ``None`` when no runner is
+        configured (offline mode); callers then fall back to
+        ``strategy(batch)``.
+        """
+        if self._rollout_runner is None:
+            return None
+        result = self._rollout_runner.evaluate(batch)
+        prepared = self.prepare_from_rollout(result)
+        return self.compute_loss_output(prepared)
 
     def _loss_output(
         self,
@@ -594,6 +609,19 @@ class GRPOStrategy(BaseStrategy):
             state_dict = broadcast_state_dict(state_dict)
         if state_dict is not None:
             self.old_model.load_state_dict(state_dict)
+
+    def optimizer_step(self, optimizer: Optimizer):
+        """Step the optimizer, then refresh the offline behaviour policy.
+
+        Without this sync the frozen ``old_model`` drifts away from the
+        training policy, so the PPO ratio degenerates and clipping shuts
+        learning down. Online GRPO passes ``logprobs_old`` instead and
+        runs with ``old_model=None``, skipping the sync.
+        """
+        result = super().optimizer_step(optimizer)
+        if self.old_model is not None:
+            self.sync_old_model()
+        return result
 
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)

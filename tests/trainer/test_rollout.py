@@ -388,6 +388,21 @@ def test_rollout_runner_cache_returns_stale_flag(device):
     assert fresh2 is False
 
 
+def test_rollout_runner_evaluate_leaves_cache_untouched(device):
+    runner, _ = _make_runner(device, rollout_interval=10)
+    batch = _make_instruction_batch()
+    cached, _ = runner(batch)
+
+    eval_batch = _make_instruction_batch(n=1)
+    result = runner.evaluate(eval_batch)
+
+    assert result.rewards.shape == result.responses.shape[:2]
+    replayed, fresh = runner(batch)
+    assert replayed is cached
+    assert fresh is False
+    assert runner._steps_since_rollout == 0
+
+
 def test_rollout_runner_tags_generation_version_and_preserves_cached_behavior(device):
     runner, _ = _make_runner(device, rollout_interval=100)
     batch = _make_instruction_batch(n=1)

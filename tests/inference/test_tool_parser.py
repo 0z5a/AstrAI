@@ -565,3 +565,40 @@ def test_parser_uses_token_ids_for_detection():
     parser = TokenIdParser()
     parser.feed("hello", current_token_ids=[1, 999, 3])
     assert parser.has_tool_calls
+
+
+def test_streaming_partial_name_prefix_never_leaks_into_content():
+    parser = SimpleJsonToolParser()
+    parts = ["Hello ", '{"', '{"n', '{"na', '{"name"']
+    emitted = []
+    body = ""
+    for part in parts:
+        body += part
+        for d in parser.feed(body):
+            if "content" in d:
+                emitted.append(d["content"])
+    assert "".join(emitted) == "Hello "
+
+
+def test_finalize_flushes_withheld_plain_json_content():
+    parser = SimpleJsonToolParser()
+    text = 'Answer: {"price": 1}'
+    deltas = parser.feed(text)
+    streamed = "".join(d["content"] for d in deltas if "content" in d)
+    flushed = parser.finalize(text)
+    joined = streamed + "".join(d["content"] for d in flushed if "content" in d)
+    assert joined == text
+    assert not parser.has_tool_calls
+    assert parser.finalize(text) == []
+
+
+def test_streaming_args_concat_matches_parse_complete():
+    parser = SimpleJsonToolParser()
+    # Compact spacing: json.dumps would re-space this and desync the
+    # streamed arguments diff.
+    text = '{"name": "get_weather","arguments": {"city":"Beijing","unit":"c"}}'
+    _, args_chunks = _simulate_streaming(parser, text)
+    streamed = "".join(args_chunks)
+    completed = parser.parse_complete(text)["tool_calls"][0]["function"]["arguments"]
+    assert streamed == completed
+    assert streamed == '"city":"Beijing","unit":"c"'

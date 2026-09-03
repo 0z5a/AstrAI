@@ -59,6 +59,7 @@ class TrainContext:
     world_size: int = field(default=1)
     rank: int = field(default=0)
     kwargs: Dict[str, Any] = field(default_factory=dict)
+    param_path: Optional[str] = field(default=None)
 
     _stop_event: threading.Event = field(default_factory=threading.Event)
 
@@ -180,6 +181,7 @@ class TrainContextBuilder:
             epoch=state.epoch,
             consumed_samples=state.consumed_samples,
             checkpoint=state.checkpoint,
+            param_path=self._param_path,
         )
 
     def _prepare_model(

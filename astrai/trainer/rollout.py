@@ -551,3 +551,16 @@ class RolloutRunner:
         # cache publication. Reward scoring itself intentionally remains
         # outside the policy lock because it may call an external service.
         return self.generator.with_policy_snapshot(commit)
+
+    def evaluate(self, batch: Dict) -> RolloutResult:
+        """One-off rollout + scoring that leaves the replay cache untouched.
+
+        Used by validation on online strategies: the training cache, its
+        cadence counter, and the cache key stay intact, so evaluation
+        prompts never disturb the rollout replay schedule.
+        """
+        raw = self.generator.generate(batch)
+        self._validate_policy_version(raw)
+        scored = self._score(raw)
+        self._validate_policy_version(scored)
+        return scored

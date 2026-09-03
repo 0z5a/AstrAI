@@ -15,6 +15,7 @@ from astrai.serialization import (
     looks_like_hf_state_dict,
     save_model,
 )
+from astrai.serialization.hf_adapter import _half_to_interleaved
 from tests.helpers import assert_state_dicts_equal, make_tiny_config
 
 LLAMA_RAW = {
@@ -47,10 +48,38 @@ MOE_RAW = {
 }
 
 
-def to_hf_keys(state_dict):
-    """Rename AstrAI state dict keys to HuggingFace LLaMA-style names."""
+def to_hf_keys(state_dict, head_dim=None):
+    """Rename AstrAI state dict keys to HuggingFace LLaMA-style names.
+
+    When *head_dim* is given, q/k projections and q/k norm weights are
+    also converted from AstrAI interleaved RoPE coordinates to the HF
+    half-split (rotate_half) convention, so the produced state dict is a
+    faithful HF-layout checkpoint.
+    """
     out = {}
     for key, tensor in state_dict.items():
+        if head_dim is not None:
+            name = key.split(".")
+            is_qk_proj = (
+                len(name) >= 4
+                and name[2] == "attention"
+                and name[3] in ("q_proj", "k_proj")
+            )
+            is_qk_norm = (
+                len(name) >= 4
+                and name[2] == "attention"
+                and name[3] in ("q_norm", "k_norm")
+                and name[4] == "weight"
+            )
+            if is_qk_proj or is_qk_norm:
+                inv = torch.argsort(_half_to_interleaved(head_dim))
+                rows = tensor.shape[0]
+                if rows > head_dim:
+                    blocks = torch.arange(rows // head_dim) * head_dim
+                    idx = (blocks[:, None] + inv[None, :]).flatten()
+                else:
+                    idx = inv
+                tensor = tensor.index_select(0, idx)
         if key == "embed_tokens.weight":
             out["model.embed_tokens.weight"] = tensor
         elif key == "norm.weight":
@@ -141,7 +170,9 @@ def test_adapt_config_passthrough():
 def test_convert_hf_weights_dense_roundtrip():
     cfg = make_tiny_config()
     model = AutoRegressiveLM(cfg)
-    converted = convert_hf_weights(to_hf_keys(model.state_dict()), cfg)
+    converted = convert_hf_weights(
+        to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads), cfg
+    )
     assert_state_dicts_equal(converted, model.state_dict())
 
 
@@ -157,7 +188,10 @@ def test_convert_hf_weights_moe_roundtrip():
     model = AutoRegressiveLM(cfg)
     hf_raw = convert_hf_config(MOE_RAW)
     hf_cfg = ConfigFactory.load(hf_raw)
-    converted = convert_hf_weights(to_hf_keys(model.state_dict()), hf_cfg)
+    converted = convert_hf_weights(
+        to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads),
+        hf_cfg,
+    )
     assert_state_dicts_equal(converted, model.state_dict())
 
 
@@ -216,7 +250,9 @@ def test_convert_hf_weights_moe_with_dense_layers_roundtrip():
         decoder_sparse_step=1,
     )
     model = AutoRegressiveLM(cfg)
-    converted = convert_hf_weights(to_hf_keys(model.state_dict()), cfg)
+    converted = convert_hf_weights(
+        to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads), cfg
+    )
     assert_state_dicts_equal(converted, model.state_dict())
 
 
@@ -230,7 +266,7 @@ def test_convert_hf_weights_qwen2_moe_singular_shared_expert_roundtrip():
         shared_expert_intermediate_size=16,
     )
     model = AutoRegressiveLM(cfg)
-    hf_sd = to_hf_keys(model.state_dict())
+    hf_sd = to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads)
     hf_sd = {
         k.replace("shared_experts.", "shared_expert.", 1): v for k, v in hf_sd.items()
     }
@@ -241,7 +277,9 @@ def test_convert_hf_weights_qwen2_moe_singular_shared_expert_roundtrip():
 def test_convert_hf_weights_gemma_qk_norm_roundtrip():
     cfg = make_tiny_config(use_qk_norm=True)
     model = AutoRegressiveLM(cfg)
-    converted = convert_hf_weights(to_hf_keys(model.state_dict()), cfg)
+    converted = convert_hf_weights(
+        to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads), cfg
+    )
     assert_state_dicts_equal(converted, model.state_dict())
 
 
@@ -250,7 +288,9 @@ def test_from_pretrained_hf_directory(tmp_path):
     model = AutoRegressiveLM(cfg).eval()
     save_model(
         config=LLAMA_RAW,
-        state_dict=to_hf_keys(model.state_dict()),
+        state_dict=to_hf_keys(
+            model.state_dict(), cfg.hidden_size // cfg.num_attention_heads
+        ),
         save_directory=str(tmp_path),
     )
     loaded = AutoModel.from_pretrained(tmp_path).eval()
@@ -292,7 +332,9 @@ def test_from_pretrained_weights_format_astrai_rejects_hf(tmp_path):
     model = AutoRegressiveLM(cfg)
     save_model(
         config=LLAMA_RAW,
-        state_dict=to_hf_keys(model.state_dict()),
+        state_dict=to_hf_keys(
+            model.state_dict(), cfg.hidden_size // cfg.num_attention_heads
+        ),
         save_directory=str(tmp_path),
     )
     with pytest.raises(ValueError):
@@ -313,7 +355,7 @@ def test_from_pretrained_invalid_weights_format(tmp_path):
 def test_from_pretrained_hf_directory_sharded(tmp_path):
     cfg = make_tiny_config()
     model = AutoRegressiveLM(cfg).eval()
-    hf_sd = to_hf_keys(model.state_dict())
+    hf_sd = to_hf_keys(model.state_dict(), cfg.hidden_size // cfg.num_attention_heads)
     keys = sorted(hf_sd)
     split = len(keys) // 2
     shard_a = {k: hf_sd[k] for k in keys[:split]}
@@ -342,6 +384,128 @@ def test_from_pretrained_hf_directory_sharded(tmp_path):
         )
 
 
+def _half_split_rope(q, theta=10000.0):
+    """HF llama-style rotate_half RoPE on [batch, seq, heads, head_dim]."""
+    b, s, h, d = q.shape
+    inv_freq = theta ** (-torch.arange(0, d, 2, dtype=torch.float64) / d)
+    freqs = torch.outer(torch.arange(s, dtype=torch.float64), inv_freq).float()
+    cos, sin = freqs.cos()[None, :, None, :], freqs.sin()[None, :, None, :]
+    q1, q2 = q[..., : d // 2], q[..., d // 2 :]
+    return torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
+
+
+def _rms_norm_hf(t, weight, eps):
+    t = t.float()
+    t = t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+    return weight.float() * t
+
+
+def _hf_reference_attn(
+    x, Wq, Wk, Wv, Wo, n_heads, n_kv, head_dim, q_norm_w=None, k_norm_w=None, eps=1e-5
+):
+    """Ground-truth HF attention: per-head RMSNorm BEFORE RoPE (half-split)."""
+    import torch.nn.functional as F
+
+    b, s, dim = x.shape
+    q = (x @ Wq.T).reshape(b, s, n_heads, head_dim).float()
+    k = (x @ Wk.T).reshape(b, s, n_kv, head_dim).float()
+    v = (x @ Wv.T).reshape(b, s, n_kv, head_dim).float()
+    if q_norm_w is not None:
+        q = _rms_norm_hf(q, q_norm_w, eps)
+        k = _rms_norm_hf(k, k_norm_w, eps)
+    q, k = _half_split_rope(q), _half_split_rope(k)
+    rep = n_heads // n_kv
+    k = k.repeat_interleave(rep, dim=2).transpose(1, 2)
+    v = v.repeat_interleave(rep, dim=2).transpose(1, 2)
+    out = F.scaled_dot_product_attention(q.transpose(1, 2), k, v, is_causal=True)
+    out = out.transpose(1, 2).reshape(b, s, n_heads * head_dim)
+    return out @ Wo.T
+
+
+def _run_converted_gqa(x, hf_sd, cfg):
+    from astrai.model.components.attention import GQA
+    from astrai.model.components.rope import get_rotary_emb
+
+    attn = GQA(
+        dim=cfg.hidden_size,
+        n_heads=cfg.num_attention_heads,
+        n_kv_heads=cfg.num_key_value_heads,
+        use_qk_norm=cfg.use_qk_norm,
+        norm_eps=cfg.rms_norm_eps,
+        use_gated_attention=False,
+        layer_id=0,
+    ).eval()
+    converted = convert_hf_weights(hf_sd, cfg)
+    local = {
+        k.removeprefix("layers.0.attention."): v
+        for k, v in converted.items()
+        if k.startswith("layers.0.attention.")
+    }
+    attn.load_state_dict(local, strict=True)
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    seq = x.shape[1]
+    rot = get_rotary_emb(head_dim, seq)[None, :seq].expand(x.shape[0], seq, -1, -1)
+    with torch.no_grad():
+        return attn(x, rot, is_causal=True)
+
+
+def test_hf_import_rope_permutation_matches_half_split_reference():
+    torch.manual_seed(0)
+    n_heads, n_kv, head_dim = 4, 2, 8
+    dim = n_heads * head_dim
+    Wq = torch.randn(n_heads * head_dim, dim)
+    Wk = torch.randn(n_kv * head_dim, dim)
+    Wv = torch.randn(n_kv * head_dim, dim)
+    Wo = torch.randn(dim, dim)
+    x = torch.randn(2, 16, dim)
+
+    hf_sd = {
+        "model.layers.0.self_attn.q_proj.weight": Wq,
+        "model.layers.0.self_attn.k_proj.weight": Wk,
+        "model.layers.0.self_attn.v_proj.weight": Wv,
+        "model.layers.0.self_attn.o_proj.weight": Wo,
+    }
+    cfg = make_tiny_config(
+        hidden_size=dim, num_attention_heads=n_heads, num_key_value_heads=n_kv
+    )
+    ref = _hf_reference_attn(x, Wq, Wk, Wv, Wo, n_heads, n_kv, head_dim)
+    out = _run_converted_gqa(x, hf_sd, cfg)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+
+def test_hf_import_qk_norm_matches_norm_before_rope_reference():
+    torch.manual_seed(1)
+    n_heads, n_kv, head_dim = 4, 2, 8
+    dim = n_heads * head_dim
+    Wq = torch.randn(n_heads * head_dim, dim)
+    Wk = torch.randn(n_kv * head_dim, dim)
+    Wv = torch.randn(n_kv * head_dim, dim)
+    Wo = torch.randn(dim, dim)
+    gq = torch.randn(head_dim)
+    gk = torch.randn(head_dim)
+    x = torch.randn(2, 16, dim)
+
+    hf_sd = {
+        "model.layers.0.self_attn.q_proj.weight": Wq,
+        "model.layers.0.self_attn.k_proj.weight": Wk,
+        "model.layers.0.self_attn.v_proj.weight": Wv,
+        "model.layers.0.self_attn.o_proj.weight": Wo,
+        "model.layers.0.self_attn.q_norm.weight": gq,
+        "model.layers.0.self_attn.k_norm.weight": gk,
+    }
+    cfg = make_tiny_config(
+        hidden_size=dim,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_kv,
+        use_qk_norm=True,
+    )
+    ref = _hf_reference_attn(
+        x, Wq, Wk, Wv, Wo, n_heads, n_kv, head_dim, q_norm_w=gq, k_norm_w=gk
+    )
+    out = _run_converted_gqa(x, hf_sd, cfg)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+
 def test_from_pretrained_hf_directory_with_moe(tmp_path):
     cfg = make_tiny_config(
         ffn_type="moe",
@@ -354,7 +518,9 @@ def test_from_pretrained_hf_directory_with_moe(tmp_path):
     model = AutoRegressiveLM(cfg).eval()
     save_model(
         config=MOE_RAW,
-        state_dict=to_hf_keys(model.state_dict()),
+        state_dict=to_hf_keys(
+            model.state_dict(), cfg.hidden_size // cfg.num_attention_heads
+        ),
         save_directory=str(tmp_path),
     )
     loaded = AutoModel.from_pretrained(tmp_path).eval()

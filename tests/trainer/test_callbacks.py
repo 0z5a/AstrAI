@@ -4,7 +4,11 @@ import torch
 
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.serialization import Checkpoint
-from astrai.trainer.train_callback import GradientCheckpointingCallback, TrainCallback
+from astrai.trainer.train_callback import (
+    GradientCheckpointingCallback,
+    TrainCallback,
+    _copy_tokenizer_files,
+)
 from astrai.trainer.trainer import Trainer
 from tests.helpers import RandomTokenDataset
 
@@ -174,3 +178,38 @@ def test_checkpoint_captures_completed_optimizer_step(
     assert (
         Path(base_test_env["test_dir"]) / "epoch_0_step_1" / "metric.jsonl"
     ).is_file()
+
+
+def test_checkpoint_snapshots_tokenizer_files(
+    base_test_env, train_config_factory, device, tmp_path
+):
+    """Checkpoints copy tokenizer files from param_path so resume works."""
+    param_dir = tmp_path / "model"
+    param_dir.mkdir()
+    (param_dir / "tokenizer.json").write_text("{}")
+    (param_dir / "tokenizer_config.json").write_text("{}")
+
+    train_config = train_config_factory(
+        model_fn=lambda: base_test_env["model"],
+        dataset=RandomTokenDataset(length=2),
+        test_dir=base_test_env["test_dir"],
+        device=device,
+        batch_per_device=2,
+        ckpt_interval=1,
+    )
+
+    Trainer(train_config).train(param_path=str(param_dir))
+
+    ckpt_dir = Path(base_test_env["test_dir"]) / "epoch_0_step_1"
+    assert (ckpt_dir / "tokenizer.json").is_file()
+    assert (ckpt_dir / "tokenizer_config.json").is_file()
+
+    # Resuming with param_path == checkpoint dir must not raise
+    # (samefile guard).
+    _copy_tokenizer_files(str(ckpt_dir), str(ckpt_dir))
+
+
+def test_copy_tokenizer_files_skips_missing_and_none(tmp_path):
+    _copy_tokenizer_files(None, str(tmp_path))
+    _copy_tokenizer_files(str(tmp_path), str(tmp_path / "out"))
+    assert not (tmp_path / "out").exists() or not any((tmp_path / "out").iterdir())

@@ -69,10 +69,14 @@ class GQA(nn.Module):
         q = self._split_heads(self.q_proj(x), self.n_heads)
         k = self._split_heads(self.k_proj(x), self.n_kv_heads)
         v = self._split_heads(self.v_proj(x), self.n_kv_heads)
-        q, k = apply_rotary_emb(q, rotary_emb), apply_rotary_emb(k, rotary_emb)
 
+        # Match the HuggingFace convention (Qwen2/Gemma): normalize Q/K
+        # before RoPE. RMSNorm's per-channel gain does not commute with
+        # the rotation, so the order changes numerics.
         if self.use_qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
+
+        q, k = apply_rotary_emb(q, rotary_emb), apply_rotary_emb(k, rotary_emb)
 
         sdqa_out = attention(
             q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
