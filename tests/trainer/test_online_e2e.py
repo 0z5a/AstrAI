@@ -8,9 +8,9 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
-import astrai.trainer.train_context as train_context
 from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
+from astrai.trainer import train_context
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer

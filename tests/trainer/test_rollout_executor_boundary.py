@@ -19,7 +19,6 @@ from astrai.trainer import train_context
 from astrai.trainer.train_context import TrainContextBuilder
 from tests.helpers import FakeTokenizer, make_rollout_config
 
-
 _DDP_TEST_WORLD_SIZE = int(os.environ.get("ASTRAI_DDP_TEST_WORLD_SIZE", "2"))
 
 

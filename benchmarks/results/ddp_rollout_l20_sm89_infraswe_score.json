@@ -2,7 +2,7 @@
   "schema_version": "0.5.1",
   "score_kind": "diagnostic-project-fit",
   "score_is_official": false,
-  "candidate_revision": "sha256:a3f1d270aa82ab508e36669fb2c80e6f89ccae09fef8e577867151ca37d5e95b",
+  "candidate_revision": "sha256:1751778633e223b800321aaa4f1f3914d356c8ad6dc80b447e841ec595a21393",
   "formula_template_id": "project-fit-system-path-v0.5.1",
   "diagnostic_project_fit_100": 94.99970824191391,
   "component_values": {
@@ -49,23 +49,23 @@
   "input_rationale": {
     "evolution": "The executor boundary and rank-local broadcast rule are additive and focused, but do not yet have upstream maintenance history.",
     "locality": "The change stays within configuration validation, executor ownership, focused rollout tests, and matching documentation/evidence.",
-    "tests": "The local suite, focused two-rank NCCL tests, five fresh two-rank replays, and the L20 non-extension regression suite passed.",
+    "tests": "The local suite, focused two-rank NCCL tests, six-rank lifecycle and GRPO tests, five fresh six-rank replays, and the L20 non-extension regression suite passed.",
     "failure": "Non-DDP multiprocess rollout, distributed FSDP, and torch.compile combinations fail before unsupported scheduler execution.",
     "contract": "Source, tests, workload, deployment cell, and acceptance criteria are digest-bound, but the artifact is not sealed or maintainer-reviewed.",
     "integration": "TrainContextBuilder obtains the inference model through its executor while retaining the wrapped DDP model for synchronized training.",
     "interface": "The executor-owned model_for_inference API preserves existing single-device behavior and exposes DDP.module only for replicated DDP.",
     "lifecycle": "Ranks may perform different counts of collective-free rollout forwards, then safely resume wrapped DDP forward/backward/update and invalidate stale KV state.",
     "buildtest": "Python and torch-native regression paths pass; the source-mounted cu128 runtime image lacked nvcc and could not rebuild native extensions.",
-    "policy": "Only two initially idle L20s were used, no unrelated process was stopped, and unsupported modes remain explicit.",
+    "policy": "Six zero-compute L20s were used after an explicitly authorized release of their inference contexts; the active training jobs on GPU2 and GPU7 were left untouched, and unsupported modes remain explicit.",
     "attainment": "The correctness target passed: divergent per-rank rollout forwards complete without deadlock and the next DDP update leaves changed, bitwise-identical replicas.",
-    "coverage": "Coverage includes CPU/Gloo state broadcast, NCCL DDP lifecycle, a real two-rank online GRPO Trainer job, five replays, and negative configuration contracts.",
+    "coverage": "Coverage includes CPU/Gloo state broadcast, two-rank focused checks, a six-rank NCCL DDP lifecycle probe, a real six-rank online GRPO Trainer job, five replays, and negative configuration contracts.",
     "retention": "The local suite and the complete non-extension L20 regression suite passed after the change.",
     "family": "The executor boundary is shared by online GRPO and online DPO, while the end-to-end multirank workload specifically exercises GRPO.",
     "compile": "torch.compile is explicitly rejected for online rollout, and native extension rebuild evidence was unavailable in the runtime-only L20 image.",
-    "replay": "Five independent fresh pytest processes passed the two-rank, 20-step online GRPO workload.",
-    "load": "Each replay ran a real two-rank Trainer job for 20 optimizer steps with rollout refresh every step and produced epoch_0_step_20.",
-    "resource": "Only idle GPU0 and GPU1 were exposed to the isolated test container; other users' GPUs and containers were untouched.",
-    "coldsteady": "Five independent processes provide cold-start-inclusive stability data, and the warmed workload also passed inside the broader regression run."
+    "replay": "Five independent fresh pytest processes passed the six-rank online GRPO workload.",
+    "load": "Each replay ran a real six-rank Trainer job for seven optimizer steps per rank with rollout refresh every step and produced epoch_0_step_7.",
+    "resource": "Only GPU0, GPU1, GPU3, GPU4, GPU5, and GPU6 were exposed; the active training workloads on GPU2 and GPU7 were not touched.",
+    "coldsteady": "Five independent six-rank processes provide cold-start-inclusive stability data, and the workload also passed inside the broader six-rank regression run."
   },
   "benchmark_trust": {
     "formula_version": "benchmark-trust-v0.5",
@@ -94,14 +94,16 @@
   },
   "comparison_cell_path": "benchmarks/infraswe/astrai-ddp-rollout-comparison-cell.json",
   "execution": {
-    "infraswe_commit": "f07ed0ae86cf1c09cf79499ce0d3cf59a77bca98",
+    "infraswe_commit": "a955e00cc3ac79b261d515fb6dd393ba5fd306dd",
     "comparison_cell_validation": "pass",
-    "infraswe_engine_tests": "41 passed in 0.22s",
-    "astrai_local_tests": "638 passed, 208 skipped, 1 warning in 12.02s",
-    "astrai_l20_focused_tests": "9 passed in 26.96s",
-    "astrai_l20_multi_rank_core": "1 passed in 5.62s",
-    "astrai_l20_non_extension_tests": "577 passed in 59.26s",
-    "astrai_l20_fresh_process_replays_seconds": [9.23, 9.18, 8.66, 9.06, 9.34],
+    "infraswe_engine_tests": "283 passed in 8.88s",
+    "astrai_local_tests": "646 passed, 176 skipped, 1 warning in 12.82s",
+    "astrai_l20_two_gpu_focused_tests": "20 passed in 24.42s",
+    "astrai_l20_six_rank_core_and_end_to_end": "2 passed in 13.69s; 18.99s total wall clock",
+    "astrai_l20_six_rank_non_extension_tests": "577 passed in 61.54s; 66.84s total wall clock",
+    "astrai_l20_six_rank_fresh_process_replays_seconds": [11.85, 11.98, 12.30, 12.18, 12.00],
+    "astrai_l20_six_rank_replay_mean_seconds": 12.062,
+    "astrai_l20_six_rank_replay_cv_percent": 1.4719,
     "sm89_build": "not run: isolated cu128 runtime image lacked nvcc/native build toolchain"
   }
 }
