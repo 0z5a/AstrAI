@@ -131,6 +131,9 @@ def _warmup_cuda_graphs(
                 kv_cache=kv,
                 position_ids=pos_in,
                 fwd="prefill",
+                logits_positions=torch.tensor(
+                    [warmup_len - 1], dtype=torch.long, device=dev
+                ),
             )
         task_cache.task_free(tid)
 
@@ -346,6 +349,11 @@ class Executor:
             ]
         )
 
+        # Last packed position per request; the model projects only these rows.
+        last_token_indices = (
+            torch.tensor(q_lens, dtype=torch.long, device=self.device).cumsum(0) - 1
+        )
+
         with (
             torch.inference_mode(),
             timed(
@@ -363,11 +371,9 @@ class Executor:
                     start_pos=start_pos,
                 ),
                 fwd="prefill",
+                logits_positions=last_token_indices,
             )
-            last_token_indices = (
-                torch.tensor(q_lens, dtype=torch.long, device=self.device).cumsum(0) - 1
-            )
-            logits = outputs["logits"][last_token_indices]
+            logits = outputs["logits"]
 
         step_out, _ = self._sample_logits(logits, tasks, return_logprobs)
         return tasks, step_out

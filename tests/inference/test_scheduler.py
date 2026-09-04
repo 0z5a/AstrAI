@@ -195,7 +195,11 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     executor._workspace = MagicMock()
     executor._workspace.max_batch_size = 16  # Add max_batch_size for validation
     all_logits = torch.arange(42, dtype=torch.float32).reshape(6, 7)
-    executor.model = MagicMock(return_value={"logits": all_logits})
+
+    def fake_model(ids, *, position_ids, kv_cache, fwd, logits_positions):
+        return {"logits": all_logits[logits_positions]}
+
+    executor.model = MagicMock(side_effect=fake_model)
     executor._sample_logits = MagicMock(
         return_value=([101, 102], torch.tensor([101, 102]))
     )
@@ -210,6 +214,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     model_args, model_kwargs = executor.model.call_args
     assert model_args[0].tolist() == [11, 12, 21, 22, 23, 24]
     assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
+    assert model_kwargs["logits_positions"].tolist() == [1, 5]
     executor.task_cache.bind.assert_called_once_with(
         ["a", "b"], executor._workspace, start_pos=1
     )
