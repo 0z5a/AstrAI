@@ -176,3 +176,47 @@ Before adding capture or replay, a follow-up must define how model revision,
 checkpoint revision, router-state version, kernel semantics, token boundaries,
 and parallel-layout digest are sourced atomically. That integration must remain
 opt-in and preserve the current model path when disabled.
+
+## Checkpoint-recompute route validation
+
+`astrai.moe.compare_recompute_routes(...)` compares ordered top-k expert IDs
+from the original forward and activation-checkpoint recomputation. It
+normalizes integer storage to a canonical CPU representation and reports
+content hashes plus mismatched layer, token-row, and top-k-slot counts. Shape,
+negative-ID, duplicate-ID, and missing-layer ambiguities fail closed.
+
+`GradientCheckpointingCallback` can attach one observer to each checkpoint
+invocation. Its `route_validation` modes are:
+
+- `off` (default): the existing non-reentrant checkpoint path is unchanged;
+- `record`: compare routes and publish bounded counters into training metrics;
+- `error`: publish the same counters and stop before the optimizer step if a
+  mismatch, malformed observation, missing recomputation, or cross-rank
+  observation-count inconsistency is present.
+
+The observer uses the checkpoint API's separate forward/recompute contexts,
+so concurrent or reverse-order backward graphs are paired by invocation rather
+than by a global call counter. It stores only detached CPU top-k IDs until the
+matching recomputation and then releases them. In distributed training, small
+integer summaries are gathered on the initialized process group and every rank
+receives the same decision. This is generic in world size; tests exercise two
+and four Gloo ranks.
+
+The opt-in path disables checkpoint early-stop for the wrapped invocation so
+the post-forward observer always receives the recomputed route. It is therefore
+incompatible with `torch.compile` in this version and has measurable overhead.
+It does not select or replay experts and does not change gradients when routes
+match.
+
+Measure a local MoE forward/backward against the existing checkpoint path with:
+
+```bash
+python scripts/benchmark_moe_recompute_validation.py \
+  --tokens 128 --dim 128 --dim-ffn 256 \
+  --num-experts 8 --top-k 2 --device cpu \
+  --warmups 3 --repeats 10
+```
+
+The report includes route hashes, mismatch counters, output/gradient parity,
+and paired-path latency. It excludes route replay, optimizer work, distributed
+training throughput, and end-to-end model performance.
