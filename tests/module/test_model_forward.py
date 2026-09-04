@@ -157,7 +157,9 @@ def test_forward_logits_positions_projects_only_requested_rows():
 
     assert full["logits"].shape == (5, config.vocab_size)
     assert sliced["logits"].shape == (2, config.vocab_size)
-    assert torch.equal(sliced["logits"], full["logits"][last_rows])
+    # Projecting M=2 rows vs M=5 rows may pick different GEMM kernels and
+    # differ in the last float32 bits — assert_close, not bit equality.
+    torch.testing.assert_close(sliced["logits"], full["logits"][last_rows])
     assert torch.equal(sliced["hidden_states"], full["hidden_states"][last_rows])
 
 
