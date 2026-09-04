@@ -1,7 +1,7 @@
-"""Benchmark decode-time linear shapes before enabling custom GEMV dispatch.
+"""Benchmark decode-time linear shapes before enabling custom GEMM dispatch.
 
 The benchmark deliberately calls ``torch.nn.functional.linear`` directly. It
-establishes the per-architecture cuBLAS baseline that later GEMV primitives and
+establishes the per-architecture cuBLAS baseline that later GEMM primitives and
 dispatch decisions must beat.
 """
 

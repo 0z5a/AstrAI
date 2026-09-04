@@ -1,4 +1,4 @@
-"""Benchmark the BF16 GEMV primitive and guarded linear dispatcher.
+"""Benchmark the BF16 GEMM primitive and guarded linear dispatcher.
 
 The kernel suite covers AstrAI's native projections plus common LLaMA and
 GPT-NeoX matrix shapes. The chain suite is a synthetic projection/MLP chain;
@@ -19,7 +19,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from astrai.extension import bf16_gemv, is_available, linear
+from astrai.extension import bf16_gemm, is_available, linear
 
 
 @dataclass(frozen=True)
@@ -198,7 +198,7 @@ def _kernel_functions(
         return F.linear(x, weight)
 
     def candidate() -> torch.Tensor:
-        return bf16_gemv(x, weight.detach())
+        return bf16_gemm(x, weight.detach())
 
     return baseline, candidate
 
@@ -256,7 +256,7 @@ def benchmark_kernels(
 
 
 def _set_mode(mode: str) -> None:
-    os.environ["ASTRAI_GEMV"] = mode
+    os.environ["ASTRAI_GEMM"] = mode
 
 
 def _chain_weights(
@@ -398,8 +398,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not torch.cuda.is_available() or not is_available("bf16_gemv"):
-        raise RuntimeError("benchmark requires CUDA and the built bf16_gemv extension")
+    if not torch.cuda.is_available() or not is_available("bf16_gemm"):
+        raise RuntimeError("benchmark requires CUDA and the built bf16_gemm extension")
     if args.warmup < 0 or args.samples < 1 or args.inner < 1 or args.chain_inner < 1:
         raise ValueError("warmup must be non-negative and sample/inner counts positive")
 

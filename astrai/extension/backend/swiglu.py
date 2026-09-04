@@ -52,16 +52,16 @@ def _swiglu_capable(x: Tensor, up_weight: Tensor, gate_weight: Tensor) -> bool:
 def swiglu(x: Tensor, up_weight: Tensor, gate_weight: Tensor) -> Tensor:
     """Apply the dense-MLP SwiGLU projection with a safe torch fallback.
 
-    ``ASTRAI_SWIGLU=0`` and ``auto`` keep the unfused linear-backend chain;
-    ``1`` forces the fused primitive for supported inputs. Auto will adopt
-    an M-banded rule mirroring the linear backend once end-to-end evidence
-    qualifies one.
+    ``ASTRAI_SWIGLU=0`` keeps the unfused linear-backend chain; ``1`` forces
+    the fused primitive for supported inputs; ``auto`` (the default) uses
+    the fused primitive for decode batches with M in ``{1, ..., 8}``. The
+    fused kernel reads x once and covers both projections plus the SiLU
+    gate-multiply in a single launch, measured 9-15% faster than the
+    unfused chain per MLP call on L20 with L2-thrashing weight rotation.
     """
-    if env_mode("ASTRAI_SWIGLU") != "1" or not _swiglu_capable(
-        x, up_weight, gate_weight
-    ):
-        return _unfused_swiglu(x, up_weight, gate_weight)
-    return _fused_swiglu(x, up_weight, gate_weight)
+    if env_mode("ASTRAI_SWIGLU") != "0" and _swiglu_capable(x, up_weight, gate_weight):
+        return _fused_swiglu(x, up_weight, gate_weight)
+    return _unfused_swiglu(x, up_weight, gate_weight)
 
 
 __all__ = ["swiglu"]

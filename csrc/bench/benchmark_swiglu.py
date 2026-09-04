@@ -1,4 +1,4 @@
-"""Benchmark fused BF16 SwiGLU against torch and unfused GEMV chains."""
+"""Benchmark fused BF16 SwiGLU against torch and unfused GEMM chains."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import click
 import torch
 import torch.nn.functional as F
 
-from astrai.extension import bf16_gemv, bf16_swiglu, is_available
+from astrai.extension import bf16_gemm, bf16_swiglu, is_available
 
 
 @dataclass(frozen=True)
@@ -124,8 +124,8 @@ def capture(operation: Callable[[], torch.Tensor]):
 def make_operations(x, up_weight, gate_weight, mode: str):
     operations: dict[str, Callable[[], torch.Tensor]] = {
         "torch": lambda: F.linear(x, up_weight) * F.silu(F.linear(x, gate_weight)),
-        "gemv_chain": lambda: (
-            bf16_gemv(x, up_weight) * F.silu(bf16_gemv(x, gate_weight))
+        "gemm_chain": lambda: (
+            bf16_gemm(x, up_weight) * F.silu(bf16_gemm(x, gate_weight))
         ),
         "fused": lambda: bf16_swiglu(x, up_weight, gate_weight),
     }
@@ -226,19 +226,19 @@ def render_markdown(payload: dict[str, object]) -> str:
         f"- Compute capability: {metadata['compute_capability']}",
         f"- PyTorch / CUDA: {metadata['torch_version']} / {metadata['cuda_version']}",
         "",
-        "| Shape | M | Mode | torch ms | GEMV chain ms | fused ms | "
+        "| Shape | M | Mode | torch ms | GEMM chain ms | fused ms | "
         "vs best unfused | fused kernels | max abs | cosine |",
         "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for shape, m, mode in cases:
         torch_item = by_case[(shape, m, mode, "torch")]
-        gemv_item = by_case[(shape, m, mode, "gemv_chain")]
+        gemm_item = by_case[(shape, m, mode, "gemm_chain")]
         fused_item = by_case[(shape, m, mode, "fused")]
-        best = min(torch_item["median_ms"], gemv_item["median_ms"])
+        best = min(torch_item["median_ms"], gemm_item["median_ms"])
         improvement = (best / fused_item["median_ms"] - 1) * 100
         lines.append(
             f"| {shape} | {m} | {mode} | {torch_item['median_ms']:.5f} | "
-            f"{gemv_item['median_ms']:.5f} | {fused_item['median_ms']:.5f} | "
+            f"{gemm_item['median_ms']:.5f} | {fused_item['median_ms']:.5f} | "
             f"{improvement:+.2f}% | "
             f"{fused_item['cuda_kernel_launches_per_call']:.1f} | "
             f"{fused_item['max_abs_error']:.5f} | "
@@ -273,8 +273,8 @@ def benchmark_command(
 ) -> None:
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA is required")
-    if not is_available("bf16_gemv") or not is_available("bf16_swiglu"):
-        raise click.ClickException("built bf16_gemv and bf16_swiglu are required")
+    if not is_available("bf16_gemm") or not is_available("bf16_swiglu"):
+        raise click.ClickException("built bf16_gemm and bf16_swiglu are required")
     shapes = tuple(parse_shape(value) for value in shape_values) or DEFAULT_SHAPES
     m_values_parsed = parse_positive_ints(m_values)
     if any(m > 8 for m in m_values_parsed):

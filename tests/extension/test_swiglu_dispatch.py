@@ -86,10 +86,9 @@ def test_mode_one_forces_supported_shape(monkeypatch):
 
 
 @skip_no_swiglu
-def test_auto_uses_unfused_chain_until_shape_is_qualified(monkeypatch):
-    # The fusion table is empty, so auto keeps the unfused linear-backend
-    # chain. The linear backend may still dispatch its own GEMV for M=4,
-    # hence the relaxed tolerance versus the pure-torch reference.
+def test_auto_uses_fused_chain_for_decode_batches(monkeypatch):
+    # Auto adopts the fused primitive for the decode band; numerics match
+    # the unfused linear-backend chain within BF16 accumulation-order noise.
     monkeypatch.setenv("ASTRAI_SWIGLU", "auto")
     x = torch.randn(4, 1536, device="cuda", dtype=torch.bfloat16)
     up_weight = torch.randn(6912, 1536, device="cuda", dtype=torch.bfloat16)

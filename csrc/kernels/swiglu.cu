@@ -1,8 +1,7 @@
 // Fused small-M BF16 SwiGLU primitive for decode-time dense MLP layers.
 // One CTA per output column; each weight pair is read once and reused across
 // all decode rows. Bandwidth-bound in the cold-HBM decode regime, so variant
-// selection beyond the M=8 block-size rule is noise (see
-// docs/developer/swiglu_benchmark.md).
+// selection beyond the M=8 block-size rule is noise.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

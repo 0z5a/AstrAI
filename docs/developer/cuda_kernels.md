@@ -1,8 +1,8 @@
 # CUDA Kernels
 
 AstrAI includes optional custom CUDA kernels for attention, rotary embedding,
-BF16 GEMV/SwiGLU, and FP8 GEMM. These are built when `nvcc` is available and
-CUDA is detected. BF16 GEMV and SwiGLU are directly callable and can be
+BF16 GEMM/SwiGLU, and FP8 GEMM. These are built when `nvcc` is available and
+CUDA is detected. BF16 GEMM and SwiGLU are directly callable and can be
 selected by guarded model dispatchers described below.
 
 ## Overview
@@ -14,49 +14,55 @@ selected by guarded model dispatchers described below.
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
-| `bf16_gemv` | `bf16_gemv.cu` | M=1..8 BF16 linear with FP32 accumulation (sm_80+) |
-| `bf16_swiglu` | `bf16_swiglu.cu` | Fused M=1..8 BF16 up/gate projections and SwiGLU epilogue (sm_80+) |
+| `bf16_gemm` | `gemm.cu` | M=1..64 BF16 linear, skinny GEMM path for M<=8 and tensor-core tiled path above (sm_80+) |
+| `bf16_swiglu` | `swiglu.cu` | Fused M=1..8 BF16 up/gate projections and SwiGLU epilogue (sm_80+) |
 | `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
 
-### BF16 GEMV primitive
+### BF16 GEMM primitive
 
-`astrai.extension.bf16_gemv(x, weight, bias=None)` accepts a contiguous BF16
-input shaped `[K]` or `[M, K]`, with `M` in `[1, 8]` and any positive `K`, and
-row-major weights `[N, K]`. One CTA computes an output row for all M tokens
-together, reusing the weight row across tokens. CTA size is 256 threads,
-except for small weight matrices (`N*K <= 12 MiB`) at `M=8`, where a
-128-thread CTA measured 5-9% faster on L20. Variant selection is otherwise
-intentionally shape-free: under HBM-streaming conditions (weights rotated
-through L2, as in real decode) the kernel is bandwidth-bound and block-size
-choice measures within noise, so earlier per-shape variant tables were
-removed along with the warp-tiled kernel.
+`astrai.extension.bf16_gemm(x, weight, bias=None)` accepts a contiguous BF16
+input shaped `[K]` or `[M, K]`, with `M` in `[1, 64]`, and row-major weights
+`[N, K]`. One entry point selects the internal path by M:
 
-The weight stream uses 128-bit vectorized loads anchored at each row's first
-16-byte-aligned address with scalar head/tail sweeps for unaligned remainders,
-so arbitrary `K` and storage offsets stay correct. Accumulation is FP32; the
-optional BF16 bias is fused before the BF16 store. The launcher uses the
-current CUDA stream, is CUDA Graph capture-safe, and requires sm_80 or newer.
+- `M` in `[1, 8]` — register-resident GEMV kernel, any positive `K`: one
+  flat 128-thread CTA per weight row computes the output column for all M
+  tokens together. Under HBM-streaming conditions (weights rotated through
+  L2, as in real decode) the kernel is bandwidth-bound; on L20 the flat
+  128-thread CTA measured within ~1% of a per-shape tuned 128/256/512 mix at
+  M=1 and M=8 and at most ~2% below it at M=2-4, while dodging the register
+  cliff the larger CTAs hit on the 307MB lm_head at M>=7 (+21% DRAM
+  throughput vs 256t). Simplicity was chosen over the last ~2%.
+- `M` in `(8, 64]` — CUTLASS-style tiled kernel (`tiled_gemm_kernel`,
+  fully parameterized by template parameters BM/BN/BK/stages/threads):
+  multistage cp.async staging with XOR-swizzled 16B chunks, no split-K —
+  every block walks the whole K range in one pass and the grid fills the
+  SMs along N. Dispatch is shape-driven: wide N (n >= 4096, grid already
+  full) uses the bandwidth-optimal default (BN=64, BK=64, 3 stages; BM
+  widens to 32 at M>16); narrow N is K-serial, where widening the grid
+  measurably does nothing and deeper K chunks win (BN=32, BK=256 while
+  the grid fits one wave, BK=128 past it). Requires `K % 8 == 0` and
+  16-byte-aligned tensors.
+
+Both paths accumulate in FP32, fuse the optional BF16 bias before the BF16
+store, use the current CUDA stream, are CUDA Graph capture-safe, and require
+sm_80 or newer. The GEMV path anchors 128-bit weight loads at each row's
+first 16-byte-aligned address with scalar head/tail sweeps for unaligned
+remainders, so arbitrary `K` and storage offsets stay correct.
 
 Model `Linear` calls route through the lightweight linear backend. Set
-`ASTRAI_GEMV=0` for an unconditional `F.linear` fallback, `1` to force the
-kernel for any supported M in [1, 8], or `auto` (the default). Automatic
-dispatch is keyed on the decode batch size alone: the kernel streams each
-weight exactly once, so once a batch size is profitable it is profitable
-across projection shapes. On compute capability 8.0+, `auto` selects the
-kernel for `M` in [2, 4], where every measured model family beat the cuBLAS
-small-M path at the HBM bandwidth floor (AstrAI 1B chain +11.8% to +14.0%,
-common LLaMA/Qwen/OPT chains +5.66% to +25.20%). `M=1` keeps cuBLAS, whose
-GEMV path is already at the floor, and `M >= 5` approaches the cuBLAS
-tensor-core crossover (M=8 regressed at wrapper level in every measured
-family). Out-of-band, training, prefill-sized, or unsupported calls fall
-back to PyTorch.
+`ASTRAI_GEMM=0` for an unconditional `F.linear` fallback, `1` to force the
+kernel for any capable M (1-64, with K%8==0 and alignment for M>8), or
+`auto` (the default). On compute capability 8.0+, `auto` routes all capable
+decode batches M in [1, 64] through the kernel. The GEMV path (M≤8, any K)
+measured universal wins at the HBM bandwidth floor (AstrAI 1B end-to-end
++8.8% at M=1 rising to +17% at M=8). The tiled path (M 9-64) measured on
+L20 across five shape families wins or ties four (q/o, kv, gate/up, lm_head)
+and regresses one (down-projection M>16: +25% latency; narrow-N long-K where
+cuBLAS is strong). Out-of-band, training, prefill-sized, or unsupported
+calls fall back to PyTorch.
 
-Inside the primitive, a templated cooperative kernel uses 256 threads,
-except at the largest decode batch where a 128-thread CTA wins 5-9% on
-small weight matrices: `M=8` with 16-byte-aligned inputs, `K % 8 == 0`,
-and `N*K <= 12 MiB` selects the smaller CTA. This internal selector is
-separate from model automatic dispatch, whose Python/wrapper overhead is
-included in the gates above.
+The measurements below date from the original `[2, 4]` automatic band; the
+band has since widened to `{1, ..., 8}` with the flat 128-thread kernel:
 
 On NVIDIA L20 (SM89), the common-shape microbenchmark reports +5.37% to
 +114.39% for M=2 and +5.38% to +115.26% for M=4 versus `F.linear`. The paired
@@ -84,7 +90,7 @@ OPT 1.3B M=1 is +4.54%. Qwen2 and LLaMA 3 70B M=1, and all three new
 families at M=8, remain exact PyTorch fallbacks.
 
 These are synthetic projection-chain measurements, not whole-model throughput
-claims. Reproduce them with `csrc/bench/benchmark_gemv_common.py`.
+claims. Reproduce them with `csrc/bench/benchmark_gemm_common.py`.
 
 The AstrAI 1B A→B→B→A results use the real `InferenceEngine`, including scheduler,
 sampling, and CUDA Graph. M=8 stays on PyTorch because its remaining
@@ -121,8 +127,7 @@ the unfused linear backend, and `1` explicitly forces the fused primitive.
 errors are small (maximum absolute error at most 2.4e-4 in the L20 matrix),
 the different FP32 reduction order changed greedy checkpoint output for
 M=1/2/4. Automatic dispatch therefore remains numerically identical to the
-existing path. See [the benchmark protocol](./swiglu_benchmark.md) for raw
-operator, engine, and checkpoint evidence.
+existing path.
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -313,7 +318,7 @@ astrai/extension/
 ├── ops/
 │   ├── attention.py        # Stateless attention kernel wrappers
 │   ├── rotary.py           # Stateless rotary kernel wrapper
-│   ├── gemv.py             # Stateless BF16 GEMV primitive
+│   ├── gemm.py             # Stateless BF16 GEMM primitive
 │   ├── swiglu.py           # Stateless fused BF16 SwiGLU primitive
 │   └── fp8.py              # Stateless FP8 primitives (custom_op)
 ├── fp8.py                  # FP8 strategy layer (fp8_autocast, recipes)

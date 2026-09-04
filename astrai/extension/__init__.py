@@ -5,7 +5,7 @@ Public API:
       families with safe torch fallbacks (see ``astrai.extension.backend``)
     - ``attn_decode`` / ``attn_prefill`` / ``attn_paged_decode`` /
       ``attn_paged_prefill`` — direct attention kernel wrappers
-    - ``bf16_gemv`` / ``bf16_swiglu`` — directly callable linear/MLP kernels
+    - ``bf16_gemm`` / ``bf16_swiglu`` — directly callable linear/MLP kernels
     - ``AttentionBackend`` / ``TorchNativeBackend`` / ``CudaBackend`` /
       ``FlashAttnBackend`` — attention backend strategies
     - ``resolve`` / ``explain`` / ``op_backend`` / ``env_mode`` — the shared
@@ -53,7 +53,7 @@ from astrai.extension.ops import (
     attn_decode,
     attn_paged_decode,
     attn_prefill,
-    bf16_gemv,
+    bf16_gemm,
     bf16_swiglu,
 )
 
@@ -73,7 +73,7 @@ __all__ = [
     "attn_decode",
     "attn_paged_decode",
     "attn_prefill",
-    "bf16_gemv",
+    "bf16_gemm",
     "bf16_swiglu",
     "is_available",
     "KERNEL_NAMES",
