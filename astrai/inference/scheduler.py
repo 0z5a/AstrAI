@@ -150,6 +150,7 @@ class InferenceScheduler:
             )
 
     def _ensure_weight_update_ready(self) -> None:
+        """Check weight update preconditions. Must be called under _weight_lock."""
         if self._loop_thread is not None and self._loop_thread.is_alive():
             raise RuntimeError("Stop the scheduler before updating model weights")
         if self._task_mgr.get_active_tasks() or self._task_mgr.get_waiting_tasks():

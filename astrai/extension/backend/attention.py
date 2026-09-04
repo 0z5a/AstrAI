@@ -343,9 +343,11 @@ def attention(
 class AttentionBackend(ABC):
     """Abstract base for attention computation strategies.
 
-    Subclasses implement ``fwd_decode`` (q_len == 1, with cache) and
-    ``fwd_prefill`` (q_len > 1, with or without cache). The public
-    ``forward`` method dispatches based on q_len.
+    Subclasses implement a single ``forward`` and branch on ``fwd``
+    ("decode" / "prefill", or None for training) wherever their kernels
+    split — the mode taxonomy is the caller's, not the base class's, so
+    it lives in the implementations. ``_check_fwd`` is the shared guard
+    against unknown mode strings.
 
     Capability contract — every backend declares:
 
@@ -365,7 +367,6 @@ class AttentionBackend(ABC):
         with attn_backend(TorchNativeBackend):          # class
             ...
         with TorchNativeBackend():                       # instance
-            ...
     """
 
     def __enter__(self) -> "AttentionBackend":
@@ -398,7 +399,15 @@ class AttentionBackend(ABC):
         Called on the canonical singleton instance (or a caller-provided
         one); must be side-effect free.
         """
+        return True
 
+    @staticmethod
+    def _check_fwd(fwd: Optional[str]) -> None:
+        """Reject unknown forward modes loudly."""
+        if fwd not in (None, "prefill", "decode"):
+            raise ValueError(f"unsupported attention forward mode: {fwd}")
+
+    @abstractmethod
     def forward(
         self,
         q: Tensor,
@@ -410,7 +419,7 @@ class AttentionBackend(ABC):
         is_causal: bool = False,
         fwd: Optional[str] = None,
     ) -> Tensor:
-        """Dispatch to decode or extend based on q_len.
+        """Run one attention call; ``fwd`` selects the mode.
 
         Args:
             q: [batch, q_len, n_heads, head_dim]
@@ -420,41 +429,11 @@ class AttentionBackend(ABC):
             layer_id: transformer layer index for buffer access.
             attn_mask: pre-built attention mask compatible with SDPA.
             is_causal: whether to apply causal masking.
+            fwd: "prefill" / "decode" for inference, None for training.
 
         Returns:
             [batch, q_len, n_heads * head_dim]
         """
-        if fwd == "decode":
-            return self.fwd_decode(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-        if fwd == "prefill" or fwd is None:
-            return self.fwd_prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-        raise ValueError(f"unsupported attention forward mode: {fwd}")
-
-    @abstractmethod
-    def fwd_decode(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        """Single-token decode with KV cache."""
-
-    @abstractmethod
-    def fwd_prefill(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        """Multi-token prefill or training forward."""
 
     @staticmethod
     def supports_graph() -> bool:
@@ -498,7 +477,7 @@ class TorchNativeBackend(AttentionBackend):
     ) -> bool:
         return True
 
-    def fwd_decode(
+    def forward(
         self,
         q: Tensor,
         k: Tensor,
@@ -507,31 +486,9 @@ class TorchNativeBackend(AttentionBackend):
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
-        return self._forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-
-    def fwd_prefill(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        return self._forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-
-    def _forward(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
+        self._check_fwd(fwd)
         if q.ndim == 4:
             n_rep = q.size(2) // k.size(2)
             if n_rep > 1:
@@ -633,7 +590,7 @@ class CudaBackend(AttentionBackend):
     def supports_graph() -> bool:
         return True
 
-    def fwd_decode(
+    def forward(
         self,
         q: Tensor,
         k: Tensor,
@@ -642,10 +599,23 @@ class CudaBackend(AttentionBackend):
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
+        self._check_fwd(fwd)
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
+        if fwd == "decode":
+            return self._decode(q, k, v, kv_cache, layer_id)
+        return self._prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
 
+    def _decode(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        kv_cache: "KVCache",
+        layer_id: int,
+    ) -> Tensor:
         kv_indptr = kv_cache.kv_indptr
 
         out = attn_paged_decode(
@@ -664,19 +634,16 @@ class CudaBackend(AttentionBackend):
         )
         return out
 
-    def fwd_prefill(
+    def _prefill(
         self,
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional["KVCache"],
+        kv_cache: "KVCache",
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
     ) -> Tensor:
-        if kv_cache is None:
-            raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
-
         loc = kv_cache.out_cache_loc
         kv_cache.k_buffer[layer_id, loc] = k
         kv_cache.v_buffer[layer_id, loc] = v
@@ -734,7 +701,7 @@ class FlashAttnBackend(AttentionBackend):
         # back to TorchNativeBackend instead of silently ignoring the mask.
         return attn_mask is None
 
-    def fwd_decode(
+    def forward(
         self,
         q: Tensor,
         k: Tensor,
@@ -743,20 +710,11 @@ class FlashAttnBackend(AttentionBackend):
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
-        return self._forward_packed(q, k, v, kv_cache, layer_id)
-
-    def fwd_prefill(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        if q.ndim == 3:
+        self._check_fwd(fwd)
+        # Decode is always packed; prefill/training split by layout.
+        if fwd == "decode" or q.ndim == 3:
             return self._forward_packed(q, k, v, kv_cache, layer_id)
         return self._forward_dense(q, k, v, attn_mask, is_causal)
 

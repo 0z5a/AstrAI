@@ -185,6 +185,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     executor.task_cache = MagicMock()
     executor.task_cache.bind.return_value = MagicMock()
     executor._workspace = MagicMock()
+    executor._workspace.max_batch_size = 16  # Add max_batch_size for validation
     all_logits = torch.arange(42, dtype=torch.float32).reshape(6, 7)
     executor.model = MagicMock(return_value={"logits": all_logits})
     executor._sample_logits = MagicMock(
@@ -721,11 +722,15 @@ def test_decode_does_not_reuse_previous_batch_state():
     executor.device = torch.device("cpu")
     executor.task_cache = MagicMock()
     executor.task_cache.bind_was_steady = True
+    executor.task_cache.last_task_signature_matches.return_value = (
+        False  # Different task
+    )
     executor.task_cache.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
 
     workspace = MagicMock()
+    workspace.max_batch_size = 16
     workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids.return_value = torch.tensor([7], dtype=torch.long)
     workspace.decode_mask.return_value = torch.ones(1, 1, 9, dtype=torch.bool)
@@ -766,11 +771,13 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     executor.device = torch.device("cpu")
     executor.task_cache = MagicMock()
     executor.task_cache.bind_was_steady = True
+    executor.task_cache.last_task_signature_matches.return_value = True  # Same task
     executor.task_cache.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
 
     workspace = MagicMock()
+    workspace.max_batch_size = 16
     workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids_from_device.return_value = torch.tensor(
         [9], dtype=torch.long

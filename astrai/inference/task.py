@@ -18,6 +18,7 @@ from typing import (
 
 from tokenizers.decoders import DecodeStream
 
+from astrai.config.inference_config import InferenceConfig
 from astrai.inference.metrics import MetricsCollector
 from astrai.tokenize.tokenizer import AutoTokenizer
 
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from astrai.extension import AttentionBackend
 
 STOP = object()
+_config = InferenceConfig()
 
 
 @dataclass(frozen=True)
@@ -85,7 +87,7 @@ class Task:
         top_p: float = 1.0,
         top_k: int = 50,
         frequency_penalty: float = 0.0,
-        rep_window: int = 64,
+        rep_window: int = _config.default_rep_window,
         backend: Optional["AttentionBackend"] = None,
     ):
         self.task_id = task_id
