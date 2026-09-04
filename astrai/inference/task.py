@@ -1,6 +1,7 @@
 import threading
 import time
 import uuid
+from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -145,6 +146,22 @@ class Task:
         return False
 
 
+class BatchedStreamCallback(ABC):
+    """Stream sink that receives a whole scheduler step's events in one call.
+
+    The scheduling loop dispatches once per decode step: every
+    ``(task_id, token)`` event routed to the same sink object is delivered
+    as a single list, so batch-aware consumers take their lock and wake
+    waiters once per step instead of once per token. Plain per-token
+    callbacks keep the ``Callable[[str], None]`` contract.
+    """
+
+    @abstractmethod
+    def __call__(self, events: List[Tuple[str, Any]]) -> None:
+        """Consume ``[(task_id, token), ...]`` produced by one decode step."""
+        raise NotImplementedError
+
+
 class TaskManager:
     """Thread-safe task queues and lifecycle transitions (no page ops)."""
 
@@ -256,7 +273,10 @@ class TaskManager:
                 immediate = [task]
 
         if cancelled and callback is not None:
-            callback(STOP)
+            if isinstance(callback, BatchedStreamCallback):
+                callback([(task_id, STOP)])
+            else:
+                callback(STOP)
         return immediate, cancelled
 
     def remove_task(self, task_id: str) -> List[Task]:
@@ -264,10 +284,40 @@ class TaskManager:
         immediate, _ = self.cancel_task(task_id)
         return immediate
 
-    def invoke_callback(self, task_id: str, token: str):
+    def invoke_callback(self, task_id: str, token: Any):
         with self._lock:
             cb = self._callbacks.get(task_id)
-        if cb:
+        if isinstance(cb, BatchedStreamCallback):
+            cb([(task_id, token)])
+        elif cb:
+            cb(token)
+
+    def invoke_callbacks(self, events: List[Tuple[str, Any]]) -> None:
+        """Dispatch one decode step's ``(task_id, token)`` events.
+
+        Callbacks resolve under a single lock acquisition; events aimed at
+        the same batched sink are delivered as one list (one consumer-side
+        lock/notify per step), while plain per-token callbacks receive one
+        call per event.
+        """
+        grouped: Dict[int, Tuple[BatchedStreamCallback, List[Any]]] = {}
+        plain: List[Tuple[Callable[[str], None], Any]] = []
+        with self._lock:
+            for task_id, token in events:
+                cb = self._callbacks.get(task_id)
+                if cb is None:
+                    continue
+                if isinstance(cb, BatchedStreamCallback):
+                    entry = grouped.get(id(cb))
+                    if entry is None:
+                        grouped[id(cb)] = (cb, [(task_id, token)])
+                    else:
+                        entry[1].append((task_id, token))
+                else:
+                    plain.append((cb, token))
+        for cb, batch in grouped.values():
+            cb(batch)
+        for cb, token in plain:
             cb(token)
 
     def get_stats(self) -> Dict[str, Any]:

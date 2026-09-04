@@ -264,17 +264,19 @@ class InferenceScheduler:
 
                     decoded, aborted = self._stepper.step(active)
 
-                    for t in aborted:
-                        self._task_mgr.invoke_callback(t.task_id, STOP)
-
+                    # One dispatch per step: batch-aware sinks take their
+                    # lock (and wake waiters) once instead of once per token.
+                    events: List[Tuple[str, Any]] = [(t.task_id, STOP) for t in aborted]
                     for t in decoded:
                         if t.status == TaskStatus.ABORTED:
                             continue
                         new_text = t.decode_new_token(self._task_mgr.tokenizer)
                         if new_text:
-                            self._task_mgr.invoke_callback(t.task_id, new_text)
+                            events.append((t.task_id, new_text))
                         if t.is_finished(stop_ids):
-                            self._task_mgr.invoke_callback(t.task_id, STOP)
+                            events.append((t.task_id, STOP))
+                    if events:
+                        self._task_mgr.invoke_callbacks(events)
 
         except Exception as e:
             self._stop_event.set()
