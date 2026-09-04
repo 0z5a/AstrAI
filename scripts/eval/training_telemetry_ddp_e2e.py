@@ -24,7 +24,7 @@ from torch.utils.data import Dataset
 
 from astrai.config import AutoRegressiveLMConfig, TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
-from astrai.parallel.setup import find_free_port
+from astrai.parallel.setup import find_free_port, get_rank
 from astrai.serialization import Checkpoint
 from astrai.trainer import Trainer
 
@@ -62,7 +62,10 @@ def _configure_trace_logging() -> None:
     trace_dir = os.environ.get(_TRACE_DIR_ENV)
     if not trace_dir:
         return
-    rank = int(os.environ.get("RANK", "0"))
+    # LocalStrategy passes rank directly to init_process_group instead of
+    # exporting RANK. Query the initialized process group so each spawned
+    # worker writes its own evidence file under both local and torchrun launch.
+    rank = get_rank()
     path = Path(trace_dir) / f"rank-{rank}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     telemetry_logger = logging.getLogger("astrai.trainer.training_telemetry")
