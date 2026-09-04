@@ -12,6 +12,7 @@ from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
 from astrai.inference import GenerationResult, InferenceScheduler
 from astrai.inference.metrics import MetricsCollector
 from astrai.inference.runtime.executor import DecodeSteadyState, Executor
+from astrai.inference.runtime.stepper import Stepper
 from astrai.inference.task import Task
 from astrai.model.transformer import AutoRegressiveLM
 from tests.helpers import FakeTokenizer, make_rollout_config
@@ -119,10 +120,14 @@ def test_generation_loop_activates_backend_in_worker_thread():
 
 def test_step_splits_decode_batch_by_request_backend():
     scheduler = object.__new__(InferenceScheduler)
+    scheduler._cache = SimpleNamespace(page_size=1)
     scheduler._task_cache = MagicMock()
     scheduler._task_cache.task_extend.return_value = True
     scheduler._metrics = MetricsCollector()
     scheduler._executor = MagicMock()
+    scheduler._stepper = Stepper(
+        scheduler._cache, scheduler._task_cache, scheduler._executor, scheduler._metrics
+    )
 
     observed = []
 
@@ -157,6 +162,9 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
     scheduler._task_cache.task_cached.return_value = 0
     scheduler._metrics = MetricsCollector()
     scheduler._executor = MagicMock()
+    scheduler._stepper = Stepper(
+        scheduler._cache, scheduler._task_cache, scheduler._executor, scheduler._metrics
+    )
 
     short = Task("short", [1, 2, 3])
     long = Task("long", [4, 5, 6, 7, 8])
@@ -701,8 +709,8 @@ def test_run_batch_details_report_extension_failure_and_cleanup(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         with patch.object(
-            scheduler,
-            "_step",
+            scheduler._stepper,
+            "step",
             side_effect=lambda tasks, **_kwargs: ([], list(tasks)),
         ):
             result = scheduler.run_batch([[10, 20]], max_tokens=2, return_details=True)[
@@ -722,9 +730,6 @@ def test_decode_does_not_reuse_previous_batch_state():
     executor.device = torch.device("cpu")
     executor.task_cache = MagicMock()
     executor.task_cache.bind_was_steady = True
-    executor.task_cache.last_task_signature_matches.return_value = (
-        False  # Different task
-    )
     executor.task_cache.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
@@ -771,7 +776,6 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     executor.device = torch.device("cpu")
     executor.task_cache = MagicMock()
     executor.task_cache.bind_was_steady = True
-    executor.task_cache.last_task_signature_matches.return_value = True  # Same task
     executor.task_cache.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)

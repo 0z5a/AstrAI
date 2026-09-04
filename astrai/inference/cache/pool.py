@@ -406,22 +406,6 @@ class TaskCacheManager:
         """True if the last bind was a steady-state increment (same tasks, +1 seq_lens)."""
         return self._bind_was_steady
 
-    def last_task_signature_matches(self, task_ids: List[str]) -> bool:
-        """Check if task_ids match the previous bind's signature.
-
-        Used by Executor to detect steady-state decode for device-to-device
-        token copy optimization.
-        """
-        if self._bind_state is None:
-            return False
-        prev_sig = self._bind_state.sig
-        # sig is tuple of req_indices, need to map task_ids to req_indices
-        try:
-            current_sig = tuple(self._states[tid].req_idx for tid in task_ids)
-            return prev_sig == current_sig
-        except KeyError:
-            return False
-
     # -- internals --
 
     def _rollback(self, state: TaskCacheState, task_id: str):

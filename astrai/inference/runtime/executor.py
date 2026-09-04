@@ -415,14 +415,14 @@ class Executor:
         # inference-mode context.
         #
         # ``cache_valid`` checks the decode cache's own task signature:
-        # req-index signatures in the cache manager are recycled when freed
-        # slots are reallocated to new tasks, so a fresh batch whose prefill
-        # re-bind coincides with a stale signature would otherwise replay a
-        # previous generation's tokens into ``input_ids``.
-        task_sig_match = self.task_cache.last_task_signature_matches(task_ids)
+        # task ids are globally unique, so equality alone proves the cached
+        # tokens were sampled for exactly this ordered batch.  Req-index
+        # signatures in the cache manager are deliberately NOT consulted —
+        # they are recycled when freed slots are reallocated, which once
+        # let a fresh batch replay a previous generation's tokens.
         cached = self._decode_cache
         cache_valid = cached is not None and cached.task_sig == task_sig
-        if task_sig_match and cache_valid and cached.last_tokens is not None:
+        if cache_valid and cached.last_tokens is not None:
             with torch.inference_mode():
                 input_ids = ws.fill_input_ids_from_device(cached.last_tokens)
         else:
@@ -433,12 +433,9 @@ class Executor:
         kv_cache = self.task_cache.bind(task_ids, ws)
 
         # Reuse sampling state only if all conditions hold:
-        # 1. KV bind detected steady increment (same req_indices, seq_lens +1)
-        # 2. Task signature matches (same task_ids in same order)
-        # 3. We have a valid cached decode state for THIS task set
-        reuse_decode_state = (
-            cache_valid and self.task_cache.bind_was_steady and task_sig_match
-        )
+        # 1. The cached decode state belongs to THIS task set (task_sig)
+        # 2. KV bind detected steady increment (same req_indices, seq_lens +1)
+        reuse_decode_state = cache_valid and self.task_cache.bind_was_steady
         if reuse_decode_state:
             info = cached.sampling_info
             ws.position_ids[:b] += 1

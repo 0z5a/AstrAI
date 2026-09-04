@@ -80,7 +80,10 @@ class InferenceWorkspace:
                 (max_batch_size,), dtype=torch.long, device=device
             )
             self._pin = torch.empty(
-                (max_batch_size,), dtype=torch.long, pin_memory=True
+                (max_batch_size,),
+                dtype=torch.long,
+                pin_memory=torch.cuda.is_available()
+                and torch.device(device).type == "cuda",
             )
 
             # KV-cache bind metadata (fixed shape, written by
