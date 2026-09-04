@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 import astrai.trainer.train_context as train_context
 from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.value import ValueModel
 from astrai.serialization import Checkpoint
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.schedule import SchedulerFactory
@@ -67,6 +68,10 @@ def _model_fn(model_config):
     return AutoRegressiveLM(model_config).to(dtype=torch.float32)
 
 
+def _value_model_fn(model_config):
+    return ValueModel(model_config).to(dtype=torch.float32)
+
+
 def _optimizer_fn(m):
     return torch.optim.AdamW(m.parameters(), lr=1e-4)
 
@@ -81,16 +86,32 @@ _ONLINE_STRATEGIES = [
     pytest.param(
         "online_grpo",
         {"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
+        None,
         id="grpo",
     ),
-    pytest.param("online_dpo", {"beta": 0.1, "group_size": 2}, id="dpo"),
+    pytest.param("online_dpo", {"beta": 0.1, "group_size": 2}, None, id="dpo"),
+    pytest.param(
+        "online_ppo",
+        {
+            "clip_eps": 0.2,
+            "kl_coef": 0.01,
+            "group_size": 2,
+            "gamma": 1.0,
+            "gae_lambda": 0.95,
+            "vf_coef": 0.5,
+        },
+        True,
+        id="ppo",
+    ),
 ]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(("strategy", "strategy_kwargs"), _ONLINE_STRATEGIES)
+@pytest.mark.parametrize(
+    ("strategy", "strategy_kwargs", "with_critic"), _ONLINE_STRATEGIES
+)
 def test_online_rollout_end_to_end(
-    base_test_env, strategy, strategy_kwargs, monkeypatch
+    base_test_env, strategy, strategy_kwargs, with_critic, monkeypatch
 ):
     """Run one epoch of online RL rollout with KV-cache-backed generation."""
     created_reference_models = []
@@ -110,7 +131,7 @@ def test_online_rollout_end_to_end(
     tokenizer.set_chat_template(CHAT_TEMPLATE)
     tokenizer.save_pretrained(test_dir)
 
-    train_config = TrainConfig(
+    config_kwargs = dict(
         strategy=strategy,
         model_fn=partial(_model_fn, model_config),
         dataset=InstructionDataset(),
@@ -135,6 +156,10 @@ def test_online_rollout_end_to_end(
         reward_model_fn=LengthRewardModel,
         collate_fn=instruction_collate_fn,
     )
+    if with_critic:
+        config_kwargs["critic_model_fn"] = partial(_value_model_fn, model_config)
+        config_kwargs["critic_optimizer_fn"] = _optimizer_fn
+    train_config = TrainConfig(**config_kwargs)
 
     trainer = Trainer(train_config)
     trainer.train(param_path=test_dir)
@@ -144,6 +169,11 @@ def test_online_rollout_end_to_end(
     checkpoint = Checkpoint.load(checkpoint_dir)
     assert checkpoint.meta["policy_version"] == 2
     assert len(created_reference_models) == 1
+    if with_critic:
+        assert "value_model" in checkpoint.extra
+        assert "value_optimizer" in checkpoint.extra
+    else:
+        assert "value_model" not in checkpoint.extra
 
 
 def _minimal_online_config(**overrides):

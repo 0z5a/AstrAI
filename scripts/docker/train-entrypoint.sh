@@ -34,6 +34,7 @@ fi
 if [[ -n "${TRAIN_CONFIG}" ]]; then
     [[ -f "${TRAIN_CONFIG}" ]] || die "Training config not found: ${TRAIN_CONFIG}"
 fi
+export CHECKPOINT_EXTRA_FILES="$(checkpoint_extra_files "${TRAIN_CONFIG}")"
 [[ -r /data ]] || die "Training data directory is not readable: /data"
 
 mkdir -p "${CHECKPOINT_DIR}"

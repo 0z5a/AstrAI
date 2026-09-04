@@ -1,7 +1,7 @@
 """Training strategy implementations with factory pattern."""
 
 from abc import ABC
-from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, Union
 
 import torch
 import torch.nn as nn
@@ -83,6 +83,166 @@ def get_logprobs(
         "aux_loss": outputs.get("aux_loss"),
         "router_stats": outputs.get("router_stats"),
     }
+
+
+def rollout_sequences(
+    prompts: Tensor,
+    prompt_mask: Tensor,
+    responses: Tensor,
+    response_masks: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """Concatenate grouped prompts with responses for sequence scoring.
+
+    Expands ``prompts`` [B, P] across the group dimension of ``responses``
+    [B, G, R] and builds the combined key-padding + causal attention mask.
+
+    Returns:
+        ``(full_sequences, attn_mask)`` each shaped [B*G, P + R]; the
+        attention mask is 4-D boolean.
+    """
+    group_size = responses.size(1)
+    responses_flat = responses.view(-1, responses.size(-1))
+    masks_flat = response_masks.view(-1, responses.size(-1)).bool()
+    prompt_expanded = prompts.unsqueeze(1).repeat(1, group_size, 1).flatten(0, 1)
+    prompt_mask_expanded = (
+        prompt_mask.unsqueeze(1).expand(-1, group_size, -1).flatten(0, 1).bool()
+    )
+
+    full_sequences = torch.cat([prompt_expanded, responses_flat], dim=-1)
+    # Build full attention mask: key-padding + causal
+    key_pad = torch.cat([prompt_mask_expanded, masks_flat], dim=-1)[:, None, None, :]
+    S = key_pad.shape[-1]
+    causal = torch.tril(
+        torch.ones(S, S, dtype=torch.bool, device=full_sequences.device)
+    )[None, None, :, :]
+    attn_mask = key_pad & causal
+    return full_sequences, attn_mask
+
+
+def rollout_token_logprobs(
+    model: nn.Module,
+    prompts: Tensor,
+    prompt_mask: Tensor,
+    responses: Tensor,
+    response_masks: Tensor,
+) -> LogprobsOutput:
+    """Per-response-token log probabilities for a grouped rollout batch.
+
+    Prompt tokens are masked out (0) so logprobs are computed only for
+    response tokens.  ``get_logprobs`` shifts the mask by one position, so
+    the first response token's logprob (predicted from the last prompt
+    token) is correctly included.
+
+    Returns:
+        ``logprobs`` reshaped to [B, G, R]: position j is the log-probability
+        of response token j under ``model``.
+    """
+    batch_size, group_size, response_len = responses.shape
+    prompt_len = prompts.size(1)
+    full_sequences, attn_mask = rollout_sequences(
+        prompts, prompt_mask, responses, response_masks
+    )
+    masks_flat = response_masks.view(-1, response_len)
+    full_masks = torch.cat(
+        [
+            torch.zeros(
+                batch_size * group_size,
+                prompt_len,
+                dtype=torch.bool,
+                device=full_sequences.device,
+            ),
+            masks_flat,
+        ],
+        dim=-1,
+    )
+
+    # get_logprobs returns [B*G, S-1] (S = prompt_len + response_len).
+    # Response token logprobs occupy the last ``response_len`` positions.
+    output = get_logprobs(model, full_sequences, attn_mask, full_masks, "none")
+    output["logprobs"] = output["logprobs"][:, prompt_len - 1 :].view(
+        batch_size, group_size, response_len
+    )
+    return output
+
+
+def rollout_token_values(
+    model: nn.Module,
+    prompts: Tensor,
+    prompt_mask: Tensor,
+    responses: Tensor,
+    response_masks: Tensor,
+) -> Tensor:
+    """Critic values [B, G, R] aligned with response token positions.
+
+    Position j holds V(s_j) — the value of the state right before response
+    token j is emitted — matching the logprob alignment of
+    :func:`rollout_token_logprobs`.
+    """
+    prompt_len = prompts.size(1)
+    full_sequences, attn_mask = rollout_sequences(
+        prompts, prompt_mask, responses, response_masks
+    )
+    output = model(full_sequences, input_mask=attn_mask)
+    values = output["values"].float()[
+        :, prompt_len - 1 : prompt_len - 1 + responses.size(-1)
+    ]
+    return values.view(responses.shape)
+
+
+def compute_gae(
+    rewards: Tensor,
+    values: Tensor,
+    mask: Tensor,
+    gamma: float,
+    gae_lambda: float,
+) -> Tuple[Tensor, Tensor]:
+    """Generalized advantage estimation over padded response tokens.
+
+    Args:
+        rewards: [B, G, R] per-token rewards; the terminal reward must sit
+            at each response's last valid position, padded positions 0.
+        values: [B, G, R] rollout-time critic values V(s_t) (see
+            :func:`rollout_token_values`).
+        mask: [B, G, R] valid-token mask; padded positions are excluded
+            and cannot leak into valid advantages.
+        gamma: Discount factor.
+        gae_lambda: GAE bias/variance trade-off.
+
+    Returns:
+        ``(advantages, returns)`` shaped [B, G, R].  The episode ends at the
+        last valid token (no bootstrap value beyond truncation).
+    """
+    response_len = rewards.size(-1)
+    flat_rewards = rewards.reshape(-1, response_len)
+    flat_mask = mask.reshape(-1, response_len).to(values.dtype)
+    # Padded values must be zero or the backward scan would leak them.
+    flat_values = values.reshape(-1, response_len) * flat_mask
+
+    advantages = torch.zeros_like(flat_rewards)
+    gae = torch.zeros_like(flat_values[:, 0])
+    for t in range(response_len - 1, -1, -1):
+        next_values = (
+            flat_values[:, t + 1]
+            if t + 1 < response_len
+            else torch.zeros_like(flat_values[:, t])
+        )
+        delta = flat_rewards[:, t] + gamma * next_values - flat_values[:, t]
+        gae = flat_mask[:, t] * (delta + gamma * gae_lambda * gae)
+        advantages[:, t] = gae
+    returns = advantages + flat_values
+    return advantages.view_as(rewards), returns.view_as(rewards)
+
+
+def _validate_behavior_logprobs(behavior_logprobs: Tensor, responses: Tensor) -> None:
+    """Reject behaviour-policy logprobs that do not match the responses."""
+    if behavior_logprobs.shape != responses.shape:
+        raise ValueError(
+            "logprobs_old shape must match responses: "
+            f"got {tuple(behavior_logprobs.shape)}, "
+            f"expected {tuple(responses.shape)}"
+        )
+    if not torch.isfinite(behavior_logprobs).all():
+        raise ValueError("logprobs_old must contain only finite values")
 
 
 def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
@@ -630,82 +790,36 @@ class GRPOStrategy(BaseStrategy):
         masks = batch["masks"]
         rewards = batch["rewards"]
 
-        batch_size, group_size, response_len = responses.shape
         behavior_logprobs = batch.get("logprobs_old")
         if behavior_logprobs is not None:
-            if behavior_logprobs.shape != responses.shape:
-                raise ValueError(
-                    "logprobs_old shape must match responses: "
-                    f"got {tuple(behavior_logprobs.shape)}, "
-                    f"expected {tuple(responses.shape)}"
-                )
-            if not torch.isfinite(behavior_logprobs).all():
-                raise ValueError("logprobs_old must contain only finite values")
+            _validate_behavior_logprobs(behavior_logprobs, responses)
             behavior_logprobs = behavior_logprobs.detach().float()
         elif self.old_model is None:
             raise ValueError(
                 "GRPO batches must provide logprobs_old when no old_model is configured"
             )
 
-        responses_flat = responses.view(-1, response_len)
-        masks_flat = masks.view(-1, response_len)
-        prompt_expanded = prompts.unsqueeze(1).repeat(1, group_size, 1).flatten(0, 1)
         prompt_mask = batch.get("prompt_mask")
         if prompt_mask is None:
             prompt_mask = prompts.ne(0)
-        prompt_mask_expanded = (
-            prompt_mask.unsqueeze(1).expand(-1, group_size, -1).flatten(0, 1)
-        )
-        prompt_len = prompt_expanded.size(1)
 
-        full_sequences = torch.cat([prompt_expanded, responses_flat], dim=-1)
-        # Prompt tokens are masked out (0) so logprobs are computed only for
-        # response tokens.  get_logprobs shifts the mask by one position, so
-        # the first response token's logprob (predicted from the last prompt
-        # token) is correctly included.
-        full_masks = torch.cat(
-            [torch.zeros_like(prompt_expanded, dtype=torch.bool), masks_flat], dim=-1
-        )
-
-        # Build full attention mask: key-padding + causal
-        key_pad = torch.cat([prompt_mask_expanded, masks_flat.bool()], dim=-1)[
-            :, None, None, :
-        ]
-        S = key_pad.shape[-1]
-        causal = torch.tril(
-            torch.ones(S, S, dtype=torch.bool, device=full_sequences.device)
-        )[None, None, :, :]
-        attn_mask = key_pad & causal
-
-        # get_logprobs returns [B*G, S-1] (S = prompt_len + response_len).
-        # Response token logprobs occupy the last ``response_len`` positions
-        # (the first response token is predicted from the last prompt token).
-        policy_output = get_logprobs(
-            self.model, full_sequences, attn_mask, full_masks, "none"
+        policy_output = rollout_token_logprobs(
+            self.model, prompts, prompt_mask, responses, masks
         )
         token_log_probs_policy = policy_output["logprobs"]
         aux_loss = policy_output["aux_loss"]
-        token_log_probs_policy = token_log_probs_policy[:, prompt_len - 1 :]
         with torch.no_grad():
             if behavior_logprobs is None:
-                old_output = get_logprobs(
-                    self.old_model, full_sequences, attn_mask, full_masks, "none"
-                )
-                token_log_probs_old = old_output["logprobs"]
-                token_log_probs_old = token_log_probs_old[:, prompt_len - 1 :]
+                token_log_probs_old = rollout_token_logprobs(
+                    self.old_model, prompts, prompt_mask, responses, masks
+                )["logprobs"]
             else:
                 token_log_probs_old = behavior_logprobs
-            ref_output = get_logprobs(
-                self.ref_model, full_sequences, attn_mask, full_masks, "none"
-            )
-            token_log_probs_ref = ref_output["logprobs"]
-            token_log_probs_ref = token_log_probs_ref[:, prompt_len - 1 :]
+            token_log_probs_ref = rollout_token_logprobs(
+                self.ref_model, prompts, prompt_mask, responses, masks
+            )["logprobs"]
 
-        # Reshape to [B, G, response_len]
-        token_log_probs_policy = token_log_probs_policy.view(batch_size, group_size, -1)
-        token_log_probs_old = token_log_probs_old.view(batch_size, group_size, -1)
-        token_log_probs_ref = token_log_probs_ref.view(batch_size, group_size, -1)
-        token_masks = masks_flat.view(batch_size, group_size, -1).float()
+        token_masks = masks.float()
 
         # Group-normalized advantages from scalar per-response rewards.
         eps = 1e-8
@@ -754,8 +868,228 @@ class GRPOStrategy(BaseStrategy):
         }
 
 
+@StrategyFactory.register("online_ppo")
+class PPOStrategy(BaseStrategy):
+    """Proximal Policy Optimization with a learned critic (actor-critic).
+
+    Uses the same token-level clipped surrogate as GRPO, but advantages
+    come from GAE(λ) over a :class:`~astrai.model.value.ValueModel` critic
+    instead of group-normalized rewards.
+
+    Roles:
+
+    * **Policy** ``self.model`` — the actor being trained.
+    * **Behaviour policy** — per-token ``logprobs_old`` captured by the
+      rollout sampler; always required (no offline old-model fallback).
+    * **Critic** ``self.critic`` — trained jointly by masked MSE regression
+      against the GAE returns.  It owns a separate optimizer, stepped by
+      :meth:`optimizer_step` *outside* the policy-version lock: the critic
+      never serves generation, so its weights are not part of a policy
+      version publication.
+    * **Reference model** ``self.ref_model`` — optional frozen copy of the
+      initial policy.  When set (and ``kl_coef > 0``), a per-token KL
+      penalty (k3 estimator, ``logπ_old − logπ_ref``) is folded into the
+      rewards before GAE, following InstructGPT-style reward shaping.
+
+    Advantages and returns are computed once per rollout — with rollout-time
+    critic values — and pinned on the :class:`RolloutResult`, so every
+    replayed gradient step optimizes the same fixed targets, mirroring
+    classic PPO's multiple epochs over one batch.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        device: str,
+        critic: nn.Module,
+        critic_optimizer: Optional[Optimizer] = None,
+        ref_model: Optional[nn.Module] = None,
+        clip_eps: float = 0.2,
+        kl_coef: float = 0.01,
+        gamma: float = 1.0,
+        gae_lambda: float = 0.95,
+        vf_coef: float = 0.5,
+        max_grad_norm: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(model, device, **kwargs)
+        self.critic = critic
+        self.critic_optimizer = critic_optimizer
+        self.ref_model = ref_model
+        self.clip_eps = clip_eps
+        self.kl_coef = kl_coef
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.vf_coef = vf_coef
+        self.max_grad_norm = max_grad_norm
+
+    def optimizer_step(self, optimizer: Optimizer):
+        """Step the policy under the version lock, then the critic.
+
+        The critic step runs after the policy's atomic version publication:
+        a concurrent rollout may already observe the new policy version,
+        but only the (unused-for-generation) critic lags by one step.
+        """
+        result = super().optimizer_step(optimizer)
+        if self.critic_optimizer is not None:
+            if self.max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.critic.parameters(), self.max_grad_norm
+                )
+            self.critic_optimizer.step()
+            self.critic_optimizer.zero_grad()
+        return result
+
+    @torch.no_grad()
+    def _compute_advantages(
+        self,
+        prompts: Tensor,
+        prompt_mask: Tensor,
+        responses: Tensor,
+        response_masks: Tensor,
+        rewards: Tensor,
+        behavior_logprobs: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """GAE advantages/returns pinned to rollout-time critic values."""
+        device = self.device
+        prompts = prompts.to(device)
+        prompt_mask = prompt_mask.to(device)
+        responses = responses.to(device)
+        response_masks = response_masks.to(device)
+        rewards = rewards.to(device)
+        behavior_logprobs = behavior_logprobs.to(device)
+
+        values = rollout_token_values(
+            self.critic, prompts, prompt_mask, responses, response_masks
+        )
+
+        # Terminal reward lands on each response's last valid token.
+        token_rewards = torch.zeros_like(values)
+        lengths = response_masks.long().sum(dim=-1)
+        terminal = (lengths - 1).clamp(min=0)
+        token_rewards.view(-1, values.size(-1)).scatter_(
+            1, terminal.reshape(-1, 1), rewards.reshape(-1, 1).to(values.dtype)
+        )
+
+        if self.ref_model is not None and self.kl_coef > 0:
+            ref_logprobs = rollout_token_logprobs(
+                self.ref_model, prompts, prompt_mask, responses, response_masks
+            )["logprobs"]
+            # k3 per-token KL estimator folded into the reward.
+            kl_penalty = behavior_logprobs.float() - ref_logprobs
+            token_rewards = (
+                token_rewards
+                - self.kl_coef * kl_penalty * response_masks.to(values.dtype)
+            )
+
+        return compute_gae(
+            token_rewards, values, response_masks, self.gamma, self.gae_lambda
+        )
+
+    def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
+        _validate_behavior_logprobs(result.logprobs_old, result.responses)
+        if result.advantages is None or result.returns is None:
+            result.advantages, result.returns = self._compute_advantages(
+                result.prompts,
+                result.prompt_mask,
+                result.responses,
+                result.response_mask,
+                result.rewards,
+                result.logprobs_old,
+            )
+        return {
+            "prompts": result.prompts,
+            "prompt_mask": result.prompt_mask,
+            "responses": result.responses,
+            "masks": result.response_mask,
+            "rewards": result.rewards,
+            "logprobs_old": result.logprobs_old,
+            "advantages": result.advantages,
+            "returns": result.returns,
+        }
+
+    def supports_online(self) -> bool:
+        return True
+
+    def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
+        batch = move_to_device(batch, self.device)
+        prompts = batch["prompts"]
+        responses = batch["responses"]
+        masks = batch["masks"]
+
+        behavior_logprobs = batch.get("logprobs_old")
+        if behavior_logprobs is None:
+            raise ValueError(
+                "PPO batches must provide logprobs_old captured at rollout"
+            )
+        _validate_behavior_logprobs(behavior_logprobs, responses)
+        behavior_logprobs = behavior_logprobs.detach().float()
+
+        prompt_mask = batch.get("prompt_mask")
+        if prompt_mask is None:
+            prompt_mask = prompts.ne(0)
+
+        advantages = batch.get("advantages")
+        returns = batch.get("returns")
+        if advantages is None or returns is None:
+            advantages, returns = self._compute_advantages(
+                prompts,
+                prompt_mask,
+                responses,
+                masks,
+                batch["rewards"],
+                behavior_logprobs,
+            )
+
+        policy_output = rollout_token_logprobs(
+            self.model, prompts, prompt_mask, responses, masks
+        )
+        token_log_probs_policy = policy_output["logprobs"]
+
+        # Critic forward with gradients: value regression against the
+        # rollout-pinned GAE returns.
+        values = rollout_token_values(
+            self.critic, prompts, prompt_mask, responses, masks
+        )
+        token_masks = masks.float()
+        token_count = token_masks.sum().clamp(min=1.0)
+
+        # Token-level ratio (π_θ / π_old) and PPO clipping.
+        log_ratio = token_log_probs_policy - behavior_logprobs
+        ratio = torch.exp(log_ratio)
+
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        per_token_policy_loss = -torch.min(surr1, surr2)
+        policy_loss = (per_token_policy_loss * token_masks).sum() / token_count
+
+        value_loss = ((values - returns) ** 2 * token_masks).sum() / token_count
+        task_loss = policy_loss + self.vf_coef * value_loss
+
+        def masked_variance(x: Tensor) -> Tensor:
+            mean = (x * token_masks).sum() / token_count
+            return ((x - mean) ** 2 * token_masks).sum() / token_count
+
+        with torch.no_grad():
+            explained_variance = 1.0 - masked_variance(
+                values - returns
+            ) / masked_variance(returns).clamp(min=1e-8)
+
+        return self._loss_output(
+            task_loss,
+            {
+                "policy_loss": policy_loss,
+                "value_loss": value_loss,
+                "explained_variance": explained_variance,
+            },
+            policy_output["aux_loss"],
+            policy_output.get("router_stats"),
+        )
+
+
 # Factory aliases: online variants use the same strategy class; the
 # ``RolloutRunner`` is injected by ``TrainContextBuilder`` to enable
-# online mode, so no separate subclass is needed.
+# online mode, so no separate subclass is needed.  ``PPOStrategy`` is
+# registered under its sole name ``online_ppo`` — it has no offline mode.
 StrategyFactory.register("online_grpo")(GRPOStrategy)
 StrategyFactory.register("online_dpo")(DPOStrategy)

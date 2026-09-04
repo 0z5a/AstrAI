@@ -16,6 +16,7 @@ from astrai.model.components.lora import inject_lora
 from astrai.parallel.executor import (
     BaseExecutor,
     ExecutorFactory,
+    broadcast_state_dict,
     create_ref_model,
     strip_compile_prefix,
 )
@@ -297,7 +298,7 @@ class TrainContextBuilder:
         cfg = self.config
         kwargs = dict(cfg.strategy_kwargs)
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
-        if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo"):
+        if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"):
             kwargs["ref_model"] = create_ref_model(
                 cfg.model_fn,
                 executor=executor,
@@ -313,6 +314,11 @@ class TrainContextBuilder:
             )
         elif cfg.strategy == "online_grpo":
             kwargs["old_model"] = None
+        if cfg.strategy == "online_ppo":
+            critic, critic_optimizer = self._create_critic(context, executor)
+            kwargs["critic"] = critic
+            kwargs["critic_optimizer"] = critic_optimizer
+            kwargs.setdefault("max_grad_norm", cfg.max_grad_norm)
         context.strategy = StrategyFactory.create(
             cfg.strategy,
             model=context.model,
@@ -321,6 +327,63 @@ class TrainContextBuilder:
             **kwargs,
         )
         return kwargs
+
+    def _create_critic(
+        self, context: TrainContext, executor: BaseExecutor
+    ) -> tuple[nn.Module, OptimizerProtocol]:
+        """Build the PPO critic and its optimizer, restoring persisted state.
+
+        The critic backbone warm-starts from the policy weights (standard
+        actor-critic initialization; the fresh value head is the only
+        randomly-initialized part).  On resume, ``value_model`` /
+        ``value_optimizer`` checkpoint extras override the warm start —
+        and their absence is fatal rather than a silent fresh critic.
+        """
+        cfg = self.config
+        device = get_current_device()
+        checkpoint = context.checkpoint
+        if checkpoint is not None:
+            missing = [
+                name
+                for name in ("value_model", "value_optimizer")
+                if name not in checkpoint.extra
+            ]
+            if missing:
+                raise ValueError(
+                    "online_ppo resume requires critic state in the "
+                    f"checkpoint; missing extras: {', '.join(missing)}"
+                )
+
+        state_dict = executor.unwrap_model(context.model)
+        if executor.use_distributed:
+            state_dict = broadcast_state_dict(state_dict)
+        critic = cfg.critic_model_fn()
+        if state_dict is not None:
+            state_dict = strip_compile_prefix(state_dict)
+            result = critic.load_state_dict(state_dict, strict=False)
+            if result.unexpected_keys:
+                raise ValueError(
+                    "critic model received unexpected keys from the policy "
+                    f"state dict: {result.unexpected_keys[:3]}"
+                )
+            unexpected_missing = [
+                key for key in result.missing_keys if not key.startswith("value_head.")
+            ]
+            if unexpected_missing:
+                raise ValueError(
+                    "critic backbone is missing policy parameters: "
+                    f"{unexpected_missing[:3]}"
+                )
+        if checkpoint is not None:
+            critic.load_state_dict(checkpoint.extra["value_model"])
+        critic = critic.to(device)
+        critic.train()
+
+        optimizer_factory = cfg.critic_optimizer_fn or cfg.optimizer_fn
+        critic_optimizer = optimizer_factory(critic)
+        if checkpoint is not None:
+            critic_optimizer.load_state_dict(checkpoint.extra["value_optimizer"])
+        return critic, critic_optimizer
 
     def _configure_rollout(self, context: TrainContext, strategy_kwargs: dict) -> None:
         cfg = self.config

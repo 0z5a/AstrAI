@@ -186,6 +186,10 @@ scheduler.pt
 manifest.json
 ```
 
+`online_ppo` jobs additionally require `value_model.pt` and
+`value_optimizer.pt` (the critic state); the completeness check derives this
+from the training config's `train_type`.
+
 New checkpoints write `manifest.json` after every payload file, sync the complete
 staging directory, and then atomically rename that directory into place. Legacy
 checkpoints without a manifest remain resumable when the original required files

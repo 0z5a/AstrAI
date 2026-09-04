@@ -55,6 +55,7 @@ load_config() {
         die "Failed to load runtime configuration"
     eval "${exports}"
     validate_job_name "${TRAIN_JOB_NAME}"
+    export CHECKPOINT_EXTRA_FILES="$(checkpoint_extra_files "${CONFIG_FILE}")"
 }
 
 compose() {

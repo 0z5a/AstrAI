@@ -170,6 +170,18 @@ them with a `BaseRewardModel`. It refreshes cached rollouts every
 behaviour log-probabilities into the loss, so it does not allocate or synchronize
 a separate old-policy model.
 
+`online_ppo` is actor-critic PPO on the same rollout pipeline. A `ValueModel`
+critic (backbone warm-started from the policy, zero-initialized value head)
+scores the rollout states; advantages come from GAE(`--ppo_gamma`,
+`--ppo_gae_lambda`) with the terminal reward on each response's last token and
+the reference-KL penalty (k3 estimator, `--grpo_kl_coef`) folded into per-token
+rewards. Advantages and returns are computed once per rollout and pinned on the
+`RolloutResult`, so replayed steps optimize fixed targets. The critic has its
+own optimizer, stepped outside the policy-version lock, and persists as
+`value_model.pt`/`value_optimizer.pt` checkpoint extras — resume without them
+fails loudly, and `scripts/train.sh` treats a PPO checkpoint as incomplete when
+they are missing.
+
 Every successful optimizer step mutates the shared model and advances its
 monotonic `policy_version` under the same generation lock. The scheduler
 invalidates reusable KV prefixes before accepting the new version, so an async

@@ -68,9 +68,16 @@ class RolloutResult(RawRollout):
 
     Fields:
         rewards: Reward per response, shape ``[B, G]``.
+        advantages: Optional GAE advantages ``[B, G, R_max]`` pinned at
+            rollout time by actor-critic strategies (PPO).  ``None`` until
+            a strategy computes them.
+        returns: Optional GAE value targets ``[B, G, R_max]`` matching
+            ``advantages``.
     """
 
     rewards: Tensor
+    advantages: Optional[Tensor] = None
+    returns: Optional[Tensor] = None
 
 
 class BaseRewardModel(ABC):

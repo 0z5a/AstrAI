@@ -21,7 +21,7 @@ from astrai.config.train_config import (
     TRAIN_TYPES,
 )
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
-from astrai.model import AutoRegressiveLM
+from astrai.model import AutoRegressiveLM, ValueModel
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.optim import OptimizerFactory
 from astrai.trainer import SchedulerFactory, Trainer
@@ -211,6 +211,27 @@ _SPECS = [
         type=float,
         default=0.01,
         help="GRPO KL penalty coefficient.",
+    ),
+    OptSpec(
+        "ppo_gamma",
+        "Algorithm",
+        type=float,
+        default=1.0,
+        help="PPO reward discount factor.",
+    ),
+    OptSpec(
+        "ppo_gae_lambda",
+        "Algorithm",
+        type=float,
+        default=0.95,
+        help="PPO GAE bias/variance trade-off.",
+    ),
+    OptSpec(
+        "ppo_vf_coef",
+        "Algorithm",
+        type=float,
+        default=0.5,
+        help="PPO value-loss coefficient.",
     ),
     OptSpec(
         "moe_aux_loss_coef",
@@ -408,6 +429,10 @@ def create_model(config):
     return AutoRegressiveLM(config).to(dtype=torch.bfloat16)
 
 
+def create_value_model(config):
+    return ValueModel(config).to(dtype=torch.bfloat16)
+
+
 def create_optimizer(
     model, optimizer_name: str = "muon_adamw", **kwargs
 ) -> optim.Optimizer:
@@ -502,6 +527,9 @@ def train(
         "clip_eps": kwargs.pop("grpo_clip_eps"),
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
+        "gamma": kwargs.pop("ppo_gamma"),
+        "gae_lambda": kwargs.pop("ppo_gae_lambda"),
+        "vf_coef": kwargs.pop("ppo_vf_coef"),
     }
 
     rollout_interval = kwargs.pop("rollout_interval", 512)
@@ -511,6 +539,11 @@ def train(
     rollout_top_p = kwargs.pop("rollout_top_p", 0.9)
     rollout_max_tokens = kwargs.pop("rollout_max_tokens", 1024)
     reward_model_fn: Callable[[], BaseRewardModel] | None = None
+    critic_model_fn = None
+    if train_type == "online_ppo":
+        # The optimizer defaults to the policy's; critic_optimizer_fn can
+        # override it in the TrainConfig.
+        critic_model_fn = partial(create_value_model, config)
 
     executor_kwargs = {}
     if parallel_mode == "ddp":
@@ -622,7 +655,7 @@ def train(
         collate_fn = dpo_collate_fn
     elif train_type == "grpo":
         collate_fn = grpo_collate_fn
-    elif train_type in ("online_grpo", "online_dpo"):
+    elif train_type in ("online_grpo", "online_dpo", "online_ppo"):
         collate_fn = None
 
     train_config = TrainConfig(
@@ -668,6 +701,7 @@ def train(
         rollout_top_p=rollout_top_p,
         rollout_max_tokens=rollout_max_tokens,
         reward_model_fn=reward_model_fn,
+        critic_model_fn=critic_model_fn,
         moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),
     )
 

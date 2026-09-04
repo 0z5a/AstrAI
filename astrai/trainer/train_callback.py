@@ -231,6 +231,12 @@ class CheckpointCallback(TrainCallback):
             obj = getattr(context, name, None)
             if obj:
                 extra[name] = obj.state_dict()
+        critic = getattr(context.strategy, "critic", None)
+        if critic is not None:
+            extra["value_model"] = critic.state_dict()
+            critic_optimizer = getattr(context.strategy, "critic_optimizer", None)
+            if critic_optimizer is not None:
+                extra["value_optimizer"] = critic_optimizer.state_dict()
         return extra
 
 

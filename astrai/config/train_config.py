@@ -11,7 +11,9 @@ from torch.utils.data import Dataset
 from astrai.config.base import BaseConfig
 from astrai.model.components.lora import LoRAConfig
 
-TRAIN_TYPES = frozenset({"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"})
+TRAIN_TYPES = frozenset(
+    {"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"}
+)
 PARALLEL_MODES = frozenset({"none", "ddp", "fsdp"})
 BACKENDS = frozenset({"nccl", "gloo"})
 START_METHODS = frozenset({"spawn", "fork", "forkserver"})
@@ -70,6 +72,8 @@ class TrainConfig(BaseConfig):
         rollout_top_p (float): Top-p (nucleus) filtering for online rollout. Defaults to 0.9.
         rollout_max_tokens (int): Maximum generated tokens per response in rollout. Defaults to 1024.
         reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
+        critic_model_fn (Optional[Callable]): Factory for the value (critic) model, required for online_ppo. Defaults to None.
+        critic_optimizer_fn (Optional[Callable]): Factory for the critic optimizer; None reuses optimizer_fn. Defaults to None.
         executor_kwargs (Dict[str, Any]): Extra kwargs passed to ExecutorFactory.create(). Defaults to {}.
         strategy_kwargs (Dict[str, Any]): Extra strategy arguments. Defaults to {}.
     """
@@ -125,6 +129,8 @@ class TrainConfig(BaseConfig):
     rollout_top_p: float = 0.9
     rollout_max_tokens: int = 1024
     reward_model_fn: Optional[Callable] = None
+    critic_model_fn: Optional[Callable] = None
+    critic_optimizer_fn: Optional[Callable] = None
 
     executor_kwargs: Dict[str, Any] = field(default_factory=dict)
     strategy_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -226,6 +232,10 @@ class TrainConfig(BaseConfig):
                 raise ValueError(
                     f"reward_model_fn is required for online RL strategy "
                     f"{self.strategy!r}"
+                )
+            if self.strategy == "online_ppo" and self.critic_model_fn is None:
+                raise ValueError(
+                    "critic_model_fn is required for online RL strategy 'online_ppo'"
                 )
             if self.nprocs > 1:
                 raise ValueError(

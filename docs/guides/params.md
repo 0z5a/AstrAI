@@ -14,7 +14,7 @@
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--config`, `-c` | YAML config file; explicit CLI options override YAML values | None |
-| `--train_type` | Training type (`seq`, `sft`, `dpo`, `grpo`, `online_grpo`, `online_dpo`) | required |
+| `--train_type` | Training type (`seq`, `sft`, `dpo`, `grpo`, `online_grpo`, `online_dpo`, `online_ppo`) | required |
 | `--data_root_path` | Dataset root directory | required |
 | `--param_path` | Model parameters or checkpoint path | required |
 | `--resume` | Resume training from `--param_path` | False |
@@ -139,16 +139,22 @@ with `--optimizer=muon_adamw`.
 |-----------|-------------|---------|---------|
 | `--dpo_beta` | DPO beta value | 0.1 | `dpo`, `online_dpo` |
 | `--label_smoothing` | Label smoothing for cross-entropy loss | 0.0 | `seq`, `sft` |
-| `--group_size` | GRPO/rollout group size | 4 | `grpo`, `online_grpo`, `online_dpo` |
-| `--grpo_clip_eps` | GRPO clipping epsilon | 0.2 | `grpo`, `online_grpo` |
-| `--grpo_kl_coef` | GRPO KL penalty coefficient | 0.01 | `grpo`, `online_grpo` |
+| `--group_size` | GRPO/rollout group size | 4 | `grpo`, `online_grpo`, `online_dpo`, `online_ppo` |
+| `--grpo_clip_eps` | Clipping epsilon for the PPO-style surrogate loss | 0.2 | `grpo`, `online_grpo`, `online_ppo` |
+| `--grpo_kl_coef` | KL penalty coefficient | 0.01 | `grpo`, `online_grpo`, `online_ppo` |
+| `--ppo_gamma` | PPO reward discount factor | 1.0 | `online_ppo` |
+| `--ppo_gae_lambda` | PPO GAE bias/variance trade-off | 0.95 | `online_ppo` |
+| `--ppo_vf_coef` | PPO value-loss coefficient | 0.5 | `online_ppo` |
 | `--neftune_alpha` | NEFTune noise alpha (0=disabled, typical: 5.0) | 0.0 | `sft` |
 
 ### Online Rollout
 
 `online_grpo` and `online_dpo` are factory aliases for the existing `grpo` and
 `dpo` strategy classes; online behavior is enabled by rollout components rather
-than separate strategy subclasses. These options apply to the online aliases.
+than separate strategy subclasses. `online_ppo` is a dedicated actor-critic
+strategy: a `ValueModel` critic supplies GAE advantages, and its state persists
+as `value_model.pt`/`value_optimizer.pt` checkpoint extras (required for
+resume). These options apply to the online strategies.
 Online strategies require
 a `BaseRewardModel` factory in `TrainConfig`; `train.py` does not currently
 provide a command-line option for configuring one.
