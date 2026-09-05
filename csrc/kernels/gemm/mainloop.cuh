@@ -22,7 +22,7 @@ struct GemmCollectiveMainloop {
     using LayoutB = typename Policy::LayoutTagB;
     using Smem = GemmSmem<Traits, LayoutA, LayoutB>;
     static constexpr bool kFastLoop = Policy::kFastLoop;
-    using T8 = typename Traits::ElemT;  // operand element type via traits
+    using ElemT = typename Traits::ElemT;  // operand element type via traits
     static constexpr int kBlockM = Traits::kBlockM;
     static constexpr int kBlockN = Traits::kBlockN;
     static constexpr int kK = Traits::kK;
@@ -40,13 +40,17 @@ struct GemmCollectiveMainloop {
     static constexpr int kSegs = kK / Traits::kMmaK;  // mma-sized k segments
     static constexpr int kARing = Smem::kRingDepth;
     static constexpr int kBRing = Smem::kRingDepth;
-    static constexpr int kAStageBytes = kBlockM * kK;
-    static constexpr int kBStageBytes = kBlockN * kK;
+    // Stage strides in BOTH units: ElemT* staging arithmetic uses elements,
+    // the smem split / byte-address carries / PrefetchCarry use bytes.
+    static constexpr int kAStageElems = kBlockM * kK;
+    static constexpr int kBStageElems = kBlockN * kK;
+    static constexpr int kAStageBytes = kAStageElems * (int)sizeof(ElemT);
+    static constexpr int kBStageBytes = kBStageElems * (int)sizeof(ElemT);
 
-    T8* const a_base;
-    T8* const b_base;
-    const T8* const a;
-    const T8* const b;
+    ElemT* const a_base;
+    ElemT* const b_base;
+    const ElemT* const a;
+    const ElemT* const b;
     const int64_t m, n, k, a_ld, b_ld;
     const int tid;
     const int64_t block_m, block_n;
@@ -61,12 +65,12 @@ struct GemmCollectiveMainloop {
     // small CTA opts in). The verdict is uniform per CTA.
     const bool fast_cta;
 
-    __device__ GemmCollectiveMainloop(char* smem, const T8* a, const T8* b,
+    __device__ GemmCollectiveMainloop(char* smem, const ElemT* a, const ElemT* b,
                                      int64_t m, int64_t n, int64_t k,
                                      int64_t a_ld, int64_t b_ld, int tid,
                                      int2 block)
-        : a_base(reinterpret_cast<T8*>(smem)),
-          b_base(reinterpret_cast<T8*>(smem + kARing * kAStageBytes)),
+        : a_base(reinterpret_cast<ElemT*>(smem)),
+          b_base(reinterpret_cast<ElemT*>(smem + kARing * kAStageBytes)),
           a(a), b(b), m(m), n(n), k(k), a_ld(a_ld), b_ld(b_ld), tid(tid),
           block_m(block.x), block_n(block.y),
           warp_m((tid >> 5) / Traits::kWarpsN),
@@ -84,37 +88,37 @@ struct GemmCollectiveMainloop {
     // Stage-slot helpers: rings rotate one slot per k-tile, so callers
     // either compute the slot from the tile index (prologue, generic loop)
     // or carry an advancing pointer (steady-state fast loop).
-    __device__ __forceinline__ T8* a_stage_of(int64_t tile) const {
-        return a_base + (size_t)(tile % kARing) * kAStageBytes;
+    __device__ __forceinline__ ElemT* a_stage_of(int64_t tile) const {
+        return a_base + (size_t)(tile % kARing) * kAStageElems;
     }
-    __device__ __forceinline__ T8* b_stage_of(int64_t tile) const {
-        return b_base + (size_t)(tile % kBRing) * kBStageBytes;
+    __device__ __forceinline__ ElemT* b_stage_of(int64_t tile) const {
+        return b_base + (size_t)(tile % kBRing) * kBStageElems;
     }
     // Asynchronous congruous loads for one k-tile: cp.async into the
     // canonical rings; kFast selects the predication-free interior copy
     // (fast_cta admits only congruous operands). Called after the
     // post-compute barrier, alongside the commit.
     template <bool kFast = false>
-    __device__ __forceinline__ void load_async(T8* a_stage, T8* b_stage,
+    __device__ __forceinline__ void load_async(ElemT* a_stage, ElemT* b_stage,
                                                int64_t k_base) const {
         if constexpr (!kDirectA)
-            load_operand_tile<T8, kK, kBlockM, kCtaThreads, kFast>(
+            load_operand_tile<ElemT, kK, kBlockM, kCtaThreads, kFast>(
                 a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (!kDirectB)
-            load_operand_tile<T8, kK, kBlockN, kCtaThreads, kFast>(
+            load_operand_tile<ElemT, kK, kBlockN, kCtaThreads, kFast>(
                 b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
     // Synchronous direct-crosswise loads for one k-tile. In the steady
     // state this runs right after barrier 1, so the LDG latency and the
     // PRMT transpose overlap the MMA phase instead of stalling the
     // inter-barrier window.
-    __device__ __forceinline__ void load_direct(T8* a_stage, T8* b_stage,
+    __device__ __forceinline__ void load_direct(ElemT* a_stage, ElemT* b_stage,
                                                 int64_t k_base) const {
         if constexpr (kDirectA)
-            load_crosswise_direct<T8, kK, kBlockM, kCtaThreads>(
+            load_crosswise_direct<ElemT, kK, kBlockM, kCtaThreads>(
                 a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (kDirectB)
-            load_crosswise_direct<T8, kK, kBlockN, kCtaThreads>(
+            load_crosswise_direct<ElemT, kK, kBlockN, kCtaThreads>(
                 b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
 
@@ -154,10 +158,10 @@ struct GemmCollectiveMainloop {
         // in, advanced one stage per iteration with an equality wrap —
         // replaces the per-k-tile (tile % ring) * stage_bytes
         // recomputation (a UIMAD.WIDE magic-division ladder in SASS).
-        PrefetchCarry<!kDirectA, T8, kK, kBlockM, kCtaThreads> carry_a(
+        PrefetchCarry<!kDirectA, ElemT, kK, kBlockM, kCtaThreads> carry_a(
             a_base, kARing, kAStageBytes, a, a_ld, block_m * kBlockM, tid,
             kStages);
-        PrefetchCarry<!kDirectB, T8, kK, kBlockN, kCtaThreads> carry_b(
+        PrefetchCarry<!kDirectB, ElemT, kK, kBlockN, kCtaThreads> carry_b(
             b_base, kBRing, kBStageBytes, b, b_ld, block_n * kBlockN, tid,
             kStages);
         const unsigned a_rd0 = __cvta_generic_to_shared(a_base) + a_lane_off(lane);
@@ -187,8 +191,8 @@ struct GemmCollectiveMainloop {
         const unsigned a_addr = a_rd;
         const unsigned b_addr = b_rd;
         // Per-k_seg base pair (cuBLAS's scheme): seg s lives at the seg-0
-        // base XOR (s<<5) — one LOP3 per extra seg per k-tile, never per
-        // fragment. Every LDSM below addresses [base + immediate].
+        // base XOR (s * kSegXor) — one LOP3 per extra seg per k-tile, never
+        // per fragment. Every LDSM below addresses [base + immediate].
         unsigned a_seg[kSegs], b_seg[kSegs];
 #pragma unroll
         for (int s = 0; s < kSegs; ++s) {
@@ -224,7 +228,7 @@ struct GemmCollectiveMainloop {
                 const unsigned* bops =
                     kPairB ? (b_frag4[bcur][nt >> 1] + (nt & 1) * 2)
                            : b_frag[bcur][nt];
-                astrai::mma_sync<T8>(acc[nt][mt], a_frag[mt], bops,
+                astrai::mma_sync<ElemT>(acc[nt][mt], a_frag[mt], bops,
                                      acc[nt][mt]);
             }
         }
@@ -274,27 +278,36 @@ struct GemmCollectiveMainloop {
     // from the cuBLAS SASS; derivation in the design notes): one base
     // register per operand per k_seg, every fragment offset an LDSM
     // immediate — zero address arithmetic inside the MMA phase.
+    // Per-lane stage-relative BYTE offsets: the ldmatrix *_lane primitives
+    // take raw shared-memory byte addresses, so every offset below is
+    // element math scaled by sizeof(ElemT). The swizzle chunk term mirrors
+    // tile_at (16B chunks = kChunkElems elements).
+    static constexpr int kChunkElems = 16 / sizeof(ElemT);
+    static constexpr int kChunkShift = log2_const<kChunkElems>::value;
     __device__ __forceinline__ unsigned a_lane_off(int lane) const {
         const int r7 = lane & 7;          // row within the 8-row matrix
         const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
         const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31)
-        constexpr int kChunks = kK / 16;
+        constexpr int kChunks = kK / kChunkElems;
         constexpr int kShift = 3 - log2_const<kChunks>::value;  // tile_at's shift
         const unsigned lswz =
             static_cast<unsigned>((r7 >> kShift) & (kChunks - 1));
         // Stage-relative, loop-invariant per-lane base; A's fragment row
         // carries the +8-row (rh8) and +1-chunk (rh16) halves.
-        return static_cast<unsigned>((a_row0 + rh8 * 8 + r7) * kK +
-                                     ((rh16 ^ lswz) << 4));
+        return static_cast<unsigned>(((a_row0 + rh8 * 8 + r7) * kK +
+                                      ((rh16 ^ lswz) << kChunkShift)) *
+                                     sizeof(ElemT));
     }
     __device__ __forceinline__ unsigned b_lane_off(int lane) const {
         const int r7 = lane & 7;
         const int rh8 = (lane >> 3) & 1;  // +8 rows (B uses rh8 as its chunk half)
-        constexpr int kChunks = kK / 16;
+        constexpr int kChunks = kK / kChunkElems;
         constexpr int kShift = 3 - log2_const<kChunks>::value;
         const unsigned lswz =
             static_cast<unsigned>((r7 >> kShift) & (kChunks - 1));
-        return static_cast<unsigned>((b_row0 + r7) * kK + ((rh8 ^ lswz) << 4));
+        return static_cast<unsigned>(((b_row0 + r7) * kK +
+                                      ((rh8 ^ lswz) << kChunkShift)) *
+                                     sizeof(ElemT));
     }
     // x4-paired B loads: one ldmatrix.x4 feeds the two adjacent nt
     // fragments. Lane contract: lanes 0-7 address rows n0..n7 chunk c,
@@ -302,12 +315,15 @@ struct GemmCollectiveMainloop {
     // lanes 24-31 rows n8..n15 chunk c+1. The +8-row step never reaches
     // the swizzle source bits for kK <= 64; kK=128 swizzles on row[2:0]
     // where +8 flips bits, so that config keeps the x2 loads.
-    static constexpr unsigned kMtStep = 16 * kK;  // bytes per m-tile row step
-    static constexpr unsigned kNtStep = 8 * kK;   // bytes per n-tile row step
-    static constexpr unsigned kSegXor = 32;       // chunk-index +2 per k_seg
-    static constexpr bool kPairB = kK / 16 <= 4;
+    // Fragment step constants, in BYTES (consumed by the *_lane address
+    // math). kSegXor = one mma k-segment = kMmaK elements — 32B for every
+    // supported dtype (fp8 k32 x 1B, bf16 k16 x 2B), i.e. two 16B chunks.
+    static constexpr unsigned kMtStep = 16u * kK * sizeof(ElemT);  // m-tile row step
+    static constexpr unsigned kNtStep = 8u * kK * sizeof(ElemT);   // n-tile row step
+    static constexpr unsigned kSegXor = (unsigned)Traits::kMmaK * sizeof(ElemT);
+    static constexpr bool kPairB = kK * sizeof(ElemT) / 16 <= 4;
     static_assert(!kPairB || kNt % 2 == 0, "B pairing needs even kNt");
-    static constexpr unsigned kPairStep = 16 * kK;  // bytes per nt-pair row step
+    static constexpr unsigned kPairStep = 16u * kK * sizeof(ElemT);  // nt-pair row step
     __device__ __forceinline__ unsigned b4_lane_off(int lane) const {
         return b_lane_off(lane) + (lane >> 4) * kPairStep / 2;
     }

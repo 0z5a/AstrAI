@@ -34,31 +34,34 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     using Epilogue = GemmCollectiveEpilogue<Policy>;
     // Stages live in dynamic shared memory so deep pipelines (> 48KB
     // static limit) opt in via cudaFuncSetAttribute in the launcher.
-    extern __shared__ __align__(16) char fp8_gemm_smem[];
+    extern __shared__ __align__(16) char gemm_smem[];
 
     // Batch slice (grid.z): broadcast operands carry a 0 stride, so the
     // same pointer serves every batch.
-    using T8 = typename Mainloop::T8;
-    const T8* a = reinterpret_cast<const T8*>(p.a_ptr) +
+    using ElemT = typename Mainloop::ElemT;
+    using OutT = typename Policy::OutT;
+    const ElemT* a = reinterpret_cast<const ElemT*>(p.a_ptr) +
                   (int64_t)blockIdx.z * p.a_batch_stride;
-    const T8* b = reinterpret_cast<const T8*>(p.b_ptr) +
+    const ElemT* b = reinterpret_cast<const ElemT*>(p.b_ptr) +
                   (int64_t)blockIdx.z * p.b_batch_stride;
-    auto* out_bf16 = reinterpret_cast<__nv_bfloat16*>(p.out_ptr) +
-                     (int64_t)blockIdx.z * p.out_batch_stride;
+    auto* out = reinterpret_cast<OutT*>(p.out_ptr) +
+                (int64_t)blockIdx.z * p.out_batch_stride;
 
-    static_assert(Mainloop::kBlockM * Mainloop::kBlockN * 2 <=
-                      Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK +
-                          Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK,
+    static_assert(Mainloop::kBlockM * Mainloop::kBlockN * sizeof(OutT) <=
+                      Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK *
+                          sizeof(ElemT) +
+                          Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK *
+                              sizeof(ElemT),
                   "output tile must fit the reclaimed operand smem");
     const int2 bn = GemmTileScheduler<Policy::kGroupRaster>::tile(blockIdx, gridDim);
-    Mainloop mainloop(fp8_gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
+    Mainloop mainloop(gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
                       threadIdx.x, bn);
     float acc[Mainloop::kNt][Mainloop::kMt][4] = {};  // [nt][mt][acc]
     mainloop.prologue();
     mainloop.accumulate(acc);
     // Drain the pipeline before the epilogue reclaims the operand rings.
     astrai::cp_async_wait_all();
-    Epilogue(fp8_gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out_bf16);
+    Epilogue(gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,38 +198,54 @@ void launch_policy(const GemmParams& p, cudaStream_t stream) {
 // Plan -> Policy: the production-tuned configs. Big CTA: 128x128 of 8 warps
 // x 64x32, kK=64, 2-stage full ring, fast loop only for dual-congruous
 // layouts. Narrow: 128x64. Small CTA: 64x64 of 4 warps x 32x32, kK=64,
-// kFastLoop always on.
-template <FP8Format Fmt, typename LayoutA, typename LayoutB,
-          typename LayoutOut = RowMajor, int GroupRaster = 8>
+// kFastLoop always on. ElemT and OutT are independent template knobs (both
+// flow from the entry dispatch; fp8 formats arrive through fp8_elem_t).
+template <typename ElemT, typename LayoutA, typename LayoutB,
+          typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16,
+          int GroupRaster = 8>
 void launch_plan(const GemmParams& p, const GemmPlan& plan,
                  cudaStream_t stream) {
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
+    // The epilogue reclaims the operand rings for the output tile; a fat
+    // output (fp32, 4B/elem) cannot fit the 128x128 tile inside the fp8
+    // rings (64KB > 48KB) — compile-time route those to the narrow CTA
+    // (32KB tile <= 36KB rings), same math at lower reuse.
+    constexpr int kRingBytes = 3 * (128 + 128) * 64 * (int)sizeof(ElemT);
+    constexpr bool kBigReclaim = 128 * 128 * (int)sizeof(OutT) <= kRingBytes;
     switch (plan.cta) {
     case GemmPlan::Cta::kBig128: {
-        using Policy =
-            Fp8GemmPolicy<Fmt, LayoutA, LayoutB, LayoutOut, 128, 128, 64,
-                          32, 64, 2, GroupRaster, false, kBigFast>;
-        launch_policy<Policy>(p, stream);
+        if constexpr (kBigReclaim) {
+            using Policy =
+                GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                           128, 128, 64, 32, 64, 2, GroupRaster, false,
+                           kBigFast>;
+            launch_policy<Policy>(p, stream);
+        } else {
+            using Policy =
+                GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                           128, 64, 32, 32, 64, 2, GroupRaster, false, true>;
+            launch_policy<Policy>(p, stream);
+        }
         break;
     }
     case GemmPlan::Cta::kNarrow128x64: {
         using Policy =
-            Fp8GemmPolicy<Fmt, LayoutA, LayoutB, LayoutOut, 128, 64, 32, 32,
-                          64, 2, GroupRaster, false, true>;
+            GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                       128, 64, 32, 32, 64, 2, GroupRaster, false, true>;
         launch_policy<Policy>(p, stream);
         break;
     }
     case GemmPlan::Cta::kSmall64: {
         if (plan.small_s3) {
-            using Policy = Fp8GemmPolicy<Fmt, LayoutA, LayoutB, LayoutOut,
-                                         64, 64, 32, 32, 64, 3, GroupRaster,
-                                         false, true>;
+            using Policy =
+                GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                           64, 64, 32, 32, 64, 3, GroupRaster, false, true>;
             launch_policy<Policy>(p, stream);
         } else {
-            using Policy = Fp8GemmPolicy<Fmt, LayoutA, LayoutB, LayoutOut,
-                                         64, 64, 32, 32, 64, 2, GroupRaster,
-                                         false, true>;
+            using Policy =
+                GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                           64, 64, 32, 32, 64, 2, GroupRaster, false, true>;
             launch_policy<Policy>(p, stream);
         }
         break;
@@ -260,10 +279,12 @@ inline void canonicalize_gemm(GemmParams& p, bool& trans_a, bool& trans_b) {
     }
 }
 
-// Entry point: canonicalize the problem, plan the launch, wire the layout
-// tags through.
-template <FP8Format Fmt>
-void gemm(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
+// Dtype-generic entry point: canonicalize the problem, plan the launch,
+// wire the layout tags through. ElemT (operand) and OutT (output) are
+// independent knobs; fp8-format callers go through the wrapper below.
+template <typename ElemT, typename OutT = __nv_bfloat16>
+void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
+                   bool trans_b) {
     const bool swapped = !trans_a && !trans_b;  // canonicalize rewrites NN
     canonicalize_gemm(p, trans_a, trans_b);
     // Crosswise operand count for the plan: transposed-A storage (ColMajor)
@@ -274,14 +295,21 @@ void gemm(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
     // instantiates the column-major-output epilogue through LayoutOut.
     if (trans_a && trans_b) {
         if (swapped)
-            launch_plan<Fmt, ColMajor, ColMajor, ColMajor, 8>(p, plan, stream);
+            launch_plan<ElemT, ColMajor, ColMajor, ColMajor, OutT, 8>(p, plan, stream);
         else
-            launch_plan<Fmt, ColMajor, ColMajor, RowMajor, 8>(p, plan, stream);
+            launch_plan<ElemT, ColMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
     } else if (trans_b) {
-        launch_plan<Fmt, RowMajor, ColMajor, RowMajor, 8>(p, plan, stream);
+        launch_plan<ElemT, RowMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
     } else {
-        launch_plan<Fmt, ColMajor, RowMajor, RowMajor, 8>(p, plan, stream);
+        launch_plan<ElemT, ColMajor, RowMajor, RowMajor, OutT, 8>(p, plan, stream);
     }
+}
+
+// fp8-format entry over the generic dispatch (fp8_elem_t maps Fmt -> type;
+// bf16 output is the fused-linear convention).
+template <FP8Format Fmt>
+void gemm(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
+    gemm_dispatch<fp8_elem_t<Fmt>>(p, stream, trans_a, trans_b);
 }
 
 // Non-template entry over the production instantiations (defined in

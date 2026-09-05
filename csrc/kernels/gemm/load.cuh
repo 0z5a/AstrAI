@@ -24,14 +24,20 @@ struct log2_const<1, Acc> {
 // index is XORed with the row bits at [3, 3+log2(kChunks)) so a warp's
 // ldmatrix fragment load (8 consecutive rows x 16B) hits all 32 banks
 // exactly once; chunks stay contiguous, so cp.async staging is unaffected.
-template <int K, typename T8>
-__device__ __forceinline__ T8* tile_at(T8* tile, int row, int col) {
-    constexpr int kChunks = K / 16;  // 16B chunks per row
+// All chunk math is in BYTES (16B granularity); element counts enter only
+// through kChunkElems = 16 / sizeof(T).
+template <int K, typename ElemT>
+__device__ __forceinline__ ElemT* tile_at(ElemT* tile, int row, int col) {
+    constexpr int kChunkElems = 16 / sizeof(ElemT);  // elems per 16B chunk
+    constexpr int kChunks = K / kChunkElems;      // 16B chunks per row
     static_assert(kChunks >= 1 && (kChunks & (kChunks - 1)) == 0,
                   "swizzle needs a power-of-two 16B-chunk count");
     constexpr int kShift = 3 - log2_const<kChunks>::value;
+    constexpr int kChunkShift = log2_const<kChunkElems>::value;
     return tile + row * K +
-           ((((col >> 4) ^ ((row >> kShift) & (kChunks - 1))) << 4) + (col & 15));
+           ((((col >> kChunkShift) ^ ((row >> kShift) & (kChunks - 1)))
+                 << kChunkShift) +
+            (col & (kChunkElems - 1)));
 }
 
 // Stage-load a CONGRUOUS operand (contract-contiguous storage — the only
@@ -40,19 +46,20 @@ __device__ __forceinline__ T8* tile_at(T8* tile, int row, int col) {
 // 16B-aligned base|ld, k_base + K <= contract); the address math then folds
 // to one immediate XOR per chunk (see the design notes). Crosswise operands
 // go through load_crosswise_direct instead.
-template <typename T8, int K, int RowsTile, int kThreads,
+template <typename ElemT, int K, int RowsTile, int kThreads,
           bool kInterior = false>
 __device__ __forceinline__ void
-load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
+load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
                   int64_t contract, int64_t ld, int tid, int64_t k_base,
                   int64_t block_row) {
-    constexpr int kChunks = K / 16;
+    constexpr int kChunkElems = 16 / sizeof(ElemT);
+    constexpr int kChunks = K / kChunkElems;
     static_assert(RowsTile * kChunks % kThreads == 0,
                   "tile chunks must divide evenly across threads");
     constexpr int kCpt = RowsTile * kChunks / kThreads;  // chunks per thread
     constexpr int kCpr = kChunks / kCpt;  // chunks per row slice
     const int r = tid / kCpr;
-    const int c0 = (tid % kCpr) * kCpt * 16;
+    const int c0 = (tid % kCpr) * kCpt * kChunkElems;
     if constexpr (kInterior) {
         const char* src = reinterpret_cast<const char*>(
             operand + (block_row + r) * ld + k_base + c0);
@@ -60,7 +67,7 @@ load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
             reinterpret_cast<uintptr_t>(tile_at<K>(tile, r, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j)
-            astrai::cp_async_16(reinterpret_cast<T8*>(dst ^ (j << 4)),
+            astrai::cp_async_16(reinterpret_cast<ElemT*>(dst ^ (j << 4)),
                                 src + j * 16);
     } else {
         const int64_t row = block_row + r;
@@ -71,16 +78,17 @@ load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
         const bool chunk_aligned = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
 #pragma unroll
         for (int j = 0; j < kCpt; ++j) {
-            const int c = c0 + j * 16;
-            T8* dst = tile_at<K>(tile, r, c);
-            if (row_ok && chunk_aligned && k_base + c + 15 < contract) {
+            const int c = c0 + j * kChunkElems;
+            ElemT* dst = tile_at<K>(tile, r, c);
+            if (row_ok && chunk_aligned &&
+                k_base + c + kChunkElems - 1 < contract) {
                 astrai::cp_async_16(dst, src + c);
             } else {
                 // Tail chunk / misaligned base / OOB row: scalar fill.
 #pragma unroll
-                for (int i = 0; i < 16; ++i)
+                for (int i = 0; i < kChunkElems; ++i)
                     dst[i] =
-                        row_ok && k_base + c + i < contract ? src[c + i] : T8(0.0f);
+                        row_ok && k_base + c + i < contract ? src[c + i] : ElemT(0.0f);
             }
         }
     }
@@ -92,33 +100,39 @@ load_operand_tile(T8* tile, const T8* __restrict__ operand, int64_t rows,
 // issued straight from registers. The guard is a property of the operand's
 // layout, so it lives in the type: the false specialization (crosswise
 // operand) is an empty no-op.
-template <bool kAsync, typename T8, int kK, int kRowsTile, int kThreads>
+template <bool kAsync, typename ElemT, int kK, int kRowsTile, int kThreads>
 struct PrefetchCarry;
 
-template <typename T8, int kK, int kRowsTile, int kThreads>
-struct PrefetchCarry<true, T8, kK, kRowsTile, kThreads> {
-    static constexpr int kCpt = kRowsTile * (kK / 16) / kThreads;
-    static constexpr int kCpr = (kK / 16) / kCpt;
+template <typename ElemT, int kK, int kRowsTile, int kThreads>
+struct PrefetchCarry<true, ElemT, kK, kRowsTile, kThreads> {
+    static constexpr int kChunkElems = 16 / sizeof(ElemT);
+    static constexpr int kCpt = kRowsTile * (kK / kChunkElems) / kThreads;
+    static constexpr int kCpr = (kK / kChunkElems) / kCpt;
+    // All carried state is in BYTES: the smem write ring and the global
+    // source pointer both advance by the byte-sized stage stride.
+    static constexpr unsigned kKBytes = (unsigned)kK * sizeof(ElemT);
     unsigned wr = 0;    // current stage's swizzled destination offset
     unsigned wr0 = 0;   // slot-0 wrap base
     unsigned wrEnd = 0; // one-past-the-ring sentinel
     const char* src = nullptr;  // current tile's global source bytes
 
     __device__ __forceinline__ PrefetchCarry(
-        const T8* ring, int ringSlots, int stageElems, const T8* operand,
+        const ElemT* ring, int ringSlots, int stageBytes, const ElemT* operand,
         int64_t ld, int64_t blockRow, int tid, int firstTile) {
         const int r = tid / kCpr;
-        const int c0 = (tid % kCpr) * kCpt * 16;
-        const T8* slot0 = ring + (firstTile % ringSlots) * stageElems;
+        const int c0 = (tid % kCpr) * kCpt * kChunkElems;
+        const int stageElems = stageBytes / (int)sizeof(ElemT);
+        const ElemT* slot0 =
+            ring + (int64_t)(firstTile % ringSlots) * stageElems;
         const unsigned laneOff = static_cast<unsigned>(
             (const char*)tile_at<kK>(slot0, r, c0) - (const char*)slot0);
         const unsigned base = __cvta_generic_to_shared(ring) + laneOff;
-        wr = base + (unsigned)((firstTile % ringSlots) * stageElems);
+        wr = base + (unsigned)((int64_t)(firstTile % ringSlots) * stageBytes);
         wr0 = base;
-        wrEnd = base + (unsigned)(ringSlots * stageElems);
+        wrEnd = base + (unsigned)((int64_t)ringSlots * stageBytes);
         src = reinterpret_cast<const char*>(
                   operand + (blockRow + r) * ld + c0) +
-              (int64_t)firstTile * kK;
+              (int64_t)firstTile * kKBytes;
     }
 
     // Emit this thread's chunks for the current tile; pf false (loop tail)
@@ -129,17 +143,17 @@ struct PrefetchCarry<true, T8, kK, kRowsTile, kThreads> {
             astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);
     }
 
-    __device__ __forceinline__ void advance(int stageElems) {
-        wr += (unsigned)stageElems;
+    __device__ __forceinline__ void advance(int stageBytes) {
+        wr += (unsigned)stageBytes;
         if (wr == wrEnd) wr = wr0;
-        src += kK;
+        src += kKBytes;
     }
 };
 
-template <typename T8, int kK, int kRowsTile, int kThreads>
-struct PrefetchCarry<false, T8, kK, kRowsTile, kThreads> {
+template <typename ElemT, int kK, int kRowsTile, int kThreads>
+struct PrefetchCarry<false, ElemT, kK, kRowsTile, kThreads> {
     __device__ __forceinline__ PrefetchCarry(
-        const T8*, int, int, const T8*, int64_t, int64_t, int, int) {}
+        const ElemT*, int, int, const ElemT*, int64_t, int64_t, int, int) {}
     __device__ __forceinline__ void emit(bool) const {}
     __device__ __forceinline__ void advance(int) {}
 };
@@ -150,11 +164,16 @@ struct PrefetchCarry<false, T8, kK, kRowsTile, kThreads> {
 // canonical tile (a 16B global run holds one contract byte for each of 16
 // rows), so they take this path; a staged smem->smem variant measured
 // 15-20% slower and was removed (see git history).
-template <typename T8, int K, int RowsTile, int kThreads>
+template <typename ElemT, int K, int RowsTile, int kThreads>
 __device__ __forceinline__ void
-load_crosswise_direct(T8* tile, const T8* __restrict__ operand, int64_t rows,
+load_crosswise_direct(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
                       int64_t contract, int64_t ld, int tid, int64_t k_base,
                       int64_t block_row) {
+    // The PRMT byte-perm transpose gathers 4 contract bytes per 32-bit word,
+    // so this path is 1-byte-element only. 2-byte operands must arrive in
+    // congruous storage (layout tags catch the mismatch at instantiation).
+    static_assert(sizeof(ElemT) == 1,
+                  "crosswise LDG+PRMT staging requires 1-byte elements");
     constexpr int kQuads = K / 4;    // 4-byte contract quads per tile
     constexpr int kGroups = RowsTile / 16;
     constexpr int kTChunks = kQuads * kGroups;  // 64B chunks per tile
@@ -204,7 +223,7 @@ load_crosswise_direct(T8* tile, const T8* __restrict__ operand, int64_t rows,
                 if (k_base + col >= contract) {
 #pragma unroll
                     for (int i = 0; i < 16; ++i)
-                        *tile_at<K>(tile, rg * 16 + i, col) = T8(0.0f);
+                        *tile_at<K>(tile, rg * 16 + i, col) = ElemT(0.0f);
                     continue;
                 }
 #pragma unroll
@@ -213,7 +232,7 @@ load_crosswise_direct(T8* tile, const T8* __restrict__ operand, int64_t rows,
                     *tile_at<K>(tile, rg * 16 + i, col) =
                         r_idx < rows
                             ? operand[(k_base + col) * ld + r_idx]
-                            : T8(0.0f);
+                            : ElemT(0.0f);
                 }
             }
         }

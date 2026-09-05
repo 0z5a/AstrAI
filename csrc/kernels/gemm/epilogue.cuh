@@ -8,16 +8,49 @@
 namespace astrai {
 namespace gemm {
 
+// Output-element packing facts for the staging tile: elements per 16B
+// chunk, pair packing for the vectorized scatter, and the scalar
+// conversion. bf16 is the fused-linear default; fp32 keeps the fp32
+// accumulators unrounded (training dX/dW style outputs).
+template <typename OutT>
+struct OutElem;
+
+template <>
+struct OutElem<__nv_bfloat16> {
+    using T2 = __nv_bfloat162;
+    static constexpr int kChunkElems = 8;  // per 16B chunk
+    static constexpr int kChunkShift = 3;
+    static __device__ __forceinline__ __nv_bfloat162 pack2(float a, float b) {
+        return __floats2bfloat162_rn(a, b);
+    }
+    static __device__ __forceinline__ __nv_bfloat16 cvt(float a) {
+        return __float2bfloat16_rn(a);
+    }
+};
+
+template <>
+struct OutElem<float> {
+    using T2 = float2;
+    static constexpr int kChunkElems = 4;
+    static constexpr int kChunkShift = 2;
+    static __device__ __forceinline__ float2 pack2(float a, float b) {
+        return make_float2(a, b);
+    }
+    static __device__ __forceinline__ float cvt(float a) { return a; }
+};
+
 template <typename Policy>
 struct GemmCollectiveEpilogue {
     using Traits = typename Policy::Traits;
+    using OutT = typename Policy::OutT;
+    using OE = OutElem<OutT>;
     static constexpr bool kStreamOut = Policy::kStreamOut;
     static constexpr int kBlockM = Traits::kBlockM;
     static constexpr int kBlockN = Traits::kBlockN;
     static constexpr int kMt = Traits::kWarpM / 16;
     static constexpr int kNt = Traits::kWarpN / 8;
 
-    __nv_bfloat16* const tile_out;
+    OutT* const tile_out;
     const float output_scale;
     const __nv_bfloat16* const bias;
     const int64_t m, n, out_ld;
@@ -31,12 +64,12 @@ struct GemmCollectiveEpilogue {
 
     __device__ GemmCollectiveEpilogue(char* smem, const GemmParams& p,
                                      int64_t block_m, int64_t block_n, int tid)
-        : tile_out(reinterpret_cast<__nv_bfloat16*>(smem)),
+        : tile_out(reinterpret_cast<OutT*>(smem)),
           output_scale(Traits::kNeedsDequant ? *p.scale : 1.0f),
           bias(reinterpret_cast<const __nv_bfloat16*>(p.bias_ptr)),
           m(p.m), n(p.n), out_ld(p.out_ld),
           row_elems(t_out ? kBlockM : kBlockN),
-          row_chunks(row_elems / 8),
+          row_chunks(row_elems / OE::kChunkElems),
           warp_m((tid >> 5) / Traits::kWarpsN),
           warp_n((tid >> 5) % Traits::kWarpsN),
           group((tid & 31) >> 2),
@@ -48,12 +81,12 @@ struct GemmCollectiveEpilogue {
     // transposed (swap dispatch): rows and row length trade places. Both
     // row-chunk counts are powers of two, keeping the XOR swizzle
     // well-defined.
-    __device__ __forceinline__ __nv_bfloat16* out_chunk(int r, int c) const {
+    __device__ __forceinline__ OutT* out_chunk(int r, int c) const {
         return tile_out + (size_t)r * row_elems +
-               ((c ^ (r & (row_chunks - 1))) * 8);
+               ((c ^ (r & (row_chunks - 1))) * OE::kChunkElems);
     }
-    __device__ __forceinline__ __nv_bfloat16* out_elem(int r, int v) const {
-        return out_chunk(r, v >> 3) + (v & 7);
+    __device__ __forceinline__ OutT* out_elem(int r, int v) const {
+        return out_chunk(r, v >> OE::kChunkShift) + (v & (OE::kChunkElems - 1));
     }
 
     // Scatter the accumulators into the staging tile: the operand rings are
@@ -87,15 +120,15 @@ struct GemmCollectiveEpilogue {
                     // Two bf16x2 stores per accumulator tile: rows g and
                     // g+8 of the m16n8 output, columns tig*2/tig*2+1 inside
                     // one 16B chunk.
-                    const int off = col & 7;  // element offset in the chunk
-                    *reinterpret_cast<__nv_bfloat162*>(
-                        out_chunk(r0, col >> 3) + off) =
-                        __floats2bfloat162_rn(tile_acc[0] * output_scale + b0,
-                                              tile_acc[1] * output_scale + b1);
-                    *reinterpret_cast<__nv_bfloat162*>(
-                        out_chunk(r0 + 8, col >> 3) + off) =
-                        __floats2bfloat162_rn(tile_acc[2] * output_scale + b0,
-                                              tile_acc[3] * output_scale + b1);
+                    const int off = col & (OE::kChunkElems - 1);  // in-chunk elems
+                    *reinterpret_cast<typename OE::T2*>(
+                        out_chunk(r0, col >> OE::kChunkShift) + off) =
+                        OE::pack2(tile_acc[0] * output_scale + b0,
+                                  tile_acc[1] * output_scale + b1);
+                    *reinterpret_cast<typename OE::T2*>(
+                        out_chunk(r0 + 8, col >> OE::kChunkShift) + off) =
+                        OE::pack2(tile_acc[2] * output_scale + b0,
+                                  tile_acc[3] * output_scale + b1);
                 }
             }
         } else {
@@ -115,13 +148,13 @@ struct GemmCollectiveEpilogue {
                         bias && grow < m ? __bfloat162float(bias[grow]) : 0.0f;
                     const float* tile_acc = acc[nt][mt];
                     *out_elem(col, r0) =
-                        __float2bfloat16(tile_acc[0] * output_scale + b);
+                        OE::cvt(tile_acc[0] * output_scale + b);
                     *out_elem(col + 1, r0) =
-                        __float2bfloat16(tile_acc[1] * output_scale + b);
+                        OE::cvt(tile_acc[1] * output_scale + b);
                     *out_elem(col, r0 + 8) =
-                        __float2bfloat16(tile_acc[2] * output_scale + b);
+                        OE::cvt(tile_acc[2] * output_scale + b);
                     *out_elem(col + 1, r0 + 8) =
-                        __float2bfloat16(tile_acc[3] * output_scale + b);
+                        OE::cvt(tile_acc[3] * output_scale + b);
                 }
             }
         }
@@ -131,9 +164,9 @@ struct GemmCollectiveEpilogue {
     // a row so each global transaction covers a full 128B line. Under the
     // swap the staged rows are D-rows counted from block_n's stripe while
     // the row length is kernel m', so row/stride flip to the swapped dims.
-    __device__ __forceinline__ void store(__nv_bfloat16* out_bf16) const {
+    __device__ __forceinline__ void store(OutT* out) const {
         constexpr int kTotalChunks =
-            kBlockM * (kBlockN / 8);  // == kBlockN * (kBlockM/8)
+            kBlockM * (kBlockN / OE::kChunkElems);  // == kBlockN * (kBlockM/chunk)
         const int64_t row0_global = block_m * kBlockM;
         const int64_t col0_global = block_n * kBlockN;
         for (int idx = threadIdx.x; idx < kTotalChunks; idx += kCtaThreads) {
@@ -142,13 +175,13 @@ struct GemmCollectiveEpilogue {
             const uint4 v = *reinterpret_cast<const uint4*>(out_chunk(r, c));
             const int64_t row = t_out ? (int64_t)block_n * kBlockN + r
                                       : row0_global + r;
-            const int64_t col = t_out ? row0_global + (int64_t)c * 8
-                                      : col0_global + (int64_t)c * 8;
+            const int64_t col = t_out ? row0_global + (int64_t)c * OE::kChunkElems
+                                      : col0_global + (int64_t)c * OE::kChunkElems;
             const int64_t rows_total = t_out ? n : m;
             const int64_t row_stride = out_ld;
             if (row >= rows_total) break;  // rows are consecutive: nothing left
-            auto* dst = out_bf16 + row * row_stride + col;
-            if (col + 8 <= row_stride &&
+            auto* dst = out + row * row_stride + col;
+            if (col + OE::kChunkElems <= row_stride &&
                 (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
                 if constexpr (kStreamOut) {
                     // Evict-first streaming store knob: neutral on L20
@@ -160,19 +193,17 @@ struct GemmCollectiveEpilogue {
             } else {
                 // Row-edge chunk or an odd-stride row base: spill the
                 // elements that survive the row edge.
-                const __nv_bfloat16* elems =
-                    reinterpret_cast<const __nv_bfloat16*>(&v);
-                for (int e = 0; e < 8 && col + e < row_stride; ++e)
+                const OutT* elems = reinterpret_cast<const OutT*>(&v);
+                for (int e = 0; e < OE::kChunkElems && col + e < row_stride; ++e)
                     dst[e] = elems[e];
             }
         }
     }
 
-    __device__ __forceinline__ void run(float acc[kNt][kMt][4],
-                                        __nv_bfloat16* out_bf16) {
+    __device__ __forceinline__ void run(float acc[kNt][kMt][4], OutT* out) {
         stage(acc);
         __syncthreads();
-        store(out_bf16);
+        store(out);
     }
 
   private:

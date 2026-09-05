@@ -72,7 +72,8 @@ struct GemmSmem {
 };
 
 template <typename ElemT_, typename LayoutA_, typename LayoutB_,
-          typename LayoutOut_ = RowMajor, int BlockM_ = 128, int BlockN_ = 128,
+          typename LayoutOut_ = RowMajor, typename OutT_ = __nv_bfloat16,
+          int BlockM_ = 128, int BlockN_ = 128,
           int WarpM_ = 64, int WarpN_ = 32, int kK_ = 64, int Stages_ = 2,
           int GroupRaster_ = 8, bool StreamOut_ = false, bool FastLoop_ = false>
 struct GemmPolicy {
@@ -82,6 +83,10 @@ struct GemmPolicy {
     // Output orientation (CUTLASS LayoutC): direction lives in the type,
     // the row stride lives in GemmParams::out_ld.
     using LayoutTagOut = LayoutOut_;
+    // Output element type: bf16 (default, the fused-linear convention) or
+    // fp32 (accumulated outputs, e.g. training dX/dW). The epilogue stages
+    // and copies out through OutElem<OutT> packing facts.
+    using OutT = OutT_;
     static constexpr int kGroupRaster = GroupRaster_;
     static constexpr bool kStreamOut = StreamOut_;
     static constexpr bool kFastLoop = FastLoop_;
@@ -99,13 +104,14 @@ template <FP8Format Fmt, int BlockM, int BlockN, int K, int Stages,
 using Fp8GemmTraits = GemmTraits<fp8_elem_t<Fmt>, BlockM, BlockN, K, Stages, WarpM, WarpN>;
 
 template <FP8Format Fmt_, typename LayoutA_, typename LayoutB_,
-          typename LayoutOut_ = RowMajor, int BlockM_ = 128, int BlockN_ = 128,
+          typename LayoutOut_ = RowMajor, typename OutT_ = __nv_bfloat16,
+          int BlockM_ = 128, int BlockN_ = 128,
           int WarpM_ = 64, int WarpN_ = 32, int kK_ = 64, int Stages_ = 2,
           int GroupRaster_ = 8, bool StreamOut_ = false, bool FastLoop_ = false>
 using Fp8GemmPolicy =
-    GemmPolicy<fp8_elem_t<Fmt_>, LayoutA_, LayoutB_, LayoutOut_, BlockM_,
-               BlockN_, WarpM_, WarpN_, kK_, Stages_, GroupRaster_, StreamOut_,
-               FastLoop_>;
+    GemmPolicy<fp8_elem_t<Fmt_>, LayoutA_, LayoutB_, LayoutOut_, OutT_,
+               BlockM_, BlockN_, WarpM_, WarpN_, kK_, Stages_, GroupRaster_,
+               StreamOut_, FastLoop_>;
 
 }  // namespace gemm
 }  // namespace astrai
