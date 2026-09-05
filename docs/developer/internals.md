@@ -247,20 +247,20 @@ Three cooperating layers enable gradient accumulation:
 
 3. **`AccumOptimizer` / `AccumScheduler`** — wrap the real optimizer/scheduler. `step()` and `zero_grad()` are gated on `sync_gradients` — they only forward to the inner optimizer when the sync flag is True.
 
-The loss is divided by `grad_accum_steps` before `backward()`, so gradients sum to the correct mean across micro-steps. `consumed_samples` increments by `batch_per_device * world_size` every micro-batch.
+The loss is divided by `grad_accum_steps` before `backward()`, so gradients sum to the correct mean across micro-steps. `consumed_samples` increments by `batch_per_device * dp_size` every micro-batch (cp ranks share a batch, so they do not scale it).
 
 ### Effective batch size
 
-$$ \text{Effective batch} = \text{nprocs} \times \text{batch\_per\_device} \times \text{grad\_accum\_steps} $$
+$$ \text{Effective batch} = \text{dp\_size} \times \text{batch\_per\_device} \times \text{grad\_accum\_steps} $$
 
 ### Total optimizer steps
 
 ```
-samples_per_replica = ceil(dataset_len / nprocs)
+samples_per_replica = ceil(dataset_len / dp_size)
 batches_per_replica  = ceil(samples_per_replica / batch_per_device)
 total_steps          = (batches_per_replica // grad_accum_steps) * n_epoch
 ```
 
-This accounts for data-parallel sharding — each rank processes `1/nprocs` of the dataset.
+This accounts for data-parallel sharding — each dp replica processes `1/dp_size` of the dataset.
 
-> Document Update Time: 2026-08-16
+> Document Update Time: 2026-09-05

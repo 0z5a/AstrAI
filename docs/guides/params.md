@@ -124,8 +124,8 @@ with `--optimizer=muon_adamw`.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--nprocs` | Number of GPUs / processes | 1 |
-| `--parallel_mode` | Parallel strategy (`none`, `ddp`, `fsdp`) | fsdp |
+| `--dp_size` | Data-parallel replicas; the launcher starts `dp_size × cp_size` processes | 1 |
+| `--dp_mode` | Parallel strategy (`none`, `ddp`, `fsdp`) | fsdp |
 | `--device_type` | Device type | cuda |
 | `--start_method` | Multiprocessing start method (`spawn`, `fork`, `forkserver`) | spawn |
 | `--backend` | Distributed training backend | nccl |
@@ -185,8 +185,8 @@ provide a command-line option for configuring one.
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 nohup python scripts/tools/train.py \
-    --nprocs=4 \
-    --parallel_mode=ddp \
+    --dp_size=4 \
+    --dp_mode=ddp \
     --train_type=seq \
     --data_root_path=/path/to/dataset \
     --param_path=/path/to/model \

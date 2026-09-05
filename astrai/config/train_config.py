@@ -14,7 +14,8 @@ from astrai.model.components.lora import LoRAConfig
 TRAIN_TYPES = frozenset(
     {"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"}
 )
-PARALLEL_MODES = frozenset({"none", "ddp", "fsdp"})
+# Data-parallel gradient-sync strategies.
+DP_MODES = frozenset({"none", "ddp", "fsdp"})
 BACKENDS = frozenset({"nccl", "gloo"})
 START_METHODS = frozenset({"spawn", "fork", "forkserver"})
 _COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
@@ -53,11 +54,12 @@ class TrainConfig(BaseConfig):
         persistent_workers (bool): Keep DataLoader workers alive between epochs. Defaults to False.
         pin_memory (bool): Pin memory for dataloader. Defaults to False.
         collate_fn (Optional[Callable[[List[Any]], Any]]): Collate function for dataloader (e.g. dpo_collate_fn). Defaults to None.
-        nprocs (int): Number of processes for distributed training. Defaults to 1.
+        dp_size (int): Data-parallel replicas; total training processes (``nprocs``) are derived as ``dp_size * cp_size``. Defaults to 1.
+        cp_size (int): Context-parallel group size: shards the sequence across contiguous ranks (seq pretraining, torch-native attention only). Defaults to 1.
+        dp_mode (str): Data-parallel gradient-sync strategy: none, ddp, fsdp. Defaults to "none".
         backend (str): Distributed training backend. Defaults to "nccl".
         master_addr (str): Master address for distributed training. Defaults to "localhost".
         master_port (str): Master port for distributed training. Defaults to "29500".
-        parallel_mode (str): Parallel strategy: none, ddp, fsdp. Defaults to "none".
         start_method (str): Multiprocessing start method: spawn/fork/forkserver. Defaults to "spawn".
         device_type (str): Device type for distributed training. Defaults to "cuda".
         val_dataset (Optional[Dataset]): Dataset for validation. Defaults to None.
@@ -108,11 +110,12 @@ class TrainConfig(BaseConfig):
     pin_memory: bool = False
     collate_fn: Optional[Callable[[List[Any]], Any]] = None
 
-    nprocs: int = 1
+    dp_size: int = 1
+    cp_size: int = 1
+    dp_mode: str = "none"
     backend: str = "nccl"
     master_addr: str = "localhost"
     master_port: str = "29500"
-    parallel_mode: str = "none"
     start_method: str = "spawn"
 
     device_type: str = "cuda"
@@ -143,12 +146,33 @@ class TrainConfig(BaseConfig):
             )
         return v
 
-    @field_validator("parallel_mode")
-    def _validate_parallel_mode(cls, v: str) -> str:
-        if v not in PARALLEL_MODES:
-            raise ValueError(
-                f"parallel_mode must be one of {sorted(PARALLEL_MODES)}, got {v!r}"
-            )
+    @field_validator("dp_mode")
+    def _validate_dp_mode(cls, v: str) -> str:
+        if v not in DP_MODES:
+            raise ValueError(f"dp_mode must be one of {sorted(DP_MODES)}, got {v!r}")
+        return v
+
+    @field_validator("dp_size")
+    def _validate_dp_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"dp_size must be >= 1, got {v}")
+        return v
+
+    @property
+    def nprocs(self) -> int:
+        """Total training processes: dp_size x cp_size (tp stays reserved).
+
+        The world size follows from the parallelism degrees the user
+        configures, not the other way around — the sampler shards data over
+        dp replicas only, so every batch-scaling formula wants dp_size, and
+        divisibility by cp_size holds by construction.
+        """
+        return self.dp_size * self.cp_size
+
+    @field_validator("cp_size")
+    def _validate_cp_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"cp_size must be >= 1, got {v}")
         return v
 
     @field_validator("backend")

@@ -2,7 +2,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Self
+from typing import Any, Callable, Dict, Optional, Self
 
 import torch
 import torch.nn as nn
@@ -13,14 +13,15 @@ from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.model.components.lora import inject_lora
+from astrai.parallel.cp import CPState, CPStrategy, LossReduction
 from astrai.parallel.executor import (
     BaseExecutor,
     ExecutorFactory,
     broadcast_state_dict,
-    create_ref_model,
     strip_compile_prefix,
 )
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
+from astrai.parallel.topology import ParallelTopology, build_topology
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import (
     Checkpoint,
@@ -59,10 +60,28 @@ class TrainContext:
 
     world_size: int = field(default=1)
     rank: int = field(default=0)
+    topology: Optional[ParallelTopology] = field(default=None)
     kwargs: Dict[str, Any] = field(default_factory=dict)
     param_path: Optional[str] = field(default=None)
 
     _stop_event: threading.Event = field(default_factory=threading.Event)
+
+    def __post_init__(self):
+        # A topology is always answerable: contexts built outside the
+        # builder (tests, tools) still get rank-layout math from their
+        # world_size, with a trivial layout by definition.
+        if self.topology is None:
+            self.topology = ParallelTopology(self.world_size)
+
+    @property
+    def dp_size(self) -> int:
+        """Data-parallel degree — the unit for data sharding and step math.
+
+        Ranks sharing a dp_rank consume the same batch (cp peers hold
+        different sequence slices of it), so sample and step counts derived
+        from world size must use this instead.
+        """
+        return self.topology.dp_size
 
     @property
     def stop_requested(self) -> bool:
@@ -74,9 +93,7 @@ class TrainContext:
     @property
     def optimizer_step(self) -> int:
         return self.consumed_samples // (
-            self.config.batch_per_device
-            * self.world_size
-            * self.config.grad_accum_steps
+            self.config.batch_per_device * self.dp_size * self.config.grad_accum_steps
         )
 
 
@@ -89,6 +106,44 @@ class _PreloadedState:
     checkpoint: Optional[Checkpoint] = None
 
 
+def create_ref_model(
+    model_fn: Callable[[], nn.Module],
+    executor: Optional[BaseExecutor] = None,
+    model: Optional[nn.Module] = None,
+    state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    device: Optional[str] = None,
+) -> Optional[nn.Module]:
+    """Create a frozen reference model from executor or state dict.
+
+    Training-domain helper for the DPO/GRPO reference and old policies: it
+    builds the model, loads the broadcast state dict, and freezes it.  The
+    distributed mechanics live in :func:`broadcast_state_dict`.
+
+    In distributed mode (FSDP), ``unwrap_model`` returns ``None`` on
+    non-rank-0.  The state_dict is broadcast from rank-0 to all ranks
+    so every rank gets a complete copy.
+    """
+    if state_dict is None and executor is not None and model is not None:
+        state_dict = executor.unwrap_model(model)
+
+    # FSDP's unwrap_model returns None on non-rank-0. Broadcast from
+    # rank-0 so every rank receives a complete state_dict.
+    if executor is not None and executor.use_distributed:
+        state_dict = broadcast_state_dict(state_dict)
+
+    if state_dict is None:
+        return None
+
+    state_dict = strip_compile_prefix(state_dict)
+    ref_model = model_fn()
+    ref_model.load_state_dict(state_dict)
+    ref_model.requires_grad_(False)
+    ref_model.eval()
+    if device is not None:
+        ref_model = ref_model.to(device=device)
+    return ref_model
+
+
 class TrainContextBuilder:
     def __init__(
         self,
@@ -97,6 +152,7 @@ class TrainContextBuilder:
         self.config = config
         self._param_path: Optional[str] = None
         self._resume: bool = False
+        self._topology: Optional[ParallelTopology] = None
 
     def with_param_path(self, param_path: Optional[str], resume: bool = False) -> Self:
         self._param_path = param_path
@@ -104,6 +160,11 @@ class TrainContextBuilder:
         return self
 
     def build(self) -> TrainContext:
+        # Resolve the (dp, cp, tp) rank layout before anything consumes it.
+        self._topology = build_topology(
+            cp_size=self.config.cp_size, device_type=self.config.device_type
+        )
+
         # Resolve persisted state.
         preloaded_state = self._load_preloaded_state()
 
@@ -126,7 +187,7 @@ class TrainContextBuilder:
     def _create_executor(self) -> BaseExecutor:
         cfg = self.config
         return ExecutorFactory.create(
-            cfg.parallel_mode,
+            cfg.dp_mode,
             grad_accum_steps=cfg.grad_accum_steps,
             **cfg.executor_kwargs,
         )
@@ -135,7 +196,7 @@ class TrainContextBuilder:
         cfg = self.config
         state = _PreloadedState(
             epoch=cfg.start_epoch,
-            consumed_samples=cfg.start_samples * get_world_size(),
+            consumed_samples=cfg.start_samples * self._topology.dp_size,
         )
         if self._param_path:
             config_path = Path(self._param_path) / "config.json"
@@ -158,7 +219,9 @@ class TrainContextBuilder:
                 if self._resume:
                     state.epoch = checkpoint.epoch
                     per_step = (
-                        cfg.batch_per_device * get_world_size() * cfg.grad_accum_steps
+                        cfg.batch_per_device
+                        * self._topology.dp_size
+                        * cfg.grad_accum_steps
                     )
                     state.consumed_samples = (
                         checkpoint.consumed_samples // per_step * per_step
@@ -176,6 +239,7 @@ class TrainContextBuilder:
         return TrainContext(
             world_size=get_world_size(),
             rank=get_rank(),
+            topology=self._topology,
             config=self.config,
             model_config=state.model_config,
             executor=executor,
@@ -240,11 +304,9 @@ class TrainContextBuilder:
     def _create_dataloaders(
         self, context: TrainContext, train_dataset, val_dataset
     ) -> None:
-        sampler_offset = context.consumed_samples // context.world_size
+        sampler_offset = context.consumed_samples // context.dp_size
         if self._resume and sampler_offset > 0:
-            samples_per_replica = (
-                len(train_dataset) + context.world_size - 1
-            ) // context.world_size
+            samples_per_replica = self._topology.samples_per_replica(len(train_dataset))
             if samples_per_replica > 0:
                 context.epoch = sampler_offset // samples_per_replica
         context.dataloader = self._create_dataloader(
@@ -265,6 +327,9 @@ class TrainContextBuilder:
             start_iter=start_iter,
             seed=cfg.random_seed,
             shuffle=shuffle,
+            # dp_group: None on trivial layouts, where the sampler's world-group
+            # fallback is correct; a dp singleton keeps cp peers on identical batches.
+            process_group=self._topology.dp_group,
         )
         loader_kwargs = dict(
             dataset=dataset,
@@ -296,6 +361,10 @@ class TrainContextBuilder:
 
     def _create_strategy(self, context: TrainContext, executor: BaseExecutor) -> dict:
         cfg = self.config
+        cp_state = None
+        if self._topology is not None and self._topology.cp_size > 1:
+            self._validate_cp(context)
+            cp_state = CPState(self._topology)
         kwargs = dict(cfg.strategy_kwargs)
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
         if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"):
@@ -326,7 +395,40 @@ class TrainContextBuilder:
             executor=executor,
             **kwargs,
         )
+        if cp_state is not None:
+            # Decorate, don't branch: the strategy stays CP-oblivious and
+            # implements the token-mean two-phase protocol; CPStrategy owns
+            # the shard entry and the loss rescale.
+            context.strategy = CPStrategy(context.strategy, cp_state)
         return kwargs
+
+    def _validate_cp(self, context: TrainContext) -> None:
+        """Guard the context-parallel support surface at build time."""
+        cfg = self.config
+        strategy_cls = StrategyFactory.get_component_class(cfg.strategy)
+        if strategy_cls.loss_reduction is not LossReduction.TOKEN_MEAN:
+            online = cfg.strategy.startswith("online_")
+            reason = (
+                "rollouts run on the single-GPU inference scheduler, which "
+                "has no context-parallel path"
+                if online
+                else "the logprob shift crosses shard boundaries and the "
+                "per-sequence reductions need cp-group all-reduces"
+            )
+            raise ValueError(
+                f"cp_size > 1 supports token-mean strategies (seq, sft) only; "
+                f"'{cfg.strategy}' additionally needs: {reason}"
+            )
+        if cfg.dp_mode not in ("ddp", "fsdp"):
+            raise ValueError(
+                "cp_size > 1 requires --dp_mode ddp or fsdp: unsynced "
+                "cp peers hold gradients of different sequence slices"
+            )
+        if str(context.model_config.get("ffn_type", "mlp")) == "moe":
+            raise NotImplementedError(
+                "cp_size > 1 does not support MoE yet: the load-balance aux "
+                "loss would be computed per sequence slice instead of per token"
+            )
 
     def _create_critic(
         self, context: TrainContext, executor: BaseExecutor

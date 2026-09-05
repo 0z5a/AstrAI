@@ -1,7 +1,18 @@
 """Training strategy implementations with factory pattern."""
 
 from abc import ABC
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, Union
+from dataclasses import dataclass
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -11,6 +22,7 @@ from torch.optim import Optimizer
 
 from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
+from astrai.parallel.cp import LossReduction, TokenLoss
 from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.rollout import RolloutResult
 
@@ -24,6 +36,20 @@ class LogprobsOutput(TypedDict):
     logprobs: Tensor
     aux_loss: Optional[Tensor]
     router_stats: Optional[List[RouterStats]]
+
+
+@dataclass
+class ForwardResult:
+    """Model forward over the (possibly sequence-sharded) batch.
+
+    ``logits`` keeps the model dtype; :meth:`BaseStrategy.reduce_loss`
+    upcasts at the loss input.  The MoE extras ride along so the loss
+    assembly can attach aux-loss and router diagnostics.
+    """
+
+    logits: Tensor
+    aux_loss: Optional[Tensor] = None
+    router_stats: Optional[List[RouterStats]] = None
 
 
 def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
@@ -245,6 +271,11 @@ def _validate_behavior_logprobs(behavior_logprobs: Tensor, responses: Tensor) ->
         raise ValueError("logprobs_old must contain only finite values")
 
 
+def _is_packed(position_ids: Tensor) -> bool:
+    """Whether rows pack multiple documents (positions reset mid-row)."""
+    return bool((position_ids[:, 1:] <= position_ids[:, :-1]).any())
+
+
 def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
     S = position_ids.size(1)
     device = position_ids.device
@@ -334,6 +365,12 @@ class BaseStrategy(ABC):
     offline mode and consumes the batch directly.
     """
 
+    #: Declared loss reduction (see :class:`astrai.parallel.cp.LossReduction`).
+    #: Token-mean strategies compose with
+    #: :class:`astrai.parallel.cp.CPStrategy`; sequence-level strategies
+    #: do not shard and inherit the SEQUENCE default.
+    loss_reduction: ClassVar[LossReduction] = LossReduction.SEQUENCE
+
     def __init__(
         self,
         model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
@@ -348,6 +385,52 @@ class BaseStrategy(ABC):
         self.strategy_kwargs = kwargs
         self._rollout_runner = None
 
+    # ---------- token-mean two-phase protocol ----------
+    # CP composes between the phases: astrai.parallel.cp.CPStrategy shards
+    # the batch buffers after prepare_batch, runs forward_tokens and
+    # reduce_loss on the local slice, and rescales the reduction.  A
+    # strategy that declares LossReduction.TOKEN_MEAN implements these
+    # instead of compute_loss_output, and its code runs identically on
+    # full sequences and on cp shards.  Sequence-level strategies (dpo,
+    # grpo, ...) keep overriding compute_loss_output wholesale.
+
+    def prepare_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """Place the batch on device and synthesize missing inputs."""
+        return move_to_device(batch, self.device)
+
+    def shard_spec(self, batch: Dict[str, Tensor]) -> Tuple[List[Tensor], List[int]]:
+        """Buffers to shard along the sequence dimension, with their dims.
+
+        Called only by :class:`~astrai.parallel.cp.CPStrategy`.  The base
+        strategy declares no shard surface.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declares no context-parallel shard surface"
+        )
+
+    def forward_tokens(self, batch: Dict[str, Tensor]) -> ForwardResult:
+        """Run the model over the (possibly sharded) sequence."""
+        raise NotImplementedError(f"{type(self).__name__} implements no token forward")
+
+    def reduce_loss(
+        self, forward: ForwardResult, batch: Dict[str, Tensor]
+    ) -> TokenLoss:
+        """Local token reduction: loss sum plus contributing token count."""
+        raise NotImplementedError(
+            f"{type(self).__name__} implements no token reduction"
+        )
+
+    def token_loss_output(
+        self, loss: Tensor, reported_loss: Tensor, forward: ForwardResult
+    ) -> LossOutput:
+        """Assemble the LossOutput around an already-reduced token loss."""
+        return self._loss_output(
+            loss,
+            {"task_loss": reported_loss.detach()},
+            forward.aux_loss,
+            forward.router_stats,
+        )
+
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
         """Compute loss for the given batch.
 
@@ -360,7 +443,14 @@ class BaseStrategy(ABC):
         return self.compute_loss_output(batch)["loss"]
 
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
-        return self._normalize_output(self.compute_loss(batch))
+        if type(self).forward_tokens is BaseStrategy.forward_tokens:
+            # Legacy contract: a strategy overriding only compute_loss
+            # (returning a tensor) still gets a normalized LossOutput.
+            return self._normalize_output(self.compute_loss(batch))
+        batch = self.prepare_batch(batch)
+        forward = self.forward_tokens(batch)
+        tokens = self.reduce_loss(forward, batch)
+        return self.token_loss_output(tokens.mean(), tokens.mean(), forward)
 
     def validate_online(self, batch: Dict[str, Any]) -> Optional[LossOutput]:
         """Validate one batch through a one-off rollout.
@@ -513,6 +603,8 @@ class SEQStrategy(BaseStrategy):
     Optionally adds MoE load balancing auxiliary loss.
     """
 
+    loss_reduction = LossReduction.TOKEN_MEAN
+
     def __init__(
         self,
         model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
@@ -523,24 +615,48 @@ class SEQStrategy(BaseStrategy):
         super().__init__(model, device, **kwargs)
         self.label_smoothing = label_smoothing
 
-    def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
-        batch = move_to_device(batch, self.device)
-        input_ids, target_ids = batch["input_ids"], batch["target_ids"]
-        outputs = self.model(input_ids=input_ids)
-        logits = outputs["logits"]
+    def prepare_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        batch = super().prepare_batch(batch)
+        if "position_ids" not in batch:
+            # Positions are explicit so the CP shard can split them with the
+            # inputs: the model's default arange is local-only and would
+            # drop higher ranks' RoPE offsets.
+            input_ids = batch["input_ids"]
+            batch["position_ids"] = (
+                torch.arange(input_ids.size(1), device=input_ids.device)
+                .unsqueeze(0)
+                .expand(input_ids.size(0), -1)
+            )
+        return batch
 
-        loss = F.cross_entropy(
-            input=logits.flatten(0, 1).float(),
+    def shard_spec(self, batch: Dict[str, Tensor]) -> Tuple[List[Tensor], List[int]]:
+        return (
+            [batch["input_ids"], batch["target_ids"], batch["position_ids"]],
+            [1, 1, 1],
+        )
+
+    def forward_tokens(self, batch: Dict[str, Tensor]) -> ForwardResult:
+        outputs = self.model(
+            input_ids=batch["input_ids"], position_ids=batch["position_ids"]
+        )
+        return ForwardResult(
+            outputs["logits"], outputs.get("aux_loss"), outputs.get("router_stats")
+        )
+
+    def reduce_loss(
+        self, forward: ForwardResult, batch: Dict[str, Tensor]
+    ) -> TokenLoss:
+        target_ids = batch["target_ids"]
+        loss_sum = F.cross_entropy(
+            input=forward.logits.flatten(0, 1).float(),
             target=target_ids.flatten(),
             label_smoothing=self.label_smoothing,
+            reduction="sum",
         )
-
-        return self._loss_output(
-            loss,
-            {"task_loss": loss},
-            outputs.get("aux_loss"),
-            outputs.get("router_stats"),
+        token_count = torch.tensor(
+            target_ids.numel(), dtype=torch.float32, device=target_ids.device
         )
+        return TokenLoss(loss_sum, token_count)
 
 
 @StrategyFactory.register("sft")
@@ -551,6 +667,8 @@ class SFTStrategy(BaseStrategy):
     Optionally adds MoE load balancing auxiliary loss.
     """
 
+    loss_reduction = LossReduction.TOKEN_MEAN
+
     def __init__(
         self,
         model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
@@ -561,36 +679,55 @@ class SFTStrategy(BaseStrategy):
         super().__init__(model, device, **kwargs)
         self.label_smoothing = label_smoothing
 
-    def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
-        batch = move_to_device(batch, self.device)
-        input_ids, target_ids, position_ids, loss_mask = (
-            batch["input_ids"],
-            batch["target_ids"],
-            batch["position_ids"],
-            batch["loss_mask"],
+    def shard_spec(self, batch: Dict[str, Tensor]) -> Tuple[List[Tensor], List[int]]:
+        if _is_packed(batch["position_ids"]):
+            raise NotImplementedError(
+                "packed multi-document SFT cannot shard across cp ranks: "
+                "the doc-boundary attention mask cannot ride the ring "
+                "attention kernels"
+            )
+        return (
+            [
+                batch["input_ids"],
+                batch["target_ids"],
+                batch["position_ids"],
+                batch["loss_mask"],
+            ],
+            [1, 1, 1, 1],
         )
 
-        ignore_index = -100
-        input_mask = make_doc_boundary_mask(position_ids)
-        target_ids = target_ids.masked_fill(~loss_mask, ignore_index)
+    def forward_tokens(self, batch: Dict[str, Tensor]) -> ForwardResult:
+        position_ids = batch["position_ids"]
+        # Unpacked positions make the doc-boundary mask plain causality, so
+        # pass None and take the is_causal fast path — the only form ring
+        # attention accepts.  shard_spec has rejected packed documents
+        # before a sharded forward gets here.
+        input_mask = (
+            make_doc_boundary_mask(position_ids) if _is_packed(position_ids) else None
+        )
         outputs = self.model(
-            input_ids=input_ids, position_ids=position_ids, input_mask=input_mask
+            input_ids=batch["input_ids"],
+            position_ids=position_ids,
+            input_mask=input_mask,
         )
-        logits = outputs["logits"]
+        return ForwardResult(
+            outputs["logits"], outputs.get("aux_loss"), outputs.get("router_stats")
+        )
 
-        loss = F.cross_entropy(
-            input=logits.flatten(0, 1).float(),
+    def reduce_loss(
+        self, forward: ForwardResult, batch: Dict[str, Tensor]
+    ) -> TokenLoss:
+        ignore_index = -100
+        target_ids = batch["target_ids"].masked_fill(~batch["loss_mask"], ignore_index)
+        loss_sum = F.cross_entropy(
+            input=forward.logits.flatten(0, 1).float(),
             target=target_ids.flatten(),
             ignore_index=ignore_index,
             label_smoothing=self.label_smoothing,
+            reduction="sum",
         )
-
-        return self._loss_output(
-            loss,
-            {"task_loss": loss},
-            outputs.get("aux_loss"),
-            outputs.get("router_stats"),
-        )
+        token_count = (target_ids != ignore_index).sum().to(dtype=torch.float32)
+        return TokenLoss(loss_sum, token_count)
 
 
 @StrategyFactory.register("dpo")

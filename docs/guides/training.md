@@ -248,7 +248,7 @@ context = TrainContextBuilder(config).with_param_path(param_path, resume=True).b
 ```
 
 - Loads checkpoint weights before the model is wrapped
-- Creates executor via `ExecutorFactory.create(cfg.parallel_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)`
+- Creates executor via `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)`
 - Calls `executor.prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap=...)`; the executor creates, wraps, then builds the optimizer and scheduler for the wrapped model
 - Creates `RDSampler` for shuffle+resume
 - Builds strategy via `StrategyFactory.create(train_type, model, device, **kwargs)`
@@ -259,8 +259,8 @@ context = TrainContextBuilder(config).with_param_path(param_path, resume=True).b
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 nohup python scripts/tools/train.py \
-    --nprocs=4 \
-    --parallel_mode=ddp \
+    --dp_size=4 \
+    --dp_mode=ddp \
     --train_type=seq \
     --data_root_path=/path/to/dataset \
     --param_path=/path/to/model \

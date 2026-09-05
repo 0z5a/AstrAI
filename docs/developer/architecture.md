@@ -139,7 +139,8 @@ classDiagram
             +Optional[int] prefetch_factor
             +bool pin_memory
             +Optional[Callable] collate_fn
-            +int nprocs
+            +int dp_size
+            +int cp_size
             +str backend
             +str master_addr
             +str master_port
@@ -150,7 +151,7 @@ classDiagram
             +int val_step
             +float neftune_alpha
             +float moe_aux_loss_coef
-            +str parallel_mode
+            +str dp_mode
             +int rollout_interval
             +float rollout_temperature
             +int rollout_top_k
@@ -1281,7 +1282,7 @@ classDiagram
         class ExecutorFactory {
             +Dict _entries
             +register(name) decorator
-            +create(parallel_mode, **kwargs) BaseExecutor
+            +create(dp_mode, **kwargs) BaseExecutor
         }
 
     }
@@ -1511,10 +1512,10 @@ classDiagram
 
 ## Core Relationships
 
-1. **Config → Training**: `TrainConfig` holds `model_fn`, `dataset`, `optimizer_fn`, `scheduler_fn`, `parallel_mode`, `executor_kwargs`
+1. **Config → Training**: `TrainConfig` holds `model_fn`, `dataset`, `optimizer_fn`, `scheduler_fn`, `dp_mode`, `executor_kwargs`
 2. **Training Flow**: `Trainer` → `TrainContextBuilder` → `TrainContext`, uses `BaseStrategy` for loss, `BaseExecutor` for gradient accumulation + model distribution
 3. **Strategy Selection**: `StrategyFactory` creates strategy by `train_type`
-4. **Executor Selection**: `ExecutorFactory.create(cfg.parallel_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
+4. **Executor Selection**: `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
 5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.ops`. Attention uses cuda > flash > torch priority unless explicitly selected by `ASTR_BACKEND` or `attn_backend()`. Rotary embedding auto-dispatches to the CUDA op when supported, else torch complex multiply.
 6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` for multi-process DDP
 7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (`MmapStore`/`JsonlStore`) loads data with explicit `_length` and multi-segment `_data`

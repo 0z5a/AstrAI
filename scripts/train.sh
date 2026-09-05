@@ -141,7 +141,7 @@ preflight() {
     fi
 
     compose config --quiet
-    log_info "Preflight passed for ${TRAIN_JOB_NAME} (GPU request: ${TRAIN_GPU_COUNT}, parallel: ${TRAIN_PARALLEL_MODE})"
+    log_info "Preflight passed for ${TRAIN_JOB_NAME} (GPU request: ${TRAIN_GPU_COUNT}, dp_mode: ${TRAIN_DP_MODE})"
 }
 
 runtime_environment_args() {

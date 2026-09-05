@@ -34,7 +34,7 @@ runtime:
     checkpoints: ./checkpoints
   gpu:
     devices: all
-    parallel_mode: auto  # one GPU: none; multiple GPUs: ddp
+    dp_mode: auto  # one GPU: none; multiple GPUs: ddp
   container:
     cuda_tag: cu128
     ipc: host
@@ -54,7 +54,7 @@ runtime:
   passes all GPUs once; `CUDA_VISIBLE_DEVICES` performs the only filtering.
 - The process count is derived from `devices`. With `all`, the entrypoint uses
   `torch.cuda.device_count()` after Docker starts.
-- `parallel_mode: auto` selects `none` for one GPU and `ddp` for multiple GPUs.
+- `dp_mode: auto` selects `none` for one GPU and `ddp` for multiple GPUs.
   Use `fsdp` explicitly when model sharding is required.
 - To select specific physical GPUs, replace `all` with a list such as
   `devices: [0, 1]`.

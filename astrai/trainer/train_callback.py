@@ -333,15 +333,16 @@ class MetricCallback(TrainCallback):
         selected = set(context.metrics) | set(names)
         selected.discard("*")
         result = {name: metrics[name] for name in selected if name in metrics}
-        if context.world_size > 1 and dist.is_initialized() and result:
+        if result and context.dp_size > 1 and dist.is_initialized():
             metric_names = sorted(result)
             values = torch.tensor(
                 [result[name] for name in metric_names],
                 dtype=torch.float32,
                 device=get_current_device(),
             )
-            dist.all_reduce(values, op=dist.ReduceOp.SUM)
-            values /= context.world_size
+            # dp-dimension average only: cp peers hold values derived from
+            # the same batch, so summing them in would double-count.
+            values = context.topology.reduce_mean(values)
             result.update(zip(metric_names, values.tolist()))
         return result
 
@@ -374,14 +375,14 @@ class MetricCallback(TrainCallback):
                 total_loss += loss_output["loss"].item()
                 num_batches += 1
 
-        if context.world_size > 1 and dist.is_initialized():
-            stats = torch.tensor(
-                [total_loss, float(num_batches)], device=get_current_device()
-            )
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            avg_loss = (stats[0] / stats[1]).item()
-        else:
-            avg_loss = total_loss / max(num_batches, 1)
+        # Sum (loss, batches) across dp replicas and take the ratio; the
+        # reduce is a no-op single-process, where the clamp preserves the
+        # local zero-batch behavior.
+        stats = torch.tensor(
+            [total_loss, float(num_batches)], device=get_current_device()
+        )
+        stats = context.topology.reduce_sum(stats)
+        avg_loss = (stats[0] / stats[1].clamp(min=1.0)).item()
 
         context.model.train()
         return avg_loss
