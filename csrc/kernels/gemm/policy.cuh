@@ -25,11 +25,18 @@ using fp8_elem_t =
 // Compile-time tile configuration, mirroring KernelTraits in the attention
 // kernels: CTA tile, warp tile (WarpM x WarpN — e.g. 64x32 on the 128x128
 // CTA, 32x32 on the 64x64 small CTA) and cp.async pipeline depth.
-template <typename ElemT_, int BlockM, int BlockN, int K, int Stages,
-          int WarpM = 64, int WarpN = 32>
+//
+// ElemA / ElemB are independent operand types. The MMA always runs on
+// ElemA (the activation); a differing ElemB (weight-only quantization,
+// e.g. int8 x bf16) is staged packed and dequantized in-register between
+// the fragment load and the mma — kNeedsDequantB marks that insert.
+template <typename ElemA_, typename ElemB_, 
+            int BlockM, int BlockN, int K, int Stages, int WarpM = 64, int WarpN = 32>
 struct GemmTraits {
-    using ElemT = ElemT_;
-    using ElemTraits = gemm_elem_traits<ElemT_>;
+    using ElemA = ElemA_;
+    using ElemB = ElemB_;
+    using ElemTraitsA = gemm_elem_traits<ElemA_>;
+    using ElemTraitsB = gemm_elem_traits<ElemB_>;
 
     static constexpr int kBlockM = BlockM;
     static constexpr int kBlockN = BlockN;
@@ -38,9 +45,13 @@ struct GemmTraits {
     static constexpr int kWarpM = WarpM;
     static constexpr int kWarpN = WarpN;
 
-    static constexpr int kElemBytes = ElemTraits::kBytes;
-    static constexpr int kMmaK = ElemTraits::kMmaK;
-    static constexpr bool kNeedsDequant = ElemTraits::kNeedsDequant;
+    static constexpr int kElemBytesA = ElemTraitsA::kBytes;
+    static constexpr int kElemBytesB = ElemTraitsB::kBytes;
+    // MMA shape follows the A-side (compute) type; B fragments are brought
+    // to it by the dequant stage when the types differ.
+    static constexpr int kMmaK = ElemTraitsA::kMmaK;
+    static constexpr bool kNeedsDequant = ElemTraitsA::kNeedsDequant;
+    static constexpr bool kNeedsDequantB = !std::is_same_v<ElemA_, ElemB_>;
 
     // Derived geometry: warp tiles tile the CTA. The smem budget is
     // layout-aware, so it lives in GemmSmem (below).
@@ -66,18 +77,21 @@ struct GemmSmem {
     static constexpr bool kDirectA = std::is_same_v<LayoutA, ColMajor>;
     static constexpr bool kDirectB = std::is_same_v<LayoutB, RowMajor>;
     static constexpr int kRingDepth = Traits::kStages + 1;
-    static constexpr int kBytes = kRingDepth * (Traits::kBlockM + Traits::kBlockN) *
-                                  Traits::kK * Traits::kElemBytes;
+    static constexpr int kBytes =
+        kRingDepth * Traits::kBlockM * Traits::kK * Traits::kElemBytesA +
+        kRingDepth * Traits::kBlockN * Traits::kK * Traits::kElemBytesB;
     static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
 };
 
-template <typename ElemT_, typename LayoutA_, typename LayoutB_,
-          typename LayoutOut_ = RowMajor, typename OutT_ = __nv_bfloat16,
+template <typename ElemA_, typename ElemB_, typename LayoutA_,
+          typename LayoutB_, typename LayoutOut_ = RowMajor,
+          typename OutT_ = __nv_bfloat16,
           int BlockM_ = 128, int BlockN_ = 128,
           int WarpM_ = 64, int WarpN_ = 32, int kK_ = 64, int Stages_ = 2,
           int GroupRaster_ = 8, bool StreamOut_ = false, bool FastLoop_ = false>
 struct GemmPolicy {
-    using Traits = GemmTraits<ElemT_, BlockM_, BlockN_, kK_, Stages_, WarpM_, WarpN_>;
+    using Traits =
+        GemmTraits<ElemA_, ElemB_, BlockM_, BlockN_, kK_, Stages_, WarpM_, WarpN_>;
     using LayoutTagA = LayoutA_;
     using LayoutTagB = LayoutB_;
     // Output orientation (CUTLASS LayoutC): direction lives in the type,
@@ -98,10 +112,11 @@ struct GemmPolicy {
 };
 
 // fp8 convenience aliases: format-parameterized names over the generic
-// policy, kept for the binding's FP8Format dispatch and the C tests.
+// policy (A and B share the fp8 type), kept for the binding's FP8Format
+// dispatch and the C tests.
 template <FP8Format Fmt, int BlockM, int BlockN, int K, int Stages,
           int WarpM = 64, int WarpN = 32>
-using Fp8GemmTraits = GemmTraits<fp8_elem_t<Fmt>, BlockM, BlockN, K, Stages, WarpM, WarpN>;
+using Fp8GemmTraits = GemmTraits<fp8_elem_t<Fmt>, fp8_elem_t<Fmt>, BlockM, BlockN, K, Stages, WarpM, WarpN>;
 
 template <FP8Format Fmt_, typename LayoutA_, typename LayoutB_,
           typename LayoutOut_ = RowMajor, typename OutT_ = __nv_bfloat16,
@@ -109,8 +124,8 @@ template <FP8Format Fmt_, typename LayoutA_, typename LayoutB_,
           int WarpM_ = 64, int WarpN_ = 32, int kK_ = 64, int Stages_ = 2,
           int GroupRaster_ = 8, bool StreamOut_ = false, bool FastLoop_ = false>
 using Fp8GemmPolicy =
-    GemmPolicy<fp8_elem_t<Fmt_>, LayoutA_, LayoutB_, LayoutOut_, OutT_,
-               BlockM_, BlockN_, WarpM_, WarpN_, kK_, Stages_, GroupRaster_,
+    GemmPolicy<fp8_elem_t<Fmt_>, fp8_elem_t<Fmt_>, LayoutA_, LayoutB_, LayoutOut_,
+               OutT_, BlockM_, BlockN_, WarpM_, WarpN_, kK_, Stages_, GroupRaster_,
                StreamOut_, FastLoop_>;
 
 }  // namespace gemm

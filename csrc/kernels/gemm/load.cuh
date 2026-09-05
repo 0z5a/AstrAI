@@ -159,67 +159,97 @@ struct PrefetchCarry<false, ElemT, kK, kRowsTile, kThreads> {
 };
 
 // Direct (synchronous) crosswise load into a canonical rotating stage:
-// LDG.128 x4 (4 consecutive contract bytes x 16 rows) + in-register PRMT
-// transpose + 16 STS.32. Crosswise operands cannot cp.async into the
-// canonical tile (a 16B global run holds one contract byte for each of 16
-// rows), so they take this path; a staged smem->smem variant measured
-// 15-20% slower and was removed (see git history).
+// LDG.128 runs (4 x 16B of the non-contract dim) + in-register transpose
+// (PRMT) + 16 STS.32. Crosswise operands cannot cp.async into the
+// canonical tile (a 16B global run holds contract positions for a run of
+// the other dim), so they take this path; a staged smem->smem variant
+// measured 15-20% slower and was removed (see git history).
+//
+// One chunk = 64B of global memory staging one 16-row group:
+//   1-byte elements: 4 runs of 16 rows x 4 contract positions; the PRMT
+//     byte-perm gathers one 32-bit word per row across the four runs;
+//   2-byte elements: 2 contract positions x 2 eight-row halves; a 16B run
+//     covers only 8 rows, and the transpose selects halfwords — one
+//     PRMT per output word (the byte selector already spans both source
+//     words: 0x5410 low pair, 0x7632 high pair).
 template <typename ElemT, int K, int RowsTile, int kThreads>
 __device__ __forceinline__ void
 load_crosswise_direct(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
                       int64_t contract, int64_t ld, int tid, int64_t k_base,
                       int64_t block_row) {
-    // The PRMT byte-perm transpose gathers 4 contract bytes per 32-bit word,
-    // so this path is 1-byte-element only. 2-byte operands must arrive in
-    // congruous storage (layout tags catch the mismatch at instantiation).
-    static_assert(sizeof(ElemT) == 1,
-                  "crosswise LDG+PRMT staging requires 1-byte elements");
-    constexpr int kQuads = K / 4;    // 4-byte contract quads per tile
+    static_assert(sizeof(ElemT) == 1 || sizeof(ElemT) == 2,
+                  "crosswise LDG+PRMT staging requires 1- or 2-byte elements");
+    constexpr int kCw = sizeof(ElemT) == 1 ? 4 : 2;  // contract elems per chunk
+    constexpr int kSpans = K / kCw;    // contract spans per tile
     constexpr int kGroups = RowsTile / 16;
-    constexpr int kTChunks = kQuads * kGroups;  // 64B chunks per tile
+    constexpr int kTChunks = kSpans * kGroups;  // 64B chunks per tile
     // r0 is a multiple of 16 and p*ld preserves alignment whenever ld has
     // it, so every run of a chunk shares one alignment verdict.
     const bool run_aligned =
-        ((reinterpret_cast<uintptr_t>(operand) | ld) & 15) == 0;
+        ((reinterpret_cast<uintptr_t>(operand) | (ld * (int64_t)sizeof(ElemT))) &
+         15) == 0;
     for (int chunk = tid; chunk < kTChunks; chunk += kThreads) {
-        const int quad = chunk / kGroups;
+        const int span = chunk / kGroups;
         const int rg = chunk % kGroups;
         const int64_t r0 = block_row + rg * 16;
         const bool rows_full = r0 + 15 < rows;
         if (rows_full && run_aligned) {
-            const int64_t p0 = k_base + quad * 4;
+            const int64_t p0 = k_base + span * kCw;
             uint4 v[4];
 #pragma unroll
-            for (int s = 0; s < 4; ++s) {
+            for (int i = 0; i < 4; ++i) {
                 // Contract tail: a run past k carries zero bytes; they flow
-                // through the PRMT transpose like any other value.
-                if (p0 + s < contract)
-                    v[s] = *reinterpret_cast<const uint4*>(
-                        operand + (p0 + s) * ld + r0);
-                else
-                    v[s] = make_uint4(0u, 0u, 0u, 0u);
+                // through the transpose like any other value.
+                if constexpr (sizeof(ElemT) == 1) {
+                    // v[s] = 16 rows at contract p0+s (run index i = s).
+                    if (p0 + i < contract)
+                        v[i] = *reinterpret_cast<const uint4*>(
+                            operand + (p0 + i) * ld + r0);
+                    else
+                        v[i] = make_uint4(0u, 0u, 0u, 0u);
+                } else {
+                    // v[s][h] = 8 rows at contract p0+s (flat i = s*2+h).
+                    const int s = i >> 1, h = i & 1;
+                    if (p0 + s < contract)
+                        v[i] = *reinterpret_cast<const uint4*>(
+                            operand + (p0 + s) * ld + r0 + h * 8);
+                    else
+                        v[i] = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
             const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                // word i = row r0+i's quad: byte i of each of the four runs
-                // [v0.b(i), v1.b(i), v2.b(i), v3.b(i)].
-                const unsigned nib = i & 3;
-                const unsigned sel = nib | ((nib + 4) << 4);
-                const unsigned w01 =
-                    __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
-                const unsigned w23 =
-                    __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
-                *reinterpret_cast<unsigned*>(tile_at<K>(tile, rg * 16 + i,
-                                                        quad * 4)) =
-                    __byte_perm(w01, w23, 0x5410u);
+                unsigned w;
+                if constexpr (sizeof(ElemT) == 1) {
+                    // word i = row r0+i's span: byte i of each of the four
+                    // runs [v0.b(i), v1.b(i), v2.b(i), v3.b(i)].
+                    const unsigned nib = i & 3;
+                    const unsigned sel = nib | ((nib + 4) << 4);
+                    const unsigned w01 =
+                        __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
+                    const unsigned w23 =
+                        __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
+                    w = __byte_perm(w01, w23, 0x5410u);
+                } else {
+                    // word i = row r0+i's element pair (contracts p0, p0+1):
+                    // uint4 v[s*2+h] holds 8 rows of contract p0+s (h =
+                    // i>>3), word (i>>1)&3, halfword i&1 — one selector
+                    // spans both source words: 0x5410 low pair, 0x7632 high.
+                    const unsigned* v0 =
+                        bytes + ((i >> 3) * 4 + ((i >> 1) & 3));
+                    const unsigned* v1 = v0 + 8;  // p0+1 run, same h/j
+                    w = __byte_perm(*v0, *v1, (i & 1) ? 0x7632u : 0x5410u);
+                }
+                *reinterpret_cast<unsigned*>(
+                    tile_at<K>(tile, rg * 16 + i, span * kCw)) = w;
             }
         } else {
-            // Row-tail or misaligned chunk: byte-granular gather with
+            // Row-tail or misaligned chunk: element-granular gather with
             // per-row predication; contract-tail columns zero-fill.
 #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                const int col = quad * 4 + s;
+            for (int s = 0; s < kCw; ++s) {
+                const int col = span * kCw + s;
                 if (k_base + col >= contract) {
 #pragma unroll
                     for (int i = 0; i < 16; ++i)

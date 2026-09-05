@@ -52,6 +52,8 @@ struct GemmCollectiveEpilogue {
 
     OutT* const tile_out;
     const float output_scale;
+    const float* const a_scale;  // [a_scale_m] row factor or null
+    const float* const b_scale;  // [b_scale_n] col factor or null
     const __nv_bfloat16* const bias;
     const int64_t m, n, out_ld;
     // Output orientation from the policy tag (CUTLASS LayoutC): the NN
@@ -65,7 +67,10 @@ struct GemmCollectiveEpilogue {
     __device__ GemmCollectiveEpilogue(char* smem, const GemmParams& p,
                                      int64_t block_m, int64_t block_n, int tid)
         : tile_out(reinterpret_cast<OutT*>(smem)),
-          output_scale(Traits::kNeedsDequant ? *p.scale : 1.0f),
+          output_scale((p.a_scale && p.a_scale_m == 0 ? *p.a_scale : 1.0f) *
+                       (p.b_scale && p.b_scale_n == 0 ? *p.b_scale : 1.0f)),
+          a_scale(p.a_scale_m > 0 ? p.a_scale : nullptr),
+          b_scale(p.b_scale_n > 0 ? p.b_scale : nullptr),
           bias(reinterpret_cast<const __nv_bfloat16*>(p.bias_ptr)),
           m(p.m), n(p.n), out_ld(p.out_ld),
           row_elems(t_out ? kBlockM : kBlockN),
@@ -108,14 +113,24 @@ struct GemmCollectiveEpilogue {
             for (int nt = 0; nt < kNt; ++nt) {
                 const int col = local_col0 + nt * 8;
                 const int64_t gcol = bias_col0 + col;
-                const float b0 =
-                    bias && gcol < n ? __bfloat162float(bias[gcol]) : 0.0f;
-                const float b1 =
-                    bias && gcol + 1 < n ? __bfloat162float(bias[gcol + 1])
-                                         : 0.0f;
+                const float b0 = bias && gcol < n 
+                    ? __bfloat162float(bias[gcol]) 
+                    : 0.0f;
+                const float b1 = bias && gcol + 1 < n 
+                    ? __bfloat162float(bias[gcol + 1])
+                    : 0.0f;
+                const float c0 = b_scale && gcol < n ? b_scale[gcol] : 1.0f;
+                const float c1 = b_scale && gcol + 1 < n ? b_scale[gcol + 1] : 1.0f;
 #pragma unroll
                 for (int mt = 0; mt < kMt; ++mt) {
                     const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
+                    // Per-row activation scale: D-row == kernel row here.
+                    const float rfac = a_scale && bias_row0 + r0 < m 
+                            ? a_scale[bias_row0 + r0]
+                            : 1.0f;
+                    const float rfac8 = a_scale && bias_row0 + r0 + 8 < m
+                            ? a_scale[bias_row0 + r0 + 8]
+                            : 1.0f;
                     const float* tile_acc = acc[nt][mt];
                     // Two bf16x2 stores per accumulator tile: rows g and
                     // g+8 of the m16n8 output, columns tig*2/tig*2+1 inside
@@ -123,12 +138,12 @@ struct GemmCollectiveEpilogue {
                     const int off = col & (OE::kChunkElems - 1);  // in-chunk elems
                     *reinterpret_cast<typename OE::T2*>(
                         out_chunk(r0, col >> OE::kChunkShift) + off) =
-                        OE::pack2(tile_acc[0] * output_scale + b0,
-                                  tile_acc[1] * output_scale + b1);
+                        OE::pack2(tile_acc[0] * output_scale * rfac * c0 + b0,
+                                  tile_acc[1] * output_scale * rfac * c1 + b1);
                     *reinterpret_cast<typename OE::T2*>(
                         out_chunk(r0 + 8, col >> OE::kChunkShift) + off) =
-                        OE::pack2(tile_acc[2] * output_scale + b0,
-                                  tile_acc[3] * output_scale + b1);
+                        OE::pack2(tile_acc[2] * output_scale * rfac8 * c0 + b0,
+                                  tile_acc[3] * output_scale * rfac8 * c1 + b1);
                 }
             }
         } else {
@@ -146,15 +161,22 @@ struct GemmCollectiveEpilogue {
                     const int64_t grow = bias_row0 + r0;
                     const float b =
                         bias && grow < m ? __bfloat162float(bias[grow]) : 0.0f;
+                    // Swapped orientation mirrors bias: D-cols come from
+                    // kernel rows, D-rows from kernel cols.
+                    const float c = b_scale && grow < m 
+                        ? b_scale[grow] 
+                        : 1.0f;
+                    const float r0f = a_scale && bias_col0 + col < n 
+                        ? a_scale[bias_col0 + col]
+                        : 1.0f;
+                    const float r1f = a_scale && bias_col0 + col + 1 < n
+                        ? a_scale[bias_col0 + col + 1]
+                        : 1.0f;
                     const float* tile_acc = acc[nt][mt];
-                    *out_elem(col, r0) =
-                        OE::cvt(tile_acc[0] * output_scale + b);
-                    *out_elem(col + 1, r0) =
-                        OE::cvt(tile_acc[1] * output_scale + b);
-                    *out_elem(col, r0 + 8) =
-                        OE::cvt(tile_acc[2] * output_scale + b);
-                    *out_elem(col + 1, r0 + 8) =
-                        OE::cvt(tile_acc[3] * output_scale + b);
+                    *out_elem(col, r0) = OE::cvt(tile_acc[0] * output_scale * r0f * c + b);
+                    *out_elem(col + 1, r0) = OE::cvt(tile_acc[1] * output_scale * r1f * c + b);
+                    *out_elem(col, r0 + 8) =  OE::cvt(tile_acc[2] * output_scale * r0f * c + b);
+                    *out_elem(col + 1, r0 + 8) =  OE::cvt(tile_acc[3] * output_scale * r1f * c + b);
                 }
             }
         }
@@ -173,12 +195,15 @@ struct GemmCollectiveEpilogue {
             const int r = idx / row_chunks;
             const int c = idx % row_chunks;
             const uint4 v = *reinterpret_cast<const uint4*>(out_chunk(r, c));
-            const int64_t row = t_out ? (int64_t)block_n * kBlockN + r
-                                      : row0_global + r;
-            const int64_t col = t_out ? row0_global + (int64_t)c * OE::kChunkElems
-                                      : col0_global + (int64_t)c * OE::kChunkElems;
+            const int64_t row = t_out 
+                ? (int64_t)block_n * kBlockN + r
+                : row0_global + r;
+            const int64_t col = t_out 
+                ? row0_global + (int64_t)c * OE::kChunkElems
+                : col0_global + (int64_t)c * OE::kChunkElems;
             const int64_t rows_total = t_out ? n : m;
             const int64_t row_stride = out_ld;
+            
             if (row >= rows_total) break;  // rows are consecutive: nothing left
             auto* dst = out + row * row_stride + col;
             if (col + OE::kChunkElems <= row_stride &&

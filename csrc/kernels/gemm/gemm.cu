@@ -116,7 +116,7 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
     p.a_ptr = a_st.data_ptr();
     p.b_ptr = b_st.data_ptr();
     p.out_ptr = output.data_ptr();
-    p.scale = scale.data_ptr<float>();
+    p.a_scale = scale.data_ptr<float>();
     p.m = static_cast<int>(m);
     p.n = static_cast<int>(n);
     p.k = static_cast<int>(k);

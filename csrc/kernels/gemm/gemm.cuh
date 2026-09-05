@@ -38,20 +38,19 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
 
     // Batch slice (grid.z): broadcast operands carry a 0 stride, so the
     // same pointer serves every batch.
-    using ElemT = typename Mainloop::ElemT;
+    using ElemA = typename Mainloop::ElemA;
+    using ElemB = typename Mainloop::ElemB;
     using OutT = typename Policy::OutT;
-    const ElemT* a = reinterpret_cast<const ElemT*>(p.a_ptr) +
+    const ElemA* a = reinterpret_cast<const ElemA*>(p.a_ptr) +
                   (int64_t)blockIdx.z * p.a_batch_stride;
-    const ElemT* b = reinterpret_cast<const ElemT*>(p.b_ptr) +
+    const ElemB* b = reinterpret_cast<const ElemB*>(p.b_ptr) +
                   (int64_t)blockIdx.z * p.b_batch_stride;
     auto* out = reinterpret_cast<OutT*>(p.out_ptr) +
                 (int64_t)blockIdx.z * p.out_batch_stride;
 
     static_assert(Mainloop::kBlockM * Mainloop::kBlockN * sizeof(OutT) <=
-                      Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK *
-                          sizeof(ElemT) +
-                          Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK *
-                              sizeof(ElemT),
+                  Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK * sizeof(ElemA) +
+                  Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK * sizeof(ElemB),
                   "output tile must fit the reclaimed operand smem");
     const int2 bn = GemmTileScheduler<Policy::kGroupRaster>::tile(blockIdx, gridDim);
     Mainloop mainloop(gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
@@ -200,7 +199,7 @@ void launch_policy(const GemmParams& p, cudaStream_t stream) {
 // layouts. Narrow: 128x64. Small CTA: 64x64 of 4 warps x 32x32, kK=64,
 // kFastLoop always on. ElemT and OutT are independent template knobs (both
 // flow from the entry dispatch; fp8 formats arrive through fp8_elem_t).
-template <typename ElemT, typename LayoutA, typename LayoutB,
+template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
           typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16,
           int GroupRaster = 8>
 void launch_plan(const GemmParams& p, const GemmPlan& plan,
@@ -211,19 +210,19 @@ void launch_plan(const GemmParams& p, const GemmPlan& plan,
     // output (fp32, 4B/elem) cannot fit the 128x128 tile inside the fp8
     // rings (64KB > 48KB) — compile-time route those to the narrow CTA
     // (32KB tile <= 36KB rings), same math at lower reuse.
-    constexpr int kRingBytes = 3 * (128 + 128) * 64 * (int)sizeof(ElemT);
+    constexpr int kRingBytes = 3 * 64 * (128 * (int)sizeof(ElemA) + 128 * (int)sizeof(ElemB));
     constexpr bool kBigReclaim = 128 * 128 * (int)sizeof(OutT) <= kRingBytes;
     switch (plan.cta) {
     case GemmPlan::Cta::kBig128: {
         if constexpr (kBigReclaim) {
             using Policy =
-                GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
                            128, 128, 64, 32, 64, 2, GroupRaster, false,
                            kBigFast>;
             launch_policy<Policy>(p, stream);
         } else {
             using Policy =
-                GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
                            128, 64, 32, 32, 64, 2, GroupRaster, false, true>;
             launch_policy<Policy>(p, stream);
         }
@@ -231,7 +230,7 @@ void launch_plan(const GemmParams& p, const GemmPlan& plan,
     }
     case GemmPlan::Cta::kNarrow128x64: {
         using Policy =
-            GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+            GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
                        128, 64, 32, 32, 64, 2, GroupRaster, false, true>;
         launch_policy<Policy>(p, stream);
         break;
@@ -239,12 +238,12 @@ void launch_plan(const GemmParams& p, const GemmPlan& plan,
     case GemmPlan::Cta::kSmall64: {
         if (plan.small_s3) {
             using Policy =
-                GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
                            64, 64, 32, 32, 64, 3, GroupRaster, false, true>;
             launch_policy<Policy>(p, stream);
         } else {
             using Policy =
-                GemmPolicy<ElemT, LayoutA, LayoutB, LayoutOut, OutT,
+                GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
                            64, 64, 32, 32, 64, 2, GroupRaster, false, true>;
             launch_policy<Policy>(p, stream);
         }
@@ -280,28 +279,50 @@ inline void canonicalize_gemm(GemmParams& p, bool& trans_a, bool& trans_b) {
 }
 
 // Dtype-generic entry point: canonicalize the problem, plan the launch,
-// wire the layout tags through. ElemT (operand) and OutT (output) are
-// independent knobs; fp8-format callers go through the wrapper below.
-template <typename ElemT, typename OutT = __nv_bfloat16>
+// wire the layout tags through. ElemA / ElemB / OutT are independent
+// knobs; fp8-format callers go through the wrapper below.
+//
+// Symmetric and mixed dtypes share this fan-out; the one asymmetry is NN
+// (dual row-major storage): the swap rewrite exchanges operand roles and
+// so assumes a single element type — symmetric operands rewrite to the
+// transposed TT kernel, mixed operands instantiate the dual-row-major
+// shape directly (A congruous, B crosswise) instead.
+template <typename ElemA, typename ElemB = ElemA, typename OutT = __nv_bfloat16>
 void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
                    bool trans_b) {
-    const bool swapped = !trans_a && !trans_b;  // canonicalize rewrites NN
-    canonicalize_gemm(p, trans_a, trans_b);
-    // Crosswise operand count for the plan: transposed-A storage (ColMajor)
-    // and plain-B storage (RowMajor) both take the direct crosswise load.
+    constexpr bool kSymmetric = std::is_same_v<ElemA, ElemB>;
+    bool swapped = false;
+    if constexpr (kSymmetric) {
+        swapped = !trans_a && !trans_b;  // canonicalize rewrites NN
+        canonicalize_gemm(p, trans_a, trans_b);
+    }
+    // Crosswise operand count for the plan: transposed-A storage
+    // (ColMajor) and plain-B storage (RowMajor) both take the direct
+    // crosswise load.
     const int crosswise = (trans_a ? 1 : 0) + (trans_b ? 0 : 1);
     const GemmPlan plan = plan_gemm(p, crosswise);
-    // The swap computes the transposed problem; its (rewritten TT) branch
-    // instantiates the column-major-output epilogue through LayoutOut.
     if (trans_a && trans_b) {
-        if (swapped)
-            launch_plan<ElemT, ColMajor, ColMajor, ColMajor, OutT, 8>(p, plan, stream);
-        else
-            launch_plan<ElemT, ColMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
+        // The swap computes the transposed problem; its (rewritten TT)
+        // branch instantiates the column-major-output epilogue through
+        // LayoutOut. Mixed never swaps, so its output stays row-major.
+        if constexpr (kSymmetric) {
+            if (swapped)
+                launch_plan<ElemA, ElemB, ColMajor, ColMajor, ColMajor, OutT, 8>(p, plan, stream);
+            else
+                launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
+        } else {
+            launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
+        }
     } else if (trans_b) {
-        launch_plan<ElemT, RowMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
+        launch_plan<ElemA, ElemB, RowMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
+    } else if (trans_a) {
+        launch_plan<ElemA, ElemB, ColMajor, RowMajor, RowMajor, OutT, 8>(p, plan, stream);
     } else {
-        launch_plan<ElemT, ColMajor, RowMajor, RowMajor, OutT, 8>(p, plan, stream);
+        // Dual row-major: mixed only — symmetric NN was rewritten above
+        // into the transposed TT kernel (if constexpr keeps this
+        // instantiation out of symmetric builds).
+        if constexpr (!kSymmetric)
+            launch_plan<ElemA, ElemB, RowMajor, RowMajor, RowMajor, OutT, 8>(p, plan, stream);
     }
 }
 
@@ -309,7 +330,8 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
 // bf16 output is the fused-linear convention).
 template <FP8Format Fmt>
 void gemm(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
-    gemm_dispatch<fp8_elem_t<Fmt>>(p, stream, trans_a, trans_b);
+    using ElemT = fp8_elem_t<Fmt>;
+    gemm_dispatch<ElemT, ElemT>(p, stream, trans_a, trans_b);
 }
 
 // Non-template entry over the production instantiations (defined in

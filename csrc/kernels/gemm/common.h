@@ -52,6 +52,16 @@ struct gemm_elem_traits<__nv_bfloat16> {
     static constexpr bool kNeedsDequant = false;
 };
 
+// int8 weight-only operand (W8A16): staged packed, dequantized in-register
+// to the activation type between the fragment load and the mma, so its
+// kMmaK never feeds the tile geometry (that comes from the A-side traits).
+template <>
+struct gemm_elem_traits<int8_t> {
+    static constexpr int kBytes = 1;
+    static constexpr int kMmaK = 32;  // unused: no int8 mma on this path
+    static constexpr bool kNeedsDequant = true;
+};
+
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
 // through the kernels; each kernel touches only the fields it needs.
 struct GemmParams {
@@ -64,7 +74,18 @@ struct GemmParams {
     const void* __restrict__ bias_ptr = nullptr;
     void* __restrict__ out_ptr = nullptr;
 
-    const float* __restrict__ scale = nullptr;
+    // Per-operand dequant scales, folded multiplicatively into the
+    // epilogue (the mma accumulates the raw quantized product):
+    //   a_scale — length a_scale_m: 0 = device scalar applied to the whole
+    //             output (per-tensor activation dequant), m = per-row [m];
+    //   b_scale — length b_scale_n: 0 = device scalar, n = per-output-
+    //             channel [n] (weight-only quantization);
+    // null / 0 disable each side.  Grouped-along-K scales cannot fold here
+    // and belong in the mainloop (not implemented).
+    const float* __restrict__ a_scale = nullptr;
+    const float* __restrict__ b_scale = nullptr;
+    int a_scale_m = 0;
+    int b_scale_n = 0;
 
     // Batched (bmm) geometry: grid.z steps these element strides (0
     // broadcasts the operand across batches).
