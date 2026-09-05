@@ -108,7 +108,7 @@ ASTR_BACKEND=torch python scripts/tools/train.py \
 
 How it works:
 
-- The world decomposes as `dp × cp` (`astrai/parallel/topology.py`). Ranks in one cp group consume the **same** batches — the data sampler shards over dp groups only — and each rank holds a contiguous slice of every sequence.
+- The world decomposes as `dp × cp × tp` (`astrai/parallel/topology.py`); cp requires `tp_size == 1` for now. Ranks in one cp group consume the **same** batches — the data sampler shards over dp groups only — and each rank holds a contiguous slice of every sequence.
 - All per-token computation (norms, projections, MLP, RoPE) runs locally on plain tensors. Only attention crosses ranks: the training forward routes through torch SDPA, which `torch.distributed.tensor.experimental.context_parallel` replaces with ring attention inside the loss computation (`astrai/parallel/cp.py`). The custom CUDA attention kernels and FlashAttention do not participate and CP fails loudly if they are active — set `ASTR_BACKEND=torch`.
 - Strategies stay CP-oblivious: seq/sft implement the token-mean two-phase protocol (`forward_tokens` + `reduce_loss` in `BaseStrategy`), and `CPStrategy` decorates them — it shards the batch buffers between the phases and rescales the local reduction to the global mean (`CPState.mean_loss`: the true mean for logging, the cp-scaled loss for backward so DDP/FSDP's averaged gradient reduce reproduces the single-device gradient).
 - Weights, optimizer state, and checkpoints are untouched — CP shards activations only.
@@ -120,6 +120,36 @@ Constraints (enforced with explicit errors at launch):
 - Requires a flash/cuDNN SDPA kernel — train in bf16. The mem-efficient kernel's logsumexp layout breaks the ring's partial-attention merge, so `CPState.shard` restricts SDPA to flash/cuDNN and rejects others.
 - MoE is not supported yet (the load-balance aux loss would be computed per sequence slice).
 - Head-tail causal load balancing is disabled (`_cp_options.enable_load_balance = False`): with contiguous chunks, later ranks do more cross-chunk attention work, but the math is exact. The balanced path produced incorrect losses on torch 2.11 and is revisited when upstream fixes land.
+
+## Tensor Parallelism
+
+Tensor parallelism (`--tp_size`) shards the **feature** dimension across a group of contiguous ranks — model parallelism inside a layer, orthogonal to DDP/FSDP (batch and parameters) and CP (sequence). It targets the case where a single layer's projections dominate activation or weight memory.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+python scripts/tools/train.py \
+    --train_type=seq \
+    --param_path ./params \
+    --data_root_path ./dataset/cached \
+    --dp_mode=fsdp \
+    --dp_size=1 \
+    --tp_size=2 \
+    --batch_per_device=4 \
+    --grad_accum_steps=8
+```
+
+How it works:
+
+- `astrai/parallel/tp.py` shards the one operator that carries weights: `Linear`. A plan maps module keys (fnmatch patterns over `named_modules()`) to split styles — `colwise` chunks the weight along dim 0 (attention q/k/v over heads, MLP up/gate over ffn channels; each rank computes its own output features, no communication) and `rowwise` chunks along dim 1 (attention o_proj, MLP down; each rank computes a partial sum, one all-reduce ends the forward).
+- Everything between a colwise and a rowwise projection is per-feature elementwise (RoPE per head, SiLU per channel, norms over the fully reduced hidden), so the model code between the two ends of a shard never observes the split. The `lm_head` and the embedding stay replicated.
+- Communication rides megatron-style autograd functions: rowwise all-reduces on forward and passes gradients through; colwise passes the forward and all-reduces gradients on backward.
+- Every rank evaluates the **full** loss (the hidden state is whole at each rowwise boundary), so a rank's gradient on its own shard is already the exact single-device gradient — no loss rescaling. DDP/FSDP gradient sync is forced onto the dp group: tp peers hold different shards, and a world-group default would all-reduce unrelated shards together.
+- Sharding happens after the full weights load and before the executor wraps and builds the optimizer (`train_context.before_wrap`); the shard is final, never restored. A tp=2 test pins forward logits/loss and gradients exactly against the single-device run.
+
+Constraints (enforced with explicit errors at launch):
+
+- `--tp_size > 1` cannot be combined with `--cp_size > 1` — the ring-attention patch and head-sharded projections interact on the SDPA inputs and the combination is unverified.
+- MoE is refused (expert dispatch and the per-token aux loss assume full-feature router inputs), and so is LoRA (the `LoRALinear` wrapper bypasses the sharded `Linear` forward).
 
 ## Gradient Accumulation
 
@@ -287,16 +317,16 @@ python scripts/tools/train.py \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--dp_size` | 1 | Data-parallel replicas; the launcher starts `dp_size × cp_size` processes. Under `torchrun`, keep `dp_size × cp_size` equal to the global `WORLD_SIZE` |
+| `--dp_size` | 1 | Data-parallel replicas; the launcher starts `dp_size × cp_size × tp_size` processes. Under `torchrun`, keep the product equal to the global `WORLD_SIZE` |
 | `--dp_mode` | `fsdp` | `none`, `ddp`, or `fsdp` |
 | `--cp_size` | 1 | Context-parallel group size: shards sequences across contiguous ranks (seq pretraining, requires `ddp`/`fsdp` and the torch attention backend) |
+| `--tp_size` | 1 | Tensor-parallel group size: shards Linear projections over features (attention heads / ffn channels; refuses cp+tp, MoE, and LoRA) |
 | `--start_method` | `spawn` | Multiprocessing start method (`spawn`, `fork`, `forkserver`) |
 | `--backend` | `nccl` | Distributed backend (`nccl`, `gloo`) |
 | `--master_addr` | `localhost` | Master node address |
 | `--master_port` | `29500` | Master node port |
 | `--device_type` | `cuda` | Device type |
 
-> `--tp_size` is accepted by the CLI but discarded before configuration. Tensor parallelism is not implemented, and there is no tensor-parallel module or model integration.
 
 Full parameter reference: [CLI Reference](params.md). Training loop and strategies: [Training Guide](training.md).
 

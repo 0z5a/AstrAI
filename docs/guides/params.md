@@ -124,14 +124,14 @@ with `--optimizer=muon_adamw`.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--dp_size` | Data-parallel replicas; the launcher starts `dp_size × cp_size` processes | 1 |
+| `--dp_size` | Data-parallel replicas; the launcher starts `dp_size × cp_size × tp_size` processes | 1 |
 | `--dp_mode` | Parallel strategy (`none`, `ddp`, `fsdp`) | fsdp |
 | `--device_type` | Device type | cuda |
 | `--start_method` | Multiprocessing start method (`spawn`, `fork`, `forkserver`) | spawn |
 | `--backend` | Distributed training backend | nccl |
 | `--master_addr` | Master node address | localhost |
 | `--master_port` | Master node port | 29500 |
-| `--tp_size` | Reserved tensor-parallel size; accepted but currently ignored | None |
+| `--tp_size` | Tensor-parallel group size: shards Linear projections over features (attention heads / ffn channels) | 1 |
 
 ### Strategy-specific
 

@@ -12,6 +12,7 @@ TRAIN_CONFIG="${TRAIN_CONFIG:-}"
 TRAIN_GPU_COUNT="${TRAIN_GPU_COUNT:-all}"
 TRAIN_DP_MODE="${TRAIN_DP_MODE:-auto}"
 TRAIN_CP_SIZE="${TRAIN_CP_SIZE:-1}"
+TRAIN_TP_SIZE="${TRAIN_TP_SIZE:-1}"
 
 validate_job_name "${TRAIN_JOB_NAME}"
 if [[ "${TRAIN_GPU_COUNT}" == "all" ]]; then
@@ -20,10 +21,13 @@ fi
 [[ "${TRAIN_GPU_COUNT}" =~ ^[1-9][0-9]*$ ]] || die "No visible GPU found"
 [[ "${TRAIN_CP_SIZE}" =~ ^[1-9][0-9]*$ ]] ||
     die "Invalid cp_size: ${TRAIN_CP_SIZE}"
-if (( TRAIN_GPU_COUNT % TRAIN_CP_SIZE != 0 )); then
-    die "GPU count (${TRAIN_GPU_COUNT}) must be divisible by cp_size (${TRAIN_CP_SIZE})"
+[[ "${TRAIN_TP_SIZE}" =~ ^[1-9][0-9]*$ ]] ||
+    die "Invalid tp_size: ${TRAIN_TP_SIZE}"
+TRAIN_WORLD_PER_DP=$(( TRAIN_CP_SIZE * TRAIN_TP_SIZE ))
+if (( TRAIN_GPU_COUNT % TRAIN_WORLD_PER_DP != 0 )); then
+    die "GPU count (${TRAIN_GPU_COUNT}) must be divisible by cp_size x tp_size (${TRAIN_WORLD_PER_DP})"
 fi
-TRAIN_DP_SIZE=$(( TRAIN_GPU_COUNT / TRAIN_CP_SIZE ))
+TRAIN_DP_SIZE=$(( TRAIN_GPU_COUNT / TRAIN_WORLD_PER_DP ))
 if [[ "${TRAIN_DP_MODE}" == "auto" ]]; then
     if (( TRAIN_GPU_COUNT > 1 )); then
         TRAIN_DP_MODE=ddp
@@ -53,6 +57,7 @@ train_args=(
     python scripts/tools/train.py
     --ckpt_dir "${CHECKPOINT_DIR}"
     --cp_size "${TRAIN_CP_SIZE}"
+    --tp_size "${TRAIN_TP_SIZE}"
     --dp_size "${TRAIN_DP_SIZE}"
 )
 
@@ -72,7 +77,7 @@ else
     train_args+=(--param_path "${BASE_MODEL}")
 fi
 
-log_info "GPUs=${TRAIN_GPU_COUNT} (dp=${TRAIN_DP_SIZE} x cp=${TRAIN_CP_SIZE}), dp_mode=${TRAIN_DP_MODE}, checkpoints=${CHECKPOINT_DIR}"
+log_info "GPUs=${TRAIN_GPU_COUNT} (dp=${TRAIN_DP_SIZE} x cp=${TRAIN_CP_SIZE} x tp=${TRAIN_TP_SIZE}), dp_mode=${TRAIN_DP_MODE}, checkpoints=${CHECKPOINT_DIR}"
 
 # Replace the shell so the container init forwards SIGTERM to the trainer.
 exec "${train_args[@]}" "$@"

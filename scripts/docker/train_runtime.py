@@ -82,10 +82,11 @@ def load_runtime(config_path: str) -> dict[str, str]:
         if dp_mode in {"ddp", "fsdp"} and count < 2:
             raise ValueError(f"dp_mode {dp_mode} requires at least two GPUs")
 
-    # The parallel section feeds the trainer's --dp_size/--cp_size; the
-    # process count is derived from the degrees, so the device list must
-    # decompose along cp_size.  dp_size itself is derived per launch
-    # (gpu count / cp_size) unless declared, in which case it must agree.
+    # The parallel section feeds the trainer's --dp_size/--cp_size/--tp_size;
+    # the process count is derived from the degrees, so the device list must
+    # decompose along cp_size * tp_size.  dp_size itself is derived per launch
+    # (gpu count / (cp_size * tp_size)) unless declared, in which case it must
+    # agree.
     parallel = _mapping(config.get("parallel"), "parallel")
 
     def _degree(name: str) -> int:
@@ -95,18 +96,20 @@ def load_runtime(config_path: str) -> dict[str, str]:
         return value
 
     cp_size = _degree("cp_size")
+    tp_size = _degree("tp_size")
     yaml_dp_size = _degree("dp_size")
     if gpu_count != "all":
         count = int(gpu_count)
-        if count % cp_size != 0:
+        world = cp_size * tp_size
+        if count % world != 0:
             raise ValueError(
                 f"runtime.gpu.devices count ({count}) must be divisible by "
-                f"parallel.cp_size ({cp_size})"
+                f"parallel.cp_size * tp_size ({world})"
             )
-        if "dp_size" in parallel and count != yaml_dp_size * cp_size:
+        if "dp_size" in parallel and count != yaml_dp_size * world:
             raise ValueError(
-                f"parallel degrees dp_size x cp_size = "
-                f"{yaml_dp_size * cp_size} must match the "
+                f"parallel degrees dp_size x cp_size x tp_size = "
+                f"{yaml_dp_size * world} must match the "
                 f"runtime.gpu.devices count ({count})"
             )
 
@@ -130,6 +133,7 @@ def load_runtime(config_path: str) -> dict[str, str]:
         "TRAIN_GPU_COUNT": gpu_count,
         "TRAIN_DP_MODE": dp_mode,
         "TRAIN_CP_SIZE": str(cp_size),
+        "TRAIN_TP_SIZE": str(tp_size),
         "CUDA_TAG": str(container.get("cuda_tag", "cu128")),
         "TRAIN_IPC_MODE": str(container.get("ipc", "host")),
         "TRAIN_STOP_GRACE_PERIOD": str(container.get("stop_grace_period", "10m")),

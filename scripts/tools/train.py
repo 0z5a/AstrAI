@@ -284,7 +284,8 @@ _SPECS = [
         "Distributed",
         type=int,
         default=None,
-        help="Tensor parallelism (future).",
+        help="Tensor parallelism: shard Linear projections over features "
+        "(attention heads / ffn channels).",
     ),
     OptSpec(
         "dp_mode",
@@ -399,8 +400,7 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
 
     # Convert tuple back to list
     kwargs["metrics"] = list(kwargs["metrics"])
-    # Remove tp_size (not yet wired)
-    kwargs.pop("tp_size", None)
+    kwargs["tp_size"] = kwargs.pop("tp_size") or 1
     kwargs["cp_size"] = kwargs.pop("cp_size") or 1
     kwargs["dp_size"] = kwargs.pop("dp_size") or 1
 
@@ -415,6 +415,7 @@ def _print_dry_run(kwargs: dict) -> None:
     """Print training plan summary."""
     dp_size = kwargs.get("dp_size", 1) or 1
     cp_size = kwargs.get("cp_size", 1) or 1
+    tp_size = kwargs.get("tp_size", 1) or 1
     rows = [
         ("Train type", kwargs.get("train_type")),
         ("Model path", kwargs.get("param_path")),
@@ -422,7 +423,8 @@ def _print_dry_run(kwargs: dict) -> None:
         ("DP mode", kwargs.get("dp_mode", "none")),
         ("DP replicas", str(dp_size)),
         ("CP size", str(cp_size)),
-        ("GPUs", str(dp_size * cp_size)),
+        ("TP size", str(tp_size)),
+        ("GPUs", str(dp_size * cp_size * tp_size)),
         ("Epochs", str(kwargs.get("n_epoch", 1))),
         ("Batch/device", str(kwargs.get("batch_per_device", 1))),
         ("Grad accum", str(kwargs.get("grad_accum_steps", 1))),
@@ -506,6 +508,7 @@ def train(
     stride: int,
     dp_size: int,
     cp_size: int,
+    tp_size: int,
     dp_mode: str,
     device_type: str,
     backend: str,
@@ -532,6 +535,12 @@ def train(
         raise ValueError("--dp_size > 1 requires --dp_mode to be 'ddp' or 'fsdp'")
 
     if cp_size > 1:
+        if tp_size > 1:
+            raise ValueError(
+                "--cp_size > 1 combined with --tp_size > 1 is not verified "
+                "yet: the ring-attention patch and head-sharded projections "
+                "interact on the SDPA inputs"
+            )
         if train_type not in ("seq", "sft"):
             raise ValueError(
                 "--cp_size > 1 supports seq (pretrain) and sft only; RL "
@@ -710,6 +719,7 @@ def train(
         persistent_workers=persistent_workers,
         dp_size=dp_size,
         cp_size=cp_size,
+        tp_size=tp_size,
         dp_mode=dp_mode,
         backend=backend,
         master_addr=master_addr,
