@@ -5,6 +5,7 @@
 
 #include "common/cp_async.cuh"
 #include "common/mma.cuh"
+#include "softmax.cuh"
 
 // Predicated cp.async (4-operand form) requires CUDA 11.2+.
 // bf16 mma.sync requires sm_80+ (guarded at build time by ASTRAI_NO_MMA).
@@ -188,11 +189,9 @@ __device__ inline void mma_softmax_tile(
     rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
     rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
 
-    float nm0 = fmaxf(m0, rmax0), nm1 = fmaxf(m1, rmax1);
-    float corr0 = __expf(m0 - nm0);
-    float corr1 = __expf(m1 - nm1);
-    float pn0 = (nm0 == -FLT_MAX) ? 0.0f : 1.0f;
-    float pn1 = (nm1 == -FLT_MAX) ? 0.0f : 1.0f;
+    float corr0, corr1, pn0, pn1;
+    float nm0 = softmax_remax(m0, rmax0, corr0, pn0);
+    float nm1 = softmax_remax(m1, rmax1, corr1, pn1);
 
     float rsum0 = 0.0f, rsum1 = 0.0f;
     #pragma unroll
@@ -212,7 +211,6 @@ __device__ inline void mma_softmax_tile(
     rsum1 += __shfl_xor_sync(0xFFFFFFFF, rsum1, 2);
     l0 = l0 * corr0 + rsum0;
     l1 = l1 * corr1 + rsum1;
-    m0 = nm0; m1 = nm1;
 
     #pragma unroll
     for (int j = 0; j < Traits::DN8; j++) {

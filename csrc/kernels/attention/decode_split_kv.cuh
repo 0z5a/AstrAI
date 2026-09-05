@@ -4,6 +4,7 @@
 #include "common.h"
 #include "common/reduce.cuh"
 #include "layout_policies.cuh"
+#include "softmax.cuh"
 
 namespace astrai {
 namespace attention {
@@ -62,7 +63,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
 
         int mask_base = batch * p.mask_b_stride + safe_head * p.mask_h_stride;
 
-        float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
+        SoftmaxState sm;
+        float acc_reg[8] = {0.0f};
 
         for (int ci = ch_begin; ci < ch_end; ci++) {
             int chunk_start = ci * DC_CHUNK;
@@ -100,21 +102,13 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
                         partial = -FLT_MAX;
                 }
 
-                float new_m = fmaxf(m, partial);
-                float alpha = __expf(m - new_m);
-                // Guard: while no valid key has been seen (new_m == -FLT_MAX),
-                // __expf(partial - new_m) == 1 would admit masked keys with
-                // weight 1.  Keeps fully-masked splits at d == 0 so the
-                // combine's `mi <= -FLT_MAX` skip sees a clean empty split.
-                float beta = (new_m == -FLT_MAX) ? 0.0f
-                                                  : __expf(partial - new_m);
-                d = d * alpha + beta;
+                float alpha, beta;
+                softmax_step(sm, partial, 1.0f, alpha, beta);
 
                 for (int i = 0; i < hd_per_thread; i++) {
                     float vv = __bfloat162float(v_smem[s * p.head_dim + lane * hd_per_thread + i]);
                     acc_reg[i] = fmaf(acc_reg[i], alpha, vv * beta);
                 }
-                m = new_m;
             }
             __syncthreads();
         }
@@ -129,8 +123,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
                 p.o_part[slot * p.head_dim + dd] = acc_reg[i];
             }
             if (lane == 0) {
-                p.ml_part[slot * 2] = m;
-                p.ml_part[slot * 2 + 1] = d;
+                p.ml_part[slot * 2] = sm.m;
+                p.ml_part[slot * 2 + 1] = sm.l;
             }
         }
     }
@@ -152,20 +146,18 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     const float* mlp = p.ml_part + split_base * 2;
     const float* op = p.o_part + split_base * p.head_dim;
 
-    float m = -FLT_MAX, l = 0.0f, acc = 0.0f;
+    SoftmaxState st;
+    float acc = 0.0f;
     for (int s = 0; s < p.num_splits; s++) {
         float mi = mlp[s * 2];
         if (mi <= -FLT_MAX) continue;
         float li = mlp[s * 2 + 1];
-        float nm = fmaxf(m, mi);
-        float corr = __expf(m - nm);
-        float e = __expf(mi - nm);
+        float corr, e;
+        softmax_step(st, mi, li, corr, e);
         acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
-        l = fmaf(l, corr, li * e);
-        m = nm;
     }
 
-    float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
+    float inv = (st.l > 1e-20f) ? (1.0f / st.l) : 0.0f;
     int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
     p.o_ptr[o_off] = __float2bfloat16(acc * inv);
 }
