@@ -23,9 +23,9 @@ def _make_moe(device):
         n_layers=2,
     )
     model.apply(
-        lambda module: module.reset_parameters()
-        if hasattr(module, "reset_parameters")
-        else None
+        lambda module: (
+            module.reset_parameters() if hasattr(module, "reset_parameters") else None
+        )
     )
     return model.to(device)
 

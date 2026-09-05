@@ -55,9 +55,9 @@ def _make_model(
         n_layers=2,
     )
     model.apply(
-        lambda module: module.reset_parameters()
-        if hasattr(module, "reset_parameters")
-        else None
+        lambda module: (
+            module.reset_parameters() if hasattr(module, "reset_parameters") else None
+        )
     )
     return model.to(device=device)
 
