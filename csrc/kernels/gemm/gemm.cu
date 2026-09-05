@@ -136,6 +136,7 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
     p.a_batch_stride = (batch_a == 1 && batch > 1) ? 0 : a_bstride;
     p.b_batch_stride = (batch_b == 1 && batch > 1) ? 0 : b_bstride;
     p.out_batch_stride = m * n;
+    p.out_ld = static_cast<int>(n);
     launch_gemm(a.scalar_type() == torch::kFloat8_e4m3fn ? FP8Format::E4M3
                                                          : FP8Format::E5M2,
                 p, stream.stream(), tag_a, tag_b);

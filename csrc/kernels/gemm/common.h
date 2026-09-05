@@ -65,10 +65,6 @@ struct GemmParams {
     void* __restrict__ out_ptr = nullptr;
 
     const float* __restrict__ scale = nullptr;
-    // NN-swap mode (canonicalize_gemm): the kernel computes the transposed
-    // problem and the epilogue scatters D[row][col] to out[col * p.m + row]
-    // in the caller's [M][N] buffer. Zero in the plain orientation.
-    int out_transposed = 0;
 
     // Batched (bmm) geometry: grid.z steps these element strides (0
     // broadcasts the operand across batches).
@@ -77,7 +73,12 @@ struct GemmParams {
     // promote to int64. Batch strides are extent *products* (k*m, k*n,
     // m*n) and can cross the int32 boundary on large bmms.
     int m, n, k;
-    int a_ld, b_ld;
+    // Physical leading dims (row strides in elements) of A, B and the
+    // output; out_ld lets non-contiguous outputs (slices of a larger
+    // buffer) cost nothing — the epilogue writes out[row * out_ld + col].
+    // The output orientation is not data: it rides the policy's LayoutOut
+    // tag (see policy.cuh).
+    int a_ld, b_ld, out_ld;
     int64_t a_batch_stride = 0;
     int64_t b_batch_stride = 0;
     int64_t out_batch_stride = 0;

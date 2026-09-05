@@ -194,7 +194,8 @@ void launch_policy(const GemmParams& p, cudaStream_t stream) {
 // x 64x32, kK=64, 2-stage full ring, fast loop only for dual-congruous
 // layouts. Narrow: 128x64. Small CTA: 64x64 of 4 warps x 32x32, kK=64,
 // kFastLoop always on.
-template <FP8Format Fmt, typename LayoutA, typename LayoutB, int GroupRaster>
+template <FP8Format Fmt, typename LayoutA, typename LayoutB,
+          typename LayoutOut = RowMajor, int GroupRaster = 8>
 void launch_plan(const GemmParams& p, const GemmPlan& plan,
                  cudaStream_t stream) {
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
@@ -202,26 +203,28 @@ void launch_plan(const GemmParams& p, const GemmPlan& plan,
     switch (plan.cta) {
     case GemmPlan::Cta::kBig128: {
         using Policy =
-            Fp8GemmPolicy<Fmt, 128, 128, LayoutA, LayoutB, 64, 32, 64, 2,
-                          GroupRaster, false, kBigFast>;
+            Fp8GemmPolicy<Fmt, LayoutA, LayoutB, LayoutOut, 128, 128, 64,
+                          32, 64, 2, GroupRaster, false, kBigFast>;
         launch_policy<Policy>(p, stream);
         break;
     }
     case GemmPlan::Cta::kNarrow128x64: {
         using Policy =
-            Fp8GemmPolicy<Fmt, 128, 64, LayoutA, LayoutB, 32, 32, 64, 2,
-                          GroupRaster, false, true>;
+            Fp8GemmPolicy<Fmt, LayoutA, LayoutB, LayoutOut, 128, 64, 32, 32,
+                          64, 2, GroupRaster, false, true>;
         launch_policy<Policy>(p, stream);
         break;
     }
     case GemmPlan::Cta::kSmall64: {
         if (plan.small_s3) {
-            using Policy = Fp8GemmPolicy<Fmt, 64, 64, LayoutA, LayoutB, 32, 32,
-                                         64, 3, GroupRaster, false, true>;
+            using Policy = Fp8GemmPolicy<Fmt, LayoutA, LayoutB, LayoutOut,
+                                         64, 64, 32, 32, 64, 3, GroupRaster,
+                                         false, true>;
             launch_policy<Policy>(p, stream);
         } else {
-            using Policy = Fp8GemmPolicy<Fmt, 64, 64, LayoutA, LayoutB, 32, 32,
-                                         64, 2, GroupRaster, false, true>;
+            using Policy = Fp8GemmPolicy<Fmt, LayoutA, LayoutB, LayoutOut,
+                                         64, 64, 32, 32, 64, 2, GroupRaster,
+                                         false, true>;
             launch_policy<Policy>(p, stream);
         }
         break;
@@ -232,7 +235,7 @@ void launch_plan(const GemmParams& p, const GemmPlan& plan,
 // Pure problem rewrite: the dual-N-contiguous problem (trans_a/trans_b both
 // false) has no dedicated instantiation — it runs as its transpose
 // E[N][M] = B^T @ A^T (CUTLASS-sm90's is_swapAB) over swapped operands,
-// with p.out_transposed making the epilogue scatter into the caller's
+// with the geometry-derived transposed epilogue staging scattering into
 // [M][N] row-major buffer. The rewritten trans flags become the layout tags
 // the launcher instantiates; the NN path pays a scalar-store scatter, which
 // its rare usage makes the right trade.
@@ -247,7 +250,9 @@ inline void canonicalize_gemm(GemmParams& p, bool& trans_a, bool& trans_b) {
         s.b_ld = p.a_ld;
         s.a_batch_stride = p.b_batch_stride;
         s.b_batch_stride = p.a_batch_stride;
-        s.out_transposed = 1;
+        // The caller's [M][N] buffer read as E = B^T A^T: the epilogue
+        // walks the caller's rows (kernel n) with the caller's N stride.
+        s.out_ld = p.n;
         p = s;
         trans_a = trans_b = true;
     }
@@ -257,17 +262,24 @@ inline void canonicalize_gemm(GemmParams& p, bool& trans_a, bool& trans_b) {
 // tags through.
 template <FP8Format Fmt>
 void gemm(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
+    const bool swapped = !trans_a && !trans_b;  // canonicalize rewrites NN
     canonicalize_gemm(p, trans_a, trans_b);
     // Crosswise operand count for the plan: transposed-A storage (ColMajor)
     // and plain-B storage (RowMajor) both take the direct crosswise load.
     const int crosswise = (trans_a ? 1 : 0) + (trans_b ? 0 : 1);
     const GemmPlan plan = plan_gemm(p, crosswise);
-    if (trans_a && trans_b)
-        launch_plan<Fmt, ColMajor, ColMajor, 8>(p, plan, stream);
-    else if (trans_b)
-        launch_plan<Fmt, RowMajor, ColMajor, 8>(p, plan, stream);
-    else
-        launch_plan<Fmt, ColMajor, RowMajor, 8>(p, plan, stream);
+    // The swap computes the transposed problem; its (rewritten TT) branch
+    // instantiates the column-major-output epilogue through LayoutOut.
+    if (trans_a && trans_b) {
+        if (swapped)
+            launch_plan<Fmt, ColMajor, ColMajor, ColMajor, 8>(p, plan, stream);
+        else
+            launch_plan<Fmt, ColMajor, ColMajor, RowMajor, 8>(p, plan, stream);
+    } else if (trans_b) {
+        launch_plan<Fmt, RowMajor, ColMajor, RowMajor, 8>(p, plan, stream);
+    } else {
+        launch_plan<Fmt, ColMajor, RowMajor, RowMajor, 8>(p, plan, stream);
+    }
 }
 
 // Non-template entry over the production instantiations (defined in

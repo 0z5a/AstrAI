@@ -196,8 +196,8 @@ constexpr bool kCaseFast =
     !std::is_same_v<LA, ColMajor> && !std::is_same_v<LB, RowMajor>;
 template <typename LA, typename LB, int kK, int Stages>
 using CasePolicy =
-    Fp8GemmPolicy<FP8Format::E4M3, 128, 128, LA, LB, 64, 32, kK, Stages, 8,
-                  false, kCaseFast<LA, LB>>;
+    Fp8GemmPolicy<FP8Format::E4M3, LA, LB, RowMajor, 128, 128, 64, 32, kK,
+                  Stages, 8, false, kCaseFast<LA, LB>>;
 
 template <typename LA, typename LB, int kK, int Stages>
 static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
@@ -234,6 +234,7 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
     p.k = k;
     p.a_ld = a_ld;
     p.b_ld = b_ld;
+    p.out_ld = n;
     float* d_ref;
     cudaMalloc(&d_ref, (size_t)m * n * 4);
     naive_gemm_ref<<<dim3((n + 31) / 32, (m + 31) / 32), dim3(32, 32)>>>(

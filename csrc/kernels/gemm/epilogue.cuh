@@ -20,8 +20,11 @@ struct GemmCollectiveEpilogue {
     __nv_bfloat16* const tile_out;
     const float output_scale;
     const __nv_bfloat16* const bias;
-    const int64_t m, n;
-    const bool t_out;
+    const int64_t m, n, out_ld;
+    // Output orientation from the policy tag (CUTLASS LayoutC): the NN
+    // swap computes E = B^T A^T, instantiated with LayoutOut = ColMajor.
+    static constexpr bool t_out =
+        !std::is_same_v<typename Policy::LayoutTagOut, RowMajor>;
     const int row_elems, row_chunks;
     const int warp_m, warp_n, group, thread_in_group;
     const int64_t block_m, block_n;
@@ -31,7 +34,7 @@ struct GemmCollectiveEpilogue {
         : tile_out(reinterpret_cast<__nv_bfloat16*>(smem)),
           output_scale(Traits::kNeedsDequant ? *p.scale : 1.0f),
           bias(reinterpret_cast<const __nv_bfloat16*>(p.bias_ptr)),
-          m(p.m), n(p.n), t_out(p.out_transposed != 0),
+          m(p.m), n(p.n), out_ld(p.out_ld),
           row_elems(t_out ? kBlockM : kBlockN),
           row_chunks(row_elems / 8),
           warp_m((tid >> 5) / Traits::kWarpsN),
@@ -63,7 +66,7 @@ struct GemmCollectiveEpilogue {
         // Fused bias: added to the fp32 accumulator before the single bf16
         // rounding. The per-lane loads are L1 broadcasts; rows past the
         // edge skip the load (their smem slots never copy out). Under
-        // out_transposed the bias indexes D-cols = the kernel's rows.
+        // the swapped orientation the bias indexes D-cols = the kernel's rows.
         const int local_col0 = warp_n * Traits::kWarpN + thread_in_group * 2;
         const int64_t bias_col0 = block_n * kBlockN;
         const int64_t bias_row0 = block_m * kBlockM;
@@ -142,7 +145,7 @@ struct GemmCollectiveEpilogue {
             const int64_t col = t_out ? row0_global + (int64_t)c * 8
                                       : col0_global + (int64_t)c * 8;
             const int64_t rows_total = t_out ? n : m;
-            const int64_t row_stride = t_out ? m : n;
+            const int64_t row_stride = out_ld;
             if (row >= rows_total) break;  // rows are consecutive: nothing left
             auto* dst = out_bf16 + row * row_stride + col;
             if (col + 8 <= row_stride &&
