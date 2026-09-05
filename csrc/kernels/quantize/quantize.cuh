@@ -1,6 +1,6 @@
 #pragma once
 // FP8 quantize device code — pure CUDA, no torch: kernels take the
-// FP8QuantizeParams POD, format and input type ride on template parameters,
+// QuantParams POD, format and input type ride on template parameters,
 // and the launcher is shared by the torch binding and the C tests.
 
 #include <cuda_bf16.h>
@@ -13,8 +13,7 @@
 #include "common/reduce.cuh"
 
 namespace astrai {
-namespace fp8 {
-
+namespace quant {
 // Input element type traits: one element -> float, the unpack of one
 // 16-byte load into kVecElems floats, and a native 2-element pair load.
 template <typename InT>
@@ -113,7 +112,7 @@ __device__ __forceinline__ unsigned cvt_fp8x2(float a, float b) {
 // ticket + fences), re-zeroing the amax slot and the counter for the next
 // launch — the host-side delayed-scaling update chain disappears.
 template <int kWarps>
-__device__ __forceinline__ void publish_amax(const FP8QuantizeParams& p,
+__device__ __forceinline__ void publish_amax(const QuantParams& p,
                                              float v) {
     v = warp_reduce_max(v);
     __shared__ float slots[kWarps];
@@ -141,7 +140,7 @@ __device__ __forceinline__ void publish_amax(const FP8QuantizeParams& p,
 // Elementwise quantize kernel (QuantLayout::RowMajor): vectorized 16B loads
 // -> fp8 stores, fused amax over raw values.
 template <FP8Format Fmt, typename InT>
-__global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
+__global__ void fp8_quantize_kernel(QuantParams p) {
     const float mult = *p.scale;
     const auto* x = static_cast<const InT*>(p.input_ptr);
     uint8_t* x8 = static_cast<uint8_t*>(p.output_ptr);
@@ -204,7 +203,7 @@ __global__ void fp8_quantize_kernel(FP8QuantizeParams p) {
 // (+25-35% over the former 32x32 scalar kernel on sub-4M tensors; ~5%
 // slower once DRAM-saturated — accepted for the single-kernel shape.)
 template <FP8Format Fmt, typename InT>
-__global__ void fp8_quantize_tiled_kernel(FP8QuantizeParams p) {
+__global__ void fp8_quantize_tiled_kernel(QuantParams p) {
     constexpr int kTileC = 64, kTileR = 32;
     // 34B pitch: staging stride is 17 words (coprime with the 32 banks) so
     // the pair-byte stores stay conflict-free, and the byte-wise consume
@@ -292,7 +291,7 @@ __global__ void fp8_quantize_tiled_kernel(FP8QuantizeParams p) {
 // pair loads in-kernel and falls back to scalar loads at unaligned/ragged
 // rows, so the host side picks only the grid.
 template <FP8Format Fmt, typename InT, bool Tiled = false>
-void launch_fp8_quantize(const FP8QuantizeParams& p, cudaStream_t stream) {
+void launch_fp8_quantize(const QuantParams& p, cudaStream_t stream) {
     if constexpr (Tiled) {
         const dim3 grid((p.cols + 63) / 64, (p.rows + 31) / 32);
         if (grid.x == 0 || grid.y == 0) return;
@@ -307,5 +306,5 @@ void launch_fp8_quantize(const FP8QuantizeParams& p, cudaStream_t stream) {
     }
 }
 
-}  // namespace fp8
+}  // namespace quant
 }  // namespace astrai

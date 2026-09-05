@@ -11,23 +11,26 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
-#include "common.h"
 #include "common/cp_async.cuh"
-#include "gemm/epilogue.cuh"
-#include "gemm/load.cuh"
-#include "gemm/mainloop.cuh"
-#include "gemm/policy.cuh"
-#include "gemm/scheduler.cuh"
+#include "epilogue.cuh"
+#include "quantize/common.h"
+#include "gemm/common.h"
+#include "load.cuh"
+#include "mainloop.cuh"
+#include "policy.cuh"
+#include "scheduler.cuh"
 
 namespace astrai {
-namespace fp8 {
+namespace gemm {
+
+using quant::FP8Format;
 
 template <typename Policy>
 __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
-    fp8_gemm_kernel(FP8Params p) {
+    gemm_kernel(GemmParams p) {
     using Traits = typename Policy::Traits;
-    using Mainloop = Fp8CollectiveMainloop<Policy>;
-    using Epilogue = Fp8CollectiveEpilogue<Policy>;
+    using Mainloop = GemmCollectiveMainloop<Policy>;
+    using Epilogue = GemmCollectiveEpilogue<Policy>;
     // Stages live in dynamic shared memory so deep pipelines (> 48KB
     // static limit) opt in via cudaFuncSetAttribute in the launcher.
     extern __shared__ __align__(16) char fp8_gemm_smem[];
@@ -46,7 +49,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
                       Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK +
                           Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK,
                   "output tile must fit the reclaimed operand smem");
-    const int2 bn = Fp8GemmTileScheduler<Policy::kGroupRaster>::tile(blockIdx, gridDim);
+    const int2 bn = GemmTileScheduler<Policy::kGroupRaster>::tile(blockIdx, gridDim);
     Mainloop mainloop(fp8_gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
                       threadIdx.x, bn);
     float acc[Mainloop::kNt][Mainloop::kMt][4] = {};  // [nt][mt][acc]
@@ -113,7 +116,7 @@ inline bool small_cta_padding(int64_t m, int64_t n) {
 // without a GPU). Raster order is not a plan field: every canonical layout
 // runs grouped raster; the plain-raster knob stays available through
 // launch_plan's GroupRaster parameter for experiments.
-struct Fp8GemmPlan {
+struct GemmPlan {
     enum class Cta { kSmall64, kNarrow128x64, kBig128 };
     Cta cta;
     bool small_s3;  // kSmall64 only: cp.async pipeline depth (2 vs 3 stages)
@@ -125,18 +128,18 @@ struct Fp8GemmPlan {
 // the design notes): the small CTA hides the crosswise LDG+PRMT latency
 // far better, while the big CTA's operand reuse buys back load bandwidth
 // the crosswise path does not traffic in.
-inline Fp8GemmPlan plan_gemm(const FP8Params& p, int crosswise_ops = 0) {
+inline GemmPlan plan_gemm(const GemmParams& p, int crosswise_ops = 0) {
     const int64_t sm = device_sm_count();
     const int64_t tiles_128 =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
     const auto small = [&](bool s3) {
-        return Fp8GemmPlan{Fp8GemmPlan::Cta::kSmall64, s3};
+        return GemmPlan{GemmPlan::Cta::kSmall64, s3};
     };
     const auto big = [] {
-        return Fp8GemmPlan{Fp8GemmPlan::Cta::kBig128, false};
+        return GemmPlan{GemmPlan::Cta::kBig128, false};
     };
     const auto narrow = [] {
-        return Fp8GemmPlan{Fp8GemmPlan::Cta::kNarrow128x64, false};
+        return GemmPlan{GemmPlan::Cta::kNarrow128x64, false};
     };
     // Padding rules first: predication waste beats any wave-fill effect.
     if (small_cta_padding(p.m, p.n)) return small(crosswise_ops > 0);
@@ -179,11 +182,11 @@ inline Fp8GemmPlan plan_gemm(const FP8Params& p, int crosswise_ops = 0) {
 // Grid + launch for one concrete Policy — the only place a GEMM kernel goes
 // to the wire.
 template <typename Policy>
-void launch_policy(const FP8Params& p, cudaStream_t stream) {
+void launch_policy(const GemmParams& p, cudaStream_t stream) {
     using Traits = typename Policy::Traits;
     dim3 grid((p.n + Traits::kBlockN - 1) / Traits::kBlockN,
               (p.m + Traits::kBlockM - 1) / Traits::kBlockM, p.batch);
-    launch_with_smem<fp8_gemm_kernel<Policy>>(
+    launch_with_smem<gemm_kernel<Policy>>(
         Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p);
 }
 
@@ -192,26 +195,26 @@ void launch_policy(const FP8Params& p, cudaStream_t stream) {
 // layouts. Narrow: 128x64. Small CTA: 64x64 of 4 warps x 32x32, kK=64,
 // kFastLoop always on.
 template <FP8Format Fmt, typename LayoutA, typename LayoutB, int GroupRaster>
-void launch_plan(const FP8Params& p, const Fp8GemmPlan& plan,
+void launch_plan(const GemmParams& p, const GemmPlan& plan,
                  cudaStream_t stream) {
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
     switch (plan.cta) {
-    case Fp8GemmPlan::Cta::kBig128: {
+    case GemmPlan::Cta::kBig128: {
         using Policy =
             Fp8GemmPolicy<Fmt, 128, 128, LayoutA, LayoutB, 64, 32, 64, 2,
                           GroupRaster, false, kBigFast>;
         launch_policy<Policy>(p, stream);
         break;
     }
-    case Fp8GemmPlan::Cta::kNarrow128x64: {
+    case GemmPlan::Cta::kNarrow128x64: {
         using Policy =
             Fp8GemmPolicy<Fmt, 128, 64, LayoutA, LayoutB, 32, 32, 64, 2,
                           GroupRaster, false, true>;
         launch_policy<Policy>(p, stream);
         break;
     }
-    case Fp8GemmPlan::Cta::kSmall64: {
+    case GemmPlan::Cta::kSmall64: {
         if (plan.small_s3) {
             using Policy = Fp8GemmPolicy<Fmt, 64, 64, LayoutA, LayoutB, 32, 32,
                                          64, 3, GroupRaster, false, true>;
@@ -233,9 +236,9 @@ void launch_plan(const FP8Params& p, const Fp8GemmPlan& plan,
 // [M][N] row-major buffer. The rewritten trans flags become the layout tags
 // the launcher instantiates; the NN path pays a scalar-store scatter, which
 // its rare usage makes the right trade.
-inline void canonicalize_gemm(FP8Params& p, bool& trans_a, bool& trans_b) {
+inline void canonicalize_gemm(GemmParams& p, bool& trans_a, bool& trans_b) {
     if (!trans_a && !trans_b) {
-        FP8Params s = p;  // E = B^T * A^T: swap roles, M <-> N
+        GemmParams s = p;  // E = B^T * A^T: swap roles, M <-> N
         s.m = p.n;
         s.n = p.m;
         s.a_ptr = p.b_ptr;
@@ -253,12 +256,12 @@ inline void canonicalize_gemm(FP8Params& p, bool& trans_a, bool& trans_b) {
 // Entry point: canonicalize the problem, plan the launch, wire the layout
 // tags through.
 template <FP8Format Fmt>
-void gemm(FP8Params p, cudaStream_t stream, bool trans_a, bool trans_b) {
+void gemm(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
     canonicalize_gemm(p, trans_a, trans_b);
     // Crosswise operand count for the plan: transposed-A storage (ColMajor)
     // and plain-B storage (RowMajor) both take the direct crosswise load.
     const int crosswise = (trans_a ? 1 : 0) + (trans_b ? 0 : 1);
-    const Fp8GemmPlan plan = plan_gemm(p, crosswise);
+    const GemmPlan plan = plan_gemm(p, crosswise);
     if (trans_a && trans_b)
         launch_plan<Fmt, ColMajor, ColMajor, 8>(p, plan, stream);
     else if (trans_b)
@@ -267,5 +270,5 @@ void gemm(FP8Params p, cudaStream_t stream, bool trans_a, bool trans_b) {
         launch_plan<Fmt, ColMajor, RowMajor, 8>(p, plan, stream);
 }
 
-}  // namespace fp8
+}  // namespace gemm
 }  // namespace astrai

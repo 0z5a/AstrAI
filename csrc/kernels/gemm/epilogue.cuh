@@ -2,14 +2,14 @@
 // Collective epilogue: fused bias, the bf16 scatter of the fp32 accumulators
 // through the reclaimed operand shared memory, and the coalesced copy-out.
 
-#include "fp8/common.h"
+#include "gemm/common.h"
 #include "policy.cuh"
 
 namespace astrai {
-namespace fp8 {
+namespace gemm {
 
 template <typename Policy>
-struct Fp8CollectiveEpilogue {
+struct GemmCollectiveEpilogue {
     using Traits = typename Policy::Traits;
     static constexpr bool kStreamOut = Policy::kStreamOut;
     static constexpr int kBlockM = Traits::kBlockM;
@@ -26,10 +26,10 @@ struct Fp8CollectiveEpilogue {
     const int warp_m, warp_n, group, thread_in_group;
     const int64_t block_m, block_n;
 
-    __device__ Fp8CollectiveEpilogue(char* smem, const FP8Params& p,
+    __device__ GemmCollectiveEpilogue(char* smem, const GemmParams& p,
                                      int64_t block_m, int64_t block_n, int tid)
         : tile_out(reinterpret_cast<__nv_bfloat16*>(smem)),
-          output_scale(*p.scale),
+          output_scale(Traits::kNeedsDequant ? *p.scale : 1.0f),
           bias(reinterpret_cast<const __nv_bfloat16*>(p.bias_ptr)),
           m(p.m), n(p.n), t_out(p.out_transposed != 0),
           row_elems(t_out ? kBlockM : kBlockN),
@@ -176,5 +176,5 @@ struct Fp8CollectiveEpilogue {
     static constexpr int kCtaThreads = Traits::kCtaThreads;
 };
 
-}  // namespace fp8
+}  // namespace gemm
 }  // namespace astrai

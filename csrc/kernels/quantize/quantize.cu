@@ -9,10 +9,11 @@
 #include <unordered_map>
 
 #include "common/device.cuh"
-#include "gemm.cuh"
+#include "gemm/gemm.cuh"
 #include "quantize.cuh"
 
-using namespace astrai::fp8;
+using namespace astrai::quant;
+using namespace astrai::gemm;
 
 namespace {
 
@@ -71,7 +72,7 @@ bool resolve_operand(const torch::Tensor& t_in, bool flag, int64_t& ld,
 
 // Dtype dispatch over the unified quantize launcher.
 template <bool Tiled, FP8Format Fmt>
-void launch_for_dtype(const torch::Tensor& x, const FP8QuantizeParams& p,
+void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
                       cudaStream_t stream) {
     switch (x.scalar_type()) {
     case torch::kHalf:
@@ -86,7 +87,7 @@ void launch_for_dtype(const torch::Tensor& x, const FP8QuantizeParams& p,
 }
 
 template <bool Tiled>
-void launch_quantize_for(const torch::Tensor& x, const FP8QuantizeParams& p,
+void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
                          bool e5m2, cudaStream_t stream) {
     if (e5m2)
         launch_for_dtype<Tiled, FP8Format::E5M2>(x, p, stream);
@@ -145,7 +146,7 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
         cudaMemsetAsync(amax.data_ptr(), 0, sizeof(float), stream.stream());
     }
 
-    FP8QuantizeParams p;
+    QuantParams p;
     p.input_ptr = input.data_ptr();
     p.scale = scale.data_ptr<float>();
     p.amax = amax.data_ptr<float>();
@@ -260,7 +261,7 @@ torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
         batched_out
             ? torch::empty({batch, m, n}, a.options().dtype(torch::kBFloat16))
             : torch::empty({m, n}, a.options().dtype(torch::kBFloat16));
-    FP8Params p;
+    GemmParams p;
     p.a_ptr = a_st.data_ptr();
     p.b_ptr = b_st.data_ptr();
     p.out_ptr = output.data_ptr();

@@ -12,7 +12,7 @@ and FP8 GEMM. These are built when `nvcc` is available and CUDA is detected.
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
-| `fp8_ops` | `fp8/ops.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
+| `quantize` | `quantize/quantize.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -40,7 +40,7 @@ Standalone benchmark vs torch complex-multiply (48 calls = 24 layers × q+k): 6-
 
 ### FP8 GEMM / Linear Kernel
 
-The `fp8_ops` family (`csrc/kernels/fp8/`) accelerates bf16 linear layers by
+The `quantize` family accelerates bf16 linear layers by
 quantizing to FP8 and running tensor-core GEMMs (**requires sm_89+**; fp8
 `mma.sync.m16n8k32` only exists on Ada/Hopper). Same three-layer style as
 attention; the GEMM device code is split humming/CUTLASS-style into one
@@ -48,15 +48,16 @@ layered directory:
 
 | File | Role |
 |------|------|
-| `fp8/common.h` | `FP8Format` enum (E4M3/E5M2), `Fp8GemmTraits<Fmt, BlockM, BlockN, K, Stages>`, `FP8Params` / `FP8QuantizeParams` PODs, layout tags — no torch |
-| `fp8/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 32×32-tile transpose kernel (out_layout 0/1/2), `quant_in_traits<InT>` unpack — no torch |
-| `fp8/gemm/policy.cuh` | smem budget / occupancy hint (`Fp8GemmSmem`) + `Fp8GemmPolicy` (traits + layouts + knobs — the kernel's single template parameter) |
-| `fp8/gemm/load.cuh` | operand loaders: swizzle (`tile_at`), congruous cp.async (predicated + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load |
-| `fp8/gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster |
-| `fp8/gemm/mainloop.cuh` | `Fp8CollectiveMainloop`: stage rings, stage loads, fragment addressing, pipelined mma.sync loop |
-| `fp8/gemm/epilogue.cuh` | `Fp8CollectiveEpilogue`: fused bias + bf16 smem scatter + coalesced copy-out |
-| `fp8/gemm.cuh` | umbrella: `fp8_gemm_kernel<Policy>` orchestrator + host planning (`plan_gemm` / `launch_plan`; 64×64 / 128×64 / 128×128 CTA) + entry `gemm<Fmt>(params, stream, trans_a, trans_b)` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
-| `fp8/ops.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `fp8_ops` |
+| `quantize/common.h` | `FP8Format` enum (E4M3/E5M2) + `QuantLayout` + `QuantParams` POD — no torch |
+| `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 32×32-tile transpose kernel (out_layout 0/1/2), `quant_in_traits<InT>` unpack — no torch |
+| `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK/kNeedsDequant — adding a dtype = one specialization), `GemmParams` POD |
+| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemT>` (tile geometry via `gemm_elem_traits`) + smem budget / occupancy hint (`GemmSmem`) + `GemmPolicy<ElemT>` (traits + layouts + knobs — the kernel's single template parameter); `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
+| `gemm/load.cuh` | operand loaders: swizzle (`tile_at`), congruous cp.async (predicated + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load |
+| `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster |
+| `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing, pipelined mma.sync loop |
+| `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + bf16 smem scatter + coalesced copy-out (dequant scale gated on `kNeedsDequant`) |
+| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + host planning (`plan_gemm` / `launch_plan`; 64×64 / 128×64 / 128×128 CTA) + entry `gemm<Fmt>(params, stream, trans_a, trans_b)` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
+| `quantize/quantize.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
 strategy layer passes `scale.reciprocal()` and the kernel multiplies by it.
@@ -172,9 +173,9 @@ unset, `setup.py` auto-detects the real GPU capability through
 
 - **sm_80+** (Ampere and later): enables the tensor-core MMA path
   (`mma.sync.m16n8k16.bf16` for bf16 attention, `mma.sync.m16n8k32` for FP8).
-- **sm_89+**: required for the FP8 family (`fp8_ops`) — FP8 tensor-core
+- **sm_89+**: required for the FP8 family (`quantize`) — FP8 tensor-core
   instructions only exist on Ada/Hopper and newer. On older architectures,
-  CMake emits a warning and skips the `fp8_ops` target so the remaining CUDA
+  CMake emits a warning and skips the `quantize` target so the remaining CUDA
   kernels still build successfully.
 - **`-DASTRAI_NO_MMA`** is a manual escape hatch only — the build never defines
   it automatically. To disable the MMA path, add it to `NVCC_FLAGS` yourself;
@@ -189,7 +190,7 @@ NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
              --ptxas-options=-O3,-v --extra-device-vectorization --threads=16
 ```
 
-Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all registered kernel targets in parallel via `cmake --build -j N` (the five base targets always; `fp8_ops` additionally on sm_89+). The target list is the **single source of truth**: `KERNEL_NAMES` and the parallel `KERNEL_SRCS` list in `csrc/CMakeLists.txt`; `astrai/extension/loader.py` auto-discovers the compiled `.so` files.
+Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all registered kernel targets in parallel via `cmake --build -j N` (the five base targets always; `quantize` additionally on sm_89+). The target list is the **single source of truth**: `KERNEL_NAMES` and the parallel `KERNEL_SRCS` list in `csrc/CMakeLists.txt`; `astrai/extension/loader.py` auto-discovers the compiled `.so` files.
 
 ## Python Extension Architecture
 
@@ -462,17 +463,18 @@ csrc/
 │   │   ├── paged_decode.cu           #   → module attn_paged_decode
 │   │   └── paged_prefill.cu          #   → module attn_paged_prefill
 │   ├── rotary_emb.cu                  # rotary embedding (kernel + binding in one file) → module rotary_emb
-│   └── fp8/                          # FP8 family (module name fp8_ops)
-│       ├── common.h                  #   FP8Format enum, Fp8GemmTraits, FP8Params / FP8QuantizeParams PODs, layout tags (no torch)
-│       ├── quantize.cuh              #   quantize kernels: vectorized + 32×32-tile transpose (out_layout 0/1/2) (no torch)
-│       ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
-│       ├── gemm/                     #   GEMM device layers (humming/CUTLASS-style split)
-│       │   ├── policy.cuh            #     smem budget / occupancy hint + Fp8GemmPolicy
-│       │   ├── load.cuh              #     operand loaders (swizzle, congruous cp.async, crosswise direct)
-│       │   ├── scheduler.cuh         #     grouped/plain raster mapping
-│       │   ├── mainloop.cuh          #     stage rings + pipelined mma.sync mainloop
-│       │   └── epilogue.cuh          #     fused bias + bf16 scatter + copy-out
-│       └── ops.cu                    #   binding only: validation, param packing, launch dispatch, pybind
+│   ├── quantize/                        # quantize family (no torch)
+│   │   ├── common.h                  #   FP8Format enum, QuantLayout, QuantParams POD
+│   │   └── quantize.cuh              #   quantize kernels: vectorized + 32×32-tile transpose (out_layout 0/1/2)
+│   ├── gemm/                         # GEMM family, dtype-neutral (module quantize binds quantize/ + gemm/)
+│   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, GemmParams POD (no torch)
+│   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
+│   │   ├── policy.cuh                #     smem budget / occupancy hint + Fp8GemmPolicy
+│   │   ├── load.cuh                  #     operand loaders (swizzle, congruous cp.async, crosswise direct)
+│   │   ├── scheduler.cuh             #     grouped/plain raster mapping
+│   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop
+│   │   └── epilogue.cuh              #     fused bias + bf16 scatter + copy-out
+│   └── quantize/quantize.cu                  #   binding only (module quantize): validation, param packing, launch dispatch, pybind
 └── tests/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
     ├── attn_test.cu                  # Decode + prefill kernels

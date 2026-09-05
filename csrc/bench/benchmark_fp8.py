@@ -303,9 +303,9 @@ def benchmark_command(
 ) -> None:
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA is required")
-    if not is_available("fp8_ops"):
+    if not is_available("quantize"):
         raise click.ClickException(
-            "the built fp8_ops kernel is required (compute capability 89+)"
+            "the built quantize kernel is required (compute capability 89+)"
         )
     selected = ("quantize", "gemm") if "all" in suites else tuple(dict.fromkeys(suites))
     m_values_parsed = parse_positive_ints(m_values)

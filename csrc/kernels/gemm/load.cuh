@@ -6,11 +6,11 @@
 // docs/developer/cuda_kernels.md.
 
 #include "common/cp_async.cuh"
-#include "fp8/common.h"
+#include "gemm/common.h"
 #include "policy.cuh"
 
 namespace astrai {
-namespace fp8 {
+namespace gemm {
 
 // log2 of a compile-time power of two (for the swizzle shifts).
 template <int N, int Acc = 0>
@@ -220,5 +220,5 @@ load_crosswise_direct(T8* tile, const T8* __restrict__ operand, int64_t rows,
     }
 }
 
-}  // namespace fp8
+}  // namespace gemm
 }  // namespace astrai

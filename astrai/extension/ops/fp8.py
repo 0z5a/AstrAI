@@ -63,7 +63,7 @@ def quantize(
     self-cleaned persistent slot (reads zero). None keeps the classic
     fresh-amax return.
     """
-    return get_module("fp8_ops").quantize(
+    return get_module("quantize").quantize(
         x,
         scale,
         _fmt_int(fmt),
@@ -91,7 +91,7 @@ def quantize_dual(
     ``ring_state`` switches on the in-kernel delayed-scaling fold exactly as
     in :func:`quantize`.
     """
-    return get_module("fp8_ops").quantize_dual(
+    return get_module("quantize").quantize_dual(
         x, scale, _fmt_int(fmt), ring_state, hist_idx, fp8_max, pow2_margin
     )
 
@@ -113,7 +113,7 @@ def mm_fp8(
     kernel epilogue in fp32 — no separate elementwise pass. The result is
     BF16; FP8 output is a separate quantize operation.
     """
-    return get_module("fp8_ops").mm_fp8(a, b, scale, trans_a, trans_b, bias)
+    return get_module("quantize").mm_fp8(a, b, scale, trans_a, trans_b, bias)
 
 
 __all__ = ["mm_fp8", "quantize", "quantize_dual"]

@@ -8,21 +8,21 @@
 #include <type_traits>
 
 #include "common/mma.cuh"
-#include "fp8/common.h"
+#include "gemm/common.h"
 #include "load.cuh"
 #include "policy.cuh"
 
 namespace astrai {
-namespace fp8 {
+namespace gemm {
 
 template <typename Policy>
-struct Fp8CollectiveMainloop {
+struct GemmCollectiveMainloop {
     using Traits = typename Policy::Traits;
     using LayoutA = typename Policy::LayoutTagA;
     using LayoutB = typename Policy::LayoutTagB;
-    using Smem = Fp8GemmSmem<Traits, LayoutA, LayoutB>;
+    using Smem = GemmSmem<Traits, LayoutA, LayoutB>;
     static constexpr bool kFastLoop = Policy::kFastLoop;
-    using T8 = std::conditional_t<Traits::kIsE5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
+    using T8 = typename Traits::ElemT;  // operand element type via traits
     static constexpr int kBlockM = Traits::kBlockM;
     static constexpr int kBlockN = Traits::kBlockN;
     static constexpr int kK = Traits::kK;
@@ -34,10 +34,10 @@ struct Fp8CollectiveMainloop {
                   "FP8 GEMM stages must be in [1, 8]");
     // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps, each warp computing
     // kMt x kNt m16n8k32 MMAs. Rings rotate kStages+1 buffers (see
-    // Fp8GemmSmem) — one __syncthreads per k-tile.
+    // GemmSmem) — one __syncthreads per k-tile.
     static constexpr int kMt = Traits::kWarpM / 16;  // 16-row MMA tiles per warp
     static constexpr int kNt = Traits::kWarpN / 8;   // 8-col MMA tiles per warp
-    static constexpr int kSegs = kK / kMmaK;  // mma-sized k segments per tile
+    static constexpr int kSegs = kK / Traits::kMmaK;  // mma-sized k segments
     static constexpr int kARing = Smem::kRingDepth;
     static constexpr int kBRing = Smem::kRingDepth;
     static constexpr int kAStageBytes = kBlockM * kK;
@@ -61,7 +61,7 @@ struct Fp8CollectiveMainloop {
     // small CTA opts in). The verdict is uniform per CTA.
     const bool fast_cta;
 
-    __device__ Fp8CollectiveMainloop(char* smem, const T8* a, const T8* b,
+    __device__ GemmCollectiveMainloop(char* smem, const T8* a, const T8* b,
                                      int64_t m, int64_t n, int64_t k,
                                      int64_t a_ld, int64_t b_ld, int tid,
                                      int2 block)
@@ -332,5 +332,5 @@ struct Fp8CollectiveMainloop {
     }
 };
 
-}  // namespace fp8
+}  // namespace gemm
 }  // namespace astrai

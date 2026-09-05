@@ -5,10 +5,10 @@
 // crosswise-B layouts where grouping was neutral).
 
 namespace astrai {
-namespace fp8 {
+namespace gemm {
 
 template <int kRasterGroup>
-struct Fp8GemmTileScheduler {
+struct GemmTileScheduler {
     static __device__ int2 tile(const uint3& block, const dim3& blocks) {
         if constexpr (kRasterGroup > 0) {
             constexpr int kGroupM = kRasterGroup;
@@ -24,5 +24,5 @@ struct Fp8GemmTileScheduler {
     }
 };
 
-}  // namespace fp8
+}  // namespace gemm
 }  // namespace astrai

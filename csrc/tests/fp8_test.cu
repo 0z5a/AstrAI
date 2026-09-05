@@ -22,9 +22,10 @@ nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/fp8_test.cu -o /tmp/f
 #include <vector>
 
 #include "common/mma.cuh"
-#include "fp8/gemm.cuh"
+#include "gemm/gemm.cuh"
 
-using namespace astrai::fp8;
+using namespace astrai::quant;
+using namespace astrai::gemm;
 
 // ---------------------------------------------------------------------------
 // Part 1: single-kernel BF16 -> FP8 MMA -> BF16 demo (m16n8k32)
@@ -223,7 +224,7 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
     cudaMemcpy(da, qa.data(), qa.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(db, qb.data(), qb.size(), cudaMemcpyHostToDevice);
 
-    FP8Params p = {};
+    GemmParams p = {};
     p.a_ptr = da;
     p.b_ptr = db;
     p.out_ptr = dout;
