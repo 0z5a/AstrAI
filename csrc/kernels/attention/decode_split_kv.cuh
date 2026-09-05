@@ -20,24 +20,11 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     int batch = blockIdx.x / p.kv_head;
     int kv_head = blockIdx.x % p.kv_head;
     int split = blockIdx.z;
-    int group_size = blockDim.y;
-    int q_head = kv_head * group_size + threadIdx.y;
     int lane = threadIdx.x;
     int hd_per_thread = p.head_dim / 32;
 
     const int seq_len = KV::kv_len(p, batch);
     const KVContext kctx = KV::template make_ctx<HEAD_DIM>(p, batch, kv_head);
-
-    // Q: [batch, q_head, q_len=1, head_dim] — stride-based
-    float q_reg[8];
-    int q_off = KV::q_decode_base(p, batch, q_head)
-              + lane * hd_per_thread * p.q_d_stride;
-    for (int i = 0; i < hd_per_thread; i++)
-        q_reg[i] = __bfloat162float(p.q_ptr[q_off + i * p.q_d_stride]);
-
-    int mask_base = batch * p.mask_b_stride + q_head * p.mask_h_stride;
-
-    float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
 
     extern __shared__ __align__(16) bf16 smem[];
     bf16* k_smem = smem;
@@ -49,67 +36,103 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     int ch_begin = split * chunks_per_split;
     int ch_end = min(chunks_total, ch_begin + chunks_per_split);
 
-    for (int ci = ch_begin; ci < ch_end; ci++) {
-        int chunk_start = ci * DC_CHUNK;
-        int this_chunk = min(DC_CHUNK, seq_len - chunk_start);
+    const int group_size = p.q_head / p.kv_head;
 
-        // Load K and V into shared memory (addressing via KV policy;
-        // paged guards empty slots with zero-fill).
-        int total = this_chunk * p.head_dim;
-        for (int i = threadIdx.y * 32 + lane; i < total;
-             i += blockDim.x * blockDim.y) {
-            int s = i / p.head_dim;
-            int d_dim = i % p.head_dim;
-            int kc = chunk_start + s;
-            KVAddr a = KV::template decode_addr<1>(
-                p, kctx, batch, kv_head, kc, d_dim, true, true);
-            k_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
-            v_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
-        }
-        __syncthreads();
+    // GQA group can exceed blockDim.y (capped at 32 for the 1024-thread
+    // limit): loop passes over 32-head slices, mirroring the MMA kernel's
+    // block-level GQA passes.  G <= 32 is a single pass.  All threads of a
+    // pass — including inactive tail threads — must reach the __syncthreads
+    // in the chunk loop, so `active` gates loads/stores, never barriers.
+    // Inactive warps compute on zero Q and never store.
+    for (int g0 = 0; g0 < group_size; g0 += 32) {
+        const int q_head = kv_head * group_size + g0 + threadIdx.y;
+        // Clip at the GROUP boundary, not p.q_head: a partial last pass of
+        // kv_head g must not spill into heads owned by group g+1.
+        const bool active = q_head < (kv_head + 1) * group_size;
+        const int safe_head = active ? q_head : 0;
 
-        for (int s = 0; s < this_chunk; s++) {
-            float partial = 0.0f;
+        // Q: [batch, q_head, q_len=1, head_dim] — stride-based
+        float q_reg[8] = {0.0f};
+        if (active) {
+            int q_off = KV::q_decode_base(p, batch, safe_head)
+                      + lane * hd_per_thread * p.q_d_stride;
             for (int i = 0; i < hd_per_thread; i++)
-                partial += q_reg[i] * __bfloat162float(
-                    k_smem[s * p.head_dim + lane * hd_per_thread + i]);
-            partial = warp_reduce_sum(partial) * p.scale;
-
-            int kv_idx = chunk_start + s;
-            if constexpr (HasMask) {
-                if (!p.mask[mask_base + kv_idx])
-                    partial = -FLT_MAX;
-            }
-            if constexpr (IsCausal) {
-                if (kv_idx >= KV::decode_attend_len(p, batch))
-                    partial = -FLT_MAX;
-            }
-
-            float new_m = fmaxf(m, partial);
-            float alpha = __expf(m - new_m);
-            float beta  = __expf(partial - new_m);
-            d = d * alpha + beta;
-
-            for (int i = 0; i < hd_per_thread; i++) {
-                float vv = __bfloat162float(v_smem[s * p.head_dim + lane * hd_per_thread + i]);
-                acc_reg[i] = fmaf(acc_reg[i], alpha, vv * beta);
-            }
-            m = new_m;
+                q_reg[i] = __bfloat162float(p.q_ptr[q_off + i * p.q_d_stride]);
         }
-        __syncthreads();
-    }
 
-    // ---- write UN-normalised partials for this split ----
-    size_t bh = (size_t)batch * p.q_head + q_head;
-    size_t slot = bh * MAX_SPLITS + split;
-    int d0 = lane * hd_per_thread;
-    for (int i = 0; i < hd_per_thread; i++) {
-        int dd = d0 + i;
-        p.o_part[slot * p.head_dim + dd] = acc_reg[i];
-    }
-    if (lane == 0) {
-        p.ml_part[slot * 2] = m;
-        p.ml_part[slot * 2 + 1] = d;
+        int mask_base = batch * p.mask_b_stride + safe_head * p.mask_h_stride;
+
+        float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
+
+        for (int ci = ch_begin; ci < ch_end; ci++) {
+            int chunk_start = ci * DC_CHUNK;
+            int this_chunk = min(DC_CHUNK, seq_len - chunk_start);
+
+            // Load K and V into shared memory (addressing via KV policy;
+            // paged guards empty slots with zero-fill).
+            int total = this_chunk * p.head_dim;
+            for (int i = threadIdx.y * 32 + lane; i < total;
+                 i += blockDim.x * blockDim.y) {
+                int s = i / p.head_dim;
+                int d_dim = i % p.head_dim;
+                int kc = chunk_start + s;
+                KVAddr a = KV::template decode_addr<1>(
+                    p, kctx, batch, kv_head, kc, d_dim, true, true);
+                k_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
+                v_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
+            }
+            __syncthreads();
+
+            for (int s = 0; s < this_chunk; s++) {
+                float partial = 0.0f;
+                for (int i = 0; i < hd_per_thread; i++)
+                    partial += q_reg[i] * __bfloat162float(
+                        k_smem[s * p.head_dim + lane * hd_per_thread + i]);
+                partial = warp_reduce_sum(partial) * p.scale;
+
+                int kv_idx = chunk_start + s;
+                if constexpr (HasMask) {
+                    if (!p.mask[mask_base + kv_idx])
+                        partial = -FLT_MAX;
+                }
+                if constexpr (IsCausal) {
+                    if (kv_idx >= KV::decode_attend_len(p, batch))
+                        partial = -FLT_MAX;
+                }
+
+                float new_m = fmaxf(m, partial);
+                float alpha = __expf(m - new_m);
+                // Guard: while no valid key has been seen (new_m == -FLT_MAX),
+                // __expf(partial - new_m) == 1 would admit masked keys with
+                // weight 1.  Keeps fully-masked splits at d == 0 so the
+                // combine's `mi <= -FLT_MAX` skip sees a clean empty split.
+                float beta = (new_m == -FLT_MAX) ? 0.0f
+                                                  : __expf(partial - new_m);
+                d = d * alpha + beta;
+
+                for (int i = 0; i < hd_per_thread; i++) {
+                    float vv = __bfloat162float(v_smem[s * p.head_dim + lane * hd_per_thread + i]);
+                    acc_reg[i] = fmaf(acc_reg[i], alpha, vv * beta);
+                }
+                m = new_m;
+            }
+            __syncthreads();
+        }
+
+        // ---- write UN-normalised partials for this split ----
+        if (active) {
+            size_t bh = (size_t)batch * p.q_head + q_head;
+            size_t slot = bh * MAX_SPLITS + split;
+            int d0 = lane * hd_per_thread;
+            for (int i = 0; i < hd_per_thread; i++) {
+                int dd = d0 + i;
+                p.o_part[slot * p.head_dim + dd] = acc_reg[i];
+            }
+            if (lane == 0) {
+                p.ml_part[slot * 2] = m;
+                p.ml_part[slot * 2 + 1] = d;
+            }
+        }
     }
 }
 

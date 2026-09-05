@@ -127,7 +127,11 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
 
             float nm = fmaxf(m, dot);
             float al = __expf(m - nm);
-            float be = __expf(dot - nm);
+            // Guard: while no valid key has been seen (nm == -FLT_MAX),
+            // __expf(dot - nm) == 1 would admit masked keys with weight 1 —
+            // a fully-masked row must stay l == 0 so it outputs 0.  Same
+            // guard as pn0/pn1 in mma_utils.cuh.
+            float be = (nm == -FLT_MAX) ? 0.0f : __expf(dot - nm);
             l = l * al + be;
 
             const bf16* vr = sV + s * HEAD_DIM + gpos * DPT;
