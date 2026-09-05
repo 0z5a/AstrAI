@@ -113,7 +113,7 @@ on_train_begin
         stand_loss = loss_output["loss"] / executor.grad_accum_steps
         executor.backward(stand_loss)
         context.consumed_samples += (
-            context.config.batch_per_device * context.world_size
+            context.config.batch_per_device * context.dp_size
         )
         on_batch_end
 
@@ -131,6 +131,14 @@ on_train_end
 The loss is divided by `grad_accum_steps` before `backward()`, so accumulated gradients sum to the correct mean.
 Strategy metrics are detached and converted to Python `float` values before the
 `LossOutput` is returned; only `LossOutput.loss` remains a differentiable tensor.
+
+With `cp_size > 1`, `TrainContextBuilder` wraps the strategy in `CPStrategy`
+(`astrai/parallel/cp.py`): the same `strategy(batch)` call shards the batch
+across the cp group, runs the strategy's forward/reduction on the local slice,
+and rescales the local token loss to the global mean. Metric and validation
+reductions go through `ParallelTopology.reduce_mean`/`reduce_sum` over the dp
+group — cp peers hold values derived from the same batch, so summing them
+would double-count.
 
 ## Callback Lifecycle
 
