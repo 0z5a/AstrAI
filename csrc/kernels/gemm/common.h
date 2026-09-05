@@ -103,6 +103,18 @@ struct GemmParams {
     int64_t a_batch_stride = 0;
     int64_t b_batch_stride = 0;
     int64_t out_batch_stride = 0;
+
+
+    // Raster order (runtime knob — the plan layer picks it from the
+    // problem's aspect; see plan_gemm):
+    //   >0 — grouped raster, group of `raster` M-tile rows, M walked
+    //        fastest inside a group (consecutive CTAs share one B column
+    //        stripe); best when there are at least as many M tiles as N;
+    //   <0 — mirrored: group of -raster N-tile columns, N walked fastest
+    //        (consecutive CTAs share one A row stripe) — the wide-output
+    //        shapes (e.g. dW = g^T @ x);
+    //    0 — plain N-fastest raster (no grouping).
+    int raster = 8;
 };
 
 }  // namespace gemm

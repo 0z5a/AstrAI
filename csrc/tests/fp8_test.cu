@@ -321,7 +321,7 @@ constexpr bool kCaseFast =
 template <typename LA, typename LB, int kK, int Stages>
 using CasePolicy =
     Fp8GemmPolicy<FP8Format::E4M3, LA, LB, RowMajor, __nv_bfloat16, 128, 128,
-                  64, 32, kK, Stages, 8, false, kCaseFast<LA, LB>>;
+                  64, 32, kK, Stages, false, kCaseFast<LA, LB>>;
 
 // fp8 e4m3 layout case: direct big-CTA policy (dispatch=0), the production
 // NN-swap route (1) or the production NT route (2).
@@ -418,10 +418,10 @@ static bool test_gemm_dtypes() {
     // elements — and the NN swap rewrite).
     using Bf16Big =
         GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, 8, false, true>;
+                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, true>;
     using Bf16Small =
         GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 64, 64, 32, 32, 64, 3, 8, false, true>;
+                   __nv_bfloat16, 64, 64, 32, 32, 64, 3, false, true>;
     printf("bf16 operands (all layouts):\n");
     for (int k : {64, 128, 320, 512}) {
         std::vector<float> ha, hb;
@@ -469,19 +469,19 @@ static bool test_gemm_dtypes() {
     // pinned at k=320 (the plan ladder routes 256x256 to the small CTA).
     using MixedBig =
         GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, 8, false, true>;
+                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, true>;
     using MixedSmall =
         GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 64, 64, 32, 32, 64, 3, 8, false, true>;
+                   __nv_bfloat16, 64, 64, 32, 32, 64, 3, false, true>;
     using MixedTT =
         GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, 8, false, false>;
+                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, false>;
     using MixedTN =
         GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, 8, false, false>;
+                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, false>;
     using MixedNN =
         GemmPolicy<__nv_bfloat16, int8_t, RowMajor, RowMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, 8, false, false>;
+                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, false>;
     printf("W8A16 (bf16 act x int8 weight, all layouts):\n");
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;
@@ -592,7 +592,7 @@ static bool test_gemm_dtypes() {
     // (launch_plan compile-time-reroutes the 128x128 CTA for fat outputs).
     using Fp8F32Out =
         GemmPolicy<__nv_fp8_e4m3, __nv_fp8_e4m3, RowMajor, ColMajor, RowMajor,
-                   float, 128, 64, 32, 32, 64, 2, 8, false, true>;
+                   float, 128, 64, 32, 32, 64, 2, false, true>;
     printf("fp8 operands, fp32 output:\n");
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;

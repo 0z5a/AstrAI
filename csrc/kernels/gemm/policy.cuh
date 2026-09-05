@@ -88,7 +88,7 @@ template <typename ElemA_, typename ElemB_, typename LayoutA_,
           typename OutT_ = __nv_bfloat16,
           int BlockM_ = 128, int BlockN_ = 128,
           int WarpM_ = 64, int WarpN_ = 32, int kK_ = 64, int Stages_ = 2,
-          int GroupRaster_ = 8, bool StreamOut_ = false, bool FastLoop_ = false>
+          bool StreamOut_ = false, bool FastLoop_ = false>
 struct GemmPolicy {
     using Traits =
         GemmTraits<ElemA_, ElemB_, BlockM_, BlockN_, kK_, Stages_, WarpM_, WarpN_>;
@@ -101,7 +101,6 @@ struct GemmPolicy {
     // fp32 (accumulated outputs, e.g. training dX/dW). The epilogue stages
     // and copies out through OutElem<OutT> packing facts.
     using OutT = OutT_;
-    static constexpr int kGroupRaster = GroupRaster_;
     static constexpr bool kStreamOut = StreamOut_;
     static constexpr bool kFastLoop = FastLoop_;
     using Smem = GemmSmem<Traits, LayoutA_, LayoutB_>;
@@ -122,10 +121,10 @@ template <FP8Format Fmt_, typename LayoutA_, typename LayoutB_,
           typename LayoutOut_ = RowMajor, typename OutT_ = __nv_bfloat16,
           int BlockM_ = 128, int BlockN_ = 128,
           int WarpM_ = 64, int WarpN_ = 32, int kK_ = 64, int Stages_ = 2,
-          int GroupRaster_ = 8, bool StreamOut_ = false, bool FastLoop_ = false>
+          bool StreamOut_ = false, bool FastLoop_ = false>
 using Fp8GemmPolicy =
     GemmPolicy<fp8_elem_t<Fmt_>, fp8_elem_t<Fmt_>, LayoutA_, LayoutB_, LayoutOut_,
-               OutT_, BlockM_, BlockN_, WarpM_, WarpN_, kK_, Stages_, GroupRaster_,
+               OutT_, BlockM_, BlockN_, WarpM_, WarpN_, kK_, Stages_,
                StreamOut_, FastLoop_>;
 
 }  // namespace gemm

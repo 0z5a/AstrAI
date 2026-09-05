@@ -52,7 +52,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
                   Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK * sizeof(ElemA) +
                   Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK * sizeof(ElemB),
                   "output tile must fit the reclaimed operand smem");
-    const int2 bn = GemmTileScheduler<Policy::kGroupRaster>::tile(blockIdx, gridDim);
+    const int2 bn = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
     Mainloop mainloop(gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
                       threadIdx.x, bn);
     float acc[Mainloop::kNt][Mainloop::kMt][4] = {};  // [nt][mt][acc]
@@ -117,14 +117,23 @@ inline bool small_cta_padding(int64_t m, int64_t n) {
 }
 
 // Launch configuration — a pure function of the problem (unit-testable
-// without a GPU). Raster order is not a plan field: every canonical layout
-// runs grouped raster; the plain-raster knob stays available through
-// launch_plan's GroupRaster parameter for experiments.
+// without a GPU). Raster order is a plan field picked by the aspect
+// heuristic (plan_raster); a manual p.raster=0 keeps plain raster
+// reachable for experiments.
 struct GemmPlan {
     enum class Cta { kSmall64, kNarrow128x64, kBig128 };
     Cta cta;
     bool small_s3;  // kSmall64 only: cp.async pipeline depth (2 vs 3 stages)
+    int raster;     // GemmParams::raster value this launch runs
 };
+
+// Raster-order heuristic (CUTLASS's rule): walk the dimension with more
+// tiles fastest. Groups chunk the long side, and the swept operand stays
+// L2-resident across a group — consecutive CTAs share one stripe of the
+// other operand. Width stays the measured 8.
+inline int plan_raster(int64_t m, int64_t n, int bm, int bn) {
+    return (m + bm - 1) / bm >= (n + bn - 1) / bn ? 8 : -8;
+}
 
 // crosswise_ops counts the operands taking the direct crosswise load
 // (A ColMajor / B RowMajor storage): 0 = dual-congruous NT, 1 = TN and the
@@ -137,13 +146,16 @@ inline GemmPlan plan_gemm(const GemmParams& p, int crosswise_ops = 0) {
     const int64_t tiles_128 =
         (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
     const auto small = [&](bool s3) {
-        return GemmPlan{GemmPlan::Cta::kSmall64, s3};
+        return GemmPlan{GemmPlan::Cta::kSmall64, s3,
+                        plan_raster(p.m, p.n, 64, 64)};
     };
-    const auto big = [] {
-        return GemmPlan{GemmPlan::Cta::kBig128, false};
+    const auto big = [&]() {
+        return GemmPlan{GemmPlan::Cta::kBig128, false,
+                        plan_raster(p.m, p.n, 128, 128)};
     };
-    const auto narrow = [] {
-        return GemmPlan{GemmPlan::Cta::kNarrow128x64, false};
+    const auto narrow = [&]() {
+        return GemmPlan{GemmPlan::Cta::kNarrow128x64, false,
+                        plan_raster(p.m, p.n, 128, 64)};
     };
     // Padding rules first: predication waste beats any wave-fill effect.
     if (small_cta_padding(p.m, p.n)) return small(crosswise_ops > 0);
@@ -199,11 +211,12 @@ void launch_policy(const GemmParams& p, cudaStream_t stream) {
 // layouts. Narrow: 128x64. Small CTA: 64x64 of 4 warps x 32x32, kK=64,
 // kFastLoop always on. ElemT and OutT are independent template knobs (both
 // flow from the entry dispatch; fp8 formats arrive through fp8_elem_t).
+// Takes the params by value: the plan's raster decision lands in the copy
+// the kernel receives (callers keep theirs).
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
-          typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16,
-          int GroupRaster = 8>
-void launch_plan(const GemmParams& p, const GemmPlan& plan,
-                 cudaStream_t stream) {
+          typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16>
+void launch_plan(GemmParams p, const GemmPlan& plan, cudaStream_t stream) {
+    p.raster = plan.raster;
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
     // The epilogue reclaims the operand rings for the output tile; a fat
@@ -217,13 +230,12 @@ void launch_plan(const GemmParams& p, const GemmPlan& plan,
         if constexpr (kBigReclaim) {
             using Policy =
                 GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           128, 128, 64, 32, 64, 2, GroupRaster, false,
-                           kBigFast>;
+                           128, 128, 64, 32, 64, 2, false, kBigFast>;
             launch_policy<Policy>(p, stream);
         } else {
             using Policy =
                 GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           128, 64, 32, 32, 64, 2, GroupRaster, false, true>;
+                           128, 64, 32, 32, 64, 2, false, true>;
             launch_policy<Policy>(p, stream);
         }
         break;
@@ -231,7 +243,7 @@ void launch_plan(const GemmParams& p, const GemmPlan& plan,
     case GemmPlan::Cta::kNarrow128x64: {
         using Policy =
             GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                       128, 64, 32, 32, 64, 2, GroupRaster, false, true>;
+                       128, 64, 32, 32, 64, 2, false, true>;
         launch_policy<Policy>(p, stream);
         break;
     }
@@ -239,12 +251,12 @@ void launch_plan(const GemmParams& p, const GemmPlan& plan,
         if (plan.small_s3) {
             using Policy =
                 GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           64, 64, 32, 32, 64, 3, GroupRaster, false, true>;
+                           64, 64, 32, 32, 64, 3, false, true>;
             launch_policy<Policy>(p, stream);
         } else {
             using Policy =
                 GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           64, 64, 32, 32, 64, 2, GroupRaster, false, true>;
+                           64, 64, 32, 32, 64, 2, false, true>;
             launch_policy<Policy>(p, stream);
         }
         break;
@@ -307,22 +319,22 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
         // LayoutOut. Mixed never swaps, so its output stays row-major.
         if constexpr (kSymmetric) {
             if (swapped)
-                launch_plan<ElemA, ElemB, ColMajor, ColMajor, ColMajor, OutT, 8>(p, plan, stream);
+                launch_plan<ElemA, ElemB, ColMajor, ColMajor, ColMajor, OutT>(p, plan, stream);
             else
-                launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
+                launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(p, plan, stream);
         } else {
-            launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
+            launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(p, plan, stream);
         }
     } else if (trans_b) {
-        launch_plan<ElemA, ElemB, RowMajor, ColMajor, RowMajor, OutT, 8>(p, plan, stream);
+        launch_plan<ElemA, ElemB, RowMajor, ColMajor, RowMajor, OutT>(p, plan, stream);
     } else if (trans_a) {
-        launch_plan<ElemA, ElemB, ColMajor, RowMajor, RowMajor, OutT, 8>(p, plan, stream);
+        launch_plan<ElemA, ElemB, ColMajor, RowMajor, RowMajor, OutT>(p, plan, stream);
     } else {
         // Dual row-major: mixed only — symmetric NN was rewritten above
         // into the transposed TT kernel (if constexpr keeps this
         // instantiation out of symmetric builds).
         if constexpr (!kSymmetric)
-            launch_plan<ElemA, ElemB, RowMajor, RowMajor, RowMajor, OutT, 8>(p, plan, stream);
+            launch_plan<ElemA, ElemB, RowMajor, RowMajor, RowMajor, OutT>(p, plan, stream);
     }
 }
 
