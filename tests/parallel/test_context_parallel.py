@@ -158,8 +158,8 @@ def test_topology_decomposition():
     with pytest.raises(ValueError, match="divisible"):
         ParallelTopology(world_size=3, cp_size=2)
 
-    with pytest.raises(NotImplementedError, match="tp_size > 1"):
-        ParallelTopology(world_size=2, tp_size=2)
+    with pytest.raises(ValueError, match="divisible"):
+        ParallelTopology(world_size=3, tp_size=2)
 
 
 def _cp_sampler_replication_worker():

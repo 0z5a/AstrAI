@@ -11,11 +11,11 @@ Rank mapping is row-major over ``mesh = (dp, cp, tp)``::
 so the tp dimension is innermost (contiguous ranks — fastest interconnect)
 and each cp group is a contiguous block when ``tp_size == 1``.
 
-``tp_size`` is a reserved dimension: the mesh and rank math support it, but
-tensor-parallel sharding itself is not implemented yet and building a
-topology with ``tp_size > 1`` raises.  ``cp_size == tp_size == 1`` builds a
-trivial topology with no new process groups — byte-identical to the
-pre-topology single-dimension behavior.
+``tp_size > 1`` activates the tp dimension for
+:class:`astrai.parallel.tp.TPState`; combined cp+tp layouts are refused at
+the trainer level until their interaction is verified.  ``cp_size ==
+tp_size == 1`` builds a trivial topology with no new process groups —
+byte-identical to the pre-topology single-dimension behavior.
 """
 
 import logging
@@ -60,11 +60,6 @@ class ParallelTopology:
             raise ValueError(
                 f"cp_size and tp_size must be >= 1, got cp={cp_size} tp={tp_size}"
             )
-        if tp_size > 1:
-            raise NotImplementedError(
-                "tp_size > 1 is reserved but not implemented; tensor-parallel "
-                "sharding has no module support yet"
-            )
         if world_size % (cp_size * tp_size) != 0:
             raise ValueError(
                 f"world_size ({world_size}) must be divisible by "
@@ -85,7 +80,6 @@ class ParallelTopology:
         self.dp_group = None
         self.cp_group = None
         self.tp_group = None
-        self.cp_mesh: Optional[DeviceMesh] = None
 
         # Only materialize a mesh when a parallel dimension is active — the
         # trivial path creates no groups and stays byte-identical to legacy.
@@ -100,7 +94,6 @@ class ParallelTopology:
                 )
                 _MESH_CACHE[key] = mesh
             self.mesh = mesh
-            self.cp_mesh = mesh["cp"] if cp_size > 1 else None
             # Every dimension carries a group once a mesh exists — a
             # singleton where the dimension is inactive.  Consumers can
             # reduce on their own dimension unconditionally, with no
@@ -122,6 +115,14 @@ class ParallelTopology:
                 self.cp_rank,
                 self.tp_rank,
             )
+
+    @property
+    def cp_mesh(self) -> Optional[DeviceMesh]:
+        """1-D ``DeviceMesh`` over the cp dimension, consumed by the
+        experimental ``context_parallel`` API.  ``None`` when the dimension
+        is inactive (no mesh) — :class:`astrai.parallel.cp.CPState` gates
+        on this."""
+        return self.mesh["cp"] if self.mesh is not None else None
 
     @property
     def is_trivial(self) -> bool:

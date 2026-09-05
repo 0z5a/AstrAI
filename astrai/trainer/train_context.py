@@ -22,6 +22,7 @@ from astrai.parallel.executor import (
 )
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.parallel.topology import ParallelTopology, build_topology
+from astrai.parallel.tp import TPState
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import (
     Checkpoint,
@@ -162,11 +163,23 @@ class TrainContextBuilder:
     def build(self) -> TrainContext:
         # Resolve the (dp, cp, tp) rank layout before anything consumes it.
         self._topology = build_topology(
-            cp_size=self.config.cp_size, device_type=self.config.device_type
+            cp_size=self.config.cp_size,
+            tp_size=self.config.tp_size,
+            device_type=self.config.device_type,
         )
+        if self._topology.tp_size > 1:
+            self._validate_tp()
 
         # Resolve persisted state.
         preloaded_state = self._load_preloaded_state()
+        if (
+            self._topology.tp_size > 1
+            and str(preloaded_state.model_config.get("ffn_type", "mlp")) == "moe"
+        ):
+            raise NotImplementedError(
+                "tp_size > 1 does not support MoE yet: expert dispatch and "
+                "the per-token aux loss assume full-feature router inputs"
+            )
 
         # Build the core training components and restore their persisted state.
         executor = self._create_executor()
@@ -186,10 +199,19 @@ class TrainContextBuilder:
 
     def _create_executor(self) -> BaseExecutor:
         cfg = self.config
+        kwargs = dict(cfg.executor_kwargs)
+        if self._topology is not None and self._topology.tp_size > 1:
+            # Gradient sync must span the dp dimension only: tp peers hold
+            # different weight shards, and a world-group default would
+            # all-reduce unrelated shards together.
+            if cfg.dp_mode == "ddp":
+                kwargs.setdefault("process_group", self._topology.dp_group)
+            elif cfg.dp_mode == "fsdp":
+                kwargs.setdefault("mesh", self._topology.mesh["dp"])
         return ExecutorFactory.create(
             cfg.dp_mode,
             grad_accum_steps=cfg.grad_accum_steps,
-            **cfg.executor_kwargs,
+            **kwargs,
         )
 
     def _load_preloaded_state(self) -> _PreloadedState:
@@ -275,6 +297,13 @@ class TrainContextBuilder:
                         result.missing_keys[:3],
                         result.unexpected_keys[:3],
                     )
+            if self._topology.tp_size > 1:
+                # Shard after the full weights are in and before the
+                # executor wraps/optimize: the shards are the parameters the
+                # optimizer and FSDP/DDP see from here on.  The context exits
+                # immediately by design — TPState.shard never restores.
+                with TPState(self._topology).shard(model):
+                    pass
             return model
 
         def after_wrap(model):
@@ -401,6 +430,21 @@ class TrainContextBuilder:
             # the shard entry and the loss rescale.
             context.strategy = CPStrategy(context.strategy, cp_state)
         return kwargs
+
+    def _validate_tp(self) -> None:
+        """Guard the tensor-parallel support surface at build time."""
+        cfg = self.config
+        if cfg.cp_size > 1:
+            raise NotImplementedError(
+                "cp_size > 1 combined with tp_size > 1 is not verified yet: "
+                "the ring-attention patch and head-sharded projections "
+                "interact on the SDPA inputs"
+            )
+        if cfg.lora is not None:
+            raise NotImplementedError(
+                "tp_size > 1 does not support LoRA yet: the LoRALinear "
+                "wrapper bypasses the sharded Linear forward"
+            )
 
     def _validate_cp(self, context: TrainContext) -> None:
         """Guard the context-parallel support surface at build time."""

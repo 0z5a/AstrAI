@@ -54,8 +54,9 @@ class TrainConfig(BaseConfig):
         persistent_workers (bool): Keep DataLoader workers alive between epochs. Defaults to False.
         pin_memory (bool): Pin memory for dataloader. Defaults to False.
         collate_fn (Optional[Callable[[List[Any]], Any]]): Collate function for dataloader (e.g. dpo_collate_fn). Defaults to None.
-        dp_size (int): Data-parallel replicas; total training processes (``nprocs``) are derived as ``dp_size * cp_size``. Defaults to 1.
+        dp_size (int): Data-parallel replicas; total training processes (``nprocs``) are derived as ``dp_size * cp_size * tp_size``. Defaults to 1.
         cp_size (int): Context-parallel group size: shards the sequence across contiguous ranks (seq pretraining, torch-native attention only). Defaults to 1.
+        tp_size (int): Tensor-parallel group size: shards Linear projections over features (attention heads / ffn channels) using the default plan over the standard module layout. Defaults to 1.
         dp_mode (str): Data-parallel gradient-sync strategy: none, ddp, fsdp. Defaults to "none".
         backend (str): Distributed training backend. Defaults to "nccl".
         master_addr (str): Master address for distributed training. Defaults to "localhost".
@@ -112,6 +113,7 @@ class TrainConfig(BaseConfig):
 
     dp_size: int = 1
     cp_size: int = 1
+    tp_size: int = 1
     dp_mode: str = "none"
     backend: str = "nccl"
     master_addr: str = "localhost"
@@ -160,19 +162,25 @@ class TrainConfig(BaseConfig):
 
     @property
     def nprocs(self) -> int:
-        """Total training processes: dp_size x cp_size (tp stays reserved).
+        """Total training processes: dp_size x cp_size x tp_size.
 
         The world size follows from the parallelism degrees the user
         configures, not the other way around — the sampler shards data over
         dp replicas only, so every batch-scaling formula wants dp_size, and
         divisibility by cp_size holds by construction.
         """
-        return self.dp_size * self.cp_size
+        return self.dp_size * self.cp_size * self.tp_size
 
     @field_validator("cp_size")
     def _validate_cp_size(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"cp_size must be >= 1, got {v}")
+        return v
+
+    @field_validator("tp_size")
+    def _validate_tp_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"tp_size must be >= 1, got {v}")
         return v
 
     @field_validator("backend")
