@@ -21,6 +21,7 @@ nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/fp8_test.cu -o /tmp/f
 #include <type_traits>
 #include <vector>
 
+#include "common/launch.cuh"
 #include "common/mma.cuh"
 #include "gemm/gemm.cuh"
 
@@ -145,6 +146,7 @@ static bool test_single_mma() {
                           cudaMemcpyHostToDevice));
 
     fused_bf16_fp8_mma_kernel<<<1, 32>>>(d_a, d_b, d_out, scale_a, scale_b);
+    ASTRAI_LAUNCH_CHECK();
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(output.data(), d_out, output.size() * sizeof(bf16),
                           cudaMemcpyDeviceToHost));
@@ -240,6 +242,7 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
     naive_gemm_ref<<<dim3((n + 31) / 32, (m + 31) / 32), dim3(32, 32)>>>(
         da, db, d_ref, m, n, k, a_ld, b_ld,
         !std::is_same_v<LA, ColMajor>, !std::is_same_v<LB, ColMajor>);
+    ASTRAI_LAUNCH_CHECK();
     std::vector<float> href((size_t)m * n);
     cudaMemcpy(href.data(), d_ref, href.size() * 4, cudaMemcpyDeviceToHost);
     cudaFree(d_ref);

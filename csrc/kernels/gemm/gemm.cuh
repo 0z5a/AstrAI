@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "common/cp_async.cuh"
+#include "common/launch.cuh"
 #include "epilogue.cuh"
 #include "quantize/common.h"
 #include "gemm/common.h"
@@ -99,6 +100,7 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
         }
     }
     Kernel<<<grid, block, smem_bytes, stream>>>(args...);
+    ASTRAI_LAUNCH_CHECK();
 }
 
 // Padding-driven small-CTA rule: m or n <= 64 wastes half a 128-row CTA's

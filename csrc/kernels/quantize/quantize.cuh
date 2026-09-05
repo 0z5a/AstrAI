@@ -10,6 +10,7 @@
 #include <cstdint>
 
 #include "common.h"
+#include "common/launch.cuh"
 #include "common/reduce.cuh"
 
 namespace astrai {
@@ -296,6 +297,7 @@ void launch_fp8_quantize(const QuantParams& p, cudaStream_t stream) {
         const dim3 grid((p.cols + 63) / 64, (p.rows + 31) / 32);
         if (grid.x == 0 || grid.y == 0) return;
         fp8_quantize_tiled_kernel<Fmt, InT><<<grid, dim3(32, 8), 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
     } else {
         constexpr int kThreads = 256;
         constexpr int kVecElems = quant_in_traits<InT>::kVecElems;
@@ -303,6 +305,7 @@ void launch_fp8_quantize(const QuantParams& p, cudaStream_t stream) {
         // vectors plus the tail block covers tiny and misaligned tensors.
         const int64_t blocks = 1 + p.total / (kVecElems * kThreads);
         fp8_quantize_kernel<Fmt, InT><<<blocks, kThreads, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
     }
 }
 

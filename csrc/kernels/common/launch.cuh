@@ -1,10 +1,11 @@
-// Launch-and-check macros — pure CUDA, no torch, so out-of-tree harnesses
-// (tile sweeps, csrc/tests) share the exact production launch discipline.
+// Launch-and-check macros — pure C, no torch/C++ deps, so out-of-tree
+// harnesses (tile sweeps, csrc/tests) share the exact production launch
+// discipline. A failed launch prints one line to stderr and exits the
+// process — a rejected configuration must fail loudly instead of silently
+// measuring as a constant ~3us no-op (the tile-sweep lesson).
 //
-// Include order matters for overrides: define ASTRAI_LAUNCH_FAIL before
-// including this header (directly or via another kernel header) to swap
-// print+abort for a throwing check, as the torch entry units do with
-// C10_CUDA_CHECK.
+// Define ASTRAI_LAUNCH_FAIL before including this header (directly or via
+// another kernel header) to override the failure path.
 
 #pragma once
 
@@ -12,15 +13,16 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 
-
+#ifndef ASTRAI_LAUNCH_FAIL
 #define ASTRAI_LAUNCH_FAIL(err, what)                                        \
     do {                                                                     \
         std::fprintf(                                                        \
             stderr, "ASTRAI: %s failed: %s (%s:%d)\n", what,                 \
             cudaGetErrorString(err), __FILE__, __LINE__                      \
         );                                                                   \
-        std::abort();                                                        \
+        std::exit(EXIT_FAILURE);                                             \
     } while (0)
+#endif
 
 #define ASTRAI_CUDA_CHECK(expr)                                              \
     do {                                                                     \

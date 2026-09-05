@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include "common/launch.cuh"
 #include "layout_policies.cuh"
 #include "prefill_split_q.cuh"
 #include "decode_split_kv.cuh"
@@ -103,6 +104,7 @@ struct PrefillLauncherMMA {
         dim3 block(Traits::NUM_THREADS);
         attn_prefill_split_q_mma_kernel<Traits, QSchedule, KV, IsCausal, HasMask>
             <<<grid, block, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
     }
 };
 #endif
@@ -118,6 +120,7 @@ struct PrefillLauncherScalar {
         attn_prefill_split_q_kernel_t<HEAD_DIM, QSchedule, KV, G, ROWS, P_BC,
                                       IsCausal, HasMask>
             <<<grid, block, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
     }
 };
 
@@ -182,6 +185,7 @@ struct DecodeLauncherMMA {
         dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
         attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask>
             <<<grid, 32, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
     }
 };
 #endif
@@ -198,12 +202,13 @@ struct DecodeLauncherScalar {
         int g = min(group_size, 32);  // cap at 32 to respect 1024-thread limit
         dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
         dim3 block(32, g);
-        cudaFuncSetAttribute(
+        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(
             attn_decode_split_kv_kernel<HEAD_DIM, KV, IsCausal, HasMask>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem);
+            smem));
         attn_decode_split_kv_kernel<HEAD_DIM, KV, IsCausal, HasMask>
             <<<grid, block, smem, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
     }
 };
 
@@ -223,6 +228,7 @@ static inline void dispatch_decode(AttentionParams<bf16>& p, cudaStream_t stream
 #endif
 
     attn_decode_combine_kernel<ContigKV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
+    ASTRAI_LAUNCH_CHECK();
 }
 
 template <int HEAD_DIM>
@@ -241,6 +247,7 @@ static inline void dispatch_paged_decode(AttentionParams<bf16>& p, cudaStream_t 
 #endif
 
     attn_decode_combine_kernel<PagedKV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
+    ASTRAI_LAUNCH_CHECK();
 }
 
 }  // namespace attention
