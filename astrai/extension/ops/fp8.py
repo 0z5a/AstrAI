@@ -113,7 +113,7 @@ def mm_fp8(
     kernel epilogue in fp32 — no separate elementwise pass. The result is
     BF16; FP8 output is a separate quantize operation.
     """
-    return get_module("quantize").mm_fp8(a, b, scale, trans_a, trans_b, bias)
+    return get_module("gemm").mm_fp8(a, b, scale, trans_a, trans_b, bias)
 
 
 __all__ = ["mm_fp8", "quantize", "quantize_dual"]

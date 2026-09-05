@@ -12,7 +12,8 @@ and FP8 GEMM. These are built when `nvcc` is available and CUDA is detected.
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
-| `quantize` | `quantize/quantize.cu` | FP8 quantization + tensor-core GEMM (sm_89+) |
+| `quantize` | `quantize/quantize.cu` | FP8 quantization kernels (sm_89+) |
+| `gemm` | `gemm/gemm.cu` | FP8 tensor-core GEMM binding + the family's kernel-policy instantiation unit (sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -466,7 +467,7 @@ csrc/
 │   ├── quantize/                        # quantize family (no torch)
 │   │   ├── common.h                  #   FP8Format enum, QuantLayout, QuantParams POD
 │   │   └── quantize.cuh              #   quantize kernels: vectorized + 32×32-tile transpose (out_layout 0/1/2)
-│   ├── gemm/                         # GEMM family, dtype-neutral (module quantize binds quantize/ + gemm/)
+│   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
 │   │   ├── policy.cuh                #     smem budget / occupancy hint + Fp8GemmPolicy

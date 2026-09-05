@@ -74,6 +74,8 @@ set(KERNEL_SRCS
 if(ASTRAI_CUDA_ARCH GREATER_EQUAL 89)
     list(APPEND KERNEL_NAMES quantize)
     list(APPEND KERNEL_SRCS quantize/quantize.cu)
+    list(APPEND KERNEL_NAMES gemm)
+    list(APPEND KERNEL_SRCS gemm/gemm.cu)
 else()
     message(WARNING
         "FP8 operator disabled: ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "

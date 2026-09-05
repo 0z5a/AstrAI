@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -53,13 +52,6 @@ struct gemm_elem_traits<__nv_bfloat16> {
     static constexpr bool kNeedsDequant = false;
 };
 
-template <>
-struct gemm_elem_traits<__half> {
-    static constexpr int kBytes = 2;
-    static constexpr int kMmaK = 16;  // mma.sync.m16n8k16 (sm_80+)
-    static constexpr bool kNeedsDequant = false;
-};
-
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
 // through the kernels; each kernel touches only the fields it needs.
 struct GemmParams {
@@ -77,19 +69,18 @@ struct GemmParams {
     // problem and the epilogue scatters D[row][col] to out[col * p.m + row]
     // in the caller's [M][N] buffer. Zero in the plain orientation.
     int out_transposed = 0;
-    int m, n, k;  // int covers LLM shapes; kernels promote to int64
 
     // Batched (bmm) geometry: grid.z steps these element strides (0
     // broadcasts the operand across batches).
     int batch = 1;
+    // Single extents and row strides fit int for LLM shapes; kernels
+    // promote to int64. Batch strides are extent *products* (k*m, k*n,
+    // m*n) and can cross the int32 boundary on large bmms.
+    int m, n, k;
+    int a_ld, b_ld;
     int64_t a_batch_stride = 0;
     int64_t b_batch_stride = 0;
     int64_t out_batch_stride = 0;
-
-    // Physical leading dims (row strides) of A and B; the binding packs
-    // them so the kernel reads each buffer naturally or transposed per the
-    // LayoutA/LayoutB tags.
-    int a_ld, b_ld;
 };
 
 }  // namespace gemm
