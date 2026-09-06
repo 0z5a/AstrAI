@@ -53,13 +53,13 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
                 (int64_t)blockIdx.z * p.out_batch_stride;
 
     static_assert(Mainloop::kBlockM * Mainloop::kBlockN * sizeof(OutT) <=
-                  Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK * sizeof(ElemA) +
-                  Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK * sizeof(ElemB),
+                  Mainloop::RingA::Layout::kTotalBytes +
+                  Mainloop::RingB::Layout::kTotalBytes,
                   "output tile must fit the reclaimed operand smem");
     const int2 bn = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
     Mainloop mainloop(gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
                       threadIdx.x, bn);
-    typename Mainloop::AccT acc[Mainloop::kNt][Mainloop::kMt][4] = {};  // [nt][mt][acc]
+    typename Mainloop::AccTensor acc = {};  // C cells on the (mt, nt) grid
     mainloop.prologue();
     mainloop.accumulate(acc);
     // Drain the pipeline before the epilogue reclaims the operand rings.
@@ -99,18 +99,16 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
                 (int64_t)blockIdx.z * p.out_batch_stride;
 
     static_assert(Mainloop::kBlockM * Mainloop::kBlockN * sizeof(OutT) <=
-                  Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK *
-                      sizeof(typename Mainloop::ElemA) +
-                  Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK *
-                      sizeof(typename Mainloop::ElemB),
+                  Mainloop::RingA::Layout::kTotalBytes +
+                  Mainloop::RingB::Layout::kTotalBytes,
                   "output tile must fit the reclaimed operand smem");
 
     GemmTmaContext<kRank3A, kRank3B> tma;
     tma.map_a = &tma_a;
     tma.map_b = &tma_b;
     tma.bars = reinterpret_cast<uint64_t*>(
-        smem + Mainloop::kARing * Mainloop::kAStageBytes +
-               Mainloop::kBRing * Mainloop::kBStageBytes);
+        smem + Mainloop::RingA::Layout::kTotalBytes +
+               Mainloop::RingB::Layout::kTotalBytes);
     tma.depth = Mainloop::kARing;
     tma.z = blockIdx.z;
     if (threadIdx.x == 0) {
@@ -125,7 +123,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     Mainloop mainloop(smem, static_cast<const typename Mainloop::ElemA*>(p.a_ptr),
                       static_cast<const typename Mainloop::ElemB*>(p.b_ptr), p.m,
                       p.n, p.k, p.a_ld, p.b_ld, threadIdx.x, bn);
-    typename Mainloop::AccT acc[Mainloop::kNt][Mainloop::kMt][4] = {};
+    typename Mainloop::AccTensor acc = {};
     mainloop.prologue(tma);
     mainloop.accumulate(acc, tma);
     // No cp.async groups on this path; the CTA join alone releases the

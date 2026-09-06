@@ -9,6 +9,7 @@
 
 #include "common/mma.cuh"
 #include "common/tma.cuh"
+#include "common/tensor.cuh"
 #include "gemm/common.h"
 #include "load.cuh"
 #include "policy.cuh"
@@ -101,12 +102,6 @@ struct GemmCollectiveMainloop {
     static constexpr int kSegs = kK / Traits::kMmaK;  // mma-sized k segments
     static constexpr int kARing = Smem::kRingDepth;
     static constexpr int kBRing = Smem::kRingDepth;
-    // Stage strides in BOTH units: ElemT* staging arithmetic uses elements,
-    // the smem split / byte-address carries / PrefetchCarry use bytes.
-    static constexpr int kAStageElems = kBlockM * kK;
-    static constexpr int kBStageElems = kBlockN * kK;
-    static constexpr int kAStageBytes = kAStageElems * (int)sizeof(ElemA);
-    static constexpr int kBStageBytes = kBStageElems * (int)sizeof(ElemB);
 
     // Staging layouts, cute-style: one declared instance per staged tile —
     // composition(Swizzle, Layout<Shape, Stride>) over the row-major 16B-
@@ -136,8 +131,42 @@ struct GemmCollectiveMainloop {
                             log2_const<kChunksBT>::value>{},
                     Layout<Shape<kK, kChunksBT>, Stride<kChunksBT, 1>>{}));
 
-    ElemA* const a_base;
-    ElemB* const b_base;
+    // One ring type per operand (common/tensor.cuh): the staged-layout
+    // instance each path addresses — the trans tile when the 16-bit
+    // crosswise staging is active, the canonical tile otherwise (congruous
+    // staging, 8-bit crosswise-direct staging and the dequant fragment
+    // readers all address the canonical tile; both stagings hold the same
+    // element count, so one ring stride serves either). The rings carry
+    // the slot rotation, the stage/ring byte budget and the typed tile
+    // view — the smem carve and every stage consumer below read them off
+    // the type instead of re-deriving strides.
+    using StagedLayoutA =
+        std::conditional_t<kTransA, SmemLayoutATrans, SmemLayoutA>;
+    using StagedLayoutB =
+        std::conditional_t<kTransB, SmemLayoutBTrans, SmemLayoutB>;
+    using RingA = Tensor<PtrEngine<ElemA>, RingLayout<StagedLayoutA, kARing>>;
+    using RingB = Tensor<PtrEngine<ElemB>, RingLayout<StagedLayoutB, kBRing>>;
+    using TileA = Tensor<PtrEngine<ElemA>, StagedLayoutA>;
+    using TileB = Tensor<PtrEngine<ElemB>, StagedLayoutB>;
+
+    // The warp's accumulator: typed C cells on a (mt, nt) grid — indexing
+    // by semantic coordinates all the way to the mma (no pointer decay at
+    // the fma seam; the epilogue reads the same cells).
+    using AccTensor =
+        Tensor<ArrayEngine<typename MmaOp::CFrag, kMt * kNt>,
+               CellLayout<kNt>>;
+
+    // Stage strides in BOTH units (aliases of the ring facts: the smem
+    // carve and the byte-address read carries measure against them).
+    static constexpr int kAStageElems =
+        RingA::Layout::kStageBytes / (int)sizeof(ElemA);
+    static constexpr int kAStageBytes = RingA::Layout::kStageBytes;
+    static constexpr int kBStageElems =
+        RingB::Layout::kStageBytes / (int)sizeof(ElemB);
+    static constexpr int kBStageBytes = RingB::Layout::kStageBytes;
+
+    const RingA ring_a;  // A's stage ring; B carves right past its end
+    const RingB ring_b;
     const ElemA* const a;
     const ElemB* const b;
     const int64_t m, n, k, a_ld, b_ld;
@@ -154,12 +183,13 @@ struct GemmCollectiveMainloop {
     // small CTA opts in). The verdict is uniform per CTA.
     const bool fast_cta;
 
-    __device__ GemmCollectiveMainloop(char* smem, 
-                                     const ElemA* a, const ElemB* b, 
+    __device__ GemmCollectiveMainloop(char* smem,
+                                     const ElemA* a, const ElemB* b,
                                      int64_t m, int64_t n, int64_t k, int64_t a_ld, int64_t b_ld,
                                      int tid, int2 block)
-        : a_base(reinterpret_cast<ElemA*>(smem)),
-          b_base(reinterpret_cast<ElemB*>(smem + kARing * kAStageBytes)),
+        : ring_a(astrai::make_ring<ElemA, StagedLayoutA, kARing>(smem)),
+          ring_b(astrai::make_ring<ElemB, StagedLayoutB, kBRing>(
+              smem + RingA::Layout::kTotalBytes)),
           a(a), b(b), m(m), n(n), k(k), a_ld(a_ld), b_ld(b_ld), tid(tid),
           block_m(block.x), block_n(block.y),
           warp_m((tid >> 5) / Traits::kWarpsN),
@@ -174,51 +204,46 @@ struct GemmCollectiveMainloop {
                    ((reinterpret_cast<uintptr_t>(b) | (uint64_t)b_ld) & 15) == 0 &&
                    (k % kK) == 0) {}
 
-    // Stage-slot helpers: rings rotate one slot per k-tile, so callers
-    // either compute the slot from the tile index (prologue, generic loop)
-    // or carry an advancing pointer (steady-state fast loop).
-    __device__ __forceinline__ ElemA* a_stage_of(int64_t tile) const {
-        return a_base + (size_t)(tile % kARing) * kAStageElems;
-    }
-    __device__ __forceinline__ ElemB* b_stage_of(int64_t tile) const {
-        return b_base + (size_t)(tile % kBRing) * kBStageElems;
-    }
     // Asynchronous loads for one k-tile: congruous operands cp.async into
     // the canonical rings, crosswise 16-bit operands cp.async into the
     // transposed rings (kFast selects the predication-free interior copy —
     // trans staging qualifies: it is cp.async like the congruous path).
-    // Called after the post-compute barrier, alongside the commit.
+    // The tiles arrive typed by each ring's staged layout, so a mismatched
+    // loader/tile pairing is a compile error. Called after the
+    // post-compute barrier, alongside the commit.
     template <bool kFast = false>
-    __device__ __forceinline__ void load_async(ElemA* a_stage, ElemB* b_stage,
-                                               int64_t k_base) const {
+    __device__ __forceinline__ void
+    load_async(TileA a_tile, TileB b_tile,
+               int64_t k_base) const {
         if constexpr (kTransA)
-            load_operand_tile_trans<SmemLayoutATrans, ElemA, kCtaThreads,
-                                    kFast>(a_stage, a, m, k, a_ld, tid,
+            load_operand_tile_trans<StagedLayoutA, ElemA, kCtaThreads,
+                                    kFast>(a_tile, a, m, k, a_ld, tid,
                                            k_base, block_m * kBlockM);
         else if constexpr (!kDirectA)
-            load_operand_tile<SmemLayoutA, ElemA, kCtaThreads, kFast>(
-                a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+            load_operand_tile<StagedLayoutA, ElemA, kCtaThreads, kFast>(
+                a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (kTransB)
-            load_operand_tile_trans<SmemLayoutBTrans, ElemB, kCtaThreads,
-                                    kFast>(b_stage, b, n, k, b_ld, tid,
+            load_operand_tile_trans<StagedLayoutB, ElemB, kCtaThreads,
+                                    kFast>(b_tile, b, n, k, b_ld, tid,
                                            k_base, block_n * kBlockN);
         else if constexpr (!kDirectB)
-            load_operand_tile<SmemLayoutB, ElemB, kCtaThreads, kFast>(
-                b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+            load_operand_tile<StagedLayoutB, ElemB, kCtaThreads, kFast>(
+                b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
     // Synchronous direct loads for one k-tile (8-bit crosswise operands
     // only — 16-bit crosswise rides the async trans staging above). In the
     // steady state this runs right after barrier 1, so the LDG latency and
     // the PRMT transpose overlap the MMA phase instead of stalling the
     // inter-barrier window.
-    __device__ __forceinline__ void load_direct(ElemA* a_stage, ElemB* b_stage,
-                                                int64_t k_base) const {
+    __device__ __forceinline__ void
+    load_direct(TileA a_tile, TileB b_tile,
+                int64_t k_base) const {
         if constexpr (kSyncA)
-            load_crosswise_direct<SmemLayoutA, ElemA, kCtaThreads>(
-                a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+            load_crosswise_direct<StagedLayoutA, ElemA, kCtaThreads>(
+                a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (kSyncB)
-            load_crosswise_direct<SmemLayoutB, ElemB, kCtaThreads>(
-                b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+            load_crosswise_direct<StagedLayoutB, ElemB, kCtaThreads>(
+                b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
 
     // One TMA stage issue: gate on the slot's empty barrier (its previous
@@ -239,10 +264,12 @@ struct GemmCollectiveMainloop {
         mbarrier_arrive_expect_tx(
             bar, (uint32_t)((uint64_t)kAStageBytes + kBStageBytes));
         const int x = (int)((int64_t)tile * kK);
-        astrai::tma_load<kRank3A>(tma.map_a, bar, a_stage_of(tile),
+        astrai::tma_load<kRank3A>(tma.map_a, bar,
+                                  astrai::stage_of(ring_a, tile).engine.ptr,
                                   x * (int)sizeof(ElemA),
                                   (int)(block_m * kBlockM), tma.z);
-        astrai::tma_load<kRank3B>(tma.map_b, bar, b_stage_of(tile),
+        astrai::tma_load<kRank3B>(tma.map_b, bar,
+                                  astrai::stage_of(ring_b, tile).engine.ptr,
                                   x * (int)sizeof(ElemB),
                                   (int)(block_n * kBlockN), tma.z);
     }
@@ -271,12 +298,15 @@ struct GemmCollectiveMainloop {
         for (int stage = 0; stage < kStages; ++stage) {
             if (stage < tile_count) {
                 if (fast_cta)
-                    load_async<true>(a_stage_of(stage), b_stage_of(stage),
+                    load_async<true>(astrai::stage_of(ring_a, stage),
+                                    astrai::stage_of(ring_b, stage),
                                      (int64_t)stage * kK);
                 else
-                    load_async(a_stage_of(stage), b_stage_of(stage),
+                    load_async(astrai::stage_of(ring_a, stage),
+                               astrai::stage_of(ring_b, stage),
                                (int64_t)stage * kK);
-                load_direct(a_stage_of(stage), b_stage_of(stage),
+                load_direct(astrai::stage_of(ring_a, stage),
+                            astrai::stage_of(ring_b, stage),
                             (int64_t)stage * kK);
             }
             pipe.producer_commit();
@@ -295,7 +325,7 @@ struct GemmCollectiveMainloop {
     template <bool kFast, bool kTma = false, bool kRank3A = false,
               bool kRank3B = false>
     __device__ __forceinline__ void
-    run_loop(AccT acc[kNt][kMt][4],
+    run_loop(AccTensor& acc,
              const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         const astrai::PipelineSync<kStages> pipe;
         const int lane = tid & 31;
@@ -306,24 +336,18 @@ struct GemmCollectiveMainloop {
         // in, advanced one stage per iteration with an equality wrap —
         // replaces the per-k-tile (tile % ring) * stage_bytes
         // recomputation (a UIMAD.WIDE magic-division ladder in SASS).
-        // The carry rides the staging geometry of its operand: the trans
-        // layout when the 16-bit crosswise path is active, the canonical
-        // one otherwise.
-        using CarryLayoutA =
-            std::conditional_t<kTransA, SmemLayoutATrans, SmemLayoutA>;
-        using CarryLayoutB =
-            std::conditional_t<kTransB, SmemLayoutBTrans, SmemLayoutB>;
-        PrefetchCarry<!kSyncA && !kTma, ElemA, CarryLayoutA, kCtaThreads, kTransA>
-            carry_a(a_base, kARing, kAStageBytes, a, a_ld, block_m * kBlockM,
-                    tid, kStages);
-        PrefetchCarry<!kSyncB && !kTma, ElemB, CarryLayoutB, kCtaThreads, kTransB>
-            carry_b(b_base, kBRing, kBStageBytes, b, b_ld, block_n * kBlockN,
-                    tid, kStages);
-        const unsigned a_rd0 = __cvta_generic_to_shared(a_base) +
+        // The carries ride the operand rings, so each one already carries
+        // its staging geometry (trans layout on the 16-bit crosswise path,
+        // canonical otherwise).
+        PrefetchCarry<!kSyncA && !kTma, RingA, kCtaThreads, kTransA>
+            carry_a(ring_a, a, a_ld, block_m * kBlockM, tid, kStages);
+        PrefetchCarry<!kSyncB && !kTma, RingB, kCtaThreads, kTransB>
+            carry_b(ring_b, b, b_ld, block_n * kBlockN, tid, kStages);
+        const unsigned a_rd0 = __cvta_generic_to_shared(ring_a.engine.ptr) +
                                (kTransA ? a_trans_lane_off(lane)
                                         : a_lane_off(lane));
         const unsigned b_rd0 =
-            __cvta_generic_to_shared(b_base) +
+            __cvta_generic_to_shared(ring_b.engine.ptr) +
             (kTransB ? b_trans_lane_off(lane)
                      : (kPairB ? b4_lane_off(lane) : b_lane_off(lane)));
         const unsigned a_rd_end = a_rd0 + (unsigned)(kARing * kAStageBytes);
@@ -357,8 +381,8 @@ struct GemmCollectiveMainloop {
             if (prefetch && tid == 0)
                 tma_issue_stage(tma, (int)(tile_index + kStages));
         } else if (prefetch) {
-            load_direct(a_stage_of(tile_index + kStages),
-                        b_stage_of(tile_index + kStages),
+            load_direct(astrai::stage_of(ring_a, tile_index + kStages),
+                        astrai::stage_of(ring_b, tile_index + kStages),
                         (tile_index + kStages) * kK);
         }
 
@@ -381,18 +405,25 @@ struct GemmCollectiveMainloop {
         // kNt ldmatrix.x2 (B) + kMt ldmatrix.x4 (A) feed kMt*kNt*2 mma.sync
         // per k_seg — 0.5 load instructions per MMA. B fragments
         // double-buffer across k_segs; kPairB folds the two adjacent nt
-        // fragments of one pair into a single x4 (see b4_lane_off).
-        const ElemB* b_stage = b_stage_of(tile_index);
-        unsigned b_frag[2][kNt][2];
-        unsigned b_frag4[2][kNt / 2][4];
-        load_b_frags_at(b_frag[0][0], b_frag4[0][0], b_stage, 0, b_seg[0],
-                        lane);
+        // fragments of one pair into a single x4 (see b4_lane_off). All
+        // fragment arrays hold typed cells (MmaOp::BFrag / BFragPair): the
+        // loads fill cells, the mma consumes cells by reference — fragment
+        // pointer arithmetic has no spelling left.
+        typename MmaOp::BFrag b_frag[2][kNt];
+        BFragPair b_frag4[2][kNt / 2];
+        // This tile's staged tensors, hoisted out of the k_seg/mt loops:
+        // the slot pick is a tile-index modulo and must not re-enter the
+        // MMA phase (it regressed the dequant readers' register budget).
+        const auto b_tile = astrai::stage_of(ring_b, tile_index);
+        load_b_frags_at(b_frag[0], b_frag4[0], b_tile, 0,
+                        b_seg[0], lane);
 #pragma unroll
         for (int k_seg = 0; k_seg < kSegs; ++k_seg) {
             const int bcur = k_seg & 1, bnext = bcur ^ 1;
             if (k_seg + 1 < kSegs)
-                load_b_frags_at(b_frag[bnext][0], b_frag4[bnext][0], b_stage,
-                                k_seg + 1, b_seg[k_seg + 1], lane);
+                load_b_frags_at(b_frag[bnext], b_frag4[bnext], b_tile,
+                                k_seg + 1,
+                                b_seg[k_seg + 1], lane);
         // Software-pipelined A fragments: the ldmatrix.x4 for row mt+1 is
         // issued before the MMAs consuming row mt, so the LDS latency hides
         // behind tensor-pipe work. Costs 4 extra registers. Trans tiles
@@ -400,12 +431,13 @@ struct GemmCollectiveMainloop {
         // the 16-row byte stride. Dequantized A (W8A8) fills all m-row
         // fragments upfront through the scalar pair reads — no ldmatrix on
         // 8-bit storage — so its LDS latency overlaps the first MMA batch.
-        unsigned a_frag[kMt + 1][4];
+        typename MmaOp::AFrag a_frag[kMt + 1];
         if constexpr (kDequantA) {
-            const ElemA* a_stage = a_stage_of(tile_index);
+            const auto a_tile = astrai::stage_of(ring_a, tile_index);
 #pragma unroll
             for (int mt = 0; mt < kMt; ++mt)
-                load_a_frags_at(a_frag[mt], a_stage, k_seg, mt, lane);
+                load_a_frags_at(a_frag[mt], a_tile, k_seg,
+                                mt, lane);
         } else if constexpr (kTransA) {
             astrai::ldmatrix_x4_lane<true>(a_frag[0], a_seg[k_seg]);
         } else {
@@ -426,10 +458,13 @@ struct GemmCollectiveMainloop {
             }
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
-                const unsigned* bops =
-                    kPairB ? (b_frag4[bcur][nt >> 1] + (nt & 1) * 2)
-                           : b_frag[bcur][nt];
-                MmaOp::fma(acc[nt][mt], a_frag[mt], bops, acc[nt][mt]);
+                if constexpr (kPairB)
+                    MmaOp::fma(*acc(mt, nt), a_frag[mt],
+                               b_frag4[bcur][nt >> 1].cell(nt & 1),
+                               *acc(mt, nt));
+                else
+                    MmaOp::fma(*acc(mt, nt), a_frag[mt],
+                               b_frag[bcur][nt], *acc(mt, nt));
             }
         }
         // Next tile's LDGSTS chunks inside the MMA phase: A's after the
@@ -443,8 +478,8 @@ struct GemmCollectiveMainloop {
         // loads run after the MMA phase.
         if constexpr (!kFast && !kTma) {
             if (prefetch) {
-                load_async(a_stage_of(tile_index + kStages),
-                           b_stage_of(tile_index + kStages),
+                load_async(astrai::stage_of(ring_a, tile_index + kStages),
+                           astrai::stage_of(ring_b, tile_index + kStages),
                            (tile_index + kStages) * kK);
             }
         }
@@ -462,15 +497,15 @@ struct GemmCollectiveMainloop {
         b_rd += (unsigned)kBStageBytes;
         if (b_rd == b_rd_end) b_rd = b_rd0;
         if constexpr (kFast && !kTma) {
-            carry_a.advance(kAStageBytes);
-            carry_b.advance(kBStageBytes);
+            carry_a.advance();
+            carry_b.advance();
         }
         }
     }
 
     template <bool kRank3A = false, bool kRank3B = false>
     __device__ __forceinline__ void
-    accumulate(AccT acc[kNt][kMt][4],
+    accumulate(AccTensor& acc,
                const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         if constexpr (kUseTma) {
             run_loop<false, true, kRank3A, kRank3B>(acc, tma);
@@ -485,6 +520,17 @@ struct GemmCollectiveMainloop {
     }
 
   private:
+    // One ldmatrix.x4 payload covering two adjacent n8 B fragments (the
+    // kPairB fold): cell(i) selects the fragment mma tile nt consumes —
+    // the register pairing lives in the type, not in (+ (nt & 1) * 2)
+    // pointer arithmetic at the fma seam. (Not "half": nvcc reserves
+    // that name for the fp16 type.)
+    struct BFragPair : ArrayEngine<unsigned, 4> {
+        __device__ __forceinline__ typename MmaOp::BFrag cell(int i) const {
+            return {storage[2 * i + 0], storage[2 * i + 1]};
+        }
+    };
+
     // Per-lane ldmatrix fragment addressing (base-pair scheme, mirrored
     // from the cuBLAS SASS; derivation in the design notes): one base
     // register per operand per k_seg, every fragment offset an LDSM
@@ -492,8 +538,8 @@ struct GemmCollectiveMainloop {
     // Per-lane stage-relative BYTE offsets: the ldmatrix *_lane primitives
     // take raw shared-memory byte addresses, so every offset below is
     // element math scaled by sizeof(ElemT). The swizzle chunk term comes
-    // from the declared staging layouts — the same instances tile_at
-    // applies, so the mirror can never drift.
+    // from the declared staging layouts — the same instances the staged
+    // tiles apply, so the mirror can never drift.
     static constexpr int kChunkElems = 16 / sizeof(ElemA);
     static constexpr int kChunkShift = log2_const<kChunkElems>::value;
     __device__ __forceinline__ unsigned a_lane_off(int lane) const {
@@ -581,27 +627,29 @@ struct GemmCollectiveMainloop {
     }
 
     // One k_seg's B-fragment loads, shared by the initial fill and the
-    // double-buffer's next-seg fill. frag2/frag4 are the flat bases of one
-    // b_frag / b_frag4 buffer (the unused one is never touched).
+    // double-buffer's next-seg fill. frag2/frag4 are one b_frag /
+    // b_frag4 buffer (the unused one is never touched) — typed cells, so
+    // every load addresses a whole fragment.
     __device__ __forceinline__ void
-    load_b_frags(unsigned* frag2, unsigned* frag4, unsigned seg_base) const {
+    load_b_frags(typename MmaOp::BFrag (&frag2)[kNt],
+                 BFragPair (&frag4)[kNt / 2],
+                 unsigned seg_base) const {
 #pragma unroll
         for (int p = 0; p < kNt / 2; ++p) {
             if constexpr (kTransB) {
                 // Trans tile: each x2.trans reads 16 k rows at one n
                 // chunk; the nt windows step by one XORed chunk.
                 astrai::ldmatrix_x2_lane<true>(
-                    frag2 + p * 4, seg_base ^ (unsigned)(p * 2 * kNtXor));
+                    frag2[p * 2], seg_base ^ (unsigned)(p * 2 * kNtXor));
                 astrai::ldmatrix_x2_lane<true>(
-                    frag2 + p * 4 + 2,
+                    frag2[p * 2 + 1],
                     seg_base ^ (unsigned)((p * 2 + 1) * kNtXor));
             } else if constexpr (kPairB) {
-                astrai::ldmatrix_x4_lane(frag4 + p * 4,
-                                         seg_base + p * kPairStep);
+                astrai::ldmatrix_x4_lane(frag4[p], seg_base + p * kPairStep);
             } else {
-                astrai::ldmatrix_x2_lane(frag2 + p * 4,
+                astrai::ldmatrix_x2_lane(frag2[p * 2],
                                          seg_base + p * 2 * kNtStep);
-                astrai::ldmatrix_x2_lane(frag2 + p * 4 + 2,
+                astrai::ldmatrix_x2_lane(frag2[p * 2 + 1],
                                          seg_base + (p * 2 + 1) * kNtStep);
             }
         }
@@ -611,24 +659,22 @@ struct GemmCollectiveMainloop {
     // m16n8k16 B fragment of lane l (quad q = l>>2, r = l&3) holds
     // tile[n = b_row0 + nt*8 + q][k = k_seg*16 + {2r, 2r+1, 2r+8, 2r+9}]
     // as two packed pairs — both u16 reads land inside one 16B swizzle
-    // chunk, so plain tile_at addressing works. The LOP3 expansion
+    // chunk, so plain staged-tile addressing works. The LOP3 expansion
     // (dequant.cuh) is exact for the int8 range.
     __device__ __forceinline__ void
-    load_b_frags_at(unsigned* frag2, unsigned* frag4, const ElemB* stage,
-                    int k_seg, unsigned seg_base, int lane) const {
+    load_b_frags_at(typename MmaOp::BFrag (&frag2)[kNt],
+                    BFragPair (&frag4)[kNt / 2],
+                    TileB stage, int k_seg, unsigned seg_base,
+                    int lane) const {
         if constexpr (kDequantB) {
             const int q = lane >> 2, c2 = (lane & 3) * 2;
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const int row = b_row0 + nt * 8 + q;
-                const ElemB* p0 =
-                    tile_at<SmemLayoutB>(stage, row, k_seg * 16 + c2);
-                const ElemB* p1 =
-                    tile_at<SmemLayoutB>(stage, row, k_seg * 16 + c2 + 8);
-                frag2[nt * 2 + 0] =
-                    DequantB::pair(*(const unsigned short*)p0);
-                frag2[nt * 2 + 1] =
-                    DequantB::pair(*(const unsigned short*)p1);
+                const ElemB* p0 = stage(row, k_seg * 16 + c2);
+                const ElemB* p1 = stage(row, k_seg * 16 + c2 + 8);
+                frag2[nt][0] = DequantB::pair(*(const unsigned short*)p0);
+                frag2[nt][1] = DequantB::pair(*(const unsigned short*)p1);
             }
         } else {
             load_b_frags(frag2, frag4, seg_base);
@@ -642,12 +688,12 @@ struct GemmCollectiveMainloop {
     // the non-dequant path produces (see a_trans_lane_off's note). Both
     // u16 reads of one row stay inside one swizzle chunk (c2 <= 6).
     __device__ __forceinline__ void
-    load_a_frags_at(unsigned frag[4], const ElemA* stage, int k_seg, int mt,
-                    int lane) const {
+    load_a_frags_at(typename MmaOp::AFrag& frag, TileA stage, int k_seg,
+                    int mt, int lane) const {
         const int q = lane >> 2, c2 = (lane & 3) * 2;
         const int row = a_row0 + mt * 16 + q;
-        const ElemA* p0 = tile_at<SmemLayoutA>(stage, row, k_seg * 16 + c2);
-        const ElemA* p8 = tile_at<SmemLayoutA>(stage, row + 8, k_seg * 16 + c2);
+        const ElemA* p0 = stage(row, k_seg * 16 + c2);
+        const ElemA* p8 = stage(row + 8, k_seg * 16 + c2);
         frag[0] = DequantA::pair(*(const unsigned short*)p0);
         frag[1] = DequantA::pair(*(const unsigned short*)p8);
         frag[2] = DequantA::pair(*(const unsigned short*)(p0 + 8));

@@ -34,6 +34,7 @@
 #include <type_traits>
 
 #include "shape.cuh"
+#include "tensor.cuh"
 
 #define DEVICE_FORCEINLINE static __device__ __forceinline__
 
@@ -81,6 +82,14 @@ struct MmaShapeFor<__nv_fp8_e5m2> {
 
 // --- <A, B, Shape> -> the mma op -------------------------------------------
 // Primary template undefined: only the instantiated cells below exist.
+//
+// Each cell names its register cells as types (humming's ARegisters /
+// BRegisters / CRegisters role): AFrag/BFrag/CFrag over common/tensor.cuh's
+// ArrayEngine (cute's Array). The typed fma overload takes fragments BY
+// REFERENCE, so
+// fragment tensors index by semantic coordinates and no pointer arithmetic
+// survives at the mma seam; the raw-array fma stays the core (the
+// attention kernels' mma_sync and the C tests build on it).
 template <typename A, typename B, typename ShapeT>
 struct MmaOp;
 
@@ -90,6 +99,13 @@ struct MmaOp<__nv_bfloat16, __nv_bfloat16, Shape<16, 8, 16>> {
     static constexpr int kARegs = 4;  // A fragment: 4x b32
     static constexpr int kBRegs = 2;  // B fragment: 2x b32
     static constexpr int kCRegs = 4;  // C/D fragment: 4x f32
+    using AFrag = ArrayEngine<unsigned, kARegs>;
+    using BFrag = ArrayEngine<unsigned, kBRegs>;
+    using CFrag = ArrayEngine<AccT, kCRegs>;
+    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
+                                const CFrag& c) {
+        fma(d.storage, a.storage, b.storage, c.storage);
+    }
     DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
                                        const unsigned b[2], const float c[4]) {
         static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 800,
@@ -109,6 +125,13 @@ struct MmaOp<__nv_fp8_e4m3, __nv_fp8_e4m3, Shape<16, 8, 32>> {
     static constexpr int kARegs = 4;
     static constexpr int kBRegs = 2;
     static constexpr int kCRegs = 4;
+    using AFrag = ArrayEngine<unsigned, kARegs>;
+    using BFrag = ArrayEngine<unsigned, kBRegs>;
+    using CFrag = ArrayEngine<AccT, kCRegs>;
+    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
+                                const CFrag& c) {
+        fma(d.storage, a.storage, b.storage, c.storage);
+    }
     DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
                                        const unsigned b[2], const float c[4]) {
         static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 890,
@@ -128,6 +151,13 @@ struct MmaOp<__nv_fp8_e5m2, __nv_fp8_e5m2, Shape<16, 8, 32>> {
     static constexpr int kARegs = 4;
     static constexpr int kBRegs = 2;
     static constexpr int kCRegs = 4;
+    using AFrag = ArrayEngine<unsigned, kARegs>;
+    using BFrag = ArrayEngine<unsigned, kBRegs>;
+    using CFrag = ArrayEngine<AccT, kCRegs>;
+    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
+                                const CFrag& c) {
+        fma(d.storage, a.storage, b.storage, c.storage);
+    }
     DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
                                        const unsigned b[2], const float c[4]) {
         static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 890,
@@ -147,6 +177,13 @@ struct MmaOp<int8_t, int8_t, Shape<16, 8, 32>> {
     static constexpr int kARegs = 4;
     static constexpr int kBRegs = 2;
     static constexpr int kCRegs = 4;
+    using AFrag = ArrayEngine<unsigned, kARegs>;
+    using BFrag = ArrayEngine<unsigned, kBRegs>;
+    using CFrag = ArrayEngine<AccT, kCRegs>;
+    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
+                                const CFrag& c) {
+        fma(d.storage, a.storage, b.storage, c.storage);
+    }
     DEVICE_FORCEINLINE void fma(int32_t d[4], const unsigned a[4],
                                        const unsigned b[2], const int32_t c[4]) {
         static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 800,
@@ -249,6 +286,21 @@ DEVICE_FORCEINLINE void ldmatrix_x4_lane(unsigned r[4],
                      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                      : "r"(addr));
     }
+}
+
+// Array-typed cores: the register cell IS the destination — fragment
+// tensors hand their cells straight to the instruction, no decayed pointers
+// at the seam. Same instructions, forwarding wrappers.
+template <bool Trans = false>
+DEVICE_FORCEINLINE void ldmatrix_x2_lane(ArrayEngine<unsigned, 2>& f,
+                                         unsigned addr) {
+    ldmatrix_x2_lane<Trans>(f.storage, addr);
+}
+
+template <bool Trans = false>
+DEVICE_FORCEINLINE void ldmatrix_x4_lane(ArrayEngine<unsigned, 4>& f,
+                                         unsigned addr) {
+    ldmatrix_x4_lane<Trans>(f.storage, addr);
 }
 
 // Common-pointer wrappers over the per-lane cores (see the x2/x4 matrix

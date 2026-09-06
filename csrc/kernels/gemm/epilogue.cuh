@@ -5,6 +5,7 @@
 // (common/swizzle.cuh) shared with the operand staging in load.cuh.
 
 #include "common/swizzle.cuh"
+#include "common/tensor.cuh"
 #include "gemm/common.h"
 #include "policy.cuh"
 
@@ -56,8 +57,12 @@ struct GemmCollectiveEpilogue {
     static constexpr int kBlockN = Traits::kBlockN;
     static constexpr int kMt = Traits::kWarpM / 16;
     static constexpr int kNt = Traits::kWarpN / 8;
+    // The mainloop's accumulator type (typed C cells on the (mt, nt)
+    // grid) — the epilogue reads the same cells the mma wrote.
+    using AccTensor =
+        Tensor<ArrayEngine<typename Traits::MmaOp::CFrag, kMt * kNt>,
+               CellLayout<kNt>>;
 
-    OutT* const tile_out;
     const float output_scale;
     const float* const a_scale;  // [a_scale_m] row factor or null
     const float* const b_scale;  // [b_scale_n] col factor or null
@@ -79,13 +84,16 @@ struct GemmCollectiveEpilogue {
     using OutLayout = decltype(
         composition(Swizzle<kRowBits, kRowBits>{},
                     Layout<Shape<kRowRows, kRowChunks>, Stride<kRowChunks, 1>>{}));
+    // The staged output tile, typed by OutLayout (common/tensor.cuh):
+    // operator()(row, elem) is the swizzled address.
+    const Tensor<PtrEngine<OutT>, OutLayout> out_tile;
     const int row_elems, row_chunks;
     const int warp_m, warp_n, group, thread_in_group;
     const int64_t block_m, block_n;
 
     __device__ GemmCollectiveEpilogue(char* smem, const GemmParams& p,
                                      int64_t block_m, int64_t block_n, int tid)
-        : tile_out(reinterpret_cast<OutT*>(smem)),
+        : out_tile{reinterpret_cast<OutT*>(smem)},
           output_scale((p.a_scale && p.a_scale_m == 0 ? *p.a_scale : 1.0f) *
                        (p.b_scale && p.b_scale_n == 0 ? *p.b_scale : 1.0f)),
           a_scale(p.a_scale_m > 0 ? p.a_scale : nullptr),
@@ -101,15 +109,15 @@ struct GemmCollectiveEpilogue {
           block_m(block_m), block_n(block_n) {}
 
     // Swizzled address of one 16B chunk (row r, chunk c) of the staged
-    // tile — the OutLayout instance. Plain orientation: kBlockM rows of
-    // kBlockN elems; out-transposed (swap dispatch): rows and row length
-    // trade places. Both row-chunk counts are powers of two, keeping the
-    // XOR swizzle well-defined.
+    // tile — the OutLayout instance riding out_tile. Plain orientation:
+    // kBlockM rows of kBlockN elems; out-transposed (swap dispatch): rows
+    // and row length trade places. Both row-chunk counts are powers of
+    // two, keeping the XOR swizzle well-defined.
     __device__ __forceinline__ OutT* out_chunk(int r, int c) const {
-        return tile_out + (size_t)OutLayout{}(r, c) * OE::kChunkElems;
+        return out_tile(r, c << OE::kChunkShift);
     }
     __device__ __forceinline__ OutT* out_elem(int r, int v) const {
-        return out_chunk(r, v >> OE::kChunkShift) + (v & (OE::kChunkElems - 1));
+        return out_tile(r, v);
     }
 
     // Scatter the accumulators into the staging tile: the operand rings are
@@ -118,7 +126,7 @@ struct GemmCollectiveEpilogue {
     // tile coherent, then the whole CTA copies it out in fully-coalesced
     // 16B chunks. The 16B-chunk XOR swizzle keeps both the scatter and the
     // gather conflict-free.
-    __device__ __forceinline__ void stage(AccT acc[kNt][kMt][4]) const {
+    __device__ __forceinline__ void stage(AccTensor& acc) const {
         // Fused bias: added to the fp32 accumulator before the single bf16
         // rounding. The per-lane loads are L1 broadcasts; rows past the
         // edge skip the load (their smem slots never copy out). Under
@@ -143,25 +151,25 @@ struct GemmCollectiveEpilogue {
                 for (int mt = 0; mt < kMt; ++mt) {
                     const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
                     // Per-row activation scale: D-row == kernel row here.
-                    const float rfac = a_scale && bias_row0 + r0 < m 
+                    const float rfac = a_scale && bias_row0 + r0 < m
                             ? a_scale[bias_row0 + r0]
                             : 1.0f;
                     const float rfac8 = a_scale && bias_row0 + r0 + 8 < m
-                            ? a_scale[bias_row0 + r0 + 8]
-                            : 1.0f;
-                    const AccT* tile_acc = acc[nt][mt];
+                        ? a_scale[bias_row0 + r0 + 8]
+                        : 1.0f;
+                    const auto& cell = *acc(mt, nt);
                     // Two bf16x2 stores per accumulator tile: rows g and
                     // g+8 of the m16n8 output, columns tig*2/tig*2+1 inside
                     // one 16B chunk.
                     const int off = col & (OE::kChunkElems - 1);  // in-chunk elems
                     *reinterpret_cast<typename OE::T2*>(
                         out_chunk(r0, col >> OE::kChunkShift) + off) =
-                        OE::pack2((float)tile_acc[0] * output_scale * rfac * c0 + b0,
-                                  (float)tile_acc[1] * output_scale * rfac * c1 + b1);
+                        OE::pack2((float)cell[0] * output_scale * rfac * c0 + b0,
+                                  (float)cell[1] * output_scale * rfac * c1 + b1);
                     *reinterpret_cast<typename OE::T2*>(
                         out_chunk(r0 + 8, col >> OE::kChunkShift) + off) =
-                        OE::pack2((float)tile_acc[2] * output_scale * rfac8 * c0 + b0,
-                                  (float)tile_acc[3] * output_scale * rfac8 * c1 + b1);
+                        OE::pack2((float)cell[2] * output_scale * rfac8 * c0 + b0,
+                                  (float)cell[3] * output_scale * rfac8 * c1 + b1);
                 }
             }
         } else {
@@ -197,11 +205,11 @@ struct GemmCollectiveEpilogue {
                     const float r1f = a_scale && bias_col0 + col + 1 < n
                         ? a_scale[bias_col0 + col + 1]
                         : 1.0f;
-                    const AccT* tile_acc = acc[nt][mt];
-                    *out_elem(col, r0) = OE::cvt((float)tile_acc[0] * output_scale * r0f * c + b);
-                    *out_elem(col + 1, r0) = OE::cvt((float)tile_acc[1] * output_scale * r1f * c + b);
-                    *out_elem(col, r0 + 8) =  OE::cvt((float)tile_acc[2] * output_scale * r0f * c8 + b8);
-                    *out_elem(col + 1, r0 + 8) = OE::cvt((float)tile_acc[3] * output_scale * r1f * c8 + b8);
+                    const auto& cell = *acc(mt, nt);
+                    *out_elem(col, r0) = OE::cvt((float)cell[0] * output_scale * r0f * c + b);
+                    *out_elem(col + 1, r0) = OE::cvt((float)cell[1] * output_scale * r1f * c + b);
+                    *out_elem(col, r0 + 8) =  OE::cvt((float)cell[2] * output_scale * r0f * c8 + b8);
+                    *out_elem(col + 1, r0 + 8) = OE::cvt((float)cell[3] * output_scale * r1f * c8 + b8);
                 }
             }
         }
@@ -250,7 +258,7 @@ struct GemmCollectiveEpilogue {
         }
     }
 
-    __device__ __forceinline__ void run(AccT acc[kNt][kMt][4], OutT* out) {
+    __device__ __forceinline__ void run(AccTensor& acc, OutT* out) {
         stage(acc);
         __syncthreads();
         store(out);

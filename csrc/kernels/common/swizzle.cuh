@@ -80,24 +80,46 @@ struct Layout<Shape<Rows, Chunks>, Stride<RowStride, ColStride>> {
 };
 
 // composition(Swizzle, Layout) — cute's composed-layout idiom: the swizzle
-// bijection applied to the layout's offset. The two-coordinate view the
-// folded lane-offset mirrors use is chunk' = chunk ^ (row >> kRowShift) &
-// kMask — the row-field bits that land on the chunk field.
+// bijection applied to the layout's offset. operator() is the composition
+// pre-folded to its closed two-coordinate form, chunk' = (chunk & ~kMask) |
+// ((chunk ^ (row >> kRowShift)) & kMask): for every chunk < kChunks the
+// swizzle's XOR value ((L >> Shift) & kMask — row bits) is narrower than
+// the chunk field, so it never spills into the row term — identical map to
+// Swz{}(LayT{}(row, chunk)), but the XOR derives from the row ALONE and
+// computes in parallel with the chunk extraction instead of serializing
+// behind the row*stride IMAD (CUTLASS 2.x's iterators apply the swizzle
+// the same way). Tensors dispatch to this op (common/tensor.cuh); nothing
+// re-derives strides at call sites.
 template <typename SwzT, typename LayT>
 struct ComposedLayout {
     using Swz = SwzT;
     using Lay = LayT;
+    // 16B-chunk domain flag for the tensor layer (common/tensor.cuh):
+    // the (Bits, Shift) pair stays dtype-blind; the tensor scales.
+    static constexpr bool kChunkUnit = true;
     static constexpr int kRows = LayT::kRows;
     static constexpr int kChunks = LayT::kChunks;
     static_assert(kChunks >= 1 && (kChunks & (kChunks - 1)) == 0,
                   "the XOR swizzle needs a power-of-two chunk count");
+    static_assert(SwzT::kBits <= log2_const<kChunks>::value,
+                  "closed two-coordinate form needs the XOR inside the "
+                  "chunk field");
     static constexpr int kRowShift = SwzT::kShift - log2_const<kChunks>::value;
     static_assert(kRowShift >= 0,
                   "swizzle source must start inside the row field");
     static constexpr uint32_t kMask = SwzT::kMask;
+    // The layout's chunk-map op: the swizzled chunk coordinate alone (the
+    // row term stays out — the tensor scales the two terms separately in
+    // 32-bit so the address chain never widens to 64-bit).
+    __device__ __forceinline__ uint32_t chunk_of(uint32_t row,
+                                                 uint32_t chunk) const {
+        const uint32_t swz = (row >> kRowShift) & kMask;
+        return (chunk & ~kMask) | ((chunk ^ swz) & kMask);
+    }
+    // Linear chunk index: row-major layout over the swizzled chunk.
     __device__ __forceinline__ uint32_t operator()(uint32_t row,
                                                    uint32_t chunk) const {
-        return SwzT{}(LayT{}(row, chunk));
+        return row * (uint32_t)kChunks + chunk_of(row, chunk);
     }
 };
 

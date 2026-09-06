@@ -54,7 +54,7 @@ layered directory:
 | `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK — adding a dtype = one specialization), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
 | `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBig128x128` / `TileBigFast` / `TileNarrow128x64` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter); `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
-| `gemm/load.cuh` | operand loaders: one `tile_at<SmemLayout>` over the tile's declared layout (`common/swizzle.cuh`), congruous cp.async staging (predicated via runtime src-size zfill + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
+| `gemm/load.cuh` | operand loaders: typed staged tiles (`SmemTile<StagedLayout>`, `common/tensor.cuh`) over the tile's declared layout (`common/swizzle.cuh`), congruous cp.async staging (predicated via runtime src-size zfill + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
 | `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16 smem scatter + coalesced copy-out |
@@ -91,7 +91,8 @@ the mainloop, `OutLayout` in the epilogue. The family instances: congruous
 2B staging is the TMA 128B mode `<3,3>`, 1B is `<2,3>`, 16-bit trans
 staging swizzles chunks by the k-row bits (custom `<log2(min(chunks,8)),
 log2(chunks)>`), and the epilogue output keeps its row-width mode.
-`tile_at<SmemLayout>` applies the composed layout — the 16B chunk index
+The tensor layer dispatches to `ComposedLayout::operator()` (the closed
+two-coordinate form) — the 16B chunk index
 XORed with row bits at `[3, 3+log2(kChunks))` — so a warp's ldmatrix
 fragment load (8 consecutive rows × 16B) hits all 32 banks exactly once
 (the unswizzled row word-stride is `kK/4` words, so rows `r` and
@@ -108,6 +109,26 @@ source size (CUTLASS 2.x's zfill iterators): `cp.async.cg [dst], [src],
 contract extent — 0 reads nothing and the hardware zero-fills the 16B
 chunk, a partial size covers the k tail, and only a misaligned base
 (non-16B `ld`) keeps the scalar-copy fallback.
+
+**Tensor vocabulary (common/tensor.cuh, cute's Tensor<Engine, Layout>).**
+ONE tensor type — storage and addressing are its two template parameters,
+and every operation dispatches to a layout op; use sites spell
+`Tensor<...>` directly, with no second names. Engines: `PtrEngine<T>`
+(smem/gmem) and `ArrayEngine<T, N>` (cute's Array — the mma fragment
+cells; `MmaOp` names them `AFrag`/`BFrag`/`CFrag`, and the typed
+`fma`/`ldmatrix` overloads take them by reference so the registers stay
+in place). Layouts: the `ComposedLayout` instances of `common/swizzle.cuh`
+(16B chunk grids, dtype-blind; `chunk_of` is the swizzled-chunk op, and
+the tensor scales the row/chunk terms separately in 32-bit — a 64-bit
+multiply on the address chain regressed the crosswise readers' registers)
+plus `RingLayout` (slot rotation over a per-stage grid) and `CellLayout`
+(element-unit (m, n) grid). A staged tile is
+`Tensor<PtrEngine<Elem>, ComposedLayout>`; the stage ring adds the slot
+dimension (`make_ring` / `stage_of`, cute's make_tensor / slicing); the
+warp's accumulator is `Tensor<ArrayEngine<CFrag>, CellLayout>` —
+`*acc(mt, nt)` at the fma seam, the kPairB x4 fold is `BFragPair::cell`,
+so `+ (nt & 1) * 2`-style pointer arithmetic has no spelling left. Every
+method folds away at -O3.
 
 **Fragment addressing (base-pair scheme).** One base register per operand
 per k_seg, every fragment offset an LDSM immediate. The closure works
@@ -671,9 +692,10 @@ csrc/
 ├── kernels/
 │   ├── common/                       # cross-family pure-CUDA helpers (no torch)
 │   │   ├── device.cuh                #   DeviceFacts geometry query (sms / smem opt-in / L2) + ArchSm80..100 generation tags with feature gates (fp8 mma / TMA / mbarrier / wgmma) and the runtime arch_dispatch ladder; fp8 capability helpers live in quantize/common.h, the torch-bound gate in quantize/checks.h
-│   │   ├── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2/x4<T>
+│   │   ├── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2/x4<T> + typed fragment cells (AFrag/BFrag/CFrag, by-reference fma/ldmatrix overloads)
 │   │   ├── pipeline.cuh              #   async data-movement vocabulary, one header: raw cp.async 16B emitters (fixed + runtime-src-size zfill) and mbarrier PTX, plus PipelineSync (sm_80/89 wait_group+syncthreads) / PipelineMbarrier (sm_90+) stage pipelines
 │   │   ├── swizzle.cuh               #   staging-layout vocabulary: Swizzle/Shape/Stride/Layout + composition(Swizzle, Layout) in 16B-chunk units; per-tile SmemLayout types declared by the gemm collectives
+│   │   ├── tensor.cuh                #   tensor vocabulary, cute's Tensor<Engine, Layout>: PtrEngine/ArrayEngine, RingLayout/CellLayout, one Tensor type spelled directly (make_ring constructs the stage ring, stage_of slices a slot)
 │   │   └── reduce.cuh                #   warp_reduce_max, atomic_max_float
 │   ├── attention/                    # attention family (module names keep the attn_* prefix)
 │   │   ├── common.h                  #   AttentionParams POD, TensorLayout enum (BHLD/BLHD)
@@ -700,7 +722,7 @@ csrc/
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
 │   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy
-│   │   ├── load.cuh                  #     operand loaders (tile_at over declared layouts, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
+│   │   ├── load.cuh                  #     operand loaders (typed staged tiles over declared layouts, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
 │   │   ├── scheduler.cuh             #     grouped/plain raster mapping
 │   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
 │   │   ├── epilogue.cuh              #     fused bias + scale folding + bf16 scatter + copy-out
@@ -715,4 +737,4 @@ csrc/
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-> Document Update Time: 2026-08-29
+> Document Update Time: 2026-09-07

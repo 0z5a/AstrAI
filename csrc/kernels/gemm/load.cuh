@@ -7,43 +7,18 @@
 
 #include "common/pipeline.cuh"
 #include "common/swizzle.cuh"
+#include "common/tensor.cuh"
 #include "gemm/common.h"
 #include "policy.cuh"
 
 namespace astrai {
 namespace gemm {
 
-// Swizzled address inside a staged tile: the two-coordinate view of the
-// tile's declared layout (common/swizzle.cuh) — chunk' = chunk ^
-// (row >> kRowShift), the XOR confined to kMask's bits so chunks wider
-// than the mask (trans tiles with 16 chunks: kBlockM=128) keep their
-// un-swizzled high bits instead of aliasing onto the low half-row. The
-// XOR term derives from the row alone, so it
-// computes in parallel with the chunk extraction instead of serializing
-// behind the row*stride IMAD (CUTLASS 2.x's iterators apply the swizzle
-// the same way). The layout type carries the tile's whole geometry, so
-// the congruous [rows][K] staging and the crosswise trans [K][rows]
-// staging are two layout instances of this one helper. The swizzle keeps
-// a warp's ldmatrix fragment load (8 consecutive rows x 16B) hitting all
-// 32 banks exactly once, while chunks stay contiguous so cp.async staging
-// is unaffected. All chunk math is in BYTES (16B granularity); element
-// counts enter only through kChunkElems = 16 / sizeof(T).
-template <typename SmemLayout, typename ElemT>
-__device__ __forceinline__ ElemT* tile_at(ElemT* tile, int row, int col) {
-    constexpr int kChunkElems = 16 / sizeof(ElemT);  // elems per 16B chunk
-    constexpr int kChunkShift = log2_const<kChunkElems>::value;
-    constexpr unsigned kChunkHi = ~SmemLayout::kMask;
-    const unsigned chunk = (unsigned)(col >> kChunkShift);
-    const unsigned swz = ((unsigned)row >> SmemLayout::kRowShift) &
-                         SmemLayout::kMask;
-    return tile + row * (SmemLayout::kChunks * kChunkElems) +
-           (((chunk & kChunkHi) | ((chunk ^ swz) & SmemLayout::kMask))
-                << kChunkShift) +
-           (unsigned)(col & (kChunkElems - 1));
-}
-
 // Stage-load a CONGRUOUS operand (contract-contiguous storage — the only
-// cp.async-able shape) into the flat [rows * K] swizzled tile. kInterior
+// cp.async-able shape) into the flat [rows * K] swizzled tile. The tile
+// arrives as a Tensor over the staged layout (common/tensor.cuh): the
+// swizzled address is the tensor's operator(), dispatching to the
+// layout op. kInterior
 // drops all predication: valid only for a fully interior CTA (whole rows,
 // 16B-aligned base|ld, k_base + K <= contract); the address math then folds
 // to one immediate XOR per chunk (see the design notes). Crosswise operands
@@ -52,7 +27,8 @@ __device__ __forceinline__ ElemT* tile_at(ElemT* tile, int row, int col) {
 template <typename SmemLayout, typename ElemT,
           int kThreads, bool kInterior = false>
 __device__ __forceinline__ void
-load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
+load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
+                  const ElemT* __restrict__ operand, int64_t rows,
                   int64_t contract, int64_t ld, int tid, int64_t k_base,
                   int64_t block_row) {
     constexpr int kChunkElems = 16 / sizeof(ElemT);
@@ -73,7 +49,7 @@ load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
         const char* src = reinterpret_cast<const char*>(
             operand + (block_row + r) * ld + k_base + c0);
         const uintptr_t dst =
-            reinterpret_cast<uintptr_t>(tile_at<SmemLayout>(tile, r, c0));
+            reinterpret_cast<uintptr_t>(tile(r, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j)
             astrai::cp_async_16(reinterpret_cast<ElemT*>(dst ^ (j << 4)),
@@ -86,7 +62,7 @@ load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
         const auto* src = operand + row * ld + k_base + c0;
         const bool chunk_aligned = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
         const uintptr_t dst =
-            reinterpret_cast<uintptr_t>(tile_at<SmemLayout>(tile, r, c0));
+            reinterpret_cast<uintptr_t>(tile(r, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j) {
             const int c = j * kChunkElems;
@@ -133,7 +109,8 @@ load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
 template <typename SmemLayout, typename ElemT,
           int kThreads, bool kInterior = false>
 __device__ __forceinline__ void
-load_operand_tile_trans(ElemT* tile, const ElemT* __restrict__ operand,
+load_operand_tile_trans(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
+                        const ElemT* __restrict__ operand,
                         int64_t rows, int64_t contract, int64_t ld, int tid,
                         int64_t k_base, int64_t block_row) {
     constexpr int kChunkElems = 16 / sizeof(ElemT);
@@ -152,7 +129,7 @@ load_operand_tile_trans(ElemT* tile, const ElemT* __restrict__ operand,
         const char* src = reinterpret_cast<const char*>(
             operand + (k_base + kr) * ld + block_row + c0);
         const uintptr_t dst =
-            reinterpret_cast<uintptr_t>(tile_at<SmemLayout>(tile, kr, c0));
+            reinterpret_cast<uintptr_t>(tile(kr, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j)
             astrai::cp_async_16(reinterpret_cast<ElemT*>(dst ^ (j << 4)),
@@ -165,7 +142,7 @@ load_operand_tile_trans(ElemT* tile, const ElemT* __restrict__ operand,
         const auto* src = operand + (k_base + kr) * ld + block_row + c0;
         const bool run16 = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
         const uintptr_t dst =
-            reinterpret_cast<uintptr_t>(tile_at<SmemLayout>(tile, kr, c0));
+            reinterpret_cast<uintptr_t>(tile(kr, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j) {
             const int c = j * kChunkElems;
@@ -195,23 +172,24 @@ load_operand_tile_trans(ElemT* tile, const ElemT* __restrict__ operand,
 // Loop-carried prefetch state for one congruous-or-trans operand ring:
 // per-thread (r, c0) mapping with the swizzled stage destination and global
 // source pointer carried across k-tiles, so each prefetch chunk is one
-// LDGSTS issued straight from registers. The guard is a property of the
-// operand's layout, so it lives in the type: the false specialization
-// (synchronous 8-bit crosswise operand) is an empty no-op. The tile
-// geometry rides the SmemLayout type (kTrans selects the crosswise 16-bit
-// geometry on the SOURCE side: the tile's rows are k lines, so the
-// per-tile source advance is kK * ld instead of kK).
-template <bool kAsync, typename ElemT, typename SmemLayout, int kThreads,
-          bool kTrans = false>
+// LDGSTS issued straight from registers. The geometry rides the operand's
+// Ring tensor (slots, stage stride, staged layout — one type where a
+// base/slots/stride triple used to travel as separate arguments). kTrans
+// selects the crosswise 16-bit geometry on the SOURCE side: the tile's rows
+// are k lines, so the per-tile source advance is kK * ld instead of kK.
+// kAsync=false (synchronous 8-bit crosswise operand) is an empty no-op.
+template <bool kAsync, typename RingT, int kThreads, bool kTrans = false>
 struct PrefetchCarry;
 
-template <typename ElemT, typename SmemLayout, int kThreads, bool kTrans>
-struct PrefetchCarry<true, ElemT, SmemLayout, kThreads, kTrans> {
+template <typename RingT, int kThreads, bool kTrans>
+struct PrefetchCarry<true, RingT, kThreads, kTrans> {
+    using ElemT = typename RingT::Elem;  // Ring = Tensor<PtrEngine, RingLayout>
+    using SmemLayout = typename RingT::Layout::Stage;  // per-stage layout
     static constexpr int kChunkElems = 16 / sizeof(ElemT);
     // The layout carries the tile geometry (rows x chunks per row),
     // whichever way round the staging runs — one decomposition expression.
-    static constexpr int kCpt = SmemLayout::kRows * SmemLayout::kChunks /
-                                kThreads;
+    static constexpr int kCpt =
+        SmemLayout::kRows * SmemLayout::kChunks / kThreads;
     static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
                   "XOR chunk stepping needs a power-of-two chunks-per-thread");
     static constexpr int kCpr = SmemLayout::kChunks / kCpt;
@@ -228,20 +206,20 @@ struct PrefetchCarry<true, ElemT, SmemLayout, kThreads, kTrans> {
     int64_t srcStep = 0;            // per-tile source advance (bytes)
 
     __device__ __forceinline__ PrefetchCarry(
-        const ElemT* ring, int ringSlots, int stageBytes, const ElemT* operand,
+        const RingT& ring, const ElemT* operand,
         int64_t ld, int64_t blockRow, int tid, int firstTile) {
         const int r = tid / kCpr;
         const int c0 = (tid % kCpr) * kCpt * kChunkElems;
-        const int stageElems = stageBytes / (int)sizeof(ElemT);
-        const ElemT* slot0 =
-            ring + (int64_t)(firstTile % ringSlots) * stageElems;
+        const ElemT* slot0 = astrai::stage_of(ring, firstTile).engine.ptr;
         const unsigned laneOff = static_cast<unsigned>(
-            (const char*)tile_at<SmemLayout>(slot0, r, c0) -
+            (const char*)astrai::stage_of(ring, firstTile)(r, c0) -
             (const char*)slot0);
-        const unsigned base = __cvta_generic_to_shared(ring) + laneOff;
-        wr = base + (unsigned)((int64_t)(firstTile % ringSlots) * stageBytes);
+        const unsigned base =
+            __cvta_generic_to_shared(ring.engine.ptr) + laneOff;
+        wr = base + (unsigned)((int64_t)(firstTile % RingT::Layout::kSlots) *
+                               RingT::Layout::kStageBytes);
         wr0 = base;
-        wrEnd = base + (unsigned)((int64_t)ringSlots * stageBytes);
+        wrEnd = base + (unsigned)RingT::Layout::kTotalBytes;
         if constexpr (kTrans) {
             src = reinterpret_cast<const char*>(
                 operand + ((int64_t)firstTile * kK + r) * ld + blockRow + c0);
@@ -262,19 +240,20 @@ struct PrefetchCarry<true, ElemT, SmemLayout, kThreads, kTrans> {
             astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);
     }
 
-    __device__ __forceinline__ void advance(int stageBytes) {
-        wr += (unsigned)stageBytes;
+    __device__ __forceinline__ void advance() {
+        wr += (unsigned)RingT::Layout::kStageBytes;
         if (wr == wrEnd) wr = wr0;
         src += srcStep;
     }
 };
 
-template <typename ElemT, typename SmemLayout, int kThreads, bool kTrans>
-struct PrefetchCarry<false, ElemT, SmemLayout, kThreads, kTrans> {
+template <typename RingT, int kThreads, bool kTrans>
+struct PrefetchCarry<false, RingT, kThreads, kTrans> {
     __device__ __forceinline__ PrefetchCarry(
-        const ElemT*, int, int, const ElemT*, int64_t, int64_t, int, int) {}
+        const RingT&, const typename RingT::Elem*, int64_t, int64_t, int,
+        int) {}
     __device__ __forceinline__ void emit(bool) const {}
-    __device__ __forceinline__ void advance(int) {}
+    __device__ __forceinline__ void advance() {}
 };
 
 // Direct (synchronous) crosswise load into a canonical rotating stage:
@@ -293,7 +272,8 @@ struct PrefetchCarry<false, ElemT, SmemLayout, kThreads, kTrans> {
 //     words: 0x5410 low pair, 0x7632 high pair).
 template <typename SmemLayout, typename ElemT, int kThreads>
 __device__ __forceinline__ void
-load_crosswise_direct(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
+load_crosswise_direct(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
+                      const ElemT* __restrict__ operand, int64_t rows,
                       int64_t contract, int64_t ld, int tid, int64_t k_base,
                       int64_t block_row) {
     static_assert(sizeof(ElemT) == 1 || sizeof(ElemT) == 2,
@@ -363,7 +343,7 @@ load_crosswise_direct(ElemT* tile, const ElemT* __restrict__ operand, int64_t ro
                     w = __byte_perm(*v0, *v1, (i & 1) ? 0x7632u : 0x5410u);
                 }
                 *reinterpret_cast<unsigned*>(
-                    tile_at<SmemLayout>(tile, rg * 16 + i, span * kCw)) = w;
+                    tile(rg * 16 + i, span * kCw)) = w;
             }
         } else {
             // Row-tail or misaligned chunk: element-granular gather with
@@ -374,13 +354,13 @@ load_crosswise_direct(ElemT* tile, const ElemT* __restrict__ operand, int64_t ro
                 if (k_base + col >= contract) {
 #pragma unroll
                     for (int i = 0; i < 16; ++i)
-                        *tile_at<SmemLayout>(tile, rg * 16 + i, col) = ElemT(0.0f);
+                        *tile(rg * 16 + i, col) = ElemT(0.0f);
                     continue;
                 }
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
                     const int64_t r_idx = r0 + i;
-                    *tile_at<SmemLayout>(tile, rg * 16 + i, col) =
+                    *tile(rg * 16 + i, col) =
                         r_idx < rows
                             ? operand[(k_base + col) * ld + r_idx]
                             : ElemT(0.0f);
