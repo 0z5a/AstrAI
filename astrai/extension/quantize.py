@@ -60,7 +60,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch.library import Library
 
-from astrai.extension.ops.gemm import mm_fp8
+from astrai.extension.ops.gemm import quant_gemm
 from astrai.extension.ops.quantize import quantize, quantize_dual
 
 # ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ def quantize_act_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Symmetric per-row dynamic int8 quantization of activations.
 
     ``x`` is ``[..., K]``; returns ``(q int8 with x's shape, scale f32
-    [prod(leading dims)])`` — the scale layout ``mm_w8a8`` expects once the
+    [prod(leading dims)])`` — the scale layout ``quant_gemm``'s per-row a_scale expects once the
     leading dims flatten.
     """
     xf = x.detach().to(torch.float32)
@@ -369,8 +369,13 @@ def fp8_linear_forward(
         # Bias fuses into the GEMM epilogue (fp32 add before the single bf16
         # rounding — one rounding fewer than the separate out + bias pass);
         # None passes through to the kernel's no-bias path.
-        out = mm_fp8(
-            x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True, bias=bias
+        out = quant_gemm(
+            x8.reshape(-1, x8.size(-1)),
+            w8,
+            a_scale=sx,
+            b_scale=sw,
+            trans_b=True,
+            bias=bias,
         ).reshape(*x.shape[:-1], w.size(0))
         return out, sx, sw
 
@@ -388,8 +393,13 @@ def fp8_linear_forward(
         w8 = w
     else:
         w8, _ = quantize(w, sw.reciprocal(), fmt, **meta.w.fold_args(fmt))
-    out = mm_fp8(
-        x8.reshape(-1, x8.size(-1)), w8, sx * sw, trans_b=True, bias=bias
+    out = quant_gemm(
+        x8.reshape(-1, x8.size(-1)),
+        w8,
+        a_scale=sx,
+        b_scale=sw,
+        trans_b=True,
+        bias=bias,
     ).reshape(*x.shape[:-1], w.size(0))
     meta.x.advance()
     if not _is_fp8(w.dtype):
@@ -451,11 +461,15 @@ class _LinearFp8(torch.autograd.Function):
         if _is_fp8(w.dtype):
             # Pre-quantized weight has no transposed copy: keep the swap
             # path for grad_x (grad_w is unaffected).
-            grad_x = mm_fp8(g8, w, sg * sw).reshape(x.shape)
+            grad_x = quant_gemm(g8, w, a_scale=sg, b_scale=sw, trans_b=False).reshape(
+                x.shape
+            )
         else:
             w8T, _ = quantize(w, sw.reciprocal(), fmt, transposed=True)
-            grad_x = mm_fp8(g8, w8T, sg * sw, trans_b=True).reshape(x.shape)
-        grad_w = mm_fp8(g8T, x8T, sg * sx, trans_b=True)  # g8.T @ x8
+            grad_x = quant_gemm(g8, w8T, a_scale=sg, b_scale=sw, trans_b=True).reshape(
+                x.shape
+            )
+        grad_w = quant_gemm(g8T, x8T, a_scale=sg, b_scale=sx, trans_b=True)  # g8.T @ x8
         # bias-free linears must not pay the column-sum
         # reduce: g2.sum(0) is another full read of the gradient.
         grad_b = g2.sum(0).to(torch.bfloat16) if ctx.needs_input_grad[2] else None

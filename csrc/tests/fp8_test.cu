@@ -324,6 +324,73 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
 }
 
 // ---------------------------------------------------------------------------
+// Shared section helpers: storage materialization, int8 scale setup, and
+// the four-layout production-dispatch sweep every dtype section reuses.
+// ---------------------------------------------------------------------------
+
+// [rows][cols] -> [cols][rows] storage materialization.
+static std::vector<float> transpose(const std::vector<float>& x, int rows,
+                                    int cols) {
+    std::vector<float> t((size_t)rows * cols);
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            t[(size_t)j * rows + i] = x[(size_t)i * cols + j];
+    return t;
+}
+
+// Symmetric scale setup for one host operand stored [rows][cols]: returns
+// the per-row scale (amax / qmax — 127 for int8, 448/57344 for fp8) and
+// divides the buffer by it, so the kernel (which re-applies the scale in
+// its epilogue) and the naive reference see the same quantized values.
+static std::vector<float> div_row_scales(std::vector<float>& x, int rows,
+                                         int cols, float qmax = 127.f) {
+    std::vector<float> s(rows);
+    for (int i = 0; i < rows; ++i) {
+        float amax = 1e-6f;
+        for (int j = 0; j < cols; ++j)
+            amax = fmaxf(amax, fabsf(x[(size_t)i * cols + j]));
+        s[i] = amax / qmax;
+        for (int j = 0; j < cols; ++j) x[(size_t)i * cols + j] /= s[i];
+    }
+    return s;
+}
+
+// One dtype pair through ALL FOUR storage layouts of the production
+// dispatch: NT (congruous, the nn.Linear main path), TN/TT (crosswise A),
+// NN (dual N-contiguous — the swap rewrite for symmetric pairs, the direct
+// mixed instantiation otherwise). ha/hb are the canonical [M][K]/[N][K]
+// storages (post-quantization); transposed variants materialize here.
+template <typename ElemA, typename ElemB = ElemA>
+static bool check_all_layouts(const std::vector<float>& ha,
+                              const std::vector<float>& hb, int m, int n,
+                              int k, const char* tag, float tol,
+                              const std::vector<float>& b_scale = {},
+                              const std::vector<float>& a_scale = {}) {
+    const std::vector<float> ha_t = transpose(ha, m, k);  // [K][M]
+    const std::vector<float> hb_t = transpose(hb, n, k);  // [K][N]
+    struct Lay {
+        bool ta, tb;
+        int ald, bld;
+        const char* name;
+    };
+    const Lay lays[] = {{false, true, k, k, "NT"}, {true, false, m, n, "TN"},
+                        {true, true, m, k, "TT"}, {false, false, k, n, "NN"}};
+    bool ok = true;
+    for (const Lay& l : lays) {
+        char name[32];
+        snprintf(name, sizeof(name), "%s %s", tag, l.name);
+        ok &= check_gemm<ElemA, ElemB>(
+            l.ta ? ha_t.data() : ha.data(), l.tb ? hb.data() : hb.data(), m,
+            n, k, l.ald, l.bld, !l.ta, !l.tb, name, tol,
+            [&](GemmParams& p) {
+                gemm_dispatch<ElemA, ElemB>(p, 0, l.ta, l.tb);
+            },
+            b_scale, a_scale);
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Part 2: fp8 GEMM — all four operand layouts x K-tiles x production routes
 // ---------------------------------------------------------------------------
 
@@ -375,46 +442,38 @@ static bool test_gemm() {
     };
     bool all = true;
     for (auto& c : cfgs) {
-        float* ha = new float[c.m * c.k];
-        float* hb_rowmajor = new float[c.k * c.n];  // [K][N] for B RowMajor
-        float* hb_colmajor = new float[c.n * c.k];  // [N][K] for B ColMajor
-        for (int i = 0; i < c.m * c.k; ++i) ha[i] = randf();
-        for (int i = 0; i < c.k * c.n; ++i) hb_rowmajor[i] = randf();
-        for (int i = 0; i < c.k * c.n; ++i)
-            hb_colmajor[i / c.k * c.k + i % c.k] = hb_rowmajor[i];
-        float* ha_t = new float[c.k * c.m];  // [K][M] for A ColMajor
-        for (int i = 0; i < c.m; ++i)
-            for (int p = 0; p < c.k; ++p) ha_t[p * c.m + i] = ha[i * c.k + p];
+        std::vector<float> ha((size_t)c.m * c.k), hb((size_t)c.k * c.n);
+        for (float& v : ha) v = randf();
+        for (float& v : hb) v = randf();
+        const std::vector<float> hb_col = transpose(hb, c.k, c.n);  // [N][K]
+        const std::vector<float> ha_t = transpose(ha, c.m, c.k);    // [K][M]
         printf("%dx%dx%d:\n", c.m, c.n, c.k);
-        all &= run_gemm_case<RowMajor, ColMajor, 32, 3>(ha, hb_colmajor, c.m,
-                                                        c.n, c.k, c.k, c.k,
+        all &= run_gemm_case<RowMajor, ColMajor, 32, 3>(ha.data(), hb_col.data(),
+                                                        c.m, c.n, c.k, c.k, c.k,
                                                         "NT K32");
-        all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(ha, hb_colmajor, c.m,
-                                                        c.n, c.k, c.k, c.k,
+        all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(ha.data(), hb_col.data(),
+                                                        c.m, c.n, c.k, c.k, c.k,
                                                         "NT K64");
         all &= run_gemm_case<RowMajor, RowMajor, 64, 2>(
-            ha, hb_rowmajor, c.m, c.n, c.k, c.k, c.n, "NN swap", 1);
+            ha.data(), hb.data(), c.m, c.n, c.k, c.k, c.n, "NN swap", 1);
         all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(
-            ha, hb_colmajor, c.m, c.n, c.k, c.k, c.k, "NT disp", 2);
-        all &= run_gemm_case<ColMajor, ColMajor, 32, 3>(ha_t, hb_colmajor, c.m,
-                                                        c.n, c.k, c.m, c.k,
+            ha.data(), hb_col.data(), c.m, c.n, c.k, c.k, c.k, "NT disp", 2);
+        all &= run_gemm_case<ColMajor, ColMajor, 32, 3>(ha_t.data(), hb_col.data(),
+                                                        c.m, c.n, c.k, c.m, c.k,
                                                         "TN K32");
-        all &= run_gemm_case<ColMajor, ColMajor, 64, 2>(ha_t, hb_colmajor, c.m,
-                                                        c.n, c.k, c.m, c.k,
+        all &= run_gemm_case<ColMajor, ColMajor, 64, 2>(ha_t.data(), hb_col.data(),
+                                                        c.m, c.n, c.k, c.m, c.k,
                                                         "TN K64");
-        all &= run_gemm_case<ColMajor, RowMajor, 64, 2>(ha_t, hb_rowmajor, c.m,
-                                                        c.n, c.k, c.m, c.n,
+        all &= run_gemm_case<ColMajor, RowMajor, 64, 2>(ha_t.data(), hb.data(),
+                                                        c.m, c.n, c.k, c.m, c.n,
                                                         "TT K64");
-        delete[] ha;
-        delete[] hb_rowmajor;
-        delete[] hb_colmajor;
-        delete[] ha_t;
     }
     return all;
 }
 
 // ---------------------------------------------------------------------------
-// Part 3: dtype coverage — bf16 operands (congruous NT) and fp32 output
+// Part 3: dtype coverage — bf16/int8 operand pairs (all four layouts) and
+// fp32 output
 // ---------------------------------------------------------------------------
 
 static bool test_gemm_dtypes() {
@@ -428,61 +487,37 @@ static bool test_gemm_dtypes() {
         for (float& v : b) v = randf();
     };
 
-    // bf16 operands through the dtype-generic GemmPolicy: big CTA (fast
-    // loop, dual-congruous) and small CTA s3, plus the production dispatch
-    // across the remaining layouts (TN/TT crosswise staging — 2-byte
-    // elements — and the NN swap rewrite).
+    // W16A16: all four layouts through the production dispatch, plus pinned
+    // big/small tile variants (the plan ladder routes 256x256 to the small
+    // CTA, so the big CTA needs pinning).
     using Bf16Big =
         GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, TileBigFast,
                    RowMajor, __nv_bfloat16>;
     using Bf16Small =
         GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, TileSmall64s3,
                    RowMajor, __nv_bfloat16>;
-    printf("bf16 operands (all layouts):\n");
+    printf("W16A16 (bf16 x bf16, all layouts):\n");
     for (int k : {64, 128, 320, 512}) {
         std::vector<float> ha, hb;
         prep(ha, hb, 256, 256, k, 1234 + k);
-        // Transposed storages: ha_t [K][M], hb_t [K][N].
-        std::vector<float> ha_t((size_t)k * 256), hb_t((size_t)k * 256);
-        for (int i = 0; i < 256; ++i)
-            for (int p = 0; p < k; ++p) ha_t[p * 256 + i] = ha[i * k + p];
-        for (int j = 0; j < 256; ++j)
-            for (int p = 0; p < k; ++p) hb_t[p * 256 + j] = hb[j * k + p];
         printf(" 256x256x%d:\n", k);
+        all &= check_all_layouts<__nv_bfloat16>(ha, hb, 256, 256, k, "w16a16",
+                                                0.02f);
         all &= check_gemm<__nv_bfloat16>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "bf16 big 128x128", 0.02f,
+            "w16a16 big 128x128", 0.02f,
             [&](GemmParams& p) { launch_policy<Bf16Big>(p, 0); });
         all &= check_gemm<__nv_bfloat16>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "bf16 small 64x64", 0.02f,
+            "w16a16 small 64x64", 0.02f,
             [&](GemmParams& p) { launch_policy<Bf16Small>(p, 0); });
-        all &= check_gemm<__nv_bfloat16>(
-            ha_t.data(), hb_t.data(), 256, 256, k, 256, 256, 0, 1,
-            "bf16 TN disp", 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_bfloat16>(p, 0, true, false);
-            });
-        all &= check_gemm<__nv_bfloat16>(
-            ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-            "bf16 TT disp", 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_bfloat16>(p, 0, true, true);
-            });
-        all &= check_gemm<__nv_bfloat16>(
-            ha.data(), hb_t.data(), 256, 256, k, k, 256, 1, 1,
-            "bf16 NN swap", 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_bfloat16>(p, 0, false, false);
-            });
     }
 
     // W8A16 weight-only: bf16 activation x per-channel-scaled int8 weight.
     // The kernel dequantizes B fragments in-register and folds the channel
-    // scale into the epilogue; the reference applies the same scale. All
-    // four storage layouts run through the production dispatch (NT/TN/TT
-    // plus the direct dual-row-major NN), with big-CTA instantiations
-    // pinned at k=320 (the plan ladder routes 256x256 to the small CTA).
+    // scale into the epilogue. All four storage layouts run through the
+    // production dispatch (NN takes the direct mixed instantiation), with
+    // pinned tile variants the plan ladder would not route 256x256 to.
     using MixedBig =
         GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, TileBigFast,
                    RowMajor, __nv_bfloat16>;
@@ -502,23 +537,10 @@ static bool test_gemm_dtypes() {
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;
         prep(ha, hb, 256, 256, k, 777 + k);
-        // per-channel symmetric int8 quantization of the weight
-        std::vector<float> scale(256);
-        for (int n = 0; n < 256; ++n) {
-            float amax = 1e-6f;
-            for (int kk = 0; kk < k; ++kk)
-                amax = fmaxf(amax, fabsf(hb[(size_t)n * k + kk]));
-            scale[n] = amax / 127.0f;
-            for (int kk = 0; kk < k; ++kk)
-                hb[(size_t)n * k + kk] /= scale[n];
-        }
-        // Transposed storages: ha_t [K][M], hb_t [K][N] (post-quantization).
-        std::vector<float> ha_t((size_t)k * 256), hb_t((size_t)k * 256);
-        for (int i = 0; i < 256; ++i)
-            for (int p = 0; p < k; ++p) ha_t[p * 256 + i] = ha[i * k + p];
-        for (int j = 0; j < 256; ++j)
-            for (int p = 0; p < k; ++p) hb_t[p * 256 + j] = hb[j * k + p];
+        const std::vector<float> scale = div_row_scales(hb, 256, k);
         printf(" 256x256x%d:\n", k);
+        all &= check_all_layouts<__nv_bfloat16, int8_t>(ha, hb, 256, 256, k,
+                                                        "w8a16", 0.02f, scale);
         all &= check_gemm<__nv_bfloat16, int8_t>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
             "w8a16 big 128x128", 0.02f,
@@ -527,35 +549,11 @@ static bool test_gemm_dtypes() {
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
             "w8a16 small 64x64", 0.02f,
             [&](GemmParams& p) { launch_policy<MixedSmall>(p, 0); }, scale);
-        all &= check_gemm<__nv_bfloat16, int8_t>(
-            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w8a16 disp", 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_bfloat16, int8_t>(p, 0, false, true);
-            },
-            scale);
-        all &= check_gemm<__nv_bfloat16, int8_t>(
-            ha_t.data(), hb_t.data(), 256, 256, k, 256, 256, 0, 1,
-            "w8a16 TN disp", 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_bfloat16, int8_t>(p, 0, true, false);
-            },
-            scale);
-        all &= check_gemm<__nv_bfloat16, int8_t>(
-            ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-            "w8a16 TT disp", 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_bfloat16, int8_t>(p, 0, true, true);
-            },
-            scale);
-        all &= check_gemm<__nv_bfloat16, int8_t>(
-            ha.data(), hb_t.data(), 256, 256, k, k, 256, 1, 1,
-            "w8a16 NN disp", 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_bfloat16, int8_t>(p, 0, false, false);
-            },
-            scale);
         if (k == 320) {
+            // Crosswise/dual-row-major big CTA pinned (the planner routes
+            // 256x256 crosswise to the small CTA).
+            const std::vector<float> ha_t = transpose(ha, 256, k);
+            const std::vector<float> hb_t = transpose(hb, 256, k);
             all &= check_gemm<__nv_bfloat16, int8_t>(
                 ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
                 "w8a16 TT big", 0.02f,
@@ -578,20 +576,9 @@ static bool test_gemm_dtypes() {
     {
         std::vector<float> ha, hb;
         prep(ha, hb, 100, 130, 96, 555);
-        std::vector<float> scale(130);
-        for (int j = 0; j < 130; ++j) {
-            float amax = 1e-6f;
-            for (int p = 0; p < 96; ++p)
-                amax = fmaxf(amax, fabsf(hb[(size_t)j * 96 + p]));
-            scale[j] = amax / 127.0f;
-            for (int p = 0; p < 96; ++p)
-                hb[(size_t)j * 96 + p] /= scale[j];
-        }
-        std::vector<float> ha_t((size_t)96 * 100), hb_t((size_t)96 * 130);
-        for (int i = 0; i < 100; ++i)
-            for (int p = 0; p < 96; ++p) ha_t[p * 100 + i] = ha[i * 96 + p];
-        for (int j = 0; j < 130; ++j)
-            for (int p = 0; p < 96; ++p) hb_t[p * 130 + j] = hb[j * 96 + p];
+        const std::vector<float> scale = div_row_scales(hb, 130, 96);
+        const std::vector<float> ha_t = transpose(ha, 100, 96);
+        const std::vector<float> hb_t = transpose(hb, 130, 96);
         printf("W8A16 odd shape (100x130x96, TN):\n");
         all &= check_gemm<__nv_bfloat16, int8_t>(
             ha_t.data(), hb_t.data(), 100, 130, 96, 100, 130, 0, 1,
@@ -604,8 +591,8 @@ static bool test_gemm_dtypes() {
 
     // W8A8 dynamic: per-row-scaled int8 activation x per-channel-scaled
     // int8 weight — BOTH operands dequantize in-register to the bf16 mma.
-    // All four storage layouts through the production dispatch, plus a
-    // pinned big-CTA instantiation at k=320.
+    // All four storage layouts (NN rides the symmetric swap rewrite),
+    // plus a pinned big-CTA instantiation at k=320.
     {
         using W8A8Big =
             GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, TileBigFast,
@@ -614,57 +601,11 @@ static bool test_gemm_dtypes() {
         for (int k : {64, 320, 512}) {
             std::vector<float> ha, hb;
             prep(ha, hb, 256, 256, k, 888 + k);
-            std::vector<float> rscale(256), cscale(256);
-            for (int i = 0; i < 256; ++i) {
-                float amax = 1e-6f;
-                for (int kk = 0; kk < k; ++kk)
-                    amax = fmaxf(amax, fabsf(ha[(size_t)i * k + kk]));
-                rscale[i] = amax / 127.0f;
-                for (int kk = 0; kk < k; ++kk)
-                    ha[(size_t)i * k + kk] /= rscale[i];
-            }
-            for (int j = 0; j < 256; ++j) {
-                float amax = 1e-6f;
-                for (int kk = 0; kk < k; ++kk)
-                    amax = fmaxf(amax, fabsf(hb[(size_t)j * k + kk]));
-                cscale[j] = amax / 127.0f;
-                for (int kk = 0; kk < k; ++kk)
-                    hb[(size_t)j * k + kk] /= cscale[j];
-            }
-            std::vector<float> ha_t((size_t)k * 256), hb_t((size_t)k * 256);
-            for (int i = 0; i < 256; ++i)
-                for (int p = 0; p < k; ++p) ha_t[p * 256 + i] = ha[i * k + p];
-            for (int j = 0; j < 256; ++j)
-                for (int p = 0; p < k; ++p) hb_t[p * 256 + j] = hb[j * k + p];
+            const std::vector<float> rscale = div_row_scales(ha, 256, k);
+            const std::vector<float> cscale = div_row_scales(hb, 256, k);
             printf(" 256x256x%d:\n", k);
-            all &= check_gemm<int8_t, int8_t>(
-                ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-                "w8a8 disp", 0.02f,
-                [&](GemmParams& p) {
-                    gemm_dispatch<int8_t, int8_t>(p, 0, false, true);
-                },
-                cscale, rscale);
-            all &= check_gemm<int8_t, int8_t>(
-                ha_t.data(), hb_t.data(), 256, 256, k, 256, 256, 0, 1,
-                "w8a8 TN disp", 0.02f,
-                [&](GemmParams& p) {
-                    gemm_dispatch<int8_t, int8_t>(p, 0, true, false);
-                },
-                cscale, rscale);
-            all &= check_gemm<int8_t, int8_t>(
-                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a8 TT disp", 0.02f,
-                [&](GemmParams& p) {
-                    gemm_dispatch<int8_t, int8_t>(p, 0, true, true);
-                },
-                cscale, rscale);
-            all &= check_gemm<int8_t, int8_t>(
-                ha.data(), hb_t.data(), 256, 256, k, k, 256, 1, 1,
-                "w8a8 NN swap", 0.02f,
-                [&](GemmParams& p) {
-                    gemm_dispatch<int8_t, int8_t>(p, 0, false, false);
-                },
-                cscale, rscale);
+            all &= check_all_layouts<int8_t>(ha, hb, 256, 256, k, "w8a8",
+                                             0.02f, cscale, rscale);
             if (k == 320) {
                 all &= check_gemm<int8_t, int8_t>(
                     ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
@@ -677,39 +618,55 @@ static bool test_gemm_dtypes() {
 
     // A8W16 (the mirrored mixed pair): int8 activation dequantizes on the
     // A side while the bf16 weight rides the ldmatrix path — exercises the
-    // split kSegXorA/kSegXorB addressing.
+    // split kSegXorA/kSegXorB addressing across all four layouts.
+    printf("A8W16 (int8 act x bf16 weight, all layouts):\n");
+    for (int k : {64, 320}) {
+        std::vector<float> ha, hb;
+        prep(ha, hb, 256, 256, k, 999 + k);
+        const std::vector<float> rscale = div_row_scales(ha, 256, k);
+        printf(" 256x256x%d:\n", k);
+        all &= check_all_layouts<int8_t, __nv_bfloat16>(ha, hb, 256, 256, k,
+                                                        "a8w16", 0.02f, {},
+                                                        rscale);
+    }
+
+    // W-F8A16 weight-only: bf16 activation x per-channel-scaled e4m3
+    // weight. The weight dequantizes in-register through the hardware
+    // fp8->fp16 widen + exact bf16 rounding; row 0 is seeded with exact
+    // zeros and subnormal-magnitude values (0.001 < 2^-6) so those paths
+    // are exercised, and the mirrored pair follows. Pinned big CTA at
+    // k=320 covers the TileBigFast instantiation the planner would not
+    // route 256x256 to.
     {
-        printf("A8W16 (int8 act x bf16 weight):\n");
+        using F8Big = GemmPolicy<__nv_bfloat16, __nv_fp8_e4m3, RowMajor,
+                                 ColMajor, TileBigFast, RowMajor,
+                                 __nv_bfloat16>;
+        printf("W-F8A16 (bf16 act x e4m3 weight, all layouts):\n");
         for (int k : {64, 320}) {
             std::vector<float> ha, hb;
-            prep(ha, hb, 256, 256, k, 999 + k);
-            std::vector<float> rscale(256);
-            for (int i = 0; i < 256; ++i) {
-                float amax = 1e-6f;
-                for (int kk = 0; kk < k; ++kk)
-                    amax = fmaxf(amax, fabsf(ha[(size_t)i * k + kk]));
-                rscale[i] = amax / 127.0f;
-                for (int kk = 0; kk < k; ++kk)
-                    ha[(size_t)i * k + kk] /= rscale[i];
-            }
-            std::vector<float> ha_t((size_t)k * 256);
-            for (int i = 0; i < 256; ++i)
-                for (int p = 0; p < k; ++p) ha_t[p * 256 + i] = ha[i * k + p];
+            prep(ha, hb, 256, 256, k, 222 + k);
+            const std::vector<float> scale = div_row_scales(hb, 256, k, 448.f);
+            for (int j = 0; j < 16; ++j)
+                hb[j] = j < 8 ? 0.f : 0.001f;  // +0 and e4m3 subnormals
             printf(" 256x256x%d:\n", k);
-            all &= check_gemm<int8_t, __nv_bfloat16>(
-                ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-                "a8w16 NT disp", 0.02f,
-                [&](GemmParams& p) {
-                    gemm_dispatch<int8_t, __nv_bfloat16>(p, 0, false, true);
-                },
-                {}, rscale);
-            all &= check_gemm<int8_t, __nv_bfloat16>(
-                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "a8w16 TT disp", 0.02f,
-                [&](GemmParams& p) {
-                    gemm_dispatch<int8_t, __nv_bfloat16>(p, 0, true, true);
-                },
-                {}, rscale);
+            all &= check_all_layouts<__nv_bfloat16, __nv_fp8_e4m3>(
+                ha, hb, 256, 256, k, "w-f8a16", 0.02f, scale);
+            if (k == 320) {
+                all &= check_gemm<__nv_bfloat16, __nv_fp8_e4m3>(
+                    ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
+                    "w-f8a16 big 128x128", 0.02f,
+                    [&](GemmParams& p) { launch_policy<F8Big>(p, 0); },
+                    scale);
+            }
+        }
+        printf("A-F8W16 (e4m3 act x bf16 weight, all layouts):\n");
+        for (int k : {64, 320}) {
+            std::vector<float> ha, hb;
+            prep(ha, hb, 256, 256, k, 333 + k);
+            const std::vector<float> rscale = div_row_scales(ha, 256, k, 448.f);
+            printf(" 256x256x%d:\n", k);
+            all &= check_all_layouts<__nv_fp8_e4m3, __nv_bfloat16>(
+                ha, hb, 256, 256, k, "a-f8w16", 0.02f, {}, rscale);
         }
     }
 

@@ -336,12 +336,5 @@ void gemm(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
     gemm_dispatch<ElemT, ElemT>(p, stream, trans_a, trans_b);
 }
 
-// Non-template entry over the production instantiations (defined in
-// launch.cu). Bindings that link it declare the extern-template
-// suppressions locally before use, so C tests instantiating straight from
-// this header stay single-file self-contained.
-void launch_gemm(FP8Format fmt, const GemmParams& p, cudaStream_t stream,
-                 bool trans_a, bool trans_b);
-
 }  // namespace gemm
 }  // namespace astrai

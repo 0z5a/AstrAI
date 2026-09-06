@@ -1,7 +1,7 @@
 """Benchmark the FP8 quantize and GEMM kernels against torch baselines.
 
 Suites (--suite): quantize (plain / delayed-scaling ring / dual-orientation
-entries vs the aten float8 cast) and gemm (pre-quantized ``mm_fp8`` in the
+entries vs the aten float8 cast) and gemm (pre-quantized ``quant_gemm`` in the
 NT orientation the fp8 linear path uses, vs bf16 ``F.linear``). GEMM
 agreement reports both kernel error (vs the fp32 dequantized fp8 product)
 and format error (that product vs the bf16 matmul). FP8 MMA requires
@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from astrai.extension import is_available
-from astrai.extension.ops.gemm import mm_fp8
+from astrai.extension.ops.gemm import quant_gemm
 from astrai.extension.ops.quantize import quantize, quantize_dual
 
 FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -215,7 +215,7 @@ def benchmark_gemm(
         return F.linear(x, w)
 
     def fp8_op() -> torch.Tensor:
-        return mm_fp8(x8, w8, dequant_scale, trans_b=True)
+        return quant_gemm(x8, w8, a_scale=dequant_scale, trans_b=True)
 
     operations = {"torch_bf16": torch_op, "fp8": fp8_op}
     samples = measure_operations(

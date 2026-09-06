@@ -63,12 +63,13 @@ layered directory:
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
 strategy layer passes `scale.reciprocal()` and the kernel multiplies by it.
-`mm_fp8` takes the combined dequant scale (`sa * sb`). `amax` is always
+`quant_gemm` takes per-operand dequant scales (`a_scale`, `b_scale`;
+the fp8 training path passes `sa` / `sb` separately). `amax` is always
 returned in the original input domain.
 
 Python layer (two levels): `astrai/extension/ops/quantize.py` and
 `ops/gemm.py` are the stateless kernel adapters (plain `quantize` /
-`quantize_dual` / `mm_fp8` wrappers, one adapter file per compiled kernel
+`quantize_dual` / `quant_gemm` wrappers, one adapter file per compiled kernel
 module), and `astrai/extension/quantize.py` is the strategy layer (fp8
 recipes, delayed / dynamic scaling, `fp8_autocast`,
 `fp8_linear_forward/backward` wiring `aten::linear` on CUDA, plus the int8
@@ -194,9 +195,9 @@ applies `b_scale`/bias per kernel row — including the +8 accumulator half
 NN-swap test exposed.
 
 **Python surface (two layers).** `astrai/extension/ops/gemm.py` is the
-compiled `gemm` module's adapter — the stateless kernel entries (`mm_fp8`
-and `mm_w8a16` / `mm_w8a8` / `mm_w16a16`, dtype pairing + scale extent
-validated in the binding); `astrai/extension/quantize.py` carries the int8
+compiled `gemm` module's adapter — the single `quant_gemm` entry (the
+operand dtype pair picks the kernel, per-side scale arity is validated:
+int8 requires its scale, fp8 takes one optionally, bf16 takes none); `astrai/extension/quantize.py` carries the int8
 policy (symmetric per-channel weight quantization, per-row dynamic
 activation quantization). There is deliberately no nn.Module layer on the
 int8 path: the only model-facing quantization integration is the fp8
@@ -564,7 +565,7 @@ csrc/
 │   │   ├── scheduler.cuh             #     grouped/plain raster mapping
 │   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
 │   │   ├── epilogue.cuh              #     fused bias + scale folding + bf16 scatter + copy-out
-│   │   └── gemm.cu                   #   binding + explicit instantiations (mm_fp8 / mm_w8a16 / mm_w8a8 / mm_w16a16)
+│   │   └── gemm.cu                   #   quant_gemm binding + dtype-pair explicit instantiations (precision-ordered)
 │   └── quantize/quantize.cu                  #   binding only (module quantize): validation, param packing, launch dispatch, pybind
 └── tests/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)

@@ -1,9 +1,9 @@
-// GEMM family binding (module `gemm`): the pre-quantized FP8 matmul
-// ``mm_fp8`` plus the quantized-GEMM entries ``mm_w8a16`` / ``mm_w8a8`` /
-// ``mm_w16a16`` over the same dtype-generic dispatch. This TU is also the
-// single kernel-policy instantiation site — the explicit instantiations
-// below pin every production Policy to SASS exactly once; the C tests
-// instantiate straight from the headers instead.
+// GEMM family binding (module `gemm`): the single quantized-GEMM entry
+// ``quant_gemm`` — every dtype pairing (bf16 / int8 / fp8 operands, per-
+// operand scales) dispatches over the same dtype-generic kernel family.
+// This TU is also the single kernel-policy instantiation site — the
+// explicit instantiations below pin every production Policy to SASS
+// exactly once; the C tests instantiate straight from the headers instead.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -20,28 +20,27 @@ namespace astrai {
 namespace gemm {
 
 // Explicit instantiation of the production entry points: every kernel
-// Policy lands in SASS exactly once, here. Other TUs reach this through
-// launch_gemm below (the header declares it); the C tests instantiate from
+// Policy lands in SASS exactly once, here; the C tests instantiate from
 // the headers directly.
 template void gemm<FP8Format::E4M3>(GemmParams, cudaStream_t, bool, bool);
 template void gemm<FP8Format::E5M2>(GemmParams, cudaStream_t, bool, bool);
-// The quantized-GEMM dtype pairs: W8A16 (bf16 x int8), W8A8 (int8 x int8,
-// both sides dequantize in-register), W16A16 (bf16 passthrough).
-template void gemm_dispatch<__nv_bfloat16, int8_t>(GemmParams, cudaStream_t,
-                                                   bool, bool);
-template void gemm_dispatch<int8_t, int8_t>(GemmParams, cudaStream_t, bool,
-                                            bool);
+// The quantized-GEMM dtype pairs, ordered by operand precision (activation
+// dtype first, then weight): W16A16 (bf16 passthrough), W8A16 (bf16 x int8),
+// the fp8-weight variants (bf16 x e4m3/e5m2, in-register hardware widen),
+// then W8A8 (int8 x int8, both sides dequantize in-register).
 template void gemm_dispatch<__nv_bfloat16, __nv_bfloat16>(GemmParams,
                                                           cudaStream_t, bool,
                                                           bool);
-
-void launch_gemm(FP8Format fmt, const GemmParams& p, cudaStream_t stream,
-                 bool trans_a, bool trans_b) {
-    if (fmt == FP8Format::E5M2)
-        gemm<FP8Format::E5M2>(p, stream, trans_a, trans_b);
-    else
-        gemm<FP8Format::E4M3>(p, stream, trans_a, trans_b);
-}
+template void gemm_dispatch<__nv_bfloat16, int8_t>(GemmParams, cudaStream_t,
+                                                   bool, bool);
+template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>(GemmParams,
+                                                          cudaStream_t, bool,
+                                                          bool);
+template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>(GemmParams,
+                                                          cudaStream_t, bool,
+                                                          bool);
+template void gemm_dispatch<int8_t, int8_t>(GemmParams, cudaStream_t, bool,
+                                            bool);
 
 namespace {
 
@@ -70,94 +69,10 @@ bool resolve_operand(const torch::Tensor& t_in, bool flag, int64_t& ld,
 }
 
 
-torch::Tensor mm_fp8(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
-                     bool trans_a, bool trans_b, py::object bias) {
-    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn ||
-                    a.scalar_type() == torch::kFloat8_e5m2,
-                "a and b must be fp8");
-    TORCH_CHECK(a.scalar_type() == b.scalar_type(), "a and b must share format");
-    TORCH_CHECK((a.dim() == 2 || a.dim() == 3) &&
-                    (b.dim() == 2 || b.dim() == 3),
-                "a and b must be 2D or 3D (batched)");
-    TORCH_CHECK(a.device() == b.device(), "a and b must share device");
-    // Python None and an omitted argument both mean "no bias" — an undefined
-    // tensor below. (py::isinstance<torch::Tensor> is false for real tensors
-    // here — torch's caster registers no pybind type info — so validate by
-    // attempting the cast itself.)
-    torch::Tensor bias_t;
-    if (!bias.is_none()) {
-        try {
-            bias_t = bias.cast<torch::Tensor>();
-        } catch (const py::cast_error&) {
-            TORCH_CHECK(false, "bias must be a torch.Tensor or None");
-        }
-    }
-    check_scale(scale, a);
-    check_fp8_device(a);
-    const at::cuda::OptionalCUDAGuard guard(a.device());
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    // Batched operands follow matmul broadcast rules: 2D acts as a batch
-    // of 1; a size-1 batch broadcasts across the other side (stride 0).
-    const int64_t batch_a = a.dim() == 3 ? a.size(0) : 1;
-    const int64_t batch_b = b.dim() == 3 ? b.size(0) : 1;
-    TORCH_CHECK(batch_a == batch_b || batch_a == 1 || batch_b == 1,
-                "batch dim mismatch (got ", batch_a, " and ", batch_b, ")");
-    const int64_t batch = std::max(batch_a, batch_b);
-    TORCH_CHECK(batch <= 65535, "batch dim exceeds the grid.z launch limit");
-
-    torch::Tensor a_st, b_st;
-    int64_t a_ld, b_ld, a_bstride, b_bstride;
-    const bool tag_a = resolve_operand(a, trans_a, a_ld, a_bstride, a_st);
-    const bool tag_b = resolve_operand(b, trans_b, b_ld, b_bstride, b_st);
-    // GEMM dims from the user flags; storage layout never swaps them.
-    const int64_t m = trans_a ? a.size(-1) : a.size(-2);
-    const int64_t k = trans_a ? a.size(-2) : a.size(-1);
-    const int64_t n = trans_b ? b.size(-2) : b.size(-1);
-    TORCH_CHECK(k == (trans_b ? b.size(-1) : b.size(-2)), "inner dim mismatch");
-
-    const bool batched_out = a.dim() == 3 || b.dim() == 3;
-    torch::Tensor output =
-        batched_out
-            ? torch::empty({batch, m, n}, a.options().dtype(torch::kBFloat16))
-            : torch::empty({m, n}, a.options().dtype(torch::kBFloat16));
-    GemmParams p;
-    p.a_ptr = a_st.data_ptr();
-    p.b_ptr = b_st.data_ptr();
-    p.out_ptr = output.data_ptr();
-    p.a_scale = scale.data_ptr<float>();
-    p.m = static_cast<int>(m);
-    p.n = static_cast<int>(n);
-    p.k = static_cast<int>(k);
-    p.a_ld = static_cast<int>(a_ld);
-    p.b_ld = static_cast<int>(b_ld);
-    // Fused epilogue bias (bf16, broadcast over rows and batches). An
-    // undefined or 0-element tensor keeps the plain scaled output.
-    if (bias_t.defined() && bias_t.numel() > 0) {
-        TORCH_CHECK(bias_t.is_cuda() && bias_t.scalar_type() == torch::kBFloat16,
-                    "fp8 gemm bias must be a CUDA bf16 tensor");
-        TORCH_CHECK(bias_t.dim() == 1 && bias_t.size(0) == n,
-                    "fp8 gemm bias must be 1D of length n=", n);
-        TORCH_CHECK(bias_t.is_contiguous(), "fp8 gemm bias must be contiguous");
-        p.bias_ptr = bias_t.data_ptr();
-    }
-    p.batch = static_cast<int>(batch);
-    p.a_batch_stride = (batch_a == 1 && batch > 1) ? 0 : a_bstride;
-    p.b_batch_stride = (batch_b == 1 && batch > 1) ? 0 : b_bstride;
-    p.out_batch_stride = m * n;
-    p.out_ld = static_cast<int>(n);
-    launch_gemm(a.scalar_type() == torch::kFloat8_e4m3fn ? FP8Format::E4M3
-                                                         : FP8Format::E5M2,
-                p, stream.stream(), tag_a, tag_b);
-    C10_CUDA_CHECK(cudaGetLastError());
-    return output;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Quantized-GEMM entries: W8A16 / W8A8 / W16A16 over the dtype-generic
+// quant_gemm: the single quantized-GEMM entry over the dtype-generic
 // dispatch. Scale semantics follow GemmParams: one float32 element is the
 // per-tensor device scalar; a 1-D float32 tensor of the operand's extent
 // is per-row (activations) / per-channel (weights), applied in the epilogue.
@@ -183,9 +98,8 @@ QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent,
     return {s.data_ptr<float>(), s.numel() == 1 ? 0 : (int)extent};
 }
 
-// Shared body of the three entries: everything but the dtype dispatch and
-// the scales mirrors mm_fp8 (batch broadcast rules, zero-copy transposed
-// views, fused bf16 bias).
+// Shared body of quant_gemm: batch broadcast rules, zero-copy transposed
+// views, fused bf16 bias, and the dtype-pair dispatch.
 torch::Tensor mm_quant(const torch::Tensor& a, const torch::Tensor& b,
                        const QuantScale& sa, const QuantScale& sb,
                        bool trans_a, bool trans_b, py::object bias) {
@@ -265,10 +179,23 @@ torch::Tensor mm_quant(const torch::Tensor& a, const torch::Tensor& b,
     } else if (dt_a == torch::kBFloat16 && dt_b == torch::kBFloat16) {
         gemm_dispatch<__nv_bfloat16, __nv_bfloat16>(p, stream.stream(), tag_a,
                                                     tag_b);
+    } else if (dt_a == torch::kBFloat16 && dt_b == torch::kFloat8_e4m3fn) {
+        gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>(p, stream.stream(), tag_a,
+                                                    tag_b);
+    } else if (dt_a == torch::kBFloat16 && dt_b == torch::kFloat8_e5m2) {
+        gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>(p, stream.stream(), tag_a,
+                                                    tag_b);
+    } else if (dt_a == torch::kFloat8_e4m3fn && dt_b == torch::kFloat8_e4m3fn) {
+        gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(p, stream.stream(), tag_a,
+                                                    tag_b);
+    } else if (dt_a == torch::kFloat8_e5m2 && dt_b == torch::kFloat8_e5m2) {
+        gemm_dispatch<__nv_fp8_e5m2, __nv_fp8_e5m2>(p, stream.stream(), tag_a,
+                                                    tag_b);
     } else {
         TORCH_CHECK(false,
                     "unsupported operand dtype pair: expected bf16 x int8 "
-                    "(W8A16), int8 x int8 (W8A8), or bf16 x bf16 (W16A16)");
+                    "(W8A16), int8 x int8 (W8A8), bf16 x bf16 (W16A16), bf16 "
+                    "x fp8 (W-F8A16), or matching fp8 x fp8");
     }
     C10_CUDA_CHECK(cudaGetLastError());
     return output;
@@ -276,51 +203,62 @@ torch::Tensor mm_quant(const torch::Tensor& a, const torch::Tensor& b,
 
 }  // namespace
 
-torch::Tensor mm_w8a16(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
-                       bool trans_a, bool trans_b, py::object bias) {
-    TORCH_CHECK(a.scalar_type() == torch::kBFloat16 &&
-                    b.scalar_type() == torch::kChar,
-                "mm_w8a16 expects a bf16 activation and an int8 weight");
-    const int64_t n = trans_b ? b.size(-2) : b.size(-1);
-    return mm_quant(a, b, {}, resolve_quant_scale(scale, n, "w_scale"),
-                    trans_a, trans_b, bias);
-}
-
-torch::Tensor mm_w8a8(torch::Tensor a, torch::Tensor b, torch::Tensor a_scale,
-                      torch::Tensor w_scale, bool trans_a, bool trans_b,
-                      py::object bias) {
-    TORCH_CHECK(a.scalar_type() == torch::kChar &&
-                    b.scalar_type() == torch::kChar,
-                "mm_w8a8 expects int8 operands");
+// The single quantized-GEMM entry. The dtype pair picks the kernel:
+//   bf16 x bf16 (W16A16)        — no scales
+//   bf16 x int8 (W8A16)         — b_scale required
+//   int8 x int8 (W8A8)          — both scales required
+//   bf16 x fp8 (W-F8A16)        — b_scale optional
+//   fp8 x fp8, matching formats — both scales optional
+// Scale arity is validated per side: int8 requires its dequant scale, fp8
+// takes one optionally (per-tensor scalar or the operand's extent), bf16
+// (nothing to dequant) rejects it.
+torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
+                         py::object b_scale, bool trans_a, bool trans_b,
+                         py::object bias) {
+    const auto dt_a = a.scalar_type(), dt_b = b.scalar_type();
+    const bool i8a = dt_a == torch::kChar, i8b = dt_b == torch::kChar;
+    const bool f8a =
+        dt_a == torch::kFloat8_e4m3fn || dt_a == torch::kFloat8_e5m2;
+    const bool f8b =
+        dt_b == torch::kFloat8_e4m3fn || dt_b == torch::kFloat8_e5m2;
+    const bool b16a = dt_a == torch::kBFloat16, b16b = dt_b == torch::kBFloat16;
+    TORCH_CHECK((b16a && (b16b || i8b || f8b)) || (i8a && i8b) ||
+                    (f8a && f8b && dt_a == dt_b),
+                "quant_gemm: unsupported dtype pair (a=", toString(dt_a),
+                ", b=", toString(dt_b),
+                "): expected bf16 x bf16/int8/fp8, int8 x int8, or matching "
+                "fp8 x fp8");
+    if (f8a || f8b) check_fp8_device(a);
     const int64_t m = trans_a ? a.size(-1) : a.size(-2);
     const int64_t n = trans_b ? b.size(-2) : b.size(-1);
-    return mm_quant(a, b, resolve_quant_scale(a_scale, m, "a_scale"),
-                    resolve_quant_scale(w_scale, n, "w_scale"), trans_a,
+    auto opt_scale = [&](py::object s, int64_t extent, const char* name,
+                         bool i8_side, bool bf16_side) -> QuantScale {
+        if (s.is_none()) {
+            TORCH_CHECK(!i8_side, "quant_gemm: ", name,
+                        " is required for an int8 operand");
+            return {nullptr, 0};
+        }
+        TORCH_CHECK(!bf16_side, "quant_gemm: ", name,
+                    " given for a bf16 operand (nothing to dequant)");
+        torch::Tensor t;
+        try {
+            t = s.cast<torch::Tensor>();
+        } catch (const py::cast_error&) {
+            TORCH_CHECK(false, name, " must be a torch.Tensor or None");
+        }
+        return resolve_quant_scale(t, extent, name);
+    };
+    return mm_quant(a, b, opt_scale(a_scale, m, "a_scale", i8a, b16a),
+                    opt_scale(b_scale, n, "b_scale", i8b, b16b), trans_a,
                     trans_b, bias);
-}
-
-torch::Tensor mm_w16a16(torch::Tensor a, torch::Tensor b, bool trans_a,
-                        bool trans_b, py::object bias) {
-    TORCH_CHECK(a.scalar_type() == torch::kBFloat16 &&
-                    b.scalar_type() == torch::kBFloat16,
-                "mm_w16a16 expects bf16 operands");
-    return mm_quant(a, b, {}, {}, trans_a, trans_b, bias);
 }
 
 }  // namespace gemm
 }  // namespace astrai
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("mm_fp8", &astrai::gemm::mm_fp8, py::arg("a"), py::arg("b"), py::arg("scale"),
-          py::arg("trans_a") = false, py::arg("trans_b") = false,
-          py::arg("bias") = py::none());
-    m.def("mm_w8a16", &astrai::gemm::mm_w8a16, py::arg("a"), py::arg("b"),
-          py::arg("w_scale"), py::arg("trans_a") = false,
-          py::arg("trans_b") = true, py::arg("bias") = py::none());
-    m.def("mm_w8a8", &astrai::gemm::mm_w8a8, py::arg("a"), py::arg("b"),
-          py::arg("a_scale"), py::arg("w_scale"), py::arg("trans_a") = false,
-          py::arg("trans_b") = true, py::arg("bias") = py::none());
-    m.def("mm_w16a16", &astrai::gemm::mm_w16a16, py::arg("a"), py::arg("b"),
+    m.def("quant_gemm", &astrai::gemm::quant_gemm, py::arg("a"), py::arg("b"),
+          py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
           py::arg("trans_a") = false, py::arg("trans_b") = true,
           py::arg("bias") = py::none());
 }

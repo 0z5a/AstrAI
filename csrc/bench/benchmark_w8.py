@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from astrai.extension import is_available
-from astrai.extension.ops.gemm import mm_w8a8, mm_w8a16, mm_w16a16
+from astrai.extension.ops.gemm import quant_gemm
 from astrai.extension.quantize import quantize_act_int8, quantize_weight_int8
 
 # GEMM shapes as (N, K) weight mats; M comes from --m-values.
@@ -114,9 +114,9 @@ def benchmark_gemm(
     samples = measure_operations(
         {
             "bf16": lambda: F.linear(x, w),
-            "w16a16": lambda: mm_w16a16(x, w),
-            "w8a16": lambda: mm_w8a16(x, w8, ws),
-            "w8a8": lambda: mm_w8a8(x8, w8, xs, ws),
+            "w16a16": lambda: quant_gemm(x, w),
+            "w8a16": lambda: quant_gemm(x, w8, b_scale=ws),
+            "w8a8": lambda: quant_gemm(x8, w8, a_scale=xs, b_scale=ws),
         },
         warmup=warmup,
         iterations=iterations,
@@ -126,9 +126,12 @@ def benchmark_gemm(
     flops = 2.0 * m * n * k
     tfs = {key: flops / (ms * 1e-3) / 1e12 for key, ms in med.items()}
     err = {
-        "w16a16": (mm_w16a16(x, w).float() - ref16).abs().max().item(),
-        "w8a16": (mm_w8a16(x, w8, ws).float() - ref816).abs().max().item(),
-        "w8a8": (mm_w8a8(x8, w8, xs, ws).float() - ref88).abs().max().item(),
+        "w16a16": (quant_gemm(x, w).float() - ref16).abs().max().item(),
+        "w8a16": (quant_gemm(x, w8, b_scale=ws).float() - ref816).abs().max().item(),
+        "w8a8": (quant_gemm(x8, w8, a_scale=xs, b_scale=ws).float() - ref88)
+        .abs()
+        .max()
+        .item(),
     }
     print(
         f"{name},{m}x{n}x{k},{med['bf16']:.4f},{med['w16a16']:.4f},"

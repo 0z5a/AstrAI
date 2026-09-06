@@ -1,7 +1,7 @@
 """FP8 primitives: kernel-level (CUDA) and policy-level (CPU-verifiable) tests.
 
 The kernel-level tests exercise the two stateless primitives (``quantize`` for
-bf16/fp16/fp32 -> FP8, ``mm_fp8`` for the pre-quantized GEMM with transposed
+bf16/fp16/fp32 -> FP8, ``quant_gemm`` for the pre-quantized GEMM with transposed
 operands); the policy-level tests (recipes, autocast context, per-tensor
 meta) run without a GPU. The primitives themselves are CUDA-only
 (attention-style direct wrappers — no torch.library dispatch layer).
@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 import astrai.extension.quantize as f8mod
-from astrai.extension.ops.gemm import mm_fp8
+from astrai.extension.ops.gemm import quant_gemm
 from astrai.extension.ops.quantize import quantize, quantize_dual
 from astrai.extension.quantize import (
     FP8Format,
@@ -58,7 +58,7 @@ def test_fp8_mm_matches_explicit_quantization(m, n, k):
     scale_b = _scale(b)
     a8, _ = quantize(a, scale_a.reciprocal(), "e4m3")
     b8, _ = quantize(b, scale_b.reciprocal(), "e4m3")
-    out = mm_fp8(a8, b8, scale_a * scale_b)
+    out = quant_gemm(a8, b8, a_scale=scale_a * scale_b, trans_b=False)
     expected = (_quantize(a, scale_a) @ _quantize(b, scale_b) * scale_a * scale_b).to(
         torch.bfloat16
     )
@@ -99,8 +99,8 @@ def test_quantize_e5m2_format():
 @skip_no_fp8
 @pytest.mark.parametrize("trans_a", [False, True])
 @pytest.mark.parametrize("trans_b", [False, True])
-def test_mm_fp8_transposed_operands(trans_a, trans_b):
-    """mm_fp8 handles all four operand layouts via trans_a/trans_b."""
+def test_quant_gemm_transposed_operands(trans_a, trans_b):
+    """quant_gemm handles all four operand layouts via trans_a/trans_b."""
     torch.manual_seed(17)
     m, n, k = 19, 13, 37
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)  # A [M][K]
@@ -111,7 +111,7 @@ def test_mm_fp8_transposed_operands(trans_a, trans_b):
     a_op = a8.t().contiguous() if trans_a else a8
     b_op = b8 if trans_b else b8.t().contiguous()
 
-    out = mm_fp8(a_op, b_op, sa * sb, trans_a=trans_a, trans_b=trans_b)
+    out = quant_gemm(a_op, b_op, a_scale=sa * sb, trans_a=trans_a, trans_b=trans_b)
     assert out.shape == (m, n)
     expected = (_quantize(a, sa) @ _quantize(b, sb).t() * sa * sb).to(torch.bfloat16)
     torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
@@ -119,7 +119,7 @@ def test_mm_fp8_transposed_operands(trans_a, trans_b):
 
 @skip_no_fp8
 @pytest.mark.parametrize("bias_on", [False, True])
-def test_mm_fp8_fused_bias(bias_on):
+def test_quant_gemm_fused_bias(bias_on):
     """Epilogue-fused bias matches the unfused out + bias reference (single
     fp32 rounding vs the reference's double rounding keeps it within 1 ulp),
     including N-tail columns and batched broadcast."""
@@ -132,7 +132,9 @@ def test_mm_fp8_fused_bias(bias_on):
     b8, _ = quantize(b, sb.reciprocal(), "e4m3")
     bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
 
-    out = mm_fp8(a8, b8, sa * sb, trans_b=True, bias=bias if bias_on else None)
+    out = quant_gemm(
+        a8, b8, a_scale=sa * sb, trans_b=True, bias=bias if bias_on else None
+    )
     base = (_quantize(a, sa) @ _quantize(b, sb).t() * sa * sb).to(torch.bfloat16)
     expected = base + bias if bias_on else base
     # bias is O(1) against O(sqrt(k)) accumulators: absolute tolerance rules
@@ -142,7 +144,7 @@ def test_mm_fp8_fused_bias(bias_on):
     # its own reference from its own operand values).
     ab = torch.randn(3, m, k, device="cuda", dtype=torch.bfloat16)
     ab8, _ = quantize(ab, sa.reciprocal(), "e4m3")
-    outb = mm_fp8(ab8, b8, sa * sb, trans_b=True, bias=bias)
+    outb = quant_gemm(ab8, b8, a_scale=sa * sb, trans_b=True, bias=bias)
     assert outb.shape == (3, m, n)
     for i in range(3):
         expected_b = (_quantize(ab[i], sa) @ _quantize(b, sb).t() * sa * sb).to(
@@ -154,7 +156,7 @@ def test_mm_fp8_fused_bias(bias_on):
 @skip_no_fp8
 @pytest.mark.parametrize("trans_a", [False, True])
 @pytest.mark.parametrize("trans_b", [False, True])
-def test_mm_fp8_batched(trans_a, trans_b):
+def test_quant_gemm_batched(trans_a, trans_b):
     """3D operands run as one bmm launch: all four layouts, odd shapes."""
     torch.manual_seed(23)
     batch, m, n, k = 4, 19, 13, 37
@@ -166,7 +168,7 @@ def test_mm_fp8_batched(trans_a, trans_b):
     a_op = a8.transpose(-2, -1).contiguous() if trans_a else a8
     b_op = b8 if trans_b else b8.transpose(-2, -1).contiguous()
 
-    out = mm_fp8(a_op, b_op, sa * sb, trans_a=trans_a, trans_b=trans_b)
+    out = quant_gemm(a_op, b_op, a_scale=sa * sb, trans_a=trans_a, trans_b=trans_b)
     assert out.shape == (batch, m, n)
     # flags + transposed buffers reconstruct the original operands: the math
     # is always A_orig @ B_orig^T regardless of the layout combination.
@@ -177,7 +179,7 @@ def test_mm_fp8_batched(trans_a, trans_b):
 
 
 @skip_no_fp8
-def test_mm_fp8_batched_broadcast():
+def test_quant_gemm_batched_broadcast():
     """A size-1 batch broadcasts across the other operand (matmul rules),
     and a 2D operand broadcasts across a 3D one."""
     torch.manual_seed(29)
@@ -188,7 +190,7 @@ def test_mm_fp8_batched_broadcast():
     a8, _ = quantize(a, sa.reciprocal(), "e4m3")
     b8, _ = quantize(b, sb.reciprocal(), "e4m3")
 
-    out = mm_fp8(a8, b8, sa * sb, trans_b=True)
+    out = quant_gemm(a8, b8, a_scale=sa * sb, trans_b=True)
     assert out.shape == (batch, m, n)
     expected = (_quantize(a, sa) @ _quantize(b, sb).transpose(-2, -1) * sa * sb).to(
         torch.bfloat16
@@ -197,13 +199,13 @@ def test_mm_fp8_batched_broadcast():
 
     # 2D weight broadcast over 3D activations
     w8 = b8[0]
-    out2 = mm_fp8(a8, w8, sa * sb, trans_b=True)
+    out2 = quant_gemm(a8, w8, a_scale=sa * sb, trans_b=True)
     assert out2.shape == (batch, m, n)
     torch.testing.assert_close(out2, expected, atol=0.125, rtol=0.01)
 
 
 @skip_no_fp8
-def test_mm_fp8_col_major_view_zero_copy():
+def test_quant_gemm_col_major_view_zero_copy():
     """An inner-transposed view (.t() of a contiguous buffer) folds into the
     layout tag with no device copy — the only allocation is the output."""
     torch.manual_seed(31)
@@ -216,7 +218,7 @@ def test_mm_fp8_col_major_view_zero_copy():
 
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
-    out = mm_fp8(a8.t(), b8, sa * sb, trans_a=True, trans_b=True)
+    out = quant_gemm(a8.t(), b8, a_scale=sa * sb, trans_a=True, trans_b=True)
     torch.cuda.synchronize()
     grew = torch.cuda.memory_allocated() - before
     assert grew == out.numel() * out.element_size()  # no operand copy
@@ -364,7 +366,7 @@ def test_fp8_linear_backward_outside_autocast():
 
 
 @skip_no_fp8
-def test_mm_fp8_matches_scaled_mm():
+def test_quant_gemm_matches_scaled_mm():
     torch.manual_seed(11)
     m, n, k = 512, 4096, 4096
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -373,7 +375,7 @@ def test_mm_fp8_matches_scaled_mm():
     sb = _scale(b)
     a8, _ = quantize(a, sa.reciprocal(), "e4m3")
     b8, _ = quantize(b, sb.reciprocal(), "e4m3")
-    out = mm_fp8(a8, b8, sa * sb)
+    out = quant_gemm(a8, b8, a_scale=sa * sb, trans_b=False)
     assert out.dtype == torch.bfloat16
     assert out.shape == (m, n)
 
