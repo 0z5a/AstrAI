@@ -162,6 +162,19 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* bar, uint32_t count) {
 #endif
 }
 
+// Plain arrival (no transaction expectation): the TMA pipeline's
+// consumer-side release — every thread arrives on the stage's empty
+// barrier after its last fragment read, and the producer waits that
+// barrier's phase before overwriting the slot.
+__device__ __forceinline__ void mbarrier_arrive(uint64_t* bar) {
+#if ASTRAI_MBAR_ENABLED
+    const uint32_t addr = __cvta_generic_to_shared(bar);
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(addr));
+#else
+    (void)bar;
+#endif
+}
+
 // Arrive with a transaction-count expectation: the barrier trips only
 // after `bytes` of async copies (TMA) have landed in addition to the
 // arrival itself. The TMA-issuing producer thread calls this once per

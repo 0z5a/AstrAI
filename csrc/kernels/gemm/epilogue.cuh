@@ -47,6 +47,10 @@ struct GemmCollectiveEpilogue {
     using Traits = typename Policy::Traits;
     using OutT = typename Policy::OutT;
     using OE = OutElem<OutT>;
+    // The mainloop's accumulator element: fp32 for the float mma families,
+    // int32 for the native s8 pair — the scale/bias folding below applies
+    // after the int->float conversion, so both share one scatter path.
+    using AccT = typename Traits::AccT;
     static constexpr bool kStreamOut = Policy::kStreamOut;
     static constexpr int kBlockM = Traits::kBlockM;
     static constexpr int kBlockN = Traits::kBlockN;
@@ -114,7 +118,7 @@ struct GemmCollectiveEpilogue {
     // tile coherent, then the whole CTA copies it out in fully-coalesced
     // 16B chunks. The 16B-chunk XOR swizzle keeps both the scatter and the
     // gather conflict-free.
-    __device__ __forceinline__ void stage(float acc[kNt][kMt][4]) const {
+    __device__ __forceinline__ void stage(AccT acc[kNt][kMt][4]) const {
         // Fused bias: added to the fp32 accumulator before the single bf16
         // rounding. The per-lane loads are L1 broadcasts; rows past the
         // edge skip the load (their smem slots never copy out). Under
@@ -145,19 +149,19 @@ struct GemmCollectiveEpilogue {
                     const float rfac8 = a_scale && bias_row0 + r0 + 8 < m
                             ? a_scale[bias_row0 + r0 + 8]
                             : 1.0f;
-                    const float* tile_acc = acc[nt][mt];
+                    const AccT* tile_acc = acc[nt][mt];
                     // Two bf16x2 stores per accumulator tile: rows g and
                     // g+8 of the m16n8 output, columns tig*2/tig*2+1 inside
                     // one 16B chunk.
                     const int off = col & (OE::kChunkElems - 1);  // in-chunk elems
                     *reinterpret_cast<typename OE::T2*>(
                         out_chunk(r0, col >> OE::kChunkShift) + off) =
-                        OE::pack2(tile_acc[0] * output_scale * rfac * c0 + b0,
-                                  tile_acc[1] * output_scale * rfac * c1 + b1);
+                        OE::pack2((float)tile_acc[0] * output_scale * rfac * c0 + b0,
+                                  (float)tile_acc[1] * output_scale * rfac * c1 + b1);
                     *reinterpret_cast<typename OE::T2*>(
                         out_chunk(r0 + 8, col >> OE::kChunkShift) + off) =
-                        OE::pack2(tile_acc[2] * output_scale * rfac8 * c0 + b0,
-                                  tile_acc[3] * output_scale * rfac8 * c1 + b1);
+                        OE::pack2((float)tile_acc[2] * output_scale * rfac8 * c0 + b0,
+                                  (float)tile_acc[3] * output_scale * rfac8 * c1 + b1);
                 }
             }
         } else {
@@ -193,11 +197,11 @@ struct GemmCollectiveEpilogue {
                     const float r1f = a_scale && bias_col0 + col + 1 < n
                         ? a_scale[bias_col0 + col + 1]
                         : 1.0f;
-                    const float* tile_acc = acc[nt][mt];
-                    *out_elem(col, r0) = OE::cvt(tile_acc[0] * output_scale * r0f * c + b);
-                    *out_elem(col + 1, r0) = OE::cvt(tile_acc[1] * output_scale * r1f * c + b);
-                    *out_elem(col, r0 + 8) =  OE::cvt(tile_acc[2] * output_scale * r0f * c8 + b8);
-                    *out_elem(col + 1, r0 + 8) = OE::cvt(tile_acc[3] * output_scale * r1f * c8 + b8);
+                    const AccT* tile_acc = acc[nt][mt];
+                    *out_elem(col, r0) = OE::cvt((float)tile_acc[0] * output_scale * r0f * c + b);
+                    *out_elem(col + 1, r0) = OE::cvt((float)tile_acc[1] * output_scale * r1f * c + b);
+                    *out_elem(col, r0 + 8) =  OE::cvt((float)tile_acc[2] * output_scale * r0f * c8 + b8);
+                    *out_elem(col + 1, r0 + 8) = OE::cvt((float)tile_acc[3] * output_scale * r1f * c8 + b8);
                 }
             }
         }
@@ -246,7 +250,7 @@ struct GemmCollectiveEpilogue {
         }
     }
 
-    __device__ __forceinline__ void run(float acc[kNt][kMt][4], OutT* out) {
+    __device__ __forceinline__ void run(AccT acc[kNt][kMt][4], OutT* out) {
         stage(acc);
         __syncthreads();
         store(out);

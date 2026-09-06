@@ -125,8 +125,8 @@ replacing the per-k-tile `(tile % ring) * stage_bytes` recomputation
 buffers: the load for tile `i+kStages` targets slot `(i-1)%(kStages+1)`,
 which compute(i-1) finished reading before this iteration's barrier — no
 post-compute barrier, one `__syncthreads` per k-tile. Prologue and tail
-commits are unconditional so the group sequence stays tile-indexed and the
-fixed `wait_group<kStages-1>` is iteration-invariant (a runtime
+commits are unconditional so the group sequence stays tile-indexed and
+the fixed `wait_group<kStages-1>` is iteration-invariant (a runtime
 wait-count dispatch ladder cost 16 instructions/k-tile). A lean
 `kStages`-deep ring trading the barrier for a 4th resident CTA measured
 +5..9% slower at 1280³ and was removed. The final iteration carries no
@@ -140,6 +140,52 @@ discipline itself (prologue commit, steady wait, tail commit) runs through
 the `PipelineSync` stage-pipeline type of `common/pipeline.cuh` — the
 sm_80/89 backing of the shared producer/consumer surface that
 `PipelineMbarrier` (sm_90+, TMA) implements on the other generation.
+
+**TMA staging (sm_90+, dual-congruous operands).** The congruous rings
+can also be fed by TMA (`common/tma.cuh`): the staging swizzles already
+ARE the TMA hardware modes (`<3,3>` = SWIZZLE_128B for 2-byte elements,
+`<2,3>` = SWIZZLE_64B for 1-byte), so fragment addressing, ring slots
+and the epilogue reclaim are untouched — only the load/wait discipline
+changes. The templating follows the staging types: `TmaSwizzleOf<Staged>`
+derives the swizzle enum and the box's inner extent (the mode's span)
+from the declared `ComposedLayout`, and `tma_spec<Elem, Staged, BoxRows>`
+fills only the runtime geometry — the map cannot drift from what the
+fragments read. Each operand's rank is a template bit on
+`GemmTmaContext` / `gemm_kernel_tma` (strided batch = 3D emitter,
+broadcast = shared 2D map), so the per-stage 2D/3D issue pick compiles
+away; the launcher dispatches the four rank combinations. One elected
+thread arms a per-slot mbarrier with `arrive.expect_tx` and issues the
+boxes; OOB coordinates zero-fill, which absorbs the
+k tail and edge tiles the cp.async zfill iterators predicated per chunk.
+Two TMA-specific invariants: the swizzle applies to the ABSOLUTE shared
+address, so the ring base rounds up to 1024B (budgeted in
+`Policy::kSmemBytes` together with the barrier array); and the pipeline
+is the CUTLASS `PipelineTmaAsync` handshake — `full[slot]` (count 1,
+expect_tx) for arrival, `empty[slot]` (count = CTA threads, every
+consumer arrives after its last fragment read) for release — which
+REPLACES the per-k-tile `__syncthreads`: warps skew freely across slots
+and the producer's overwrite gate is the empty phase alone. A phase-1
+variant that kept the `__syncthreads` (mbarrier only replacing
+`wait_group`) measured 2-4% SLOWER than cp.async on RTX 5090 — the
+CTA-join elimination is the win, not the TMA issue itself; the full
+handshake measures +3..7% over cp.async across the llama shapes (largest
+on the bf16 pair, whose fat operands pay the most issue slots).
+Descriptors are host-encoded (`cuTensorMapEncodeTiled` via dlsym — no
+link-line changes) and cached exact-match, so steady-state calls pay the
+few-microsecond encode once. The planner gates TMA on the device's
+compute capability, dual-congruous layouts, 1-/2-byte dtypes and
+descriptor encodability (misaligned base/ld falls back to the cp.async
+twin, which stays compiled); `ASTR_GEMM_NO_TMA=1` forces the fallback
+for experiments.
+
+**Stage depth.** The manifest carries s3 deep-ring siblings of the big
+and narrow tiles (`TileBig128x128s3` etc., humming's `_fit_num_stages`
+rule — the thinner the operand pair, the more smem headroom under the
+96KB budget). RTX 5090 measured them a wash to -1.3% on the cp.async
+rings (three buffers already hide the LDGSTS latency), so the congruous
+scan keeps s2 on ties; `ASTR_GEMM_S3=1` flips the preference — the
+calibration knob for staging variants whose latency profile differs
+(the TMA rings in particular).
 
 **Crosswise loads.** Crosswise operands (A `[K][M]` / B `[N][K]` storage)
 cannot cp.async into the canonical tile; they take the direct LDG.128×4 +
@@ -218,13 +264,40 @@ operand pair hits.
 
 The same mainloop serves every dtype pairing through one promotion rule
 (`gemm_mma_traits`): the mma runs on the **MmaT** — symmetric fp8 keeps its
-native `m16n8k32`, symmetric bf16 (W16A16) passes through untouched, and
-any pair involving int8 (W8A16 weight-only, W8A8 dynamic, or the mirrored
-A8W16) promotes to bf16 `m16n8k16` with per-operand in-register dequant
-(`kDequantA` / `kDequantB` — W8A8 inserts both sides, W8A16 only B).
-Staging never changes: int8 operands ride the existing congruous
-cp.async / crosswise PRMT paths into the canonical swizzled tiles, and
-`kMmaK` follows the promoted type so the tile geometry is shared.
+native `m16n8k32`, symmetric bf16 (W16A16) passes through untouched,
+**symmetric int8 (W8A8) keeps its native `m16n8k32.s8.s8.s32`** (int32
+accumulators; `.satfinite` clamps the wrap all-max-magnitude K≈16k inputs
+could reach — the standard production int8-GEMM semantics), and a *lone*
+int8 (W8A16 weight-only or the mirrored A8W16) promotes to bf16
+`m16n8k16` with per-operand in-register dequant (`kDequantA` /
+`kDequantB` — W8A16 only B). Staging never changes: int8 operands ride
+the existing congruous cp.async / crosswise PRMT paths into the canonical
+swizzled tiles, and `kMmaK` follows the mma cell (the `MmaShapeFor`
+trait) so the tile geometry is shared — the native s8 pair reuses the
+fp8 k32 fragment layouts verbatim (1-byte dtypes share the packed
+two-per-b16-slot layout, so ldmatrix addressing is identical).
+
+**Mma trait layer (common/mma.cuh, humming's compile-time format).** The
+instruction vocabulary assembles from two specializable traits:
+`MmaShapeFor<Dtype>` maps an input dtype to its instruction `Shape<M, N,
+K>` (primary template undefined — a dtype with no MMA is a compile error;
+K follows the 256-bit A-fragment invariant: bf16 k16, 1-byte dtypes k32;
+`kMinArch` encodes each instruction's hardware floor as a build-time
+assert), and `MmaOp<A, B, Shape>` — one specialization per
+instantiated pairing cell carrying the accumulator type, register counts
+and the dedicated asm block. `mma_sync<InT>` remains as the fp32-family
+convenience view (attention + tests); the gemm mainloop calls
+`Traits::MmaOp::fma` directly so the accumulator type rides the cell
+(fp32 for float families, s32 for s8). `Shape` itself lives in
+`common/shape.cuh` — the shared static-geometry vocabulary the policy,
+staging and mma layers all spell.
+
+The switch from the dequant-promoted W8A8 (measured at 162-198 TF,
+0.92× cuBLAS bf16 on the RTX 5090) to the native s8 mma delivers
+520-650 TF — 2.6-3.0× cuBLAS bf16 end-to-end, ~3× the old path at
+identical staging and tile choices (kPlanEff's kW8A8 scalars held; the
+relative tile efficiencies barely moved with the mma no longer the
+bottleneck).
 
 **Dequant (quantize/dequant.cuh).** Each fragment register pair costs one
 `LDS.16` + four LOP3-class instructions, exact for the full int8 range
@@ -242,9 +315,11 @@ PRMT; deferred until measurement justifies a repack pass.
 **Scales.** `GemmParams` carries per-operand dequant scales folded
 multiplicatively into the epilogue (the mma accumulates the raw quantized
 product): per-tensor device scalar, per-row activation `a_scale[m]`, or
-per-channel weight `b_scale[n]`. Grouped-along-K scales belong in the
-mainloop and are not implemented. The transposed-output epilogue branch
-applies `b_scale`/bias per kernel row — including the +8 accumulator half
+per-channel weight `b_scale[n]`. The epilogue applies them after the
+accumulator's int→float conversion, so the s32 path shares one scatter
+code. Grouped-along-K scales belong in the mainloop and are not
+implemented. The transposed-output epilogue branch applies
+`b_scale`/bias per kernel row — including the +8 accumulator half
 (its own row factor), a pre-existing mixup the first scale-carrying
 NN-swap test exposed.
 
@@ -268,17 +343,21 @@ W16A16 baseline within a few percent.
 **Humming parity (what we deliberately have and have not).** Adopted from
 humming: in-register LOP3 dequant, the dtype-promotion unified mainloop,
 per-operand epilogue scale placement, the CUTLASS-style
-`Shape`/`GemmTileConfig` vocabulary, and the device-parameterized launch
+`Shape`/`GemmTileConfig` vocabulary, the device-parameterized launch
 planning (the `DeviceFacts` wave-count model plus the L2-budget raster
-rule from humming's tune heuristics). Not adopted, in rough priority order
+rule from humming's tune heuristics), and — since the TMA staging — the
+sm90+ load/PDMA vocabulary (TMA descriptors + the `PipelineMbarrier`-style
+full/empty handshake humming's sm120 heuristics enable for WnA16). Not
+adopted, in rough priority order
 for future work: grouped-along-K / 2-D block scales (GPTQ/AWQ import —
 needs mainloop scale application, the epilogue cannot fold them),
 asymmetric quantization with zero-points (offline folding at repack time),
 sub-int8 dtypes (int4 and 3/5/6/7-bit need packed staging + a second
-dequant family), the offline weight interleave (documented deferred above),
-stream-K (wave-quantization; persistent scheduling alone measured worse
-here), and the sm90+ feature set (TMA/cluster/warp-spec/PDL — a different
-device target). Out of scope by design: NVRTC JIT and MoE
+dequant family), the offline weight interleave (documented deferred
+above), stream-K (wave-quantization; persistent scheduling alone measured
+worse here), and warp specialization / cluster / PDL (the TMA producer is
+currently an elected thread of the math CTA, not a dedicated warp). Out
+of scope by design: NVRTC JIT and MoE
 gather/grouped GEMM (the JIT-per-SM-heuristic idea survives AOT as the
 per-dtype-class `kPlanEff` table, calibrated by the tile bench). We keep
 two things humming lacks: strided-batch operands with broadcast, and fp32

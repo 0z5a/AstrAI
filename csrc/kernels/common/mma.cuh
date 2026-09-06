@@ -1,12 +1,28 @@
 // Shared mma.sync wrappers — pure CUDA, no torch.
 //
-// One template for every tensor-core MMA used by the kernel families. The
-// instruction shape follows from the input element type:
-//   __nv_bfloat16        -> mma.sync.aligned.m16n8k16 (sm_80+), A = 4x b32, B = 2x b32
-//   __nv_fp8_e4m3/e5m2   -> mma.sync.aligned.m16n8k32 (sm_89+), A = 4x b32, B = 2x b32
-// All variants accumulate into fp32: d = a*b + c, with the PTX mnemonic and
-// the K dimension differing per type. `d` may alias `c` (in-place accumulate,
-// as the FP8 GEMM does).
+// The instruction vocabulary is assembled from two trait layers (the
+// humming codegen's compile-time format, hand-written):
+//
+//   MmaShapeFor<Dtype> — instruction shape per input dtype. The primary
+//      template is UNDEFINED: a dtype with no tensor-core MMA is a compile
+//      error at the use site, not a silent fallback. The K extent follows
+//      the 256-bit A-fragment invariant (16B per lane row): bf16 k16, the
+//      1-byte dtypes k32. kMinArch encodes each instruction's hardware
+//      floor — the one place the requirement lives. (humming also keys on
+//      an Arch tag for its sm_75 Turing thin-instruction correction; every
+//      AstrAI target is sm_80+, where one shape serves all archs, so the
+//      arch dimension collapses into kMinArch's build-time assert.)
+//
+//   MmaOp<A, B, Shape> — one specialization per instantiated
+//      <dtype-pair, shape> cell: accumulator type, register counts and the
+//      dedicated asm block. Mixed dtype pairs never reach the tensor core
+//      (the gemm promotes both sides to MmaT first), so every cell is
+//      symmetric; the A/B parameters keep the pairing explicit.
+//
+// All floating-point variants accumulate into fp32; the s8 pair accumulates
+// into s32 (satfinite clamps the wrap that all-max-magnitude K~16k inputs
+// could reach — the standard production int8-GEMM semantics). `d` may alias
+// `c` (in-place accumulate, as the FP8 GEMM does).
 
 #pragma once
 
@@ -17,6 +33,7 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
+#include "shape.cuh"
 
 #define DEVICE_FORCEINLINE static __device__ __forceinline__
 
@@ -24,7 +41,7 @@ namespace astrai {
 
 // Compute capability of the current compilation pass: 0 in the host pass,
 // the numeric CC (e.g. 890) in device passes where __CUDA_ARCH__ is defined.
-// Defined() cannot appear in expressions, so this macro lets mma_sync use
+// Defined() cannot appear in expressions, so this macro lets the mma ops use
 // the arch in a static_assert instead of per-branch #if guards.
 #ifndef __CUDA_ARCH__
 #define ASTRAI_DEVICE_ARCH 0
@@ -32,60 +49,70 @@ namespace astrai {
 #define ASTRAI_DEVICE_ARCH __CUDA_ARCH__
 #endif
 
-// Compile-time shape of the MMA instruction for an input element type.
-// `min_arch` is the numeric compute capability the instruction requires —
-// the single place that encodes the hardware floor for each type.
-template <typename InT>
-struct mma_shape {
-    static constexpr int k = 16;         // m16n8k16
-    static constexpr int a_regs = 4;     // A fragment: 4x b32
-    static constexpr int b_regs = 2;     // B fragment: 2x b32
-    static constexpr int min_arch = 800; // bf16 mma.sync, sm_80+
+// --- <Dtype> -> instruction shape ------------------------------------------
+// Primary template undefined: illegal <Dtype> combinations fail at compile
+// time. Specializations spell one Shape<M, N, K> each.
+template <typename Dtype>
+struct MmaShapeFor;
+
+template <>
+struct MmaShapeFor<__nv_bfloat16> {
+    using type = Shape<16, 8, 16>;   // f16/bf16 family: 256b / 16 bits
+    static constexpr int kMinArch = 800;
 };
 
 template <>
-struct mma_shape<__nv_fp8_e4m3> {
-    static constexpr int k = 32;         // m16n8k32
-    static constexpr int a_regs = 4;
-    static constexpr int b_regs = 2;
-    static constexpr int min_arch = 890; // fp8 mma.sync, sm_89+ (Ada/Hopper)
+struct MmaShapeFor<int8_t> {
+    using type = Shape<16, 8, 32>;   // s8: 256b / 8 bits (sm_80 wide form)
+    static constexpr int kMinArch = 800;
 };
 
 template <>
-struct mma_shape<__nv_fp8_e5m2> {
-    static constexpr int k = 32;
-    static constexpr int a_regs = 4;
-    static constexpr int b_regs = 2;
-    static constexpr int min_arch = 890;
+struct MmaShapeFor<__nv_fp8_e4m3> {
+    using type = Shape<16, 8, 32>;
+    static constexpr int kMinArch = 890;  // fp8 mma.sync, sm_89+ (Ada/Hopper)
 };
 
-// d[4] = a[4] x b[2] + c[4], row-major A, col-major B, fp32 accumulator.
-// The PTX mnemonic is selected from InT. Building for a compute capability
-// below `mma_shape<InT>::min_arch` is a **compile error** — the instruction
-// does not exist there, and a silent no-op would produce wrong results.
-template <typename InT>
-DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
-                                 const unsigned b[2],
-                                 const float c[4]) {
-    static_assert(ASTRAI_DEVICE_ARCH == 0 ||
-                      ASTRAI_DEVICE_ARCH >= mma_shape<InT>::min_arch,
-                  "mma_sync: this MMA shape requires a newer compute "
-                  "capability than the build target");
-    if constexpr (std::is_same_v<InT, __nv_bfloat16>) {
+template <>
+struct MmaShapeFor<__nv_fp8_e5m2> {
+    using type = Shape<16, 8, 32>;
+    static constexpr int kMinArch = 890;
+};
+
+// --- <A, B, Shape> -> the mma op -------------------------------------------
+// Primary template undefined: only the instantiated cells below exist.
+template <typename A, typename B, typename ShapeT>
+struct MmaOp;
+
+template <>
+struct MmaOp<__nv_bfloat16, __nv_bfloat16, Shape<16, 8, 16>> {
+    using AccT = float;               // the accumulator type is derived, too
+    static constexpr int kARegs = 4;  // A fragment: 4x b32
+    static constexpr int kBRegs = 2;  // B fragment: 2x b32
+    static constexpr int kCRegs = 4;  // C/D fragment: 4x f32
+    DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
+                                       const unsigned b[2], const float c[4]) {
+        static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 800,
+                      "bf16 mma.sync requires sm_80+");
         asm volatile(
             "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
             : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
               "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-    } else if constexpr (std::is_same_v<InT, __nv_fp8_e5m2>) {
-        asm volatile(
-            "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
-            : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
-              "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-    } else {
+    }
+};
+
+template <>
+struct MmaOp<__nv_fp8_e4m3, __nv_fp8_e4m3, Shape<16, 8, 32>> {
+    using AccT = float;
+    static constexpr int kARegs = 4;
+    static constexpr int kBRegs = 2;
+    static constexpr int kCRegs = 4;
+    DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
+                                       const unsigned b[2], const float c[4]) {
+        static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 890,
+                      "fp8 mma.sync requires sm_89+");
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
@@ -93,6 +120,73 @@ DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
               "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
     }
+};
+
+template <>
+struct MmaOp<__nv_fp8_e5m2, __nv_fp8_e5m2, Shape<16, 8, 32>> {
+    using AccT = float;
+    static constexpr int kARegs = 4;
+    static constexpr int kBRegs = 2;
+    static constexpr int kCRegs = 4;
+    DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
+                                       const unsigned b[2], const float c[4]) {
+        static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 890,
+                      "fp8 mma.sync requires sm_89+");
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+              "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+    }
+};
+
+template <>
+struct MmaOp<int8_t, int8_t, Shape<16, 8, 32>> {
+    using AccT = int32_t;
+    static constexpr int kARegs = 4;
+    static constexpr int kBRegs = 2;
+    static constexpr int kCRegs = 4;
+    DEVICE_FORCEINLINE void fma(int32_t d[4], const unsigned a[4],
+                                       const unsigned b[2], const int32_t c[4]) {
+        static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 800,
+                      "s8 mma.sync requires sm_80+");
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+};
+
+// --- convenience views over the trait layers --------------------------------
+
+// Compile-time facts of an input type's MMA, flattened for the layers that
+// want plain ints (the attention kernels' KD/KT2 math, the gemm policy's
+// register budgets). Derives entirely from the two traits above.
+template <typename InT>
+struct mma_shape {
+    using Op = MmaOp<InT, InT, typename MmaShapeFor<InT>::type>;
+    static constexpr int k = MmaShapeFor<InT>::type::kK;
+    static constexpr int a_regs = Op::kARegs;
+    static constexpr int b_regs = Op::kBRegs;
+    static constexpr int min_arch = MmaShapeFor<InT>::kMinArch;
+};
+
+// d[4] = a[4] x b[2] + c[4], row-major A, col-major B — the fp32-accumulating
+// family (bf16 / fp8 pairs). The s8 cell keeps its int32 accumulators and is
+// reached through MmaOp directly. Building for a compute capability below
+// MmaShapeFor<InT>::kMinArch is a **compile error** — the instruction does
+// not exist there, and a silent no-op would produce wrong results.
+template <typename InT>
+DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
+                                 const unsigned b[2],
+                                 const float c[4]) {
+    static_assert(ASTRAI_DEVICE_ARCH == 0 ||
+                      ASTRAI_DEVICE_ARCH >= MmaShapeFor<InT>::kMinArch,
+                  "mma_sync: this MMA shape requires a newer compute "
+                  "capability than the build target");
+    MmaOp<InT, InT, typename MmaShapeFor<InT>::type>::fma(d, a, b, c);
 }
 
 #undef ASTRAI_DEVICE_ARCH
@@ -101,8 +195,8 @@ DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
 // ldmatrix — cooperatively load 8x8 b16 matrices from smem into registers.
 //
 // The instruction is identical for every 16-bit-storage element type: bf16
-// maps 1:1 onto b16 slots; fp8 is stored packed two-per-slot (see
-// gemm/gemm.cuh), so one b16 slot holds two fp8 values. `T` is the element
+// maps 1:1 onto b16 slots; fp8 and s8 are stored packed two-per-slot (see
+// gemm/gemm.cuh), so one b16 slot holds two 1-byte values. `T` is the element
 // type and only serves as a semantic tag.
 //
 //   x2 (single address): matrix0 = p (8 rows), matrix1 = p + 8*16 bytes
@@ -115,8 +209,8 @@ DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
 // lanes 8-15 matrix 1's rows (x2/x4), lanes 16-23 / 24-31 matrix 2 / 3's rows
 // (x4 only; their addresses are ignored by x2). Each matrix is 8 rows x 16
 // bytes, and consecutive matrices of one instruction are contiguous at
-// 128-byte strides. fp8 fragment layouts in gemm/gemm.cuh are arranged around
-// this constraint.
+// 128-byte strides. 1-byte fragment layouts in gemm/gemm.cuh are arranged
+// around this constraint.
 // ---------------------------------------------------------------------------
 
 // Per-lane-address cores: the caller supplies a raw shared-memory address
@@ -126,7 +220,7 @@ DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
 // m16n8k32 operand layouts). Trans selects the transposed load — the
 // gemm's crosswise 16-bit staging ([K][rows] tiles) reads its fragments
 // through it. (ldmatrix is a b16-only instruction: 8-bit crosswise
-// operands keep the PRMT staging + plain loads.)
+// operands keep the PRPT staging + plain loads.)
 template <bool Trans = false>
 DEVICE_FORCEINLINE void ldmatrix_x2_lane(unsigned r[2],
                                          unsigned addr) {
@@ -151,10 +245,9 @@ DEVICE_FORCEINLINE void ldmatrix_x4_lane(unsigned r[4],
             : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
             : "r"(addr));
     } else {
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-            : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-            : "r"(addr));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                     : "r"(addr));
     }
 }
 

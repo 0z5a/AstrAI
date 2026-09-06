@@ -8,6 +8,7 @@
 #include <type_traits>
 
 #include "common/mma.cuh"
+#include "common/tma.cuh"
 #include "gemm/common.h"
 #include "load.cuh"
 #include "policy.cuh"
@@ -16,6 +17,33 @@
 namespace astrai {
 namespace gemm {
 
+// TMA producer context: the operand descriptors (kernel-param addresses),
+// the ring-slot mbarriers and the batch coordinate bits the issue path
+// needs. The barrier array holds 2*kARing slots — full[0..D) (count 1,
+// tripped by the elected thread's expect_tx + the TMA's transaction
+// bytes) and empty[D..2D) (count = CTA threads, tripped when every
+// consumer finished reading the slot) — the CUTLASS PipelineTmaAsync
+// handshake, which replaces the per-k-tile __syncthreads: warps skew
+// freely across stage slots and the producer's overwrite gate is the
+// empty barrier alone. Each operand's rank is a template bit (strided
+// batch = rank 3, broadcast = rank 2 sharing one map's coordinates), so
+// the per-stage 2D/3D issue pick compiles away.
+template <bool kRank3A = false, bool kRank3B = false>
+struct GemmTmaContext {
+    const void* map_a = nullptr;
+    const void* map_b = nullptr;
+    uint64_t* bars = nullptr;
+    int depth = 0;       // ring slots (kStages + 1): 2*depth barriers
+    int z = 0;           // batch coordinate (rank-3 descriptors)
+
+    __device__ __forceinline__ uint64_t* full(int slot) const {
+        return bars + slot;
+    }
+    __device__ __forceinline__ uint64_t* empty(int slot) const {
+        return bars + depth + slot;
+    }
+};
+
 template <typename Policy>
 struct GemmCollectiveMainloop {
     using Traits = typename Policy::Traits;
@@ -23,14 +51,21 @@ struct GemmCollectiveMainloop {
     using LayoutB = typename Policy::LayoutTagB;
     using Smem = GemmSmem<Traits, LayoutA, LayoutB>;
     static constexpr bool kFastLoop = Policy::kFastLoop;
+    static constexpr bool kUseTma = Policy::kUseTma;
+    static_assert(!kUseTma || (!Smem::kDirectA && !Smem::kDirectB),
+                  "TMA staging is congruous-only");
     // Operands are independently typed; the mma runs on the promoted MmaT
-    // (policy.cuh). Int8 operands (W8A16 weight-only, W8A8 dynamic) expand
-    // in-register between the smem read and the mma — kDequantA/kDequantB
-    // mark the insert per side (dequant.cuh); W16A16/W8A8-fp8 passthrough
-    // leaves both false.
+    // (policy.cuh). A lone int8 side (W8A16 weight-only) or a lone fp8 side
+    // expands in-register between the smem read and the mma —
+    // kDequantA/kDequantB mark the insert per side (dequant.cuh);
+    // W16A16/W8A8/W8A8-fp8 passthrough leaves both false. The accumulator
+    // type rides the mma cell: fp32 for the float families, int32 for the
+    // native s8 pair.
     using ElemA = typename Traits::ElemA;
     using ElemB = typename Traits::ElemB;
     using MmaT = typename Traits::MmaT;
+    using MmaOp = typename Traits::MmaOp;
+    using AccT = typename Traits::AccT;
     static constexpr bool kDequantA = Traits::kDequantA;
     static constexpr bool kDequantB = Traits::kDequantB;
     using DequantA = quant::DequantPair<ElemA, MmaT>;
@@ -59,7 +94,7 @@ struct GemmCollectiveMainloop {
     static_assert(kStages >= 1 && kStages <= 8,
                   "FP8 GEMM stages must be in [1, 8]");
     // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps, each warp computing
-    // kMt x kNt m16n8k32 MMAs. Rings rotate kStages+1 buffers (see
+    // kMt x kNt m16n8k{kMmaK} MMAs. Rings rotate kStages+1 buffers (see
     // GemmSmem) — one __syncthreads per k-tile.
     static constexpr int kMt = Traits::kWarpM / 16;  // 16-row MMA tiles per warp
     static constexpr int kNt = Traits::kWarpN / 8;   // 8-col MMA tiles per warp
@@ -186,12 +221,51 @@ struct GemmCollectiveMainloop {
                 b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
 
+    // One TMA stage issue: gate on the slot's empty barrier (its previous
+    // occupant fully consumed; skipped for the ring's first sweep), arm
+    // the full barrier's byte count, then issue both operand boxes
+    // (typed loads: each operand's rank rides its context type).
+    // Elected-thread only.
+    template <bool kRank3A, bool kRank3B>
+    __device__ __forceinline__ void
+    tma_issue_stage(const GemmTmaContext<kRank3A, kRank3B>& tma,
+                    int tile) const {
+        const int slot = tile % kARing;
+        if (tile >= kARing)
+            astrai::mbarrier_wait_parity(
+                tma.empty(slot),
+                (uint32_t)(((tile / kARing) - 1) & 1));
+        uint64_t* bar = tma.full(slot);
+        mbarrier_arrive_expect_tx(
+            bar, (uint32_t)((uint64_t)kAStageBytes + kBStageBytes));
+        const int x = (int)((int64_t)tile * kK);
+        astrai::tma_load<kRank3A>(tma.map_a, bar, a_stage_of(tile),
+                                  x * (int)sizeof(ElemA),
+                                  (int)(block_m * kBlockM), tma.z);
+        astrai::tma_load<kRank3B>(tma.map_b, bar, b_stage_of(tile),
+                                  x * (int)sizeof(ElemB),
+                                  (int)(block_n * kBlockN), tma.z);
+    }
+
     // Prime the pipeline: kStages committed groups, one per stage slot.
     // The commit is unconditional — when K is shorter than the pipeline the
     // skipped stages commit empty groups, so the group sequence stays
     // tile-indexed and the steady-state wait count never needs a runtime
-    // dispatch.
-    __device__ __forceinline__ void prologue() const {
+    // dispatch. The TMA discipline arms only stages that carry a copy: an
+    // expect_tx barrier with no transaction never trips, so short-K tiles
+    // skip their slots' barriers entirely (and are never waited on).
+    template <bool kRank3A = false, bool kRank3B = false>
+    __device__ __forceinline__ void
+    prologue(const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
+        if constexpr (kUseTma) {
+            if (tid == 0) {
+#pragma unroll
+                for (int stage = 0; stage < kStages; ++stage) {
+                    if (stage < tile_count) tma_issue_stage(tma, stage);
+                }
+            }
+            return;
+        }
         const astrai::PipelineSync<kStages> pipe;
 #pragma unroll
         for (int stage = 0; stage < kStages; ++stage) {
@@ -212,9 +286,17 @@ struct GemmCollectiveMainloop {
     // Steady-state mainloop, compile-time specialized on kFast: the fast
     // copy runs predication-free loads with loop-carried read/write
     // pointers; the generic copy keeps full predication. kFastLoop=false
-    // instantiates only the generic copy.
-    template <bool kFast>
-    __device__ __forceinline__ void run_loop(float acc[kNt][kMt][4]) const {
+    // instantiates only the generic copy. kTma swaps the staging
+    // discipline: the per-thread cp.async chunks and the wait_group+
+    // syncthreads consumer fence become one elected-thread TMA issue and
+    // an mbarrier phase wait (plus the same CTA barrier, which stays the
+    // slot-release guarantee: it proves every thread finished reading
+    // tile i-1 before tile i+kStages's boxes overwrite its slot).
+    template <bool kFast, bool kTma = false, bool kRank3A = false,
+              bool kRank3B = false>
+    __device__ __forceinline__ void
+    run_loop(AccT acc[kNt][kMt][4],
+             const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         const astrai::PipelineSync<kStages> pipe;
         const int lane = tid & 31;
         // Fast-path write carries: one per congruous operand (crosswise
@@ -231,10 +313,10 @@ struct GemmCollectiveMainloop {
             std::conditional_t<kTransA, SmemLayoutATrans, SmemLayoutA>;
         using CarryLayoutB =
             std::conditional_t<kTransB, SmemLayoutBTrans, SmemLayoutB>;
-        PrefetchCarry<!kSyncA, ElemA, CarryLayoutA, kCtaThreads, kTransA>
+        PrefetchCarry<!kSyncA && !kTma, ElemA, CarryLayoutA, kCtaThreads, kTransA>
             carry_a(a_base, kARing, kAStageBytes, a, a_ld, block_m * kBlockM,
                     tid, kStages);
-        PrefetchCarry<!kSyncB, ElemB, CarryLayoutB, kCtaThreads, kTransB>
+        PrefetchCarry<!kSyncB && !kTma, ElemB, CarryLayoutB, kCtaThreads, kTransB>
             carry_b(b_base, kBRing, kBStageBytes, b, b_ld, block_n * kBlockN,
                     tid, kStages);
         const unsigned a_rd0 = __cvta_generic_to_shared(a_base) +
@@ -252,18 +334,33 @@ struct GemmCollectiveMainloop {
         // when this fires; the tail's unconditional (possibly empty)
         // commits keep that invariant true for every iteration.
         const bool prefetch = tile_index + kStages < tile_count;
-        // Steady-state wait + CTA barrier via the sm_80/89 pipeline (one
-        // wait_group<kStages-1> + one __syncthreads): every thread's
-        // cp.async for this stage is complete before any thread reads
-        // tiles written by other threads.
-        pipe.consumer_wait();
+        // Steady-state wait: the TMA path waits the slot's full barrier
+        // (phase flips once per ring sweep) — no CTA-wide barrier; each
+        // warp releases its slot below, after its own last fragment read,
+        // and the producer's overwrite gate is the empty barrier alone.
+        // The cp.async path drains its group ladder then joins the CTA
+        // (the join doubles as the slot release).
+        if constexpr (kTma) {
+            astrai::mbarrier_wait_parity(
+                tma.full((int)(tile_index % kARing)),
+                static_cast<uint32_t>((tile_index / kARing) & 1));
+        } else {
+            pipe.consumer_wait();
+        }
 
-        // Direct chunks for tile i+kStages: issue LDG+PRMT+STS now so the
-        // global-load latency hides behind the MMA phase below.
-        if (prefetch)
+        // Staging for tile i+kStages (its slot = (i-1)'s, released by the
+        // barrier above): the elected thread arms and issues both TMA
+        // boxes; the cp.async path issues its direct chunks (LDG+PRMT,
+        // 8-bit crosswise) now so the global-load latency hides behind the
+        // MMA phase below.
+        if constexpr (kTma) {
+            if (prefetch && tid == 0)
+                tma_issue_stage(tma, (int)(tile_index + kStages));
+        } else if (prefetch) {
             load_direct(a_stage_of(tile_index + kStages),
                         b_stage_of(tile_index + kStages),
                         (tile_index + kStages) * kK);
+        }
 
         const unsigned a_addr = a_rd;
         const unsigned b_addr = b_rd;
@@ -332,20 +429,19 @@ struct GemmCollectiveMainloop {
                 const unsigned* bops =
                     kPairB ? (b_frag4[bcur][nt >> 1] + (nt & 1) * 2)
                            : b_frag[bcur][nt];
-                astrai::mma_sync<MmaT>(acc[nt][mt], a_frag[mt], bops,
-                                       acc[nt][mt]);
+                MmaOp::fma(acc[nt][mt], a_frag[mt], bops, acc[nt][mt]);
             }
         }
         // Next tile's LDGSTS chunks inside the MMA phase: A's after the
         // first k_seg's MMA batch, B's after the last.
-        if constexpr (kFast) {
+        if constexpr (kFast && !kTma) {
             if (k_seg == 0) carry_a.emit(prefetch);
             if (k_seg == kSegs - 1) carry_b.emit(prefetch);
         }
         }
         // Generic loop (no interleaved prefetch): the next tile's predicated
         // loads run after the MMA phase.
-        if constexpr (!kFast) {
+        if constexpr (!kFast && !kTma) {
             if (prefetch) {
                 load_async(a_stage_of(tile_index + kStages),
                            b_stage_of(tile_index + kStages),
@@ -353,21 +449,32 @@ struct GemmCollectiveMainloop {
             }
         }
         // Unconditional commit: empty in the tail, it pads the group
-        // sequence so the fixed wait above stays correct.
-        pipe.producer_commit();
+        // sequence so the fixed wait above stays correct. TMA's commit is
+        // the arm inside tma_issue_stage — nothing to do here.
+        if constexpr (!kTma) pipe.producer_commit();
+        // TMA consumer release: this thread's fragment reads of the slot
+        // are done; the slot's empty barrier trips once every thread
+        // arrives, gating the producer's next overwrite.
+        if constexpr (kTma)
+            astrai::mbarrier_arrive(tma.empty((int)(tile_index % kARing)));
         a_rd += (unsigned)kAStageBytes;
         if (a_rd == a_rd_end) a_rd = a_rd0;
         b_rd += (unsigned)kBStageBytes;
         if (b_rd == b_rd_end) b_rd = b_rd0;
-        if constexpr (kFast) {
+        if constexpr (kFast && !kTma) {
             carry_a.advance(kAStageBytes);
             carry_b.advance(kBStageBytes);
         }
         }
     }
 
-    __device__ __forceinline__ void accumulate(float acc[kNt][kMt][4]) const {
-        if constexpr (kFastLoop) {
+    template <bool kRank3A = false, bool kRank3B = false>
+    __device__ __forceinline__ void
+    accumulate(AccT acc[kNt][kMt][4],
+               const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
+        if constexpr (kUseTma) {
+            run_loop<false, true, kRank3A, kRank3B>(acc, tma);
+        } else if constexpr (kFastLoop) {
             if (fast_cta)
                 run_loop<true>(acc);
             else

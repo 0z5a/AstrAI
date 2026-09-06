@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "common/swizzle.cuh"
+#include "common/shape.cuh"
 
 // GEMM-family pure POD/traits header — dtype-neutral: layout tags, element
 // traits and the unified parameter POD shared by every element-type
@@ -23,10 +23,10 @@ namespace gemm {
 struct RowMajor {};
 struct ColMajor {};
 
-// Tile-geometry Shape: merged into the shared static-shape vocabulary
-// (common/swizzle.cuh) the staging layouts also compose from — imported
-// here so the Shape<M, N, K> recipes (CTA tile) and Shape<M, N> (warp
-// tile) keep their spelling (see GemmTileConfig in policy.cuh).
+// Tile-geometry Shape: the shared static-shape vocabulary (common/
+// shape.cuh) the staging layouts and mma traits also compose from —
+// imported here so the Shape<M, N, K> recipes (CTA tile) and Shape<M, N>
+// (warp tile) keep their spelling (see GemmTileConfig in policy.cuh).
 using astrai::Shape;
 
 // Element-type traits: the per-dtype facts the policy/smem/load layers
@@ -62,32 +62,37 @@ struct gemm_elem_traits<__nv_bfloat16> {
 };
 
 // int8 quantized operand (weight-only W8A16 or dynamic W8A8): staged
-// packed, dequantized in-register to the MMA compute type between the
-// fragment load and the mma.sync (dequant.cuh), so its kMmaK never feeds
-// the tile geometry — that comes from the promoted pair traits below.
+// packed. The symmetric W8A8 pair runs its NATIVE mma (m16n8k32.s8.s8.s32,
+// int32 accumulators, scales folded in the epilogue after the int->float
+// conversion); mixed pairs (W8A16 / A8W16) dequantize in-register to the
+// promoted bf16 compute type between the fragment load and the mma.sync
+// (dequant.cuh) — their kMmaK comes from the promoted pair traits below.
 template <>
 struct gemm_elem_traits<int8_t> {
     static constexpr int kBytes = 1;
-    static constexpr int kMmaK = 16;  // via the bf16 promotion (unused directly)
+    static constexpr int kMmaK = 32;  // native mma.sync.m16n8k32 (sm_80+)
     static constexpr bool kNeedsDequant = true;
 };
 
 // MMA compute type for one operand pair — the dtype promotion every
 // quantized-GEMM family (humming-style) routes through: the tensor-core
 // input type both operands are brought to before mma.sync. Promotes to
-// bf16 m16n8k16 when int8 rides either side (W8A16, W8A8, A8W16) or when
+// bf16 m16n8k16 when int8 rides exactly one side (W8A16, A8W16) or when
 // exactly one side is fp8 and the other bf16 (W-F8A16 weight-only and its
-// mirror) — the quantized side(s) dequantize in-register. Symmetric fp8
-// pairs keep their native mma; symmetric bf16 passes through untouched.
-// kDequantA/B are per-operand: W8A8 dequantizes both sides, W8A16 only B.
+// mirror) — the quantized side dequantizes in-register. Symmetric pairs
+// keep their native mma and accumulator: bf16 passes through, fp8 keeps
+// the fp8 mma, int8 keeps the s8 mma (int32 accumulators).
+// kDequantA/B are per-operand: W8A16 dequantizes only B.
 template <typename ElemA, typename ElemB>
 struct gemm_mma_traits {
     static constexpr bool kFp8A =
         std::is_same_v<ElemA, __nv_fp8_e4m3> || std::is_same_v<ElemA, __nv_fp8_e5m2>;
     static constexpr bool kFp8B =
         std::is_same_v<ElemB, __nv_fp8_e4m3> || std::is_same_v<ElemB, __nv_fp8_e5m2>;
+    static constexpr bool kI8A = std::is_same_v<ElemA, int8_t>;
+    static constexpr bool kI8B = std::is_same_v<ElemB, int8_t>;
     static constexpr bool kPromote =
-        std::is_same_v<ElemA, int8_t> || std::is_same_v<ElemB, int8_t> ||
+        (kI8A != kI8B) ||
         ((kFp8A != kFp8B) && (std::is_same_v<ElemA, __nv_bfloat16> ||
                               std::is_same_v<ElemB, __nv_bfloat16>));
     using MmaT = std::conditional_t<kPromote, __nv_bfloat16, ElemA>;

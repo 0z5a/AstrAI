@@ -1,18 +1,20 @@
-"""Benchmark the quantized-GEMM family (W8A16 / W8A8 / W16A16) against the
-bf16 ``F.linear`` baseline.
+"""Benchmark the quantized-GEMM family against the bf16 ``F.linear`` baseline.
 
-All three modes run the NT orientation the linear path uses (bf16 / int8
-activation ``[M][K]``, weight ``[N][K]``). W8A16 applies per-channel weight
-scales; W8A8 additionally quantizes activations per-row (the quantize pass
-is excluded from the timed GEMM — it prices the kernel, not the policy).
-Agreement columns report the max error against the dequantized reference.
+Every dtype pairing the gemm dispatch instantiates, as an activation-kind
+x weight-kind grid: W16A16 (bf16 x bf16), W8A16 (bf16 activations against
+int8 or fp8 e4m3/e5m2 weights, per-channel scales), W8A8 (int8 x int8,
+per-row activations), and the symmetric-fp8 training pair (matching
+formats, per-tensor activations). All modes run the NT orientation the
+linear path uses (activation ``[M][K]``, weight ``[N][K]``); quantize
+passes are excluded from the timed GEMM — they price the kernel, not the
+policy. Agreement columns report the max error against the dequantized
+reference.
 """
 
 from __future__ import annotations
 
 import json
 import statistics
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -27,11 +29,34 @@ from astrai.extension.quantize import quantize_act_int8, quantize_weight_int8
 
 # GEMM shapes as (N, K) weight mats; M comes from --m-values.
 GEMM_SHAPES = (
+    ("astrai_1b_square", 1536, 1536),
+    ("astrai_1b_qkv", 1536 * 4, 1536),
     ("llama2_7b_qkv", 4096, 4096),
     ("llama2_7b_up_gate", 11008, 4096),
     ("llama2_7b_down", 4096, 11008),
     ("llama3_70b_up_gate", 28672, 8192),
 )
+
+# The fp8 formats and their max finite magnitudes.
+FP8_FORMATS = (
+    ("f8e4m3", torch.float8_e4m3fn, 448.0),
+    ("f8e5m2", torch.float8_e5m2, 57344.0),
+)
+
+# Every dtype pairing the gemm dispatch instantiates (find_gemm_dispatch in
+# csrc/kernels/gemm/gemm.cu): each row names the cell, then the activation
+# and weight kinds. Asymmetric low-bit mixes — int8 x fp8, mismatched fp8
+# formats, quantized acts against bf16 weights — have no kernel and no row.
+GEMM_COMBOS = (
+    ("w16a16", "bf16", "bf16"),
+    ("w8a16", "bf16", "int8"),
+    ("w8a16_f8e4m3", "bf16", "f8e4m3"),
+    ("w8a16_f8e5m2", "bf16", "f8e5m2"),
+    ("w8a8", "int8", "int8"),
+    ("f8a8_e4m3", "f8e4m3", "f8e4m3"),
+    ("f8a8_e5m2", "f8e5m2", "f8e5m2"),
+)
+OP_ORDER = ("bf16", *(label for label, _, _ in GEMM_COMBOS))
 
 
 def parse_positive_ints(value: str) -> tuple[int, ...]:
@@ -89,6 +114,40 @@ def measure_operations(
     return samples
 
 
+def quantize_fp8(
+    t: torch.Tensor, dtype: torch.dtype, max_val: float, per_channel: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric fp8 quantization onto the format's finite range.
+
+    Weights go per-channel (``[N]`` scales, the W-F8A16 pairing);
+    activations per-tensor (one scalar, the F8A8 training pairing). The
+    kernel applies the inverse scales in its epilogue.
+    """
+    amax = t.float().abs().amax(dim=-1 if per_channel else None, keepdim=True)
+    scale = amax.clamp_min(1e-12) / max_val
+    t_q = (t.float() / scale).clamp(-max_val, max_val).to(dtype)
+    return t_q, (scale.squeeze(-1) if per_channel else scale).float()
+
+
+def make_combo_op(
+    a: torch.Tensor,
+    a_scale: torch.Tensor | None,
+    b: torch.Tensor,
+    b_scale: torch.Tensor | None,
+) -> Callable[[], torch.Tensor]:
+    """Bind one combo cell into a zero-arg op (lambdas in loops bind late)."""
+    return lambda: quant_gemm(a, b, a_scale=a_scale, b_scale=b_scale)
+
+
+def dequantize(t: torch.Tensor, scale: torch.Tensor | None) -> torch.Tensor:
+    """Undo a quantize pair for the F.linear reference."""
+    if scale is None:
+        return t
+    if scale.ndim == 1:
+        scale = scale.unsqueeze(-1)
+    return (t.float() * scale).to(torch.bfloat16)
+
+
 def benchmark_gemm(
     name: str,
     n: int,
@@ -101,45 +160,42 @@ def benchmark_gemm(
 ) -> dict[str, object]:
     x = (torch.randn(m, k, device="cuda") * 0.05).to(torch.bfloat16)
     w = (torch.randn(n, k, device="cuda") * 0.05).to(torch.bfloat16)
-    w8, ws = quantize_weight_int8(w)
-    x8, xs = quantize_act_int8(x)
+    acts: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {
+        "bf16": (x, None),
+        "int8": quantize_act_int8(x),
+    }
+    weights: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {
+        "bf16": (w, None),
+        "int8": quantize_weight_int8(w),
+    }
+    for label, dtype, max_val in FP8_FORMATS:
+        acts[label] = quantize_fp8(x, dtype, max_val, per_channel=False)
+        weights[label] = quantize_fp8(w, dtype, max_val, per_channel=True)
 
-    w_ref16 = w
-    w_ref8 = (w8.float() * ws.unsqueeze(1)).to(torch.bfloat16)
-    x_ref8 = (x8.float() * xs.unsqueeze(1)).to(torch.bfloat16)
-    ref16 = F.linear(x, w_ref16).float()
-    ref816 = F.linear(x, w_ref8).float()
-    ref88 = F.linear(x_ref8, w_ref8).float()
+    operations: dict[str, Callable[[], torch.Tensor]] = {"bf16": lambda: F.linear(x, w)}
+    ref = {}
+    for label, a_kind, b_kind in GEMM_COMBOS:
+        operations[label] = make_combo_op(*acts[a_kind], *weights[b_kind])
+        ref[label] = F.linear(
+            dequantize(*acts[a_kind]), dequantize(*weights[b_kind])
+        ).float()
 
     samples = measure_operations(
-        {
-            "bf16": lambda: F.linear(x, w),
-            "w16a16": lambda: quant_gemm(x, w),
-            "w8a16": lambda: quant_gemm(x, w8, b_scale=ws),
-            "w8a8": lambda: quant_gemm(x8, w8, a_scale=xs, b_scale=ws),
-        },
-        warmup=warmup,
-        iterations=iterations,
-        trials=trials,
+        operations, warmup=warmup, iterations=iterations, trials=trials
     )
     med = {key: statistics.median(vals) for key, vals in samples.items()}
     flops = 2.0 * m * n * k
     tfs = {key: flops / (ms * 1e-3) / 1e12 for key, ms in med.items()}
     err = {
-        "w16a16": (quant_gemm(x, w).float() - ref16).abs().max().item(),
-        "w8a16": (quant_gemm(x, w8, b_scale=ws).float() - ref816).abs().max().item(),
-        "w8a8": (quant_gemm(x8, w8, a_scale=xs, b_scale=ws).float() - ref88)
-        .abs()
-        .max()
-        .item(),
+        label: (operations[label]().float() - ref[label]).abs().max().item()
+        for label, _, _ in GEMM_COMBOS
     }
-    print(
-        f"{name},{m}x{n}x{k},{med['bf16']:.4f},{med['w16a16']:.4f},"
-        f"{med['w8a16']:.4f},{med['w8a8']:.4f},{tfs['bf16']:.1f},"
-        f"{tfs['w16a16']:.1f},{tfs['w8a16']:.1f},{tfs['w8a8']:.1f},"
-        f"{med['bf16'] / med['w8a16']:.2f}x,{med['bf16'] / med['w8a8']:.2f}x,"
-        f"{err['w16a16']:.4f},{err['w8a16']:.4f},{err['w8a8']:.4f}"
-    )
+    row = [name, f"{m}x{n}x{k}"]
+    row += [f"{med[op]:.4f}" for op in OP_ORDER]
+    row += [f"{tfs[op]:.1f}" for op in OP_ORDER]
+    row += [f"{med['bf16'] / med[op]:.2f}x" for op in OP_ORDER[1:]]
+    row += [f"{err[op]:.4f}" for op in OP_ORDER[1:]]
+    print(",".join(row))
     return {
         "shape": name,
         "m": m,
@@ -207,11 +263,14 @@ def benchmark_command(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    print(
-        "shape,mxn_xk,bf16_ms,w16a16_ms,w8a16_ms,w8a8_ms,"
-        "bf16_tflops,w16a16_tflops,w8a16_tflops,w8a8_tflops,"
-        "w8a16_vs_bf16,w8a8_vs_bf16,err16,err816,err88"
+    header = (
+        ["shape", "mxn_xk"]
+        + [f"{op}_ms" for op in OP_ORDER]
+        + [f"{op}_tflops" for op in OP_ORDER]
+        + [f"{op}_vs_bf16" for op in OP_ORDER[1:]]
+        + [f"err_{op}" for op in OP_ORDER[1:]]
     )
+    print(",".join(header))
     results = []
     with torch.inference_mode():
         for name, n, k in shapes:

@@ -9,6 +9,7 @@
 #include <cuda_fp8.h>
 #include <type_traits>
 
+#include "common/mma.cuh"
 #include "gemm/common.h"
 #include "quantize/common.h"
 
@@ -28,9 +29,10 @@ using fp8_elem_t =
 //
 // ElemA / ElemB are independent operand types. The MMA runs on the
 // promoted MmaT (gemm_mma_traits): W16A16 passes through, symmetric fp8
-// keeps its native mma, and any int8 operand dequantizes in-register to
-// bf16 between the fragment load and the mma — kDequantA/kDequantB mark
-// those inserts per side (W8A8 inserts both, W8A16 only B).
+// and symmetric int8 keep their native mma (fp32 / int32 accumulators),
+// and a lone int8 or fp8 operand against bf16 dequantizes in-register
+// between the fragment load and the mma — kDequantA/kDequantB mark those
+// inserts per side (W8A16 only B).
 template <typename ElemA_, typename ElemB_, typename CtaShape_,
           typename WarpShape_, int Stages>
 struct GemmTraits {
@@ -38,6 +40,11 @@ struct GemmTraits {
     using ElemB = ElemB_;
     using MmaPair = gemm_mma_traits<ElemA_, ElemB_>;
     using MmaT = typename MmaPair::MmaT;
+    // The exact mma cell <MmaT, MmaT, shape> (common/mma.cuh): one
+    // type carries the instruction's K extent, register counts and the
+    // accumulator type (fp32 for the float families, s32 for the s8 pair).
+    using MmaOp = astrai::MmaOp<MmaT, MmaT, typename astrai::MmaShapeFor<MmaT>::type>;
+    using AccT = typename MmaOp::AccT;
     using ElemTraitsA = gemm_elem_traits<ElemA_>;
     using ElemTraitsB = gemm_elem_traits<ElemB_>;
 
@@ -52,9 +59,10 @@ struct GemmTraits {
 
     static constexpr int kElemBytesA = ElemTraitsA::kBytes;
     static constexpr int kElemBytesB = ElemTraitsB::kBytes;
-    // MMA shape follows the promoted compute type; dequantized fragments
-    // are brought to it in-register (dequant.cuh).
-    static constexpr int kMmaK = gemm_elem_traits<MmaT>::kMmaK;
+    // MMA shape follows the promoted compute type (the shape trait above is
+    // the single source); dequantized fragments are brought to it
+    // in-register (dequant.cuh).
+    static constexpr int kMmaK = astrai::MmaShapeFor<MmaT>::type::kK;
     static constexpr bool kDequantA = MmaPair::kDequantA;
     static constexpr bool kDequantB = MmaPair::kDequantB;
 
@@ -116,17 +124,27 @@ struct GemmTileConfig {
 // 128x128 of 8 warps x 64x32, kK=64, 2-stage full ring; the fast
 // (predication-free) loop exists only for dual-congruous staging. Narrow:
 // 128x64, the wave-filling and fat-output route. Small CTA: 64x64 of 4
-// warps x 32x32 — the 24KB s2 variant keeps 4 CTAs/SM resident, the 32KB
-// s3 variant trades that for a deeper pipeline on multi-wave grids.
+// warps x 32x32 — the 24KB s2 variant keeps 4 CTAs/SM resident, the 32KB s3
+// variant trades that for a deeper pipeline on multi-wave grids.
+//
+// The s3 deep-ring variants (humming's _fit_num_stages rule) spend the
+// smem headroom a thinner operand pair leaves under the 96KB budget the
+// fat bf16 pair already fills: 2B x 1B reaches s3 on the big CTA
+// (4 buffers x 24KB), 2B x 2B on the narrow CTA — one extra in-flight
+// k-tile of DRAM latency to hide on long-K shapes.
 using TileBig128x128 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2, false>;
 using TileBigFast = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2, true>;
 using TileNarrow128x64 = GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 2, true>;
 using TileSmall64s2 = GemmTileConfig<Shape<64, 64, 64>, Shape<32, 32>, 2, true>;
 using TileSmall64s3 = GemmTileConfig<Shape<64, 64, 64>, Shape<32, 32>, 3, true>;
+using TileBig128x128s3 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3, false>;
+using TileBigFastS3 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3, true>;
+using TileNarrow128x64s3 = GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 3, true>;
 
 template <typename ElemA_, typename ElemB_, typename LayoutA_, typename LayoutB_,
           typename Tile_, typename LayoutOut_ = RowMajor,
-          typename OutT_ = __nv_bfloat16, bool StreamOut_ = false>
+          typename OutT_ = __nv_bfloat16, bool StreamOut_ = false,
+          bool UseTma_ = false>
 struct GemmPolicy {
     using Tile = Tile_;
     using Traits = GemmTraits<ElemA_, ElemB_, typename Tile_::CtaShape,
@@ -141,12 +159,24 @@ struct GemmPolicy {
     // and copies out through OutElem<OutT> packing facts.
     using OutT = OutT_;
     static constexpr bool kStreamOut = StreamOut_;
+    // TMA staging (sm_90+): congruous-only by construction — the launcher
+    // instantiates these policies solely for dual-congruous layout pairs
+    // with aligned operands; staging layouts and fragment addressing are
+    // identical, only the load/wait discipline changes (tma.cuh).
+    static constexpr bool kUseTma = UseTma_;
+    static_assert(!UseTma_ || (sizeof(ElemA_) <= 2 && sizeof(ElemB_) <= 2),
+                  "TMA staging covers the 1-/2-byte congruous dtypes");
     static constexpr bool kFastLoop = Tile_::kFastLoop;
     using Smem = GemmSmem<Traits, LayoutA_, LayoutB_>;
+    // TMA budgets the 1024B ring-base alignment pad plus the full/empty
+    // mbarrier pair per ring slot (tma.cuh); the residency hint stays
+    // ring-based.
+    static constexpr int kTmaExtra =
+        UseTma_ ? 1024 + 2 * (Tile_::kStages + 1) * 8 : 0;
     // Flattened for __launch_bounds__, which takes no dependent type names.
     static constexpr int kCtaThreads = Traits::kCtaThreads;
     static constexpr int kMinCtas = Smem::kMinCtas;
-    static constexpr int kSmemBytes = Smem::kBytes;
+    static constexpr int kSmemBytes = Smem::kBytes + kTmaExtra;
 };
 
 // fp8 convenience aliases: format-parameterized names over the generic

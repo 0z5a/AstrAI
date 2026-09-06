@@ -59,7 +59,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     const int2 bn = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
     Mainloop mainloop(gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
                       threadIdx.x, bn);
-    float acc[Mainloop::kNt][Mainloop::kMt][4] = {};  // [nt][mt][acc]
+    typename Mainloop::AccT acc[Mainloop::kNt][Mainloop::kMt][4] = {};  // [nt][mt][acc]
     mainloop.prologue();
     mainloop.accumulate(acc);
     // Drain the pipeline before the epilogue reclaims the operand rings.
@@ -72,6 +72,68 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     Epilogue(gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
 }
 
+// TMA orchestrator (sm_90+, dual-congruous staging): identical rings,
+// layouts and epilogue; the staging discipline changes — one elected
+// thread arms a per-slot mbarrier and issues the operand boxes
+// (cp.async.bulk.tensor), consumers wait the slot's phase. The rings sit
+// on a 1024B-aligned base because TMA swizzles the ABSOLUTE shared
+// address (the pad is budgeted in Policy::kSmemBytes), and the mbarriers
+// live right past the B ring.
+template <typename Policy, bool kRank3A, bool kRank3B>
+__global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
+    gemm_kernel_tma(GemmParams p, const __grid_constant__ CUtensorMap tma_a,
+                    const __grid_constant__ CUtensorMap tma_b) {
+    using Traits = typename Policy::Traits;
+    using Mainloop = GemmCollectiveMainloop<Policy>;
+    using Epilogue = GemmCollectiveEpilogue<Policy>;
+    static_assert(!Mainloop::kDirectA && !Mainloop::kDirectB,
+                  "TMA staging requires dual-congruous operands");
+    extern __shared__ __align__(16) char gemm_smem[];
+    // Round the ring base up to its 1024B pattern period. Two's-complement
+    // form: already-aligned bases pad 0 (~p would pad 1023 and misalign).
+    char* smem =
+        gemm_smem + ((-reinterpret_cast<uintptr_t>(gemm_smem)) & 1023u);
+
+    using OutT = typename Policy::OutT;
+    auto* out = reinterpret_cast<OutT*>(p.out_ptr) +
+                (int64_t)blockIdx.z * p.out_batch_stride;
+
+    static_assert(Mainloop::kBlockM * Mainloop::kBlockN * sizeof(OutT) <=
+                  Mainloop::kARing * Mainloop::kBlockM * Mainloop::kK *
+                      sizeof(typename Mainloop::ElemA) +
+                  Mainloop::kBRing * Mainloop::kBlockN * Mainloop::kK *
+                      sizeof(typename Mainloop::ElemB),
+                  "output tile must fit the reclaimed operand smem");
+
+    GemmTmaContext<kRank3A, kRank3B> tma;
+    tma.map_a = &tma_a;
+    tma.map_b = &tma_b;
+    tma.bars = reinterpret_cast<uint64_t*>(
+        smem + Mainloop::kARing * Mainloop::kAStageBytes +
+               Mainloop::kBRing * Mainloop::kBStageBytes);
+    tma.depth = Mainloop::kARing;
+    tma.z = blockIdx.z;
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < Mainloop::kARing; ++s) {
+            astrai::mbarrier_init(tma.full(s), 1);  // producer expect_tx
+            astrai::mbarrier_init(tma.empty(s), Policy::kCtaThreads);
+        }
+    }
+    __syncthreads();
+
+    const int2 bn = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
+    Mainloop mainloop(smem, static_cast<const typename Mainloop::ElemA*>(p.a_ptr),
+                      static_cast<const typename Mainloop::ElemB*>(p.b_ptr), p.m,
+                      p.n, p.k, p.a_ld, p.b_ld, threadIdx.x, bn);
+    typename Mainloop::AccT acc[Mainloop::kNt][Mainloop::kMt][4] = {};
+    mainloop.prologue(tma);
+    mainloop.accumulate(acc, tma);
+    // No cp.async groups on this path; the CTA join alone releases the
+    // rings for the epilogue's reclaim.
+    __syncthreads();
+    Epilogue(smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
+}
+
 // ---------------------------------------------------------------------------
 // Launchers — pure CUDA (no torch), usable from the binding and pure C tests.
 // ---------------------------------------------------------------------------
@@ -81,6 +143,21 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
 // launch.
 inline bool gemm_plan_log() {
     static const bool on = std::getenv("ASTR_GEMM_PLAN") != nullptr;
+    return on;
+}
+
+// Experiment/debug knobs, one getenv at first use:
+//   ASTR_GEMM_NO_TMA=1 forces the cp.async staging everywhere;
+//   ASTR_GEMM_S3=1 flips the congruous scan to prefer the s3 deep rings
+//   (stage-depth calibration — the cp.async rings measured it a wash on
+//   RTX 5090, the TMA rings may price differently).
+inline bool gemm_tma_disabled() {
+    static const bool off = std::getenv("ASTR_GEMM_NO_TMA") != nullptr;
+    return off;
+}
+
+inline bool gemm_prefer_s3() {
+    static const bool on = std::getenv("ASTR_GEMM_S3") != nullptr;
     return on;
 }
 
@@ -124,8 +201,12 @@ inline bool small_cta_padding(int64_t m, int64_t n) {
 struct GemmPlan {
     enum class Cta { kSmall64, kNarrow128x64, kBig128 };
     Cta cta;
-    bool small_s3;  // kSmall64 only: cp.async pipeline depth (2 vs 3 stages)
-    int raster;     // GemmParams::raster value this launch runs
+    // Ring depth (kStages) this launch runs. The manifest default is 2;
+    // the planner raises it to 3 where the dtype pair's thinner operands
+    // leave smem headroom under the same 96KB budget (humming's
+    // _fit_num_stages rule: deepest ring that fits).
+    int stages;
+    int raster;  // GemmParams::raster value this launch runs
 };
 
 // Raster order. Direction follows the tile aspect (walk the dimension with
@@ -154,15 +235,17 @@ inline int plan_raster(const GemmParams& p, int bm, int bn, int ba, int bb,
 }
 
 // Per-SM throughput scalars of the non-big recipes relative to the big
-// CTA, one row per dtype class — RTX 5090-measured (gemm_tile_bench.cu,
-// saturation medians at M >= 1024; the 1B/1B int8 pair adjusted down from
+// CTA, one row per dtype class — RTX 5090-measured (saturation medians at
+// M >= 1024, via the direct-instantiation pattern of csrc/tests/fp8_test.cu
+// — `launch_policy<GemmPolicy<..., TileXxx, ...>>`, no planner; the
+// 1B/1B int8 pair adjusted down from
 // its saturation medians (.95/1.0), which over-credit the finer tiles on
 // large-N mid-M grids — .92 keeps the measured small-CTA wins while
 // holding the big CTA on the largest-N band). They also absorb smem
 // residency (co-resident CTAs share SM throughput), which is why the cost
 // model carries no separate residency term. The scalars are the one
 // device-dependent constant set:
-// re-measure with the harness when porting.
+// re-measure with that harness when porting.
 enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
 constexpr double kPlanEff[4][2] = {  // [class]{narrow, small}
     {0.76, 0.58},  // W16A16: bf16 x bf16 — fat operands lose most to finer tiles
@@ -195,12 +278,15 @@ constexpr GemmPerfClass gemm_perf_class() {
 // arithmetic, so a new GPU needs no re-measured thresholds. A recipe's
 // cost is ceil(tiles / sms) quantized waves of bm * bn / eff SM-work
 // each, scaled by edge-tile padding waste. The scan runs big -> narrow ->
-// small and a challenger needs a >2% lead to displace the incumbent, so
-// ties resolve to the bigger tile — the same bias the measured ladder
-// encoded. The small recipe's ring depth follows the wave count: the
-// 3-stage ring's lighter smem (a second resident CTA) wins the sub-wave
-// latency-bound band, the 4-stage ring's deeper pipeline wins once the
-// small grid spans multiple waves.
+// small, s2 ring first (RTX 5090-measured: the s3 deep rings ride even to
+// -1.3% on cp.async staging — three buffers already hide the LDGSTS
+// latency, unlike humming's TMA rings that want the depth; the s3
+// siblings stay in the manifest for staging variants that price
+// differently), and a challenger needs a >2% lead to displace the
+// incumbent, so ties resolve to the bigger tile — the same bias the
+// measured ladder encoded. The small recipe keeps its residency-aware
+// stage rule: the 3-stage ring's heavier smem (a second resident CTA on
+// the 2Bx2B pair) only pays once the small grid spans multiple waves.
 inline GemmPlan plan_congruous(const GemmParams& p, const DeviceFacts& dev,
                                int ba, int bb, GemmPerfClass perf) {
     struct Recipe {
@@ -211,8 +297,11 @@ inline GemmPlan plan_congruous(const GemmParams& p, const DeviceFacts& dev,
     };
     static constexpr Recipe kRecipes[] = {
         {GemmPlan::Cta::kBig128, 128, 128, 64, 2, -1},
+        {GemmPlan::Cta::kBig128, 128, 128, 64, 3, -1},
         {GemmPlan::Cta::kNarrow128x64, 128, 64, 64, 2, 0},
+        {GemmPlan::Cta::kNarrow128x64, 128, 64, 64, 3, 0},
         {GemmPlan::Cta::kSmall64, 64, 64, 64, 2, 1},
+        {GemmPlan::Cta::kSmall64, 64, 64, 64, 3, 1},
     };
     const double* eff = kPlanEff[(int)perf];
     const Recipe* best = nullptr;
@@ -233,21 +322,32 @@ inline GemmPlan plan_congruous(const GemmParams& p, const DeviceFacts& dev,
             (double)(p.m * p.n);
         const double e = r.eff_idx < 0 ? 1.0 : eff[r.eff_idx];
         const double cost = (double)waves * r.bm * r.bn / e * waste;
-        if (best == nullptr || cost < best_cost * 0.98) {
+        if (best == nullptr) {
+            best = &r;
+            best_cost = cost;
+            continue;
+        }
+        // ASTR_GEMM_S3: the same CTA's s3 twin takes over on ties (the
+        // stage-depth measurement knob); otherwise the >2% challenger
+        // rule keeps the scan's first — the s2 ring — on ties.
+        const bool deeper_twin = gemm_prefer_s3() && r.stages == 3 &&
+                                 best->stages == 2 && best->cta == r.cta;
+        if (cost < best_cost * 0.98 || deeper_twin) {
             best = &r;
             best_cost = cost;
         }
     }
     // The s2 small recipe (48KB) is the floor every supported device fits;
     // the guard keeps the planner a total function on any other geometry.
-    if (best == nullptr) best = &kRecipes[2];
+    if (best == nullptr) best = &kRecipes[4];
     const int64_t tiles_64 =
         p.batch * ((p.m + 63) / 64) * ((p.n + 63) / 64);
     const bool small = best->cta == GemmPlan::Cta::kSmall64;
     const bool s3_fits =
         ring_smem_bytes(64, 64, 64, 3, ba, bb) <= dev.smem_max;
-    return GemmPlan{best->cta,
-                    small && s3_fits && tiles_64 > 2 * dev.sms,
+    int stages = best->stages;
+    if (small && !(s3_fits && tiles_64 > 2 * dev.sms)) stages = 2;
+    return GemmPlan{best->cta, stages,
                     plan_raster(p, best->bm, best->bn, ba, bb, dev)};
 }
 
@@ -271,7 +371,7 @@ inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
     const bool s3_fits =
         ring_smem_bytes(64, 64, 64, 3, ba, bb) <= dev.smem_max;
     const auto small = [&](bool s3) {
-        return GemmPlan{GemmPlan::Cta::kSmall64, s3 && s3_fits,
+        return GemmPlan{GemmPlan::Cta::kSmall64, s3 && s3_fits ? 3 : 2,
                         plan_raster(p, 64, 64, ba, bb, dev)};
     };
     // Padding rules first: predication waste beats any wave-fill effect.
@@ -280,7 +380,7 @@ inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
         const int64_t tiles_128 =
             (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
         if (big_fits && tiles_128 >= (int64_t)dev.sms * 3 / 2) {
-            return GemmPlan{GemmPlan::Cta::kBig128, false,
+            return GemmPlan{GemmPlan::Cta::kBig128, 2,
                             plan_raster(p, 128, 128, ba, bb, dev)};
         }
         return small(true);
@@ -307,38 +407,195 @@ void launch_policy(const GemmParams& p, cudaStream_t stream) {
         Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p);
 }
 
+// ---------------------------------------------------------------------------
+// TMA staging (sm_90+): descriptor build + the TMA twin of launch_policy.
+// The descriptors are cached exact-match (tma.cuh), so steady-state calls
+// with unchanged tensors and tile pay the encode once.
+// ---------------------------------------------------------------------------
+
+// Big-CTA output-reclaim feasibility: the epilogue scatters the output
+// tile into the reclaimed operand rings, and a fat output (fp32, 4B/elem)
+// cannot fit the 128x128 tile inside thin operand rings — one definition
+// serves the cp.async and TMA dispatch twins alike.
+template <typename ElemA, typename ElemB, typename OutT>
+constexpr bool big_reclaim_fits() {
+    return 128 * 128 * sizeof(OutT) <=
+           ring_smem_bytes(128, 128, 64, 2, (int)sizeof(ElemA),
+                           (int)sizeof(ElemB));
+}
+
+// Build both operand descriptors for one TMA Policy's geometry. Dim/stride
+// units are bytes along the contract dim; the batch encodes as a third
+// dimension only when it strides (a broadcast operand shares one 2D map's
+// coordinates across grid.z). The swizzle mode, box extents and byte
+// scaling all derive from the operand's declared staging layout (the
+// TmaSwizzleOf / tma_spec trait layer in common/tma.cuh) — the same
+// instances the fragment readers consume, so the map cannot drift from
+// the staging.
+template <typename Policy>
+bool tma_maps_for(const GemmParams& p, const CUtensorMap** ma,
+                  const CUtensorMap** mb) {
+    using Mainloop = GemmCollectiveMainloop<Policy>;
+    *ma = astrai::tma_map_cache().lookup(
+        astrai::tma_spec<typename Mainloop::ElemA, typename Mainloop::SmemLayoutA,
+                        Mainloop::kBlockM>(p.a_ptr, p.m, p.k, p.a_ld, p.batch,
+                                           p.a_batch_stride));
+    *mb = astrai::tma_map_cache().lookup(
+        astrai::tma_spec<typename Mainloop::ElemB, typename Mainloop::SmemLayoutB,
+                        Mainloop::kBlockN>(p.b_ptr, p.n, p.k, p.b_ld, p.batch,
+                                           p.b_batch_stride));
+    return *ma != nullptr && *mb != nullptr;
+}
+
+// TMA launch for one Policy; false (nothing launched) when an operand
+// cannot be described — misaligned base/ld — so the caller falls back to
+// the cp.async twin.
+template <typename Policy>
+bool launch_policy_tma(const GemmParams& p, cudaStream_t stream) {
+    using Traits = typename Policy::Traits;
+    // The planner's feasibility gate prices rings only; the TMA budget
+    // adds the alignment pad + barriers and can tip past the opt-in
+    // ceiling on the fattest pair — fall back rather than fail.
+    if (Policy::kSmemBytes > astrai::device_facts().smem_max) return false;
+    const CUtensorMap *ma = nullptr, *mb = nullptr;
+    if (!tma_maps_for<Policy>(p, &ma, &mb)) return false;
+    dim3 grid((p.n + Traits::kBlockN - 1) / Traits::kBlockN,
+              (p.m + Traits::kBlockM - 1) / Traits::kBlockM, p.batch);
+    if (gemm_plan_log()) {
+        std::fprintf(stderr,
+                     "[gemm-plan] %lldx%lldx%lld b=%d -> tile %dx%d s%d tma "
+                     "grid %dx%dx%d raster %d smem %d\n",
+                     (long long)p.m, (long long)p.n, (long long)p.k, p.batch,
+                     Traits::kBlockM, Traits::kBlockN, Traits::kStages,
+                     grid.x, grid.y, grid.z, p.raster, Policy::kSmemBytes);
+    }
+    // Rank bits pick the kernel instantiation: a strided batch rides the
+    // 3D emitters, a broadcast operand keeps its shared 2D map — the
+    // per-stage 2D/3D issue branch compiles away either way.
+    if (p.batch > 1 && p.a_batch_stride > 0 && p.b_batch_stride > 0) {
+        launch_with_smem<gemm_kernel_tma<Policy, true, true>>(
+            Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
+            *ma, *mb);
+    } else if (p.batch > 1 && p.a_batch_stride > 0) {
+        launch_with_smem<gemm_kernel_tma<Policy, true, false>>(
+            Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
+            *ma, *mb);
+    } else if (p.batch > 1 && p.b_batch_stride > 0) {
+        launch_with_smem<gemm_kernel_tma<Policy, false, true>>(
+            Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
+            *ma, *mb);
+    } else {
+        launch_with_smem<gemm_kernel_tma<Policy, false, false>>(
+            Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
+            *ma, *mb);
+    }
+    return true;
+}
+
+// TMA twin of launch_plan's tile dispatch. The caller's gate already
+// guarantees dual-congruous 1-/2-byte operands, so the layout tags
+// collapse to the NT pair. False (nothing launched) propagates the
+// fallback: either the device pre-dates sm_90 or a descriptor could not
+// be encoded (misaligned operand).
+template <typename ElemA, typename ElemB, typename LayoutOut, typename OutT>
+bool launch_tma_dispatch(const GemmParams& p, const GemmPlan& plan,
+                         cudaStream_t stream) {
+    // The ladder: the plan's CTA class picks a geometry, its depth bit
+    // the stage twin. The big row swaps to its narrow twin when the output
+    // tile cannot reclaim the big rings — std::conditional_t keeps every
+    // alias instantiable, which the kernel's reclaim static_assert
+    // requires (an if-constexpr branch still NAMES its dead types).
+    using TmaNarrow =
+        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileNarrow128x64,
+                   LayoutOut, OutT, false, true>;
+    using TmaNarrowS3 =
+        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileNarrow128x64s3,
+                   LayoutOut, OutT, false, true>;
+    using TmaBig = std::conditional_t<
+        big_reclaim_fits<ElemA, ElemB, OutT>(),
+        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileBigFast, LayoutOut,
+                   OutT, false, true>,
+        TmaNarrow>;
+    using TmaBigS3 = std::conditional_t<
+        big_reclaim_fits<ElemA, ElemB, OutT>(),
+        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileBigFastS3, LayoutOut,
+                   OutT, false, true>,
+        TmaNarrowS3>;
+    using TmaSmallS2 =
+        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileSmall64s2, LayoutOut,
+                   OutT, false, true>;
+    using TmaSmallS3 =
+        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileSmall64s3, LayoutOut,
+                   OutT, false, true>;
+    switch (plan.cta) {
+    case GemmPlan::Cta::kBig128:
+        return plan.stages >= 3 ? launch_policy_tma<TmaBigS3>(p, stream)
+                                : launch_policy_tma<TmaBig>(p, stream);
+    case GemmPlan::Cta::kNarrow128x64:
+        return plan.stages >= 3 ? launch_policy_tma<TmaNarrowS3>(p, stream)
+                                : launch_policy_tma<TmaNarrow>(p, stream);
+    case GemmPlan::Cta::kSmall64:
+        return plan.stages >= 3 ? launch_policy_tma<TmaSmallS3>(p, stream)
+                                : launch_policy_tma<TmaSmallS2>(p, stream);
+    }
+    return false;
+}
+
 // Plan -> Policy: compose the operand facts with one named tile config
 // from the manifest in policy.cuh. The big CTA's fast loop exists only for
 // dual-congruous staging (both operands cp.async); crosswise operands take
-// the predicated generic loop. Takes the params by value: the plan's raster
-// decision lands in the copy the kernel receives (callers keep theirs).
+// the predicated generic loop. plan.stages >= 3 selects the deep-ring
+// sibling of the same geometry (the planner only raises it where the
+// operand pair's ring fits the smem opt-in ceiling). Takes the params by
+// value: the plan's raster decision lands in the copy the kernel receives
+// (callers keep theirs).
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
           typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16>
 void launch_plan(GemmParams p, const GemmPlan& plan, cudaStream_t stream) {
     p.raster = plan.raster;
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
+    // TMA staging first when the layout pair and dtypes allow it (the
+    // planner's stage/tile decisions are shared): sm_90+ device, no
+    // kill switch, and every descriptor encodable — else the cp.async
+    // twin below runs unchanged.
+    if constexpr (kBigFast && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
+        if (!gemm_tma_disabled() && astrai::device_facts().cc >= 90 &&
+            launch_tma_dispatch<ElemA, ElemB, LayoutOut, OutT>(p, plan, stream))
+            return;
+    }
     using BigTile = std::conditional_t<kBigFast, TileBigFast, TileBig128x128>;
+    using BigTileS3 = std::conditional_t<kBigFast, TileBigFastS3, TileBig128x128s3>;
     // The epilogue reclaims the operand rings for the output tile; a fat
     // output (fp32, 4B/elem) cannot fit the 128x128 tile inside the fp8
     // rings (64KB > 48KB) — compile-time route those to the narrow CTA
     // (32KB tile <= 36KB rings), same math at lower reuse.
-    constexpr int kRingBytes = ring_smem_bytes(
-        128, 128, 64, 2, (int)sizeof(ElemA), (int)sizeof(ElemB));
-    constexpr bool kBigReclaim = 128 * 128 * (int)sizeof(OutT) <= kRingBytes;
+    constexpr bool kBigReclaim = big_reclaim_fits<ElemA, ElemB, OutT>();
     using BigOrNarrow =
         std::conditional_t<kBigReclaim, BigTile, TileNarrow128x64>;
+    using BigOrNarrowS3 =
+        std::conditional_t<kBigReclaim, BigTileS3, TileNarrow128x64s3>;
     switch (plan.cta) {
     case GemmPlan::Cta::kBig128:
-        launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, BigOrNarrow,
-                                 LayoutOut, OutT>>(p, stream);
+        if (plan.stages >= 3) {
+            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, BigOrNarrowS3,
+                                     LayoutOut, OutT>>(p, stream);
+        } else {
+            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, BigOrNarrow,
+                                     LayoutOut, OutT>>(p, stream);
+        }
         break;
     case GemmPlan::Cta::kNarrow128x64:
-        launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
-                                 TileNarrow128x64, LayoutOut, OutT>>(p, stream);
+        if (plan.stages >= 3) {
+            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
+                                     TileNarrow128x64s3, LayoutOut, OutT>>(p, stream);
+        } else {
+            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
+                                     TileNarrow128x64, LayoutOut, OutT>>(p, stream);
+        }
         break;
     case GemmPlan::Cta::kSmall64:
-        if (plan.small_s3) {
+        if (plan.stages >= 3) {
             launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
                                      TileSmall64s3, LayoutOut, OutT>>(p, stream);
         } else {

@@ -30,20 +30,18 @@
 // consumer either aligns the tile to 1024B or phases the index by the
 // tile's own address bits.) Every application folds to one IMAD plus one
 // XOR immediate; the vocabulary is zero-cost.
+//
+// The Shape/Stride extent vocabulary this layer's layouts are written in
+// lives in shape.cuh (shared with the policy and mma trait layers); only
+// the swizzle-specific carriers are defined here.
 
 #pragma once
 
 #include <cstdint>
 
-namespace astrai {
+#include "shape.cuh"
 
-// log2 of a compile-time power of two.
-template <int N, int Acc = 0>
-struct log2_const : log2_const<(N >> 1), Acc + 1> {};
-template <int Acc>
-struct log2_const<1, Acc> {
-    static constexpr int value = Acc;
-};
+namespace astrai {
 
 template <int Bits, int Shift>
 struct Swizzle {
@@ -59,21 +57,8 @@ struct Swizzle {
     }
 };
 
-// Static integer shape (cute's Shape<> role): one variadic type names one
-// geometry — the CTA tile Shape<M, N, K> and warp tile Shape<M, N> of the
-// policy layer (kM/kN/kK, missing extents read 0) or the staged tile's
-// chunk grid Shape<Rows, Chunks> of the layout layer below. One vocabulary
-// serves both; tile recipes and staging layouts compose from the same type.
-template <int... Ns>
-struct Shape {
-    static constexpr int kRank = sizeof...(Ns);
-    static constexpr int kVals[kRank ? kRank : 1] = {Ns...};
-    static constexpr int kM = kRank > 0 ? kVals[0] : 0;
-    static constexpr int kN = kRank > 1 ? kVals[1] : 0;
-    static constexpr int kK = kRank > 2 ? kVals[2] : 0;
-};
-
-// Layout carriers: the Shape above carries the extents, Stride the affine
+// Layout carriers: the Shape above (see shape.cuh) carries the extents,
+// Stride the affine
 // map. All staged tiles are row-major 16B-chunk grids, so the row stride
 // is the chunk count and the column stride one.
 template <int... Ns>

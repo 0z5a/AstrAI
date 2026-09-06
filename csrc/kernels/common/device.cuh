@@ -93,11 +93,13 @@ decltype(auto) arch_dispatch(int major, int minor, Fn&& fn) {
 // cudaFuncSetAttribute can raise dynamic shared memory to (about 1KB
 // under the per-SM figure), the feasibility bound for staged kernels;
 // consumers that fold smem residency into measured throughput scalars
-// simply do not read it.
+// simply do not read it. cc is the numeric compute capability (120 =
+// sm_120), the feature gate for the TMA staging path.
 struct DeviceFacts {
     int sms;
     int smem_max;
     int64_t l2_bytes;
+    int cc = 0;
 };
 
 inline DeviceFacts device_facts() {
@@ -107,14 +109,17 @@ inline DeviceFacts device_facts() {
     const bool cacheable = dev >= 0 && dev < 64;
     DeviceFacts facts = cacheable ? cached[dev] : DeviceFacts{};
     if (!facts.sms) {
-        int l2 = 0;
+        int l2 = 0, major = 0, minor = 0;
         cudaDeviceGetAttribute(&facts.sms, cudaDevAttrMultiProcessorCount, dev);
         cudaDeviceGetAttribute(&facts.smem_max,
                                cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         facts.sms = facts.sms > 0 ? facts.sms : 1;
         facts.smem_max = facts.smem_max > 0 ? facts.smem_max : 48 * 1024;
         facts.l2_bytes = l2 > 0 ? l2 : (int64_t{4} << 20);
+        facts.cc = major > 0 ? major * 10 + minor : 0;
         if (cacheable) cached[dev] = facts;
     }
     return facts;
