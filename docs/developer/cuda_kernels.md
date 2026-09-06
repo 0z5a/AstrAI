@@ -53,7 +53,7 @@ layered directory:
 | `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 32×32-tile transpose kernel (out_layout 0/1/2), `quant_in_traits<InT>` unpack — no torch |
 | `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK — adding a dtype = one specialization), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
-| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB>` (tile geometry via the promoted MmaT) + smem budget / occupancy hint (`GemmSmem`) + `GemmPolicy` (traits + layouts + knobs — the kernel's single template parameter); `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
+| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBig128x128` / `TileBigFast` / `TileNarrow128x64` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter); `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
 | `gemm/load.cuh` | operand loaders: swizzle (`tile_at`), congruous cp.async (predicated + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
 | `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
@@ -128,6 +128,17 @@ to a predication-free copy with loop-carried prefetch state: +4.5..10% on
 the issue-bound 64×64 CTA (256³..1024³), −3% on the 128×128 CTA, so only
 the small CTA opts in.
 
+**Tile vocabulary (CUTLASS-style).** Tile geometry is expressed as types,
+not positional ints: `Shape<M, N, K>` (CTA tile; K = the per-stage k-tile)
+and `Shape<M, N>` (warp tile) compose into a `GemmTileConfig` — one named
+recipe bundling shapes + stage depth + loop mode. The production manifest
+in `policy.cuh` (`TileBig128x128`, `TileBigFast`, `TileNarrow128x64`,
+`TileSmall64s2/s3`) is the full set `launch_plan` dispatches to; a new
+geometry in the ladder is one alias plus one planner branch, never a
+re-spelled int list. Device collectives only read the derived
+`Traits::kBlockM/kBlockN/...` constants, so this is purely a configuration
+surface — the generated SASS is unchanged.
+
 **Launch planning crossovers** (L20, TFLOPS, big vs alternative):
 crosswise problems keep the 64×64 s3 CTA below ~1.5 waves of 128×128
 tiles (M=256: 129.7 vs 113.1; 1024³: 107.2 vs 94.8; the big CTA wins from
@@ -198,6 +209,22 @@ M=2048/4096): W8A16 reaches 0.83–1.08× of cuBLAS bf16 `F.linear`
 weight traffic pays), W8A8 0.73–0.86×, W16A16 0.83–0.94× — the dequant
 insert is not the bottleneck at these shapes; the modes track the
 W16A16 baseline within a few percent.
+
+**Humming parity (what we deliberately have and have not).** Adopted from
+humming: in-register LOP3 dequant, the dtype-promotion unified mainloop,
+per-operand epilogue scale placement, and now the CUTLASS-style
+`Shape`/`GemmTileConfig` vocabulary. Not adopted, in rough priority order
+for future work: grouped-along-K / 2-D block scales (GPTQ/AWQ import —
+needs mainloop scale application, the epilogue cannot fold them),
+asymmetric quantization with zero-points (offline folding at repack time),
+sub-int8 dtypes (int4 and 3/5/6/7-bit need packed staging + a second
+dequant family), the offline weight interleave (documented deferred above),
+stream-K (wave-quantization; persistent scheduling alone measured worse
+here), and the sm90+ feature set (TMA/cluster/warp-spec/PDL — a different
+device target). Out of scope by design: NVRTC JIT + per-SM heuristic
+tables (conflicts with the AOT single-instantiation-TU discipline) and MoE
+gather/grouped GEMM. We keep two things humming lacks: strided-batch
+operands with broadcast, and fp32 output.
 
 ## Build System
 
@@ -532,7 +559,7 @@ csrc/
 │   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
-│   │   ├── policy.cuh                #     smem budget / occupancy hint + dtype-generic GemmPolicy
+│   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy
 │   │   ├── load.cuh                  #     operand loaders (swizzle, congruous cp.async, crosswise direct, trans staging)
 │   │   ├── scheduler.cuh             #     grouped/plain raster mapping
 │   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)

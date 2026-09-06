@@ -23,16 +23,16 @@ using fp8_elem_t =
     std::conditional_t<Fmt == FP8Format::E5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
 
 // Compile-time tile configuration, mirroring KernelTraits in the attention
-// kernels: CTA tile, warp tile (WarpM x WarpN — e.g. 64x32 on the 128x128
-// CTA, 32x32 on the 64x64 small CTA) and cp.async pipeline depth.
+// kernels: the CTA tile and warp tiling arrive as Shape types, the
+// cp.async pipeline depth as a stage count.
 //
 // ElemA / ElemB are independent operand types. The MMA runs on the
 // promoted MmaT (gemm_mma_traits): W16A16 passes through, symmetric fp8
 // keeps its native mma, and any int8 operand dequantizes in-register to
 // bf16 between the fragment load and the mma — kDequantA/kDequantB mark
 // those inserts per side (W8A8 inserts both, W8A16 only B).
-template <typename ElemA_, typename ElemB_,
-            int BlockM, int BlockN, int K, int Stages, int WarpM = 64, int WarpN = 32>
+template <typename ElemA_, typename ElemB_, typename CtaShape_,
+          typename WarpShape_, int Stages>
 struct GemmTraits {
     using ElemA = ElemA_;
     using ElemB = ElemB_;
@@ -41,12 +41,14 @@ struct GemmTraits {
     using ElemTraitsA = gemm_elem_traits<ElemA_>;
     using ElemTraitsB = gemm_elem_traits<ElemB_>;
 
-    static constexpr int kBlockM = BlockM;
-    static constexpr int kBlockN = BlockN;
-    static constexpr int kK = K;
+    using CtaShape = CtaShape_;
+    using WarpShape = WarpShape_;
+    static constexpr int kBlockM = CtaShape_::kM;
+    static constexpr int kBlockN = CtaShape_::kN;
+    static constexpr int kK = CtaShape_::kK;
     static constexpr int kStages = Stages;
-    static constexpr int kWarpM = WarpM;
-    static constexpr int kWarpN = WarpN;
+    static constexpr int kWarpM = WarpShape_::kM;
+    static constexpr int kWarpN = WarpShape_::kN;
 
     static constexpr int kElemBytesA = ElemTraitsA::kBytes;
     static constexpr int kElemBytesB = ElemTraitsB::kBytes;
@@ -58,12 +60,12 @@ struct GemmTraits {
 
     // Derived geometry: warp tiles tile the CTA. The smem budget is
     // layout-aware, so it lives in GemmSmem (below).
-    static constexpr int kWarpsM = BlockM / WarpM;
-    static constexpr int kWarpsN = BlockN / WarpN;
+    static constexpr int kWarpsM = kBlockM / kWarpM;
+    static constexpr int kWarpsN = kBlockN / kWarpN;
     static constexpr int kCtaThreads = kWarpsM * kWarpsN * 32;
-    static_assert(kWarpsM * WarpM == BlockM && kWarpsN * WarpN == BlockN,
+    static_assert(kWarpsM * kWarpM == kBlockM && kWarpsN * kWarpN == kBlockN,
                   "warp tiles must exactly tile the CTA");
-    static_assert(WarpM % 16 == 0 && WarpN % 8 == 0,
+    static_assert(kWarpM % 16 == 0 && kWarpN % 8 == 0,
                   "warp tile must be a multiple of the m16n8 MMA shape");
 };
 
@@ -86,15 +88,40 @@ struct GemmSmem {
     static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
 };
 
-template <typename ElemA_, typename ElemB_, typename LayoutA_,
-          typename LayoutB_, typename LayoutOut_ = RowMajor,
-          typename OutT_ = __nv_bfloat16,
-          int BlockM_ = 128, int BlockN_ = 128,
-          int WarpM_ = 64, int WarpN_ = 32, int kK_ = 64, int Stages_ = 2,
-          bool StreamOut_ = false, bool FastLoop_ = false>
+// Tile recipe (CUTLASS-style configuration type): one named bundle of CTA
+// shape, warp tiling, pipeline depth and loop specialization. A policy
+// composes a tile config with operand dtypes and layout tags; the host
+// planner (gemm.cuh) enumerates the manifest below — extending the launch
+// ladder with a new geometry means adding one alias here and one planner
+// branch, never re-spelling positional ints.
+template <typename CtaShape_, typename WarpShape_, int Stages_, bool FastLoop_>
+struct GemmTileConfig {
+    using CtaShape = CtaShape_;
+    using WarpShape = WarpShape_;
+    static constexpr int kStages = Stages_;
+    static constexpr bool kFastLoop = FastLoop_;
+};
+
+// Production tile manifest — the tuned configs launch_plan dispatches to
+// (L20-measured; see the crossover tables in cuda_kernels.md). Big CTA:
+// 128x128 of 8 warps x 64x32, kK=64, 2-stage full ring; the fast
+// (predication-free) loop exists only for dual-congruous staging. Narrow:
+// 128x64, the wave-filling and fat-output route. Small CTA: 64x64 of 4
+// warps x 32x32 — the 24KB s2 variant keeps 4 CTAs/SM resident, the 32KB
+// s3 variant trades that for a deeper pipeline on multi-wave grids.
+using TileBig128x128 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2, false>;
+using TileBigFast = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2, true>;
+using TileNarrow128x64 = GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 2, true>;
+using TileSmall64s2 = GemmTileConfig<Shape<64, 64, 64>, Shape<32, 32>, 2, true>;
+using TileSmall64s3 = GemmTileConfig<Shape<64, 64, 64>, Shape<32, 32>, 3, true>;
+
+template <typename ElemA_, typename ElemB_, typename LayoutA_, typename LayoutB_,
+          typename Tile_, typename LayoutOut_ = RowMajor,
+          typename OutT_ = __nv_bfloat16, bool StreamOut_ = false>
 struct GemmPolicy {
-    using Traits =
-        GemmTraits<ElemA_, ElemB_, BlockM_, BlockN_, kK_, Stages_, WarpM_, WarpN_>;
+    using Tile = Tile_;
+    using Traits = GemmTraits<ElemA_, ElemB_, typename Tile_::CtaShape,
+                              typename Tile_::WarpShape, Tile_::kStages>;
     using LayoutTagA = LayoutA_;
     using LayoutTagB = LayoutB_;
     // Output orientation (CUTLASS LayoutC): direction lives in the type,
@@ -105,7 +132,7 @@ struct GemmPolicy {
     // and copies out through OutElem<OutT> packing facts.
     using OutT = OutT_;
     static constexpr bool kStreamOut = StreamOut_;
-    static constexpr bool kFastLoop = FastLoop_;
+    static constexpr bool kFastLoop = Tile_::kFastLoop;
     using Smem = GemmSmem<Traits, LayoutA_, LayoutB_>;
     // Flattened for __launch_bounds__, which takes no dependent type names.
     static constexpr int kCtaThreads = Traits::kCtaThreads;
@@ -116,19 +143,16 @@ struct GemmPolicy {
 // fp8 convenience aliases: format-parameterized names over the generic
 // policy (A and B share the fp8 type), kept for the binding's FP8Format
 // dispatch and the C tests.
-template <FP8Format Fmt, int BlockM, int BlockN, int K, int Stages,
-          int WarpM = 64, int WarpN = 32>
-using Fp8GemmTraits = GemmTraits<fp8_elem_t<Fmt>, fp8_elem_t<Fmt>, BlockM, BlockN, K, Stages, WarpM, WarpN>;
+template <FP8Format Fmt, typename CtaShape, typename WarpShape, int Stages>
+using Fp8GemmTraits =
+    GemmTraits<fp8_elem_t<Fmt>, fp8_elem_t<Fmt>, CtaShape, WarpShape, Stages>;
 
-template <FP8Format Fmt_, typename LayoutA_, typename LayoutB_,
+template <FP8Format Fmt_, typename LayoutA_, typename LayoutB_, typename Tile_,
           typename LayoutOut_ = RowMajor, typename OutT_ = __nv_bfloat16,
-          int BlockM_ = 128, int BlockN_ = 128,
-          int WarpM_ = 64, int WarpN_ = 32, int kK_ = 64, int Stages_ = 2,
-          bool StreamOut_ = false, bool FastLoop_ = false>
+          bool StreamOut_ = false>
 using Fp8GemmPolicy =
-    GemmPolicy<fp8_elem_t<Fmt_>, fp8_elem_t<Fmt_>, LayoutA_, LayoutB_, LayoutOut_,
-               OutT_, BlockM_, BlockN_, WarpM_, WarpN_, kK_, Stages_,
-               StreamOut_, FastLoop_>;
+    GemmPolicy<fp8_elem_t<Fmt_>, fp8_elem_t<Fmt_>, LayoutA_, LayoutB_, Tile_,
+               LayoutOut_, OutT_, StreamOut_>;
 
 }  // namespace gemm
 }  // namespace astrai

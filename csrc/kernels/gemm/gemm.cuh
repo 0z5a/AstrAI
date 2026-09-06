@@ -212,61 +212,45 @@ void launch_policy(const GemmParams& p, cudaStream_t stream) {
         Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p);
 }
 
-// Plan -> Policy: the production-tuned configs. Big CTA: 128x128 of 8 warps
-// x 64x32, kK=64, 2-stage full ring, fast loop only for dual-congruous
-// layouts. Narrow: 128x64. Small CTA: 64x64 of 4 warps x 32x32, kK=64,
-// kFastLoop always on. ElemT and OutT are independent template knobs (both
-// flow from the entry dispatch; fp8 formats arrive through fp8_elem_t).
-// Takes the params by value: the plan's raster decision lands in the copy
-// the kernel receives (callers keep theirs).
+// Plan -> Policy: compose the operand facts with one named tile config
+// from the manifest in policy.cuh. The big CTA's fast loop exists only for
+// dual-congruous staging (both operands cp.async); crosswise operands take
+// the predicated generic loop. Takes the params by value: the plan's raster
+// decision lands in the copy the kernel receives (callers keep theirs).
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
           typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16>
 void launch_plan(GemmParams p, const GemmPlan& plan, cudaStream_t stream) {
     p.raster = plan.raster;
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
+    using BigTile = std::conditional_t<kBigFast, TileBigFast, TileBig128x128>;
     // The epilogue reclaims the operand rings for the output tile; a fat
     // output (fp32, 4B/elem) cannot fit the 128x128 tile inside the fp8
     // rings (64KB > 48KB) — compile-time route those to the narrow CTA
     // (32KB tile <= 36KB rings), same math at lower reuse.
-    constexpr int kRingBytes = 3 * 64 * (128 * (int)sizeof(ElemA) + 128 * (int)sizeof(ElemB));
+    constexpr int kRingBytes =
+        3 * 64 * (128 * (int)sizeof(ElemA) + 128 * (int)sizeof(ElemB));
     constexpr bool kBigReclaim = 128 * 128 * (int)sizeof(OutT) <= kRingBytes;
+    using BigOrNarrow =
+        std::conditional_t<kBigReclaim, BigTile, TileNarrow128x64>;
     switch (plan.cta) {
-    case GemmPlan::Cta::kBig128: {
-        if constexpr (kBigReclaim) {
-            using Policy =
-                GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           128, 128, 64, 32, 64, 2, false, kBigFast>;
-            launch_policy<Policy>(p, stream);
-        } else {
-            using Policy =
-                GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           128, 64, 32, 32, 64, 2, false, true>;
-            launch_policy<Policy>(p, stream);
-        }
+    case GemmPlan::Cta::kBig128:
+        launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, BigOrNarrow,
+                                 LayoutOut, OutT>>(p, stream);
         break;
-    }
-    case GemmPlan::Cta::kNarrow128x64: {
-        using Policy =
-            GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                       128, 64, 32, 32, 64, 2, false, true>;
-        launch_policy<Policy>(p, stream);
+    case GemmPlan::Cta::kNarrow128x64:
+        launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
+                                 TileNarrow128x64, LayoutOut, OutT>>(p, stream);
         break;
-    }
-    case GemmPlan::Cta::kSmall64: {
+    case GemmPlan::Cta::kSmall64:
         if (plan.small_s3) {
-            using Policy =
-                GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           64, 64, 32, 32, 64, 3, false, true>;
-            launch_policy<Policy>(p, stream);
+            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
+                                     TileSmall64s3, LayoutOut, OutT>>(p, stream);
         } else {
-            using Policy =
-                GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           64, 64, 32, 32, 64, 2, false, true>;
-            launch_policy<Policy>(p, stream);
+            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
+                                     TileSmall64s2, LayoutOut, OutT>>(p, stream);
         }
         break;
-    }
     }
 }
 

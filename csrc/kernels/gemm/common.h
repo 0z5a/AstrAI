@@ -21,6 +21,19 @@ namespace gemm {
 struct RowMajor {};
 struct ColMajor {};
 
+// Compile-time tile geometry vocabulary (CUTLASS Shape<> analog): one type
+// names one tile concept — the CTA tile is Shape<M, N, K> (K = the k-tile
+// staged per pipeline step), the warp tile Shape<M, N> (K stays CTA-wide).
+// Tile recipes compose from these instead of positional ints, so a
+// configuration reads as what it tiles and can be named, aliased and
+// swapped as a single type (see GemmTileConfig in policy.cuh).
+template <int M_, int N_, int K_ = 0>
+struct Shape {
+    static constexpr int kM = M_;
+    static constexpr int kN = N_;
+    static constexpr int kK = K_;
+};
+
 // Element-type traits: the per-dtype facts the policy/smem/load layers
 // derive geometry from. Adding a dtype = adding a specialization here plus
 // an mma_shape<InT> in common/mma.cuh (fragment layout + mma.sync shape);

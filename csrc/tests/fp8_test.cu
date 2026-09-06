@@ -334,9 +334,10 @@ template <typename LA, typename LB>
 constexpr bool kCaseFast =
     !std::is_same_v<LA, ColMajor> && !std::is_same_v<LB, RowMajor>;
 template <typename LA, typename LB, int kK, int Stages>
-using CasePolicy =
-    Fp8GemmPolicy<FP8Format::E4M3, LA, LB, RowMajor, __nv_bfloat16, 128, 128,
-                  64, 32, kK, Stages, false, kCaseFast<LA, LB>>;
+using CasePolicy = Fp8GemmPolicy<
+    FP8Format::E4M3, LA, LB,
+    GemmTileConfig<Shape<128, 128, kK>, Shape<64, 32>, Stages, kCaseFast<LA, LB>>,
+    RowMajor, __nv_bfloat16>;
 
 // fp8 e4m3 layout case: direct big-CTA policy (dispatch=0), the production
 // NN-swap route (1) or the production NT route (2).
@@ -432,11 +433,11 @@ static bool test_gemm_dtypes() {
     // across the remaining layouts (TN/TT crosswise staging — 2-byte
     // elements — and the NN swap rewrite).
     using Bf16Big =
-        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, true>;
+        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, TileBigFast,
+                   RowMajor, __nv_bfloat16>;
     using Bf16Small =
-        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 64, 64, 32, 32, 64, 3, false, true>;
+        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, TileSmall64s3,
+                   RowMajor, __nv_bfloat16>;
     printf("bf16 operands (all layouts):\n");
     for (int k : {64, 128, 320, 512}) {
         std::vector<float> ha, hb;
@@ -483,20 +484,20 @@ static bool test_gemm_dtypes() {
     // plus the direct dual-row-major NN), with big-CTA instantiations
     // pinned at k=320 (the plan ladder routes 256x256 to the small CTA).
     using MixedBig =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, true>;
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, TileBigFast,
+                   RowMajor, __nv_bfloat16>;
     using MixedSmall =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 64, 64, 32, 32, 64, 3, false, true>;
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, TileSmall64s3,
+                   RowMajor, __nv_bfloat16>;
     using MixedTT =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, false>;
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileBig128x128,
+                   RowMajor, __nv_bfloat16>;
     using MixedTN =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, false>;
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, TileBig128x128,
+                   RowMajor, __nv_bfloat16>;
     using MixedNN =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, RowMajor, RowMajor,
-                   __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, false>;
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, RowMajor, TileBig128x128,
+                   RowMajor, __nv_bfloat16>;
     printf("W8A16 (bf16 act x int8 weight, all layouts):\n");
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;
@@ -607,8 +608,8 @@ static bool test_gemm_dtypes() {
     // pinned big-CTA instantiation at k=320.
     {
         using W8A8Big =
-            GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, RowMajor,
-                       __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, true>;
+            GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, TileBigFast,
+                       RowMajor, __nv_bfloat16>;
         printf("W8A8 (int8 act x int8 weight, all layouts):\n");
         for (int k : {64, 320, 512}) {
             std::vector<float> ha, hb;
@@ -717,8 +718,8 @@ static bool test_gemm_dtypes() {
     // narrow tile's 32KB output fits the 36KB reclaimed operand rings
     // (launch_plan compile-time-reroutes the 128x128 CTA for fat outputs).
     using Fp8F32Out =
-        GemmPolicy<__nv_fp8_e4m3, __nv_fp8_e4m3, RowMajor, ColMajor, RowMajor,
-                   float, 128, 64, 32, 32, 64, 2, false, true>;
+        GemmPolicy<__nv_fp8_e4m3, __nv_fp8_e4m3, RowMajor, ColMajor,
+                   TileNarrow128x64, RowMajor, float>;
     printf("fp8 operands, fp32 output:\n");
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;
