@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "common/swizzle.cuh"
+
 // GEMM-family pure POD/traits header — dtype-neutral: layout tags, element
 // traits and the unified parameter POD shared by every element-type
 // specialization (fp8 today, future bf16/half policies); raw __nv_* type
@@ -21,18 +23,11 @@ namespace gemm {
 struct RowMajor {};
 struct ColMajor {};
 
-// Compile-time tile geometry vocabulary (CUTLASS Shape<> analog): one type
-// names one tile concept — the CTA tile is Shape<M, N, K> (K = the k-tile
-// staged per pipeline step), the warp tile Shape<M, N> (K stays CTA-wide).
-// Tile recipes compose from these instead of positional ints, so a
-// configuration reads as what it tiles and can be named, aliased and
-// swapped as a single type (see GemmTileConfig in policy.cuh).
-template <int M_, int N_, int K_ = 0>
-struct Shape {
-    static constexpr int kM = M_;
-    static constexpr int kN = N_;
-    static constexpr int kK = K_;
-};
+// Tile-geometry Shape: merged into the shared static-shape vocabulary
+// (common/swizzle.cuh) the staging layouts also compose from — imported
+// here so the Shape<M, N, K> recipes (CTA tile) and Shape<M, N> (warp
+// tile) keep their spelling (see GemmTileConfig in policy.cuh).
+using astrai::Shape;
 
 // Element-type traits: the per-dtype facts the policy/smem/load layers
 // derive geometry from. Adding a dtype = adding a specialization here plus

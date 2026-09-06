@@ -527,6 +527,15 @@ static bool test_gemm_dtypes() {
     using MixedTT =
         GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileBig128x128,
                    RowMajor, __nv_bfloat16>;
+    using TTSmallS2 =
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileSmall64s2,
+                   RowMajor, __nv_bfloat16>;
+    using TTNarrow =
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileNarrow128x64,
+                   RowMajor, __nv_bfloat16>;
+    using TTBigFast =
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileBigFast,
+                   RowMajor, __nv_bfloat16>;
     using MixedTN =
         GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, TileBig128x128,
                    RowMajor, __nv_bfloat16>;
@@ -558,6 +567,18 @@ static bool test_gemm_dtypes() {
                 ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
                 "w8a16 TT big", 0.02f,
                 [&](GemmParams& p) { launch_policy<MixedTT>(p, 0); }, scale);
+            all &= check_gemm<__nv_bfloat16, int8_t>(
+                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
+                "w8a16 TT smallS2", 0.02f,
+                [&](GemmParams& p) { launch_policy<TTSmallS2>(p, 0); }, scale);
+            all &= check_gemm<__nv_bfloat16, int8_t>(
+                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
+                "w8a16 TT narrow", 0.02f,
+                [&](GemmParams& p) { launch_policy<TTNarrow>(p, 0); }, scale);
+            all &= check_gemm<__nv_bfloat16, int8_t>(
+                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
+                "w8a16 TT bigfast", 0.02f,
+                [&](GemmParams& p) { launch_policy<TTBigFast>(p, 0); }, scale);
             all &= check_gemm<__nv_bfloat16, int8_t>(
                 ha_t.data(), hb_t.data(), 256, 256, k, 256, 256, 0, 1,
                 "w8a16 TN big", 0.02f,

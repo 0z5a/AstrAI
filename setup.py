@@ -92,20 +92,26 @@ class _CMakeBuildExt(_build_ext):
             f"-DPY_SOABI={_python_soabi()}",
         ]
         arch = os.environ.get("ASTRAI_CUDA_ARCH")
-        if not arch:
-            arch = _detect_cuda_arch()
+        max_arch = None
+        try:
+            if arch:
+                # Accept a semicolon list ("80;89;120"); the FP8 gate keys
+                # on the maximum, matching the CMake-side validation.
+                max_arch = max(int(a) for a in arch.split(";") if a.strip())
+            elif detected := _detect_cuda_arch():
+                arch = detected
+                max_arch = int(detected)
+        except ValueError:
+            warnings.warn(
+                f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
+                "FP8 capability will be decided by CMake.",
+                stacklevel=2,
+            )
         if arch:
-            try:
-                if int(str(arch)) < 89:
-                    warnings.warn(
-                        f"FP8 operator disabled: CUDA compute capability {arch} "
-                        "requires 89 or newer.",
-                        stacklevel=2,
-                    )
-            except ValueError:
+            if max_arch is not None and max_arch < 89:
                 warnings.warn(
-                    f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
-                    "FP8 capability will be decided by CMake.",
+                    f"FP8 operator disabled: CUDA compute capability {arch} "
+                    "requires 89 or newer.",
                     stacklevel=2,
                 )
             cfg.append(f"-DASTRAI_CUDA_ARCH={arch}")

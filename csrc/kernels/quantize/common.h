@@ -19,6 +19,19 @@ enum class FP8Format : int {
     E5M2 = 1,
 };
 
+// Compute-capability comparison: is the device at least (major, minor)?
+inline bool sm_at_least(int device_major, int device_minor, int major,
+                        int minor) {
+    return device_major > major ||
+           (device_major == major && device_minor >= minor);
+}
+
+// FP8 tensor-core MMA (`mma.sync.aligned.m16n8k32` with fp8 inputs) exists
+// on Ada (sm_89) and Hopper (sm_90+); sm_80 has no fp8 instructions. The
+// bindings check it at their entry (getDeviceProperties is ATen-cached).
+inline constexpr int kMinSmForFp8Major = 8;
+inline constexpr int kMinSmForFp8Minor = 9;
+
 // Quantize output orientation: RowMajor = x8 only; Transposed = the
 // [cols][rows] x8T only; Dual = both from a single read. Transposed/Dual
 // produce K-contiguous operands so crosswise consumers (backward

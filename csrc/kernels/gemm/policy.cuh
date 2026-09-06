@@ -69,6 +69,14 @@ struct GemmTraits {
                   "warp tile must be a multiple of the m16n8 MMA shape");
 };
 
+// Ring-budget formula, one source for GemmSmem, launch_plan's epilogue
+// reclaim check and the host planner's recipe feasibility gate (gemm.cuh):
+// every operand ring holds kStages+1 buffers of k * (bm*ba + bn*bb) bytes.
+constexpr int ring_smem_bytes(int bm, int bn, int k, int stages,
+                              int ba, int bb) {
+    return (stages + 1) * k * (bm * ba + bn * bb);
+}
+
 // Layout-aware shared-memory budget and occupancy hint. Every operand ring
 // holds kStages+1 buffers: the load for tile i+kStages targets slot
 // (i-1)%(kStages+1) — already consumed — so neither load path needs a
@@ -83,8 +91,9 @@ struct GemmSmem {
     static constexpr bool kDirectB = std::is_same_v<LayoutB, RowMajor>;
     static constexpr int kRingDepth = Traits::kStages + 1;
     static constexpr int kBytes =
-        kRingDepth * Traits::kBlockM * Traits::kK * Traits::kElemBytesA +
-        kRingDepth * Traits::kBlockN * Traits::kK * Traits::kElemBytesB;
+        ring_smem_bytes(Traits::kBlockM, Traits::kBlockN, Traits::kK,
+                        Traits::kStages, Traits::kElemBytesA,
+                        Traits::kElemBytesB);
     static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
 };
 

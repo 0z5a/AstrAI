@@ -7,10 +7,13 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/core/ScalarType.h>
+#include <cstdint>
 #include <torch/extension.h>
 
 #include "common/device.cuh"
 #include "gemm.cuh"
+#include "quantize/checks.h"
 #include "quantize/common.h"
 
 using namespace astrai;
@@ -29,17 +32,24 @@ template void gemm<FP8Format::E5M2>(GemmParams, cudaStream_t, bool, bool);
 // the fp8-weight variants (bf16 x e4m3/e5m2, in-register hardware widen),
 // then W8A8 (int8 x int8, both sides dequantize in-register).
 template void gemm_dispatch<__nv_bfloat16, __nv_bfloat16>(GemmParams,
-                                                          cudaStream_t, bool,
+                                                          cudaStream_t, 
+                                                          bool,
                                                           bool);
-template void gemm_dispatch<__nv_bfloat16, int8_t>(GemmParams, cudaStream_t,
-                                                   bool, bool);
+template void gemm_dispatch<__nv_bfloat16, int8_t>(GemmParams, 
+                                                   cudaStream_t,
+                                                   bool, 
+                                                   bool);
 template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>(GemmParams,
-                                                          cudaStream_t, bool,
+                                                          cudaStream_t, 
+                                                          bool,
                                                           bool);
 template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>(GemmParams,
-                                                          cudaStream_t, bool,
+                                                          cudaStream_t, 
+                                                          bool,
                                                           bool);
-template void gemm_dispatch<int8_t, int8_t>(GemmParams, cudaStream_t, bool,
+template void gemm_dispatch<int8_t, int8_t>(GemmParams, 
+                                            cudaStream_t, 
+                                            bool,
                                             bool);
 
 namespace {
@@ -96,6 +106,62 @@ QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent,
                 name, " must hold 1 element (per-tensor) or ", extent,
                 " (per-row/per-channel)");
     return {s.data_ptr<float>(), s.numel() == 1 ? 0 : (int)extent};
+}
+
+// The dtype-pair dispatch switch below replaces a hand-maintained if/else
+// chain: each supported (activation, weight) pair selects its
+// gemm_dispatch instantiation exactly once, and an unsupported pair raises
+// with the actual operand dtypes in the message instead of a hardcoded
+// list that can drift out of sync. pack_dtypes is constexpr, so every
+// case label is a compile-time constant and the switch lowers to a jump
+// table — one indexed branch, no runtime-initialized state. The function
+// is not constexpr only because the default arm throws.
+using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
+
+constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
+    return static_cast<uint16_t>(static_cast<uint8_t>(a)) << 8 |
+           static_cast<uint8_t>(b);
+}
+
+template <typename A, typename B>
+constexpr GemmDispatchFn make_gemm_dispatch_fn() {
+    return [](GemmParams p, cudaStream_t s, bool ta, bool tb) {
+        gemm_dispatch<A, B>(p, s, ta, tb);
+    };
+}
+
+GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
+    GemmDispatchFn fn = nullptr;
+    switch (pack_dtypes(a, b)) {
+        case pack_dtypes(torch::kBFloat16, torch::kBFloat16):
+            fn = make_gemm_dispatch_fn<__nv_bfloat16, __nv_bfloat16>();
+            break;
+        case pack_dtypes(torch::kBFloat16, torch::kChar):
+            fn = make_gemm_dispatch_fn<__nv_bfloat16, int8_t>();
+            break;
+        case pack_dtypes(torch::kChar, torch::kChar):
+            fn = make_gemm_dispatch_fn<int8_t, int8_t>();
+            break;
+        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e4m3fn):
+            fn = make_gemm_dispatch_fn<__nv_bfloat16, __nv_fp8_e4m3>();
+            break;
+        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e5m2):
+            fn = make_gemm_dispatch_fn<__nv_bfloat16, __nv_fp8_e5m2>();
+            break;
+        case pack_dtypes(torch::kFloat8_e4m3fn, torch::kFloat8_e4m3fn):
+            fn = make_gemm_dispatch_fn<__nv_fp8_e4m3, __nv_fp8_e4m3>();
+            break;
+        case pack_dtypes(torch::kFloat8_e5m2, torch::kFloat8_e5m2):
+            fn = make_gemm_dispatch_fn<__nv_fp8_e5m2, __nv_fp8_e5m2>();
+            break;
+        default:
+            TORCH_CHECK(false,
+                        "unsupported operand dtype pair ", toString(a), " x ", toString(b),
+                        ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "
+                        "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or "
+                        "matching fp8 x fp8");
+    }
+    return fn;
 }
 
 // Shared body of quant_gemm: batch broadcast rules, zero-copy transposed
@@ -172,31 +238,7 @@ torch::Tensor mm_quant(const torch::Tensor& a, const torch::Tensor& b,
     p.out_ld = static_cast<int>(n);
 
     const auto dt_a = a.scalar_type(), dt_b = b.scalar_type();
-    if (dt_a == torch::kBFloat16 && dt_b == torch::kChar) {
-        gemm_dispatch<__nv_bfloat16, int8_t>(p, stream.stream(), tag_a, tag_b);
-    } else if (dt_a == torch::kChar && dt_b == torch::kChar) {
-        gemm_dispatch<int8_t, int8_t>(p, stream.stream(), tag_a, tag_b);
-    } else if (dt_a == torch::kBFloat16 && dt_b == torch::kBFloat16) {
-        gemm_dispatch<__nv_bfloat16, __nv_bfloat16>(p, stream.stream(), tag_a,
-                                                    tag_b);
-    } else if (dt_a == torch::kBFloat16 && dt_b == torch::kFloat8_e4m3fn) {
-        gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>(p, stream.stream(), tag_a,
-                                                    tag_b);
-    } else if (dt_a == torch::kBFloat16 && dt_b == torch::kFloat8_e5m2) {
-        gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>(p, stream.stream(), tag_a,
-                                                    tag_b);
-    } else if (dt_a == torch::kFloat8_e4m3fn && dt_b == torch::kFloat8_e4m3fn) {
-        gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(p, stream.stream(), tag_a,
-                                                    tag_b);
-    } else if (dt_a == torch::kFloat8_e5m2 && dt_b == torch::kFloat8_e5m2) {
-        gemm_dispatch<__nv_fp8_e5m2, __nv_fp8_e5m2>(p, stream.stream(), tag_a,
-                                                    tag_b);
-    } else {
-        TORCH_CHECK(false,
-                    "unsupported operand dtype pair: expected bf16 x int8 "
-                    "(W8A16), int8 x int8 (W8A8), bf16 x bf16 (W16A16), bf16 "
-                    "x fp8 (W-F8A16), or matching fp8 x fp8");
-    }
+    find_gemm_dispatch(dt_a, dt_b)(p, stream.stream(), tag_a, tag_b);
     C10_CUDA_CHECK(cudaGetLastError());
     return output;
 }
@@ -217,18 +259,17 @@ torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
                          py::object bias) {
     const auto dt_a = a.scalar_type(), dt_b = b.scalar_type();
     const bool i8a = dt_a == torch::kChar, i8b = dt_b == torch::kChar;
-    const bool f8a =
-        dt_a == torch::kFloat8_e4m3fn || dt_a == torch::kFloat8_e5m2;
-    const bool f8b =
-        dt_b == torch::kFloat8_e4m3fn || dt_b == torch::kFloat8_e5m2;
+    const bool f8a = dt_a == torch::kFloat8_e4m3fn || dt_a == torch::kFloat8_e5m2;
+    const bool f8b = dt_b == torch::kFloat8_e4m3fn || dt_b == torch::kFloat8_e5m2;
     const bool b16a = dt_a == torch::kBFloat16, b16b = dt_b == torch::kBFloat16;
-    TORCH_CHECK((b16a && (b16b || i8b || f8b)) || (i8a && i8b) ||
-                    (f8a && f8b && dt_a == dt_b),
+    TORCH_CHECK((b16a && (b16b || i8b || f8b)) || (i8a && i8b) ||  (f8a && f8b && dt_a == dt_b),
                 "quant_gemm: unsupported dtype pair (a=", toString(dt_a),
                 ", b=", toString(dt_b),
                 "): expected bf16 x bf16/int8/fp8, int8 x int8, or matching "
                 "fp8 x fp8");
-    if (f8a || f8b) check_fp8_device(a);
+    if (f8a || f8b) {
+        astrai::quant::check_fp8_device(a.device().index());
+    }
     const int64_t m = trans_a ? a.size(-1) : a.size(-2);
     const int64_t n = trans_b ? b.size(-2) : b.size(-1);
     auto opt_scale = [&](py::object s, int64_t extent, const char* name,

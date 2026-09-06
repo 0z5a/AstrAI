@@ -26,6 +26,19 @@ if(NOT DEFINED ASTRAI_CUDA_ARCH)
     endif()
 endif()
 
+# ASTRAI_CUDA_ARCH accepts a single arch or a semicolon list ("80;89;120"):
+# every listed arch lands in the fatbin, so one .so serves a mixed fleet —
+# the driver picks the SASS slice per device. Validation and the FP8 gate
+# below run on the list's maximum.
+separate_arguments(ASTRAI_CUDA_ARCH_LIST NATIVE_COMMAND "${ASTRAI_CUDA_ARCH}")
+list(TRANSFORM ASTRAI_CUDA_ARCH_LIST STRIP)
+list(REMOVE_DUPLICATES ASTRAI_CUDA_ARCH_LIST)
+if(NOT ASTRAI_CUDA_ARCH_LIST)
+    message(FATAL_ERROR "ASTRAI_CUDA_ARCH resolved to an empty arch list")
+endif()
+list(SORT ASTRAI_CUDA_ARCH_LIST COMPARE NATURAL)
+list(GET ASTRAI_CUDA_ARCH_LIST -1 ASTRAI_CUDA_ARCH_MAX)
+
 set(TORCH_LIB_DIR "${TORCH_HOME}/lib")
 set(CUDA_LIB_DIR "/usr/local/cuda/lib64")
 
@@ -46,16 +59,17 @@ set(TORCH_LIBS
     "${TORCH_LIB_DIR}/libc10.so"
     CUDA::cudart)
 
-set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH}")
+set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}")
 
 # Kernel registry — parallel lists of module names (.so / pybind names,
 # globally unique across families) and their per-family source paths under
 # kernels/. `loader.py` auto-discovers the .so files in astrai/extension/lib/,
 # so this CMake registry is the single place to register a new kernel.
 #
-# FP8 MMA instructions require sm_89+. Keep the target out of the build on
-# older architectures instead of instantiating templates that cannot compile.
-# The remaining kernels are still useful on sm_80+ (including sm_86).
+# FP8 MMA instructions require sm_89+. Keep the target out of the build
+# unless at least one listed arch is 89+ instead of instantiating templates
+# that cannot compile. The remaining kernels are still useful on sm_80+
+# (including sm_86).
 set(KERNEL_NAMES
     attn_decode
     attn_prefill
@@ -71,14 +85,14 @@ set(KERNEL_SRCS
     rotary_emb.cu
 )
 
-if(ASTRAI_CUDA_ARCH GREATER_EQUAL 89)
+if(ASTRAI_CUDA_ARCH_MAX GREATER_EQUAL 89)
     list(APPEND KERNEL_NAMES quantize)
     list(APPEND KERNEL_SRCS quantize/quantize.cu)
     list(APPEND KERNEL_NAMES gemm)
     list(APPEND KERNEL_SRCS gemm/gemm.cu)
 else()
     message(WARNING
-        "FP8 operator disabled: ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "
+        "FP8 operator disabled: max ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "
         "requires compute capability 89 or newer")
 endif()
 

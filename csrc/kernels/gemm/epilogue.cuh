@@ -1,7 +1,10 @@
 #pragma once
 // Collective epilogue: fused bias, the bf16 scatter of the fp32 accumulators
 // through the reclaimed operand shared memory, and the coalesced copy-out.
+// The staging swizzle is one instance of the unified family
+// (common/swizzle.cuh) shared with the operand staging in load.cuh.
 
+#include "common/swizzle.cuh"
 #include "gemm/common.h"
 #include "policy.cuh"
 
@@ -60,6 +63,18 @@ struct GemmCollectiveEpilogue {
     // swap computes E = B^T A^T, instantiated with LayoutOut = ColMajor.
     static constexpr bool t_out =
         !std::is_same_v<typename Policy::LayoutTagOut, RowMajor>;
+    // Staged row width (full rows; rows and row length trade places under
+    // the swap), its 16B-chunk count, and the staged-output layout,
+    // cute-style: composition(Swizzle, Layout<Shape, Stride>) over the
+    // chunk grid — a custom instance (the row field XORs straight onto the
+    // chunk field).
+    static constexpr int kRowElems = t_out ? kBlockM : kBlockN;
+    static constexpr int kRowRows = t_out ? kBlockN : kBlockM;
+    static constexpr int kRowChunks = kRowElems / OE::kChunkElems;
+    static constexpr int kRowBits = log2_const<kRowChunks>::value;
+    using OutLayout = decltype(
+        composition(Swizzle<kRowBits, kRowBits>{},
+                    Layout<Shape<kRowRows, kRowChunks>, Stride<kRowChunks, 1>>{}));
     const int row_elems, row_chunks;
     const int warp_m, warp_n, group, thread_in_group;
     const int64_t block_m, block_n;
@@ -73,8 +88,8 @@ struct GemmCollectiveEpilogue {
           b_scale(p.b_scale_n > 0 ? p.b_scale : nullptr),
           bias(reinterpret_cast<const __nv_bfloat16*>(p.bias_ptr)),
           m(p.m), n(p.n), out_ld(p.out_ld),
-          row_elems(t_out ? kBlockM : kBlockN),
-          row_chunks(row_elems / OE::kChunkElems),
+          row_elems(kRowElems),
+          row_chunks(kRowChunks),
           warp_m((tid >> 5) / Traits::kWarpsN),
           warp_n((tid >> 5) % Traits::kWarpsN),
           group((tid & 31) >> 2),
@@ -82,13 +97,12 @@ struct GemmCollectiveEpilogue {
           block_m(block_m), block_n(block_n) {}
 
     // Swizzled address of one 16B chunk (row r, chunk c) of the staged
-    // tile. Plain orientation: kBlockM rows of kBlockN elems; out-
-    // transposed (swap dispatch): rows and row length trade places. Both
-    // row-chunk counts are powers of two, keeping the XOR swizzle
-    // well-defined.
+    // tile — the OutLayout instance. Plain orientation: kBlockM rows of
+    // kBlockN elems; out-transposed (swap dispatch): rows and row length
+    // trade places. Both row-chunk counts are powers of two, keeping the
+    // XOR swizzle well-defined.
     __device__ __forceinline__ OutT* out_chunk(int r, int c) const {
-        return tile_out + (size_t)r * row_elems +
-               ((c ^ (r & (row_chunks - 1))) * OE::kChunkElems);
+        return tile_out + (size_t)OutLayout{}(r, c) * OE::kChunkElems;
     }
     __device__ __forceinline__ OutT* out_elem(int r, int v) const {
         return out_chunk(r, v >> OE::kChunkShift) + (v & (OE::kChunkElems - 1));

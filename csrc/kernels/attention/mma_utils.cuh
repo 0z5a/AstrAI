@@ -3,7 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "common/cp_async.cuh"
+#include "common/pipeline.cuh"
 #include "common/mma.cuh"
 #include "softmax.cuh"
 
@@ -80,7 +80,7 @@ __device__ __forceinline__ int swiz_col(int d, int r, int mask = 7) {
     return ((d >> 3) ^ (r & mask)) << 3 | (d & 7);
 }
 
-// cp.async primitives live in the shared template (common/cp_async.cuh):
+// cp.async primitives live in the shared template (common/pipeline.cuh):
 // `astrai::cp_async_16` (predicated), `astrai::cp_async_commit_group`,
 // `astrai::cp_async_wait_group<N>` / `_wait_all` stage the K/V tiles.
 

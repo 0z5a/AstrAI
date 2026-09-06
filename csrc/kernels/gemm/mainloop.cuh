@@ -73,6 +73,34 @@ struct GemmCollectiveMainloop {
     static constexpr int kAStageBytes = kAStageElems * (int)sizeof(ElemA);
     static constexpr int kBStageBytes = kBStageElems * (int)sizeof(ElemB);
 
+    // Staging layouts, cute-style: one declared instance per staged tile —
+    // composition(Swizzle, Layout<Shape, Stride>) over the row-major 16B-
+    // chunk grid (common/swizzle.cuh) — shared by the stage loaders, the
+    // fragment reads and the folded lane-offset mirrors below. Canonical
+    // tiles [rows][kK] serve congruous and 8-bit crosswise-direct staging
+    // (2-byte elements give the TMA SWIZZLE_128B pattern, 1-byte
+    // SWIZZLE_64B); trans tiles [kK][rows] the 16-bit crosswise cp.async +
+    // ldmatrix.trans staging (custom XOR: chunks swizzled by the k-row
+    // bits, capped at 8 — the LDSM contract's row budget).
+    static constexpr int kChunksA = kK / (16 / (int)sizeof(ElemA));
+    static constexpr int kChunksB = kK / (16 / (int)sizeof(ElemB));
+    static constexpr int kChunksAT = kBlockM / (16 / (int)sizeof(ElemA));
+    static constexpr int kChunksBT = kBlockN / (16 / (int)sizeof(ElemB));
+    using SmemLayoutA = decltype(
+        composition(Swizzle<log2_const<kChunksA>::value, 3>{},
+                    Layout<Shape<kBlockM, kChunksA>, Stride<kChunksA, 1>>{}));
+    using SmemLayoutB = decltype(
+        composition(Swizzle<log2_const<kChunksB>::value, 3>{},
+                    Layout<Shape<kBlockN, kChunksB>, Stride<kChunksB, 1>>{}));
+    using SmemLayoutATrans = decltype(
+        composition(Swizzle<log2_const<kChunksAT < 8 ? kChunksAT : 8>::value,
+                            log2_const<kChunksAT>::value>{},
+                    Layout<Shape<kK, kChunksAT>, Stride<kChunksAT, 1>>{}));
+    using SmemLayoutBTrans = decltype(
+        composition(Swizzle<log2_const<kChunksBT < 8 ? kChunksBT : 8>::value,
+                            log2_const<kChunksBT>::value>{},
+                    Layout<Shape<kK, kChunksBT>, Stride<kChunksBT, 1>>{}));
+
     ElemA* const a_base;
     ElemB* const b_base;
     const ElemA* const a;
@@ -129,16 +157,18 @@ struct GemmCollectiveMainloop {
     __device__ __forceinline__ void load_async(ElemA* a_stage, ElemB* b_stage,
                                                int64_t k_base) const {
         if constexpr (kTransA)
-            load_operand_tile_trans<ElemA, kBlockM, kK, kCtaThreads, kFast>(
-                a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+            load_operand_tile_trans<SmemLayoutATrans, ElemA, kCtaThreads,
+                                    kFast>(a_stage, a, m, k, a_ld, tid,
+                                           k_base, block_m * kBlockM);
         else if constexpr (!kDirectA)
-            load_operand_tile<ElemA, kK, kBlockM, kCtaThreads, kFast>(
+            load_operand_tile<SmemLayoutA, ElemA, kCtaThreads, kFast>(
                 a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (kTransB)
-            load_operand_tile_trans<ElemB, kBlockN, kK, kCtaThreads, kFast>(
-                b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+            load_operand_tile_trans<SmemLayoutBTrans, ElemB, kCtaThreads,
+                                    kFast>(b_stage, b, n, k, b_ld, tid,
+                                           k_base, block_n * kBlockN);
         else if constexpr (!kDirectB)
-            load_operand_tile<ElemB, kK, kBlockN, kCtaThreads, kFast>(
+            load_operand_tile<SmemLayoutB, ElemB, kCtaThreads, kFast>(
                 b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
     // Synchronous direct loads for one k-tile (8-bit crosswise operands
@@ -149,10 +179,10 @@ struct GemmCollectiveMainloop {
     __device__ __forceinline__ void load_direct(ElemA* a_stage, ElemB* b_stage,
                                                 int64_t k_base) const {
         if constexpr (kSyncA)
-            load_crosswise_direct<ElemA, kK, kBlockM, kCtaThreads>(
+            load_crosswise_direct<SmemLayoutA, ElemA, kCtaThreads>(
                 a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
         if constexpr (kSyncB)
-            load_crosswise_direct<ElemB, kK, kBlockN, kCtaThreads>(
+            load_crosswise_direct<SmemLayoutB, ElemB, kCtaThreads>(
                 b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
 
@@ -162,6 +192,7 @@ struct GemmCollectiveMainloop {
     // tile-indexed and the steady-state wait count never needs a runtime
     // dispatch.
     __device__ __forceinline__ void prologue() const {
+        const astrai::PipelineSync<kStages> pipe;
 #pragma unroll
         for (int stage = 0; stage < kStages; ++stage) {
             if (stage < tile_count) {
@@ -174,7 +205,7 @@ struct GemmCollectiveMainloop {
                 load_direct(a_stage_of(stage), b_stage_of(stage),
                             (int64_t)stage * kK);
             }
-            astrai::cp_async_commit_group();
+            pipe.producer_commit();
         }
     }
 
@@ -184,6 +215,7 @@ struct GemmCollectiveMainloop {
     // instantiates only the generic copy.
     template <bool kFast>
     __device__ __forceinline__ void run_loop(float acc[kNt][kMt][4]) const {
+        const astrai::PipelineSync<kStages> pipe;
         const int lane = tid & 31;
         // Fast-path write carries: one per congruous operand (crosswise
         // operands get the empty no-op type), targeting the first
@@ -192,10 +224,17 @@ struct GemmCollectiveMainloop {
         // in, advanced one stage per iteration with an equality wrap —
         // replaces the per-k-tile (tile % ring) * stage_bytes
         // recomputation (a UIMAD.WIDE magic-division ladder in SASS).
-        PrefetchCarry<!kSyncA, ElemA, kK, kBlockM, kCtaThreads, kTransA>
+        // The carry rides the staging geometry of its operand: the trans
+        // layout when the 16-bit crosswise path is active, the canonical
+        // one otherwise.
+        using CarryLayoutA =
+            std::conditional_t<kTransA, SmemLayoutATrans, SmemLayoutA>;
+        using CarryLayoutB =
+            std::conditional_t<kTransB, SmemLayoutBTrans, SmemLayoutB>;
+        PrefetchCarry<!kSyncA, ElemA, CarryLayoutA, kCtaThreads, kTransA>
             carry_a(a_base, kARing, kAStageBytes, a, a_ld, block_m * kBlockM,
                     tid, kStages);
-        PrefetchCarry<!kSyncB, ElemB, kK, kBlockN, kCtaThreads, kTransB>
+        PrefetchCarry<!kSyncB, ElemB, CarryLayoutB, kCtaThreads, kTransB>
             carry_b(b_base, kBRing, kBStageBytes, b, b_ld, block_n * kBlockN,
                     tid, kStages);
         const unsigned a_rd0 = __cvta_generic_to_shared(a_base) +
@@ -213,10 +252,11 @@ struct GemmCollectiveMainloop {
         // when this fires; the tail's unconditional (possibly empty)
         // commits keep that invariant true for every iteration.
         const bool prefetch = tile_index + kStages < tile_count;
-        astrai::cp_async_wait_group<kStages - 1>();
-        // Barrier 1: every thread's cp.async for this stage is complete
-        // before any thread reads tiles written by other threads.
-        __syncthreads();
+        // Steady-state wait + CTA barrier via the sm_80/89 pipeline (one
+        // wait_group<kStages-1> + one __syncthreads): every thread's
+        // cp.async for this stage is complete before any thread reads
+        // tiles written by other threads.
+        pipe.consumer_wait();
 
         // Direct chunks for tile i+kStages: issue LDG+PRMT+STS now so the
         // global-load latency hides behind the MMA phase below.
@@ -314,7 +354,7 @@ struct GemmCollectiveMainloop {
         }
         // Unconditional commit: empty in the tail, it pads the group
         // sequence so the fixed wait above stays correct.
-        astrai::cp_async_commit_group();
+        pipe.producer_commit();
         a_rd += (unsigned)kAStageBytes;
         if (a_rd == a_rd_end) a_rd = a_rd0;
         b_rd += (unsigned)kBStageBytes;
@@ -344,18 +384,17 @@ struct GemmCollectiveMainloop {
     // immediate — zero address arithmetic inside the MMA phase.
     // Per-lane stage-relative BYTE offsets: the ldmatrix *_lane primitives
     // take raw shared-memory byte addresses, so every offset below is
-    // element math scaled by sizeof(ElemT). The swizzle chunk term mirrors
-    // tile_at (16B chunks = kChunkElems elements).
+    // element math scaled by sizeof(ElemT). The swizzle chunk term comes
+    // from the declared staging layouts — the same instances tile_at
+    // applies, so the mirror can never drift.
     static constexpr int kChunkElems = 16 / sizeof(ElemA);
     static constexpr int kChunkShift = log2_const<kChunkElems>::value;
     __device__ __forceinline__ unsigned a_lane_off(int lane) const {
         const int r7 = lane & 7;          // row within the 8-row matrix
         const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
         const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31)
-        constexpr int kChunks = kK / kChunkElems;
-        constexpr int kShift = 3 - log2_const<kChunks>::value;  // tile_at's shift
-        const unsigned lswz =
-            static_cast<unsigned>((r7 >> kShift) & (kChunks - 1));
+        const unsigned lswz = static_cast<unsigned>(
+            (r7 >> SmemLayoutA::kRowShift) & SmemLayoutA::kMask);
         // Stage-relative, loop-invariant per-lane base; A's fragment row
         // carries the +8-row (rh8) and +1-chunk (rh16) halves.
         return static_cast<unsigned>(((a_row0 + rh8 * 8 + r7) * kK +
@@ -368,10 +407,8 @@ struct GemmCollectiveMainloop {
         constexpr int kChunkShiftB = log2_const<kChunkB>::value;
         const int r7 = lane & 7;
         const int rh8 = (lane >> 3) & 1;  // +8 rows (B uses rh8 as its chunk half)
-        constexpr int kChunks = kK / kChunkB;
-        constexpr int kShift = 3 - log2_const<kChunks>::value;
-        const unsigned lswz =
-            static_cast<unsigned>((r7 >> kShift) & (kChunks - 1));
+        const unsigned lswz = static_cast<unsigned>(
+            (r7 >> SmemLayoutB::kRowShift) & SmemLayoutB::kMask);
         return static_cast<unsigned>(((b_row0 + r7) * kK +
                                       ((rh8 ^ lswz) << kChunkShiftB)) *
                                      sizeof(ElemB));
@@ -402,7 +439,8 @@ struct GemmCollectiveMainloop {
 
     // Trans-tile addressing (crosswise 16-bit operands): the LDSM row is a
     // k line, the 16B chunk a window of the non-contract dim, chunks
-    // swizzled by the k-row bits (tile_at_trans). ldmatrix.trans lane
+    // swizzled by the k-row bits (the trans layout instance).
+    // ldmatrix.trans lane
     // contract: lanes 0-7 feed k rows 0-7, lanes 8-15 k rows 8-15 (the
     // second k half of the fragment), lanes 16-31 (x4) step one column
     // chunk (the +8 half of the m16/n8 tile); x2 ignores lanes 16-31.
@@ -419,18 +457,18 @@ struct GemmCollectiveMainloop {
         // k+8 row half.
         const int krow = (lane & 7) + ((lane >> 4) << 3);
         const int col = a_row0 + (((lane >> 3) & 1) << 3);
-        constexpr int kSwz = kBlockM / 8 < 8 ? kBlockM / 8 : 8;
         return (unsigned)(((int64_t)krow * kBlockM +
-                           (((col >> 3) ^ (krow & (kSwz - 1))) << 3) +
+                           (((col >> 3) ^ ((krow >> SmemLayoutATrans::kRowShift) &
+                                           SmemLayoutATrans::kMask)) << 3) +
                            (col & 7)) *
                           sizeof(ElemA));
     }
     __device__ __forceinline__ unsigned b_trans_lane_off(int lane) const {
         const int krow = (lane & 7) + (((lane >> 3) & 1) << 3);
         const int col = b_row0 + 0;  // nt windows step by kNtXor at call sites
-        constexpr int kSwz = kBlockN / 8 < 8 ? kBlockN / 8 : 8;
         return (unsigned)(((int64_t)krow * kBlockN +
-                           (((col >> 3) ^ (krow & (kSwz - 1))) << 3) +
+                           (((col >> 3) ^ ((krow >> SmemLayoutBTrans::kRowShift) &
+                                           SmemLayoutBTrans::kMask)) << 3) +
                            (col & 7)) *
                           sizeof(ElemB));
     }
@@ -477,9 +515,9 @@ struct GemmCollectiveMainloop {
             for (int nt = 0; nt < kNt; ++nt) {
                 const int row = b_row0 + nt * 8 + q;
                 const ElemB* p0 =
-                    tile_at<kK>(stage, row, k_seg * 16 + c2);
+                    tile_at<SmemLayoutB>(stage, row, k_seg * 16 + c2);
                 const ElemB* p1 =
-                    tile_at<kK>(stage, row, k_seg * 16 + c2 + 8);
+                    tile_at<SmemLayoutB>(stage, row, k_seg * 16 + c2 + 8);
                 frag2[nt * 2 + 0] =
                     DequantB::pair(*(const unsigned short*)p0);
                 frag2[nt * 2 + 1] =
@@ -501,8 +539,8 @@ struct GemmCollectiveMainloop {
                     int lane) const {
         const int q = lane >> 2, c2 = (lane & 3) * 2;
         const int row = a_row0 + mt * 16 + q;
-        const ElemA* p0 = tile_at<kK>(stage, row, k_seg * 16 + c2);
-        const ElemA* p8 = tile_at<kK>(stage, row + 8, k_seg * 16 + c2);
+        const ElemA* p0 = tile_at<SmemLayoutA>(stage, row, k_seg * 16 + c2);
+        const ElemA* p8 = tile_at<SmemLayoutA>(stage, row + 8, k_seg * 16 + c2);
         frag[0] = DequantA::pair(*(const unsigned short*)p0);
         frag[1] = DequantA::pair(*(const unsigned short*)p8);
         frag[2] = DequantA::pair(*(const unsigned short*)(p0 + 8));

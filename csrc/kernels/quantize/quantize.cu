@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "common/device.cuh"
+#include "checks.h"
 #include "quantize.cuh"
 
 using namespace astrai::quant;
@@ -59,8 +60,10 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
                 "unsupported quantization type: expected E4M3 (0) or E5M2 (1)");
     TORCH_CHECK(layout == QuantLayout::RowMajor || x.dim() >= 2,
                 "transposed quantize layouts need a 2D+ tensor");
-    astrai::check_scale(scale, x);
-    astrai::check_fp8_device(x);
+    TORCH_CHECK(scale.is_cuda() && scale.device() == x.device() &&
+                    scale.scalar_type() == torch::kFloat32 && scale.numel() == 1,
+                "scale must be a CUDA float32 scalar on the input device");
+    check_fp8_device(x.device().index());
     const at::cuda::OptionalCUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     auto input = x.contiguous();

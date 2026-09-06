@@ -6,12 +6,16 @@
 // semantics are documented in common.h and the design notes
 // (docs/developer/cuda_kernels.md).
 
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
 #include <type_traits>
 
-#include "common/cp_async.cuh"
+#include "common/pipeline.cuh"
+#include "common/device.cuh"
 #include "common/launch.cuh"
 #include "epilogue.cuh"
 #include "quantize/common.h"
@@ -64,8 +68,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     // this one, a thread racing into the epilogue scatters the output tile
     // over peers' still-in-flight staging writes (and their final fragment
     // reads). One barrier closes both windows.
-    astrai::cp_async_wait_all();
-    __syncthreads();
+    astrai::PipelineSync<Mainloop::kStages>{}.drain();
     Epilogue(gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
 }
 
@@ -73,20 +76,12 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
 // Launchers — pure CUDA (no torch), usable from the binding and pure C tests.
 // ---------------------------------------------------------------------------
 
-// SM count of the current device (cached per device; benign init race —
-// every writer stores the same value).
-inline int device_sm_count() {
-    static int cached[64] = {};
-    int dev = 0;
-    cudaGetDevice(&dev);
-    const bool cacheable = dev >= 0 && dev < 64;
-    int sms = cacheable ? cached[dev] : 0;
-    if (!sms) {
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        sms = sms > 0 ? sms : 1;
-        if (cacheable) cached[dev] = sms;
-    }
-    return sms;
+// ASTR_GEMM_PLAN=1: read-only launch log (shape -> recipe / grid / raster)
+// from launch_policy. One getenv at first use; nothing here can change the
+// launch.
+inline bool gemm_plan_log() {
+    static const bool on = std::getenv("ASTR_GEMM_PLAN") != nullptr;
+    return on;
 }
 
 // Launch one kernel instantiation with its shared-memory budget: budgets
@@ -133,72 +128,164 @@ struct GemmPlan {
     int raster;     // GemmParams::raster value this launch runs
 };
 
-// Raster-order heuristic (CUTLASS's rule): walk the dimension with more
-// tiles fastest. Groups chunk the long side, and the swept operand stays
-// L2-resident across a group — consecutive CTAs share one stripe of the
-// other operand. Width stays the measured 8.
-inline int plan_raster(int64_t m, int64_t n, int bm, int bn) {
-    return (m + bm - 1) / bm >= (n + bn - 1) / bn ? 8 : -8;
+// Raster order. Direction follows the tile aspect (walk the dimension with
+// more tiles fastest, CUTLASS's rule): the N-side mirrored group keeps the
+// measured width 8. The M-side group width is humming's L2-budget rule
+// (tune/raster.py) instead of a fixed width: a group's A tiles are reused
+// across its whole N sweep, so the group is sized to keep them L2-resident
+// while B streams through the remainder — B already L2-resident means no
+// grouping pays (g = 1, plain raster); otherwise reserve a B-streaming
+// fraction of L2 (fatter B traffic than A reserves more), cap the group so
+// the A side fits, and floor it at enough M rows to keep every SM busy
+// within one group sweep.
+inline int plan_raster(const GemmParams& p, int bm, int bn, int ba, int bb,
+                       const DeviceFacts& dev) {
+    const int64_t m_tiles = (p.m + bm - 1) / bm;
+    const int64_t n_tiles = (p.n + bn - 1) / bn;
+    if (m_tiles < n_tiles) return -8;
+    if (p.n * p.k * (int64_t)bb <= dev.l2_bytes * 7 / 10) return 1;
+    const double reserve = 0.12 + 0.28 * (double)bb / (double)ba;
+    const double budget = (1.0 - std::min(reserve, 0.5)) * (double)dev.l2_bytes;
+    const int64_t ub = (int64_t)(budget / ((double)bm * (double)p.k * ba));
+    const int64_t lb = (dev.sms + n_tiles - 1) / n_tiles;
+    int64_t g = std::min(ub, m_tiles);
+    if (ub >= lb) g = std::min(std::max(g, lb), m_tiles);
+    return (int)std::max(g, (int64_t)1);
+}
+
+// Per-SM throughput scalars of the non-big recipes relative to the big
+// CTA, one row per dtype class — RTX 5090-measured (gemm_tile_bench.cu,
+// saturation medians at M >= 1024; the 1B/1B int8 pair adjusted down from
+// its saturation medians (.95/1.0), which over-credit the finer tiles on
+// large-N mid-M grids — .92 keeps the measured small-CTA wins while
+// holding the big CTA on the largest-N band). They also absorb smem
+// residency (co-resident CTAs share SM throughput), which is why the cost
+// model carries no separate residency term. The scalars are the one
+// device-dependent constant set:
+// re-measure with the harness when porting.
+enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
+constexpr double kPlanEff[4][2] = {  // [class]{narrow, small}
+    {0.76, 0.58},  // W16A16: bf16 x bf16 — fat operands lose most to finer tiles
+    {0.92, 0.77},  // W8A16: 2B x 1B mixed (incl. bf16 x fp8), bf16 mma via dequant
+    {0.82, 0.92},  // W8A8: int8 x int8 — dequant mma runs issue-bound, small holds
+    {0.85, 0.56},  // F8A8: native fp8 k32 mma — small starves the issue slots
+};
+
+// Compile-time dtype-class derivation from the operand pair (the mma
+// promotion rule plus operand widths; mixed bf16xfp8 lands with the 2B x
+// 1B class — same bytes and same promoted bf16 k16 mma as W8A16).
+template <typename ElemA, typename ElemB>
+constexpr GemmPerfClass gemm_perf_class() {
+    using MmaT = typename gemm_mma_traits<ElemA, ElemB>::MmaT;
+    if constexpr (!std::is_same_v<MmaT, __nv_bfloat16>) {
+        return GemmPerfClass::kF8A8;  // native fp8 symmetric pair
+    } else if constexpr (std::is_same_v<ElemA, __nv_bfloat16> &&
+                         std::is_same_v<ElemB, __nv_bfloat16>) {
+        return GemmPerfClass::kW16A16;
+    } else if constexpr (std::is_same_v<ElemA, int8_t> &&
+                         std::is_same_v<ElemB, int8_t>) {
+        return GemmPerfClass::kW8A8;
+    } else {
+        return GemmPerfClass::kW8A16;
+    }
+}
+
+// Conguous (NT) path: a wave-count cost model over the manifest recipes
+// replaces the measured crossover ladder — bands are derived from device
+// arithmetic, so a new GPU needs no re-measured thresholds. A recipe's
+// cost is ceil(tiles / sms) quantized waves of bm * bn / eff SM-work
+// each, scaled by edge-tile padding waste. The scan runs big -> narrow ->
+// small and a challenger needs a >2% lead to displace the incumbent, so
+// ties resolve to the bigger tile — the same bias the measured ladder
+// encoded. The small recipe's ring depth follows the wave count: the
+// 3-stage ring's lighter smem (a second resident CTA) wins the sub-wave
+// latency-bound band, the 4-stage ring's deeper pipeline wins once the
+// small grid spans multiple waves.
+inline GemmPlan plan_congruous(const GemmParams& p, const DeviceFacts& dev,
+                               int ba, int bb, GemmPerfClass perf) {
+    struct Recipe {
+        GemmPlan::Cta cta;
+        int bm, bn, k, stages;  // manifest geometry — a candidate's smem
+                                // price derives from it
+        int eff_idx;  // -1: the big CTA is the 1.0 reference
+    };
+    static constexpr Recipe kRecipes[] = {
+        {GemmPlan::Cta::kBig128, 128, 128, 64, 2, -1},
+        {GemmPlan::Cta::kNarrow128x64, 128, 64, 64, 2, 0},
+        {GemmPlan::Cta::kSmall64, 64, 64, 64, 2, 1},
+    };
+    const double* eff = kPlanEff[(int)perf];
+    const Recipe* best = nullptr;
+    double best_cost = 0.0;
+    for (const Recipe& r : kRecipes) {
+        // Device-facts feasibility (humming's candidate filter): a recipe
+        // over the smem opt-in ceiling cannot launch at all — prune before
+        // scoring. Every manifest recipe fits on the production archs
+        // (96KB max vs 99KB optin), so this only guards ports.
+        if (ring_smem_bytes(r.bm, r.bn, r.k, r.stages, ba, bb) > dev.smem_max)
+            continue;
+        const int64_t tiles =
+            p.batch * ((p.m + r.bm - 1) / r.bm) * ((p.n + r.bn - 1) / r.bn);
+        const int64_t waves = (tiles + dev.sms - 1) / dev.sms;
+        const double waste =
+            (double)(((p.m + r.bm - 1) / r.bm) * r.bm *
+                     ((p.n + r.bn - 1) / r.bn) * r.bn) /
+            (double)(p.m * p.n);
+        const double e = r.eff_idx < 0 ? 1.0 : eff[r.eff_idx];
+        const double cost = (double)waves * r.bm * r.bn / e * waste;
+        if (best == nullptr || cost < best_cost * 0.98) {
+            best = &r;
+            best_cost = cost;
+        }
+    }
+    // The s2 small recipe (48KB) is the floor every supported device fits;
+    // the guard keeps the planner a total function on any other geometry.
+    if (best == nullptr) best = &kRecipes[2];
+    const int64_t tiles_64 =
+        p.batch * ((p.m + 63) / 64) * ((p.n + 63) / 64);
+    const bool small = best->cta == GemmPlan::Cta::kSmall64;
+    const bool s3_fits =
+        ring_smem_bytes(64, 64, 64, 3, ba, bb) <= dev.smem_max;
+    return GemmPlan{best->cta,
+                    small && s3_fits && tiles_64 > 2 * dev.sms,
+                    plan_raster(p, best->bm, best->bn, ba, bb, dev)};
 }
 
 // crosswise_ops counts the operands taking the direct crosswise load
 // (A ColMajor / B RowMajor storage): 0 = dual-congruous NT, 1 = TN and the
-// NN swap, 2 = TT. The layout shifts the crossovers (measured tables in
-// the design notes): the small CTA hides the crosswise LDG+PRMT latency
-// far better, while the big CTA's operand reuse buys back load bandwidth
-// the crosswise path does not traffic in.
-inline GemmPlan plan_gemm(const GemmParams& p, int crosswise_ops = 0) {
-    const int64_t sm = device_sm_count();
-    const int64_t tiles_128 =
-        (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
+// NN swap, 2 = TT. ba / bb are the operand element sizes; perf is the
+// dtype class picking the planner's eff row. The padding gate and the
+// crosswise ladder stay measured rules (the crosswise load path prices
+// differently: the small CTA hides its LDG+PRMT latency, the big CTA's
+// operand reuse wins once its grid fills ~1.5 waves); the congruous path
+// runs the wave-count model.
+inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
+                          GemmPerfClass perf, int crosswise_ops = 0) {
+    const DeviceFacts dev = device_facts();
+    // Feasibility gates shared by the branches below: a recipe over the
+    // device's smem opt-in ceiling demotes to the next fitting geometry
+    // instead of failing the launch. Both are always true on the
+    // production archs.
+    const bool big_fits =
+        ring_smem_bytes(128, 128, 64, 2, ba, bb) <= dev.smem_max;
+    const bool s3_fits =
+        ring_smem_bytes(64, 64, 64, 3, ba, bb) <= dev.smem_max;
     const auto small = [&](bool s3) {
-        return GemmPlan{GemmPlan::Cta::kSmall64, s3,
-                        plan_raster(p.m, p.n, 64, 64)};
-    };
-    const auto big = [&]() {
-        return GemmPlan{GemmPlan::Cta::kBig128, false,
-                        plan_raster(p.m, p.n, 128, 128)};
-    };
-    const auto narrow = [&]() {
-        return GemmPlan{GemmPlan::Cta::kNarrow128x64, false,
-                        plan_raster(p.m, p.n, 128, 64)};
+        return GemmPlan{GemmPlan::Cta::kSmall64, s3 && s3_fits,
+                        plan_raster(p, 64, 64, ba, bb, dev)};
     };
     // Padding rules first: predication waste beats any wave-fill effect.
     if (small_cta_padding(p.m, p.n)) return small(crosswise_ops > 0);
     if (crosswise_ops > 0) {
-        // Crosswise ladder (L20 measured): the small s3 CTA holds ~3/4 of
-        // the big CTA's per-SM throughput but tiles 4x finer, so it owns
-        // the whole sub-wave band and past it; the big CTA takes over once
-        // its grid fills ~1.5 waves.
-        if (tiles_128 >= sm * 3 / 2) return big();
+        const int64_t tiles_128 =
+            (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
+        if (big_fits && tiles_128 >= (int64_t)dev.sms * 3 / 2) {
+            return GemmPlan{GemmPlan::Cta::kBig128, false,
+                            plan_raster(p, 128, 128, ba, bb, dev)};
+        }
         return small(true);
     }
-    if (tiles_128 >= sm) {
-        // Wave band: pick by the wave-quantization cost ceil(tiles/sm) *
-        // T_tile. The narrow tile carries half the big tile's MMA work at
-        // ~94% of its per-SM efficiency (T_narrow ~= 0.53 * T_big,
-        // integer-scaled by 100 below) — reproduces every measured
-        // crossover.
-        const int64_t tiles_narrow =
-            (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 63) / 64);
-        const auto waves = [sm](int64_t tiles) { return (tiles + sm - 1) / sm; };
-        if (waves(tiles_narrow) * 53 < waves(tiles_128) * 100) return narrow();
-        return big();
-    }
-    // Sub-wave band: the narrow CTA fills the wave with N-tiles at full
-    // warp depth once its grid passes ~3/8 of a wave; below that the plain
-    // 64x64 CTA's extra parallelism wins, and past ~5/8 of a wave of
-    // 128x128 tiles the big CTA's operand reuse wins instead.
-    if (tiles_128 >= sm * 5 / 8) return big();
-    const int64_t tiles_narrow =
-        (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 63) / 64);
-    if (tiles_narrow >= sm * 3 / 8) return narrow();
-    // Full-ring small CTAs: the 24KB s2 variant keeps 4 CTAs/SM while the
-    // whole grid stays resident; past that the 32KB s3 variant's deeper
-    // pipeline wins on multi-wave grids.
-    const int64_t tiles_64 =
-        (int64_t)p.batch * ((p.m + 63) / 64) * ((p.n + 63) / 64);
-    return small(tiles_64 > sm * 3);
+    return plan_congruous(p, dev, ba, bb, perf);
 }
 
 // Grid + launch for one concrete Policy — the only place a GEMM kernel goes
@@ -208,6 +295,14 @@ void launch_policy(const GemmParams& p, cudaStream_t stream) {
     using Traits = typename Policy::Traits;
     dim3 grid((p.n + Traits::kBlockN - 1) / Traits::kBlockN,
               (p.m + Traits::kBlockM - 1) / Traits::kBlockM, p.batch);
+    if (gemm_plan_log()) {
+        std::fprintf(stderr,
+                     "[gemm-plan] %lldx%lldx%lld b=%d -> tile %dx%d s%d "
+                     "grid %dx%dx%d raster %d smem %d\n",
+                     (long long)p.m, (long long)p.n, (long long)p.k, p.batch,
+                     Traits::kBlockM, Traits::kBlockN, Traits::kStages,
+                     grid.x, grid.y, grid.z, p.raster, Policy::kSmemBytes);
+    }
     launch_with_smem<gemm_kernel<Policy>>(
         Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p);
 }
@@ -228,8 +323,8 @@ void launch_plan(GemmParams p, const GemmPlan& plan, cudaStream_t stream) {
     // output (fp32, 4B/elem) cannot fit the 128x128 tile inside the fp8
     // rings (64KB > 48KB) — compile-time route those to the narrow CTA
     // (32KB tile <= 36KB rings), same math at lower reuse.
-    constexpr int kRingBytes =
-        3 * 64 * (128 * (int)sizeof(ElemA) + 128 * (int)sizeof(ElemB));
+    constexpr int kRingBytes = ring_smem_bytes(
+        128, 128, 64, 2, (int)sizeof(ElemA), (int)sizeof(ElemB));
     constexpr bool kBigReclaim = 128 * 128 * (int)sizeof(OutT) <= kRingBytes;
     using BigOrNarrow =
         std::conditional_t<kBigReclaim, BigTile, TileNarrow128x64>;
@@ -302,7 +397,9 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
     // (ColMajor) and plain-B storage (RowMajor) both take the direct
     // crosswise load.
     const int crosswise = (trans_a ? 1 : 0) + (trans_b ? 0 : 1);
-    const GemmPlan plan = plan_gemm(p, crosswise);
+    const GemmPlan plan = plan_gemm(p, (int)sizeof(ElemA), (int)sizeof(ElemB),
+                                    gemm_perf_class<ElemA, ElemB>(),
+                                    crosswise);
     if (trans_a && trans_b) {
         // The swap computes the transposed problem; its (rewritten TT)
         // branch instantiates the column-major-output epilogue through

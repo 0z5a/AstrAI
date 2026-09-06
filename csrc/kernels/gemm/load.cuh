@@ -5,61 +5,41 @@
 // The staging invariants and the swizzle derivation live in
 // docs/developer/cuda_kernels.md.
 
-#include "common/cp_async.cuh"
+#include "common/pipeline.cuh"
+#include "common/swizzle.cuh"
 #include "gemm/common.h"
 #include "policy.cuh"
 
 namespace astrai {
 namespace gemm {
 
-// log2 of a compile-time power of two (for the swizzle shifts).
-template <int N, int Acc = 0>
-struct log2_const : log2_const<(N >> 1), Acc + 1> {};
-template <int Acc>
-struct log2_const<1, Acc> {
-    static constexpr int value = Acc;
-};
-
-// Swizzled address inside a flat [rows * K] staging tile: the 16B chunk
-// index is XORed with the row bits at [3, 3+log2(kChunks)) so a warp's
-// ldmatrix fragment load (8 consecutive rows x 16B) hits all 32 banks
-// exactly once; chunks stay contiguous, so cp.async staging is unaffected.
-// All chunk math is in BYTES (16B granularity); element counts enter only
-// through kChunkElems = 16 / sizeof(T).
-template <int K, typename ElemT>
+// Swizzled address inside a staged tile: the two-coordinate view of the
+// tile's declared layout (common/swizzle.cuh) — chunk' = chunk ^
+// (row >> kRowShift), the XOR confined to kMask's bits so chunks wider
+// than the mask (trans tiles with 16 chunks: kBlockM=128) keep their
+// un-swizzled high bits instead of aliasing onto the low half-row. The
+// XOR term derives from the row alone, so it
+// computes in parallel with the chunk extraction instead of serializing
+// behind the row*stride IMAD (CUTLASS 2.x's iterators apply the swizzle
+// the same way). The layout type carries the tile's whole geometry, so
+// the congruous [rows][K] staging and the crosswise trans [K][rows]
+// staging are two layout instances of this one helper. The swizzle keeps
+// a warp's ldmatrix fragment load (8 consecutive rows x 16B) hitting all
+// 32 banks exactly once, while chunks stay contiguous so cp.async staging
+// is unaffected. All chunk math is in BYTES (16B granularity); element
+// counts enter only through kChunkElems = 16 / sizeof(T).
+template <typename SmemLayout, typename ElemT>
 __device__ __forceinline__ ElemT* tile_at(ElemT* tile, int row, int col) {
     constexpr int kChunkElems = 16 / sizeof(ElemT);  // elems per 16B chunk
-    constexpr int kChunks = K / kChunkElems;      // 16B chunks per row
-    static_assert(kChunks >= 1 && (kChunks & (kChunks - 1)) == 0,
-                  "swizzle needs a power-of-two 16B-chunk count");
-    constexpr int kShift = 3 - log2_const<kChunks>::value;
     constexpr int kChunkShift = log2_const<kChunkElems>::value;
-    return tile + row * K +
-           ((((col >> kChunkShift) ^ ((row >> kShift) & (kChunks - 1)))
-                  << kChunkShift) +
-             (col & (kChunkElems - 1)));
-}
-
-// Trans-tile mirror of tile_at for crosswise 16-bit operands: the tile is
-// [K][RowsT] (k rows, the non-contract dim contiguous), staged by cp.async
-// directly from the crosswise global layout and read through
-// ldmatrix.trans. The chunk XOR runs the other way — swizzled by the K-row
-// bits — so the 8 k-rows one ldmatrix matrix addresses at a fixed column
-// window land on distinct chunks (conflict-free). Only the low 3 row bits
-// can join the XOR (the LDSM contract gives 8 rows per matrix), so tiles
-// wider than 8 chunks leave the upper chunk bits unswizzled — each
-// matrix's rows stay conflict-free either way.
-template <int RowsT, typename ElemT>
-__device__ __forceinline__ ElemT* tile_at_trans(ElemT* tile, int k, int col) {
-    constexpr int kChunkElems = 16 / sizeof(ElemT);
-    constexpr int kChunks = RowsT / kChunkElems;
-    static_assert(kChunks >= 1 && (kChunks & (kChunks - 1)) == 0,
-                  "swizzle needs a power-of-two 16B-chunk count");
-    constexpr int kSwz = kChunks < 8 ? kChunks : 8;
-    constexpr int kChunkShift = log2_const<kChunkElems>::value;
-    return tile + (int64_t)k * RowsT +
-           ((((col >> kChunkShift) ^ (k & (kSwz - 1))) << kChunkShift) +
-             (col & (kChunkElems - 1)));
+    constexpr unsigned kChunkHi = ~SmemLayout::kMask;
+    const unsigned chunk = (unsigned)(col >> kChunkShift);
+    const unsigned swz = ((unsigned)row >> SmemLayout::kRowShift) &
+                         SmemLayout::kMask;
+    return tile + row * (SmemLayout::kChunks * kChunkElems) +
+           (((chunk & kChunkHi) | ((chunk ^ swz) & SmemLayout::kMask))
+                << kChunkShift) +
+           (unsigned)(col & (kChunkElems - 1));
 }
 
 // Stage-load a CONGRUOUS operand (contract-contiguous storage — the only
@@ -69,17 +49,23 @@ __device__ __forceinline__ ElemT* tile_at_trans(ElemT* tile, int k, int col) {
 // to one immediate XOR per chunk (see the design notes). Crosswise operands
 // go through load_operand_tile_trans (16-bit) or load_crosswise_direct
 // (8-bit) instead.
-template <typename ElemT, int K, int RowsTile,
+template <typename SmemLayout, typename ElemT,
           int kThreads, bool kInterior = false>
 __device__ __forceinline__ void
 load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
                   int64_t contract, int64_t ld, int tid, int64_t k_base,
                   int64_t block_row) {
     constexpr int kChunkElems = 16 / sizeof(ElemT);
-    constexpr int kChunks = K / kChunkElems;
-    static_assert(RowsTile * kChunks % kThreads == 0,
+    constexpr int kRowsTile = SmemLayout::kRows;
+    constexpr int kChunks = SmemLayout::kChunks;
+    static_assert(kRowsTile * kChunks % kThreads == 0,
                   "tile chunks must divide evenly across threads");
-    constexpr int kCpt = RowsTile * kChunks / kThreads;  // chunks per thread
+    constexpr int kCpt = kRowsTile * kChunks / kThreads;  // chunks per thread
+    // The XOR chunk stepping below (dst ^ (j << 4)) is the swizzle of
+    // c0c + j only because a thread's chunks are one aligned power-of-two
+    // run inside the row — j's bits never reach c0c's.
+    static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
+                  "XOR chunk stepping needs a power-of-two chunks-per-thread");
     constexpr int kCpr = kChunks / kCpt;  // chunks per row slice
     const int r = tid / kCpr;
     const int c0 = (tid % kCpr) * kCpt * kChunkElems;
@@ -87,7 +73,7 @@ load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
         const char* src = reinterpret_cast<const char*>(
             operand + (block_row + r) * ld + k_base + c0);
         const uintptr_t dst =
-            reinterpret_cast<uintptr_t>(tile_at<K>(tile, r, c0));
+            reinterpret_cast<uintptr_t>(tile_at<SmemLayout>(tile, r, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j)
             astrai::cp_async_16(reinterpret_cast<ElemT*>(dst ^ (j << 4)),
@@ -95,23 +81,36 @@ load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
     } else {
         const int64_t row = block_row + r;
         const bool row_ok = row < rows;
-        // k_base and every c are multiples of 16, so all chunks share the
-        // row base's alignment verdict.
-        const auto* src = operand + row * ld + k_base;
+        // k_base, c0 and every j step are multiples of 16, so all chunks
+        // share the run's alignment verdict.
+        const auto* src = operand + row * ld + k_base + c0;
         const bool chunk_aligned = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
+        const uintptr_t dst =
+            reinterpret_cast<uintptr_t>(tile_at<SmemLayout>(tile, r, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j) {
-            const int c = c0 + j * kChunkElems;
-            ElemT* dst = tile_at<K>(tile, r, c);
-            if (row_ok && chunk_aligned &&
-                k_base + c + kChunkElems - 1 < contract) {
-                astrai::cp_async_16(dst, src + c);
+            const int c = j * kChunkElems;
+            ElemT* dstj = reinterpret_cast<ElemT*>(dst ^ (unsigned)(j << 4));
+            if (chunk_aligned) {
+                // CUTLASS-style zero-fill predication: one cp.async whose
+                // runtime src-size loads the valid prefix (whole chunk,
+                // k-tail cut or nothing for an OOB row) and the hardware
+                // zero-fills the remainder.
+                const int64_t room =
+                    row_ok ? contract - (k_base + c0 + c) : 0;
+                const int bytes = room >= kChunkElems
+                                      ? 16
+                                      : room > 0
+                                            ? (int)(room * (int64_t)sizeof(ElemT))
+                                            : 0;
+                astrai::cp_async_16(dstj, src + c, bytes);
             } else {
-                // Tail chunk / misaligned base / OOB row: scalar fill.
+                // Misaligned base only: element-granular fallback.
 # pragma unroll
                 for (int i = 0; i < kChunkElems; ++i)
-                    dst[i] =
-                        row_ok && k_base + c + i < contract ? src[c + i] : ElemT(0.0f);
+                    dstj[i] = row_ok && k_base + c0 + c + i < contract
+                                  ? src[c + i]
+                                  : ElemT(0.0f);
             }
         }
     }
@@ -123,19 +122,29 @@ load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
 // fragment-extraction time (b16-only instruction — 8-bit crosswise
 // operands cannot take this path and keep the LDG+PRMT staging).
 // Role-swapped mirror of load_operand_tile: the tile's row dim is the
-// contract dim here, so the predication axes trade places.
-template <typename ElemT, int RowsTile, int kK, int kThreads,
-          bool kInterior = false>
+// contract dim here, so the predication axes trade places. The staged tile
+// is the TRANS layout instance: chunks swizzled by the k-row bits (a
+// custom XOR — the source is the row field) so the 8 k-rows one
+// ldmatrix.trans matrix addresses at a fixed column window land on
+// distinct chunks (conflict-free); only the low 3 row bits can join the
+// XOR (the LDSM contract gives 8 rows per matrix), so tiles wider than 8
+// chunks leave the upper chunk bits unswizzled — each matrix's rows stay
+// conflict-free either way.
+template <typename SmemLayout, typename ElemT,
+          int kThreads, bool kInterior = false>
 __device__ __forceinline__ void
 load_operand_tile_trans(ElemT* tile, const ElemT* __restrict__ operand,
                         int64_t rows, int64_t contract, int64_t ld, int tid,
                         int64_t k_base, int64_t block_row) {
     constexpr int kChunkElems = 16 / sizeof(ElemT);
-    constexpr int kChunks = RowsTile / kChunkElems;
+    constexpr int kK = SmemLayout::kRows;             // k lines staged
+    constexpr int kChunks = SmemLayout::kChunks;      // chunks per k line
     static_assert(sizeof(ElemT) == 2, "trans staging is 16-bit only");
     static_assert(kK * kChunks % kThreads == 0,
                   "tile chunks must divide evenly across threads");
     constexpr int kCpt = kK * kChunks / kThreads;
+    static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
+                  "XOR chunk stepping needs a power-of-two chunks-per-thread");
     constexpr int kCpr = kChunks / kCpt;  // n-chunk slices per k row
     const int kr = tid / kCpr;            // k row within the tile
     const int c0 = (tid % kCpr) * kCpt * kChunkElems;
@@ -143,31 +152,41 @@ load_operand_tile_trans(ElemT* tile, const ElemT* __restrict__ operand,
         const char* src = reinterpret_cast<const char*>(
             operand + (k_base + kr) * ld + block_row + c0);
         const uintptr_t dst =
-            reinterpret_cast<uintptr_t>(tile_at_trans<RowsTile>(tile, kr, c0));
+            reinterpret_cast<uintptr_t>(tile_at<SmemLayout>(tile, kr, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j)
             astrai::cp_async_16(reinterpret_cast<ElemT*>(dst ^ (j << 4)),
                                 src + j * 16);
     } else {
-        // block_row and every c are multiples of kChunkElems; the
-        // alignment verdict is shared across each row's chunks only when
-        // ld is (see the scalar fallback).
+        // Steps are whole 16B chunks, so one alignment verdict covers the
+        // whole run (verdicts only differ ACROSS k rows, when ld is not
+        // 16B — see the scalar fallback).
         const bool row_ok = k_base + kr < contract;
+        const auto* src = operand + (k_base + kr) * ld + block_row + c0;
+        const bool run16 = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
+        const uintptr_t dst =
+            reinterpret_cast<uintptr_t>(tile_at<SmemLayout>(tile, kr, c0));
 #pragma unroll
         for (int j = 0; j < kCpt; ++j) {
-            const int c = c0 + j * kChunkElems;
-            const int64_t col = block_row + c;
-            ElemT* dst = tile_at_trans<RowsTile>(tile, kr, c);
-            const bool col_ok = col < rows;
-            const auto* src = operand + (k_base + kr) * ld + col;
-            if (row_ok && col_ok &&
-                (reinterpret_cast<uintptr_t>(src) & 15) == 0 &&
-                col + kChunkElems <= rows) {
-                astrai::cp_async_16(dst, src);
+            const int c = j * kChunkElems;
+            const int64_t col = block_row + c0 + c;
+            ElemT* dstj = reinterpret_cast<ElemT*>(dst ^ (unsigned)(j << 4));
+            if (run16) {
+                // Zero-fill predication as in the congruous path: the
+                // non-contract extent cuts the prefix, the k-tail rows
+                // load nothing at all.
+                const int64_t room = row_ok ? rows - col : 0;
+                const int bytes = room >= kChunkElems
+                                      ? 16
+                                      : room > 0
+                                            ? (int)(room * (int64_t)sizeof(ElemT))
+                                            : 0;
+                astrai::cp_async_16(dstj, src + c, bytes);
             } else {
 # pragma unroll
                 for (int i = 0; i < kChunkElems; ++i)
-                    dst[i] = row_ok && col + i < rows ? src[i] : ElemT(0.0f);
+                    dstj[i] = row_ok && col + i < rows ? src[c + i]
+                                                       : ElemT(0.0f);
             }
         }
     }
@@ -178,23 +197,27 @@ load_operand_tile_trans(ElemT* tile, const ElemT* __restrict__ operand,
 // source pointer carried across k-tiles, so each prefetch chunk is one
 // LDGSTS issued straight from registers. The guard is a property of the
 // operand's layout, so it lives in the type: the false specialization
-// (synchronous 8-bit crosswise operand) is an empty no-op. kTrans selects
-// the crosswise 16-bit geometry: the tile is [kK][kRowsTile] (k rows), so
-// the thread's row is a k line and the per-tile source advance is
-// kK * ld instead of kK.
-template <bool kAsync, typename ElemT, int kK, int kRowsTile, int kThreads,
+// (synchronous 8-bit crosswise operand) is an empty no-op. The tile
+// geometry rides the SmemLayout type (kTrans selects the crosswise 16-bit
+// geometry on the SOURCE side: the tile's rows are k lines, so the
+// per-tile source advance is kK * ld instead of kK).
+template <bool kAsync, typename ElemT, typename SmemLayout, int kThreads,
           bool kTrans = false>
 struct PrefetchCarry;
 
-template <typename ElemT, int kK, int kRowsTile, int kThreads, bool kTrans>
-struct PrefetchCarry<true, ElemT, kK, kRowsTile, kThreads, kTrans> {
+template <typename ElemT, typename SmemLayout, int kThreads, bool kTrans>
+struct PrefetchCarry<true, ElemT, SmemLayout, kThreads, kTrans> {
     static constexpr int kChunkElems = 16 / sizeof(ElemT);
-    static constexpr int kCpt =
-        (kTrans ? kK * (kRowsTile / kChunkElems)
-                : kRowsTile * (kK / kChunkElems)) /
-        kThreads;
-    static constexpr int kCpr =
-        (kTrans ? kRowsTile / kChunkElems : kK / kChunkElems) / kCpt;
+    // The layout carries the tile geometry (rows x chunks per row),
+    // whichever way round the staging runs — one decomposition expression.
+    static constexpr int kCpt = SmemLayout::kRows * SmemLayout::kChunks /
+                                kThreads;
+    static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
+                  "XOR chunk stepping needs a power-of-two chunks-per-thread");
+    static constexpr int kCpr = SmemLayout::kChunks / kCpt;
+    // The contract extent per tile, in elements.
+    static constexpr int kK =
+        kTrans ? SmemLayout::kRows : SmemLayout::kChunks * kChunkElems;
     // All carried state is in BYTES: the smem write ring and the global
     // source pointer both advance by the byte-sized stage stride.
     static constexpr unsigned kKBytes = (unsigned)kK * sizeof(ElemT);
@@ -213,8 +236,7 @@ struct PrefetchCarry<true, ElemT, kK, kRowsTile, kThreads, kTrans> {
         const ElemT* slot0 =
             ring + (int64_t)(firstTile % ringSlots) * stageElems;
         const unsigned laneOff = static_cast<unsigned>(
-            (const char*)(kTrans ? tile_at_trans<kRowsTile>(slot0, r, c0)
-                                 : tile_at<kK>(slot0, r, c0)) -
+            (const char*)tile_at<SmemLayout>(slot0, r, c0) -
             (const char*)slot0);
         const unsigned base = __cvta_generic_to_shared(ring) + laneOff;
         wr = base + (unsigned)((int64_t)(firstTile % ringSlots) * stageBytes);
@@ -247,8 +269,8 @@ struct PrefetchCarry<true, ElemT, kK, kRowsTile, kThreads, kTrans> {
     }
 };
 
-template <typename ElemT, int kK, int kRowsTile, int kThreads, bool kTrans>
-struct PrefetchCarry<false, ElemT, kK, kRowsTile, kThreads, kTrans> {
+template <typename ElemT, typename SmemLayout, int kThreads, bool kTrans>
+struct PrefetchCarry<false, ElemT, SmemLayout, kThreads, kTrans> {
     __device__ __forceinline__ PrefetchCarry(
         const ElemT*, int, int, const ElemT*, int64_t, int64_t, int, int) {}
     __device__ __forceinline__ void emit(bool) const {}
@@ -269,16 +291,18 @@ struct PrefetchCarry<false, ElemT, kK, kRowsTile, kThreads, kTrans> {
 //     covers only 8 rows, and the transpose selects halfwords — one
 //     PRMT per output word (the byte selector already spans both source
 //     words: 0x5410 low pair, 0x7632 high pair).
-template <typename ElemT, int K, int RowsTile, int kThreads>
+template <typename SmemLayout, typename ElemT, int kThreads>
 __device__ __forceinline__ void
 load_crosswise_direct(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
                       int64_t contract, int64_t ld, int tid, int64_t k_base,
                       int64_t block_row) {
     static_assert(sizeof(ElemT) == 1 || sizeof(ElemT) == 2,
                   "crosswise LDG+PRMT staging requires 1- or 2-byte elements");
+    constexpr int kRowsTile = SmemLayout::kRows;
+    constexpr int kK = SmemLayout::kChunks * (16 / (int)sizeof(ElemT));
     constexpr int kCw = sizeof(ElemT) == 1 ? 4 : 2;  // contract elems per chunk
-    constexpr int kSpans = K / kCw;    // contract spans per tile
-    constexpr int kGroups = RowsTile / 16;
+    constexpr int kSpans = kK / kCw;    // contract spans per tile
+    constexpr int kGroups = kRowsTile / 16;
     constexpr int kTChunks = kSpans * kGroups;  // 64B chunks per tile
     // r0 is a multiple of 16 and p*ld preserves alignment whenever ld has
     // it, so every run of a chunk shares one alignment verdict.
@@ -339,7 +363,7 @@ load_crosswise_direct(ElemT* tile, const ElemT* __restrict__ operand, int64_t ro
                     w = __byte_perm(*v0, *v1, (i & 1) ? 0x7632u : 0x5410u);
                 }
                 *reinterpret_cast<unsigned*>(
-                    tile_at<K>(tile, rg * 16 + i, span * kCw)) = w;
+                    tile_at<SmemLayout>(tile, rg * 16 + i, span * kCw)) = w;
             }
         } else {
             // Row-tail or misaligned chunk: element-granular gather with
@@ -350,13 +374,13 @@ load_crosswise_direct(ElemT* tile, const ElemT* __restrict__ operand, int64_t ro
                 if (k_base + col >= contract) {
 #pragma unroll
                     for (int i = 0; i < 16; ++i)
-                        *tile_at<K>(tile, rg * 16 + i, col) = ElemT(0.0f);
+                        *tile_at<SmemLayout>(tile, rg * 16 + i, col) = ElemT(0.0f);
                     continue;
                 }
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
                     const int64_t r_idx = r0 + i;
-                    *tile_at<K>(tile, rg * 16 + i, col) =
+                    *tile_at<SmemLayout>(tile, rg * 16 + i, col) =
                         r_idx < rows
                             ? operand[(k_base + col) * ld + r_idx]
                             : ElemT(0.0f);

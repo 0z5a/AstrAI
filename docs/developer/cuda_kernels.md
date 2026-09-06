@@ -54,12 +54,12 @@ layered directory:
 | `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK — adding a dtype = one specialization), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
 | `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBig128x128` / `TileBigFast` / `TileNarrow128x64` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter); `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
-| `gemm/load.cuh` | operand loaders: swizzle (`tile_at`), congruous cp.async (predicated + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
+| `gemm/load.cuh` | operand loaders: one `tile_at<SmemLayout>` over the tile's declared layout (`common/swizzle.cuh`), congruous cp.async staging (predicated via runtime src-size zfill + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
 | `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16 smem scatter + coalesced copy-out |
-| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + host planning (`plan_gemm` / `launch_plan`; 64×64 / 128×64 / 128×128 CTA) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
-| `quantize/quantize.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `quantize` |
+| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_congruous` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
+| `quantize/quantize.cu` | binding only: entry checks (`checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
 strategy layer passes `scale.reciprocal()` and the kernel multiplies by it.
@@ -82,12 +82,32 @@ dispatcher-neutral.
 The load-bearing invariants behind the kernel code (all measurements on
 L20/sm_89 unless noted):
 
-**Swizzle.** Staging tiles are flat `[rows * kK]`; `tile_at` XORs the 16B
-chunk index with row bits at `[3, 3+log2(kChunks))` so a warp's ldmatrix
+**Swizzle.** Staging layouts are CUTLASS-style *types*: `common/swizzle.cuh`
+provides the `Swizzle<Bits, Shift>` / `Layout<Shape<Rows, Chunks>,
+Stride<Chunks, 1>>` / `composition(Swizzle, Layout)` vocabulary (16B-chunk
+units, dtype-independent `(Bits, Shift)` pairs), and each collective
+declares its tile's layout once — `SmemLayoutA/B` and the trans mirrors in
+the mainloop, `OutLayout` in the epilogue. The family instances: congruous
+2B staging is the TMA 128B mode `<3,3>`, 1B is `<2,3>`, 16-bit trans
+staging swizzles chunks by the k-row bits (custom `<log2(min(chunks,8)),
+log2(chunks)>`), and the epilogue output keeps its row-width mode.
+`tile_at<SmemLayout>` applies the composed layout — the 16B chunk index
+XORed with row bits at `[3, 3+log2(kChunks))` — so a warp's ldmatrix
 fragment load (8 consecutive rows × 16B) hits all 32 banks exactly once
 (the unswizzled row word-stride is `kK/4` words, so rows `r` and
 `r + 8/kChunks` collide mod 32). Chunks stay contiguous, so cp.async
-staging is unaffected.
+staging is unaffected. The helper derives the XOR term from the row
+coordinate alone (the layout's `kRowShift`/`kMask`) instead of the
+linearized index: a linear form serialized the XOR behind the row×stride
+multiply in the hot dequant fragment readers and regressed W8A8 up to
++29% (RTX 5090) — keep the two-coordinate form in the hot paths.
+
+**Boundary predication.** Predicated staging rides cp.async's runtime
+source size (CUTLASS 2.x's zfill iterators): `cp.async.cg [dst], [src],
+16, src_size` with `src_size` derived per chunk from the remaining
+contract extent — 0 reads nothing and the hardware zero-fills the 16B
+chunk, a partial size covers the k tail, and only a misaligned base
+(non-16B `ld`) keeps the scalar-copy fallback.
 
 **Fragment addressing (base-pair scheme).** One base register per operand
 per k_seg, every fragment offset an LDSM immediate. The closure works
@@ -111,11 +131,15 @@ wait-count dispatch ladder cost 16 instructions/k-tile). A lean
 `kStages`-deep ring trading the barrier for a 4th resident CTA measured
 +5..9% slower at 1280³ and was removed. The final iteration carries no
 trailing barrier of its own, so the epilogue transition pays one explicit
-pair: `cp_async_wait_all()` (which drains only the calling thread's
-groups) followed by `__syncthreads()` — without it a thread racing into
-the epilogue scatters the output tile over peers' still-in-flight staging
-writes and final fragment reads (caught by racecheck + a W8A8 stress
-case: zeroed 32-row output bands on multi-wave grids).
+drain (`PipelineSync<Stages>::drain()`, which empties only the calling
+thread's groups) followed by `__syncthreads()` — without it a thread racing
+into the epilogue scatters the output tile over peers' still-in-flight
+staging writes and final fragment reads (caught by racecheck + a W8A8
+stress case: zeroed 32-row output bands on multi-wave grids). The ring
+discipline itself (prologue commit, steady wait, tail commit) runs through
+the `PipelineSync` stage-pipeline type of `common/pipeline.cuh` — the
+sm_80/89 backing of the shared producer/consumer surface that
+`PipelineMbarrier` (sm_90+, TMA) implements on the other generation.
 
 **Crosswise loads.** Crosswise operands (A `[K][M]` / B `[N][K]` storage)
 cannot cp.async into the canonical tile; they take the direct LDG.128×4 +
@@ -132,27 +156,57 @@ the small CTA opts in.
 **Tile vocabulary (CUTLASS-style).** Tile geometry is expressed as types,
 not positional ints: `Shape<M, N, K>` (CTA tile; K = the per-stage k-tile)
 and `Shape<M, N>` (warp tile) compose into a `GemmTileConfig` — one named
-recipe bundling shapes + stage depth + loop mode. The production manifest
-in `policy.cuh` (`TileBig128x128`, `TileBigFast`, `TileNarrow128x64`,
-`TileSmall64s2/s3`) is the full set `launch_plan` dispatches to; a new
-geometry in the ladder is one alias plus one planner branch, never a
-re-spelled int list. Device collectives only read the derived
-`Traits::kBlockM/kBlockN/...` constants, so this is purely a configuration
-surface — the generated SASS is unchanged.
+recipe bundling shapes + stage depth + loop mode. `Shape` itself is the
+shared vocabulary type of `common/swizzle.cuh`: the same `Shape<...>`
+spells both the CTA tile here and the staging layouts' chunk grids, so
+tile geometry and smem layout read in one notation. The production
+manifest in `policy.cuh` (`TileBig128x128`, `TileBigFast`,
+`TileNarrow128x64`, `TileSmall64s2/s3`) is the full set `launch_plan`
+dispatches to; a new geometry in the ladder is one alias plus one planner
+branch, never a re-spelled int list. Device collectives only read the
+derived `Traits::kBlockM/kBlockN/...` constants, so this is purely a
+configuration surface — the generated SASS is unchanged.
 
-**Launch planning crossovers** (L20, TFLOPS, big vs alternative):
-crosswise problems keep the 64×64 s3 CTA below ~1.5 waves of 128×128
-tiles (M=256: 129.7 vs 113.1; 1024³: 107.2 vs 94.8; the big CTA wins from
-M=640/1536³ on). Dual-congruous wave band picks narrow vs big by
-`ceil(tiles/sm) * T_tile` with `T_narrow ≈ 0.53 * T_big` (M=384: 134.3 vs
-114.4 narrow wins; M=1024: 202.5 vs 178.8 big wins). Sub-wave: narrow
-wins past ~3/8 of a wave (1024³ 174 vs 131T), the big CTA's operand reuse
-wins past ~5/8 (forcing 64×64 there cost 2048³ 123→171T). Non-128-divisible
-shapes with 64-divisibility take the 64×64 CTA (edge tiles otherwise drag
-the single wave; 1088³: 76 vs 93T). Persistent schedules (static
-round-robin and atomic ticket) both measured worse on L20 (−4..−8%; the
-ticket variant recovers L2 locality but its loop-head barrier costs what
-the CTA-restart overlap saves).
+**Launch planning** (humming-style, device-parameterized): the congruous
+(NT) band picks its recipe by a wave-count cost model over the manifest —
+`cost = ceil(tiles / sms) · bm·bn / eff · padding-waste` per recipe —
+instead of measured crossover thresholds, so the bands follow the device
+arithmetic (`DeviceFacts`: SM count + L2 size + the per-block smem opt-in
+ceiling, `common/device.cuh`) rather than one GPU's calibration.
+Recipes over that smem ceiling are pruned before scoring (humming's
+candidate filter; every manifest recipe fits on the production archs —
+96KB max vs 99KB optin — so the gate only guards ports), and the small
+recipe's 3-stage variant requires the same headroom. `eff` is the per-SM throughput scalar of a
+recipe relative to the big CTA, one row per dtype class (`kPlanEff`;
+RTX 5090-measured — the fat bf16 pair loses most to finer tiles, the
+int8×int8 dequant path barely loses at all, fp8's k32 mma starves the
+small CTA) and also absorbs smem residency, which is why the model needs
+no separate residency term. The scan prefers the bigger tile and a
+challenger needs a >2% lead (hysteresis); the small recipe's ring depth
+follows its wave count (3-stage below ~2 waves — lighter smem keeps a
+second CTA resident — 4-stage past it). The padding gate and the
+crosswise ladder stay measured rules (crosswise loads price differently;
+the small CTA hides their latency, the big CTA's reuse wins once its grid
+fills ~1.5 waves). Raster group width along M is humming's L2-budget
+rule: B already L2-resident means plain raster; otherwise reserve a
+B-stream fraction of L2 (fatter B than A reserves more) and size the
+group so its A tiles stay resident across the N sweep, floored at enough
+M rows to keep every SM busy in one sweep; the N-side mirror keeps the
+measured width 8. Persistent schedules (static round-robin and atomic
+ticket) both measured worse on L20 (−4..−8%; the ticket variant recovers
+L2 locality but its loop-head barrier costs what the CTA-restart overlap
+saves).
+
+Calibration: an out-of-tree harness (the direct-instantiation pattern of
+`csrc/tests/fp8_test.cu`: `launch_policy<GemmPolicy<..., TileXxx, ...>>`,
+no planner) times every recipe across the llama shape grid; the eff
+scalars are re-measured that way when porting to a new GPU.
+`ASTR_GEMM_PLAN=1` adds a read-only launch log (shape →
+recipe/stages/grid/raster) from `launch_policy`. On RTX 5090 (170 SM, 96 MB L2) the model replaced the
+L20 ladder's mid/large-M narrow picks with the big CTA and its sub-wave
+small picks with s2: benchmark_w8 over the llama shapes totals
+−5.3% (W16A16) / −1.3% (W8A16) / −1.5% (W8A8) vs the retired ladder
+with no case regressing >3%.
 
 **NN swap.** The dual-N-contiguous problem runs as its transpose
 `E = B^T @ A^T` over swapped operands with an out-transposed epilogue
@@ -213,8 +267,10 @@ W16A16 baseline within a few percent.
 
 **Humming parity (what we deliberately have and have not).** Adopted from
 humming: in-register LOP3 dequant, the dtype-promotion unified mainloop,
-per-operand epilogue scale placement, and now the CUTLASS-style
-`Shape`/`GemmTileConfig` vocabulary. Not adopted, in rough priority order
+per-operand epilogue scale placement, the CUTLASS-style
+`Shape`/`GemmTileConfig` vocabulary, and the device-parameterized launch
+planning (the `DeviceFacts` wave-count model plus the L2-budget raster
+rule from humming's tune heuristics). Not adopted, in rough priority order
 for future work: grouped-along-K / 2-D block scales (GPTQ/AWQ import —
 needs mainloop scale application, the epilogue cannot fold them),
 asymmetric quantization with zero-points (offline folding at repack time),
@@ -222,10 +278,11 @@ sub-int8 dtypes (int4 and 3/5/6/7-bit need packed staging + a second
 dequant family), the offline weight interleave (documented deferred above),
 stream-K (wave-quantization; persistent scheduling alone measured worse
 here), and the sm90+ feature set (TMA/cluster/warp-spec/PDL — a different
-device target). Out of scope by design: NVRTC JIT + per-SM heuristic
-tables (conflicts with the AOT single-instantiation-TU discipline) and MoE
-gather/grouped GEMM. We keep two things humming lacks: strided-batch
-operands with broadcast, and fp32 output.
+device target). Out of scope by design: NVRTC JIT and MoE
+gather/grouped GEMM (the JIT-per-SM-heuristic idea survives AOT as the
+per-dtype-class `kPlanEff` table, calibrated by the tile bench). We keep
+two things humming lacks: strided-batch operands with broadcast, and fp32
+output.
 
 ## Build System
 
@@ -257,7 +314,8 @@ cmake --build build/cmake -j 16
 
 ### Architecture flags
 
-`setup.py` passes the GPU compute capability to CMake via `ASTRAI_CUDA_ARCH`. When
+`setup.py` passes the GPU compute capability to CMake via `ASTRAI_CUDA_ARCH`
+(a semicolon list, e.g. `"80;89;120"`, produces one multi-arch fatbin). When
 unset, `setup.py` auto-detects the real GPU capability through
 `torch.cuda.get_device_capability()`; the CMake fallback default is `80` (sm_80):
 
@@ -533,9 +591,10 @@ csrc/
 ├── CMakeLists.txt                    # CMake build: kernel registry (KERNEL_NAMES / KERNEL_SRCS), torch/pybind11 linking
 ├── kernels/
 │   ├── common/                       # cross-family pure-CUDA helpers (no torch)
-│   │   ├── device.cuh                #   sm_at_least(), kMinSmForFp8* constants
+│   │   ├── device.cuh                #   DeviceFacts geometry query (sms / smem opt-in / L2) + ArchSm80..100 generation tags with feature gates (fp8 mma / TMA / mbarrier / wgmma) and the runtime arch_dispatch ladder; fp8 capability helpers live in quantize/common.h, the torch-bound gate in quantize/checks.h
 │   │   ├── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2/x4<T>
-│   │   ├── cp_async.cuh              #   cp.async 16B primitives (predicated copy, commit/wait groups)
+│   │   ├── pipeline.cuh              #   async data-movement vocabulary, one header: raw cp.async 16B emitters (fixed + runtime-src-size zfill) and mbarrier PTX, plus PipelineSync (sm_80/89 wait_group+syncthreads) / PipelineMbarrier (sm_90+) stage pipelines
+│   │   ├── swizzle.cuh               #   staging-layout vocabulary: Swizzle/Shape/Stride/Layout + composition(Swizzle, Layout) in 16B-chunk units; per-tile SmemLayout types declared by the gemm collectives
 │   │   └── reduce.cuh                #   warp_reduce_max, atomic_max_float
 │   ├── attention/                    # attention family (module names keep the attn_* prefix)
 │   │   ├── common.h                  #   AttentionParams POD, TensorLayout enum (BHLD/BLHD)
@@ -553,15 +612,16 @@ csrc/
 │   │   ├── paged_decode.cu           #   → module attn_paged_decode
 │   │   └── paged_prefill.cu          #   → module attn_paged_prefill
 │   ├── rotary_emb.cu                  # rotary embedding (kernel + binding in one file) → module rotary_emb
-│   ├── quantize/                        # quantize family (no torch)
-│   │   ├── common.h                  #   FP8Format enum, QuantLayout, QuantParams POD
+│   ├── quantize/                        # quantize family (pure CUDA; checks.h is the torch-bound gate)
+│   │   ├── common.h                  #   FP8Format enum, sm_at_least + kMinSmForFp8 capability helpers, QuantLayout, QuantParams POD
+│   │   ├── checks.h                  #   torch-bound entry validation (check_fp8_device over ATen-cached properties)
 │   │   ├── dequant.cuh               #   in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
 │   │   └── quantize.cuh              #   quantize kernels: vectorized + 32×32-tile transpose (out_layout 0/1/2)
 │   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
 │   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy
-│   │   ├── load.cuh                  #     operand loaders (swizzle, congruous cp.async, crosswise direct, trans staging)
+│   │   ├── load.cuh                  #     operand loaders (tile_at over declared layouts, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
 │   │   ├── scheduler.cuh             #     grouped/plain raster mapping
 │   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
 │   │   ├── epilogue.cuh              #     fused bias + scale folding + bf16 scatter + copy-out
