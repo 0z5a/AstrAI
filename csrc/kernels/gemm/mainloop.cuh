@@ -23,12 +23,6 @@ struct GemmCollectiveMainloop {
     using LayoutB = typename Policy::LayoutTagB;
     using Smem = GemmSmem<Traits, LayoutA, LayoutB>;
     static constexpr bool kFastLoop = Policy::kFastLoop;
-    // Humming-style offline-repacked operand storage (repack.cuh): the
-    // bytes arrive pre-interleaved so each fragment register pair costs
-    // one LDS.32 + one quad dequant instead of two scalar LDS.16 pairs.
-    // Legal only for dequantized (int8) congruous operands.
-    static constexpr bool kPackedA = Policy::kPackedA;
-    static constexpr bool kPackedB = Policy::kPackedB;
     // Operands are independently typed; the mma runs on the promoted MmaT
     // (policy.cuh). Int8 operands (W8A16 weight-only, W8A8 dynamic) expand
     // in-register between the smem read and the mma — kDequantA/kDequantB
@@ -472,9 +466,8 @@ struct GemmCollectiveMainloop {
     // m16n8k16 B fragment of lane l (quad q = l>>2, r = l&3) holds
     // tile[n = b_row0 + nt*8 + q][k = k_seg*16 + {2r, 2r+1, 2r+8, 2r+9}]
     // as two packed pairs — both u16 reads land inside one 16B swizzle
-    // chunk, so plain tile_at addressing works on the un-repacked layout.
-    // The LOP3 expansion (dequant.cuh) is exact for the int8 range. The
-    // packed storage (repack.cuh) vectorizes these scalar reads.
+    // chunk, so plain tile_at addressing works. The LOP3 expansion
+    // (dequant.cuh) is exact for the int8 range.
     __device__ __forceinline__ void
     load_b_frags_at(unsigned* frag2, unsigned* frag4, const ElemB* stage,
                     int k_seg, unsigned seg_base, int lane) const {
