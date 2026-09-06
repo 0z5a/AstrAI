@@ -13,8 +13,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import astrai.extension.fp8 as f8mod
-from astrai.extension.fp8 import (
+import astrai.extension.quantize as f8mod
+from astrai.extension.ops.gemm import mm_fp8
+from astrai.extension.ops.quantize import quantize, quantize_dual
+from astrai.extension.quantize import (
     FP8Format,
     FP8Recipe,
     FP8TensorMeta,
@@ -24,7 +26,6 @@ from astrai.extension.fp8 import (
     fp8_linear_enabled,
     fp8_state,
 )
-from astrai.extension.ops.fp8 import mm_fp8, quantize, quantize_dual
 from tests.conftest import skip_no_fp8
 
 

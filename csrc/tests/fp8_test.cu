@@ -210,16 +210,18 @@ template <typename ElemA, typename ElemB>
 __global__ static void naive_gemm_ref(const ElemA* a, const ElemB* b,
                                       float* out, int m, int n, int k,
                                       int a_ld, int b_ld, int a_rm, int b_rm,
-                                      const float* b_col_scale) {
+                                      const float* b_col_scale,
+                                      const float* a_row_scale) {
     const int i = blockIdx.y * 32 + threadIdx.y;
     const int j = blockIdx.x * 32 + threadIdx.x;
     if (i >= m || j >= n) return;
     const float sc = b_col_scale ? b_col_scale[j] : 1.0f;
+    const float sa = a_row_scale ? a_row_scale[i] : 1.0f;
     float acc = 0.f;
     for (int kk = 0; kk < k; ++kk) {
         float av = a_rm ? elem2f(a[i * a_ld + kk]) : elem2f(a[kk * a_ld + i]);
         float bv = b_rm ? elem2f(b[kk * b_ld + j]) : elem2f(b[j * b_ld + kk]);
-        acc += av * bv * sc;
+        acc += av * bv * sc * sa;
     }
     out[i * n + j] = acc;
 }
@@ -233,7 +235,8 @@ template <typename ElemA, typename ElemB = ElemA, typename OutT = __nv_bfloat16,
 static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
                        int a_ld, int b_ld, int a_rm, int b_rm, const char* tag,
                        float tol, Fn&& dispatch,
-                       const std::vector<float>& b_col_scale = {}) {
+                       const std::vector<float>& b_col_scale = {},
+                       const std::vector<float>& a_row_scale = {}) {
     const size_t na = (size_t)m * k, nb = (size_t)n * k, nout = (size_t)m * n;
     std::vector<ElemA> qa(na);
     std::vector<ElemB> qb(nb);
@@ -244,6 +247,7 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
     OutT* dout;
     float *d_ref, *d_scale;
     float* d_bscale = nullptr;
+    float* d_ascale = nullptr;
     cudaMalloc(&da, na * sizeof(ElemA));
     cudaMalloc(&db, nb * sizeof(ElemB));
     cudaMalloc(&dout, nout * sizeof(OutT));
@@ -258,9 +262,15 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
         cudaMemcpy(d_bscale, b_col_scale.data(), b_col_scale.size() * 4,
                    cudaMemcpyHostToDevice);
     }
+    if (!a_row_scale.empty()) {
+        cudaMalloc(&d_ascale, a_row_scale.size() * 4);
+        cudaMemcpy(d_ascale, a_row_scale.data(), a_row_scale.size() * 4,
+                   cudaMemcpyHostToDevice);
+    }
     naive_gemm_ref<ElemA, ElemB>
         <<<dim3((n + 31) / 32, (m + 31) / 32), dim3(32, 32)>>>(
-            da, db, d_ref, m, n, k, a_ld, b_ld, a_rm, b_rm, d_bscale);
+            da, db, d_ref, m, n, k, a_ld, b_ld, a_rm, b_rm, d_bscale,
+            d_ascale);
     ASTRAI_LAUNCH_CHECK();
 
     GemmParams p = {};
@@ -271,6 +281,10 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
     if (d_bscale) {
         p.b_scale = d_bscale;
         p.b_scale_n = n;
+    }
+    if (d_ascale) {
+        p.a_scale = d_ascale;
+        p.a_scale_m = m;
     }
     p.m = m;
     p.n = n;
@@ -305,6 +319,7 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
     cudaFree(d_ref);
     cudaFree(d_scale);
     if (d_bscale) cudaFree(d_bscale);
+    if (d_ascale) cudaFree(d_ascale);
     return ok;
 }
 
@@ -584,6 +599,117 @@ static bool test_gemm_dtypes() {
                 gemm_dispatch<__nv_bfloat16, int8_t>(p, 0, true, false);
             },
             scale);
+    }
+
+    // W8A8 dynamic: per-row-scaled int8 activation x per-channel-scaled
+    // int8 weight — BOTH operands dequantize in-register to the bf16 mma.
+    // All four storage layouts through the production dispatch, plus a
+    // pinned big-CTA instantiation at k=320.
+    {
+        using W8A8Big =
+            GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, RowMajor,
+                       __nv_bfloat16, 128, 128, 64, 32, 64, 2, false, true>;
+        printf("W8A8 (int8 act x int8 weight, all layouts):\n");
+        for (int k : {64, 320, 512}) {
+            std::vector<float> ha, hb;
+            prep(ha, hb, 256, 256, k, 888 + k);
+            std::vector<float> rscale(256), cscale(256);
+            for (int i = 0; i < 256; ++i) {
+                float amax = 1e-6f;
+                for (int kk = 0; kk < k; ++kk)
+                    amax = fmaxf(amax, fabsf(ha[(size_t)i * k + kk]));
+                rscale[i] = amax / 127.0f;
+                for (int kk = 0; kk < k; ++kk)
+                    ha[(size_t)i * k + kk] /= rscale[i];
+            }
+            for (int j = 0; j < 256; ++j) {
+                float amax = 1e-6f;
+                for (int kk = 0; kk < k; ++kk)
+                    amax = fmaxf(amax, fabsf(hb[(size_t)j * k + kk]));
+                cscale[j] = amax / 127.0f;
+                for (int kk = 0; kk < k; ++kk)
+                    hb[(size_t)j * k + kk] /= cscale[j];
+            }
+            std::vector<float> ha_t((size_t)k * 256), hb_t((size_t)k * 256);
+            for (int i = 0; i < 256; ++i)
+                for (int p = 0; p < k; ++p) ha_t[p * 256 + i] = ha[i * k + p];
+            for (int j = 0; j < 256; ++j)
+                for (int p = 0; p < k; ++p) hb_t[p * 256 + j] = hb[j * k + p];
+            printf(" 256x256x%d:\n", k);
+            all &= check_gemm<int8_t, int8_t>(
+                ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
+                "w8a8 disp", 0.02f,
+                [&](GemmParams& p) {
+                    gemm_dispatch<int8_t, int8_t>(p, 0, false, true);
+                },
+                cscale, rscale);
+            all &= check_gemm<int8_t, int8_t>(
+                ha_t.data(), hb_t.data(), 256, 256, k, 256, 256, 0, 1,
+                "w8a8 TN disp", 0.02f,
+                [&](GemmParams& p) {
+                    gemm_dispatch<int8_t, int8_t>(p, 0, true, false);
+                },
+                cscale, rscale);
+            all &= check_gemm<int8_t, int8_t>(
+                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
+                "w8a8 TT disp", 0.02f,
+                [&](GemmParams& p) {
+                    gemm_dispatch<int8_t, int8_t>(p, 0, true, true);
+                },
+                cscale, rscale);
+            all &= check_gemm<int8_t, int8_t>(
+                ha.data(), hb_t.data(), 256, 256, k, k, 256, 1, 1,
+                "w8a8 NN swap", 0.02f,
+                [&](GemmParams& p) {
+                    gemm_dispatch<int8_t, int8_t>(p, 0, false, false);
+                },
+                cscale, rscale);
+            if (k == 320) {
+                all &= check_gemm<int8_t, int8_t>(
+                    ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
+                    "w8a8 big 128x128", 0.02f,
+                    [&](GemmParams& p) { launch_policy<W8A8Big>(p, 0); },
+                    cscale, rscale);
+            }
+        }
+    }
+
+    // A8W16 (the mirrored mixed pair): int8 activation dequantizes on the
+    // A side while the bf16 weight rides the ldmatrix path — exercises the
+    // split kSegXorA/kSegXorB addressing.
+    {
+        printf("A8W16 (int8 act x bf16 weight):\n");
+        for (int k : {64, 320}) {
+            std::vector<float> ha, hb;
+            prep(ha, hb, 256, 256, k, 999 + k);
+            std::vector<float> rscale(256);
+            for (int i = 0; i < 256; ++i) {
+                float amax = 1e-6f;
+                for (int kk = 0; kk < k; ++kk)
+                    amax = fmaxf(amax, fabsf(ha[(size_t)i * k + kk]));
+                rscale[i] = amax / 127.0f;
+                for (int kk = 0; kk < k; ++kk)
+                    ha[(size_t)i * k + kk] /= rscale[i];
+            }
+            std::vector<float> ha_t((size_t)k * 256);
+            for (int i = 0; i < 256; ++i)
+                for (int p = 0; p < k; ++p) ha_t[p * 256 + i] = ha[i * k + p];
+            printf(" 256x256x%d:\n", k);
+            all &= check_gemm<int8_t, __nv_bfloat16>(
+                ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
+                "a8w16 NT disp", 0.02f,
+                [&](GemmParams& p) {
+                    gemm_dispatch<int8_t, __nv_bfloat16>(p, 0, false, true);
+                },
+                {}, rscale);
+            all &= check_gemm<int8_t, __nv_bfloat16>(
+                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
+                "a8w16 TT disp", 0.02f,
+                [&](GemmParams& p) {
+                    gemm_dispatch<int8_t, __nv_bfloat16>(p, 0, true, true);
+                },
+                {}, rscale);
+        }
     }
 
     // fp32 output (OutT = float): one fixed narrow-CTA policy and one

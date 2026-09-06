@@ -1,42 +1,104 @@
-"""FP8 training: scaling recipes, per-tensor state, and aten::linear dispatch.
+"""Quantization: every scheme's policy and integration in one module.
 
-Layered (see ``ops/fp8.py`` for the CUDA interface adapter):
-1. ``ops.fp8`` — the only module touching the pybind.
-2. This module (strategy layer): scaling *recipes* (TE-style delayed scaling
-   or dynamic current-amax scaling), per-tensor scales + amax history, and the
-   ``fp8_autocast`` context manager (like ``torch.autocast``).
-3. aten::linear integration: registers the CUDA + AutogradCUDA impls.
+The python mirror of the kernel side's single quantize family
+(``csrc/kernels/quantize/`` — the fp8 quantize kernels plus the int8
+dequant the GEMM family consumes). Stateless kernel adapters live one
+layer down (``ops/quantize.py`` / ``ops/gemm.py`` — the only modules
+touching the pybind).
+
+INT8 (inference, stateless strategies consumed with ``ops.gemm``'s
+``mm_w8*`` primitives):
+
+- ``quantize_weight_int8`` — symmetric per-channel weight quantization
+  (one-shot at load time), ``w ≈ w8 * scale[:, None]``
+- ``quantize_act_int8`` — symmetric per-row dynamic activation quantization
+
+The dequant contract lives in the GEMM family: int8 operands expand to
+bf16 fragments exactly in-register, scales re-apply multiplicatively in
+the epilogue, so the only error is the round-to-nearest here. There is
+deliberately no nn.Module layer on this path.
+
+FP8 (training stack):
+
+- ``FP8Recipe`` — scaling recipes (TE-style delayed scaling over an amax
+  history window, or dynamic current-amax scaling)
+- per-tensor scale rings + process-wide ``FP8State``
+- ``fp8_autocast`` — the torch.autocast-style context (plus the
+  ``fp8_linear_enable`` global switch) routing ``aten::linear`` through
+  ``fp8_linear_forward/backward``; hybrid E4M3 forward / E5M2 backward by
+  default
 
 Usage::
 
-    from astrai.extension.fp8 import fp8_autocast
+    from astrai.extension.quantize import fp8_autocast
     with fp8_autocast(enabled=True, fp8_format="hybrid"):
         logits = model(input_ids)
     loss.backward()  # fp8 backward runs anywhere; fwd captured state on the node
 
-Format defaults follow the ecosystem consensus: E4M3 forward / E5M2 backward
-("hybrid"); every operand's scale is a quantization step derived from its amax
-history by the active recipe.
-
-The context mirrors ``torch.autocast`` (``autocast_mode.py``): the active
+The context mirrors ``torch.autocast``: the active
 ``(enabled, recipe, fp8_format)`` triple is thread-local (a ``contextvars``
 ``ContextVar``, absent outside any region), and the manager is class-based and
-reentrant with nested ``enabled=False`` disabling dispatch inside it. The module
-targets *training*: every step quantizes x/w/g fresh (no weight-cast cache — the
-optimizer bumps the weight version each step, so a torch-style cached_cast would
-miss anyway), and the per-operand scales come from the delayed/dynamic recipe.
+reentrant with nested ``enabled=False`` disabling dispatch inside it. The fp8
+path targets *training*: every step quantizes x/w/g fresh (no weight-cast
+cache — the optimizer bumps the weight version each step, so a torch-style
+cached_cast would miss anyway), and the per-operand scales come from the
+delayed/dynamic recipe.
+
+The ``aten::linear`` CUDA/AutogradCUDA override installs **lazily**, on the
+first activation (autocast enter or the global enable): importing this
+module — for the int8 strategies or anything else — never touches the
+dispatcher.
 """
 
 import functools
+import threading
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch.library import Library
 
-from astrai.extension.ops.fp8 import mm_fp8, quantize, quantize_dual
+from astrai.extension.ops.gemm import mm_fp8
+from astrai.extension.ops.quantize import quantize, quantize_dual
+
+# ---------------------------------------------------------------------------
+# INT8: stateless strategies (inference)
+# ---------------------------------------------------------------------------
+
+
+def quantize_weight_int8(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-channel int8 quantization of a linear weight.
+
+    ``w`` is ``[N, K]`` (the nn.Linear convention); returns
+    ``(w8 int8 [N, K] contiguous, scale f32 [N])`` with
+    ``w ≈ w8.float() * scale[:, None]`` and ``scale = amax(N) / 127``.
+    Quantization runs in float32 regardless of the source dtype.
+    """
+    wf = w.detach().to(torch.float32)
+    scale = wf.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
+    q = torch.round(wf / scale.unsqueeze(-1)).clamp_(-127, 127)
+    return q.to(torch.int8).contiguous(), scale.contiguous()
+
+
+def quantize_act_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-row dynamic int8 quantization of activations.
+
+    ``x`` is ``[..., K]``; returns ``(q int8 with x's shape, scale f32
+    [prod(leading dims)])`` — the scale layout ``mm_w8a8`` expects once the
+    leading dims flatten.
+    """
+    xf = x.detach().to(torch.float32)
+    x2 = xf.reshape(-1, xf.shape[-1])
+    scale = x2.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
+    q = torch.round(x2 / scale.unsqueeze(-1)).clamp_(-127, 127)
+    return q.to(torch.int8).reshape(x.shape), scale
+
+
+# ---------------------------------------------------------------------------
+# FP8: formats, recipes, per-tensor state
+# ---------------------------------------------------------------------------
 
 # Max representable value per FP8 format (E4M3: 448, E5M2: 57344).
 FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -248,6 +310,8 @@ class fp8_autocast:
         self._tokens: List[Token] = []
 
     def __enter__(self) -> "fp8_autocast":
+        if self._config.enabled:
+            _install_linear_override()
         self._tokens.append(_active_config.set(self._config))
         return self
 
@@ -408,6 +472,8 @@ class _LinearFp8(torch.autograd.Function):
 def fp8_linear_enable(enabled: bool = True) -> None:
     """Toggle fp8 dispatch for aten::linear globally (the out-of-region default;
     ``fp8_autocast`` regions override it thread-locally)."""
+    if enabled:
+        _install_linear_override()
     fp8_state().default_enabled = enabled
 
 
@@ -440,11 +506,32 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
     )
 
 
-_lib = Library("aten", "IMPL", "CUDA")
-_lib.impl("linear", _linear_cuda_impl)
-# Also replace torch's generated linear autograd formula (which would call
-# aten::linear_backward after the fp8_autocast region exits). The fp8 backward
-# is owned by _LinearFp8 with state captured at forward time, so loss.backward()
-# works wherever it is called; the CUDA registration still covers inference_mode.
-_lib_autograd = Library("aten", "IMPL", "AutogradCUDA")
-_lib_autograd.impl("linear", _linear_cuda_impl)
+_linear_libs: Optional[List[Library]] = None
+_install_lock = threading.Lock()
+
+
+def _install_linear_override() -> None:
+    """Register the fp8 aten::linear impls once, on first activation.
+
+    Importing this module must stay dispatcher-neutral: the override routes
+    every CUDA ``aten::linear`` call through ``_linear_cuda_impl``'s guard,
+    so it is installed exactly when fp8 dispatch is first switched on (an
+    autocast enter or the global enable) — never at import. The ``Library``
+    handles live in a module global for the process lifetime (dropping them
+    would unregister the impls).
+    """
+    global _linear_libs
+    if _linear_libs is None:
+        with _install_lock:
+            if _linear_libs is None:
+                lib = Library("aten", "IMPL", "CUDA")
+                lib.impl("linear", _linear_cuda_impl)
+                # Also replace torch's generated linear autograd formula
+                # (which would call aten::linear_backward after the
+                # fp8_autocast region exits). The fp8 backward is owned by
+                # _LinearFp8 with state captured at forward time, so
+                # loss.backward() works wherever it is called; the CUDA
+                # registration still covers inference_mode.
+                lib_autograd = Library("aten", "IMPL", "AutogradCUDA")
+                lib_autograd.impl("linear", _linear_cuda_impl)
+                _linear_libs = [lib, lib_autograd]

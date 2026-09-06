@@ -26,15 +26,18 @@ using fp8_elem_t =
 // kernels: CTA tile, warp tile (WarpM x WarpN — e.g. 64x32 on the 128x128
 // CTA, 32x32 on the 64x64 small CTA) and cp.async pipeline depth.
 //
-// ElemA / ElemB are independent operand types. The MMA always runs on
-// ElemA (the activation); a differing ElemB (weight-only quantization,
-// e.g. int8 x bf16) is staged packed and dequantized in-register between
-// the fragment load and the mma — kNeedsDequantB marks that insert.
-template <typename ElemA_, typename ElemB_, 
+// ElemA / ElemB are independent operand types. The MMA runs on the
+// promoted MmaT (gemm_mma_traits): W16A16 passes through, symmetric fp8
+// keeps its native mma, and any int8 operand dequantizes in-register to
+// bf16 between the fragment load and the mma — kDequantA/kDequantB mark
+// those inserts per side (W8A8 inserts both, W8A16 only B).
+template <typename ElemA_, typename ElemB_,
             int BlockM, int BlockN, int K, int Stages, int WarpM = 64, int WarpN = 32>
 struct GemmTraits {
     using ElemA = ElemA_;
     using ElemB = ElemB_;
+    using MmaPair = gemm_mma_traits<ElemA_, ElemB_>;
+    using MmaT = typename MmaPair::MmaT;
     using ElemTraitsA = gemm_elem_traits<ElemA_>;
     using ElemTraitsB = gemm_elem_traits<ElemB_>;
 
@@ -47,11 +50,11 @@ struct GemmTraits {
 
     static constexpr int kElemBytesA = ElemTraitsA::kBytes;
     static constexpr int kElemBytesB = ElemTraitsB::kBytes;
-    // MMA shape follows the A-side (compute) type; B fragments are brought
-    // to it by the dequant stage when the types differ.
-    static constexpr int kMmaK = ElemTraitsA::kMmaK;
-    static constexpr bool kNeedsDequant = ElemTraitsA::kNeedsDequant;
-    static constexpr bool kNeedsDequantB = !std::is_same_v<ElemA_, ElemB_>;
+    // MMA shape follows the promoted compute type; dequantized fragments
+    // are brought to it in-register (dequant.cuh).
+    static constexpr int kMmaK = gemm_elem_traits<MmaT>::kMmaK;
+    static constexpr bool kDequantA = MmaPair::kDequantA;
+    static constexpr bool kDequantB = MmaPair::kDequantB;
 
     // Derived geometry: warp tiles tile the CTA. The smem budget is
     // layout-aware, so it lives in GemmSmem (below).

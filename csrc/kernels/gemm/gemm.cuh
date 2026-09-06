@@ -59,7 +59,13 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     mainloop.prologue();
     mainloop.accumulate(acc);
     // Drain the pipeline before the epilogue reclaims the operand rings.
+    // cp_async_wait_all drains only the CALLING thread's cp.asyncs, and
+    // the final mainloop iteration carries no trailing barrier — without
+    // this one, a thread racing into the epilogue scatters the output tile
+    // over peers' still-in-flight staging writes (and their final fragment
+    // reads). One barrier closes both windows.
     astrai::cp_async_wait_all();
+    __syncthreads();
     Epilogue(gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
 }
 

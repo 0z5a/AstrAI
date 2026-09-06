@@ -13,7 +13,7 @@ and FP8 GEMM. These are built when `nvcc` is available and CUDA is detected.
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
 | `quantize` | `quantize/quantize.cu` | FP8 quantization kernels (sm_89+) |
-| `gemm` | `gemm/gemm.cu` | FP8 tensor-core GEMM binding + the family's kernel-policy instantiation unit (sm_89+) |
+| `gemm` | `gemm/gemm.cu` | dtype-generic tensor-core GEMM binding (fp8 / W8A16 / W8A8 / W16A16) + the family's kernel-policy instantiation unit (sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -51,13 +51,14 @@ layered directory:
 |------|------|
 | `quantize/common.h` | `FP8Format` enum (E4M3/E5M2) + `QuantLayout` + `QuantParams` POD — no torch |
 | `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 32×32-tile transpose kernel (out_layout 0/1/2), `quant_in_traits<InT>` unpack — no torch |
-| `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK/kNeedsDequant — adding a dtype = one specialization), `GemmParams` POD |
-| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemT>` (tile geometry via `gemm_elem_traits`) + smem budget / occupancy hint (`GemmSmem`) + `GemmPolicy<ElemT>` (traits + layouts + knobs — the kernel's single template parameter); `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
-| `gemm/load.cuh` | operand loaders: swizzle (`tile_at`), congruous cp.async (predicated + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load |
-| `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster |
-| `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing, pipelined mma.sync loop |
-| `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + bf16 smem scatter + coalesced copy-out (dequant scale gated on `kNeedsDequant`) |
-| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + host planning (`plan_gemm` / `launch_plan`; 64×64 / 128×64 / 128×128 CTA) + entry `gemm<Fmt>(params, stream, trans_a, trans_b)` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
+| `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
+| `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK — adding a dtype = one specialization), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
+| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB>` (tile geometry via the promoted MmaT) + smem budget / occupancy hint (`GemmSmem`) + `GemmPolicy` (traits + layouts + knobs — the kernel's single template parameter); `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
+| `gemm/load.cuh` | operand loaders: swizzle (`tile_at`), congruous cp.async (predicated + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
+| `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
+| `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
+| `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16 smem scatter + coalesced copy-out |
+| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + host planning (`plan_gemm` / `launch_plan`; 64×64 / 128×64 / 128×128 CTA) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
 | `quantize/quantize.cu` | binding only: `check_fp8_device` (sm_89+), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
@@ -65,12 +66,15 @@ strategy layer passes `scale.reciprocal()` and the kernel multiplies by it.
 `mm_fp8` takes the combined dequant scale (`sa * sb`). `amax` is always
 returned in the original input domain.
 
-Python layer (two levels): `astrai/extension/ops/fp8.py` provides stateless
-primitives (`fp8_quantize` / `fp8_gemm`) via `torch.library.custom_op`, with
-plain `quantize` / `mm_fp8` wrappers, and `astrai/extension/fp8.py` is the
-strategy layer (`fp8_autocast`, delayed / dynamic scaling recipes,
-`fp8_linear_forward/backward` wiring `aten::linear` on CUDA). See the FP8
-section in `AGENTS.md` for full detail.
+Python layer (two levels): `astrai/extension/ops/quantize.py` and
+`ops/gemm.py` are the stateless kernel adapters (plain `quantize` /
+`quantize_dual` / `mm_fp8` wrappers, one adapter file per compiled kernel
+module), and `astrai/extension/quantize.py` is the strategy layer (fp8
+recipes, delayed / dynamic scaling, `fp8_autocast`,
+`fp8_linear_forward/backward` wiring `aten::linear` on CUDA, plus the int8
+quantizers). The aten override installs lazily on the first fp8 activation
+(autocast enter or the global enable), so importing the module is
+dispatcher-neutral.
 
 #### FP8 GEMM design notes
 
@@ -104,7 +108,13 @@ commits are unconditional so the group sequence stays tile-indexed and the
 fixed `wait_group<kStages-1>` is iteration-invariant (a runtime
 wait-count dispatch ladder cost 16 instructions/k-tile). A lean
 `kStages`-deep ring trading the barrier for a 4th resident CTA measured
-+5..9% slower at 1280³ and was removed.
++5..9% slower at 1280³ and was removed. The final iteration carries no
+trailing barrier of its own, so the epilogue transition pays one explicit
+pair: `cp_async_wait_all()` (which drains only the calling thread's
+groups) followed by `__syncthreads()` — without it a thread racing into
+the epilogue scatters the output tile over peers' still-in-flight staging
+writes and final fragment reads (caught by racecheck + a W8A8 stress
+case: zeroed 32-row output bands on multi-wave grids).
 
 **Crosswise loads.** Crosswise operands (A `[K][M]` / B `[N][K]` storage)
 cannot cp.async into the canonical tile; they take the direct LDG.128×4 +
@@ -137,6 +147,57 @@ the CTA-restart overlap saves).
 scatter (CUTLASS-sm90 `is_swapAB`): one instantiation fewer per tile
 config, at the cost of a scalar-store scatter on a path no LLM-linear
 operand pair hits.
+
+#### Quantized GEMM: W8A16 / W8A8 / W16A16 (humming-style)
+
+The same mainloop serves every dtype pairing through one promotion rule
+(`gemm_mma_traits`): the mma runs on the **MmaT** — symmetric fp8 keeps its
+native `m16n8k32`, symmetric bf16 (W16A16) passes through untouched, and
+any pair involving int8 (W8A16 weight-only, W8A8 dynamic, or the mirrored
+A8W16) promotes to bf16 `m16n8k16` with per-operand in-register dequant
+(`kDequantA` / `kDequantB` — W8A8 inserts both sides, W8A16 only B).
+Staging never changes: int8 operands ride the existing congruous
+cp.async / crosswise PRMT paths into the canonical swizzled tiles, and
+`kMmaK` follows the promoted type so the tile geometry is shared.
+
+**Dequant (quantize/dequant.cuh).** Each fragment register pair costs one
+`LDS.16` + four LOP3-class instructions, exact for the full int8 range
+including −128. bf16 carries only 7 mantissa bits, so the naive
+"OR the byte into a bf16 base" trick (0x6400-style, exact for fp16) breaks
+linearity — bit 7 spills into the exponent. Instead the magnitude bits
+(0-6) and the sign bit (7) take separate LOP3s:
+`h = (u & 0x7F) | 0x4300` → exactly 128+u7; `s = (u & 0x80) | 0x4300` →
+128 or 256 as the sign picks; `v = h - s` is the exact int8 value, and
+every intermediate is bf16-exact. A future humming-style offline byte
+interleave (per k16 slice, u32 word c holding `(k₂c, k₂c₊₈, k₂c₊₁, k₂c₉)`)
+would let one `LDS.32` feed both registers of a pair and drop the spread
+PRMT; deferred until measurement justifies a repack pass.
+
+**Scales.** `GemmParams` carries per-operand dequant scales folded
+multiplicatively into the epilogue (the mma accumulates the raw quantized
+product): per-tensor device scalar, per-row activation `a_scale[m]`, or
+per-channel weight `b_scale[n]`. Grouped-along-K scales belong in the
+mainloop and are not implemented. The transposed-output epilogue branch
+applies `b_scale`/bias per kernel row — including the +8 accumulator half
+(its own row factor), a pre-existing mixup the first scale-carrying
+NN-swap test exposed.
+
+**Python surface (two layers).** `astrai/extension/ops/gemm.py` is the
+compiled `gemm` module's adapter — the stateless kernel entries (`mm_fp8`
+and `mm_w8a16` / `mm_w8a8` / `mm_w16a16`, dtype pairing + scale extent
+validated in the binding); `astrai/extension/quantize.py` carries the int8
+policy (symmetric per-channel weight quantization, per-row dynamic
+activation quantization). There is deliberately no nn.Module layer on the
+int8 path: the only model-facing quantization integration is the fp8
+autocast (same module, routing `aten::linear`), and quantized callers
+compose the primitives directly.
+
+Benchmark (L20, llama weight shapes, `csrc/bench/benchmark_w8.py`,
+M=2048/4096): W8A16 reaches 0.83–1.08× of cuBLAS bf16 `F.linear`
+(28–42 TFLOPS, faster than bf16 on the wide up_gate shapes where halved
+weight traffic pays), W8A8 0.73–0.86×, W16A16 0.83–0.94× — the dequant
+insert is not the bottleneck at these shapes; the modes track the
+W16A16 baseline within a few percent.
 
 ## Build System
 
@@ -466,21 +527,23 @@ csrc/
 │   ├── rotary_emb.cu                  # rotary embedding (kernel + binding in one file) → module rotary_emb
 │   ├── quantize/                        # quantize family (no torch)
 │   │   ├── common.h                  #   FP8Format enum, QuantLayout, QuantParams POD
+│   │   ├── dequant.cuh               #   in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
 │   │   └── quantize.cuh              #   quantize kernels: vectorized + 32×32-tile transpose (out_layout 0/1/2)
 │   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
-│   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, GemmParams POD (no torch)
+│   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
-│   │   ├── policy.cuh                #     smem budget / occupancy hint + Fp8GemmPolicy
-│   │   ├── load.cuh                  #     operand loaders (swizzle, congruous cp.async, crosswise direct)
+│   │   ├── policy.cuh                #     smem budget / occupancy hint + dtype-generic GemmPolicy
+│   │   ├── load.cuh                  #     operand loaders (swizzle, congruous cp.async, crosswise direct, trans staging)
 │   │   ├── scheduler.cuh             #     grouped/plain raster mapping
-│   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop
-│   │   └── epilogue.cuh              #     fused bias + bf16 scatter + copy-out
+│   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
+│   │   ├── epilogue.cuh              #     fused bias + scale folding + bf16 scatter + copy-out
+│   │   └── gemm.cu                   #   binding + explicit instantiations (mm_fp8 / mm_w8a16 / mm_w8a8 / mm_w16a16)
 │   └── quantize/quantize.cu                  #   binding only (module quantize): validation, param packing, launch dispatch, pybind
 └── tests/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
     ├── attn_test.cu                  # Decode + prefill kernels
     ├── attn_paged_test.cu            # Paged decode/prefill kernels
-    └── fp8_test.cu                   # MMA demo + GEMM correctness across layouts/K tiles/ragged shapes
+    └── fp8_test.cu                   # MMA demo + GEMM correctness: fp8/bf16/W8A16/W8A8/A8W16 across layouts/K tiles/ragged shapes
 ```
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.

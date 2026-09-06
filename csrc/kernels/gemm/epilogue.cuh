@@ -159,14 +159,21 @@ struct GemmCollectiveEpilogue {
                 for (int mt = 0; mt < kMt; ++mt) {
                     const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
                     const int64_t grow = bias_row0 + r0;
+                    const int64_t grow8 = grow + 8;
                     const float b =
                         bias && grow < m ? __bfloat162float(bias[grow]) : 0.0f;
+                    const float b8 =
+                        bias && grow8 < m ? __bfloat162float(bias[grow8]) : 0.0f;
                     // Swapped orientation mirrors bias: D-cols come from
-                    // kernel rows, D-rows from kernel cols.
-                    const float c = b_scale && grow < m 
-                        ? b_scale[grow] 
+                    // kernel rows (the +8 acc half carries its own), D-rows
+                    // from kernel cols.
+                    const float c = b_scale && grow < m
+                        ? b_scale[grow]
                         : 1.0f;
-                    const float r0f = a_scale && bias_col0 + col < n 
+                    const float c8 = b_scale && grow8 < m
+                        ? b_scale[grow8]
+                        : 1.0f;
+                    const float r0f = a_scale && bias_col0 + col < n
                         ? a_scale[bias_col0 + col]
                         : 1.0f;
                     const float r1f = a_scale && bias_col0 + col + 1 < n
@@ -175,8 +182,8 @@ struct GemmCollectiveEpilogue {
                     const float* tile_acc = acc[nt][mt];
                     *out_elem(col, r0) = OE::cvt(tile_acc[0] * output_scale * r0f * c + b);
                     *out_elem(col + 1, r0) = OE::cvt(tile_acc[1] * output_scale * r1f * c + b);
-                    *out_elem(col, r0 + 8) =  OE::cvt(tile_acc[2] * output_scale * r0f * c + b);
-                    *out_elem(col + 1, r0 + 8) =  OE::cvt(tile_acc[3] * output_scale * r1f * c + b);
+                    *out_elem(col, r0 + 8) =  OE::cvt(tile_acc[2] * output_scale * r0f * c8 + b8);
+                    *out_elem(col + 1, r0 + 8) = OE::cvt(tile_acc[3] * output_scale * r1f * c8 + b8);
                 }
             }
         }

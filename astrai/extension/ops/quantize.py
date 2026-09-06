@@ -1,23 +1,23 @@
-"""FP8 CUDA kernel interface adapter (the only module touching the pybind).
+"""Quantize-kernel interface adapter (the only module touching the pybind).
 
-Attention-style thin wrappers: one Python entry per binding, called directly
-— no torch.library dispatch layer. Optional arguments (``ring_state``,
-``bias``) keep native Optional semantics at the pybind boundary, and
-in-place buffer updates (the delayed-scaling ring fold, like attention's
-KV-cache appends) happen on-stream without mutation declarations. CUDA-only:
-non-CUDA or unsupported inputs raise from the binding's TORCH_CHECKs.
+Attention-style thin wrappers: one Python entry per binding of the compiled
+``quantize`` module, called directly — no torch.library dispatch layer.
+Optional arguments (``ring_state``) keep native Optional semantics at the
+pybind boundary, and in-place buffer updates (the delayed-scaling ring fold,
+like attention's KV-cache appends) happen on-stream without mutation
+declarations. CUDA-only: non-CUDA or unsupported inputs raise from the
+binding's TORCH_CHECKs.
 
 - ``quantize(x, scale, fmt, transposed=False) -> (x8|x8T, amax)`` — BF16/FP16/FP32
   → FP8 with fused amax (``transposed`` picks the orientation; arity is fixed)
 - ``quantize_dual(x, scale, fmt) -> (x8, x8T, amax)`` — both orientations, one read
-- ``mm_fp8(a8, b8, sa, sb) -> out`` — pre-quantized FP8 GEMM (BF16 output)
 
 ``scale`` is the quantization multiplier (device scalar); ``fmt`` is
 ``"e4m3"`` or ``"e5m2"``. ``amax`` values are *returned*, never passed as
 output arguments.
 
-Policy (scales, amax history, delayed scaling, autocast) lives in ``fp8.py``;
-this module is stateless.
+Policy (scales, amax history, delayed scaling, autocast) lives in
+``astrai.extension.quantize``; this module is stateless.
 """
 
 from typing import Optional, Tuple
@@ -96,24 +96,4 @@ def quantize_dual(
     )
 
 
-def mm_fp8(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale: torch.Tensor,
-    trans_a: bool = False,
-    trans_b: bool = False,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Pre-quantized FP8 GEMM: ``a @ b * scale (+ bias)``.
-
-    ``a``/``b`` must be FP8 tensors of the same format, 2D or 3D (batched,
-    matmul-style broadcast on the batch dim). Inner-transposed views (e.g.
-    ``x.t()``) fold into the layout at zero copy. ``scale`` is their combined
-    dequantization scale. ``bias`` (CUDA bf16 1D of length n) adds inside the
-    kernel epilogue in fp32 — no separate elementwise pass. The result is
-    BF16; FP8 output is a separate quantize operation.
-    """
-    return get_module("gemm").mm_fp8(a, b, scale, trans_a, trans_b, bias)
-
-
-__all__ = ["mm_fp8", "quantize", "quantize_dual"]
+__all__ = ["quantize", "quantize_dual"]

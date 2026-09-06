@@ -23,7 +23,8 @@ import torch
 import torch.nn.functional as F
 
 from astrai.extension import is_available
-from astrai.extension.ops.fp8 import mm_fp8, quantize, quantize_dual
+from astrai.extension.ops.gemm import mm_fp8
+from astrai.extension.ops.quantize import quantize, quantize_dual
 
 FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
 

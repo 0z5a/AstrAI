@@ -11,6 +11,7 @@
 #include "gemm/common.h"
 #include "load.cuh"
 #include "policy.cuh"
+#include "quantize/dequant.cuh"
 
 namespace astrai {
 namespace gemm {
@@ -22,12 +23,24 @@ struct GemmCollectiveMainloop {
     using LayoutB = typename Policy::LayoutTagB;
     using Smem = GemmSmem<Traits, LayoutA, LayoutB>;
     static constexpr bool kFastLoop = Policy::kFastLoop;
-    // Operands are independently typed: A (activation, also the mma compute
-    // type) and B (weight; when the types differ, B fragments dequantize
-    // in-register between the smem read and the mma — kDequantB).
+    // Humming-style offline-repacked operand storage (repack.cuh): the
+    // bytes arrive pre-interleaved so each fragment register pair costs
+    // one LDS.32 + one quad dequant instead of two scalar LDS.16 pairs.
+    // Legal only for dequantized (int8) congruous operands.
+    static constexpr bool kPackedA = Policy::kPackedA;
+    static constexpr bool kPackedB = Policy::kPackedB;
+    // Operands are independently typed; the mma runs on the promoted MmaT
+    // (policy.cuh). Int8 operands (W8A16 weight-only, W8A8 dynamic) expand
+    // in-register between the smem read and the mma — kDequantA/kDequantB
+    // mark the insert per side (dequant.cuh); W16A16/W8A8-fp8 passthrough
+    // leaves both false.
     using ElemA = typename Traits::ElemA;
     using ElemB = typename Traits::ElemB;
-    static constexpr bool kDequantB = Traits::kNeedsDequantB;
+    using MmaT = typename Traits::MmaT;
+    static constexpr bool kDequantA = Traits::kDequantA;
+    static constexpr bool kDequantB = Traits::kDequantB;
+    using DequantA = quant::DequantPair<ElemA, MmaT>;
+    using DequantB = quant::DequantPair<ElemB, MmaT>;
     static constexpr int kBlockM = Traits::kBlockM;
     static constexpr int kBlockN = Traits::kBlockN;
     static constexpr int kK = Traits::kK;
@@ -43,6 +56,12 @@ struct GemmCollectiveMainloop {
     static constexpr bool kTransA = kDirectA && sizeof(ElemA) == 2;
     static constexpr bool kSyncB = kDirectB && sizeof(ElemB) == 1;
     static constexpr bool kTransB = kDirectB && sizeof(ElemB) == 2;
+    // Dequant inserts are int8-storage only; a dequantized side never rides
+    // the trans staging (16-bit-only) — kTrans* is already false there.
+    static_assert(!kDequantA || sizeof(ElemA) == 1,
+                  "in-register dequant targets 1-byte storage");
+    static_assert(!kDequantB || sizeof(ElemB) == 1,
+                  "in-register dequant targets 1-byte storage");
     static_assert(kStages >= 1 && kStages <= 8,
                   "FP8 GEMM stages must be in [1, 8]");
     // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps, each warp computing
@@ -223,9 +242,9 @@ struct GemmCollectiveMainloop {
 #pragma unroll
         for (int s = 0; s < kSegs; ++s) {
             a_seg[s] = kTransA ? (a_addr + (unsigned)(s * kTransSegA))
-                               : (a_addr ^ (unsigned)(s * kSegXor));
+                               : (a_addr ^ (unsigned)(s * kSegXorA));
             b_seg[s] = kTransB ? (b_addr + (unsigned)(s * kTransSegB))
-                               : (b_addr ^ (unsigned)(s * kSegXor));
+                               : (b_addr ^ (unsigned)(s * kSegXorB));
         }
 
         // kNt ldmatrix.x2 (B) + kMt ldmatrix.x4 (A) feed kMt*kNt*2 mma.sync
@@ -247,30 +266,40 @@ struct GemmCollectiveMainloop {
         // issued before the MMAs consuming row mt, so the LDS latency hides
         // behind tensor-pipe work. Costs 4 extra registers. Trans tiles
         // advance the m window by XOR (two 16B chunks), canonical tiles by
-        // the 16-row byte stride.
+        // the 16-row byte stride. Dequantized A (W8A8) fills all m-row
+        // fragments upfront through the scalar pair reads — no ldmatrix on
+        // 8-bit storage — so its LDS latency overlaps the first MMA batch.
         unsigned a_frag[kMt + 1][4];
-        if constexpr (kTransA)
+        if constexpr (kDequantA) {
+            const ElemA* a_stage = a_stage_of(tile_index);
+#pragma unroll
+            for (int mt = 0; mt < kMt; ++mt)
+                load_a_frags_at(a_frag[mt], a_stage, k_seg, mt, lane);
+        } else if constexpr (kTransA) {
             astrai::ldmatrix_x4_lane<true>(a_frag[0], a_seg[k_seg]);
-        else
+        } else {
             astrai::ldmatrix_x4_lane(a_frag[0], a_seg[k_seg]);
+        }
 #pragma unroll
         for (int mt = 0; mt < kMt; ++mt) {
-            if (mt + 1 < kMt) {
-                const unsigned a_next =
-                    kTransA ? (a_seg[k_seg] ^ (unsigned)((mt + 1) * kMtXor))
-                            : (a_seg[k_seg] + (mt + 1) * kMtStep);
-                if constexpr (kTransA)
-                    astrai::ldmatrix_x4_lane<true>(a_frag[mt + 1], a_next);
-                else
-                    astrai::ldmatrix_x4_lane(a_frag[mt + 1], a_next);
+            if constexpr (!kDequantA) {
+                if (mt + 1 < kMt) {
+                    const unsigned a_next =
+                        kTransA ? (a_seg[k_seg] ^ (unsigned)((mt + 1) * kMtXor))
+                                : (a_seg[k_seg] + (mt + 1) * kMtStep);
+                    if constexpr (kTransA)
+                        astrai::ldmatrix_x4_lane<true>(a_frag[mt + 1], a_next);
+                    else
+                        astrai::ldmatrix_x4_lane(a_frag[mt + 1], a_next);
+                }
             }
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const unsigned* bops =
                     kPairB ? (b_frag4[bcur][nt >> 1] + (nt & 1) * 2)
                            : b_frag[bcur][nt];
-                astrai::mma_sync<ElemA>(acc[nt][mt], a_frag[mt], bops,
-                                        acc[nt][mt]);
+                astrai::mma_sync<MmaT>(acc[nt][mt], a_frag[mt], bops,
+                                       acc[nt][mt]);
             }
         }
         // Next tile's LDGSTS chunks inside the MMA phase: A's after the
@@ -360,11 +389,14 @@ struct GemmCollectiveMainloop {
     // the swizzle source bits for kK <= 64; kK=128 swizzles on row[2:0]
     // where +8 flips bits, so that config keeps the x2 loads.
     // Fragment step constants, in BYTES (consumed by the *_lane address
-    // math). kSegXor = one mma k-segment = kMmaK elements — 32B for every
-    // supported dtype (fp8 k32 x 1B, bf16 k16 x 2B), i.e. two 16B chunks.
+    // math). kSegXor{A,B} = one mma k-segment of each operand's STORAGE
+    // type — 32B for every ldmatrix-fed dtype (fp8 k32 x 1B, bf16 k16 x
+    // 2B), i.e. two 16B chunks; mixed dtype pairs (A8W16) keep their own
+    // step per side. Dequant-fed sides never consume theirs.
     static constexpr unsigned kMtStep = 16u * kK * sizeof(ElemA);  // m-tile row step
     static constexpr unsigned kNtStep = 8u * kK * sizeof(ElemB);   // n-tile row step
-    static constexpr unsigned kSegXor = (unsigned)Traits::kMmaK * sizeof(ElemA);
+    static constexpr unsigned kSegXorA = (unsigned)Traits::kMmaK * sizeof(ElemA);
+    static constexpr unsigned kSegXorB = (unsigned)Traits::kMmaK * sizeof(ElemB);
     static constexpr bool kPairB = !kDequantB && kK * sizeof(ElemB) / 16 <= 4;
     static_assert(!kPairB || kNt % 2 == 0, "B pairing needs even kNt");
     static_assert(!kPairB || !kTransB,
@@ -436,43 +468,52 @@ struct GemmCollectiveMainloop {
         }
     }
 
-    // Dequantized B fragments (weight-only path): the m16n8k16 B fragment
-    // of lane l (quad q = l>>2, r = l&3) holds tile[n = b_row0 + nt*8 + q]
-    // [k = k_seg*16 + {2r, 2r+1, 2r+8, 2r+9}] as two packed pairs — both
-    // u16 reads land inside one 16B swizzle chunk, so plain tile_at
-    // addressing works with no offline repack.  int8 -> bf16 is exact
-    // (|v| <= 127 fits bf16's integer range).  A Humming-style offline
-    // weight permutation would swap these scalar loads for LDSM + PRMT;
-    // deferred until int4 needs real bit-unpacking anyway.
-    static __device__ __forceinline__ unsigned dequant_i8_pair(unsigned short v) {
-        static_assert(std::is_same_v<ElemA, __nv_bfloat16>,
-                      "in-register dequant currently targets bf16 only");
-        const float lo = (float)(int8_t)(v & 0xff);
-        const float hi = (float)(int8_t)(v >> 8);
-        __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
-        return *reinterpret_cast<unsigned*>(&p);
-    }
-
+    // Dequantized B fragments (W8A16 weight / W8A8 weight side): the
+    // m16n8k16 B fragment of lane l (quad q = l>>2, r = l&3) holds
+    // tile[n = b_row0 + nt*8 + q][k = k_seg*16 + {2r, 2r+1, 2r+8, 2r+9}]
+    // as two packed pairs — both u16 reads land inside one 16B swizzle
+    // chunk, so plain tile_at addressing works on the un-repacked layout.
+    // The LOP3 expansion (dequant.cuh) is exact for the int8 range. The
+    // packed storage (repack.cuh) vectorizes these scalar reads.
     __device__ __forceinline__ void
     load_b_frags_at(unsigned* frag2, unsigned* frag4, const ElemB* stage,
                     int k_seg, unsigned seg_base, int lane) const {
         if constexpr (kDequantB) {
-            const int q = lane >> 2, r = lane & 3;
+            const int q = lane >> 2, c2 = (lane & 3) * 2;
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const int row = b_row0 + nt * 8 + q;
                 const ElemB* p0 =
-                    tile_at<kK>(stage, row, k_seg * 16 + 2 * r);
+                    tile_at<kK>(stage, row, k_seg * 16 + c2);
                 const ElemB* p1 =
-                    tile_at<kK>(stage, row, k_seg * 16 + 2 * r + 8);
+                    tile_at<kK>(stage, row, k_seg * 16 + c2 + 8);
                 frag2[nt * 2 + 0] =
-                    dequant_i8_pair(*(const unsigned short*)p0);
+                    DequantB::pair(*(const unsigned short*)p0);
                 frag2[nt * 2 + 1] =
-                    dequant_i8_pair(*(const unsigned short*)p1);
+                    DequantB::pair(*(const unsigned short*)p1);
             }
         } else {
             load_b_frags(frag2, frag4, seg_base);
         }
+    }
+
+    // Dequantized A fragments (W8A8 activation side): the m16n8k16 A
+    // fragment of lane l (q = l>>2, c2 = (l&3)*2) holds tile
+    // [m = a_row0 + mt*16 + q (+8)][k = k_seg*16 + c2 (+8)] — register
+    // order (m, m+8, k+8, m+8&k+8), matching the ldmatrix x4 matrix order
+    // the non-dequant path produces (see a_trans_lane_off's note). Both
+    // u16 reads of one row stay inside one swizzle chunk (c2 <= 6).
+    __device__ __forceinline__ void
+    load_a_frags_at(unsigned frag[4], const ElemA* stage, int k_seg, int mt,
+                    int lane) const {
+        const int q = lane >> 2, c2 = (lane & 3) * 2;
+        const int row = a_row0 + mt * 16 + q;
+        const ElemA* p0 = tile_at<kK>(stage, row, k_seg * 16 + c2);
+        const ElemA* p8 = tile_at<kK>(stage, row + 8, k_seg * 16 + c2);
+        frag[0] = DequantA::pair(*(const unsigned short*)p0);
+        frag[1] = DequantA::pair(*(const unsigned short*)p8);
+        frag[2] = DequantA::pair(*(const unsigned short*)(p0 + 8));
+        frag[3] = DequantA::pair(*(const unsigned short*)(p8 + 8));
     }
 };
 

@@ -187,8 +187,10 @@ Three-layer separation (SGLang-inspired):
 
 The extension package separates mechanism from policy:
 
-- `astrai/extension/ops/` contains stateless wrappers that invoke one exact compiled kernel and fail when it is unavailable.
-- `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O.
+- `astrai/extension/loader.py` discovers and lazily loads the compiled kernel modules (`.so` name = module name = pybind name).
+- `astrai/extension/ops/` contains stateless adapters — one file per compiled kernel module — that call their kernel directly and fail when it is unavailable.
+- `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O (`dispatch.py` is the family-agnostic selection core it registers into).
+- `astrai/extension/quantize.py` holds every quantization scheme (int8 strategies, fp8 recipes and autocast); its `aten::linear` override installs lazily on the first fp8 activation, so plain imports stay dispatcher-neutral.
 - Model and inference code use the stable `astrai.extension` API instead of selecting ops directly.
 
 Attention computation is decoupled from the model via `AttentionBackend` ABC (`astrai/extension/backend/attention.py`):

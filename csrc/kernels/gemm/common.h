@@ -4,6 +4,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <type_traits>
 
 // GEMM-family pure POD/traits header — dtype-neutral: layout tags, element
 // traits and the unified parameter POD shared by every element-type
@@ -52,14 +53,31 @@ struct gemm_elem_traits<__nv_bfloat16> {
     static constexpr bool kNeedsDequant = false;
 };
 
-// int8 weight-only operand (W8A16): staged packed, dequantized in-register
-// to the activation type between the fragment load and the mma, so its
-// kMmaK never feeds the tile geometry (that comes from the A-side traits).
+// int8 quantized operand (weight-only W8A16 or dynamic W8A8): staged
+// packed, dequantized in-register to the MMA compute type between the
+// fragment load and the mma.sync (dequant.cuh), so its kMmaK never feeds
+// the tile geometry — that comes from the promoted pair traits below.
 template <>
 struct gemm_elem_traits<int8_t> {
     static constexpr int kBytes = 1;
-    static constexpr int kMmaK = 32;  // unused: no int8 mma on this path
+    static constexpr int kMmaK = 16;  // via the bf16 promotion (unused directly)
     static constexpr bool kNeedsDequant = true;
+};
+
+// MMA compute type for one operand pair — the dtype promotion every
+// quantized-GEMM family (humming-style) routes through: the tensor-core
+// input type both operands are brought to before mma.sync. Symmetric fp8
+// pairs run their native fp8 mma; any pair involving int8 (W8A16, W8A8,
+// A8W16) promotes to bf16 m16n8k16 with in-register dequant of the int8
+// side(s). Symmetric bf16 (W16A16) passes through untouched. kDequantA/B
+// are per-operand: W8A8 dequantizes both sides, W8A16 only B.
+template <typename ElemA, typename ElemB>
+struct gemm_mma_traits {
+    using MmaT = std::conditional_t<std::is_same_v<ElemA, int8_t> ||
+                                        std::is_same_v<ElemB, int8_t>,
+                                    __nv_bfloat16, ElemA>;
+    static constexpr bool kDequantA = !std::is_same_v<ElemA, MmaT>;
+    static constexpr bool kDequantB = !std::is_same_v<ElemB, MmaT>;
 };
 
 // Unified GEMM parameter POD, mirroring AttentionParams: one struct flows
