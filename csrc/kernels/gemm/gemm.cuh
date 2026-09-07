@@ -267,7 +267,7 @@ inline int plan_raster(const GemmParams& p, int bm, int bn, int ba, int bb,
 
 // Per-SM throughput scalars of the non-big recipes relative to the big
 // CTA, one row per dtype class — RTX 5090-measured (saturation medians at
-// M >= 1024, via the direct-instantiation pattern of csrc/tests/fp8_test.cu
+// M >= 1024, via the direct-instantiation pattern of csrc/tests/quant_gemm_test.cu
 // — `launch_policy<GemmPolicy<..., TileXxx, ...>>`, no planner; the
 // 1B/1B int8 pair adjusted down from
 // its saturation medians (.95/1.0), which over-credit the finer tiles on

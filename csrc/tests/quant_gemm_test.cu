@@ -1,13 +1,11 @@
 /*
-FP8 family tests: single-warp MMA demo + full GEMM correctness.
+quant_gemm family test: correctness for every operand dtype combination
+(fp8 / int8 / bf16 pairs, all four storage layouts, K tiles, ragged shapes,
+per-row / per-channel scales, fp32 output) + a per-combination TFLOPS table
+over llama-linear shapes through the production NT route.
 
-Part 1 exercises one bf16 -> fp8 -> mma.sync m16n8k32 instruction pair
-(sanity for astrai::mma_sync + the fragment layout contract).
-Part 2 checks launch_fp8_gemm across all four operand layouts, both K
-tiles, and ragged shapes against an fp32 CPU reference.
-
-nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/fp8_test.cu -o /tmp/fp8_test \
-    && /tmp/fp8_test
+nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
+    -o /tmp/quant_gemm_test && /tmp/quant_gemm_test
 */
 
 #include "test_utils.cuh"
@@ -22,156 +20,12 @@ nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/fp8_test.cu -o /tmp/f
 #include <vector>
 
 #include "common/launch.cuh"
-#include "common/mma.cuh"
 #include "gemm/gemm.cuh"
 
 using namespace astrai::quant;
 using namespace astrai::gemm;
 
-// ---------------------------------------------------------------------------
-// Part 1: single-kernel BF16 -> FP8 MMA -> BF16 demo (m16n8k32)
-// ---------------------------------------------------------------------------
-
 namespace {
-
-constexpr int kMmaM = 16;
-constexpr int kMmaN = 8;
-constexpr int kMmaK = 32;
-
-__device__ __forceinline__ unsigned pack_fp8x4(float x0, float x1, float x2,
-                                                float x3) {
-    __nv_fp8_e4m3 q0(x0);
-    __nv_fp8_e4m3 q1(x1);
-    __nv_fp8_e4m3 q2(x2);
-    __nv_fp8_e4m3 q3(x3);
-    return static_cast<unsigned>(q0.__x) |
-           (static_cast<unsigned>(q1.__x) << 8) |
-           (static_cast<unsigned>(q2.__x) << 16) |
-           (static_cast<unsigned>(q3.__x) << 24);
-}
-
-__device__ __forceinline__ unsigned load_quantize_fp8x4(
-    const bf16* src, float scale_inv) {
-    return pack_fp8x4(__bfloat162float(src[0]) * scale_inv,
-                      __bfloat162float(src[1]) * scale_inv,
-                      __bfloat162float(src[2]) * scale_inv,
-                      __bfloat162float(src[3]) * scale_inv);
-}
-
-__global__ void fused_bf16_fp8_mma_kernel(
-    const bf16* __restrict__ a, const bf16* __restrict__ b,
-    bf16* __restrict__ out, float scale_a, float scale_b) {
-    const int lane = threadIdx.x;
-    const int group = lane >> 2;
-    const int thread_in_group = lane & 3;
-    const int k0 = thread_in_group * 4;
-
-    // PTX m16n8k32 A fragment: two rows, two 16-column K partitions.
-    unsigned a_frag[4];
-    a_frag[0] = load_quantize_fp8x4(&a[group * kMmaK + k0], 1.0f / scale_a);
-    a_frag[1] =
-        load_quantize_fp8x4(&a[(group + 8) * kMmaK + k0], 1.0f / scale_a);
-    a_frag[2] =
-        load_quantize_fp8x4(&a[group * kMmaK + k0 + 16], 1.0f / scale_a);
-    a_frag[3] = load_quantize_fp8x4(&a[(group + 8) * kMmaK + k0 + 16],
-                                    1.0f / scale_a);
-
-    // B is supplied as row-major [N,K], equivalent to the col-major [K,N]
-    // operand required by the MMA instruction.
-    unsigned b_frag[2];
-    b_frag[0] = load_quantize_fp8x4(&b[group * kMmaK + k0], 1.0f / scale_b);
-    b_frag[1] =
-        load_quantize_fp8x4(&b[group * kMmaK + k0 + 16], 1.0f / scale_b);
-
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    astrai::mma_sync<__nv_fp8_e4m3>(acc, a_frag, b_frag, acc);
-
-    const int col = thread_in_group * 2;
-    const float output_scale = scale_a * scale_b;
-    *reinterpret_cast<__nv_bfloat162*>(&out[group * kMmaN + col]) =
-        __floats2bfloat162_rn(acc[0] * output_scale, acc[1] * output_scale);
-    *reinterpret_cast<__nv_bfloat162*>(&out[(group + 8) * kMmaN + col]) =
-        __floats2bfloat162_rn(acc[2] * output_scale, acc[3] * output_scale);
-}
-
-static float quantize_e4m3(float value) {
-    return static_cast<float>(__nv_fp8_e4m3(value));
-}
-
-static bool test_single_mma() {
-    srand(0);
-    std::vector<float> a(kMmaM * kMmaK), b(kMmaN * kMmaK),
-        reference(kMmaM * kMmaN, 0.0f);
-    std::vector<bf16> a_bf16(kMmaM * kMmaK), b_bf16(kMmaN * kMmaK),
-        output(kMmaM * kMmaN);
-    for (float& value : a) value = randf() * 4.0f;
-    for (float& value : b) value = randf() * 4.0f;
-    for (int i = 0; i < kMmaM * kMmaK; ++i) {
-        a_bf16[i] = f2bf(a[i]);
-        a[i] = bf2f(a_bf16[i]);
-    }
-    for (int i = 0; i < kMmaN * kMmaK; ++i) {
-        b_bf16[i] = f2bf(b[i]);
-        b[i] = bf2f(b_bf16[i]);
-    }
-
-    const float amax = *std::max_element(
-        a.begin(), a.end(),
-        [](float x, float y) { return fabsf(x) < fabsf(y); });
-    const float bmax = *std::max_element(
-        b.begin(), b.end(),
-        [](float x, float y) { return fabsf(x) < fabsf(y); });
-    const float scale_a = fabsf(amax) / 448.0f;
-    const float scale_b = fabsf(bmax) / 448.0f;
-
-    for (int row = 0; row < kMmaM; ++row) {
-        for (int col = 0; col < kMmaN; ++col) {
-            float sum = 0.0f;
-            for (int k = 0; k < kMmaK; ++k) {
-                float qa = quantize_e4m3(a[row * kMmaK + k] / scale_a);
-                float qb = quantize_e4m3(b[col * kMmaK + k] / scale_b);
-                sum = fmaf(qa, qb, sum);
-            }
-            reference[row * kMmaN + col] = sum * scale_a * scale_b;
-        }
-    }
-
-    bf16 *d_a, *d_b, *d_out;
-    CUDA_CHECK(cudaMalloc(&d_a, a_bf16.size() * sizeof(bf16)));
-    CUDA_CHECK(cudaMalloc(&d_b, b_bf16.size() * sizeof(bf16)));
-    CUDA_CHECK(cudaMalloc(&d_out, output.size() * sizeof(bf16)));
-    CUDA_CHECK(cudaMemcpy(d_a, a_bf16.data(), a_bf16.size() * sizeof(bf16),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, b_bf16.data(), b_bf16.size() * sizeof(bf16),
-                          cudaMemcpyHostToDevice));
-
-    fused_bf16_fp8_mma_kernel<<<1, 32>>>(d_a, d_b, d_out, scale_a, scale_b);
-    ASTRAI_LAUNCH_CHECK();
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(output.data(), d_out, output.size() * sizeof(bf16),
-                          cudaMemcpyDeviceToHost));
-
-    float max_abs_error = 0.0f;
-    float max_rel_error = 0.0f;
-    for (int i = 0; i < kMmaM * kMmaN; ++i) {
-        float error = fabsf(bf2f(output[i]) - reference[i]);
-        max_abs_error = fmaxf(max_abs_error, error);
-        max_rel_error = fmaxf(
-            max_rel_error, error / fmaxf(fabsf(reference[i]), 1e-4f));
-    }
-    const bool pass = max_abs_error < 0.05f;
-    print_test_row("M=16 N=8 K=32 fused BF16->E4M3 MMA", max_abs_error,
-                   max_rel_error, pass);
-
-    cudaFree(d_a);
-    cudaFree(d_b);
-    cudaFree(d_out);
-    return pass;
-}
-
-// ---------------------------------------------------------------------------
-// Part 2: GEMM correctness — layouts x K-tiles vs fp32 CPU reference
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Shared GEMM correctness harness — upload / reference / launch / compare
@@ -391,7 +245,7 @@ static bool check_all_layouts(const std::vector<float>& ha,
 }
 
 // ---------------------------------------------------------------------------
-// Part 2: fp8 GEMM — all four operand layouts x K-tiles x production routes
+// fp8 e4m3 GEMM — all four operand layouts x K-tiles x production routes
 // ---------------------------------------------------------------------------
 
 // Big-CTA policies for the direct-layout cases: kK/Stages vary per case;
@@ -433,6 +287,10 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
 }
 
 static bool test_gemm() {
+    // Deterministic operand data: the fp8 tolerances below are calibrated
+    // against a fixed rand stream (seeded here — never rely on the default
+    // first-call seed).
+    srand(0);
     struct {
         int m, n, k;
     } cfgs[] = {
@@ -472,11 +330,11 @@ static bool test_gemm() {
 }
 
 // ---------------------------------------------------------------------------
-// Part 3: dtype coverage — bf16/int8 operand pairs (all four layouts) and
-// fp32 output
+// Dtype combinations — bf16/int8/fp8 operand pairs (all four layouts),
+// per-row / per-channel scales, fp32 output
 // ---------------------------------------------------------------------------
 
-static bool test_gemm_dtypes() {
+static bool test_dtype_combos() {
     bool all = true;
     auto prep = [](std::vector<float>& a, std::vector<float>& b, int m, int n,
                    int k, int seed) {
@@ -717,13 +575,113 @@ static bool test_gemm_dtypes() {
     return all;
 }
 
+// ---------------------------------------------------------------------------
+// Combination effect bench: each dtype pair through the production NT
+// route (the nn.Linear main path) at llama-linear shapes. qa_max/qb_max
+// >0 quantizes that operand (127 int8 / 448 fp8) and threads the
+// per-row/per-channel scales through the epilogue, matching how the
+// strategy layer feeds the kernel.
+// ---------------------------------------------------------------------------
+
+using bf16_ = __nv_bfloat16;
+template <typename ElemA, typename ElemB>
+static void bench_combo(int m, int n, int k, const char* tag, float qa_max,
+                        float qb_max) {
+    srand(7);
+    std::vector<float> ha((size_t)m * k), hb((size_t)n * k);
+    for (float& v : ha) v = randf();
+    for (float& v : hb) v = randf();
+    std::vector<float> sa, sb;
+    if (qa_max > 0) sa = div_row_scales(ha, m, k, qa_max);
+    if (qb_max > 0) sb = div_row_scales(hb, n, k, qb_max);
+    std::vector<ElemA> qa((size_t)m * k);
+    std::vector<ElemB> qb((size_t)n * k);
+    for (size_t i = 0; i < qa.size(); ++i) qa[i] = to_elem<ElemA>(ha[i]);
+    for (size_t i = 0; i < qb.size(); ++i) qb[i] = to_elem<ElemB>(hb[i]);
+
+    ElemA* da;
+    ElemB* db;
+    bf16_* dout;
+    float *d_one, *d_sa = nullptr, *d_sb = nullptr;
+    cudaMalloc(&da, qa.size() * sizeof(ElemA));
+    cudaMalloc(&db, qb.size() * sizeof(ElemB));
+    cudaMalloc(&dout, (size_t)m * n * sizeof(bf16_));
+    cudaMalloc(&d_one, 4);
+    cudaMemcpy(da, qa.data(), qa.size() * sizeof(ElemA), cudaMemcpyHostToDevice);
+    cudaMemcpy(db, qb.data(), qb.size() * sizeof(ElemB), cudaMemcpyHostToDevice);
+    const float one = 1.0f;
+    cudaMemcpy(d_one, &one, 4, cudaMemcpyHostToDevice);
+    if (!sa.empty()) {
+        cudaMalloc(&d_sa, sa.size() * 4);
+        cudaMemcpy(d_sa, sa.data(), sa.size() * 4, cudaMemcpyHostToDevice);
+    }
+    if (!sb.empty()) {
+        cudaMalloc(&d_sb, sb.size() * 4);
+        cudaMemcpy(d_sb, sb.data(), sb.size() * 4, cudaMemcpyHostToDevice);
+    }
+
+    GemmParams p = {};
+    p.a_ptr = da;
+    p.b_ptr = db;
+    p.out_ptr = dout;
+    p.a_scale = d_one;
+    if (d_sa) {
+        p.a_scale = d_sa;
+        p.a_scale_m = m;
+    }
+    if (d_sb) {
+        p.b_scale = d_sb;
+        p.b_scale_n = n;
+    }
+    p.m = m;
+    p.n = n;
+    p.k = k;
+    p.a_ld = k;
+    p.b_ld = k;
+    p.out_ld = n;
+
+    double flops = 2.0 * m * n * k;
+    BenchResult r = bench_kernel(
+        [&] { gemm_dispatch<ElemA, ElemB>(p, 0, false, true); }, 3, 10,
+        flops);
+    char cfg[64];
+    snprintf(cfg, sizeof(cfg), "%-16s %5dx%-5dx%-5d", tag, m, n, k);
+    print_bench_row(cfg, r);
+
+    cudaFree(da);
+    cudaFree(db);
+    cudaFree(dout);
+    cudaFree(d_one);
+    if (d_sa) cudaFree(d_sa);
+    if (d_sb) cudaFree(d_sb);
+}
+
+static void bench_dtype_combos() {
+    printf("\n===== QUANT_GEMM COMBO BENCH (production NT route) =====\n");
+    print_bench_header();
+    struct Shape { int m, n, k; };
+    const Shape shapes[] = {
+        {4096, 4096, 4096},   // square
+        {2048, 4096, 4096},   // batched linear
+        {4096, 14336, 4096},  // llama up_gate
+    };
+    for (const Shape& s : shapes) {
+        bench_combo<bf16_, bf16_>(s.m, s.n, s.k, "W16A16", 0, 0);
+        bench_combo<bf16_, int8_t>(s.m, s.n, s.k, "W8A16", 0, 127.f);
+        bench_combo<int8_t, int8_t>(s.m, s.n, s.k, "W8A8", 127.f, 127.f);
+        bench_combo<bf16_, __nv_fp8_e4m3>(s.m, s.n, s.k, "W-F8A16", 0, 448.f);
+        bench_combo<__nv_fp8_e4m3, __nv_fp8_e4m3>(s.m, s.n, s.k, "F8A8 e4m3", 0, 0);
+        bench_combo<__nv_fp8_e5m2, __nv_fp8_e5m2>(s.m, s.n, s.k, "F8A8 e5m2", 0, 0);
+    }
+}
+
 }  // namespace
 
 int main() {
     print_test_header();
-    bool ok = test_single_mma();
-    ok &= test_gemm();
-    ok &= test_gemm_dtypes();
+    bool ok = test_gemm();
+    ok &= test_dtype_combos();
     printf(ok ? "All PASS\n" : "FAILURES\n");
+    if (ok) bench_dtype_combos();
     return ok ? 0 : 1;
 }

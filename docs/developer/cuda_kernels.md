@@ -217,7 +217,7 @@ humming's MXMMA route) runs at the full 1007 TFLOPS with an IDENTICAL
 A/B/C/D register contract, so the mainloop/staging/epilogue layers are
 untouched: `MxMmaOp` (common/mma.cuh) swaps only the cell, carrying a
 constant unit scale (every ue8m0 scale byte 0x7f = 2^0, selectors inert —
-the scale-factored product IS the plain product; fp8_test output stays
+the scale-factored product IS the plain product; quant_gemm_test output stays
 byte-identical). Warp-level block_scale is an sm_120-FAMILY instruction
 (CUDA 13.0 ptxas: 120a/121a/120f accepted, 100a/103a/110a rejected —
 datacenter Blackwell does MX through tcgen05, which needs 13.1+), so the
@@ -295,7 +295,7 @@ L2 locality but its loop-head barrier costs what the CTA-restart overlap
 saves).
 
 Calibration: an out-of-tree harness (the direct-instantiation pattern of
-`csrc/tests/fp8_test.cu`: `launch_policy<GemmPolicy<..., TileXxx, ...>>`,
+`csrc/tests/quant_gemm_test.cu`: `launch_policy<GemmPolicy<..., TileXxx, ...>>`,
 no planner) times every recipe across the llama shape grid; the eff
 scalars are re-measured that way when porting to a new GPU.
 `ASTR_GEMM_PLAN=1` adds a read-only launch log (shape →
@@ -695,7 +695,7 @@ nvcc -I csrc/kernels -arch=sm_89 -O3 --use_fast_math \
 Test files:
 - `attn_test.cu` — decode + prefill kernels (correctness tables + benchmarks)
 - `attn_paged_test.cu` — paged decode/prefill kernels
-- `fp8_test.cu` — single-warp bf16→fp8→mma.sync sanity check + full FP8 GEMM correctness (sm_89)
+- `quant_gemm_test.cu` — quantized GEMM correctness: every dtype pair (fp8/int8/bf16 × layouts/K tiles/ragged shapes/scales/fp32 out) + a per-combo TFLOPS bench (sm_89+)
 
 ## Benchmarks
 
@@ -762,7 +762,7 @@ csrc/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
     ├── attn_test.cu                  # Decode + prefill kernels
     ├── attn_paged_test.cu            # Paged decode/prefill kernels
-    └── fp8_test.cu                   # MMA demo + GEMM correctness: fp8/bf16/W8A16/W8A8/A8W16 across layouts/K tiles/ragged shapes
+    └── quant_gemm_test.cu           # GEMM correctness: fp8/bf16/int8 pairs across layouts/K tiles/ragged shapes + dtype-combo TFLOPS bench
 ```
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
