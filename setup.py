@@ -98,9 +98,20 @@ class _CMakeBuildExt(_build_ext):
                 # Accept a semicolon list ("80;89;120"); the FP8 gate keys
                 # on the maximum, matching the CMake-side validation.
                 max_arch = max(int(a) for a in arch.split(";") if a.strip())
-            elif detected := _detect_cuda_arch():
-                arch = detected
-                max_arch = int(detected)
+            else:
+                # Mixed-fleet default: native SASS for every generation the
+                # kernel family supports (80 bf16/int8 baseline, 89 fp8,
+                # 120 Blackwell + its 120a slice); interim GPUs JIT the
+                # nearest compute_* PTX at load. A local GPU newer than the
+                # newest listed arch joins the list natively.
+                arch = "80;89;120"
+                if (detected := _detect_cuda_arch()) and detected not in (
+                    "80",
+                    "89",
+                    "120",
+                ):
+                    arch = f"{arch};{detected}"
+                max_arch = max(int(a) for a in arch.split(";") if a.strip())
         except ValueError:
             warnings.warn(
                 f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
@@ -115,8 +126,15 @@ class _CMakeBuildExt(_build_ext):
                     stacklevel=2,
                 )
             cfg.append(f"-DASTRAI_CUDA_ARCH={arch}")
-        subprocess.run(cfg, check=True)
-        subprocess.run([cmake, "--build", str(build_dir), "-j", parallel], check=True)
+        # CUDACXX: a cold-cache configure cannot find nvcc when it is off
+        # PATH — and caches the failure.
+        env = dict(os.environ)
+        if (nvcc := _find_nvcc()) and not env.get("CUDACXX"):
+            env["CUDACXX"] = nvcc
+        subprocess.run(cfg, check=True, env=env)
+        subprocess.run(
+            [cmake, "--build", str(build_dir), "-j", parallel], check=True, env=env
+        )
 
         # After compilation finishes, verify mandatory CUDA kernels to confirm build succeeded.
         # CMake may report partial‑target success even if some architecture‑specific kernels are skipped.
@@ -136,11 +154,25 @@ class _CMakeBuildExt(_build_ext):
             )
 
 
+def _find_nvcc():
+    """nvcc path: PATH first, then the standard toolkit locations."""
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return nvcc
+    for root in (
+        os.environ.get("CUDA_HOME"),
+        os.environ.get("CUDA_PATH"),
+        "/usr/local/cuda",
+    ):
+        if root and (Path(root) / "bin" / "nvcc").is_file():
+            return str(Path(root) / "bin" / "nvcc")
+    return None
+
+
 def _cuda_toolkit_version():
-    import shutil
     import subprocess
 
-    nvcc = shutil.which("nvcc")
+    nvcc = _find_nvcc()
     if nvcc is None:
         return None
     try:

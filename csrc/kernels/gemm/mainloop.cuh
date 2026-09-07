@@ -428,9 +428,11 @@ struct GemmCollectiveMainloop {
         // issued before the MMAs consuming row mt, so the LDS latency hides
         // behind tensor-pipe work. Costs 4 extra registers. Trans tiles
         // advance the m window by XOR (two 16B chunks), canonical tiles by
-        // the 16-row byte stride. Dequantized A (W8A8) fills all m-row
-        // fragments upfront through the scalar pair reads — no ldmatrix on
-        // 8-bit storage — so its LDS latency overlaps the first MMA batch.
+        // the 16-row byte stride. Dequantized A (W8A8) fills ALL m-row
+        // fragments upfront through the scalar pair reads — the pipelined
+        // ldmatrix would clobber the already-converted fragments with raw
+        // 2-byte-layout data, so the fill below is ldmatrix-staging
+        // (native/bf16) only.
         typename MmaOp::AFrag a_frag[kMt + 1];
         if constexpr (kDequantA) {
             const auto a_tile = astrai::stage_of(ring_a, tile_index);

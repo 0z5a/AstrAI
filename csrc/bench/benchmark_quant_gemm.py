@@ -231,7 +231,7 @@ def benchmark_gemm(
 )
 @click.option("--warmup", type=click.IntRange(min=1), default=10, show_default=True)
 @click.option("--iterations", type=click.IntRange(min=1), default=50, show_default=True)
-@click.option("--trials", type=click.IntRange(min=1), default=10, show_default=True)
+@click.option("--trials", type=click.IntRange(min=1), default=3, show_default=True)
 @click.option("--seed", type=int, default=0, show_default=True)
 def benchmark_command(
     output: Path | None,

@@ -7,6 +7,7 @@
 // over FP8Format for the binding's format dispatch.
 
 #include <cuda_fp8.h>
+#include <tuple>
 #include <type_traits>
 
 #include "common/mma.cuh"
@@ -33,8 +34,11 @@ using fp8_elem_t =
 // and a lone int8 or fp8 operand against bf16 dequantizes in-register
 // between the fragment load and the mma — kDequantA/kDequantB mark those
 // inserts per side (W8A16 only B).
+//
+// UseMx swaps the symmetric-fp8 cell for the sm_120 block_scale cell
+// (MxMmaOp); other pairs ignore it.
 template <typename ElemA_, typename ElemB_, typename CtaShape_,
-          typename WarpShape_, int Stages>
+          typename WarpShape_, int Stages, bool UseMx = false>
 struct GemmTraits {
     using ElemA = ElemA_;
     using ElemB = ElemB_;
@@ -43,7 +47,12 @@ struct GemmTraits {
     // The exact mma cell <MmaT, MmaT, shape> (common/mma.cuh): one
     // type carries the instruction's K extent, register counts and the
     // accumulator type (fp32 for the float families, s32 for the s8 pair).
-    using MmaOp = astrai::MmaOp<MmaT, MmaT, typename astrai::MmaShapeFor<MmaT>::type>;
+    static constexpr bool kMxCell =
+        UseMx && (std::is_same_v<MmaT, __nv_fp8_e4m3> ||
+                  std::is_same_v<MmaT, __nv_fp8_e5m2>);
+    using MmaOp = std::conditional_t<
+        kMxCell, astrai::MxMmaOp<MmaT>,
+        astrai::MmaOp<MmaT, MmaT, typename astrai::MmaShapeFor<MmaT>::type>>;
     using AccT = typename MmaOp::AccT;
     using ElemTraitsA = gemm_elem_traits<ElemA_>;
     using ElemTraitsB = gemm_elem_traits<ElemB_>;
@@ -141,14 +150,40 @@ using TileBig128x128s3 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3, f
 using TileBigFastS3 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3, true>;
 using TileNarrow128x64s3 = GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 3, true>;
 
+// CTA class of a tile config, derived from its CTA geometry — the dispatch
+// key the launch ladders select on (GemmPlan::Cta in gemm.cuh is this enum).
+enum class TileClass { kSmall64, kNarrow128x64, kBig128 };
+
+template <typename Tile>
+constexpr TileClass tile_class() {
+    if constexpr (Tile::CtaShape::kM == 128 && Tile::CtaShape::kN == 128)
+        return TileClass::kBig128;
+    else if constexpr (Tile::CtaShape::kM == 128 && Tile::CtaShape::kN == 64)
+        return TileClass::kNarrow128x64;
+    else
+        return TileClass::kSmall64;
+}
+
+// The dispatch manifest (CUTLASS builder-table style): every tuned recipe
+// the launch ladders in gemm.cuh select over. The ladders index this list
+// by the plan's CTA class and depth bit — extending them is one alias here
+// plus one planner branch, never a re-spelled per-site ladder. The big
+// entries carry the fast variant; the cp.async ladder downgrades to the
+// non-fast twin for crosswise staging at its resolver.
+using TileManifest = std::tuple<
+    TileBigFast, TileBigFastS3,
+    TileNarrow128x64, TileNarrow128x64s3,
+    TileSmall64s2, TileSmall64s3>;
+
 template <typename ElemA_, typename ElemB_, typename LayoutA_, typename LayoutB_,
           typename Tile_, typename LayoutOut_ = RowMajor,
           typename OutT_ = __nv_bfloat16, bool StreamOut_ = false,
-          bool UseTma_ = false>
+          bool UseTma_ = false, bool UseMxMma_ = false>
 struct GemmPolicy {
     using Tile = Tile_;
     using Traits = GemmTraits<ElemA_, ElemB_, typename Tile_::CtaShape,
-                              typename Tile_::WarpShape, Tile_::kStages>;
+                              typename Tile_::WarpShape, Tile_::kStages,
+                              UseMxMma_>;
     using LayoutTagA = LayoutA_;
     using LayoutTagB = LayoutB_;
     // Output orientation (CUTLASS LayoutC): direction lives in the type,

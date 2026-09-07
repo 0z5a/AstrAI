@@ -7,16 +7,19 @@
 // (docs/developer/cuda_kernels.md).
 
 #include <algorithm>
+#include <atomic>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <tuple>
 #include <type_traits>
 
 #include "common/pipeline.cuh"
 #include "common/device.cuh"
 #include "common/launch.cuh"
+#include "common/reduce.cuh"
 #include "epilogue.cuh"
 #include "quantize/common.h"
 #include "gemm/common.h"
@@ -30,10 +33,10 @@ namespace gemm {
 
 using quant::FP8Format;
 
+// The ONE quantized-GEMM orchestrator (cp.async staging).
 template <typename Policy>
 __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     gemm_kernel(GemmParams p) {
-    using Traits = typename Policy::Traits;
     using Mainloop = GemmCollectiveMainloop<Policy>;
     using Epilogue = GemmCollectiveEpilogue<Policy>;
     // Stages live in dynamic shared memory so deep pipelines (> 48KB
@@ -71,6 +74,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     astrai::PipelineSync<Mainloop::kStages>{}.drain();
     Epilogue(gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
 }
+
 
 // TMA orchestrator (sm_90+, dual-congruous staging): identical rings,
 // layouts and epilogue; the staging discipline changes — one elected
@@ -159,6 +163,34 @@ inline bool gemm_prefer_s3() {
     return on;
 }
 
+// ASTR_GEMM_NO_MX=1 keeps symmetric fp8 on the plain cell — the A/B knob
+// for the sm_120 block_scale cell (MxMmaOp; env read once per process).
+inline bool gemm_mx_disabled() {
+    static const bool off = std::getenv("ASTR_GEMM_NO_MX") != nullptr;
+    return off;
+}
+
+// Grid for one Policy's tile: N x M block count, batch on z.
+template <typename Traits>
+dim3 gemm_grid(const GemmParams& p) {
+    return dim3((p.n + Traits::kBlockN - 1) / Traits::kBlockN,
+                (p.m + Traits::kBlockM - 1) / Traits::kBlockM, p.batch);
+}
+
+// One read-only plan-log line per launch (ASTR_GEMM_PLAN=1; " mx" marks the
+// block_scale cell).
+inline void log_gemm_plan(const GemmParams& p, const dim3& grid, int bm,
+                          int bn, int stages, int smem, bool tma,
+                          bool mx = false) {
+    if (!gemm_plan_log()) return;
+    std::fprintf(stderr,
+                 "[gemm-plan] %lldx%lldx%lld b=%d -> tile %dx%d s%d%s%s "
+                 "grid %dx%dx%d raster %d smem %d\n",
+                 (long long)p.m, (long long)p.n, (long long)p.k, p.batch, bm,
+                 bn, stages, tma ? " tma" : "", mx ? " mx" : "", grid.x,
+                 grid.y, grid.z, p.raster, smem);
+}
+
 // Launch one kernel instantiation with its shared-memory budget: budgets
 // beyond the 48KB static limit opt in once per instantiation via
 // cudaFuncSetAttribute. Templated on the kernel *value* (auto NTTP) so
@@ -197,7 +229,8 @@ inline bool small_cta_padding(int64_t m, int64_t n) {
 // heuristic (plan_raster); a manual p.raster=0 keeps plain raster
 // reachable for experiments.
 struct GemmPlan {
-    enum class Cta { kSmall64, kNarrow128x64, kBig128 };
+    // The CTA class is the tile manifest's dispatch key (policy.cuh).
+    using Cta = TileClass;
     Cta cta;
     // Ring depth (kStages) this launch runs. The manifest default is 2;
     // the planner raises it to 3 where the dtype pair's thinner operands
@@ -249,7 +282,8 @@ constexpr double kPlanEff[4][2] = {  // [class]{narrow, small}
     {0.76, 0.58},  // W16A16: bf16 x bf16 — fat operands lose most to finer tiles
     {0.92, 0.77},  // W8A16: 2B x 1B mixed (incl. bf16 x fp8), bf16 mma via dequant
     {0.82, 0.92},  // W8A8: int8 x int8 — dequant mma runs issue-bound, small holds
-    {0.85, 0.56},  // F8A8: native fp8 k32 mma — small starves the issue slots
+    {0.82, 0.52},  // F8A8: fp8 via the sm_120 block_scale cell — finer tiles
+                   // staging-bound at the doubled mma rate
 };
 
 // Compile-time dtype-class derivation from the operand pair (the mma
@@ -386,21 +420,14 @@ inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
     return plan_congruous(p, dev, ba, bb, perf);
 }
 
-// Grid + launch for one concrete Policy — the only place a GEMM kernel goes
-// to the wire.
+// Grid + launch for one concrete Policy — the only place a GEMM kernel
+// goes to the wire.
 template <typename Policy>
-void launch_policy(const GemmParams& p, cudaStream_t stream) {
+void launch_policy(GemmParams p, cudaStream_t stream) {
     using Traits = typename Policy::Traits;
-    dim3 grid((p.n + Traits::kBlockN - 1) / Traits::kBlockN,
-              (p.m + Traits::kBlockM - 1) / Traits::kBlockM, p.batch);
-    if (gemm_plan_log()) {
-        std::fprintf(stderr,
-                     "[gemm-plan] %lldx%lldx%lld b=%d -> tile %dx%d s%d "
-                     "grid %dx%dx%d raster %d smem %d\n",
-                     (long long)p.m, (long long)p.n, (long long)p.k, p.batch,
-                     Traits::kBlockM, Traits::kBlockN, Traits::kStages,
-                     grid.x, grid.y, grid.z, p.raster, Policy::kSmemBytes);
-    }
+    dim3 grid = gemm_grid<Traits>(p);
+    log_gemm_plan(p, grid, Traits::kBlockM, Traits::kBlockN, Traits::kStages,
+                  Policy::kSmemBytes, /*tma=*/false, Traits::kMxCell);
     launch_with_smem<gemm_kernel<Policy>>(
         Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p);
 }
@@ -457,99 +484,109 @@ bool launch_policy_tma(const GemmParams& p, cudaStream_t stream) {
     if (Policy::kSmemBytes > astrai::device_facts().smem_max) return false;
     const CUtensorMap *ma = nullptr, *mb = nullptr;
     if (!tma_maps_for<Policy>(p, &ma, &mb)) return false;
-    dim3 grid((p.n + Traits::kBlockN - 1) / Traits::kBlockN,
-              (p.m + Traits::kBlockM - 1) / Traits::kBlockM, p.batch);
-    if (gemm_plan_log()) {
-        std::fprintf(stderr,
-                     "[gemm-plan] %lldx%lldx%lld b=%d -> tile %dx%d s%d tma "
-                     "grid %dx%dx%d raster %d smem %d\n",
-                     (long long)p.m, (long long)p.n, (long long)p.k, p.batch,
-                     Traits::kBlockM, Traits::kBlockN, Traits::kStages,
-                     grid.x, grid.y, grid.z, p.raster, Policy::kSmemBytes);
-    }
+    dim3 grid = gemm_grid<Traits>(p);
+    log_gemm_plan(p, grid, Traits::kBlockM, Traits::kBlockN, Traits::kStages,
+                  Policy::kSmemBytes, /*tma=*/true, Traits::kMxCell);
     // Rank bits pick the kernel instantiation: a strided batch rides the
     // 3D emitters, a broadcast operand keeps its shared 2D map — the
-    // per-stage 2D/3D issue branch compiles away either way.
-    if (p.batch > 1 && p.a_batch_stride > 0 && p.b_batch_stride > 0) {
-        launch_with_smem<gemm_kernel_tma<Policy, true, true>>(
+    // per-stage 2D/3D issue pick compiles away either way.
+    auto launch_rank = [&](auto rank3a, auto rank3b) {
+        launch_with_smem<gemm_kernel_tma<Policy, decltype(rank3a)::value,
+                                         decltype(rank3b)::value>>(
             Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
             *ma, *mb);
-    } else if (p.batch > 1 && p.a_batch_stride > 0) {
-        launch_with_smem<gemm_kernel_tma<Policy, true, false>>(
-            Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
-            *ma, *mb);
-    } else if (p.batch > 1 && p.b_batch_stride > 0) {
-        launch_with_smem<gemm_kernel_tma<Policy, false, true>>(
-            Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
-            *ma, *mb);
-    } else {
-        launch_with_smem<gemm_kernel_tma<Policy, false, false>>(
-            Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
-            *ma, *mb);
-    }
+    };
+    if (p.batch > 1 && p.a_batch_stride > 0 && p.b_batch_stride > 0)
+        launch_rank(std::true_type{}, std::true_type{});
+    else if (p.batch > 1 && p.a_batch_stride > 0)
+        launch_rank(std::true_type{}, std::false_type{});
+    else if (p.batch > 1 && p.b_batch_stride > 0)
+        launch_rank(std::false_type{}, std::true_type{});
+    else
+        launch_rank(std::false_type{}, std::false_type{});
     return true;
 }
 
-// TMA twin of launch_plan's tile dispatch. The caller's gate already
-// guarantees dual-congruous 1-/2-byte operands, so the layout tags
-// collapse to the NT pair. False (nothing launched) propagates the
-// fallback: either the device pre-dates sm_90 or a descriptor could not
-// be encoded (misaligned operand).
-template <typename ElemA, typename ElemB, typename LayoutOut, typename OutT>
-bool launch_tma_dispatch(const GemmParams& p, const GemmPlan& plan,
-                         cudaStream_t stream) {
-    // The ladder: the plan's CTA class picks a geometry, its depth bit
-    // the stage twin. The big row swaps to its narrow twin when the output
-    // tile cannot reclaim the big rings — std::conditional_t keeps every
-    // alias instantiable, which the kernel's reclaim static_assert
-    // requires (an if-constexpr branch still NAMES its dead types).
-    using TmaNarrow =
-        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileNarrow128x64,
-                   LayoutOut, OutT, false, true>;
-    using TmaNarrowS3 =
-        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileNarrow128x64s3,
-                   LayoutOut, OutT, false, true>;
-    using TmaBig = std::conditional_t<
-        big_reclaim_fits<ElemA, ElemB, OutT>(),
-        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileBigFast, LayoutOut,
-                   OutT, false, true>,
-        TmaNarrow>;
-    using TmaBigS3 = std::conditional_t<
-        big_reclaim_fits<ElemA, ElemB, OutT>(),
-        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileBigFastS3, LayoutOut,
-                   OutT, false, true>,
-        TmaNarrowS3>;
-    using TmaSmallS2 =
-        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileSmall64s2, LayoutOut,
-                   OutT, false, true>;
-    using TmaSmallS3 =
-        GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileSmall64s3, LayoutOut,
-                   OutT, false, true>;
-    switch (plan.cta) {
-    case GemmPlan::Cta::kBig128:
-        return plan.stages >= 3 ? launch_policy_tma<TmaBigS3>(p, stream)
-                                : launch_policy_tma<TmaBig>(p, stream);
-    case GemmPlan::Cta::kNarrow128x64:
-        return plan.stages >= 3 ? launch_policy_tma<TmaNarrowS3>(p, stream)
-                                : launch_policy_tma<TmaNarrow>(p, stream);
-    case GemmPlan::Cta::kSmall64:
-        return plan.stages >= 3 ? launch_policy_tma<TmaSmallS3>(p, stream)
-                                : launch_policy_tma<TmaSmallS2>(p, stream);
-    }
-    return false;
+// Manifest dispatch (CUTLASS builder-table style): the plan's (CTA class,
+// depth bit) selects exactly one TileManifest entry — the || short-circuits
+// — and the resolver maps its tile onto a concrete Policy and launches.
+template <typename Manifest, typename Resolver>
+bool dispatch_tile(const GemmPlan& plan, const Resolver& resolve) {
+    return std::apply(
+        [&plan, &resolve](auto... tiles) {
+            return (... || (tile_class<decltype(tiles)>() == plan.cta &&
+                            (decltype(tiles)::kStages >= 3) ==
+                                (plan.stages >= 3) &&
+                            resolve.template run<decltype(tiles)>()));
+        },
+        Manifest{});
 }
 
-// Plan -> Policy: compose the operand facts with one named tile config
-// from the manifest in policy.cuh. The big CTA's fast loop exists only for
-// dual-congruous staging (both operands cp.async); crosswise operands take
-// the predicated generic loop. plan.stages >= 3 selects the deep-ring
-// sibling of the same geometry (the planner only raises it where the
-// operand pair's ring fits the smem opt-in ceiling). Takes the params by
-// value: the plan's raster decision lands in the copy the kernel receives
-// (callers keep theirs).
+// TMA ladder resolver. The gate in launch_plan already guarantees
+// dual-congruous 1-/2-byte operands, so the fast tile stays; only the
+// output-reclaim fallback swaps big -> narrow. std::conditional_t keeps
+// every alias instantiable, which the kernel's reclaim static_assert
+// requires (an if-constexpr branch still NAMES its dead types).
+template <typename ElemA, typename ElemB, typename LayoutOut, typename OutT,
+          bool kBigReclaim, bool UseMx = false>
+struct TmaLauncher {
+    const GemmParams& p;
+    cudaStream_t stream;
+    template <typename Tile>
+    bool run() const {
+        using TileT = std::conditional_t<
+            tile_class<Tile>() != TileClass::kBig128, Tile,
+            std::conditional_t<
+                kBigReclaim, Tile,
+                std::conditional_t<(Tile::kStages >= 3), TileNarrow128x64s3,
+                                   TileNarrow128x64>>>;
+        return launch_policy_tma<
+            GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileT, LayoutOut,
+                       OutT, false, true, UseMx>>(p, stream);
+    }
+};
+
+// cp.async ladder resolver. Two big-CTA substitutions: the fast loop exists
+// only for dual-congruous staging (crosswise operands take the predicated
+// generic loop — the NonFast twin), and a fat output (fp32, 4B) that cannot
+// reclaim the big rings routes to the narrow CTA — same math at lower
+// reuse. Narrow and small entries pass through.
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
-          typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16>
-void launch_plan(GemmParams p, const GemmPlan& plan, cudaStream_t stream) {
+          typename LayoutOut, typename OutT, bool kBigFast, bool kBigReclaim,
+          bool UseMx = false>
+struct CpAsyncLauncher {
+    GemmParams p;
+    cudaStream_t stream;
+    template <typename Tile>
+    bool run() const {
+        using NonFast = GemmTileConfig<typename Tile::CtaShape,
+                                       typename Tile::WarpShape, Tile::kStages,
+                                       false>;
+        using TileT = std::conditional_t<
+            tile_class<Tile>() != TileClass::kBig128, Tile,
+            std::conditional_t<
+                kBigReclaim, std::conditional_t<kBigFast, Tile, NonFast>,
+                std::conditional_t<(Tile::kStages >= 3), TileNarrow128x64s3,
+                                   TileNarrow128x64>>>;
+        launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT,
+                                 LayoutOut, OutT, false, false, UseMx>>(
+            p, stream);
+        return true;
+    }
+};
+
+// Plan -> Policy: compose the operand facts with one manifest tile
+// (dispatch_tile); CpAsyncLauncher applies this ladder's substitutions.
+// plan.stages >= 3 selects the deep-ring sibling of the same geometry (the
+// planner only raises it where the operand pair's ring fits the smem
+// opt-in ceiling). Takes the params by value: the plan's raster decision
+// lands in the copy the kernel receives (callers keep theirs). UseMx threads
+// the block_scale cell through both ladders (launch_plan routes it).
+template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
+          typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16,
+          bool UseMx = false>
+void launch_plan_impl(GemmParams p, const GemmPlan& plan,
+                      cudaStream_t stream) {
     p.raster = plan.raster;
     constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
                               !std::is_same_v<LayoutB, RowMajor>;
@@ -558,50 +595,43 @@ void launch_plan(GemmParams p, const GemmPlan& plan, cudaStream_t stream) {
     // kill switch, and every descriptor encodable — else the cp.async
     // twin below runs unchanged.
     if constexpr (kBigFast && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
+        constexpr bool kTmaReclaim = big_reclaim_fits<ElemA, ElemB, OutT>();
         if (!gemm_tma_disabled() && astrai::device_facts().cc >= 90 &&
-            launch_tma_dispatch<ElemA, ElemB, LayoutOut, OutT>(p, plan, stream))
+            dispatch_tile<TileManifest>(
+                plan, TmaLauncher<ElemA, ElemB, LayoutOut, OutT, kTmaReclaim,
+                                  UseMx>{p, stream}))
             return;
     }
-    using BigTile = std::conditional_t<kBigFast, TileBigFast, TileBig128x128>;
-    using BigTileS3 = std::conditional_t<kBigFast, TileBigFastS3, TileBig128x128s3>;
-    // The epilogue reclaims the operand rings for the output tile; a fat
-    // output (fp32, 4B/elem) cannot fit the 128x128 tile inside the fp8
-    // rings (64KB > 48KB) — compile-time route those to the narrow CTA
-    // (32KB tile <= 36KB rings), same math at lower reuse.
     constexpr bool kBigReclaim = big_reclaim_fits<ElemA, ElemB, OutT>();
-    using BigOrNarrow =
-        std::conditional_t<kBigReclaim, BigTile, TileNarrow128x64>;
-    using BigOrNarrowS3 =
-        std::conditional_t<kBigReclaim, BigTileS3, TileNarrow128x64s3>;
-    switch (plan.cta) {
-    case GemmPlan::Cta::kBig128:
-        if (plan.stages >= 3) {
-            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, BigOrNarrowS3,
-                                     LayoutOut, OutT>>(p, stream);
-        } else {
-            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, BigOrNarrow,
-                                     LayoutOut, OutT>>(p, stream);
+    dispatch_tile<TileManifest>(
+        plan, CpAsyncLauncher<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
+                              kBigFast, kBigReclaim, UseMx>{p, stream});
+}
+
+// The planner entry: symmetric fp8 rides the sm_120 block_scale cell unless
+// ASTR_GEMM_NO_MX knocks it out.
+template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
+          typename LayoutOut = RowMajor, typename OutT = __nv_bfloat16>
+void launch_plan(GemmParams p, const GemmPlan& plan, cudaStream_t stream) {
+    constexpr bool kMxCell =
+        (std::is_same_v<ElemA, __nv_fp8_e4m3> &&
+         std::is_same_v<ElemB, __nv_fp8_e4m3>) ||
+        (std::is_same_v<ElemA, __nv_fp8_e5m2> &&
+         std::is_same_v<ElemB, __nv_fp8_e5m2>);
+    if constexpr (kMxCell) {
+        // cc is the CC-tens runtime form (120 = CC 12.0 — the convention
+        // table lives at csrc/CMakeLists.txt's arch-level comment). This
+        // gate is one half of a contract: the CMake side emits the
+        // sm_120a SASS slice exactly when "120" is in the arch list, so
+        // the route fires only where that image exists.
+        if (!gemm_mx_disabled() && astrai::device_facts().cc == 120) {
+            launch_plan_impl<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
+                             true>(p, plan, stream);
+            return;
         }
-        break;
-    case GemmPlan::Cta::kNarrow128x64:
-        if (plan.stages >= 3) {
-            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
-                                     TileNarrow128x64s3, LayoutOut, OutT>>(p, stream);
-        } else {
-            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
-                                     TileNarrow128x64, LayoutOut, OutT>>(p, stream);
-        }
-        break;
-    case GemmPlan::Cta::kSmall64:
-        if (plan.stages >= 3) {
-            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
-                                     TileSmall64s3, LayoutOut, OutT>>(p, stream);
-        } else {
-            launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB,
-                                     TileSmall64s2, LayoutOut, OutT>>(p, stream);
-        }
-        break;
     }
+    launch_plan_impl<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT>(
+        p, plan, stream);
 }
 
 // Pure problem rewrite: the dual-N-contiguous problem (trans_a/trans_b both
@@ -668,6 +698,7 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
             launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(p, plan, stream);
         }
     } else if (trans_b) {
+        // NT (the fused-linear shape).
         launch_plan<ElemA, ElemB, RowMajor, ColMajor, RowMajor, OutT>(p, plan, stream);
     } else if (trans_a) {
         launch_plan<ElemA, ElemB, ColMajor, RowMajor, RowMajor, OutT>(p, plan, stream);

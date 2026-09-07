@@ -53,12 +53,12 @@ layered directory:
 | `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 32×32-tile transpose kernel (out_layout 0/1/2), `quant_in_traits<InT>` unpack — no torch |
 | `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK — adding a dtype = one specialization), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
-| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBig128x128` / `TileBigFast` / `TileNarrow128x64` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter); `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
+| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBig128x128` / `TileBigFast` / `TileNarrow128x64` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key and `TileManifest` type list the launch ladders index; `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
 | `gemm/load.cuh` | operand loaders: typed staged tiles (`SmemTile<StagedLayout>`, `common/tensor.cuh`) over the tile's declared layout (`common/swizzle.cuh`), congruous cp.async staging (predicated via runtime src-size zfill + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
 | `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16 smem scatter + coalesced copy-out |
-| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_congruous` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
+| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_congruous` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
 | `quantize/quantize.cu` | binding only: entry checks (`checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
@@ -208,6 +208,34 @@ scan keeps s2 on ties; `ASTR_GEMM_S3=1` flips the preference — the
 calibration knob for staging variants whose latency profile differs
 (the TMA rings in particular).
 
+**MMA cell (sm_120a block_scale).** The plain warp-level fp8 mma
+(`m16n8k32.e4m3/e5m2`) decodes at HALF rate on sm_120 — measured pure issue
+rate 506 TFLOPS vs 1011 for the shape- and width-identical s8 instruction
+(RTX 5090). The `kind::mxf8f6f4` block_scale variant
+(`mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X…ue8m0`,
+humming's MXMMA route) runs at the full 1007 TFLOPS with an IDENTICAL
+A/B/C/D register contract, so the mainloop/staging/epilogue layers are
+untouched: `MxMmaOp` (common/mma.cuh) swaps only the cell, carrying a
+constant unit scale (every ue8m0 scale byte 0x7f = 2^0, selectors inert —
+the scale-factored product IS the plain product; fp8_test output stays
+byte-identical). Warp-level block_scale is an sm_120-FAMILY instruction
+(CUDA 13.0 ptxas: 120a/121a/120f accepted, 100a/103a/110a rejected —
+datacenter Blackwell does MX through tcgen05, which needs 13.1+), so the
+cell gates on the family pass (`ASTRAI_ARCH_FAMILY >= 1200`,
+common/mma.cuh's value-macro twin of `ASTRAI_DEVICE_ARCH`) and the gemm
+fatbin carries a sm_120a image next to the plain ones (CMake appends the
+`-gencode` — the 3.22 `CUDA_ARCHITECTURES` grammar rejects the `a` suffix)
+which the driver picks on sm_120; every other pass/device falls back to the
+plain cell inside the same tree, so routing can only trade speed, never
+correctness.
+`launch_plan` routes the symmetric-fp8 pair through the mx tree on sm_120
+unless `ASTR_GEMM_NO_MX=1` knocks it out (the A/B knob; the env is read
+once per process — separate processes to compare). End to end the fp8
+pair's benchmark geomean went 356 → 508 TFLOPS (+43%, peak 619; non-fp8
+classes unchanged — their kernels are SASS-identical in both images). The
+`kPlanEff` F8A8 row re-derived to {0.82, 0.52} (was 0.85/0.56): the
+doubled mma rate leaves the finer tiles staging-bound.
+
 **Crosswise loads.** Crosswise operands (A `[K][M]` / B `[N][K]` storage)
 cannot cp.async into the canonical tile; they take the direct LDG.128×4 +
 in-register PRMT transpose + STS.32 path. A staged variant (cp.async into
@@ -228,11 +256,13 @@ shared vocabulary type of `common/swizzle.cuh`: the same `Shape<...>`
 spells both the CTA tile here and the staging layouts' chunk grids, so
 tile geometry and smem layout read in one notation. The production
 manifest in `policy.cuh` (`TileBig128x128`, `TileBigFast`,
-`TileNarrow128x64`, `TileSmall64s2/s3`) is the full set `launch_plan`
-dispatches to; a new geometry in the ladder is one alias plus one planner
-branch, never a re-spelled int list. Device collectives only read the
-derived `Traits::kBlockM/kBlockN/...` constants, so this is purely a
-configuration surface — the generated SASS is unchanged.
+`TileNarrow128x64`, `TileSmall64s2/s3`) is the `TileManifest` type list
+the launch ladders dispatch over (CUTLASS builder-table style: `dispatch_tile`
+in `gemm.cuh` indexes the manifest by the plan's `TileClass` and depth bit,
+both ladder-agnostic); a new geometry is one alias plus one manifest entry
+and one planner branch, never a re-spelled per-site ladder. Device
+collectives only read the derived `Traits::kBlockM/kBlockN/...` constants,
+so this is purely a configuration surface — the generated SASS is unchanged.
 
 **Launch planning** (humming-style, device-parameterized): the congruous
 (NT) band picks its recipe by a wave-count cost model over the manifest —

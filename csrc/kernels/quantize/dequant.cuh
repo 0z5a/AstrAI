@@ -84,12 +84,15 @@ struct DequantPair<int8_t, __nv_bfloat16> {
 };
 
 // fp8 widen via the hardware converter (exact incl. subnormals, +-0, NaN;
-// see the header comment). One cvt + one f32 round-trip per pair.
-template <>
-struct DequantPair<__nv_fp8_e4m3, __nv_bfloat16> {
+// see the header comment). One cvt + one f32 round-trip per pair; the two
+// formats share the body — only the converter's interpretation constant
+// differs. The per-format specializations below stay explicit, so an
+// unsupported (SrcT, MmaT) pair still fails to compile.
+template <__nv_fp8_interpretation_t Fmt>
+struct Fp8WidenPair {
     static __device__ __forceinline__ unsigned pair(unsigned short v) {
         const __half2_raw h2 =
-            __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)v, __NV_E4M3);
+            __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)v, Fmt);
         const float2 f =
             __half22float2(*reinterpret_cast<const __half2*>(&h2));
         const __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
@@ -98,16 +101,9 @@ struct DequantPair<__nv_fp8_e4m3, __nv_bfloat16> {
 };
 
 template <>
-struct DequantPair<__nv_fp8_e5m2, __nv_bfloat16> {
-    static __device__ __forceinline__ unsigned pair(unsigned short v) {
-        const __half2_raw h2 =
-            __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)v, __NV_E5M2);
-        const float2 f =
-            __half22float2(*reinterpret_cast<const __half2*>(&h2));
-        const __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
-        return *reinterpret_cast<const unsigned*>(&b);
-    }
-};
+struct DequantPair<__nv_fp8_e4m3, __nv_bfloat16> : Fp8WidenPair<__NV_E4M3> {};
+template <>
+struct DequantPair<__nv_fp8_e5m2, __nv_bfloat16> : Fp8WidenPair<__NV_E5M2> {};
 
 }  // namespace quant
 }  // namespace astrai

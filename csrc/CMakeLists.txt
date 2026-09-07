@@ -22,7 +22,9 @@ if(NOT DEFINED ASTRAI_CUDA_ARCH)
     if(DEFINED ENV{ASTRAI_CUDA_ARCH})
         set(ASTRAI_CUDA_ARCH "$ENV{ASTRAI_CUDA_ARCH}")
     else()
-        set(ASTRAI_CUDA_ARCH 80)
+        # Mixed-fleet default, matching setup.py: native SASS for every
+        # supported generation; interim GPUs JIT the nearest compute_* PTX.
+        set(ASTRAI_CUDA_ARCH "80;89;120")
     endif()
 endif()
 
@@ -30,6 +32,15 @@ endif()
 # every listed arch lands in the fatbin, so one .so serves a mixed fleet —
 # the driver picks the SASS slice per device. Validation and the FP8 gate
 # below run on the list's maximum.
+#
+# Arch-level conventions, one per layer (keep them in lockstep):
+#   build (this file / setup.py env): CC tens        "120"  = CC 12.0
+#   device compile (mma.cuh): __CUDA_ARCH__ hundreds  1200  (kMinArch compares
+#     against ASTRAI_DEVICE_ARCH, the raw __CUDA_ARCH__)
+#   runtime (device_facts().cc): CC tens again        120   (gemm.cuh's
+#     route gates — cc >= 90 TMA, cc == 120 the sm_120a mx cell)
+# The sm_120a image below is emitted exactly when "120" is listed, and the
+# runtime mx route keys on cc == 120: the two conditions are one contract.
 separate_arguments(ASTRAI_CUDA_ARCH_LIST NATIVE_COMMAND "${ASTRAI_CUDA_ARCH}")
 list(TRANSFORM ASTRAI_CUDA_ARCH_LIST STRIP)
 list(REMOVE_DUPLICATES ASTRAI_CUDA_ARCH_LIST)
@@ -59,7 +70,11 @@ set(TORCH_LIBS
     "${TORCH_LIB_DIR}/libc10.so"
     CUDA::cudart)
 
-set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}")
+# One authoritative arch knob: force the cache entry too, so a stale
+# toolkit-default value (e.g. 75, seeded by project() before the env is
+# parsed) never lingers in CMakeCache.txt next to the effective list.
+set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
+    CACHE STRING "CUDA architectures (derived from ASTRAI_CUDA_ARCH)" FORCE)
 
 # Kernel registry — parallel lists of module names (.so / pybind names,
 # globally unique across families) and their per-family source paths under
@@ -105,6 +120,24 @@ foreach(i RANGE ${_kernel_last})
 
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
 
+    # Per-family arch lists: the fp8 mma cells static_assert below sm_89
+    # (MmaOp's kMinArch = 890), so the fp8 modules compile only the 89+
+    # subset of the requested arches — a compute_80 device pass would trip
+    # the assert at template instantiation. Every other family carries the
+    # full list (its oldest cell is sm_80). The 120a image below keys on
+    # the shared list, so it rides along whenever 120 is requested.
+    set(_target_arches "${ASTRAI_CUDA_ARCH_LIST}")
+    if(name STREQUAL "gemm" OR name STREQUAL "quantize")
+        set(_target_arches "")
+        foreach(a IN LISTS ASTRAI_CUDA_ARCH_LIST)
+            if(a GREATER_EQUAL 89)
+                list(APPEND _target_arches "${a}")
+            endif()
+        endforeach()
+    endif()
+    set_target_properties(${name} PROPERTIES
+        CUDA_ARCHITECTURES "${_target_arches}")
+
     target_include_directories(${name} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/kernels"
         "${TORCH_HOME}/include"
@@ -122,4 +155,12 @@ foreach(i RANGE ${_kernel_last})
         PREFIX ""
         SUFFIX ".${PY_SOABI}.so"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../astrai/extension/lib")
+
+    # Extra sm_120a image for gemm when 120 is built: the arch-specific pass
+    # that activates the block_scale cell (MxMmaOp; CMake <3.24 rejects the
+    # 'a' suffix in CUDA_ARCHITECTURES, hence the raw -gencode).
+    if(name STREQUAL "gemm" AND "120" IN_LIST ASTRAI_CUDA_ARCH_LIST)
+        target_compile_options(${name} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>)
+    endif()
 endforeach()

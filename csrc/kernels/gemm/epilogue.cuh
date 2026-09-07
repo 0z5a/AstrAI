@@ -152,10 +152,10 @@ struct GemmCollectiveEpilogue {
                     const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
                     // Per-row activation scale: D-row == kernel row here.
                     const float rfac = a_scale && bias_row0 + r0 < m
-                            ? a_scale[bias_row0 + r0]
+                            ? __ldcg(a_scale + bias_row0 + r0)
                             : 1.0f;
                     const float rfac8 = a_scale && bias_row0 + r0 + 8 < m
-                        ? a_scale[bias_row0 + r0 + 8]
+                        ? __ldcg(a_scale + bias_row0 + r0 + 8)
                         : 1.0f;
                     const auto& cell = *acc(mt, nt);
                     // Two bf16x2 stores per accumulator tile: rows g and
@@ -200,10 +200,10 @@ struct GemmCollectiveEpilogue {
                         ? b_scale[grow8]
                         : 1.0f;
                     const float r0f = a_scale && bias_col0 + col < n
-                        ? a_scale[bias_col0 + col]
+                        ? __ldcg(a_scale + bias_col0 + col)
                         : 1.0f;
                     const float r1f = a_scale && bias_col0 + col + 1 < n
-                        ? a_scale[bias_col0 + col + 1]
+                        ? __ldcg(a_scale + bias_col0 + col + 1)
                         : 1.0f;
                     const auto& cell = *acc(mt, nt);
                     *out_elem(col, r0) = OE::cvt((float)cell[0] * output_scale * r0f * c + b);
