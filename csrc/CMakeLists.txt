@@ -77,47 +77,44 @@ set(TORCH_LIBS
 set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
     CACHE STRING "CUDA architectures (derived from ASTRAI_CUDA_ARCH)" FORCE)
 
-# Kernel registry — parallel lists of module names (.so / pybind names,
-# globally unique across families) and their per-family source paths under
-# kernels/. `loader.py` auto-discovers the .so files in astrai/extension/lib/,
-# so this CMake registry is the single place to register a new kernel.
+# Kernel registry — one module per entry: name (.so / pybind name, globally
+# unique across families), then its source paths under kernels/ (space-
+# separated: a module may span several TUs; gemm is split into per-dtype-pair
+# instantiation units, see gemm/gemm_cases.h, so the heavy template work
+# parallelizes). The '|' separator keeps the entry a single list element —
+# CMake lists cannot nest semicolons. `loader.py` auto-discovers the .so
+# files in astrai/extension/lib/, so this CMake registry is the single place
+# to register a new kernel.
 #
 # FP8 MMA instructions require sm_89+. Keep the target out of the build
 # unless at least one listed arch is 89+ instead of instantiating templates
 # that cannot compile. The remaining kernels are still useful on sm_80+
 # (including sm_86).
-set(KERNEL_NAMES
-    attn_decode
-    attn_prefill
-    attn_paged_decode
-    attn_paged_prefill
-    rotary_emb
-)
-set(KERNEL_SRCS
-    attention/decode.cu
-    attention/prefill.cu
-    attention/paged_decode.cu
-    attention/paged_prefill.cu
-    rotary_emb.cu
+set(KERNEL_MODULES
+    "attn_decode|attention/decode.cu"
+    "attn_prefill|attention/prefill.cu"
+    "attn_paged_decode|attention/paged_decode.cu"
+    "attn_paged_prefill|attention/paged_prefill.cu"
+    "rotary_emb|rotary_emb.cu"
 )
 
 if(ASTRAI_CUDA_ARCH_MAX GREATER_EQUAL 89)
-    list(APPEND KERNEL_NAMES quantize)
-    list(APPEND KERNEL_SRCS quantize/quantize.cu)
-    list(APPEND KERNEL_NAMES gemm)
-    list(APPEND KERNEL_SRCS gemm/gemm.cu)
+    list(APPEND KERNEL_MODULES
+        "quantize|quantize/quantize.cu"
+        "gemm|gemm/gemm.cu gemm/gemm_bf16_bf16.cu gemm/gemm_bf16_int8.cu gemm/gemm_bf16_fp8_e4m3.cu gemm/gemm_bf16_fp8_e5m2.cu gemm/gemm_int8_int8.cu gemm/gemm_fp8_e4m3_fp8_e4m3.cu gemm/gemm_fp8_e5m2_fp8_e5m2.cu")
 else()
     message(WARNING
         "FP8 operator disabled: max ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "
         "requires compute capability 89 or newer")
 endif()
 
-list(LENGTH KERNEL_NAMES _kernel_count)
-math(EXPR _kernel_last "${_kernel_count} - 1")
-foreach(i RANGE ${_kernel_last})
-    list(GET KERNEL_NAMES ${i} name)
-    list(GET KERNEL_SRCS ${i} src)
-    add_library(${name} MODULE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${src}")
+foreach(entry IN LISTS KERNEL_MODULES)
+    string(REPLACE "|" ";" _parts "${entry}")
+    list(GET _parts 0 name)
+    list(REMOVE_AT _parts 0)
+    string(REPLACE " " ";" _srcs "${_parts}")
+    list(TRANSFORM _srcs PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/kernels/")
+    add_library(${name} MODULE ${_srcs})
 
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
 

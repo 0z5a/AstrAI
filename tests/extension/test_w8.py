@@ -122,7 +122,9 @@ class TestQuantGemmValidation:
     def test_unsupported_dtype_pair_rejected(self):
         x = torch.randn(8, 8, device="cuda", dtype=torch.float16)
         w = torch.randn(8, 8, device="cuda", dtype=torch.float16)
-        with pytest.raises(RuntimeError, match="unsupported dtype pair"):
+        # The dispatch switch's default arm is the single validator; its
+        # message names the unsupported pair and the supported set.
+        with pytest.raises(RuntimeError, match="unsupported operand dtype pair"):
             quant_gemm(x, w)
 
     def test_int8_without_scale_rejected(self):

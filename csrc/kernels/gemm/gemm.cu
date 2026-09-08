@@ -1,9 +1,11 @@
 // GEMM family binding (module `gemm`): the single quantized-GEMM entry
 // ``quant_gemm`` — every dtype pairing (bf16 / int8 / fp8 operands, per-
 // operand scales) dispatches over the same dtype-generic kernel family.
-// This TU is also the single kernel-policy instantiation site — the
-// explicit instantiations below pin every production Policy to SASS
-// exactly once; the C tests instantiate straight from the headers instead.
+// The kernel-policy instantiation space is compiled one TU per dtype pair
+// (gemm_cases.h; one gemm_dispatch specialization per unit), so the heavy
+// template work runs as parallel nvcc jobs. This TU keeps only the
+// dtype-pair switch + pybind — the C tests instantiate straight from the
+// headers instead.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -12,7 +14,7 @@
 #include <torch/extension.h>
 
 #include "common/device.cuh"
-#include "gemm.cuh"
+#include "gemm_cases.h"
 #include "quantize/checks.h"
 #include "quantize/common.h"
 
@@ -22,32 +24,6 @@ using namespace astrai::quant;
 namespace astrai {
 namespace gemm {
 
-// Explicit instantiation of the production entry points: every kernel
-// Policy lands in SASS exactly once, here; the C tests instantiate from
-// the headers directly.
-template void gemm<FP8Format::E4M3>(GemmParams, cudaStream_t, bool, bool);
-template void gemm<FP8Format::E5M2>(GemmParams, cudaStream_t, bool, bool);
-// The quantized-GEMM dtype pairs, ordered by operand precision (activation
-// dtype first, then weight): W16A16 (bf16 passthrough), W8A16 (bf16 x int8),
-// the fp8-weight variants (bf16 x e4m3/e5m2, in-register hardware widen),
-// then W8A8 (int8 x int8, both sides dequantize in-register). The binding's
-// dispatch table instantiates each cell implicitly at its call site.
-template void gemm_dispatch<__nv_bfloat16, __nv_bfloat16>(GemmParams,
-                                                          cudaStream_t,
-                                                          bool,
-                                                          bool);
-template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>(GemmParams,
-                                                          cudaStream_t, 
-                                                          bool,
-                                                          bool);
-template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>(GemmParams,
-                                                          cudaStream_t, 
-                                                          bool,
-                                                          bool);
-template void gemm_dispatch<int8_t, int8_t>(GemmParams,
-                                            cudaStream_t,
-                                            bool,
-                                            bool);
 namespace {
 
 // Inner-layout resolution for one GEMM operand. The user flag names the
@@ -117,12 +93,15 @@ torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
 
 // The dtype-pair dispatch switch below replaces a hand-maintained if/else
 // chain: each supported (activation, weight) pair selects its
-// gemm_dispatch instantiation exactly once, and an unsupported pair raises
+// gemm_dispatch specialization exactly once, and an unsupported pair raises
 // with the actual operand dtypes in the message instead of a hardcoded
-// list that can drift out of sync. pack_dtypes is constexpr, so every
-// case label is a compile-time constant and the switch lowers to a jump
-// table — one indexed branch, no runtime-initialized state. The function
-// is not constexpr only because the default arm throws.
+// list that can drift out of sync. The pair callbacks are the externs from
+// gemm_cases.h (each defined in its own instantiation unit), so the switch
+// is nothing but a jump table over resolved function pointers — no template
+// instantiation happens in this TU. pack_dtypes is constexpr, so every
+// case label is a compile-time constant and the switch lowers to one
+// indexed branch, no runtime-initialized state. The function is not
+// constexpr only because the default arm throws.
 using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
 
 constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
@@ -130,37 +109,22 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
            static_cast<uint8_t>(b);
 }
 
-template <typename A, typename B>
-constexpr GemmDispatchFn make_gemm_dispatch_fn() {
-    return [](GemmParams p, cudaStream_t s, bool ta, bool tb) {
-        gemm_dispatch<A, B>(p, s, ta, tb);
-    };
-}
-
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
-    GemmDispatchFn fn = nullptr;
     switch (pack_dtypes(a, b)) {
         case pack_dtypes(torch::kBFloat16, torch::kBFloat16):
-            fn = make_gemm_dispatch_fn<__nv_bfloat16, __nv_bfloat16>();
-            break;
+            return gemm_bf16_bf16;
         case pack_dtypes(torch::kBFloat16, torch::kChar):
-            fn = make_gemm_dispatch_fn<__nv_bfloat16, int8_t>();
-            break;
+            return gemm_bf16_int8;
         case pack_dtypes(torch::kChar, torch::kChar):
-            fn = make_gemm_dispatch_fn<int8_t, int8_t>();
-            break;
+            return gemm_int8_int8;
         case pack_dtypes(torch::kBFloat16, torch::kFloat8_e4m3fn):
-            fn = make_gemm_dispatch_fn<__nv_bfloat16, __nv_fp8_e4m3>();
-            break;
+            return gemm_bf16_fp8_e4m3;
         case pack_dtypes(torch::kBFloat16, torch::kFloat8_e5m2):
-            fn = make_gemm_dispatch_fn<__nv_bfloat16, __nv_fp8_e5m2>();
-            break;
+            return gemm_bf16_fp8_e5m2;
         case pack_dtypes(torch::kFloat8_e4m3fn, torch::kFloat8_e4m3fn):
-            fn = make_gemm_dispatch_fn<__nv_fp8_e4m3, __nv_fp8_e4m3>();
-            break;
+            return gemm_fp8_e4m3_fp8_e4m3;
         case pack_dtypes(torch::kFloat8_e5m2, torch::kFloat8_e5m2):
-            fn = make_gemm_dispatch_fn<__nv_fp8_e5m2, __nv_fp8_e5m2>();
-            break;
+            return gemm_fp8_e5m2_fp8_e5m2;
         default:
             TORCH_CHECK(false,
                         "unsupported operand dtype pair ", toString(a), " x ", toString(b),
@@ -168,7 +132,6 @@ GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
                         "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or "
                         "matching fp8 x fp8");
     }
-    return fn;
 }
 
 }  // namespace
@@ -194,11 +157,9 @@ torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
     const bool f8a = dt_a == torch::kFloat8_e4m3fn || dt_a == torch::kFloat8_e5m2;
     const bool f8b = dt_b == torch::kFloat8_e4m3fn || dt_b == torch::kFloat8_e5m2;
     const bool b16a = dt_a == torch::kBFloat16, b16b = dt_b == torch::kBFloat16;
-    TORCH_CHECK((b16a && (b16b || i8b || f8b)) || (i8a && i8b) ||  (f8a && f8b && dt_a == dt_b),
-                "quant_gemm: unsupported dtype pair (a=", toString(dt_a),
-                ", b=", toString(dt_b),
-                "): expected bf16 x bf16/int8/fp8, int8 x int8, or matching "
-                "fp8 x fp8");
+    // The supported-pair set is validated once, by the dispatch switch's
+    // default arm (find_gemm_dispatch), with the operand dtypes in the
+    // message.
     if (f8a || f8b) {
         astrai::quant::check_fp8_device(a.device().index());
     }
