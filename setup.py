@@ -80,7 +80,10 @@ class _CMakeBuildExt(_build_ext):
         if cmake is None:
             raise RuntimeError("cmake not found on PATH; install it to build kernels")
 
-        parallel = os.environ.get("BUILD_PARALLEL", "4")
+        # Job-level parallelism: one nvcc job per compile unit x arch pass;
+        # each job already pools its own ptxas via --threads. Default fills
+        # the box (capped), BUILD_PARALLEL overrides.
+        parallel = os.environ.get("BUILD_PARALLEL", str(min(os.cpu_count() or 4, 32)))
         cfg = [
             cmake,
             "-S",
@@ -99,19 +102,13 @@ class _CMakeBuildExt(_build_ext):
                 # on the maximum, matching the CMake-side validation.
                 max_arch = max(int(a) for a in arch.split(";") if a.strip())
             else:
-                # Mixed-fleet default: native SASS for every generation the
-                # kernel family supports (80 bf16/int8 baseline, 89 fp8,
-                # 120 Blackwell + its 120a slice); interim GPUs JIT the
-                # nearest compute_* PTX at load. A local GPU newer than the
-                # newest listed arch joins the list natively.
-                arch = "80;89;120"
-                if (detected := _detect_cuda_arch()) and detected not in (
-                    "80",
-                    "89",
-                    "120",
-                ):
-                    arch = f"{arch};{detected}"
-                max_arch = max(int(a) for a in arch.split(";") if a.strip())
+                # Native default: the build follows the local GPU (dev
+                # iteration — one arch; gemm adds its 'a' slice). The
+                # mixed fleet is the explicit release opt-in
+                # (ASTRAI_CUDA_ARCH="80;89;120"), and the CMake-side
+                # default serves GPU-less builds.
+                arch = _detect_cuda_arch()
+                max_arch = int(arch) if arch else None
         except ValueError:
             warnings.warn(
                 f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "

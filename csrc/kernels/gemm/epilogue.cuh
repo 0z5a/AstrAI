@@ -241,7 +241,12 @@ struct GemmCollectiveEpilogue {
             auto* dst = out + row * row_stride + col;
             if (col + OE::kChunkElems <= row_stride &&
                 (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
-                if constexpr (kStreamOut) {
+                if constexpr (Policy::kStoreWriteThrough) {
+                    // Streaming write-through: the output is read-once (no
+                    // future reuse), so bypass the L2 write-back stage and
+                    // preserve L2 for the reused weight/activation tiles.
+                    __stwt(reinterpret_cast<uint4*>(dst), v);
+                } else if constexpr (kStreamOut) {
                     // Evict-first streaming store knob: neutral on L20
                     // squares, -3..4% on rects; kept for other SKUs.
                     __stcs(reinterpret_cast<uint4*>(dst), v);

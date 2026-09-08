@@ -304,16 +304,16 @@ load_crosswise_direct(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                 if constexpr (sizeof(ElemT) == 1) {
                     // v[s] = 16 rows at contract p0+s (run index i = s).
                     if (p0 + i < contract)
-                        v[i] = *reinterpret_cast<const uint4*>(
-                            operand + (p0 + i) * ld + r0);
+                        v[i] = __ldg(reinterpret_cast<const uint4*>(
+                            operand + (p0 + i) * ld + r0));
                     else
                         v[i] = make_uint4(0u, 0u, 0u, 0u);
                 } else {
                     // v[s][h] = 8 rows at contract p0+s (flat i = s*2+h).
                     const int s = i >> 1, h = i & 1;
                     if (p0 + s < contract)
-                        v[i] = *reinterpret_cast<const uint4*>(
-                            operand + (p0 + s) * ld + r0 + h * 8);
+                        v[i] = __ldg(reinterpret_cast<const uint4*>(
+                            operand + (p0 + s) * ld + r0 + h * 8));
                     else
                         v[i] = make_uint4(0u, 0u, 0u, 0u);
                 }

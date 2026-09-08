@@ -266,24 +266,22 @@ inline int plan_raster(const GemmParams& p, int bm, int bn, int ba, int bb,
 }
 
 // Per-SM throughput scalars of the non-big recipes relative to the big
-// CTA, one row per dtype class — RTX 5090-measured (saturation medians at
-// M >= 1024, via the direct-instantiation pattern of csrc/tests/quant_gemm_test.cu
-// — `launch_policy<GemmPolicy<..., TileXxx, ...>>`, no planner; the
-// 1B/1B int8 pair adjusted down from
-// its saturation medians (.95/1.0), which over-credit the finer tiles on
-// large-N mid-M grids — .92 keeps the measured small-CTA wins while
-// holding the big CTA on the largest-N band). They also absorb smem
+// CTA, one row per dtype class, segmented by the recipe's own wave count
+// ({1, 2, >=3}): one scalar spans the wave regimes badly — the finer
+// tiles ride even with big only once the grid saturates. RTX 5090-fitted
+// medians from an offline calibration sweep (every recipe timed through
+// the production launch route over a shape grid; the fit makes the cost
+// model below reproduce the measured time ratios — method in
+// docs/developer/cuda_kernels.md). They also absorb smem
 // residency (co-resident CTAs share SM throughput), which is why the cost
 // model carries no separate residency term. The scalars are the one
-// device-dependent constant set:
-// re-measure with that harness when porting.
+// device-dependent constant set: re-run the sweep+fit when porting.
 enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
-constexpr double kPlanEff[4][2] = {  // [class]{narrow, small}
-    {0.76, 0.58},  // W16A16: bf16 x bf16 — fat operands lose most to finer tiles
-    {0.92, 0.77},  // W8A16: 2B x 1B mixed (incl. bf16 x fp8), bf16 mma via dequant
-    {0.82, 0.92},  // W8A8: int8 x int8 — dequant mma runs issue-bound, small holds
-    {0.82, 0.52},  // F8A8: fp8 via the sm_120 block_scale cell — finer tiles
-                   // staging-bound at the doubled mma rate
+constexpr double kPlanEff[4][2][3] = {  // [class]{narrow, small}{waves 1,2,3+}
+    {{0.925, 0.957, 0.977}, {0.654, 0.710, 0.730}},  // W16A16: bf16 x bf16
+    {{0.869, 0.924, 0.924}, {0.590, 0.725, 0.755}},  // W8A16: 2B x 1B (incl. fp8)
+    {{0.642, 0.862, 0.759}, {0.334, 0.624, 0.582}},  // W8A8: int8 x int8
+    {{0.669, 0.813, 0.756}, {0.413, 0.614, 0.583}},  // F8A8: fp8 (mx cell on 120)
 };
 
 // Compile-time dtype-class derivation from the operand pair (the mma
@@ -306,10 +304,11 @@ constexpr GemmPerfClass gemm_perf_class() {
 }
 
 // Conguous (NT) path: a wave-count cost model over the manifest recipes
-// replaces the measured crossover ladder — bands are derived from device
-// arithmetic, so a new GPU needs no re-measured thresholds. A recipe's
-// cost is ceil(tiles / sms) quantized waves of bm * bn / eff SM-work
-// each, scaled by edge-tile padding waste. The scan runs big -> narrow ->
+// replaces the measured crossover ladder — wave bands come from device
+// arithmetic, the per-regime eff scalars from the calibration table
+// above. A recipe's cost is ceil(tiles / sms) quantized waves of
+// bm * bn / eff SM-work each, scaled by edge-tile padding waste. The
+// scan runs big -> narrow ->
 // small, s2 ring first (RTX 5090-measured: the s3 deep rings ride even to
 // -1.3% on cp.async staging — three buffers already hide the LDGSTS
 // latency, unlike humming's TMA rings that want the depth; the s3
@@ -335,7 +334,6 @@ inline GemmPlan plan_congruous(const GemmParams& p, const DeviceFacts& dev,
         {GemmPlan::Cta::kSmall64, 64, 64, 64, 2, 1},
         {GemmPlan::Cta::kSmall64, 64, 64, 64, 3, 1},
     };
-    const double* eff = kPlanEff[(int)perf];
     const Recipe* best = nullptr;
     double best_cost = 0.0;
     for (const Recipe& r : kRecipes) {
@@ -352,7 +350,9 @@ inline GemmPlan plan_congruous(const GemmParams& p, const DeviceFacts& dev,
             (double)(((p.m + r.bm - 1) / r.bm) * r.bm *
                      ((p.n + r.bn - 1) / r.bn) * r.bn) /
             (double)(p.m * p.n);
-        const double e = r.eff_idx < 0 ? 1.0 : eff[r.eff_idx];
+        const int regime = waves <= 1 ? 0 : (waves == 2 ? 1 : 2);
+        const double e =
+            r.eff_idx < 0 ? 1.0 : kPlanEff[(int)perf][r.eff_idx][regime];
         const double cost = (double)waves * r.bm * r.bn / e * waste;
         if (best == nullptr) {
             best = &r;

@@ -234,7 +234,8 @@ once per process — separate processes to compare). End to end the fp8
 pair's benchmark geomean went 356 → 508 TFLOPS (+43%, peak 619; non-fp8
 classes unchanged — their kernels are SASS-identical in both images). The
 `kPlanEff` F8A8 row re-derived to {0.82, 0.52} (was 0.85/0.56): the
-doubled mma rate leaves the finer tiles staging-bound.
+doubled mma rate leaves the finer tiles staging-bound; both values since
+superseded by the wave-regime recalibration (Launch planning, below).
 
 **Crosswise loads.** Crosswise operands (A `[K][M]` / B `[N][K]` storage)
 cannot cp.async into the canonical tile; they take the direct LDG.128×4 +
@@ -273,11 +274,12 @@ ceiling, `common/device.cuh`) rather than one GPU's calibration.
 Recipes over that smem ceiling are pruned before scoring (humming's
 candidate filter; every manifest recipe fits on the production archs —
 96KB max vs 99KB optin — so the gate only guards ports), and the small
-recipe's 3-stage variant requires the same headroom. `eff` is the per-SM throughput scalar of a
-recipe relative to the big CTA, one row per dtype class (`kPlanEff`;
-RTX 5090-measured — the fat bf16 pair loses most to finer tiles, the
-int8×int8 dequant path barely loses at all, fp8's k32 mma starves the
-small CTA) and also absorbs smem residency, which is why the model needs
+recipe's 3-stage variant requires the same headroom. `eff` is the per-SM
+throughput scalar of a recipe relative to the big CTA, one row per dtype
+class and one cell per wave regime of the recipe's own grid ({1, 2, ≥3}
+waves — `kPlanEff[4][2][3]`; a flat scalar spans the regimes badly: the
+finer tiles ride even with big only once the grid saturates). It also
+absorbs smem residency, which is why the model needs
 no separate residency term. The scan prefers the bigger tile and a
 challenger needs a >2% lead (hysteresis); the small recipe's ring depth
 follows its wave count (3-stage below ~2 waves — lighter smem keeps a
@@ -294,10 +296,20 @@ ticket) both measured worse on L20 (−4..−8%; the ticket variant recovers
 L2 locality but its loop-head barrier costs what the CTA-restart overlap
 saves).
 
-Calibration: an out-of-tree harness (the direct-instantiation pattern of
-`csrc/tests/quant_gemm_test.cu`: `launch_policy<GemmPolicy<..., TileXxx, ...>>`,
-no planner) times every recipe across the llama shape grid; the eff
-scalars are re-measured that way when porting to a new GPU.
+Calibration: an offline sweep (standalone-nvcc harness, the C-test
+convention; kept out of tree) times every manifest recipe × dtype combo
+over an M×(N,K) shape grid through the production launch route (TMA
+first, production raster; infeasible recipes excluded rather than timed
+zero), and the fit takes the per-regime eff medians that make the cost
+model reproduce the measured time ratios, plus a shape-holdout report
+(winner-class accuracy, measured-time regret) and a cuBLAS gap list.
+Porting to a new GPU is re-running that sweep+fit. On the
+RTX 5090 the wave-regime refit (7 combos × 81 shapes) cut the holdout
+regret from 12.7% to 2.9% at p90 (winner-class accuracy 69% → 79%): the
+llama-shape W16A16 mean went 184 → 194 TF with the weak bands
+(+10..27%) landing at 0.99-1.00× cuBLAS while the saturated bands and
+the quantized-class means held within ±1.2% (single shapes trade up to
+−7% inside the fitted regret envelope).
 `ASTR_GEMM_PLAN=1` adds a read-only launch log (shape →
 recipe/stages/grid/raster) from `launch_policy`. On RTX 5090 (170 SM, 96 MB L2) the model replaced the
 L20 ladder's mid/large-M narrow picks with the big CTA and its sub-wave
@@ -410,7 +422,7 @@ worse here), and warp specialization / cluster / PDL (the TMA producer is
 currently an elected thread of the math CTA, not a dedicated warp). Out
 of scope by design: NVRTC JIT and MoE
 gather/grouped GEMM (the JIT-per-SM-heuristic idea survives AOT as the
-per-dtype-class `kPlanEff` table, calibrated by the tile bench). We keep
+per-dtype-class `kPlanEff` table, calibrated by the offline sweep). We keep
 two things humming lacks: strided-batch operands with broadcast, and fp32
 output.
 

@@ -178,7 +178,8 @@ using TileManifest = std::tuple<
 template <typename ElemA_, typename ElemB_, typename LayoutA_, typename LayoutB_,
           typename Tile_, typename LayoutOut_ = RowMajor,
           typename OutT_ = __nv_bfloat16, bool StreamOut_ = false,
-          bool UseTma_ = false, bool UseMxMma_ = false>
+          bool UseTma_ = false, bool UseMxMma_ = false,
+          bool StoreWriteThrough_ = false>
 struct GemmPolicy {
     using Tile = Tile_;
     using Traits = GemmTraits<ElemA_, ElemB_, typename Tile_::CtaShape,
@@ -194,6 +195,12 @@ struct GemmPolicy {
     // and copies out through OutElem<OutT> packing facts.
     using OutT = OutT_;
     static constexpr bool kStreamOut = StreamOut_;
+    // Output streaming store (__stwt, write-through, bypasses the L2
+    // write-back stage): the fused-linear output is read-once and never
+    // reused, so keeping it out of L2 reserves the cache for the reused
+    // weights/activations. Separate from kStreamOut (__stcs, evict-first);
+    // kStoreWriteThrough wins when both are set.
+    static constexpr bool kStoreWriteThrough = StoreWriteThrough_;
     // TMA staging (sm_90+): congruous-only by construction — the launcher
     // instantiates these policies solely for dual-congruous layout pairs
     // with aligned operands; staging layouts and fragment addressing are

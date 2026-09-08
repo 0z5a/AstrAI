@@ -22,7 +22,8 @@ if(NOT DEFINED ASTRAI_CUDA_ARCH)
     if(DEFINED ENV{ASTRAI_CUDA_ARCH})
         set(ASTRAI_CUDA_ARCH "$ENV{ASTRAI_CUDA_ARCH}")
     else()
-        # Mixed-fleet default, matching setup.py: native SASS for every
+        # Mixed-fleet fallback for GPU-less builds (setup.py passes the
+        # local GPU's arch when one is present): native SASS for every
         # supported generation; interim GPUs JIT the nearest compute_* PTX.
         set(ASTRAI_CUDA_ARCH "80;89;120")
     endif()
