@@ -11,6 +11,7 @@
 #include <type_traits>
 
 #include "common/mma.cuh"
+#include "common/tensor.cuh"
 #include "gemm/common.h"
 #include "quantize/common.h"
 
@@ -84,6 +85,13 @@ struct GemmTraits {
                   "warp tiles must exactly tile the CTA");
     static_assert(kWarpM % 16 == 0 && kWarpN % 8 == 0,
                   "warp tile must be a multiple of the m16n8 MMA shape");
+    // Warp accumulator geometry, one definition for mainloop and epilogue:
+    // m16n8 mma cells on the (kMt, kNt) warp tile grid.
+    static constexpr int kMt = kWarpM / 16;
+    static constexpr int kNt = kWarpN / 8;
+    using AccTensor =
+        Tensor<ArrayEngine<typename MmaOp::CFrag, kMt * kNt>,
+               CellLayout<kNt>>;
 };
 
 // Ring-budget formula, one source for GemmSmem, launch_plan's epilogue
@@ -220,20 +228,6 @@ struct GemmPolicy {
     static constexpr int kMinCtas = Smem::kMinCtas;
     static constexpr int kSmemBytes = Smem::kBytes + kTmaExtra;
 };
-
-// fp8 convenience aliases: format-parameterized names over the generic
-// policy (A and B share the fp8 type), kept for the binding's FP8Format
-// dispatch and the C tests.
-template <FP8Format Fmt, typename CtaShape, typename WarpShape, int Stages>
-using Fp8GemmTraits =
-    GemmTraits<fp8_elem_t<Fmt>, fp8_elem_t<Fmt>, CtaShape, WarpShape, Stages>;
-
-template <FP8Format Fmt_, typename LayoutA_, typename LayoutB_, typename Tile_,
-          typename LayoutOut_ = RowMajor, typename OutT_ = __nv_bfloat16,
-          bool StreamOut_ = false>
-using Fp8GemmPolicy =
-    GemmPolicy<fp8_elem_t<Fmt_>, fp8_elem_t<Fmt_>, LayoutA_, LayoutB_, Tile_,
-               LayoutOut_, OutT_, StreamOut_>;
 
 }  // namespace gemm
 }  // namespace astrai

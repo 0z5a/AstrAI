@@ -55,13 +55,11 @@ struct GemmCollectiveEpilogue {
     static constexpr bool kStreamOut = Policy::kStreamOut;
     static constexpr int kBlockM = Traits::kBlockM;
     static constexpr int kBlockN = Traits::kBlockN;
-    static constexpr int kMt = Traits::kWarpM / 16;
-    static constexpr int kNt = Traits::kWarpN / 8;
+    static constexpr int kMt = Traits::kMt;
+    static constexpr int kNt = Traits::kNt;
     // The mainloop's accumulator type (typed C cells on the (mt, nt)
     // grid) — the epilogue reads the same cells the mma wrote.
-    using AccTensor =
-        Tensor<ArrayEngine<typename Traits::MmaOp::CFrag, kMt * kNt>,
-               CellLayout<kNt>>;
+    using AccTensor = typename Traits::AccTensor;
 
     const float output_scale;
     const float* const a_scale;  // [a_scale_m] row factor or null

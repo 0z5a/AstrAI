@@ -97,8 +97,8 @@ struct GemmCollectiveMainloop {
     // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps, each warp computing
     // kMt x kNt m16n8k{kMmaK} MMAs. Rings rotate kStages+1 buffers (see
     // GemmSmem) — one __syncthreads per k-tile.
-    static constexpr int kMt = Traits::kWarpM / 16;  // 16-row MMA tiles per warp
-    static constexpr int kNt = Traits::kWarpN / 8;   // 8-col MMA tiles per warp
+    static constexpr int kMt = Traits::kMt;  // 16-row MMA tiles per warp
+    static constexpr int kNt = Traits::kNt;  // 8-col MMA tiles per warp
     static constexpr int kSegs = kK / Traits::kMmaK;  // mma-sized k segments
     static constexpr int kARing = Smem::kRingDepth;
     static constexpr int kBRing = Smem::kRingDepth;
@@ -152,9 +152,7 @@ struct GemmCollectiveMainloop {
     // The warp's accumulator: typed C cells on a (mt, nt) grid — indexing
     // by semantic coordinates all the way to the mma (no pointer decay at
     // the fma seam; the epilogue reads the same cells).
-    using AccTensor =
-        Tensor<ArrayEngine<typename MmaOp::CFrag, kMt * kNt>,
-               CellLayout<kNt>>;
+    using AccTensor = typename Traits::AccTensor;
 
     // Stage strides in BOTH units (aliases of the ring facts: the smem
     // carve and the byte-address read carries measure against them).
@@ -204,46 +202,41 @@ struct GemmCollectiveMainloop {
                    ((reinterpret_cast<uintptr_t>(b) | (uint64_t)b_ld) & 15) == 0 &&
                    (k % kK) == 0) {}
 
-    // Asynchronous loads for one k-tile: congruous operands cp.async into
-    // the canonical rings, crosswise 16-bit operands cp.async into the
-    // transposed rings (kFast selects the predication-free interior copy —
-    // trans staging qualifies: it is cp.async like the congruous path).
-    // The tiles arrive typed by each ring's staged layout, so a mismatched
-    // loader/tile pairing is a compile error. Called after the
-    // post-compute barrier, alongside the commit.
-    template <bool kFast = false>
+    // Stage-load one k-tile, per operand picking its loader from the
+    // staging class: congruous and 16-bit crosswise cp.async into the
+    // canonical / transposed rings, 8-bit crosswise LDG+PRMT (the tiles
+    // arrive typed by each ring's staged layout, so a mismatched
+    // loader/tile pairing is a compile error). kFast selects the
+    // predication-free interior copy (async phase only — trans staging
+    // qualifies: it is cp.async like the congruous path). kSyncPhase picks
+    // the call-site phase: true = the synchronous direct loads (8-bit
+    // crosswise only; in the steady state this runs right after barrier 1,
+    // so the LDG latency and the PRMT transpose overlap the MMA phase
+    // instead of stalling the inter-barrier window), false = the async
+    // loads (kFast applies, and in the generic loop they run after the
+    // MMA phase alongside the commit).
+    template <bool kFast = false, bool kSyncPhase = false>
     __device__ __forceinline__ void
-    load_async(TileA a_tile, TileB b_tile,
+    load_stage(TileA a_tile, TileB b_tile,
                int64_t k_base) const {
-        if constexpr (kTransA)
-            load_operand_tile_trans<StagedLayoutA, ElemA, kCtaThreads,
-                                    kFast>(a_tile, a, m, k, a_ld, tid,
-                                           k_base, block_m * kBlockM);
-        else if constexpr (!kDirectA)
-            load_operand_tile<StagedLayoutA, ElemA, kCtaThreads, kFast>(
-                a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
-        if constexpr (kTransB)
-            load_operand_tile_trans<StagedLayoutB, ElemB, kCtaThreads,
-                                    kFast>(b_tile, b, n, k, b_ld, tid,
-                                           k_base, block_n * kBlockN);
-        else if constexpr (!kDirectB)
-            load_operand_tile<StagedLayoutB, ElemB, kCtaThreads, kFast>(
-                b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
-    }
-    // Synchronous direct loads for one k-tile (8-bit crosswise operands
-    // only — 16-bit crosswise rides the async trans staging above). In the
-    // steady state this runs right after barrier 1, so the LDG latency and
-    // the PRMT transpose overlap the MMA phase instead of stalling the
-    // inter-barrier window.
-    __device__ __forceinline__ void
-    load_direct(TileA a_tile, TileB b_tile,
-                int64_t k_base) const {
-        if constexpr (kSyncA)
-            load_crosswise_direct<StagedLayoutA, ElemA, kCtaThreads>(
-                a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
-        if constexpr (kSyncB)
-            load_crosswise_direct<StagedLayoutB, ElemB, kCtaThreads>(
-                b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+        if constexpr (kSyncPhase) {
+            if constexpr (kSyncA)
+                load_crosswise_direct<StagedLayoutA, ElemA, kCtaThreads>(
+                    a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+            if constexpr (kSyncB)
+                load_crosswise_direct<StagedLayoutB, ElemB, kCtaThreads>(
+                    b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+        } else {
+            // Everything but the 8-bit crosswise (kSync) staging rides
+            // cp.async: congruous goes canonical, 16-bit crosswise goes
+            // transposed.
+            if constexpr (!kSyncA)
+                load_operand_tile<StagedLayoutA, ElemA, kCtaThreads, kTransA, kFast>(
+                    a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+            if constexpr (!kSyncB)
+                load_operand_tile<StagedLayoutB, ElemB, kCtaThreads, kTransB, kFast>(
+                    b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+        }
     }
 
     // One TMA stage issue: gate on the slot's empty barrier (its previous
@@ -298,16 +291,16 @@ struct GemmCollectiveMainloop {
         for (int stage = 0; stage < kStages; ++stage) {
             if (stage < tile_count) {
                 if (fast_cta)
-                    load_async<true>(astrai::stage_of(ring_a, stage),
-                                    astrai::stage_of(ring_b, stage),
+                    load_stage<true>(astrai::stage_of(ring_a, stage),
+                                     astrai::stage_of(ring_b, stage),
                                      (int64_t)stage * kK);
                 else
-                    load_async(astrai::stage_of(ring_a, stage),
+                    load_stage(astrai::stage_of(ring_a, stage),
                                astrai::stage_of(ring_b, stage),
                                (int64_t)stage * kK);
-                load_direct(astrai::stage_of(ring_a, stage),
-                            astrai::stage_of(ring_b, stage),
-                            (int64_t)stage * kK);
+                load_stage<false, true>(astrai::stage_of(ring_a, stage),
+                                        astrai::stage_of(ring_b, stage),
+                                        (int64_t)stage * kK);
             }
             pipe.producer_commit();
         }
@@ -381,9 +374,9 @@ struct GemmCollectiveMainloop {
             if (prefetch && tid == 0)
                 tma_issue_stage(tma, (int)(tile_index + kStages));
         } else if (prefetch) {
-            load_direct(astrai::stage_of(ring_a, tile_index + kStages),
-                        astrai::stage_of(ring_b, tile_index + kStages),
-                        (tile_index + kStages) * kK);
+            load_stage<false, true>(astrai::stage_of(ring_a, tile_index + kStages),
+                                    astrai::stage_of(ring_b, tile_index + kStages),
+                                    (tile_index + kStages) * kK);
         }
 
         const unsigned a_addr = a_rd;
@@ -480,7 +473,7 @@ struct GemmCollectiveMainloop {
         // loads run after the MMA phase.
         if constexpr (!kFast && !kTma) {
             if (prefetch) {
-                load_async(astrai::stage_of(ring_a, tile_index + kStages),
+                load_stage(astrai::stage_of(ring_a, tile_index + kStages),
                            astrai::stage_of(ring_b, tile_index + kStages),
                            (tile_index + kStages) * kK);
             }

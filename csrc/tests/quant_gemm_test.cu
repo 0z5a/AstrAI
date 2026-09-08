@@ -255,8 +255,8 @@ template <typename LA, typename LB>
 constexpr bool kCaseFast =
     !std::is_same_v<LA, ColMajor> && !std::is_same_v<LB, RowMajor>;
 template <typename LA, typename LB, int kK, int Stages>
-using CasePolicy = Fp8GemmPolicy<
-    FP8Format::E4M3, LA, LB,
+using CasePolicy = GemmPolicy<
+    fp8_elem_t<FP8Format::E4M3>, fp8_elem_t<FP8Format::E4M3>, LA, LB,
     GemmTileConfig<Shape<128, 128, kK>, Shape<64, 32>, Stages, kCaseFast<LA, LB>>,
     RowMajor, __nv_bfloat16>;
 
