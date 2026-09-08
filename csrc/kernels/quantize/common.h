@@ -19,6 +19,26 @@ enum class FP8Format : int {
     E5M2 = 1,
 };
 
+// The format enum (binding-facing dispatch key) -> the __nv_fp8 element
+// type (the kernel/traits key). Primary template undefined: an unmapped
+// format is a compile error at the use site, never a silent e4m3
+// fallback. Shared across the family — gemm/policy.cuh aliases this.
+template <FP8Format Fmt>
+struct fp8_elem;
+
+template <>
+struct fp8_elem<FP8Format::E4M3> {
+    using type = __nv_fp8_e4m3;
+};
+
+template <>
+struct fp8_elem<FP8Format::E5M2> {
+    using type = __nv_fp8_e5m2;
+};
+
+template <FP8Format Fmt>
+using fp8_elem_t = typename fp8_elem<Fmt>::type;
+
 // Compute-capability comparison: is the device at least (major, minor)?
 inline bool sm_at_least(int device_major, int device_minor, int major,
                         int minor) {

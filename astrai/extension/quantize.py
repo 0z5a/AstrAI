@@ -364,6 +364,8 @@ def fp8_linear_forward(
     if cfg.recipe.dynamic:
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), cfg.recipe, fmt)
         sw = _dynamic_scale(w, cfg.recipe, fmt)
+        # amax was already measured by _dynamic_scale: no ring means the
+        # kernel runs a pure scale+cast (no fused-amax pass) on this path.
         x8, _ = quantize(x, sx.reciprocal(), fmt)
         w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
         # Bias fuses into the GEMM epilogue (fp32 add before the single bf16
@@ -451,12 +453,21 @@ class _LinearFp8(torch.autograd.Function):
         # grad_x, g8T [n,m] with x8T [k,m] gives grad_w — no NN-swap or TT
         # crosswise kernel in the training path. g is consumed in both
         # orientations, so quantize_dual's single pass feeds both.
-        # The g quantize folds the gradient amax into its ring in-kernel;
-        # the x8T/w8T orientation copies discard amax (those rings were
-        # folded at forward time).
-        g8, g8T, _ = quantize_dual(g2, sg.reciprocal(), fmt, **meta.g.fold_args(fmt))
+        # The delayed g quantize folds the gradient amax into its ring
+        # in-kernel; the x8T/w8T orientation copies discard amax (those
+        # rings were folded at forward time), and dynamic scaling measured
+        # its own amax — so those calls run without a ring (pure cast).
+        if ctx.is_dynamic:
+            g8, g8T, _ = quantize_dual(g2, sg.reciprocal(), fmt)
+        else:
+            g8, g8T, _ = quantize_dual(
+                g2, sg.reciprocal(), fmt, **meta.g.fold_args(fmt)
+            )
         x8T, _ = quantize(
-            x.reshape(-1, x.size(-1)), sx.reciprocal(), fmt, transposed=True
+            x.reshape(-1, x.size(-1)),
+            sx.reciprocal(),
+            fmt,
+            transposed=True,
         )
         if _is_fp8(w.dtype):
             # Pre-quantized weight has no transposed copy: keep the swap

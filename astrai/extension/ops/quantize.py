@@ -13,8 +13,10 @@ binding's TORCH_CHECKs.
 - ``quantize_dual(x, scale, fmt) -> (x8, x8T, amax)`` — both orientations, one read
 
 ``scale`` is the quantization multiplier (device scalar); ``fmt`` is
-``"e4m3"`` or ``"e5m2"``. ``amax`` values are *returned*, never passed as
-output arguments.
+``"e4m3"`` or ``"e5m2"``. ``amax`` is *produced only by the delayed-scaling
+ring fold* (the kernel's fused reduction) or measured by the caller; the
+returned value is the ring's self-cleaned slot when ``ring_state`` is given,
+else ``None`` (the kernel runs a pure scale+cast — no fused-amax pass).
 
 Policy (scales, amax history, delayed scaling, autocast) lives in
 ``astrai.extension.quantize``; this module is stateless.
@@ -46,22 +48,25 @@ def quantize(
     hist_idx: int = 0,
     fp8_max: float = 448.0,
     pow2_margin: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Float (bf16/fp16/fp32) -> FP8 quantize with fused amax.
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Float (bf16/fp16/fp32) -> FP8 quantize (scale-then-cast).
 
     ``scale`` is the quantization multiplier (device scalar); ``fmt`` selects
-    E4M3 or E5M2. ``amax`` is a fresh 1-element float32 tensor.
-    ``transposed=True`` swaps ``x8`` for ``x8T``, the ``[cols][rows]``
-    row-major transpose of the quantized input — the K-contiguous operand
-    orientation NT GEMMs want — at the same 2-tuple arity.
+    E4M3 or E5M2. ``transposed=True`` swaps ``x8`` for ``x8T``, the
+    ``[cols][rows]`` row-major transpose of the quantized input — the
+    K-contiguous operand orientation NT GEMMs want — at the same 2-tuple
+    arity.
 
     ``ring_state`` (a 1D float32 CUDA buffer laid out
     ``[hist n | scale | legacy | amax | done]``) switches on the in-kernel
     delayed-scaling fold: the kernel's last block folds the amax into
     ``hist[hist_idx]`` and publishes the next scale as
-    ``max(hist) / fp8_max / pow2_margin`` — the returned ``amax`` is then the
-    self-cleaned persistent slot (reads zero). None keeps the classic
-    fresh-amax return.
+    ``max(hist) / fp8_max / pow2_margin``. The returned ``amax`` is then the
+    self-cleaned persistent slot (reads zero).
+
+    No ``ring_state`` means a pure scale+cast: no fused-amax reduction and
+    ``amax`` is ``None``. Callers that want the amax reduce the input
+    themselves (dynamic scaling measures ``x.abs().amax()``).
     """
     return get_module("quantize").quantize(
         x,
@@ -83,16 +88,23 @@ def quantize_dual(
     hist_idx: int = 0,
     fp8_max: float = 448.0,
     pow2_margin: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Dual-orientation quantize: one read of ``x`` produces both the
     row-major ``x8`` and its transposed ``x8T`` (plus ``amax``), for tensors
     consumed by GEMMs in both orientations (backward ``g``).
 
     ``ring_state`` switches on the in-kernel delayed-scaling fold exactly as
-    in :func:`quantize`.
+    in :func:`quantize`; with no ``ring_state`` the kernel runs a pure
+    scale+cast and ``amax`` is ``None``.
     """
     return get_module("quantize").quantize_dual(
-        x, scale, _fmt_int(fmt), ring_state, hist_idx, fp8_max, pow2_margin
+        x,
+        scale,
+        _fmt_int(fmt),
+        ring_state,
+        hist_idx,
+        fp8_max,
+        pow2_margin,
     )
 
 

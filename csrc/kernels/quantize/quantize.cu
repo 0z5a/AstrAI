@@ -14,11 +14,16 @@ using namespace astrai::quant;
 
 namespace {
 
-// Dtype dispatch over the unified quantize launcher.
+// Dtype dispatch over the unified quantize launcher: one case per
+// supported input dtype; the default is a hard error (entry-checked, so
+// unreachable — never a silent bf16 re-route).
 template <bool Tiled, FP8Format Fmt>
 void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
                       cudaStream_t stream) {
     switch (x.scalar_type()) {
+    case torch::kBFloat16:
+        launch_fp8_quantize<Fmt, __nv_bfloat16, Tiled>(p, stream);
+        break;
     case torch::kHalf:
         launch_fp8_quantize<Fmt, __half, Tiled>(p, stream);
         break;
@@ -26,7 +31,8 @@ void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
         launch_fp8_quantize<Fmt, float, Tiled>(p, stream);
         break;
     default:
-        launch_fp8_quantize<Fmt, __nv_bfloat16, Tiled>(p, stream);
+        TORCH_CHECK(false, "unsupported quantize input dtype: ",
+                    x.scalar_type());
     }
 }
 
@@ -44,9 +50,10 @@ void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
 // one read) serves quantize_dual(). A ring tensor switches
 // on the in-kernel delayed-scaling fold: state layout
 // [hist n | scale | legacy | amax | done-as-int], and the returned amax is
-// the (self-cleaned) persistent slot. Without it, amax is reduced into a
-// fresh buffer armed by a driver memset — cheaper than the zeros() fill
-// kernel.
+// the (self-cleaned) persistent slot — its only reducer. Without a ring the
+// kernel runs a pure scale+cast (no fused amax: p.amax stays null) and the
+// returned amax is None; callers that need one measure it themselves
+// (dynamic scaling), matching the TE-delayed versus torchao-dynamic split.
 py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
                          QuantLayout layout, py::object ring, int64_t hist_idx,
                          double fp8_max, double pow2_margin) {
@@ -87,15 +94,12 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
         ring_scale_out = base + n;
         ring_done = reinterpret_cast<unsigned int*>(base + n + 3);
         ring_len = static_cast<int>(n);
-    } else {
-        amax = torch::empty({1}, input.options().dtype(torch::kFloat32));
-        cudaMemsetAsync(amax.data_ptr(), 0, sizeof(float), stream.stream());
     }
 
     QuantParams p;
     p.input_ptr = input.data_ptr();
     p.scale = scale.data_ptr<float>();
-    p.amax = amax.data_ptr<float>();
+    p.amax = amax.defined() ? amax.data_ptr<float>() : nullptr;
     if (ring_hist) {
         p.fold_ring = true;
         p.hist = ring_hist;
@@ -135,7 +139,8 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
 
 // Single-orientation quantize binding: row-major x8, or its [cols][rows]
 // transpose when transposed is set — the K-contiguous operand orientation
-// NT GEMMs want. Returns (x8|x8T, amax).
+// NT GEMMs want. Returns (x8|x8T, amax); amax is the ring's self-cleaned
+// slot when ring_state is given, else None (pure scale+cast).
 py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
                     bool transposed, py::object ring, int64_t hist_idx,
                     double fp8_max, double pow2_margin) {
@@ -147,7 +152,7 @@ py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
 
 // Dual-orientation quantize binding: one read of x produces both the
 // row-major x8 and its transpose (plus amax), for tensors consumed by GEMMs
-// in both orientations (backward g). Returns (x8, x8T, amax).
+// in both orientations (backward g). Returns (x8, x8T, amax), amax as above.
 py::object quantize_dual(torch::Tensor x, torch::Tensor scale, int64_t fmt,
                          py::object ring, int64_t hist_idx, double fp8_max,
                          double pow2_margin) {

@@ -49,8 +49,8 @@ layered directory:
 
 | File | Role |
 |------|------|
-| `quantize/common.h` | `FP8Format` enum (E4M3/E5M2) + `QuantLayout` + `QuantParams` POD — no torch |
-| `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 32×32-tile transpose kernel (out_layout 0/1/2), `quant_in_traits<InT>` unpack — no torch |
+| `quantize/common.h` | `FP8Format` enum (E4M3/E5M2) + `fp8_elem`/`fp8_elem_t` enum→type map (shared with the gemm family) + `QuantLayout` + `QuantParams` POD — no torch |
+| `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `fp8_cvt_traits<Fp8T>` convert + `quant_in_traits<InT>` unpack (primary templates undefined — one specialization per dtype/format) — no torch |
 | `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK — adding a dtype = one specialization), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
 | `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBig128x128` / `TileBigFast` / `TileNarrow128x64` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key and `TileManifest` type list the launch ladders index; `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
@@ -64,8 +64,10 @@ layered directory:
 Scale semantics: `quantize` takes the quantization *multiplier*; the
 strategy layer passes `scale.reciprocal()` and the kernel multiplies by it.
 `quant_gemm` takes per-operand dequant scales (`a_scale`, `b_scale`;
-the fp8 training path passes `sa` / `sb` separately). `amax` is always
-returned in the original input domain.
+the fp8 training path passes `sa` / `sb` separately). `amax` is produced
+only by the delayed-scaling ring fold (the in-kernel fused reduction) or
+measured by the caller — the plain no-ring quantize runs a pure scale+cast
+and returns `amax=None`.
 
 Python layer (two levels): `astrai/extension/ops/quantize.py` and
 `ops/gemm.py` are the stateless kernel adapters (plain `quantize` /
@@ -759,7 +761,7 @@ csrc/
 │   │   ├── common.h                  #   FP8Format enum, sm_at_least + kMinSmForFp8 capability helpers, QuantLayout, QuantParams POD
 │   │   ├── checks.h                  #   torch-bound entry validation (check_fp8_device over ATen-cached properties)
 │   │   ├── dequant.cuh               #   in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
-│   │   └── quantize.cuh              #   quantize kernels: vectorized + 32×32-tile transpose (out_layout 0/1/2)
+│   │   └── quantize.cuh              #   quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
 │   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)

@@ -19,10 +19,10 @@ namespace gemm {
 
 using quant::FP8Format;
 
-// Operand element type for one fp8 format (fp8 convenience alias layer).
-template <FP8Format Fmt>
-using fp8_elem_t =
-    std::conditional_t<Fmt == FP8Format::E5M2, __nv_fp8_e5m2, __nv_fp8_e4m3>;
+// Operand element type for one fp8 format: the quantize family's shared
+// enum->type map (quantize/common.h, primary undefined — an unmapped
+// format fails at compile time).
+using quant::fp8_elem_t;
 
 // Compile-time tile configuration, mirroring KernelTraits in the attention
 // kernels: the CTA tile and warp tiling arrive as Shape types, the

@@ -82,8 +82,7 @@ def test_quantize_input_dtypes(in_dtype, fmt):
     out_dtype = torch.float8_e5m2 if fmt == "e5m2" else torch.float8_e4m3fn
     assert x8.dtype == out_dtype
     assert x8.shape == x.shape
-    assert amax.shape == (1,)
-    torch.testing.assert_close(amax, x.abs().amax().float().reshape(1))
+    assert amax is None  # no ring => pure scale+cast, no fused amax
     ref = (x.float() * 0.5).to(out_dtype)
     assert torch.equal(x8, ref)
 
@@ -93,7 +92,7 @@ def test_quantize_e5m2_format():
     x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
     x8, amax = quantize(x, torch.tensor([10.0], device="cuda"), "e5m2")
     assert x8.dtype == torch.float8_e5m2
-    torch.testing.assert_close(amax, x.abs().amax().float().reshape(1))
+    assert amax is None  # no ring => no fused amax
 
 
 @skip_no_fp8
@@ -489,7 +488,7 @@ def test_quantize_dual_and_transposed_orientations(fmt):
     assert torch.equal(x8.view(torch.uint8), d8.view(torch.uint8))
     assert torch.equal(x8T.view(torch.uint8), d8T.view(torch.uint8))
     assert torch.equal(x8T.t().contiguous().view(torch.uint8), x8.view(torch.uint8))
-    torch.testing.assert_close(amax, x.abs().amax().float().reshape(1))
+    assert amax is None  # no ring => no fused amax
 
 
 @skip_no_fp8
@@ -504,10 +503,11 @@ def test_quantize_ring_fold_matches_host_update(fmt, fmax, margin):
     mult = torch.tensor([0.01], device=dev)
     pow2m = float(2**margin)
 
-    # Reference: legacy quantize + the host fold it used to return amax for.
-    x8_ref, amax = quantize(x, mult, fmt)
+    # Reference: legacy quantize + the host fold (amax measured out-of-band,
+    # as dynamic scaling does — the no-ring kernel no longer returns one).
+    x8_ref = quantize(x, mult, fmt)[0]
     hist = torch.full((n,), 1.0, device=dev)
-    hist[idx] = amax.to(torch.float32)
+    hist[idx] = x.float().abs().amax().reshape(1)
     scale = (hist.max() / fmax / pow2m).clamp_min(1e-12).reshape(1)
 
     # Fused: same window, fold inside the quantize kernel's last block.
@@ -527,6 +527,80 @@ def test_quantize_ring_fold_matches_host_update(fmt, fmax, margin):
     torch.testing.assert_close(ring[n : n + 1], scale, rtol=0, atol=0)
     assert float(ring[n + 2]) == 0.0  # amax slot self-cleaned
     assert int(ring[n + 3].view(torch.int32)) == 0  # done counter reset
+
+
+@skip_no_fp8
+@pytest.mark.parametrize("fmt,fmax", [("e4m3", 448.0), ("e5m2", 57344.0)])
+def test_quantize_ring_fold_tall_dual_grid(fmt, fmax):
+    """The delayed-scaling fold counts BOTH grid dims: the dual (tiled)
+    kernel launches a 2D grid, and a tall tensor with a late global max must
+    fold the full amax, not a round-local partial."""
+    dev = torch.device("cuda")
+    n, idx = 4, 2
+    torch.manual_seed(7)
+    x = torch.randn(8192, 256, dtype=torch.bfloat16, device=dev) * 3
+    x[8000, 7] = 100.0  # late row block: a gridDim.x-only fold misses it
+    mult = torch.tensor([1.0], device=dev)
+
+    x8_ref = quantize(x, mult, fmt)[0]
+    hist = torch.full((n,), 1.0, device=dev)
+    hist[idx] = x.float().abs().amax().reshape(1)
+    scale = (hist.max() / fmax).clamp_min(1e-12).reshape(1)
+
+    ring = torch.zeros(n + 4, device=dev)
+    ring[:n].fill_(1.0)
+    d8, d8T, _ = quantize_dual(
+        x, mult, fmt, ring_state=ring, hist_idx=idx, fp8_max=fmax, pow2_margin=1.0
+    )
+    assert torch.equal(d8.view(torch.uint8), x8_ref.view(torch.uint8))
+    torch.testing.assert_close(ring[:n], hist, rtol=0, atol=0)
+    torch.testing.assert_close(ring[n : n + 1], scale, rtol=0, atol=0)
+    assert float(ring[n + 2]) == 0.0
+    assert int(ring[n + 3].view(torch.int32)) == 0
+
+
+@skip_no_fp8
+def test_dynamic_recipe_backward():
+    """fp8 dynamic scaling runs its backward through quantize_dual without a
+    ring (amax measured inline); the fold must not reference the None meta."""
+    torch.manual_seed(5)
+    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(96, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    state = fp8_state()
+    state.reset()
+    try:
+        with fp8_autocast(enabled=True, recipe=FP8Recipe(dynamic=True)):
+            out = F.linear(x, w)
+            out.sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        assert w.grad is not None and torch.isfinite(w.grad).all()
+    finally:
+        state.reset()
+
+
+@skip_no_fp8
+def test_quantize_amax_presence():
+    """No ring => pure scale+cast (amax None); ring => the delayed-scaling
+    fold fills a self-cleaned amax slot."""
+    torch.manual_seed(9)
+    x = torch.randn(64, 96, device="cuda", dtype=torch.bfloat16)
+    mult = _scale(x).reciprocal()
+    x8, amax = quantize(x, mult, "e4m3")
+    assert amax is None
+    d8, d8T, amax_dual = quantize_dual(x, mult, "e4m3")
+    assert amax_dual is None
+    assert torch.equal(d8.view(torch.uint8), x8.view(torch.uint8))
+    assert torch.equal(d8T.view(torch.uint8), x8.t().contiguous().view(torch.uint8))
+    # ring: the in-kernel fold writes the amax slot, then self-cleans it.
+    ring = torch.zeros(8, device="cuda")
+    ring[:4].fill_(1.0)
+    x8r, amax_ring = quantize(
+        x, mult, "e4m3", ring_state=ring, hist_idx=2, fp8_max=448.0, pow2_margin=1.0
+    )
+    assert amax_ring is not None
+    assert torch.equal(x8.view(torch.uint8), x8r.view(torch.uint8))
+    assert float(amax_ring) == 0.0  # amax slot self-cleaned by the fold
+    assert int(ring[7].view(torch.int32)) == 0  # done counter reset
 
 
 # --------------------------------------------------------------------------
