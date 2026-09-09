@@ -8,6 +8,7 @@
 #include <type_traits>
 
 #include "common/mma.cuh"
+#include "common/pipeline.cuh"
 #include "common/tma.cuh"
 #include "common/tensor.cuh"
 #include "gemm/common.h"
@@ -150,13 +151,9 @@ struct GemmCollectiveMainloop {
     // the fma seam; the epilogue reads the same cells).
     using AccTensor = typename Traits::AccTensor;
 
-    // Stage strides in BOTH units (aliases of the ring facts: the smem
-    // carve and the byte-address read carries measure against them).
-    static constexpr int kAStageElems =
-        RingA::Layout::kStageBytes / (int)sizeof(ElemA);
+    // Per-stage byte strides (the smem carve and the byte-address read
+    // carries measure against them).
     static constexpr int kAStageBytes = RingA::Layout::kStageBytes;
-    static constexpr int kBStageElems =
-        RingB::Layout::kStageBytes / (int)sizeof(ElemB);
     static constexpr int kBStageBytes = RingB::Layout::kStageBytes;
 
     const RingA ring_a;  // A's stage ring; B carves right past its end

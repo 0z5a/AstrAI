@@ -2,7 +2,6 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include <cuda_runtime.h>
 #include <cstdint>
 #include <type_traits>
 
@@ -23,38 +22,33 @@ struct ColMajor {};
 // Shape<M, N, K> CTA recipes keep their spelling (policy.cuh).
 using astrai::Shape;
 
-// Element-type traits: the per-dtype facts the policy/smem/load layers
-// derive geometry from. Adding a dtype = one specialization here plus an
-// mma_shape<InT> in common/mma.cuh.
+// Element-type traits: per-dtype storage facts the smem layers price
+// rings from (kBytes). The MMA K extent rides MmaShapeFor<MmaT>
+// (common/mma.cuh) — it keys on the COMPUTE type, so a dequantized
+// operand's storage K (32) is never conflated with the promoted cell's
+// (16); dequant insertion factors ride gemm_mma_traits. Adding a dtype =
+// one specialization here plus an MmaShapeFor<InT> cell.
 template <typename T>
 struct gemm_elem_traits;
 
 template <>
 struct gemm_elem_traits<__nv_fp8_e4m3> {
     static constexpr int kBytes = 1;
-    static constexpr int kMmaK = 32;  // mma.sync.m16n8k32 (sm_89+)
-    static constexpr bool kNeedsDequant = true;
 };
 
 template <>
 struct gemm_elem_traits<__nv_fp8_e5m2> {
     static constexpr int kBytes = 1;
-    static constexpr int kMmaK = 32;  // mma.sync.m16n8k32 (sm_89+)
-    static constexpr bool kNeedsDequant = true;
 };
 
 template <>
 struct gemm_elem_traits<__nv_bfloat16> {
     static constexpr int kBytes = 2;
-    static constexpr int kMmaK = 16;  // mma.sync.m16n8k16 (sm_80+)
-    static constexpr bool kNeedsDequant = false;
 };
 
 template <>
 struct gemm_elem_traits<int8_t> {
     static constexpr int kBytes = 1;
-    static constexpr int kMmaK = 32;  // native mma.sync.m16n8k32 (sm_80+)
-    static constexpr bool kNeedsDequant = true;
 };
 
 // MMA compute type per operand pair — the tensor-core input type both

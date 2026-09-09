@@ -80,11 +80,11 @@ set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
 # Kernel registry — one module per entry: name (.so / pybind name, globally
 # unique across families), then its source paths under kernels/ (space-
 # separated: a module may span several TUs; gemm is split into per-dtype-pair
-# instantiation units, see gemm/gemm_cases.h, so the heavy template work
-# parallelizes). The '|' separator keeps the entry a single list element —
-# CMake lists cannot nest semicolons. `loader.py` auto-discovers the .so
-# files in astrai/extension/lib/, so this CMake registry is the single place
-# to register a new kernel.
+# instantiation units (one explicit gemm_dispatch instantiation each), so
+# the heavy template work parallelizes). The '|' separator keeps the entry
+# a single list element — CMake lists cannot nest semicolons. `loader.py`
+# auto-discovers the .so files in astrai/extension/lib/, so this CMake
+# registry is the single place to register a new kernel.
 #
 # FP8 MMA instructions require sm_89+. Keep the target out of the build
 # unless at least one listed arch is 89+ instead of instantiating templates

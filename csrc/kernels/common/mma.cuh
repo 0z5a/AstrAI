@@ -342,7 +342,7 @@ DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
 //
 // The instruction is identical for every 16-bit-storage element type: bf16
 // maps 1:1 onto b16 slots; fp8 and s8 are stored packed two-per-slot (see
-// gemm/gemm.cuh), so one b16 slot holds two 1-byte values. `T` is the element
+// gemm/mainloop.cuh), so one b16 slot holds two 1-byte values. `T` is the element
 // type and only serves as a semantic tag.
 //
 //   x2 (single address): matrix0 = p (8 rows), matrix1 = p + 8*16 bytes
@@ -355,18 +355,18 @@ DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
 // lanes 8-15 matrix 1's rows (x2/x4), lanes 16-23 / 24-31 matrix 2 / 3's rows
 // (x4 only; their addresses are ignored by x2). Each matrix is 8 rows x 16
 // bytes, and consecutive matrices of one instruction are contiguous at
-// 128-byte strides. 1-byte fragment layouts in gemm/gemm.cuh are arranged
+// 128-byte strides. 1-byte fragment layouts in gemm/mainloop.cuh are arranged
 // around this constraint.
 // ---------------------------------------------------------------------------
 
 // Per-lane-address cores: the caller supplies a raw shared-memory address
 // per lane instead of one common pointer. Use when the fragment tiles are
 // XOR-swizzled per 16B chunk so each lane must compute its own row and
-// chunk address (see gemm/gemm.cuh's frag_addr + lane selectors for the
-// m16n8k32 operand layouts). Trans selects the transposed load — the
-// gemm's crosswise 16-bit staging ([K][rows] tiles) reads its fragments
-// through it. (ldmatrix is a b16-only instruction: 8-bit crosswise
-// operands keep the PRPT staging + plain loads.)
+// chunk address (see gemm/mainloop.cuh's a_lane_off / b_lane_off and the
+// trans selectors for the m16n8k32 operand layouts). Trans selects the
+// transposed load — the gemm's crosswise 16-bit staging ([K][rows] tiles)
+// reads its fragments through it. (ldmatrix is a b16-only instruction:
+// 8-bit crosswise operands keep the PRPT staging + plain loads.)
 template <bool Trans = false>
 DEVICE_FORCEINLINE void ldmatrix_x2_lane(unsigned r[2],
                                          unsigned addr) {
@@ -619,3 +619,5 @@ __device__ __forceinline__ void tcgen05_st_16x128b_x2(uint32_t address,
 
 
 }  // namespace astrai
+
+#undef DEVICE_FORCEINLINE

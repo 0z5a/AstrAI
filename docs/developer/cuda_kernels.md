@@ -13,7 +13,7 @@ and FP8 GEMM. These are built when `nvcc` is available and CUDA is detected.
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
 | `quantize` | `quantize/quantize.cu` | FP8 quantization kernels (sm_89+) |
-| `gemm` | `gemm/gemm.cu` | dtype-generic tensor-core GEMM binding (fp8 / W8A16 / W8A8 / W16A16) + the family's kernel-policy instantiation unit (sm_89+) |
+| `gemm` | `gemm/gemm.cu` + per-dtype-pair `gemm_*.cu` | dtype-generic tensor-core GEMM binding + one instantiation TU per dtype pair (fp8 / W8A16 / W8A8 / W16A16, sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -49,16 +49,16 @@ layered directory:
 
 | File | Role |
 |------|------|
-| `quantize/common.h` | `FP8Format` enum (E4M3/E5M2) + `fp8_elem`/`fp8_elem_t` enum→type map (shared with the gemm family) + `QuantLayout` + `QuantParams` POD — no torch |
+| `quantize/common.h` | capability helpers (`sm_at_least`, `kMinSmForFp8`) + `QuantLayout` + `QuantParams` POD — raw `__nv_fp8_*` element types, no format enum, no torch |
 | `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `fp8_cvt_traits<Fp8T>` convert + `quant_in_traits<InT>` unpack (primary templates undefined — one specialization per dtype/format) — no torch |
 | `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
-| `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes/kMmaK — adding a dtype = one specialization), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
-| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBig128x128` / `TileBigFast` / `TileNarrow128x64` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key and `TileManifest` type list the launch ladders index; `Fp8GemmTraits`/`Fp8GemmPolicy` are fp8-format aliases |
-| `gemm/load.cuh` | operand loaders: typed staged tiles (`SmemTile<StagedLayout>`, `common/tensor.cuh`) over the tile's declared layout (`common/swizzle.cuh`), congruous cp.async staging (predicated via runtime src-size zfill + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
+| `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes — the smem ring budgets; the MMA K extent rides `MmaShapeFor<MmaT>`), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
+| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBigFast` / `TileBigFastS3` / `TileNarrow128x64` / `TileNarrow128x64s3` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key and `TileManifest` type list the launch ladders index |
+| `gemm/load.cuh` | operand loaders: typed staged tiles (`Tensor<PtrEngine<Elem>, StagedLayout>`, `common/tensor.cuh`) over the tile's declared layout (`common/swizzle.cuh`), congruous cp.async staging (predicated via runtime src-size zfill + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
 | `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
-| `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16 smem scatter + coalesced copy-out |
-| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_congruous` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
+| `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
+| `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
 | `gemm/plan_table.h` | AOT dispatch rows: (M, N) band × dtype class → measured recipe winner (`TableRow`; band-parse + lookup, `ASTR_GEMM_TABLE` override or the compiled-in rows) — after the calibration knob, `plan_gemm` is table-only (planning section below) |
 | `quantize/quantize.cu` | binding only: entry checks (`checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
@@ -202,14 +202,15 @@ descriptor encodability (misaligned base/ld falls back to the cp.async
 twin, which stays compiled); `ASTR_GEMM_NO_TMA=1` forces the fallback
 for experiments.
 
-**Stage depth.** The manifest carries s3 deep-ring siblings of the big
-and narrow tiles (`TileBig128x128s3` etc., humming's `_fit_num_stages`
-rule — the thinner the operand pair, the more smem headroom under the
-96KB budget). RTX 5090 measured them a wash to -1.3% on the cp.async
-rings (three buffers already hide the LDGSTS latency), so the congruous
-scan keeps s2 on ties; `ASTR_GEMM_S3=1` flips the preference — the
-calibration knob for staging variants whose latency profile differs
-(the TMA rings in particular).
+**Stage depth.** The manifest carries s3 deep-ring siblings of every
+class (`TileBigFastS3` / `TileNarrow128x64s3` / `TileSmall64s3`,
+humming's `_fit_num_stages` rule — the thinner the operand pair, the
+more smem headroom under the 96KB budget). RTX 5090 measured them a
+wash to -1.3% on the cp.async rings (three buffers already hide the
+LDGSTS latency), so table rows keep s2 wherever a sweep point did not
+measure s3 ahead; `ASTR_GEMM_RECIPE` forces s2 only (s3 candidates are
+measured as one-row `ASTR_GEMM_TABLE` files — see
+`csrc/bench/gen_plan_table.py`).
 
 **MMA cell (sm_120a block_scale).** The plain warp-level fp8 mma
 (`m16n8k32.e4m3/e5m2`) decodes at HALF rate on sm_120 — measured pure issue
@@ -256,7 +257,7 @@ the small CTA opts in.
 not positional ints: `Shape<M, N, K>` (CTA tile; K = the per-stage k-tile)
 and `Shape<M, N>` (warp tile) compose into a `GemmTileConfig` — one named
 recipe bundling shapes + stage depth + loop mode. `Shape` itself is the
-shared vocabulary type of `common/swizzle.cuh`: the same `Shape<...>`
+shared vocabulary type of `common/shape.cuh`: the same `Shape<...>`
 spells both the CTA tile here and the staging layouts' chunk grids, so
 tile geometry and smem layout read in one notation. The production
 manifest in `policy.cuh` (`TileBig128x128`, `TileBigFast`,
@@ -374,7 +375,8 @@ are exercised indirectly by the correctness suite
 smem gate, which turns a stale row into the next source instead of
 a launch failure. The sweep times the fused-linear (NT) layout, so
 generated rows carry crosswise 0 — the table covers the NT path;
-TT/TN shapes miss into the degraded bands.
+non-NT shapes (TT, TN, the mixed dual-row-major NN case) miss into the
+degraded bands.
 
 **NN swap.** The dual-N-contiguous problem runs as its transpose
 `E = B^T @ A^T` over swapped operands with an out-transposed epilogue
@@ -815,19 +817,21 @@ csrc/
 │   │   └── paged_prefill.cu          #   → module attn_paged_prefill
 │   ├── rotary_emb.cu                  # rotary embedding (kernel + binding in one file) → module rotary_emb
 │   ├── quantize/                        # quantize family (pure CUDA; checks.h is the torch-bound gate)
-│   │   ├── common.h                  #   FP8Format enum, sm_at_least + kMinSmForFp8 capability helpers, QuantLayout, QuantParams POD
+│   │   ├── common.h                  #   sm_at_least + kMinSmForFp8 capability helpers, QuantLayout, QuantParams POD (raw __nv_fp8_* types)
 │   │   ├── checks.h                  #   torch-bound entry validation (check_fp8_device over ATen-cached properties)
 │   │   ├── dequant.cuh               #   in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
 │   │   └── quantize.cuh              #   quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
 │   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
-│   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy
+│   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy + TileManifest
+│   │   ├── plan_table.h              #     AOT dispatch rows (TableRow): override/builtin/degraded row sources
 │   │   ├── load.cuh                  #     operand loaders (typed staged tiles over declared layouts, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
 │   │   ├── scheduler.cuh             #     grouped/plain raster mapping
 │   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
-│   │   ├── epilogue.cuh              #     fused bias + scale folding + bf16 scatter + copy-out
-│   │   └── gemm.cu                   #   quant_gemm binding + dtype-pair explicit instantiations (precision-ordered)
+│   │   ├── epilogue.cuh              #     fused bias + scale folding + bf16/fp32 smem scatter + copy-out
+│   │   ├── gemm_bf16_* / gemm_*.cu   #     per-pair explicit gemm_dispatch instantiation units
+│   │   └── gemm.cu                   #   quant_gemm binding + dtype-pair switch (module gemm; extern template decls)
 │   └── quantize/quantize.cu                  #   binding only (module quantize): validation, param packing, launch dispatch, pybind
 └── tests/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
@@ -838,4 +842,4 @@ csrc/
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-> Document Update Time: 2026-09-07
+> Document Update Time: 2026-09-09

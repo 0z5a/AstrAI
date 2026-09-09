@@ -1,18 +1,17 @@
 #pragma once
-// FP8 GEMM umbrella: the kernel orchestrator and the host-side launch
-// planning. Device layers live in gemm/ (policy / load / scheduler /
-// mainloop / epilogue) — pure CUDA, no torch; launchers are plain functions
-// shared by the torch binding and the C tests. Layout tags and the NN swap
-// semantics live in common.h and docs/developer/cuda_kernels.md.
+// GEMM-family umbrella (bf16 / int8 / fp8): the kernel orchestrator and the
+// host-side launch planning. Device layers live in gemm/ (policy / load /
+// scheduler / mainloop / epilogue) — pure CUDA, no torch; launchers are
+// plain functions shared by the torch binding and the C tests. Layout tags
+// and the NN swap semantics live in common.h and
+// docs/developer/cuda_kernels.md.
 
 #include <algorithm>
-#include <atomic>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <optional>
 #include <tuple>
 #include <type_traits>
@@ -20,12 +19,9 @@
 #include "common/pipeline.cuh"
 #include "common/device.cuh"
 #include "common/launch.cuh"
-#include "common/reduce.cuh"
 #include "epilogue.cuh"
-#include "quantize/common.h"
 #include "gemm/common.h"
 #include "gemm/plan_table.h"
-#include "load.cuh"
 #include "mainloop.cuh"
 #include "policy.cuh"
 #include "scheduler.cuh"
@@ -59,9 +55,9 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
                   Mainloop::RingA::Layout::kTotalBytes +
                   Mainloop::RingB::Layout::kTotalBytes,
                   "output tile must fit the reclaimed operand smem");
-    const int2 bn = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
+    const int2 blk = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
     Mainloop mainloop(gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
-                      threadIdx.x, bn);
+                      threadIdx.x, blk);
     typename Mainloop::AccTensor acc = {};  // C cells on the (mt, nt) grid
     mainloop.prologue();
     mainloop.accumulate(acc);
@@ -71,7 +67,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     // a thread racing into the epilogue scatters the output tile over
     // peers' still-in-flight staging writes. One barrier closes both.
     astrai::PipelineSync<Mainloop::kStages>{}.drain();
-    Epilogue(gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
+    Epilogue(gemm_smem, p, blk.x, blk.y, threadIdx.x).run(acc, out);
 }
 
 
@@ -122,17 +118,17 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     }
     __syncthreads();
 
-    const int2 bn = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
+    const int2 blk = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
     Mainloop mainloop(smem, static_cast<const typename Mainloop::ElemA*>(p.a_ptr),
                       static_cast<const typename Mainloop::ElemB*>(p.b_ptr), p.m,
-                      p.n, p.k, p.a_ld, p.b_ld, threadIdx.x, bn);
+                      p.n, p.k, p.a_ld, p.b_ld, threadIdx.x, blk);
     typename Mainloop::AccTensor acc = {};
     mainloop.prologue(tma);
     mainloop.accumulate(acc, tma);
     // No cp.async groups on this path; the CTA join alone releases the
     // rings for the epilogue's reclaim.
     __syncthreads();
-    Epilogue(smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
+    Epilogue(smem, p, blk.x, blk.y, threadIdx.x).run(acc, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -221,8 +217,8 @@ struct GemmPlan {
 };
 
 // One [gemm-plan] line naming the planner's decision (ASTR_GEMM_PLAN = 1):
-// the row source (forced recipe / table) or the last-resort step (model
-// fallback / degraded (no table)) that produced the plan.
+// the row source (forced recipe / table) or the last-resort degraded band
+// that produced the plan.
 inline void log_plan_decision(const char* src, const GemmParams& p,
                               const GemmPlan& plan) {
     if (!gemm_plan_log()) return;

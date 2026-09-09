@@ -1,14 +1,15 @@
-// fp8 x fp8 e4m3 instantiation unit. One gemm_dispatch specialization per
-// unit — see gemm_cases.h. (The C tests instantiate gemm_dispatch from the
-// headers directly, so no entry beyond the pair specialization is needed.)
-#include "gemm_cases.h"
+// fp8 x fp8 e4m3 instantiation unit. One explicit gemm_dispatch
+// instantiation per unit keeps the heavy template work in parallel nvcc
+// jobs; gemm.cu addresses the specialization through its extern template
+// declarations.
+#include "gemm.cuh"
 
 namespace astrai {
 namespace gemm {
 
-void gemm_fp8_e4m3_fp8_e4m3(GemmParams p, cudaStream_t s, bool ta, bool tb) {
-    gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(p, s, ta, tb);
-}
+template void gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(GemmParams,
+                                                          cudaStream_t, bool,
+                                                          bool);
 
 }  // namespace gemm
 }  // namespace astrai

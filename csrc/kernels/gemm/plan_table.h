@@ -8,9 +8,10 @@
 //   - the compiled-in GENERATED rows below (paste the row file the
 //     measurement script emits; the script never writes source).
 // An empty table makes every lookup miss and dispatch falls through to the
-// degraded band rows — or the cost model when ASTR_GEMM_MODEL_FALLBACK=1.
+// degraded band rows.
 // The sweep times the fused-linear (NT) layout, so pasted rows carry
-// crosswise 0: TT/TN shapes take the same degraded fallback.
+// crosswise 0: non-NT shapes (TT, TN, mixed dual-row-major) take the same
+// degraded fallback.
 
 #include <cstdint>
 #include <cstdio>
@@ -35,8 +36,9 @@ static constexpr int kTableRowK = 64;
 // same for n. perf_class is the GemmPerfClass id (0 W16A16 / 1 W8A16 /
 // 2 W8A8 / 3 F8A8; -1 = any): the same band can price a different
 // recipe per dtype class. crosswise is the crosswise-operand count of
-// the problem (0 = dual-congruous NT, 1 = TT and the NN swap, 2 = TN —
-// the (trans_a ? 1 : 0) + (trans_b ? 0 : 1) of gemm_dispatch; -1 = any).
+// the problem (0 = dual-congruous NT, 1 = TT, the NN swap and the mixed
+// dual-row-major NN case, 2 = TN — the
+// (trans_a ? 1 : 0) + (trans_b ? 0 : 1) of gemm_dispatch; -1 = any).
 // raster: 0 = plan_raster with this row's CTA geometry at launch time.
 struct TableRow {
     int64_t m_min;
@@ -138,12 +140,12 @@ inline const std::vector<TableRow>& plan_table_override_rows() {
 }
 
 // BEGIN GENERATED
-// Plan-model distillate (2026-09-09): plan_model's own (cta, stages)
-// decisions sampled on the 6-point grid 256/1024/4096 M x 512/2048 N
-// (w16a16 class only), one row per sampled point — the original tile-
-// division scheme as a table, exact on the sampled shapes. Replaces the
-// measured 125-row table BY USER DECISION. Pasted by hand; the measure-
-// ment script never writes source. NT layout only (crosswise 0).
+// Retired plan-model distillate (2026-09-09): the deleted cost model's own
+// (cta, stages) decisions sampled on the 6-point grid 256/1024/4096 M x
+// 512/2048 N (w16a16 class only), one row per sampled point — the original
+// tile-division scheme as a table, exact on the sampled shapes. Replaces
+// the measured 125-row table BY USER DECISION. Pasted by hand; the
+// measurement script never writes source. NT layout only (crosswise 0).
 static constexpr TableRow kBuiltinPlanTable[] = {
     {0, 640, 0, 1280, 0, 0, TileClass::kSmall64, 2, 0},
     {0, 640, 1280, 0, 0, 0, TileClass::kSmall64, 2, 0},
@@ -158,9 +160,7 @@ static constexpr int kBuiltinPlanTableCount =
 
 // Override file first, then the compiled-in rows. ASTR_GEMM_TABLE="-"
 // is the explicit "AOT off" escape hatch: neither override nor builtin
-// rows, so the planner runs the cost model (or the degraded bands when
-// ASTR_GEMM_MODEL_FALLBACK is unset). The sweep's "model" candidate uses
-// it now that builtin rows exist in the extension.
+// rows, so dispatch falls through to the degraded band rows (dev/bench).
 inline const TableRow* plan_table_lookup(const GemmParams& p, int perf_class,
                                          int crosswise) {
     const char* env = std::getenv("ASTR_GEMM_TABLE");

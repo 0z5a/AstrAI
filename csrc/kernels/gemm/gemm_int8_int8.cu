@@ -1,14 +1,14 @@
 // W8A8 instantiation unit: int8 x int8 (both scales; native s8 mma, s32
-// accumulators). One gemm_dispatch specialization per unit — see
-// gemm_cases.h.
-#include "gemm_cases.h"
+// accumulators). One explicit gemm_dispatch instantiation per unit keeps
+// the heavy template work in parallel nvcc jobs; gemm.cu addresses the
+// specialization through its extern template declarations.
+#include "gemm.cuh"
 
 namespace astrai {
 namespace gemm {
 
-void gemm_int8_int8(GemmParams p, cudaStream_t s, bool ta, bool tb) {
-    gemm_dispatch<int8_t, int8_t>(p, s, ta, tb);
-}
+template void gemm_dispatch<int8_t, int8_t>(GemmParams, cudaStream_t, bool,
+                                            bool);
 
 }  // namespace gemm
 }  // namespace astrai

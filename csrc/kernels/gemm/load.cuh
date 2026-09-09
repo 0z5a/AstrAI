@@ -6,10 +6,7 @@
 // docs/developer/cuda_kernels.md.
 
 #include "common/pipeline.cuh"
-#include "common/swizzle.cuh"
 #include "common/tensor.cuh"
-#include "gemm/common.h"
-#include "policy.cuh"
 
 namespace astrai {
 namespace gemm {

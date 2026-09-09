@@ -1,10 +1,10 @@
 // GEMM family binding (module `gemm`): the single quantized-GEMM entry
 // ``quant_gemm`` — every dtype pairing (bf16 / int8 / fp8 operands, per-
 // operand scales) dispatches over one dtype-generic kernel family. The
-// policy instantiation space compiles one TU per dtype pair (gemm_cases.h;
-// one gemm_dispatch specialization per unit), so the heavy template work
-// runs as parallel nvcc jobs. This TU keeps the dtype-pair switch + pybind;
-// the C tests instantiate from the headers instead.
+// policy instantiation space compiles one explicit instantiation per dtype
+// pair (one per .cu below), so the heavy template work runs as parallel
+// nvcc jobs. This TU keeps the dtype-pair switch + pybind; the C tests
+// instantiate from the headers instead.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -13,7 +13,7 @@
 #include <torch/extension.h>
 
 #include "common/device.cuh"
-#include "gemm_cases.h"
+#include "gemm.cuh"
 #include "quantize/checks.h"
 #include "quantize/common.h"
 
@@ -22,6 +22,27 @@ using namespace astrai::quant;
 
 namespace astrai {
 namespace gemm {
+
+// The per-pair specializations are explicitly instantiated in their own TUs
+// (gemm_bf16_bf16.cu etc.), one nvcc job per dtype pair. These extern
+// template declarations keep the bindings below from re-instantiating: the
+// address-of forms are references to the externally defined symbols only.
+// (They must sit here, outside the anonymous namespace — nvcc rejects
+// extern template declarations in an anonymous namespace.)
+extern template void gemm_dispatch<__nv_bfloat16, __nv_bfloat16>(
+    GemmParams, cudaStream_t, bool, bool);
+extern template void gemm_dispatch<__nv_bfloat16, int8_t>(
+    GemmParams, cudaStream_t, bool, bool);
+extern template void gemm_dispatch<int8_t, int8_t>(
+    GemmParams, cudaStream_t, bool, bool);
+extern template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>(
+    GemmParams, cudaStream_t, bool, bool);
+extern template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>(
+    GemmParams, cudaStream_t, bool, bool);
+extern template void gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(
+    GemmParams, cudaStream_t, bool, bool);
+extern template void gemm_dispatch<__nv_fp8_e5m2, __nv_fp8_e5m2>(
+    GemmParams, cudaStream_t, bool, bool);
 
 namespace {
 
@@ -94,13 +115,14 @@ torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
 // chain: each supported (activation, weight) pair selects its
 // gemm_dispatch specialization exactly once, and an unsupported pair raises
 // with the actual operand dtypes in the message instead of a hardcoded
-// list that can drift out of sync. The pair callbacks are the externs from
-// gemm_cases.h (each defined in its own instantiation unit), so the switch
-// is nothing but a jump table over resolved function pointers — no template
-// instantiation happens in this TU. pack_dtypes is constexpr, so every
-// case label is a compile-time constant and the switch lowers to one
-// indexed branch, no runtime-initialized state. The function is not
-// constexpr only because the default arm throws.
+// list that can drift out of sync. The specializations are explicitly
+// instantiated in their own TUs (one nvcc job per dtype pair), so the
+// switch is nothing but a jump table over resolved function pointers —
+// the extern template declarations above keep any re-instantiation out of
+// this TU. pack_dtypes is constexpr, so every case label is a compile-time
+// constant and the switch lowers to one indexed branch, no
+// runtime-initialized state. The function is not constexpr only because
+// the default arm throws.
 using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
 
 constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
@@ -111,19 +133,19 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
     switch (pack_dtypes(a, b)) {
         case pack_dtypes(torch::kBFloat16, torch::kBFloat16):
-            return gemm_bf16_bf16;
+            return &gemm_dispatch<__nv_bfloat16, __nv_bfloat16>;
         case pack_dtypes(torch::kBFloat16, torch::kChar):
-            return gemm_bf16_int8;
+            return &gemm_dispatch<__nv_bfloat16, int8_t>;
         case pack_dtypes(torch::kChar, torch::kChar):
-            return gemm_int8_int8;
+            return &gemm_dispatch<int8_t, int8_t>;
         case pack_dtypes(torch::kBFloat16, torch::kFloat8_e4m3fn):
-            return gemm_bf16_fp8_e4m3;
+            return &gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>;
         case pack_dtypes(torch::kBFloat16, torch::kFloat8_e5m2):
-            return gemm_bf16_fp8_e5m2;
+            return &gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>;
         case pack_dtypes(torch::kFloat8_e4m3fn, torch::kFloat8_e4m3fn):
-            return gemm_fp8_e4m3_fp8_e4m3;
+            return &gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>;
         case pack_dtypes(torch::kFloat8_e5m2, torch::kFloat8_e5m2):
-            return gemm_fp8_e5m2_fp8_e5m2;
+            return &gemm_dispatch<__nv_fp8_e5m2, __nv_fp8_e5m2>;
         default:
             TORCH_CHECK(false,
                         "unsupported operand dtype pair ", toString(a), " x ", toString(b),
