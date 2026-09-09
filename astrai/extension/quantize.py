@@ -54,8 +54,7 @@ import functools
 import threading
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from torch.library import Library
@@ -100,27 +99,27 @@ def quantize_act_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 # FP8: formats, recipes, per-tensor state
 # ---------------------------------------------------------------------------
 
-# Max representable value per FP8 format (E4M3: 448, E5M2: 57344).
-FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
+# FP8 format vocabulary: the canonical key is the fp8 dtype itself
+# (torch.float8_e4m3fn / torch.float8_e5m2 — what the quantize binding
+# dispatches and validates on). The only policy-level notion beyond a
+# dtype is the hybrid per-direction pair, carried as a plain (fwd, bwd)
+# tuple; dtype validation stays in the C++ binding.
 
 
-class FP8Format(str, Enum):
-    """Per-direction FP8 format. HYBRID = E4M3 forward / E5M2 backward."""
+def fp8_format_pair(fmt: Union[str, torch.dtype]) -> Tuple[torch.dtype, torch.dtype]:
+    """Format spec -> (fwd, bwd) fp8 dtype pair.
 
-    E4M3 = "e4m3"
-    E5M2 = "e5m2"
-    HYBRID = "hybrid"
-
-    def fwd(self) -> str:
-        return "e4m3" if self is FP8Format.HYBRID else self.value
-
-    def bwd(self) -> str:
-        return "e5m2" if self is FP8Format.HYBRID else self.value
+    A dtype is symmetric; ``'hybrid'`` is E4M3 forward / E5M2 backward
+    (the training default).
+    """
+    if fmt == "hybrid":
+        return (torch.float8_e4m3fn, torch.float8_e5m2)
+    return (fmt, fmt)
 
 
 @dataclass
 class FP8Recipe:
-    """Scale-from-amax policy: ``scale = (amax / FP8_MAX[fmt]) / 2^margin``.
+    """Scale-from-amax policy: ``scale = (amax / finfo(fmt).max) / 2^margin``.
 
     ``dynamic=False`` (default) is TE-style delayed scaling: max over the
     amax history window (amax from *previous* steps; the window trades
@@ -134,9 +133,9 @@ class FP8Recipe:
     margin: int = 0
     dynamic: bool = False
 
-    def scale_from_history(self, amax: torch.Tensor, fmt: str) -> torch.Tensor:
+    def scale_from_history(self, amax: torch.Tensor, fmt: torch.dtype) -> torch.Tensor:
         peak = amax.max()
-        return ((peak / FP8_MAX[fmt]) / (2**self.margin)).clamp_min(1e-12)
+        return ((peak / torch.finfo(fmt).max) / (2**self.margin)).clamp_min(1e-12)
 
 
 class _ScaleRing:
@@ -164,18 +163,18 @@ class _ScaleRing:
         """Rotate to the next history slot after metadata update."""
         self.idx = (self.idx + 1) % self.hist.numel()
 
-    def seed(self, t: torch.Tensor, fmt: str) -> None:
+    def seed(self, t: torch.Tensor, fmt: torch.dtype) -> None:
         amax = t.abs().amax().to(torch.float32).clamp_min(1e-12)
         self.hist.fill_(amax)
         self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
         self.initialized = True
 
-    def fold_args(self, fmt: str) -> dict:
+    def fold_args(self, fmt: torch.dtype) -> dict:
         """Keyword arguments for quantize()'s in-kernel history fold."""
         return {
             "ring_state": self.state,
             "hist_idx": self.idx,
-            "fp8_max": FP8_MAX[fmt],
+            "fp8_max": float(torch.finfo(fmt).max),
             "pow2_margin": float(2**self.recipe.margin),
         }
 
@@ -193,11 +192,12 @@ class FP8TensorMeta(NamedTuple):
 
 @dataclass(frozen=True)
 class _ActiveConfig:
-    """The immutable (enabled, recipe, format) triple of one open region."""
+    """The immutable (enabled, recipe, format-pair) triple of one open
+    region; ``fp8_format`` is the (fwd, bwd) fp8 dtype pair."""
 
     enabled: bool
     recipe: FP8Recipe
-    fp8_format: FP8Format
+    fp8_format: Tuple[torch.dtype, torch.dtype]
 
 
 # Thread-local active configuration (torch's autocast TLS analog): set by
@@ -223,7 +223,10 @@ class FP8State:
     def __init__(self):
         self.default_enabled = False
         self.default_recipe: FP8Recipe = FP8Recipe()
-        self.default_format: FP8Format = FP8Format.HYBRID
+        self.default_format: Tuple[torch.dtype, torch.dtype] = (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
         self._metas: Dict[tuple, FP8TensorMeta] = {}
 
     def get_weight_meta(self, w: torch.Tensor, recipe: FP8Recipe) -> FP8TensorMeta:
@@ -243,7 +246,7 @@ class FP8State:
         per-weight metas — a full state reset for tests / reconfiguration."""
         self.default_enabled = False
         self.default_recipe = FP8Recipe()
-        self.default_format = FP8Format.HYBRID
+        self.default_format = (torch.float8_e4m3fn, torch.float8_e5m2)
         self._metas.clear()
 
 
@@ -301,12 +304,12 @@ class fp8_autocast:
         enabled: bool = True,
         update_interval: int = 16,
         recipe: Optional[FP8Recipe] = None,
-        fp8_format: str = "hybrid",
+        fp8_format: Union[str, torch.dtype] = "hybrid",
         margin: int = 0,
     ):
         if recipe is None:
             recipe = FP8Recipe(history_len=update_interval, margin=margin)
-        self._config = _ActiveConfig(bool(enabled), recipe, FP8Format(fp8_format))
+        self._config = _ActiveConfig(bool(enabled), recipe, fp8_format_pair(fp8_format))
         self._tokens: List[Token] = []
 
     def __enter__(self) -> "fp8_autocast":
@@ -334,7 +337,9 @@ class fp8_autocast:
 # ---------------------------------------------------------------------------
 
 
-def _dynamic_scale(t: torch.Tensor, recipe: FP8Recipe, fmt: str) -> torch.Tensor:
+def _dynamic_scale(
+    t: torch.Tensor, recipe: FP8Recipe, fmt: torch.dtype
+) -> torch.Tensor:
     amax = t.abs().amax().to(torch.float32).clamp_min(1e-12)
     return recipe.scale_from_history(amax, fmt)
 
@@ -360,7 +365,7 @@ def fp8_linear_forward(
     state = fp8_state()
     if cfg is None:
         cfg = _current_config()
-    fmt = cfg.fp8_format.fwd()
+    fmt = cfg.fp8_format[0]  # fwd dtype of the active format pair ([1] = bwd)
     if cfg.recipe.dynamic:
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), cfg.recipe, fmt)
         sw = _dynamic_scale(w, cfg.recipe, fmt)
@@ -424,7 +429,7 @@ class _LinearFp8(torch.autograd.Function):
         cfg = _current_config()
         out, sx, sw = fp8_linear_forward(x, w, bias, cfg)
         ctx.save_for_backward(x, w, sx, sw)
-        ctx.fmt_bwd = cfg.fp8_format.bwd()
+        ctx.fmt_bwd = cfg.fp8_format[1]
         ctx.recipe = cfg.recipe
         ctx.is_dynamic = cfg.recipe.dynamic
         ctx.meta = None if ctx.is_dynamic else _state.get_weight_meta(w, cfg.recipe)

@@ -12,32 +12,8 @@
 namespace astrai {
 namespace quant {
 
-// Compile-time FP8 format: E4M3 (forward, max 448) or E5M2 (gradients,
-// max 57344).
-enum class FP8Format : int {
-    E4M3 = 0,
-    E5M2 = 1,
-};
-
-// The format enum (binding-facing dispatch key) -> the __nv_fp8 element
-// type (the kernel/traits key). Primary template undefined: an unmapped
-// format is a compile error at the use site, never a silent e4m3
-// fallback. Shared across the family — gemm/policy.cuh aliases this.
-template <FP8Format Fmt>
-struct fp8_elem;
-
-template <>
-struct fp8_elem<FP8Format::E4M3> {
-    using type = __nv_fp8_e4m3;
-};
-
-template <>
-struct fp8_elem<FP8Format::E5M2> {
-    using type = __nv_fp8_e5m2;
-};
-
-template <FP8Format Fmt>
-using fp8_elem_t = typename fp8_elem<Fmt>::type;
+// FP8 formats are the raw element types (__nv_fp8_e4m3 / __nv_fp8_e5m2);
+// the bindings name them directly from the output dtype — no format enum.
 
 // Compute-capability comparison: is the device at least (major, minor)?
 inline bool sm_at_least(int device_major, int device_minor, int major,

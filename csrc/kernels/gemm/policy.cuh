@@ -3,8 +3,7 @@
 // single Policy type the kernel and collectives take (CUTLASS-style
 // consolidation of traits + layout tags + scheduling knobs). Dtype-generic:
 // parameterized on the operand element type; the per-dtype facts come from
-// gemm_elem_traits (gemm/common.h). The fp8 names below are thin aliases
-// over FP8Format for the binding's format dispatch.
+// gemm_elem_traits (gemm/common.h).
 
 #include <cuda_fp8.h>
 #include <tuple>
@@ -17,13 +16,6 @@
 
 namespace astrai {
 namespace gemm {
-
-using quant::FP8Format;
-
-// Operand element type for one fp8 format: the quantize family's shared
-// enum->type map (quantize/common.h, primary undefined — an unmapped
-// format fails at compile time).
-using quant::fp8_elem_t;
 
 // Compile-time tile configuration, mirroring KernelTraits in the attention
 // kernels: the CTA tile and warp tiling arrive as Shape types, the

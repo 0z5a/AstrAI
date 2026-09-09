@@ -256,7 +256,7 @@ constexpr bool kCaseFast =
     !std::is_same_v<LA, ColMajor> && !std::is_same_v<LB, RowMajor>;
 template <typename LA, typename LB, int kK, int Stages>
 using CasePolicy = GemmPolicy<
-    fp8_elem_t<FP8Format::E4M3>, fp8_elem_t<FP8Format::E4M3>, LA, LB,
+    __nv_fp8_e4m3, __nv_fp8_e4m3, LA, LB,
     GemmTileConfig<Shape<128, 128, kK>, Shape<64, 32>, Stages, kCaseFast<LA, LB>>,
     RowMajor, __nv_bfloat16>;
 
@@ -272,11 +272,11 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
             // dedicated instantiation — canonicalize_gemm swaps to the
             // transposed <ColMajor, ColMajor> kernel with its out-transposed
             // epilogue (see gemm.cuh).
-            gemm<FP8Format::E4M3>(p, 0, false, false);
+            gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(p, 0, false, false);
         else if (dispatch == 2)
             // Production route, NT: exercises plan_gemm's small/narrow/big
             // selection for this shape.
-            gemm<FP8Format::E4M3>(p, 0, false, true);
+            gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(p, 0, false, true);
         else
             launch_policy<CasePolicy<LA, LB, kK, Stages>>(p, 0);
     };

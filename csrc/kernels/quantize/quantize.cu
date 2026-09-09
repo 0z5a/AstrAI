@@ -17,18 +17,18 @@ namespace {
 // Dtype dispatch over the unified quantize launcher: one case per
 // supported input dtype; the default is a hard error (entry-checked, so
 // unreachable — never a silent bf16 re-route).
-template <bool Tiled, FP8Format Fmt>
+template <bool Tiled, typename Fp8T>
 void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
                       cudaStream_t stream) {
     switch (x.scalar_type()) {
     case torch::kBFloat16:
-        launch_fp8_quantize<Fmt, __nv_bfloat16, Tiled>(p, stream);
+        launch_fp8_quantize<Fp8T, __nv_bfloat16, Tiled>(p, stream);
         break;
     case torch::kHalf:
-        launch_fp8_quantize<Fmt, __half, Tiled>(p, stream);
+        launch_fp8_quantize<Fp8T, __half, Tiled>(p, stream);
         break;
     case torch::kFloat32:
-        launch_fp8_quantize<Fmt, float, Tiled>(p, stream);
+        launch_fp8_quantize<Fp8T, float, Tiled>(p, stream);
         break;
     default:
         TORCH_CHECK(false, "unsupported quantize input dtype: ",
@@ -40,9 +40,9 @@ template <bool Tiled>
 void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
                          bool e5m2, cudaStream_t stream) {
     if (e5m2)
-        launch_for_dtype<Tiled, FP8Format::E5M2>(x, p, stream);
+        launch_for_dtype<Tiled, __nv_fp8_e5m2>(x, p, stream);
     else
-        launch_for_dtype<Tiled, FP8Format::E4M3>(x, p, stream);
+        launch_for_dtype<Tiled, __nv_fp8_e4m3>(x, p, stream);
 }
 
 // Shared binding body for the two quantize entry points: RowMajor /
@@ -54,17 +54,19 @@ void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
 // kernel runs a pure scale+cast (no fused amax: p.amax stays null) and the
 // returned amax is None; callers that need one measure it themselves
 // (dynamic scaling), matching the TE-delayed versus torchao-dynamic split.
-py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
-                         QuantLayout layout, py::object ring, int64_t hist_idx,
-                         double fp8_max, double pow2_margin) {
+py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
+                         at::ScalarType out_dtype, QuantLayout layout,
+                         py::object ring, int64_t hist_idx, double fp8_max,
+                         double pow2_margin) {
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 ||
                     x.scalar_type() == torch::kHalf ||
                     x.scalar_type() == torch::kFloat32,
                 "x must be bf16, fp16 or fp32");
-    TORCH_CHECK(fmt == static_cast<int64_t>(FP8Format::E4M3) ||
-                    fmt == static_cast<int64_t>(FP8Format::E5M2),
-                "unsupported quantization type: expected E4M3 (0) or E5M2 (1)");
+    TORCH_CHECK(out_dtype == torch::kFloat8_e4m3fn ||
+                    out_dtype == torch::kFloat8_e5m2,
+                "unsupported quantize output dtype: expected "
+                "float8_e4m3fn or float8_e5m2");
     TORCH_CHECK(layout == QuantLayout::RowMajor || x.dim() >= 2,
                 "transposed quantize layouts need a 2D+ tensor");
     TORCH_CHECK(scale.is_cuda() && scale.device() == x.device() &&
@@ -74,8 +76,7 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
     const at::cuda::OptionalCUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     auto input = x.contiguous();
-    auto out_opts = input.options().dtype(
-        fmt ? torch::kFloat8_e5m2 : torch::kFloat8_e4m3fn);
+    auto out_opts = input.options().dtype(out_dtype);
     torch::Tensor amax;
     float *ring_hist = nullptr, *ring_scale_out = nullptr;
     unsigned int* ring_done = nullptr;
@@ -123,7 +124,7 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
         output_t = torch::empty({input.size(-1), input.size(-2)}, out_opts);
         p.output_transposed_ptr = output_t.data_ptr();
     }
-    const bool e5m2 = fmt == static_cast<int64_t>(FP8Format::E5M2);
+    const bool e5m2 = out_dtype == torch::kFloat8_e5m2;
     if (layout == QuantLayout::RowMajor)
         launch_quantize_for<false>(input, p, e5m2, stream.stream());
     else
@@ -141,32 +142,33 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale, int64_t fmt,
 // transpose when transposed is set — the K-contiguous operand orientation
 // NT GEMMs want. Returns (x8|x8T, amax); amax is the ring's self-cleaned
 // slot when ring_state is given, else None (pure scale+cast).
-py::object quantize(torch::Tensor x, torch::Tensor scale, int64_t fmt,
-                    bool transposed, py::object ring, int64_t hist_idx,
-                    double fp8_max, double pow2_margin) {
+py::object quantize(torch::Tensor x, torch::Tensor scale,
+                    at::ScalarType dtype, bool transposed, py::object ring,
+                    int64_t hist_idx, double fp8_max, double pow2_margin) {
     const QuantLayout layout =
         transposed ? QuantLayout::Transposed : QuantLayout::RowMajor;
-    return quantize_impl(x, scale, fmt, layout, ring, hist_idx, fp8_max,
+    return quantize_impl(x, scale, dtype, layout, ring, hist_idx, fp8_max,
                          pow2_margin);
 }
 
 // Dual-orientation quantize binding: one read of x produces both the
 // row-major x8 and its transpose (plus amax), for tensors consumed by GEMMs
 // in both orientations (backward g). Returns (x8, x8T, amax), amax as above.
-py::object quantize_dual(torch::Tensor x, torch::Tensor scale, int64_t fmt,
-                         py::object ring, int64_t hist_idx, double fp8_max,
+py::object quantize_dual(torch::Tensor x, torch::Tensor scale,
+                         at::ScalarType dtype, py::object ring,
+                         int64_t hist_idx, double fp8_max,
                          double pow2_margin) {
-    return quantize_impl(x, scale, fmt, QuantLayout::Dual, ring, hist_idx,
+    return quantize_impl(x, scale, dtype, QuantLayout::Dual, ring, hist_idx,
                          fp8_max, pow2_margin);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"),
-          py::arg("fmt"), py::arg("transposed") = false,
+          py::arg("dtype"), py::arg("transposed") = false,
           py::arg("ring") = py::none(), py::arg("hist_idx") = 0,
           py::arg("fp8_max") = 448.0, py::arg("pow2_margin") = 1.0);
     m.def("quantize_dual", &quantize_dual, py::arg("x"), py::arg("scale"),
-          py::arg("fmt"), py::arg("ring") = py::none(),
+          py::arg("dtype"), py::arg("ring") = py::none(),
           py::arg("hist_idx") = 0, py::arg("fp8_max") = 448.0,
           py::arg("pow2_margin") = 1.0);
 }

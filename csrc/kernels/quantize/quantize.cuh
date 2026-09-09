@@ -2,11 +2,11 @@
 // FP8 quantize device code — pure CUDA, no torch: kernels take the
 // QuantParams POD while the fp8 element type, input type and Dual
 // orientation ride on template parameters, and the launcher is shared by
-// the torch binding and the C tests. Per-dtype/per-format facts live in
-// one traits specialization each (primary templates undefined — an
-// unsupported dtype or format is a compile error, never a silent
-// fallback), keyed on types; the FP8Format enum maps to the fp8 type
-// once, at the launcher.
+// the torch binding and the C tests. Per-dtype facts live in one traits
+// specialization each (primary templates undefined — an unsupported
+// dtype is a compile error, never a silent fallback), keyed on the fp8
+// element type; the bindings name the raw __nv_* types from the output
+// dtype directly — no format enum.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -94,8 +94,8 @@ struct quant_in_traits<float> {
     }
 };
 
-// FP8 convert traits, keyed on the fp8 element type (fp8_elem_t maps the
-// format enum once, at the launcher): round-nearest-even + satfinite, one
+// FP8 convert traits, keyed on the fp8 element type (one specialization
+// per format): round-nearest-even + satfinite, one
 // float -> one byte and one pair -> one packed fp8x2 word. Primary
 // template undefined; one specialization per format.
 namespace detail {
@@ -315,15 +315,15 @@ __global__ void fp8_quantize_tiled_kernel(QuantParams p) {
 }
 
 // Unified quantize launcher: Tiled selects the transpose kernel
-// (QuantLayout::Transposed/Dual) over the vectorized elementwise one. The
-// format enum maps to the fp8 element type once here — kernels and traits
-// are keyed on the type — and Dual picks the tiled instantiation with the
-// row-major store (Transposed compiles it out). The transpose kernel
-// vectorizes loads in-kernel and falls back to scalar loads at
-// unaligned/ragged rows, so the host side picks only the grid.
-template <FP8Format Fmt, typename InT, bool Tiled = false>
+// (QuantLayout::Transposed/Dual) over the vectorized elementwise one.
+// Kernels and traits are keyed on the fp8 element type (the launcher's
+// template parameter — the bindings name the raw types); Dual picks the
+// tiled instantiation with the row-major store (Transposed compiles it
+// out). The transpose kernel vectorizes loads in-kernel and falls back to
+// scalar loads at unaligned/ragged rows, so the host side picks only the
+// grid.
+template <typename Fp8T, typename InT, bool Tiled = false>
 void launch_fp8_quantize(const QuantParams& p, cudaStream_t stream) {
-    using Fp8T = fp8_elem_t<Fmt>;
     if constexpr (Tiled) {
         const dim3 grid((p.cols + 63) / 64, (p.rows + 31) / 32);
         if (grid.x == 0 || grid.y == 0) return;

@@ -12,8 +12,10 @@ binding's TORCH_CHECKs.
   → FP8 with fused amax (``transposed`` picks the orientation; arity is fixed)
 - ``quantize_dual(x, scale, fmt) -> (x8, x8T, amax)`` — both orientations, one read
 
-``scale`` is the quantization multiplier (device scalar); ``fmt`` is
-``"e4m3"`` or ``"e5m2"``. ``amax`` is *produced only by the delayed-scaling
+``scale`` is the quantization multiplier (device scalar); ``fmt`` is the fp8
+output dtype (``torch.float8_e4m3fn`` / ``torch.float8_e5m2``) — the binding
+validates and dispatches on the dtype itself. ``amax`` is *produced only by
+the delayed-scaling
 ring fold* (the kernel's fused reduction) or measured by the caller; the
 returned value is the ring's self-cleaned slot when ``ring_state`` is given,
 else ``None`` (the kernel runs a pure scale+cast — no fused-amax pass).
@@ -28,21 +30,11 @@ import torch
 
 from astrai.extension.loader import get_module
 
-# fmt string -> kernel int (0 = E4M3, 1 = E5M2)
-_FMT_TO_INT = {"e4m3": 0, "e5m2": 1}
-
-
-def _fmt_int(fmt: str) -> int:
-    try:
-        return _FMT_TO_INT[fmt]
-    except KeyError:
-        raise ValueError(f"unsupported fp8 format {fmt!r} (expected 'e4m3' or 'e5m2')")
-
 
 def quantize(
     x: torch.Tensor,
     scale: torch.Tensor,
-    fmt: str = "e4m3",
+    fmt: torch.dtype = torch.float8_e4m3fn,
     transposed: bool = False,
     ring_state: Optional[torch.Tensor] = None,
     hist_idx: int = 0,
@@ -51,8 +43,9 @@ def quantize(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Float (bf16/fp16/fp32) -> FP8 quantize (scale-then-cast).
 
-    ``scale`` is the quantization multiplier (device scalar); ``fmt`` selects
-    E4M3 or E5M2. ``transposed=True`` swaps ``x8`` for ``x8T``, the
+    ``scale`` is the quantization multiplier (device scalar); ``fmt`` is the
+    fp8 output dtype (E4M3 or E5M2) — the binding validates and dispatches
+    on it. ``transposed=True`` swaps ``x8`` for ``x8T``, the
     ``[cols][rows]`` row-major transpose of the quantized input — the
     K-contiguous operand orientation NT GEMMs want — at the same 2-tuple
     arity.
@@ -71,7 +64,7 @@ def quantize(
     return get_module("quantize").quantize(
         x,
         scale,
-        _fmt_int(fmt),
+        fmt,
         transposed,
         ring_state,
         hist_idx,
@@ -83,7 +76,7 @@ def quantize(
 def quantize_dual(
     x: torch.Tensor,
     scale: torch.Tensor,
-    fmt: str = "e4m3",
+    fmt: torch.dtype = torch.float8_e4m3fn,
     ring_state: Optional[torch.Tensor] = None,
     hist_idx: int = 0,
     fp8_max: float = 448.0,
@@ -100,7 +93,7 @@ def quantize_dual(
     return get_module("quantize").quantize_dual(
         x,
         scale,
-        _fmt_int(fmt),
+        fmt,
         ring_state,
         hist_idx,
         fp8_max,
