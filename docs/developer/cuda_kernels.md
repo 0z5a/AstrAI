@@ -59,6 +59,7 @@ layered directory:
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16 smem scatter + coalesced copy-out |
 | `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_congruous` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
+| `gemm/plan_table.h` | AOT dispatch rows: (M, N) band × dtype class → measured recipe winner (`TableRow`; band-parse + lookup, `ASTR_GEMM_TABLE` override or the compiled-in rows) — `plan_gemm` consults them before the cost model (planning section below) |
 | `quantize/quantize.cu` | binding only: entry checks (`checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
@@ -318,6 +319,55 @@ L20 ladder's mid/large-M narrow picks with the big CTA and its sub-wave
 small picks with s2: benchmark_w8 over the llama shapes totals
 −5.3% (W16A16) / −1.3% (W8A16) / −1.5% (W8A8) vs the retired ladder
 with no case regressing >3%.
+
+**AOT dispatch table** (`plan_table.h`): the table is the production
+planner — `plan_gemm` consults a measured row table first: (M, N) bands
+(min exclusive, max inclusive, 0 = open), keyed per dtype class /
+crosswise count, each row naming a recipe (CTA class + ring depth;
+raster 0 = `plan_raster` with the row's geometry). `plan_gemm` is a
+data-driven chain of row sources in precedence order —
+`ASTR_GEMM_RECIPE=big|narrow|small` (one synthetic open row) first, then
+the AOT table — with `plan_from_row` as the single interpreter:
+geometry from the CTA class, ring depth from the row, raster 0 =
+`plan_raster` at the row's geometry, and one smem gate (a row whose ring
+exceeds the smem opt-in ceiling is a stale tuning artifact — the next
+source runs instead of a failed launch). A miss falls to the degraded
+band rows — last-resort M-band geometry (small ≤ 512, narrow ≤ 3072,
+big beyond), always matching, so planning is a total function — because
+the cost model is retired from production. `ASTR_GEMM_MODEL_FALLBACK=1`
+re-enables the model between the table and the degraded rows as the
+dev/bench reference; full-coverage tables end each class with a
+catch-all row, so a miss means the table is empty or stale, not a shape
+to model. Rows come
+from two sources, override first: `ASTR_GEMM_TABLE=/path/to/plan_table.txt`
+(one row per line, `m_min m_max n_min n_max perf_class crosswise cta
+stages raster`; re-parsed only when the env path changes) and the
+compiled-in rows pasted manually between the GENERATED markers (the
+measurement script only emits the row file; a rebuild picks the rows up).
+The sweep times every
+combo × recipe at the M × shape grid — `ASTR_GEMM_RECIPE=big|narrow|small`
+forces one CTA class (the calibration knob; re-read on every launch, so
+the generator interleaves the four candidates at each shape and the
+comparison shares one GPU clock/thermal state — sweeping whole recipe
+batches in separate processes measured the big CTA first and the small
+CTA 30 minutes later, under different boost states, and picked
+systematically wrong winners), winners per point become rows,
+adjacent M runs with the same winner band-merge at mid-point edges. The
+model-retention mode (`--min-gain`, default 1%) rows only leads above a
+minimum gain and keeps the cost model elsewhere; the
+production mode (`--full-coverage`) rows every band, resolves ties by
+the stable big>narrow>small preference and appends the per-class
+catch-all. K is not a row key (the ring K is fixed at 64): a K/batch
+conflict at one (M, N) resolves to the best-tflops point.
+`ASTR_GEMM_PLAN` logs the decision source (`forced recipe` / `table` /
+`model fallback` / `degraded (no table)`); the row-format details
+are exercised indirectly by the correctness suite
+(the production route runs through the hooked planner) and by the
+smem gate, which turns a stale row into the next source instead of
+a launch failure. The sweep times the fused-linear (NT) layout, so
+generated rows carry crosswise 0 — the table covers the NT path;
+TT/TN shapes miss into the degraded bands (or the model, with the
+dev knob).
 
 **NN swap.** The dual-N-contiguous problem runs as its transpose
 `E = B^T @ A^T` over swapped operands with an out-transposed epilogue

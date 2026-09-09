@@ -13,6 +13,8 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 
@@ -23,6 +25,7 @@
 #include "epilogue.cuh"
 #include "quantize/common.h"
 #include "gemm/common.h"
+#include "gemm/plan_table.h"
 #include "load.cuh"
 #include "mainloop.cuh"
 #include "policy.cuh"
@@ -30,8 +33,6 @@
 
 namespace astrai {
 namespace gemm {
-
-using quant::FP8Format;
 
 // The ONE quantized-GEMM orchestrator (cp.async staging).
 template <typename Policy>
@@ -240,6 +241,19 @@ struct GemmPlan {
     int raster;  // GemmParams::raster value this launch runs
 };
 
+// One [gemm-plan] line naming the planner's decision (ASTR_GEMM_PLAN = 1):
+// the row source (forced recipe / table) or the last-resort step (model
+// fallback / degraded (no table)) that produced the plan.
+inline void log_plan_decision(const char* src, const GemmParams& p,
+                              const GemmPlan& plan) {
+    if (!gemm_plan_log()) return;
+    std::fprintf(stderr,
+                 "[gemm-plan] %s m%lld n%lld k%lld b=%d -> cta%d s%d "
+                 "raster %d\n",
+                 src, (long long)p.m, (long long)p.n, (long long)p.k, p.batch,
+                 (int)plan.cta, plan.stages, plan.raster);
+}
+
 // Raster order. Direction follows the tile aspect (walk the dimension with
 // more tiles fastest, CUTLASS's rule): the N-side mirrored group keeps the
 // measured width 8. The M-side group width is humming's L2-budget rule
@@ -383,17 +397,37 @@ inline GemmPlan plan_congruous(const GemmParams& p, const DeviceFacts& dev,
                     plan_raster(p, best->bm, best->bn, ba, bb, dev)};
 }
 
-// crosswise_ops counts the operands taking the direct crosswise load
-// (A ColMajor / B RowMajor storage): 0 = dual-congruous NT, 1 = TN and the
-// NN swap, 2 = TT. ba / bb are the operand element sizes; perf is the
-// dtype class picking the planner's eff row. The padding gate and the
-// crosswise ladder stay measured rules (the crosswise load path prices
-// differently: the small CTA hides its LDG+PRMT latency, the big CTA's
-// operand reuse wins once its grid fills ~1.5 waves); the congruous path
-// runs the wave-count model.
-inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
-                          GemmPerfClass perf, int crosswise_ops = 0) {
-    const DeviceFacts dev = device_facts();
+// A row is a plan: its CTA class names the manifest geometry (resolved at
+// launch through dispatch_tile), the ring depth rides on the row, raster 0
+// means "plan_raster for this row's geometry". A row whose ring exceeds
+// the smem opt-in ceiling is a stale tuning artifact — no plan from that
+// row, the caller tries the next source.
+inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
+                                             const GemmParams& p, int ba,
+                                             int bb, const DeviceFacts& dev) {
+    int bm, bn;
+    plan_row_geometry(row.cta, bm, bn);
+    if (ring_smem_bytes(bm, bn, kTableRowK, row.stages, ba, bb) > dev.smem_max)
+        return std::nullopt;
+    return GemmPlan{row.cta, row.stages,
+                    row.raster != 0 ? row.raster
+                                    : plan_raster(p, bm, bn, ba, bb, dev)};
+}
+
+// ASTR_GEMM_MODEL_FALLBACK=1: re-enable the cost model for a missing
+// table row. Off by default — the AOT table owns production dispatch
+// (full-coverage rows end with a catch-all row, so the model no longer
+// runs); this knob is the dev/bench escape hatch.
+inline bool gemm_model_fallback_enabled() {
+    static const bool on = std::getenv("ASTR_GEMM_MODEL_FALLBACK") != nullptr;
+    return on;
+}
+
+// The retired cost-model body, kept for ASTR_GEMM_MODEL_FALLBACK and as
+// the reference planner the table's measurements were derived from.
+inline GemmPlan plan_model(const GemmParams& p, int ba, int bb,
+                           GemmPerfClass perf, int crosswise_ops,
+                           const DeviceFacts& dev) {
     // Feasibility gates shared by the branches below: a recipe over the
     // device's smem opt-in ceiling demotes to the next fitting geometry
     // instead of failing the launch. Both are always true on the
@@ -418,6 +452,47 @@ inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
         return small(true);
     }
     return plan_congruous(p, dev, ba, bb, perf);
+}
+
+// crosswise_ops counts the operands taking the direct crosswise load
+// (A ColMajor / B RowMajor storage): 0 = dual-congruous NT, 1 = TT and
+// the NN swap, 2 = TN. ba / bb are the operand element sizes; perf is
+// the dtype class picking the planner's eff row.
+inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
+                          GemmPerfClass perf, int crosswise_ops = 0) {
+    const DeviceFacts dev = device_facts();
+    // The dispatch strategy is the sources table: precedence is array
+    // order (calibration knob > AOT table), and plan_from_row smem-gates
+    // every row, so a stale tuning ring demotes to the next source. The
+    // cost model is the one procedural step, dev-only; production
+    // dispatch is the table — full-coverage tables end each (class,
+    // crosswise) group with an open row, so the degraded rows fire only
+    // when the table is empty, stale, or never measured the shape's
+    // layout class (the sweep is NT-only).
+    static constexpr TableSource kRowSources[] = {
+        {"forced recipe", env_recipe_row},
+        {"table", table_row},
+    };
+    for (const TableSource& s : kRowSources) {
+        if (auto row = s.find(p, (int)perf, crosswise_ops); row) {
+            if (auto plan = plan_from_row(*row, p, ba, bb, dev)) {
+                log_plan_decision(s.name, p, *plan);
+                return *plan;
+            }
+        }
+    }
+    if (gemm_model_fallback_enabled()) {
+        GemmPlan plan = plan_model(p, ba, bb, perf, crosswise_ops, dev);
+        log_plan_decision("model fallback", p, plan);
+        return plan;
+    }
+    // The degraded bands are open on N with -1 keys, so a row always
+    // matches and planning stays a total function (degraded_row_for
+    // covers the degenerate m=0); the smem gate cannot demote them — the
+    // s2 64x64 ring is the floor every supported device fits.
+    GemmPlan plan = *plan_from_row(degraded_row_for(p.m), p, ba, bb, dev);
+    log_plan_decision("degraded (no table)", p, plan);
+    return plan;
 }
 
 // Grid + launch for one concrete Policy — the only place a GEMM kernel
@@ -662,7 +737,7 @@ inline void canonicalize_gemm(GemmParams& p, bool& trans_a, bool& trans_b) {
 
 // Dtype-generic entry point: canonicalize the problem, plan the launch,
 // wire the layout tags through. ElemA / ElemB / OutT are independent
-// knobs; fp8-format callers go through the wrapper below.
+// knobs; the fp8 pairs enter with their element types directly.
 //
 // Symmetric and mixed dtypes share this fan-out; the one asymmetry is NN
 // (dual row-major storage): the swap rewrite exchanges operand roles and
@@ -709,14 +784,6 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
         if constexpr (!kSymmetric)
             launch_plan<ElemA, ElemB, RowMajor, RowMajor, RowMajor, OutT>(p, plan, stream);
     }
-}
-
-// fp8-format entry over the generic dispatch (fp8_elem_t maps Fmt -> type;
-// bf16 output is the fused-linear convention).
-template <FP8Format Fmt>
-void gemm(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
-    using ElemT = fp8_elem_t<Fmt>;
-    gemm_dispatch<ElemT, ElemT>(p, stream, trans_a, trans_b);
 }
 
 }  // namespace gemm
