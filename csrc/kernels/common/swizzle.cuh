@@ -1,39 +1,19 @@
-// Unified staging-swizzle vocabulary, CUTLASS-style (cute): a swizzle is a
-// TYPE composed with a layout into the staged tile's address map —
+// Unified staging-swizzle vocabulary, CUTLASS-style: a swizzle is a TYPE
+// composed with a layout into the staged tile's address map — "a bijection
+// over the LINEAR 16B-chunk index, Swizzle<Bits,Shift>{}(L) = L ^
+// ((L>>Shift)&(2^Bits-1))" applied to the row-major chunk layout. One
+// declared instance per staged tile names the whole map (loaders, fragment
+// readers and lane-offset mirrors consume the same type), so every staged
+// tile is one (Bits, Shift) pair:
 //
-//   using SmemLayoutA = decltype(
-//       composition(Swizzle<Bits, Shift>{},
-//                   Layout<Shape<Rows, Chunks>, Stride<Chunks, 1>>{}));
+//   congruous tile 2B elems: <3,3> (TMA SWIZZLE_128B); 1B elems: <2,3> (64B);
+//   crosswise trans tile:    <3, log2 chunks>; epilogue wide-row: <log2, log2>
 //
-// where the functor is a bijection over the LINEAR 16B-chunk index,
-//
-//   Swizzle<Bits, Shift>{}(L)  =  L ^ ((L >> Shift) & (2^Bits - 1))
-//
-// (cute measures the offset in elements; 16B chunks keep one (Bits, Shift)
-// pair dtype-independent), and the layout the row-major map — the one
-// fixed point of cute's layout algebra every staging site here is. One
-// declared instance per staged tile names the whole map: the stage
-// loaders, the fragment readers and the folded lane-offset mirrors all
-// consume the same type. Every staged tile in the kernel families is one
-// (Bits, Shift) pair (the XOR stays inside the low chunk field, so the
-// row bits never carry):
-//
-//   congruous operand tile, 2B elems: <3, 3>  — the TMA SWIZZLE_128B pattern
-//   congruous operand tile, 1B elems: <2, 3>  — the TMA SWIZZLE_64B pattern
-//   crosswise trans tile (16-bit):    <3, log2 chunks> — custom
-//   epilogue wide-row tile:           <log2 chunks, log2 chunks> — custom
-//
-// The Shift == 3 members ARE the hardware TMA swizzle modes (Bits 1/2/3 =
-// 32/64/128B spans) — kTmaMode marks them, the gate for any future TMA
-// staging; the descriptor's swizzle enum derives from the same Bits.
-// (TMA applies the XOR to the ABSOLUTE shared-memory address, so a TMA
-// consumer either aligns the tile to 1024B or phases the index by the
-// tile's own address bits.) Every application folds to one IMAD plus one
-// XOR immediate; the vocabulary is zero-cost.
-//
-// The Shape/Stride extent vocabulary this layer's layouts are written in
-// lives in shape.cuh (shared with the policy and mma trait layers); only
-// the swizzle-specific carriers are defined here.
+// The Shift==3 members ARE the hardware TMA swizzle modes — kTmaMode marks
+// them (the descriptor derives its enum from the same Bits; TMA applies the
+// XOR to the ABSOLUTE smem address, so consumers align the tile to 1024B or
+// phase by the tile's address bits). The vocabulary costs one IMAD + one XOR
+// per use. Extent vocabulary (Shape/Stride) lives in shape.cuh.
 
 #pragma once
 
@@ -50,17 +30,14 @@ struct Swizzle {
     static constexpr int kBits = Bits;
     static constexpr int kShift = Shift;
     static constexpr uint32_t kMask = (uint32_t(1) << Bits) - 1;
-    // The Shift==3 members are exactly the TMA swizzle modes.
     static constexpr bool kTmaMode = Shift == 3 && Bits >= 1 && Bits <= 3;
     __device__ __forceinline__ uint32_t operator()(uint32_t linear) const {
         return linear ^ ((linear >> Shift) & kMask);
     }
 };
 
-// Layout carriers: the Shape above (see shape.cuh) carries the extents,
-// Stride the affine
-// map. All staged tiles are row-major 16B-chunk grids, so the row stride
-// is the chunk count and the column stride one.
+// Layout carriers: Shape carries extents, Stride the affine map. All staged
+// tiles are row-major packed 16B-chunk grids (row stride = chunk count).
 template <int... Ns>
 struct Stride;
 
@@ -79,24 +56,17 @@ struct Layout<Shape<Rows, Chunks>, Stride<RowStride, ColStride>> {
     }
 };
 
-// composition(Swizzle, Layout) — cute's composed-layout idiom: the swizzle
-// bijection applied to the layout's offset. operator() is the composition
-// pre-folded to its closed two-coordinate form, chunk' = (chunk & ~kMask) |
-// ((chunk ^ (row >> kRowShift)) & kMask): for every chunk < kChunks the
-// swizzle's XOR value ((L >> Shift) & kMask — row bits) is narrower than
-// the chunk field, so it never spills into the row term — identical map to
-// Swz{}(LayT{}(row, chunk)), but the XOR derives from the row ALONE and
+// composition(Swizzle, Layout): the swizzle bijection pre-folded to its
+// closed two-coordinate form, chunk' = (chunk & ~kMask) | ((chunk ^
+// (row>>kRowShift)) & kMask). The XOR derives from the row ALONE, so it
 // computes in parallel with the chunk extraction instead of serializing
-// behind the row*stride IMAD (CUTLASS 2.x's iterators apply the swizzle
-// the same way). Tensors dispatch to this op (common/tensor.cuh); nothing
-// re-derives strides at call sites.
+// behind the row*stride IMAD (CUTLASS 2.x iterators apply the swizzle the
+// same way); row bits are narrower than the chunk field, so no carry.
 template <typename SwzT, typename LayT>
 struct ComposedLayout {
     using Swz = SwzT;
     using Lay = LayT;
-    // 16B-chunk domain flag for the tensor layer (common/tensor.cuh):
-    // the (Bits, Shift) pair stays dtype-blind; the tensor scales.
-    static constexpr bool kChunkUnit = true;
+    static constexpr bool kChunkUnit = true;  // tensor layer scales per dtype
     static constexpr int kRows = LayT::kRows;
     static constexpr int kChunks = LayT::kChunks;
     static_assert(kChunks >= 1 && (kChunks & (kChunks - 1)) == 0,
@@ -108,15 +78,14 @@ struct ComposedLayout {
     static_assert(kRowShift >= 0,
                   "swizzle source must start inside the row field");
     static constexpr uint32_t kMask = SwzT::kMask;
-    // The layout's chunk-map op: the swizzled chunk coordinate alone (the
-    // row term stays out — the tensor scales the two terms separately in
-    // 32-bit so the address chain never widens to 64-bit).
+    // Swizzled chunk coordinate alone; the row term stays out so the tensor
+    // scales the two terms separately in 32-bit (the address chain never
+    // widens to 64-bit).
     __device__ __forceinline__ uint32_t chunk_of(uint32_t row,
                                                  uint32_t chunk) const {
         const uint32_t swz = (row >> kRowShift) & kMask;
         return (chunk & ~kMask) | ((chunk ^ swz) & kMask);
     }
-    // Linear chunk index: row-major layout over the swizzled chunk.
     __device__ __forceinline__ uint32_t operator()(uint32_t row,
                                                    uint32_t chunk) const {
         return row * (uint32_t)kChunks + chunk_of(row, chunk);

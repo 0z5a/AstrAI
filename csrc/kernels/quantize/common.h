@@ -14,8 +14,6 @@ namespace quant {
 
 // FP8 formats are the raw element types (__nv_fp8_e4m3 / __nv_fp8_e5m2);
 // the bindings name them directly from the output dtype — no format enum.
-
-// Compute-capability comparison: is the device at least (major, minor)?
 inline bool sm_at_least(int device_major, int device_minor, int major,
                         int minor) {
     return device_major > major ||

@@ -1,8 +1,8 @@
 #pragma once
-// Collective epilogue: fused bias, the bf16 scatter of the fp32 accumulators
-// through the reclaimed operand shared memory, and the coalesced copy-out.
-// The staging swizzle is one instance of the unified family
-// (common/swizzle.cuh) shared with the operand staging in load.cuh.
+// Collective epilogue: fused bias, the bf16 scatter of the fp32
+// accumulators through the reclaimed operand shared memory, and the
+// coalesced copy-out. The staging swizzle is one instance of the unified
+// family (common/swizzle.cuh) shared with the operand staging in load.cuh.
 
 #include "common/swizzle.cuh"
 #include "common/tensor.cuh"
@@ -57,8 +57,6 @@ struct GemmCollectiveEpilogue {
     static constexpr int kBlockN = Traits::kBlockN;
     static constexpr int kMt = Traits::kMt;
     static constexpr int kNt = Traits::kNt;
-    // The mainloop's accumulator type (typed C cells on the (mt, nt)
-    // grid) — the epilogue reads the same cells the mma wrote.
     using AccTensor = typename Traits::AccTensor;
 
     const float output_scale;
@@ -70,11 +68,10 @@ struct GemmCollectiveEpilogue {
     // swap computes E = B^T A^T, instantiated with LayoutOut = ColMajor.
     static constexpr bool t_out =
         !std::is_same_v<typename Policy::LayoutTagOut, RowMajor>;
-    // Staged row width (full rows; rows and row length trade places under
-    // the swap), its 16B-chunk count, and the staged-output layout,
-    // cute-style: composition(Swizzle, Layout<Shape, Stride>) over the
-    // chunk grid — a custom instance (the row field XORs straight onto the
-    // chunk field).
+    // Staged row width (rows and row length trade places under the swap),
+    // its 16B-chunk count, and the staged-output layout — composition
+    // (Swizzle, Layout<Shape, Stride>) over the chunk grid; a custom
+    // instance (the row field XORs straight onto the chunk field).
     static constexpr int kRowElems = t_out ? kBlockM : kBlockN;
     static constexpr int kRowRows = t_out ? kBlockN : kBlockM;
     static constexpr int kRowChunks = kRowElems / OE::kChunkElems;

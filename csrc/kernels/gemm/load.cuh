@@ -15,33 +15,29 @@ namespace astrai {
 namespace gemm {
 
 // Stage-load one operand tile from global memory into its swizzled ring
-// slot. Two geometries are the role-swapped mirror of the SAME loop, so
-// one template bit composes the whole function instead of a parallel copy:
+// slot. Two geometries are the role-swapped mirror of the SAME loop, so one
+// template bit composes the whole function instead of a parallel copy:
 //
 //   kTransposed = false — CONGRUOUS operand (contract-contiguous storage,
 //     the only cp.async-able shape) into the canonical [rows][kK] tile;
 //   kTransposed = true  — CROSSWISE 16-bit operand (row-contiguous 16B
 //     runs) into the transposed [kK][rows] tile, where ldmatrix.trans does
-//     the matrix turn at fragment-extraction time (b16-only instruction —
-//     8-bit crosswise operands cannot take this path and keep the LDG+PRMT
-//     staging).
+//     the matrix turn at fragment-extraction time (b16-only — 8-bit
+//     crosswise operands keep the LDG+PRMT staging).
 //
-// Under the transposed staging the tile's line axis is the contract dim,
-// so the predication axes trade places with a canonical run's. The staged
-// tile is the TRANS layout instance: chunks swizzled by the k-row bits (a
-// custom XOR — the source is the row field) so the 8 k-rows one
-// ldmatrix.trans matrix addresses at a fixed column window land on
-// distinct chunks (conflict-free); only the low 3 row bits can join the
-// XOR (the LDSM contract gives 8 rows per matrix), so tiles wider than 8
-// chunks leave the upper chunk bits unswizzled — each matrix's rows stay
-// conflict-free either way.
+// Under transposed staging the tile's line axis is the contract dim, so the
+// predication axes trade places with a canonical run's. The staged tile is
+// the TRANS layout instance: chunks swizzled by the k-row bits (custom XOR,
+// source is the row field) so the 8 k-rows one ldmatrix.trans matrix
+// addresses at a fixed column window land on distinct chunks (conflict-
+// free); only the low 3 row bits can join the XOR (LDSM gives 8 rows per
+// matrix), so tiles wider than 8 chunks leave the upper bits unswizzled.
 //
-// The tile arrives as a Tensor over the staged layout (common/tensor.cuh):
-// the swizzled address is the tensor's operator(), dispatching to the
-// layout op. kInterior drops all predication: valid only for a fully
-// interior CTA (whole lines, 16B-aligned base|ld, k_base + kK <=
-// contract); the address math then folds to one immediate XOR per chunk
-// (see the design notes).
+// The tile arrives as a Tensor over the staged layout: the swizzled address
+// is the tensor's operator(), dispatching to the layout op. kInterior drops
+// all predication — valid only for a fully interior CTA (whole lines,
+// 16B-aligned base|ld, k_base + kK <= contract); the address math then folds
+// to one immediate XOR per chunk (see the design notes).
 template <typename SmemLayout, typename ElemT,
           int kThreads, bool kTransposed = false, bool kInterior = false>
 __device__ __forceinline__ void
@@ -125,10 +121,9 @@ load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
 // per-thread (r, c0) mapping with the swizzled stage destination and global
 // source pointer carried across k-tiles, so each prefetch chunk is one
 // LDGSTS issued straight from registers. The geometry rides the operand's
-// Ring tensor (slots, stage stride, staged layout — one type where a
-// base/slots/stride triple used to travel as separate arguments). kTrans
-// selects the crosswise 16-bit geometry on the SOURCE side: the tile's rows
-// are k lines, so the per-tile source advance is kK * ld instead of kK.
+// Ring tensor (slots, stage stride, staged layout). kTrans selects the
+// crosswise 16-bit geometry on the SOURCE side: the tile's rows are k
+// lines, so the per-tile source advance is kK * ld instead of kK.
 // kAsync=false (synchronous 8-bit crosswise operand) is an empty no-op.
 template <bool kAsync, typename RingT, int kThreads, bool kTrans = false>
 struct PrefetchCarry;
@@ -139,17 +134,16 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
     using SmemLayout = typename RingT::Layout::Stage;  // per-stage layout
     static constexpr int kChunkElems = 16 / sizeof(ElemT);
     // The layout carries the tile geometry (rows x chunks per row),
-    // whichever way round the staging runs — one decomposition expression.
+    // whichever way round the staging runs.
     static constexpr int kCpt =
         SmemLayout::kRows * SmemLayout::kChunks / kThreads;
     static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
                   "XOR chunk stepping needs a power-of-two chunks-per-thread");
     static constexpr int kCpr = SmemLayout::kChunks / kCpt;
-    // The contract extent per tile, in elements.
-    static constexpr int kK =
-        kTrans ? SmemLayout::kRows : SmemLayout::kChunks * kChunkElems;
     // All carried state is in BYTES: the smem write ring and the global
     // source pointer both advance by the byte-sized stage stride.
+    static constexpr int kK =
+        kTrans ? SmemLayout::kRows : SmemLayout::kChunks * kChunkElems;
     static constexpr unsigned kKBytes = (unsigned)kK * sizeof(ElemT);
     unsigned wr = 0;    // current stage's swizzled destination offset
     unsigned wr0 = 0;   // slot-0 wrap base

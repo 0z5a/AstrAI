@@ -1,32 +1,15 @@
-// Async data-movement vocabulary, one header: the raw cp.async / mbarrier
-// PTX sites plus the stage-pipeline abstractions built on them.
-//
-// Raw layer (formerly cp_async.cuh — the single emitter sites, one wrapper
-// per destination/predication contract):
-//   cp_async_16*                 global -> shared copies, zfill variants
-//   cp_async_commit_group /      group commit + bounded wait (immediate
-//   cp_async_wait_group<Keep>    operand, hence the template form)
-//   mbarrier_* (sm_90+)          init / arrive.expect_tx / try_wait.parity
-//
-// Pipeline layer — one vocabulary, two generations of backing primitive
-// (CUTLASS's pipeline layer condensed):
-//
+// Async data-movement vocabulary: the raw cp.async / mbarrier PTX sites
+// plus the stage-pipeline abstractions built on them. Two generations of
+// backing primitive, one producer/consumer surface (selected with
+// `if constexpr (Arch::kHasMbarrier)`):
 //   PipelineSync<Stages>      sm_80/89: cp.async wait_group + __syncthreads
-//                             (the mainloop's current ring discipline)
-//   PipelineMbarrier<Stages>  sm_90+:   per-stage mbarrier with expect_tx,
-//                             the TMA producer/consumer discipline
+//   PipelineMbarrier<Stages>  sm_90+:   per-stage mbarrier with expect_tx
 //                             (CUTLASS PipelineTmaAsync semantics)
-//
-// Both pipelines present the same producer/consumer surface so a mainloop
-// template can select with `if constexpr (Arch::kHasMbarrier)`. The mbarrier
-// body compiles only on sm_90+; on earlier passes the class is inert so the
-// template can still name it.
-//
-// Phase protocol (mbarrier variant): stage s uses barrier s % Stages; the
-// consumer tracks a per-barrier parity bit that flips each time the
-// barrier's arrival count trips. Producers call arrive_expect_tx(bytes)
-// before issuing the stage's copies (TMA folds the transaction bytes into
-// the barrier); consumers wait_parity(phase) then read the stage.
+// The mbarrier body compiles only on sm_90+; earlier passes leave the class
+// inert so the template can still name it. Phase protocol: stage s uses
+// barrier s % Stages; the consumer tracks a per-barrier parity bit that
+// flips when the barrier's arrival count trips; producers arrive_expect_tx
+// before issuing the stage's copies; consumers wait_parity then read.
 
 #pragma once
 

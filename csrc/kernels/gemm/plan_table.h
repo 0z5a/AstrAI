@@ -1,18 +1,16 @@
 #pragma once
 // AOT dispatch table: measured best-recipe rows per (shape band, dtype
-// class, layout class) that plan_gemm consults before the cost model. The
-// rows are data — the launch ladders still resolve a row's CTA class
-// through the manifest, so this header holds no kernel pointers and no
-// registration. Rows come from two sources, override first:
-//   - a runtime table file (ASTR_GEMM_TABLE=/path/to/plan_table.txt),
-//     so tile tuning never needs a rebuild;
+// class, layout class) that plan_gemm consults. Rows are data — the launch
+// ladders resolve a row's CTA class through the manifest, so this header
+// holds no kernel pointers or registration. Sources, override first:
+//   - a runtime table file (ASTR_GEMM_TABLE=/path/to/rows.txt), so tile
+//     tuning never needs a rebuild;
 //   - the compiled-in GENERATED rows below (paste the row file the
 //     measurement script emits; the script never writes source).
-// An empty table makes every lookup miss and the dispatch falls through
-// to the degraded band rows (kDegradedPlanRows) — or the cost model,
-// when ASTR_GEMM_MODEL_FALLBACK=1 re-enables it. The measurement sweep
-// times the fused-linear (NT) layout, so pasted rows carry crosswise 0:
-// TT/TN shapes miss and take the same degraded fallback.
+// An empty table makes every lookup miss and dispatch falls through to the
+// degraded band rows — or the cost model when ASTR_GEMM_MODEL_FALLBACK=1.
+// The sweep times the fused-linear (NT) layout, so pasted rows carry
+// crosswise 0: TT/TN shapes take the same degraded fallback.
 
 #include <cstdint>
 #include <cstdio>

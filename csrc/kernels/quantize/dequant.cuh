@@ -1,20 +1,19 @@
 #pragma once
-// In-register dequantization functors — the quantize family's inverse
-// operation (humming's datatype layer): the mma.sync consumes MmaT
-// fragments while quantized operands stage in their storage type, so the
-// GEMM fragment load folds an exact expansion into the register file
-// between the LDS and the mma — never a separate F2F round-trip pass.
+// In-register dequantization functors: the mma.sync consumes MmaT fragments
+// while quantized operands stage in their storage type, so the GEMM
+// fragment load folds an exact expansion between the LDS and the mma —
+// never a separate F2F round-trip pass.
 //
-// int8 -> bf16 is exact for the full [-128, 127] range and costs four
-// LOP3-class instructions per element pair. The magnitude bits (0-6) and
-// the sign bit (7) are handled by separate LOP3s, because ORing the whole
-// byte into a bf16 base breaks linearity (bit 7 spills into the exponent:
-// bf16 carries only 7 mantissa bits). Instead, per byte u:
+// int8 -> bf16 is exact for the full [-128, 127] range, four LOP3-class
+// instructions per element pair. The magnitude bits (0-6) and the sign bit
+// (7) get separate LOP3s, because ORing the whole byte into a bf16 base
+// breaks linearity (bit 7 spills into the exponent: bf16 carries only 7
+// mantissa bits). Per byte u:
 //   h = (u & 0x7F) | 0x4300          -> bf16 128 + u7   (exact: u7 <= 127)
 //   s = (u & 0x80) | 0x4300          -> bf16 128 or 256 (the sign picks)
 //   v = h - s = (128 + u7) - (128 + 128*b7) = u - 128*b7 = the int8 value
-// Every intermediate and result lands on bf16-exact values (|v| <= 128),
-// so no rounding occurs anywhere.
+// Every intermediate lands on bf16-exact values (|v| <= 128), so no
+// rounding occurs anywhere.
 //
 // fp8 -> bf16 (W-F8A16 weight-only) instead rides the hardware widen
 // (cvt.rn.f16x2.e4m3x2 on sm_89+): an LOP3 exponent-rebias trick like

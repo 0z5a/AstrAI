@@ -1,11 +1,10 @@
 // GEMM family binding (module `gemm`): the single quantized-GEMM entry
 // ``quant_gemm`` — every dtype pairing (bf16 / int8 / fp8 operands, per-
-// operand scales) dispatches over the same dtype-generic kernel family.
-// The kernel-policy instantiation space is compiled one TU per dtype pair
-// (gemm_cases.h; one gemm_dispatch specialization per unit), so the heavy
-// template work runs as parallel nvcc jobs. This TU keeps only the
-// dtype-pair switch + pybind — the C tests instantiate straight from the
-// headers instead.
+// operand scales) dispatches over one dtype-generic kernel family. The
+// policy instantiation space compiles one TU per dtype pair (gemm_cases.h;
+// one gemm_dispatch specialization per unit), so the heavy template work
+// runs as parallel nvcc jobs. This TU keeps the dtype-pair switch + pybind;
+// the C tests instantiate from the headers instead.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

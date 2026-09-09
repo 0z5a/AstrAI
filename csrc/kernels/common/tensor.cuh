@@ -1,20 +1,19 @@
-// Tensor vocabulary after CUTLASS/cute's Tensor<Engine, Layout>: ONE
-// tensor type — storage (engine) and addressing (layout) are its two
-// template parameters, and every operation dispatches to a layout op.
-// Use sites spell Tensor<...> directly; there are no second names.
+// Tensor vocabulary after CUTLASS/cute's Tensor<Engine, Layout>: ONE tensor
+// type — storage (engine) and addressing (layout) are its two template
+// parameters, every operation dispatches to a layout op. Use sites spell
+// Tensor<...> directly; no second names.
 //
 //   engines:  PtrEngine<T> (shared/global pointer), ArrayEngine<T, N>
 //             (registers — cute's Array role: mma fragments are arrays)
-//   layouts:  the ComposedLayout instances of common/swizzle.cuh (16B
-//             chunk grids, dtype-agnostic) + RingLayout / CellLayout here
+//   layouts:  the ComposedLayout instances of common/swizzle.cuh (16B chunk
+//             grids, dtype-agnostic) + RingLayout / CellLayout here
 //   ops:      make_ring (construct over a raw carve), stage_of (slice one
 //             ring slot's tile — cute's tensor slicing)
 //
-// A staged tile is Tensor<PtrEngine<Elem>, ComposedLayout>; the stage
-// ring adds the slot dimension via RingLayout; the warp's accumulator is
-// Tensor<ArrayEngine<CFrag>, CellLayout>. All carriers are one-pointer /
-// plain-array standard-layout types and every method folds away at -O3 —
-// the generated SASS is unchanged.
+// A staged tile is Tensor<PtrEngine<Elem>, ComposedLayout>; the ring adds
+// the slot dimension via RingLayout; the accumulator is
+// Tensor<ArrayEngine<CFrag>, CellLayout>. All carriers are standard-layout
+// types and every method folds away at -O3 — the SASS is unchanged.
 
 #pragma once
 

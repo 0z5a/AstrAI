@@ -1,8 +1,8 @@
 #pragma once
-// Collective mainloop: shared-memory stage rings, the gmem->smem stage loads
-// (congruous cp.async / crosswise LDG+PRMT), the per-lane ldmatrix fragment
-// addressing and the software-pipelined mma.sync loop. The fragment
-// addressing scheme and the fast-loop peel rationale live in
+// Collective mainloop: shared-memory stage rings, the gmem->smem stage
+// loads (congruous cp.async / crosswise LDG+PRMT), the per-lane ldmatrix
+// fragment addressing and the software-pipelined mma.sync loop. The
+// fragment addressing scheme and fast-loop peel rationale live in
 // docs/developer/cuda_kernels.md.
 
 #include <type_traits>
@@ -18,17 +18,15 @@
 namespace astrai {
 namespace gemm {
 
-// TMA producer context: the operand descriptors (kernel-param addresses),
-// the ring-slot mbarriers and the batch coordinate bits the issue path
-// needs. The barrier array holds 2*kARing slots — full[0..D) (count 1,
-// tripped by the elected thread's expect_tx + the TMA's transaction
-// bytes) and empty[D..2D) (count = CTA threads, tripped when every
-// consumer finished reading the slot) — the CUTLASS PipelineTmaAsync
-// handshake, which replaces the per-k-tile __syncthreads: warps skew
-// freely across stage slots and the producer's overwrite gate is the
-// empty barrier alone. Each operand's rank is a template bit (strided
-// batch = rank 3, broadcast = rank 2 sharing one map's coordinates), so
-// the per-stage 2D/3D issue pick compiles away.
+// TMA producer context: the operand descriptors, the ring-slot mbarriers
+// and the batch coordinate bits. Barriers hold 2*kARing slots — full[0..D)
+// (count 1, tripped by the elected thread's expect_tx + the TMA's
+// transaction bytes) and empty[D..2D) (count = CTA threads, tripped when
+// every consumer finished the slot) — the CUTLASS PipelineTmaAsync
+// handshake replacing the per-k-tile __syncthreads: warps skew freely
+// across slots and the producer's overwrite gate is the empty barrier
+// alone. Each operand's rank is a template bit (strided batch = rank 3,
+// broadcast = rank 2), so the 2D/3D issue pick compiles away.
 template <bool kRank3A = false, bool kRank3B = false>
 struct GemmTmaContext {
     const void* map_a = nullptr;
@@ -56,12 +54,10 @@ struct GemmCollectiveMainloop {
     static_assert(!kUseTma || (!Smem::kDirectA && !Smem::kDirectB),
                   "TMA staging is congruous-only");
     // Operands are independently typed; the mma runs on the promoted MmaT
-    // (policy.cuh). A lone int8 side (W8A16 weight-only) or a lone fp8 side
-    // expands in-register between the smem read and the mma —
-    // kDequantA/kDequantB mark the insert per side (dequant.cuh);
-    // W16A16/W8A8/W8A8-fp8 passthrough leaves both false. The accumulator
-    // type rides the mma cell: fp32 for the float families, int32 for the
-    // native s8 pair.
+    // (policy.cuh). A lone int8 or fp8 side expands in-register between the
+    // smem read and the mma — kDequantA/kDequantB mark the insert per side
+    // (dequant.cuh); passthrough pairs leave both false. The accumulator
+    // type rides the mma cell: fp32 for float families, int32 for the s8.
     using ElemA = typename Traits::ElemA;
     using ElemB = typename Traits::ElemB;
     using MmaT = typename Traits::MmaT;
@@ -87,7 +83,7 @@ struct GemmCollectiveMainloop {
     static constexpr bool kSyncB = kDirectB && sizeof(ElemB) == 1;
     static constexpr bool kTransB = kDirectB && sizeof(ElemB) == 2;
     // Dequant inserts are int8-storage only; a dequantized side never rides
-    // the trans staging (16-bit-only) — kTrans* is already false there.
+    // the 16-bit-only trans staging — kTrans* is already false there.
     static_assert(!kDequantA || sizeof(ElemA) == 1,
                   "in-register dequant targets 1-byte storage");
     static_assert(!kDequantB || sizeof(ElemB) == 1,

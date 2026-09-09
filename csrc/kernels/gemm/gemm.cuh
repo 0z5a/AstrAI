@@ -3,8 +3,7 @@
 // planning. Device layers live in gemm/ (policy / load / scheduler /
 // mainloop / epilogue) — pure CUDA, no torch; launchers are plain functions
 // shared by the torch binding and the C tests. Layout tags and the NN swap
-// semantics are documented in common.h and the design notes
-// (docs/developer/cuda_kernels.md).
+// semantics live in common.h and docs/developer/cuda_kernels.md.
 
 #include <algorithm>
 #include <atomic>
@@ -40,8 +39,8 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     gemm_kernel(GemmParams p) {
     using Mainloop = GemmCollectiveMainloop<Policy>;
     using Epilogue = GemmCollectiveEpilogue<Policy>;
-    // Stages live in dynamic shared memory so deep pipelines (> 48KB
-    // static limit) opt in via cudaFuncSetAttribute in the launcher.
+    // Stages live in dynamic shared memory so deep pipelines (> 48KB static
+    // limit) opt in via cudaFuncSetAttribute in the launcher.
     extern __shared__ __align__(16) char gemm_smem[];
 
     // Batch slice (grid.z): broadcast operands carry a 0 stride, so the
@@ -66,12 +65,11 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     typename Mainloop::AccTensor acc = {};  // C cells on the (mt, nt) grid
     mainloop.prologue();
     mainloop.accumulate(acc);
-    // Drain the pipeline before the epilogue reclaims the operand rings.
-    // cp_async_wait_all drains only the CALLING thread's cp.asyncs, and
-    // the final mainloop iteration carries no trailing barrier — without
-    // this one, a thread racing into the epilogue scatters the output tile
-    // over peers' still-in-flight staging writes (and their final fragment
-    // reads). One barrier closes both windows.
+    // Drain the pipeline before the epilogue reclaims the operand rings:
+    // cp_async_wait_all drains only the CALLING thread's copies and the
+    // last mainloop iteration carries no trailing barrier — without this,
+    // a thread racing into the epilogue scatters the output tile over
+    // peers' still-in-flight staging writes. One barrier closes both.
     astrai::PipelineSync<Mainloop::kStages>{}.drain();
     Epilogue(gemm_smem, p, bn.x, bn.y, threadIdx.x).run(acc, out);
 }
@@ -81,9 +79,9 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
 // layouts and epilogue; the staging discipline changes — one elected
 // thread arms a per-slot mbarrier and issues the operand boxes
 // (cp.async.bulk.tensor), consumers wait the slot's phase. The rings sit
-// on a 1024B-aligned base because TMA swizzles the ABSOLUTE shared
-// address (the pad is budgeted in Policy::kSmemBytes), and the mbarriers
-// live right past the B ring.
+// on a 1024B-aligned base because TMA swizzles the ABSOLUTE smem address
+// (the pad is budgeted in Policy::kSmemBytes), and the mbarriers live
+// right past the B ring.
 template <typename Policy, bool kRank3A, bool kRank3B>
 __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     gemm_kernel_tma(GemmParams p, const __grid_constant__ CUtensorMap tma_a,
