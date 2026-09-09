@@ -82,9 +82,11 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count,
 //   m_min m_max n_min n_max perf_class crosswise cta stages raster
 // ('#' starts a comment; 'perf_class' 0..3 / -1 any; 'crosswise'
 // 0..2 / -1 any; 'cta' is 0 small / 1 narrow / 2 big — the TileClass
-// order). Invalid lines are warn-and-skip: tuning files are hand-edited
-// between sweeps, and a malformed row must never block a launch the cost
-// model would serve anyway.
+// order; 'stages' 2..3 (the s4/s5 deep rings measured no gain on the TMA
+// ring — two stages hit the latency floor, deeper stages only cost smem
+// residency; see policy.cuh). Invalid lines are warn-and-skip: tuning
+// files are hand-edited between sweeps, and a malformed row must never
+// block a launch the fallback would serve.
 inline bool parse_plan_table_file(const std::string& path,
                                   std::vector<TableRow>& rows) {
     FILE* f = std::fopen(path.c_str(), "r");

@@ -144,8 +144,11 @@ struct GemmTileConfig {
 using TileBig128x128 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2, false>;
 using TileBigFast = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2, true>;
 using TileNarrow128x64 = GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 2, true>;
-using TileSmall64s2 = GemmTileConfig<Shape<64, 64, 64>, Shape<32, 32>, 2, true>;
-using TileSmall64s3 = GemmTileConfig<Shape<64, 64, 64>, Shape<32, 32>, 3, true>;
+// 8-warp small CTA (16x32 warp tiles, 256 threads/CTA — 2026-09-09 A/B):
+// same 64x64x64 footprint and staging, double the per-SM thread count for
+// the underfed short-M shapes; mainloop traits adapt with this alias.
+using TileSmall64s2 = GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 2, true>;
+using TileSmall64s3 = GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 3, true>;
 using TileBig128x128s3 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3, false>;
 using TileBigFastS3 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3, true>;
 using TileNarrow128x64s3 = GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 3, true>;

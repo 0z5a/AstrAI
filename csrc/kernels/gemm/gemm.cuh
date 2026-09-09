@@ -423,15 +423,14 @@ bool launch_policy_tma(const GemmParams& p, cudaStream_t stream) {
 }
 
 // Manifest dispatch (CUTLASS builder-table style): the plan's (CTA class,
-// depth bit) selects exactly one TileManifest entry — the || short-circuits
+// ring depth) selects exactly one TileManifest entry — the || short-circuits
 // — and the resolver maps its tile onto a concrete Policy and launches.
 template <typename Manifest, typename Resolver>
 bool dispatch_tile(const GemmPlan& plan, const Resolver& resolve) {
     return std::apply(
         [&plan, &resolve](auto... tiles) {
             return (... || (tile_class<decltype(tiles)>() == plan.cta &&
-                            (decltype(tiles)::kStages >= 3) ==
-                                (plan.stages >= 3) &&
+                            decltype(tiles)::kStages == plan.stages &&
                             resolve.template run<decltype(tiles)>()));
         },
         Manifest{});
