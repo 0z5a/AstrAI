@@ -1,18 +1,21 @@
 """Generate AOT plan-table rows from measured shape sweeps.
 
 Every dtype combo is swept at each (M, N, K, batch) grid point under every
-recipe the host planner can pick — the cost-model default plus the three
-forced CTA classes (ASTR_GEMM_RECIPE) — and the measured winner per point
-becomes a dispatch-table row (csrc/kernels/gemm/plan_table.h). The rows are
-keyed (M, N) bands per dtype class: K is not a row key (the ring K is
-fixed at 64), so a conflict across K / batch at one (M, N) resolves to
-the recipe with the best tflops.
+candidate the host planner can pick — the degraded-bands fallback plus the six
+forced recipes (big/narrow/small CTA s2 and s3 ring; feasibility mirror
+drops the combos whose ring exceeds the smem opt-in ceiling, e.g. big s3
+on the 2B x 2B pair) — and the measured winner per point becomes a
+dispatch-table row (csrc/kernels/gemm/plan_table.h). The rows are keyed
+(M, N) bands per dtype class: K is not a row key (the ring K is fixed at
+64), so a conflict across K / batch at one (M, N) resolves to the recipe
+with the best tflops.
 
-The four candidates are measured back-to-back at each shape in a single
-process (shape outer loop, recipe inner loop): the C++ knob re-reads
-ASTR_GEMM_RECIPE on every launch, so the comparison happens under the
-same GPU clock/thermal state. A sweep that measured whole recipe batches
-in separate processes compared the big CTA (measured first) against the
+The candidates are measured back-to-back at each shape in a single
+process (shape outer loop, recipe inner loop): each forced recipe runs as
+a one-row ASTR_GEMM_TABLE file toggled per launch (the row sources re-read
+their env per call, so the comparison happens under the same GPU
+clock/thermal state). A sweep that measured whole recipe batches in
+separate processes compared the big CTA (measured first) against the
 small CTA (measured 30 minutes later) under different boost states and
 picked systematically wrong winners.
 
@@ -22,6 +25,10 @@ Usage (rows to a runtime-override file, no rebuild):
         --shapes "qkv:4096:4096,up_gate:14336:4096" \
         --batch 1 --combos w16a16 --output plan_table.txt
 
+--save-results dumps the raw measurements to JSON so the grid can be
+re-searched offline with --results-json (e.g. classic merge vs
+--band-search cut optimization — the grid search over M band splits).
+
 This script only measures and emits the row file: use it with
 ASTR_GEMM_TABLE=plan_table.txt to serve the rows without a rebuild, or
 paste them into the compiled-in GENERATED block of plan_table.h by hand.
@@ -30,7 +37,9 @@ paste them into the compiled-in GENERATED block of plan_table.h by hand.
 from __future__ import annotations
 
 import itertools
+import json
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -64,14 +73,76 @@ PERF_CLASS: dict[str, int] = {
     "f8a8_e5m2": 3,
 }
 
-# ASTR_GEMM_RECIPE values -> (cta id, stages): 0 small / 1 narrow / 2 big.
+# Candidate recipes -> (cta id, stages): 0 small / 1 narrow / 2 big.
+# The C++ recipe knob (ASTR_GEMM_RECIPE) forces s2 rings only, so s3
+# candidates are measured as one-row ASTR_GEMM_TABLE files instead (open
+# bands, -1 keys) — plan_gemm smem-gates them exactly like real rows.
 RECIPES: dict[str, tuple[int, int] | None] = {
     "model": None,
     "big": (2, 2),
+    "big_s3": (2, 3),
     "narrow": (1, 2),
+    "narrow_s3": (1, 3),
     "small": (0, 2),
+    "small_s3": (0, 3),
 }
-RECIPE_ORDER = ("big", "narrow", "small", "model")
+# Tie preference: stable big > narrow > small, s2 before its s3 twin.
+RECIPE_ORDER = (
+    "big",
+    "narrow",
+    "small",
+    "big_s3",
+    "narrow_s3",
+    "small_s3",
+    "model",
+)
+
+# Ring feasibility mirror (policy.cuh ring_smem_bytes vs the device's
+# smem opt-in ceiling): over-budget recipes cannot launch and would be
+# silently measured as the model/degraded — filter them out per combo.
+CTA_GEOM: dict[int, tuple[int, int]] = {2: (128, 128), 1: (128, 64), 0: (64, 64)}
+SMEM_OPTIN = 101376  # sm_120 (RTX 5090) MaxSharedMemoryPerBlockOptin
+_DTYPE_BYTES = {
+    torch.bfloat16: 2,
+    torch.int8: 1,
+    torch.float8_e4m3fn: 1,
+    torch.float8_e5m2: 1,
+}
+BYTES: dict[str, tuple[int, int]] = {
+    combo: (_DTYPE_BYTES[a], _DTYPE_BYTES[b]) for combo, (a, b) in COMBOS.items()
+}
+
+
+def ring_smem_bytes(stages: int, cta: int, ba: int, bb: int) -> int:
+    bm, bn = CTA_GEOM[cta]
+    return (stages + 1) * 64 * (bm * ba + bn * bb)
+
+
+def candidate_recipes(combo: str) -> tuple[str, ...]:
+    """Measurable candidates for one combo, in RECIPE_ORDER."""
+    return tuple(
+        recipe
+        for recipe in RECIPE_ORDER
+        if recipe == "model"
+        or ring_smem_bytes(RECIPES[recipe][1], RECIPES[recipe][0], *BYTES[combo])
+        <= SMEM_OPTIN
+    )
+
+
+def _candidate_row_files() -> dict[str, str]:
+    """One synthetic open row per recipe — (cta, stages) on -1/-1 keys, so
+    the row is the only plan source and plan_from_row smem-gates it."""
+    directory = tempfile.mkdtemp(prefix="gemm_recipe_rows_")
+    files: dict[str, str] = {}
+    for recipe, spec in RECIPES.items():
+        if spec is None:
+            continue
+        cta, stages = spec
+        path = os.path.join(directory, f"row_{recipe}.txt")
+        with open(path, "w") as f:
+            f.write(f"0 0 0 0 -1 -1 {cta} {stages} 0\n")
+        files[recipe] = path
+    return files
 
 
 def parse_positive_ints(value: str) -> tuple[int, ...]:
@@ -122,7 +193,7 @@ def sweep(
     iterations: int,
     trials: int,
 ) -> list[dict]:
-    """One process, shape outer loop — every recipe measured back-to-back."""
+    """One process, shape outer loop — every candidate measured back-to-back."""
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA is required")
     if not is_available("gemm"):
@@ -130,6 +201,15 @@ def sweep(
             "the built gemm kernel is required (rebuild "
             "the extension with CSRC_KERNELS=true first)"
         )
+
+    # Candidates are one-row table files toggled per launch: the row
+    # sources re-read their env per call, so all candidates at a shape
+    # share its GPU clock/thermal state. The "model" candidate measures
+    # the degraded band rows (the cost model is deleted from the C++):
+    # it is the "this band has no table row" reference of the min-gain
+    # mode, not a planner.
+    os.environ.pop("ASTR_GEMM_RECIPE", None)
+    row_files = _candidate_row_files()
 
     device = torch.device(torch.cuda.current_device())
     torch.manual_seed(0)
@@ -147,14 +227,14 @@ def sweep(
                 def run(acts=acts, weight=weight, a_scale=a_scale, b_scale=b_scale):
                     return quant_gemm(acts, weight, a_scale, b_scale)
 
-                for recipe in RECIPES:
-                    # The C++ knob re-reads the env per launch, so toggling
-                    # here lets all four candidates share this shape's GPU
-                    # state.
+                for recipe in candidate_recipes(combo):
                     if recipe == "model":
-                        os.environ.pop("ASTR_GEMM_RECIPE", None)
+                        # "-" = AOT off: skip both override and builtin rows
+                        # — the degraded-bands reference (the cost model is
+                        # deleted from the C++).
+                        os.environ["ASTR_GEMM_TABLE"] = "-"
                     else:
-                        os.environ["ASTR_GEMM_RECIPE"] = recipe
+                        os.environ["ASTR_GEMM_TABLE"] = row_files[recipe]
                     run()  # steady state for this (shape, recipe)
                     torch.cuda.synchronize()
                     ms = measure(run, warmup, iterations, trials)
@@ -178,7 +258,7 @@ def sweep(
                         f"TFLOPS",
                         flush=True,
                     )
-    os.environ.pop("ASTR_GEMM_RECIPE", None)
+    os.environ.pop("ASTR_GEMM_TABLE", None)
     return results
 
 
@@ -195,10 +275,122 @@ def band_edges(values: tuple[int, ...]) -> list[tuple[int, int]]:
     return edges
 
 
+def _optimal_partition(
+    aggregate: dict[tuple[int, int, int], dict[str, float]],
+    points: list[tuple[int, int, int]],
+    min_gain: float,
+) -> list[tuple[int, int, str]]:
+    """Best (start, end, recipe) partition of points — the band grid search:
+    a segment's recipe minimizes its total time (1/tflops summed over the
+    segment) and a cut pays a min_gain fee of the point median baseline,
+    the same noise floor --min-gain enforces for winner rows. This beats
+    merge-adjacent-equals (which only cuts where the winner stays
+    constant) at the cost of rows whose recipe wins on the segment mean
+    rather than at every sampled M."""
+    n = len(points)
+    recipes = [r for r in RECIPE_ORDER if r != "model"]
+    cost = {
+        r: [
+            1.0 / aggregate[p][r] if r in aggregate.get(p, {}) else float("inf")
+            for p in points
+        ]
+        for r in recipes
+    }
+    penalty = min_gain * sum(
+        sorted(cost[r][i] for r in recipes)[len(recipes) // 2] for i in range(n)
+    )
+    seg_cost: dict[tuple[int, int], float] = {}
+    seg_recipe: dict[tuple[int, int], str] = {}
+    for i in range(n):
+        for j in range(i, n):
+            best = float("inf")
+            best_recipe = recipes[0]
+            for r in recipes:
+                c = sum(cost[r][i : j + 1])
+                if c < best:
+                    best = c
+                    best_recipe = r
+            seg_cost[i, j] = best + penalty
+            seg_recipe[i, j] = best_recipe
+    dp = [float("inf")] * (n + 1)
+    prev = [0] * (n + 1)
+    dp[0] = 0.0
+    for end in range(1, n + 1):
+        for start in range(1, end + 1):
+            cand = dp[start - 1] + seg_cost[start - 1, end - 1]
+            if cand < dp[end]:  # strict < keeps the earlier, longer last
+                dp[end] = cand  # segment — fewer rows on exact ties
+                prev[end] = start - 1
+    segments: list[tuple[int, int, str]] = []
+    end = n
+    while end > 0:
+        start = prev[end]
+        segments.append((start, end - 1, seg_recipe[start, end - 1]))
+        end = start
+    segments.reverse()
+    return segments
+
+
+def _winners_with_lead(
+    aggregate: dict[tuple[int, int, int], dict[str, float]],
+    points: list[tuple[int, int, int]],
+) -> tuple[list[str], list[float]]:
+    """Per-point (winner, lead fraction) over the forced recipes."""
+    winners: list[str] = []
+    leads: list[float] = []
+    for p in points:
+        over = {r: v for r, v in aggregate.get(p, {}).items() if r != "model"}
+        if not over:
+            winners.append("small")
+            leads.append(0.0)
+            continue
+        values = sorted(over.values(), reverse=True)
+        best = values[0]
+        second = values[1] if len(values) > 1 else best
+        leads.append(0.0 if best == 0 else (best - second) / best)
+        for recipe in RECIPE_ORDER:
+            if recipe != "model" and over.get(recipe, 0.0) == best:
+                winners.append(recipe)
+                break
+    return winners, leads
+
+
+def _smooth_winners(
+    winners: list[str], leads: list[float], min_gain: float
+) -> list[str]:
+    """Noise merge: a point whose winner's lead is under the min-gain floor
+    is absorbed into a neighbor's recipe when the neighbors agree (the
+    flip is measurement noise, not a real crossover); run until stable.
+    Same floor the min-gain mode uses, but with a recipe fallback instead
+    of leaving the band unrowed, so full coverage still never misses."""
+    out = list(winners)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(out)):
+            if leads[i] >= min_gain:
+                continue
+            left = out[i - 1] if i > 0 else None
+            right = out[i + 1] if i + 1 < len(out) else None
+            adopt = None
+            if left is None and right is not None and right != out[i]:
+                adopt = right  # run start: follow the run
+            elif right is None and left is not None and left != out[i]:
+                adopt = left  # run end: follow the run
+            elif left is not None and left == right and left != out[i]:
+                adopt = left  # sandwiched flip: join the neighbors
+            if adopt is not None:
+                out[i] = adopt
+                changed = True
+    return out
+
+
 def build_rows(
     results: list[dict],
     min_gain: float = 0.0,
     full_coverage: bool = False,
+    band_search: bool = False,
+    smooth: bool = False,
 ) -> list[str]:
     # (perf_class, m, n) -> {recipe: best tflops across the k/batch grid}.
     aggregate: dict[tuple[int, int, int], dict[str, float]] = {}
@@ -220,9 +412,23 @@ def build_rows(
     rows: list[str] = []
     for perf_class in sorted({pt[0] for pt in aggregate}):
         for n_idx, (n_min, n_max) in enumerate(n_bands):
+            keys = [(perf_class, m, sorted_n[n_idx]) for m in sorted_m]
+            if full_coverage and band_search:
+                segments = _optimal_partition(aggregate, keys, min_gain)
+                for m_start, m_end, recipe in segments:
+                    m_min, m_max = m_bands[m_start][0], m_bands[m_end][1]
+                    cta, stages = RECIPES[recipe]
+                    rows.append(
+                        f"{m_min} {m_max} {n_min} {n_max} {perf_class} 0 "
+                        f"{cta} {stages} 0"
+                    )
+                continue
             # Winner per m band at this n band; merge adjacent m runs that
             # pick the same recipe into one row.
-            if full_coverage:
+            if full_coverage and smooth:
+                winners, leads = _winners_with_lead(aggregate, keys)
+                recipes = _smooth_winners(winners, leads, min_gain)
+            elif full_coverage:
                 # The table is the only production dispatch: every band
                 # gets a row (no min-gain gate, no model fallback), and
                 # ties resolve to the stable big>narrow>small preference.
@@ -269,7 +475,9 @@ def _best_forced(
     # no fallback).
     over = aggregate.get(key, {})
     best = max((v for r, v in over.items() if r != "model"), default=0.0)
-    for recipe in ("big", "narrow", "small"):
+    for recipe in RECIPE_ORDER:
+        if recipe == "model":
+            continue
         if over.get(recipe, 0.0) == best:
             return recipe
     return "small"
@@ -353,7 +561,7 @@ def _winner(
     show_default=True,
     help="Minimum relative gain (%) a forced recipe must show over the "
     "runner-up to claim a row; smaller leads are treated as ties and keep "
-    "the cost model. Ignored with --full-coverage (every band gets a row, "
+    "the degraded bands. Ignored with --full-coverage (every band gets a row, "
     "ties resolve to the big>narrow>small preference).",
 )
 @click.option(
@@ -361,9 +569,41 @@ def _winner(
     is_flag=True,
     default=False,
     help="Emit a row for every (class, M/N band): production dispatch "
-    "becomes the table alone (the cost model is retired; no row is ever "
+    "becomes the table alone (dispatch is table-only — no row is ever "
     "skipped), and each class ends with a catch-all row so no shape can "
     "miss the table.",
+)
+@click.option(
+    "--band-search",
+    is_flag=True,
+    default=False,
+    help="With --full-coverage: grid-search the M band cuts — DP over all "
+    "possible partitions, each segment taking the recipe with the lowest "
+    "total time and each cut paying --min-gain of the segment baseline "
+    "(the measurement noise floor) instead of merge-adjacent-equals. "
+    "Not combinable with --noise-merge.",
+)
+@click.option(
+    "--noise-merge",
+    is_flag=True,
+    default=False,
+    help="With --full-coverage: merge noise-level band flips — a point whose "
+    "winner leads the runner-up by less than --min-gain follows its "
+    "neighbors' recipe instead (run-to-run flips are measurement noise, "
+    "and per-point winners chase them).",
+)
+@click.option(
+    "--save-results",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Dump the raw per-point measurements to JSON (reproducible search: "
+    "rebuild rows from it with --results-json).",
+)
+@click.option(
+    "--results-json",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Skip the sweep: build rows from a JSON saved by --save-results.",
 )
 def plan_table_command(
     m_values: tuple[int, ...],
@@ -378,30 +618,48 @@ def plan_table_command(
     trials: int,
     min_gain: float,
     full_coverage: bool,
+    band_search: bool,
+    noise_merge: bool,
+    save_results: Path | None,
+    results_json: Path | None,
 ) -> None:
-    """Sweep every combo x recipe (interleaved) at the M x shape grid."""
+    """Sweep every candidate recipe (interleaved) at the M x shape grid."""
     unknown = [combo for combo in combos if combo not in COMBOS]
     if unknown:
         raise click.BadParameter(f"unknown combos: {', '.join(unknown)}")
+    if noise_merge and not full_coverage:
+        raise click.BadParameter("--noise-merge needs --full-coverage")
+    if band_search and noise_merge:
+        raise click.BadParameter(
+            "--band-search and --noise-merge are mutually exclusive"
+        )
 
-    if shape_values:
-        shapes = [parse_shape(value) for value in shape_values]
-    elif n_values and k_values:
-        shapes = [(f"n{n}k{k}", n, k) for n in n_values for k in k_values]
+    if results_json is not None:
+        results = json.loads(results_json.read_text())
     else:
-        shapes = [("n4096k4096", 4096, 4096), ("n14336k4096", 14336, 4096)]
+        if shape_values:
+            shapes = [parse_shape(value) for value in shape_values]
+        elif n_values and k_values:
+            shapes = [(f"n{n}k{k}", n, k) for n in n_values for k in k_values]
+        else:
+            shapes = [("n4096k4096", 4096, 4096), ("n14336k4096", 14336, 4096)]
 
-    click.echo(
-        f"--- interleaved sweep ({len(combos)} combos x {len(shapes)} shapes "
-        f"x {len(m_values)} M x b={batch}, recipes measured per shape)"
-        + ("; full coverage" if full_coverage else "")
-    )
-    results = sweep(m_values, shapes, combos, batch, warmup, iterations, trials)
+        click.echo(
+            f"--- interleaved sweep ({len(combos)} combos x {len(shapes)} shapes "
+            f"x {len(m_values)} M x b={batch}, recipes measured per shape)"
+            + ("; full coverage" if full_coverage else "")
+        )
+        results = sweep(m_values, shapes, combos, batch, warmup, iterations, trials)
+        if save_results is not None:
+            save_results.write_text(json.dumps(results))
+            click.echo(f"saved measurements to {save_results}")
 
     rows = build_rows(
         results,
         min_gain=min_gain / 100.0,
         full_coverage=full_coverage,
+        band_search=band_search,
+        smooth=noise_merge,
     )
     header = (
         "# AOT dispatch rows: m_min m_max n_min n_max perf_class crosswise "

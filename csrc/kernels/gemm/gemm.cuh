@@ -150,18 +150,10 @@ inline bool gemm_plan_log() {
 }
 
 // Experiment/debug knobs, one getenv at first use:
-//   ASTR_GEMM_NO_TMA=1 forces the cp.async staging everywhere;
-//   ASTR_GEMM_S3=1 flips the congruous scan to prefer the s3 deep rings
-//   (stage-depth calibration — the cp.async rings measured it a wash on
-//   RTX 5090, the TMA rings may price differently).
+//   ASTR_GEMM_NO_TMA=1 forces the cp.async staging everywhere.
 inline bool gemm_tma_disabled() {
     static const bool off = std::getenv("ASTR_GEMM_NO_TMA") != nullptr;
     return off;
-}
-
-inline bool gemm_prefer_s3() {
-    static const bool on = std::getenv("ASTR_GEMM_S3") != nullptr;
-    return on;
 }
 
 // ASTR_GEMM_NO_MX=1 keeps symmetric fp8 on the plain cell — the A/B knob
@@ -212,17 +204,6 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block,
     }
     Kernel<<<grid, block, smem_bytes, stream>>>(args...);
     ASTRAI_LAUNCH_CHECK();
-}
-
-// Padding-driven small-CTA rule: m or n <= 64 wastes half a 128-row CTA's
-// MMA work, and a non-128-divisible shape drags its edge tiles through the
-// predicated generic path — when 64 divides both dims, the 64x64 CTA tiles
-// exactly and wins that band.
-inline bool small_cta_padding(int64_t m, int64_t n) {
-    if (m <= 64 || n <= 64) return true;
-    const bool big_div = (m % 128 == 0) && (n % 128 == 0);
-    const bool small_div = (m % 64 == 0) && (n % 64 == 0);
-    return !big_div && small_div;
 }
 
 // Launch configuration — a pure function of the problem (unit-testable
@@ -279,24 +260,8 @@ inline int plan_raster(const GemmParams& p, int bm, int bn, int ba, int bb,
     return (int)std::max(g, (int64_t)1);
 }
 
-// Per-SM throughput scalars of the non-big recipes relative to the big
-// CTA, one row per dtype class, segmented by the recipe's own wave count
-// ({1, 2, >=3}): one scalar spans the wave regimes badly — the finer
-// tiles ride even with big only once the grid saturates. RTX 5090-fitted
-// medians from an offline calibration sweep (every recipe timed through
-// the production launch route over a shape grid; the fit makes the cost
-// model below reproduce the measured time ratios — method in
-// docs/developer/cuda_kernels.md). They also absorb smem
-// residency (co-resident CTAs share SM throughput), which is why the cost
-// model carries no separate residency term. The scalars are the one
-// device-dependent constant set: re-run the sweep+fit when porting.
+// Dtype-class ids the plan-table rows key on.
 enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
-constexpr double kPlanEff[4][2][3] = {  // [class]{narrow, small}{waves 1,2,3+}
-    {{0.925, 0.957, 0.977}, {0.654, 0.710, 0.730}},  // W16A16: bf16 x bf16
-    {{0.869, 0.924, 0.924}, {0.590, 0.725, 0.755}},  // W8A16: 2B x 1B (incl. fp8)
-    {{0.642, 0.862, 0.759}, {0.334, 0.624, 0.582}},  // W8A8: int8 x int8
-    {{0.669, 0.813, 0.756}, {0.413, 0.614, 0.583}},  // F8A8: fp8 (mx cell on 120)
-};
 
 // Compile-time dtype-class derivation from the operand pair (the mma
 // promotion rule plus operand widths; mixed bf16xfp8 lands with the 2B x
@@ -317,85 +282,7 @@ constexpr GemmPerfClass gemm_perf_class() {
     }
 }
 
-// Conguous (NT) path: a wave-count cost model over the manifest recipes
-// replaces the measured crossover ladder — wave bands come from device
-// arithmetic, the per-regime eff scalars from the calibration table
-// above. A recipe's cost is ceil(tiles / sms) quantized waves of
-// bm * bn / eff SM-work each, scaled by edge-tile padding waste. The
-// scan runs big -> narrow ->
-// small, s2 ring first (RTX 5090-measured: the s3 deep rings ride even to
-// -1.3% on cp.async staging — three buffers already hide the LDGSTS
-// latency, unlike humming's TMA rings that want the depth; the s3
-// siblings stay in the manifest for staging variants that price
-// differently), and a challenger needs a >2% lead to displace the
-// incumbent, so ties resolve to the bigger tile — the same bias the
-// measured ladder encoded. The small recipe keeps its residency-aware
-// stage rule: the 3-stage ring's heavier smem (a second resident CTA on
-// the 2Bx2B pair) only pays once the small grid spans multiple waves.
-inline GemmPlan plan_congruous(const GemmParams& p, const DeviceFacts& dev,
-                               int ba, int bb, GemmPerfClass perf) {
-    struct Recipe {
-        GemmPlan::Cta cta;
-        int bm, bn, k, stages;  // manifest geometry — a candidate's smem
-                                // price derives from it
-        int eff_idx;  // -1: the big CTA is the 1.0 reference
-    };
-    static constexpr Recipe kRecipes[] = {
-        {GemmPlan::Cta::kBig128, 128, 128, 64, 2, -1},
-        {GemmPlan::Cta::kBig128, 128, 128, 64, 3, -1},
-        {GemmPlan::Cta::kNarrow128x64, 128, 64, 64, 2, 0},
-        {GemmPlan::Cta::kNarrow128x64, 128, 64, 64, 3, 0},
-        {GemmPlan::Cta::kSmall64, 64, 64, 64, 2, 1},
-        {GemmPlan::Cta::kSmall64, 64, 64, 64, 3, 1},
-    };
-    const Recipe* best = nullptr;
-    double best_cost = 0.0;
-    for (const Recipe& r : kRecipes) {
-        // Device-facts feasibility (humming's candidate filter): a recipe
-        // over the smem opt-in ceiling cannot launch at all — prune before
-        // scoring. Every manifest recipe fits on the production archs
-        // (96KB max vs 99KB optin), so this only guards ports.
-        if (ring_smem_bytes(r.bm, r.bn, r.k, r.stages, ba, bb) > dev.smem_max)
-            continue;
-        const int64_t tiles =
-            p.batch * ((p.m + r.bm - 1) / r.bm) * ((p.n + r.bn - 1) / r.bn);
-        const int64_t waves = (tiles + dev.sms - 1) / dev.sms;
-        const double waste =
-            (double)(((p.m + r.bm - 1) / r.bm) * r.bm *
-                     ((p.n + r.bn - 1) / r.bn) * r.bn) /
-            (double)(p.m * p.n);
-        const int regime = waves <= 1 ? 0 : (waves == 2 ? 1 : 2);
-        const double e =
-            r.eff_idx < 0 ? 1.0 : kPlanEff[(int)perf][r.eff_idx][regime];
-        const double cost = (double)waves * r.bm * r.bn / e * waste;
-        if (best == nullptr) {
-            best = &r;
-            best_cost = cost;
-            continue;
-        }
-        // ASTR_GEMM_S3: the same CTA's s3 twin takes over on ties (the
-        // stage-depth measurement knob); otherwise the >2% challenger
-        // rule keeps the scan's first — the s2 ring — on ties.
-        const bool deeper_twin = gemm_prefer_s3() && r.stages == 3 &&
-                                 best->stages == 2 && best->cta == r.cta;
-        if (cost < best_cost * 0.98 || deeper_twin) {
-            best = &r;
-            best_cost = cost;
-        }
-    }
-    // The s2 small recipe (48KB) is the floor every supported device fits;
-    // the guard keeps the planner a total function on any other geometry.
-    if (best == nullptr) best = &kRecipes[4];
-    const int64_t tiles_64 =
-        p.batch * ((p.m + 63) / 64) * ((p.n + 63) / 64);
-    const bool small = best->cta == GemmPlan::Cta::kSmall64;
-    const bool s3_fits =
-        ring_smem_bytes(64, 64, 64, 3, ba, bb) <= dev.smem_max;
-    int stages = best->stages;
-    if (small && !(s3_fits && tiles_64 > 2 * dev.sms)) stages = 2;
-    return GemmPlan{best->cta, stages,
-                    plan_raster(p, best->bm, best->bn, ba, bb, dev)};
-}
+
 
 // A row is a plan: its CTA class names the manifest geometry (resolved at
 // launch through dispatch_tile), the ring depth rides on the row, raster 0
@@ -414,61 +301,19 @@ inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
                                     : plan_raster(p, bm, bn, ba, bb, dev)};
 }
 
-// ASTR_GEMM_MODEL_FALLBACK=1: re-enable the cost model for a missing
-// table row. Off by default — the AOT table owns production dispatch
-// (full-coverage rows end with a catch-all row, so the model no longer
-// runs); this knob is the dev/bench escape hatch.
-inline bool gemm_model_fallback_enabled() {
-    static const bool on = std::getenv("ASTR_GEMM_MODEL_FALLBACK") != nullptr;
-    return on;
-}
-
-// The retired cost-model body, kept for ASTR_GEMM_MODEL_FALLBACK and as
-// the reference planner the table's measurements were derived from.
-inline GemmPlan plan_model(const GemmParams& p, int ba, int bb,
-                           GemmPerfClass perf, int crosswise_ops,
-                           const DeviceFacts& dev) {
-    // Feasibility gates shared by the branches below: a recipe over the
-    // device's smem opt-in ceiling demotes to the next fitting geometry
-    // instead of failing the launch. Both are always true on the
-    // production archs.
-    const bool big_fits =
-        ring_smem_bytes(128, 128, 64, 2, ba, bb) <= dev.smem_max;
-    const bool s3_fits =
-        ring_smem_bytes(64, 64, 64, 3, ba, bb) <= dev.smem_max;
-    const auto small = [&](bool s3) {
-        return GemmPlan{GemmPlan::Cta::kSmall64, s3 && s3_fits ? 3 : 2,
-                        plan_raster(p, 64, 64, ba, bb, dev)};
-    };
-    // Padding rules first: predication waste beats any wave-fill effect.
-    if (small_cta_padding(p.m, p.n)) return small(crosswise_ops > 0);
-    if (crosswise_ops > 0) {
-        const int64_t tiles_128 =
-            (int64_t)p.batch * ((p.m + 127) / 128) * ((p.n + 127) / 128);
-        if (big_fits && tiles_128 >= (int64_t)dev.sms * 3 / 2) {
-            return GemmPlan{GemmPlan::Cta::kBig128, 2,
-                            plan_raster(p, 128, 128, ba, bb, dev)};
-        }
-        return small(true);
-    }
-    return plan_congruous(p, dev, ba, bb, perf);
-}
-
 // crosswise_ops counts the operands taking the direct crosswise load
 // (A ColMajor / B RowMajor storage): 0 = dual-congruous NT, 1 = TT and
 // the NN swap, 2 = TN. ba / bb are the operand element sizes; perf is
-// the dtype class picking the planner's eff row.
+// the dtype class the table rows key on.
 inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
                           GemmPerfClass perf, int crosswise_ops = 0) {
     const DeviceFacts dev = device_facts();
-    // The dispatch strategy is the sources table: precedence is array
-    // order (calibration knob > AOT table), and plan_from_row smem-gates
-    // every row, so a stale tuning ring demotes to the next source. The
-    // cost model is the one procedural step, dev-only; production
-    // dispatch is the table — full-coverage tables end each (class,
-    // crosswise) group with an open row, so the degraded rows fire only
-    // when the table is empty, stale, or never measured the shape's
-    // layout class (the sweep is NT-only).
+    // Table-only dispatch: precedence is the sources array order
+    // (calibration knob > AOT table), and plan_from_row smem-gates every
+    // row, so a stale tuning ring demotes to the next source. The original
+    // cost model is deleted from the codebase — a miss falls to the
+    // degraded bands (open on M, -1 keys; always match, so planning stays
+    // a total function); ASTR_GEMM_TABLE=- skips both row sources.
     static constexpr TableSource kRowSources[] = {
         {"forced recipe", env_recipe_row},
         {"table", table_row},
@@ -480,11 +325,6 @@ inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
                 return *plan;
             }
         }
-    }
-    if (gemm_model_fallback_enabled()) {
-        GemmPlan plan = plan_model(p, ba, bb, perf, crosswise_ops, dev);
-        log_plan_decision("model fallback", p, plan);
-        return plan;
     }
     // The degraded bands are open on N with -1 keys, so a row always
     // matches and planning stays a total function (degraded_row_for

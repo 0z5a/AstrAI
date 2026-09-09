@@ -131,24 +131,40 @@ inline const std::vector<TableRow>& plan_table_override_rows() {
     const std::string path = env != nullptr ? std::string(env) : std::string();
     if (path != loaded_path) {
         rows.clear();
-        if (!path.empty()) parse_plan_table_file(path, rows);
+        if (!path.empty() && path != "-") parse_plan_table_file(path, rows);
         loaded_path = path;
     }
     return rows;
 }
 
 // BEGIN GENERATED
-// Empty until the measured grid is pasted here by hand (see
-// csrc/bench/gen_plan_table.py): the sweep's "model" reference must be
-// the pure cost model, not the table it measures against. Kept empty.
-static constexpr TableRow kBuiltinPlanTable[] = {};
+// Plan-model distillate (2026-09-09): plan_model's own (cta, stages)
+// decisions sampled on the 6-point grid 256/1024/4096 M x 512/2048 N
+// (w16a16 class only), one row per sampled point — the original tile-
+// division scheme as a table, exact on the sampled shapes. Replaces the
+// measured 125-row table BY USER DECISION. Pasted by hand; the measure-
+// ment script never writes source. NT layout only (crosswise 0).
+static constexpr TableRow kBuiltinPlanTable[] = {
+    {0, 640, 0, 1280, 0, 0, TileClass::kSmall64, 2, 0},
+    {0, 640, 1280, 0, 0, 0, TileClass::kSmall64, 2, 0},
+    {640, 2560, 0, 1280, 0, 0, TileClass::kSmall64, 2, 0},
+    {640, 2560, 1280, 0, 0, 0, TileClass::kBig128, 2, 0},
+    {2560, 0, 0, 1280, 0, 0, TileClass::kBig128, 2, 0},
+    {2560, 0, 1280, 0, 0, 0, TileClass::kNarrow128x64, 2, 0},
+};
 // END GENERATED
 static constexpr int kBuiltinPlanTableCount =
     (int)(sizeof(kBuiltinPlanTable) / sizeof(TableRow));
 
-// Override file first, then the compiled-in rows.
+// Override file first, then the compiled-in rows. ASTR_GEMM_TABLE="-"
+// is the explicit "AOT off" escape hatch: neither override nor builtin
+// rows, so the planner runs the cost model (or the degraded bands when
+// ASTR_GEMM_MODEL_FALLBACK is unset). The sweep's "model" candidate uses
+// it now that builtin rows exist in the extension.
 inline const TableRow* plan_table_lookup(const GemmParams& p, int perf_class,
                                          int crosswise) {
+    const char* env = std::getenv("ASTR_GEMM_TABLE");
+    if (env != nullptr && std::strcmp(env, "-") == 0) return nullptr;
     const std::vector<TableRow>& rows = plan_table_override_rows();
     if (const TableRow* row = plan_row_for(rows.data(), (int)rows.size(), p.m,
                                            p.n, perf_class, crosswise);
