@@ -21,7 +21,7 @@ import numpy as np
 import tqdm
 from datasets import load_dataset
 
-from astrai.inference import build_engine
+from astrai.inference import InferenceEngine, build_engine
 
 # ---------------------------------------------------------------------------
 # Config
