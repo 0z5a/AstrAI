@@ -349,10 +349,10 @@ static bool test_dtype_combos() {
     // big/small tile variants (the plan ladder routes 256x256 to the small
     // CTA, so the big CTA needs pinning).
     using Bf16Big =
-        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, TileBigFast,
+        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2_Fast,
                    RowMajor, __nv_bfloat16>;
     using Bf16Small =
-        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, TileSmall64s3,
+        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3_Fast,
                    RowMajor, __nv_bfloat16>;
     printf("W16A16 (bf16 x bf16, all layouts):\n");
     for (int k : {64, 128, 320, 512}) {
@@ -377,28 +377,28 @@ static bool test_dtype_combos() {
     // production dispatch (NN takes the direct mixed instantiation), with
     // pinned tile variants the plan ladder would not route 256x256 to.
     using MixedBig =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, TileBigFast,
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2_Fast,
                    RowMajor, __nv_bfloat16>;
     using MixedSmall =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, TileSmall64s3,
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3_Fast,
                    RowMajor, __nv_bfloat16>;
     using MixedTT =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileBig128x128,
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2,
                    RowMajor, __nv_bfloat16>;
     using TTSmallS2 =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileSmall64s2,
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_64x64x64_W16x32_S2_Fast,
                    RowMajor, __nv_bfloat16>;
     using TTNarrow =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileNarrow128x64,
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x64x64_W32x32_S2_Fast,
                    RowMajor, __nv_bfloat16>;
     using TTBigFast =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, TileBigFast,
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2_Fast,
                    RowMajor, __nv_bfloat16>;
     using MixedTN =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, TileBig128x128,
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, Tile_128x128x64_W64x32_S2,
                    RowMajor, __nv_bfloat16>;
     using MixedNN =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, RowMajor, TileBig128x128,
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, RowMajor, Tile_128x128x64_W64x32_S2,
                    RowMajor, __nv_bfloat16>;
     printf("W8A16 (bf16 act x int8 weight, all layouts):\n");
     for (int k : {64, 320, 512}) {
@@ -474,7 +474,7 @@ static bool test_dtype_combos() {
     // plus a pinned big-CTA instantiation at k=320.
     {
         using W8A8Big =
-            GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, TileBigFast,
+            GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2_Fast,
                        RowMajor, __nv_bfloat16>;
         printf("W8A8 (int8 act x int8 weight, all layouts):\n");
         for (int k : {64, 320, 512}) {
@@ -514,11 +514,11 @@ static bool test_dtype_combos() {
     // fp8->fp16 widen + exact bf16 rounding; row 0 is seeded with exact
     // zeros and subnormal-magnitude values (0.001 < 2^-6) so those paths
     // are exercised, and the mirrored pair follows. Pinned big CTA at
-    // k=320 covers the TileBigFast instantiation the planner would not
+    // k=320 covers the Tile_128x128x64_W64x32_S2_Fast instantiation the planner would not
     // route 256x256 to.
     {
         using F8Big = GemmPolicy<__nv_bfloat16, __nv_fp8_e4m3, RowMajor,
-                                 ColMajor, TileBigFast, RowMajor,
+                                 ColMajor, Tile_128x128x64_W64x32_S2_Fast, RowMajor,
                                  __nv_bfloat16>;
         printf("W-F8A16 (bf16 act x e4m3 weight, all layouts):\n");
         for (int k : {64, 320}) {
@@ -555,7 +555,7 @@ static bool test_dtype_combos() {
     // (launch_plan compile-time-reroutes the 128x128 CTA for fat outputs).
     using Fp8F32Out =
         GemmPolicy<__nv_fp8_e4m3, __nv_fp8_e4m3, RowMajor, ColMajor,
-                   TileNarrow128x64, RowMajor, float>;
+                   Tile_128x64x64_W32x32_S2_Fast, RowMajor, float>;
     printf("fp8 operands, fp32 output:\n");
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;

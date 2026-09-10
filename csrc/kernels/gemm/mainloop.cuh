@@ -179,8 +179,7 @@ struct GemmCollectiveMainloop {
                                      int64_t m, int64_t n, int64_t k, int64_t a_ld, int64_t b_ld,
                                      int tid, int2 block)
         : ring_a(astrai::make_ring<ElemA, StagedLayoutA, kARing>(smem)),
-          ring_b(astrai::make_ring<ElemB, StagedLayoutB, kBRing>(
-              smem + RingA::Layout::kTotalBytes)),
+          ring_b(astrai::make_ring<ElemB, StagedLayoutB, kBRing>(smem + RingA::Layout::kTotalBytes)),
           a(a), b(b), m(m), n(n), k(k), a_ld(a_ld), b_ld(b_ld), tid(tid),
           block_m(block.x), block_n(block.y),
           warp_m((tid >> 5) / Traits::kWarpsN),

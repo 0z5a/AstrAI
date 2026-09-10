@@ -214,6 +214,10 @@ struct GemmPlan {
     // _fit_num_stages rule: deepest ring that fits).
     int stages;
     int raster;  // GemmParams::raster value this launch runs
+    // Ring K (kK), the third axis of the manifest key: the k-tile-depth twins
+    // are separate tiles, so a plan that named only the CTA class and depth
+    // could not reach them.
+    int kk;
 };
 
 // One [gemm-plan] line naming the planner's decision (ASTR_GEMM_PLAN = 1):
@@ -285,14 +289,33 @@ constexpr GemmPerfClass gemm_perf_class() {
 // row, the caller tries the next source.
 inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
                                              const GemmParams& p, int ba,
-                                             int bb, const DeviceFacts& dev) {
+                                             int bb, const DeviceFacts& dev,
+                                             int crosswise = 0) {
     int bm, bn;
     plan_row_geometry(row.cta, bm, bn);
-    if (ring_smem_bytes(bm, bn, kTableRowK, row.stages, ba, bb) > dev.smem_max)
+    // A row can name a geometry or a depth that this operand pair has no tile
+    // for: the wide CTA only exists on the 1-byte manifest, and the manifests
+    // carry kK 32 and 64. Such a row would match no tile in dispatch_tile and
+    // launch nothing at all, so it is rejected here — the next source, or the
+    // degraded bands, serves the shape instead.
+    if (row.cta == TileClass::kWide128x256 && (ba != 1 || bb != 1))
+        return std::nullopt;
+    if (!row_k_supported(row.kk)) return std::nullopt;
+    // Only the dual-2-byte ladder carries the kK=32 twins (policy.cuh): a
+    // 1-byte line holds half as many 16B chunks, so no kK=32 tile divides its
+    // load path. A row naming one for such a pair matches no tile either, and
+    // is rejected on the same terms as the width rule above.
+    if (row.kk == 32 && (ba != 2 || bb != 2)) return std::nullopt;
+    // Crosswise staging runs the conservative ladder, which carries kK 64 and
+    // no wide CTA; a row naming more than that would match no tile there.
+    if (crosswise != 0 && (row.kk != kTableRowK || row.cta == TileClass::kWide128x256))
+        return std::nullopt;
+    if (ring_smem_bytes(bm, bn, row.kk, row.stages, ba, bb) > dev.smem_max)
         return std::nullopt;
     return GemmPlan{row.cta, row.stages,
                     row.raster != 0 ? row.raster
-                                    : plan_raster(p, bm, bn, ba, bb, dev)};
+                                    : plan_raster(p, bm, bn, ba, bb, dev),
+                    row.kk};
 }
 
 // crosswise_ops counts the operands taking the direct crosswise load
@@ -314,7 +337,8 @@ inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
     };
     for (const TableSource& s : kRowSources) {
         if (auto row = s.find(p, (int)perf, crosswise_ops); row) {
-            if (auto plan = plan_from_row(*row, p, ba, bb, dev)) {
+            if (auto plan = plan_from_row(*row, p, ba, bb, dev,
+                                          crosswise_ops)) {
                 log_plan_decision(s.name, p, *plan);
                 return *plan;
             }
@@ -347,15 +371,19 @@ void launch_policy(GemmParams p, cudaStream_t stream) {
 // with unchanged tensors and tile pay the encode once.
 // ---------------------------------------------------------------------------
 
-// Big-CTA output-reclaim feasibility: the epilogue scatters the output
-// tile into the reclaimed operand rings, and a fat output (fp32, 4B/elem)
-// cannot fit the 128x128 tile inside thin operand rings — one definition
-// serves the cp.async and TMA dispatch twins alike.
-template <typename ElemA, typename ElemB, typename OutT>
-constexpr bool big_reclaim_fits() {
-    return 128 * 128 * sizeof(OutT) <=
-           ring_smem_bytes(128, 128, 64, 2, (int)sizeof(ElemA),
-                           (int)sizeof(ElemB));
+// Output-reclaim feasibility of one tile: the epilogue scatters the output
+// tile into the reclaimed operand rings, so a fat output (fp32, 4B/elem) can
+// outgrow the ring the planner priced — the wide CTA's 128x256 of fp32 is
+// 131072B against the 73728B a 1-byte pair leaves it. Keyed on the tile's own
+// geometry, which makes this exactly the predicate the launch twins' reclaim
+// static_assert states, so a new CTA class or ring depth cannot drift from the
+// assert that guards it. One definition serves both dispatch ladders.
+template <typename Tile, typename ElemA, typename ElemB, typename OutT>
+constexpr bool reclaim_fits() {
+    return Tile::CtaShape::kM * Tile::CtaShape::kN * sizeof(OutT) <=
+           ring_smem_bytes(Tile::CtaShape::kM, Tile::CtaShape::kN,
+                           Tile::CtaShape::kK, Tile::kStages,
+                           (int)sizeof(ElemA), (int)sizeof(ElemB));
 }
 
 // Build both operand descriptors for one TMA Policy's geometry. Dim/stride
@@ -417,51 +445,64 @@ bool launch_policy_tma(const GemmParams& p, cudaStream_t stream) {
 }
 
 // Manifest dispatch (CUTLASS builder-table style): the plan's (CTA class,
-// ring depth) selects exactly one TileManifest entry — the || short-circuits
-// — and the resolver maps its tile onto a concrete Policy and launches.
+// ring depth, k-tile depth) selects exactly one manifest entry — the ||
+// short-circuits — and the resolver maps its tile onto a concrete Policy and
+// launches.
 template <typename Manifest, typename Resolver>
 bool dispatch_tile(const GemmPlan& plan, const Resolver& resolve) {
     return std::apply(
         [&plan, &resolve](auto... tiles) {
-            return (... || (tile_class<decltype(tiles)>() == plan.cta &&
-                            decltype(tiles)::kStages == plan.stages &&
-                            resolve.template run<decltype(tiles)>()));
+            return (... ||
+                    (tile_class<decltype(tiles)>() == plan.cta &&
+                     decltype(tiles)::kStages == plan.stages &&
+                     (int)decltype(tiles)::CtaShape::kK == plan.kk &&
+                     resolve.template run<decltype(tiles)>()));
         },
         Manifest{});
 }
 
+// Narrow twin of a big tile for the output-reclaim fallback, carrying the
+// same ring depth as the tile it replaces (the planner priced that ring, so a
+// deeper substitute could overflow the smem opt-in). There is no kK=32 narrow
+// s3, so a deep kK=32 big tile falls back to its s2 twin.
+template <typename Tile>
+using narrow_fallback_t = std::conditional_t<
+    Tile::CtaShape::kK == 32, Tile_128x64x32_W32x32_S2_Fast,
+    std::conditional_t<(Tile::kStages >= 3), Tile_128x64x64_W32x32_S3_Fast,
+                       Tile_128x64x64_W32x32_S2_Fast>>;
+
 // TMA ladder resolver. The gate in launch_plan already guarantees
-// dual-congruous 1-/2-byte operands, so the fast tile stays; only the
-// output-reclaim fallback swaps big -> narrow. std::conditional_t keeps
-// every alias instantiable, which the kernel's reclaim static_assert
+// dual-congruous 1-/2-byte operands, so the fast tile stays; only an
+// output-reclaim overflow swaps the CTA for its narrow twin. std::conditional_t
+// keeps every alias instantiable, which the kernel's reclaim static_assert
 // requires (an if-constexpr branch still NAMES its dead types).
 template <typename ElemA, typename ElemB, typename LayoutOut, typename OutT,
-          bool kBigReclaim, bool UseMx = false>
+          bool UseMx = false>
 struct TmaLauncher {
     const GemmParams& p;
     cudaStream_t stream;
     template <typename Tile>
     bool run() const {
+        // Only the geometries whose output tile can outgrow their own rings
+        // carry a substitution; the narrow and small classes always fit.
+        constexpr bool kReclaimGated = tile_class<Tile>() == TileClass::kBig128 ||
+                                       tile_class<Tile>() == TileClass::kWide128x256;
         using TileT = std::conditional_t<
-            tile_class<Tile>() != TileClass::kBig128, Tile,
-            std::conditional_t<
-                kBigReclaim, Tile,
-                std::conditional_t<(Tile::kStages >= 3), TileNarrow128x64s3,
-                                   TileNarrow128x64>>>;
-        return launch_policy_tma<
-            GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileT, LayoutOut,
+            kReclaimGated && !reclaim_fits<Tile, ElemA, ElemB, OutT>(),
+            narrow_fallback_t<Tile>, Tile>;
+        return launch_policy_tma<GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileT, LayoutOut,
                        OutT, false, true, UseMx>>(p, stream);
     }
 };
 
-// cp.async ladder resolver. Two big-CTA substitutions: the fast loop exists
-// only for dual-congruous staging (crosswise operands take the predicated
-// generic loop — the NonFast twin), and a fat output (fp32, 4B) that cannot
-// reclaim the big rings routes to the narrow CTA — same math at lower
-// reuse. Narrow and small entries pass through.
+// cp.async ladder resolver. Two substitutions, both on the CTA classes whose
+// output tile can outgrow their own rings: the fast loop exists only for
+// dual-congruous staging (crosswise operands take the predicated generic loop
+// — the NonFast twin), and a fat output (fp32, 4B) that cannot reclaim the
+// ring routes to the narrow CTA — same math at lower reuse. Narrow and small
+// entries pass through.
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
-          typename LayoutOut, typename OutT, bool kBigFast, bool kBigReclaim,
-          bool UseMx = false>
+          typename LayoutOut, typename OutT, bool kBigFast, bool UseMx = false>
 struct CpAsyncLauncher {
     GemmParams p;
     cudaStream_t stream;
@@ -470,12 +511,16 @@ struct CpAsyncLauncher {
         using NonFast = GemmTileConfig<typename Tile::CtaShape,
                                        typename Tile::WarpShape, Tile::kStages,
                                        false>;
+        constexpr bool kFits = reclaim_fits<Tile, ElemA, ElemB, OutT>();
+        constexpr bool kBig = tile_class<Tile>() == TileClass::kBig128;
+        constexpr bool kWide = tile_class<Tile>() == TileClass::kWide128x256;
         using TileT = std::conditional_t<
-            tile_class<Tile>() != TileClass::kBig128, Tile,
-            std::conditional_t<
-                kBigReclaim, std::conditional_t<kBigFast, Tile, NonFast>,
-                std::conditional_t<(Tile::kStages >= 3), TileNarrow128x64s3,
-                                   TileNarrow128x64>>>;
+            kBig, std::conditional_t<
+                      kFits, std::conditional_t<kBigFast, Tile, NonFast>,
+                      narrow_fallback_t<Tile>>,
+            std::conditional_t<kWide, std::conditional_t<
+                                          kFits, Tile, narrow_fallback_t<Tile>>,
+                               Tile>>;
         launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT,
                                  LayoutOut, OutT, false, false, UseMx>>(
             p, stream);
@@ -503,17 +548,15 @@ void launch_plan_impl(GemmParams p, const GemmPlan& plan,
     // kill switch, and every descriptor encodable — else the cp.async
     // twin below runs unchanged.
     if constexpr (kBigFast && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
-        constexpr bool kTmaReclaim = big_reclaim_fits<ElemA, ElemB, OutT>();
         if (!gemm_tma_disabled() && astrai::device_facts().cc >= 90 &&
-            dispatch_tile<TileManifest>(
-                plan, TmaLauncher<ElemA, ElemB, LayoutOut, OutT, kTmaReclaim,
-                                  UseMx>{p, stream}))
+            dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
+                plan, TmaLauncher<ElemA, ElemB, LayoutOut, OutT, UseMx>{
+                          p, stream}))
             return;
     }
-    constexpr bool kBigReclaim = big_reclaim_fits<ElemA, ElemB, OutT>();
-    dispatch_tile<TileManifest>(
+    dispatch_tile<manifest_for<ElemA, ElemB, LayoutA, LayoutB>>(
         plan, CpAsyncLauncher<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                              kBigFast, kBigReclaim, UseMx>{p, stream});
+                              kBigFast, UseMx>{p, stream});
 }
 
 // The planner entry: symmetric fp8 rides the sm_120 block_scale cell unless

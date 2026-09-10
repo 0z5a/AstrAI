@@ -53,7 +53,7 @@ layered directory:
 | `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `fp8_cvt_traits<Fp8T>` convert + `quant_in_traits<InT>` unpack (primary templates undefined — one specialization per dtype/format) — no torch |
 | `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes — the smem ring budgets; the MMA K extent rides `MmaShapeFor<MmaT>`), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
-| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `TileBigFast` / `TileBigFastS3` / `TileNarrow128x64` / `TileNarrow128x64s3` / `TileSmall64s2` / `TileSmall64s3`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key and `TileManifest` type list the launch ladders index |
+| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `Tile_128x128x64_W64x32_S2_Fast` / `Tile_128x128x64_W64x32_S3_Fast` / `Tile_128x64x64_W32x32_S2_Fast` / `Tile_128x64x64_W32x32_S3_Fast` / `Tile_64x64x64_W16x32_S2_Fast` / `Tile_64x64x64_W16x32_S3_Fast`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key and `TileManifest` type list the launch ladders index |
 | `gemm/load.cuh` | operand loaders: typed staged tiles (`Tensor<PtrEngine<Elem>, StagedLayout>`, `common/tensor.cuh`) over the tile's declared layout (`common/swizzle.cuh`), congruous cp.async staging (predicated via runtime src-size zfill + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
 | `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
@@ -203,7 +203,7 @@ twin, which stays compiled); `ASTR_GEMM_NO_TMA=1` forces the fallback
 for experiments.
 
 **Stage depth.** The manifest carries s3 deep-ring siblings of every
-class (`TileBigFastS3` / `TileNarrow128x64s3` / `TileSmall64s3`,
+class (`Tile_128x128x64_W64x32_S3_Fast` / `Tile_128x64x64_W32x32_S3_Fast` / `Tile_64x64x64_W16x32_S3_Fast`,
 humming's `_fit_num_stages` rule — the thinner the operand pair, the
 more smem headroom under the 96KB budget). RTX 5090 measured them a
 wash to -1.3% on the cp.async rings (three buffers already hide the
@@ -260,8 +260,8 @@ recipe bundling shapes + stage depth + loop mode. `Shape` itself is the
 shared vocabulary type of `common/shape.cuh`: the same `Shape<...>`
 spells both the CTA tile here and the staging layouts' chunk grids, so
 tile geometry and smem layout read in one notation. The production
-manifest in `policy.cuh` (`TileBig128x128`, `TileBigFast`,
-`TileNarrow128x64`, `TileSmall64s2/s3`) is the `TileManifest` type list
+manifest in `policy.cuh` (`Tile_128x128x64_W64x32_S2`, `Tile_128x128x64_W64x32_S2_Fast`,
+`Tile_128x64x64_W32x32_S2_Fast`, `Tile_64x64x64_W16x32_S2_Fast/s3`) is the `TileManifest` type list
 the launch ladders dispatch over (CUTLASS builder-table style: `dispatch_tile`
 in `gemm.cuh` indexes the manifest by the plan's `TileClass` and depth bit,
 both ladder-agnostic); a new geometry is one alias plus one manifest entry
