@@ -1,23 +1,37 @@
 """Generate AOT plan-table rows from measured shape sweeps.
 
-Every dtype combo is swept at each (M, N, K, batch) grid point under every
-candidate the host planner can pick — the degraded-bands fallback plus the six
-forced recipes (big/narrow/small CTA s2 and s3 ring; feasibility mirror
-drops the combos whose ring exceeds the smem opt-in ceiling, e.g. big s3
-on the 2B x 2B pair) — and the measured winner per point becomes a
-dispatch-table row (csrc/kernels/gemm/plan_table.h). The rows are keyed
-(M, N) bands per dtype class: K is not a row key (the ring K is fixed at
-64), so a conflict across K / batch at one (M, N) resolves to the recipe
-with the best tflops.
+The candidate recipes are not a list in this file: they are read out of
+csrc/kernels/gemm/policy.cuh — the tile aliases and the three launch ladders
+that dispatch_tile resolves a row against. A hand-written candidate list
+drifts both ways: it keeps recipes the ladders dropped (so the sweep measures
+the degraded fallback and files it under that recipe's name) and it omits
+tiles they carry (so a tile that wins on the shapes at hand is never
+measured — how the wide CTA and the two kK=32 s3 tiles went missing). The
+vocabulary here is whatever the ladders say, each recipe named by its tile's
+own structural token, with the entries no row can reach reported rather than
+quietly ignored.
 
-The candidates are measured back-to-back at each shape in a single
-process (shape outer loop, recipe inner loop): each forced recipe runs as
-a one-row ASTR_GEMM_TABLE file toggled per launch (the row sources re-read
-their env per call, so the comparison happens under the same GPU
-clock/thermal state). A sweep that measured whole recipe batches in
-separate processes compared the big CTA (measured first) against the
-small CTA (measured 30 minutes later) under different boost states and
-picked systematically wrong winners.
+Every dtype combo is swept at each (M, N, K, batch) grid point under every
+candidate its ladder carries; the measured winner per point becomes a
+dispatch-table row (csrc/kernels/gemm/plan_table.h). Rows are keyed (M, N)
+bands per dtype class and carry the winning recipe's CTA class, ring depth and
+k-tile depth, so a conflict across K or batch at one (M, N) resolves to the
+recipe with the best tflops.
+
+The candidates are measured back-to-back at each shape in a single process
+(shape outer loop, recipe inner loop): each candidate runs as a one-row
+ASTR_GEMM_TABLE file toggled per launch (the row source re-reads its env per
+call, so the comparison happens under the same GPU clock/thermal state). A
+sweep that measured whole recipe batches in separate processes compared the
+big CTA (measured first) against the small CTA (measured 30 minutes later)
+under different boost states and picked systematically wrong winners.
+
+A candidate whose row the planner demotes (ring, operand width or depth gate)
+is served by the degraded bands instead, so a sweep that recorded tflops alone
+would report the fallback's number under that recipe's name — how the big CTA's
+s3 ring and the wide CTA once came to look measured. Every candidate is probed
+first, with the plan log on for a single launch, and a candidate that does not
+land on its own row is dropped before any measurement is attributed to it.
 
 Usage (rows to a runtime-override file, no rebuild):
     python csrc/bench/gen_plan_table.py \
@@ -25,13 +39,15 @@ Usage (rows to a runtime-override file, no rebuild):
         --shapes "qkv:4096:4096,up_gate:14336:4096" \
         --batch 1 --combos w16a16 --output plan_table.txt
 
---save-results dumps the raw measurements to JSON so the grid can be
-re-searched offline with --results-json (e.g. classic merge vs
---band-search cut optimization — the grid search over M band splits).
+--list-recipes prints the vocabulary this process would sweep (and the tiles no
+row can reach); --recipes narrows it. --save-results dumps the raw measurements
+to JSON so the bands can be re-cut offline with --results-json instead of
+re-measuring.
 
 This script only measures and emits the row file: use it with
-ASTR_GEMM_TABLE=plan_table.txt to serve the rows without a rebuild, or
-paste them into the compiled-in GENERATED block of plan_table.h by hand.
+ASTR_GEMM_TABLE=plan_table.txt to serve the rows without a rebuild, or paste
+them into the compiled-in GENERATED block of plan_table.h by hand (pasting
+maps the cta column onto TileClass; the rest is literal).
 """
 
 from __future__ import annotations
@@ -39,6 +55,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -73,35 +90,155 @@ PERF_CLASS: dict[str, int] = {
     "f8a8_e5m2": 3,
 }
 
-# Candidate recipes -> (cta id, stages): 0 small / 1 narrow / 2 big.
-# The C++ recipe knob (ASTR_GEMM_RECIPE) forces s2 rings only, so s3
-# candidates are measured as one-row ASTR_GEMM_TABLE files instead (open
-# bands, -1 keys) — plan_gemm smem-gates them exactly like real rows.
-RECIPES: dict[str, tuple[int, int] | None] = {
-    "model": None,
-    "big": (2, 2),
-    "big_s3": (2, 3),
-    "narrow": (1, 2),
-    "narrow_s3": (1, 3),
-    "small": (0, 2),
-    "small_s3": (0, 3),
-}
-# Tie preference: stable big > narrow > small, s2 before its s3 twin.
-RECIPE_ORDER = (
-    "big",
-    "narrow",
-    "small",
-    "big_s3",
-    "narrow_s3",
-    "small_s3",
-    "model",
+# ---------------------------------------------------------------------------
+# The candidate vocabulary, read from the launch ladders.
+#
+# A recipe is one tile: its CTA class, its ring depth and its k-tile depth,
+# written as a row file's (cta, stages, kK) — which is exactly the dispatch
+# key dispatch_tile matches on. The set of recipes is therefore the set of
+# tiles the ladders carry, so it is parsed from policy.cuh instead of being
+# maintained here. Names are the tile's own structural token
+# (Tile_<M>x<N>x<kK>_W<wM>x<wN>_S<stages>[_Fast]), so a recipe name cannot
+# describe a tile that is not there.
+#
+# One consequence worth reading twice: dispatch_tile matches (class, stages,
+# kK) and takes the FIRST entry, so two tiles on the same key are one
+# reachable recipe and one dead entry — the warp tiling is not part of the
+# key. Those dead entries are reported (see UNREACHABLE) rather than measured,
+# because a row can never select them whatever the shape.
+# ---------------------------------------------------------------------------
+
+# Operand widths per GemmPerfClass id: W16A16 / W8A16 / W8A8 / F8A8.
+PERF_WIDTH: dict[int, tuple[int, int]] = {0: (2, 2), 1: (2, 1), 2: (1, 1), 3: (1, 1)}
+
+POLICY_CUH = Path(__file__).resolve().parents[1] / "kernels" / "gemm" / "policy.cuh"
+_TILE_RE = re.compile(r"(Tile_\d+x\d+x\d+_W\d+x\d+_S\d+(?:_Fast)?)")
+_FACTS_RE = re.compile(r"Tile_(\d+)x(\d+)x(\d+)_W(\d+)x(\d+)_S(\d+)(_Fast)?")
+# TileClass ordinals, policy.cuh enum order (what a row's cta column means).
+_CLASS_OF = {(64, 64): 0, (128, 64): 1, (128, 128): 2, (128, 256): 3}
+# The shared ladder every staging path carries: six geometries, one per class
+# and ring depth. If the parse below cannot see these, it is broken.
+_SHARED = (
+    "Tile_64x64x64_W16x32_S2_Fast",
+    "Tile_64x64x64_W16x32_S3_Fast",
+    "Tile_128x64x64_W32x32_S2_Fast",
+    "Tile_128x64x64_W32x32_S3_Fast",
+    "Tile_128x128x64_W64x32_S2_Fast",
+    "Tile_128x128x64_W64x32_S3_Fast",
 )
+
+
+def tile_facts(name: str) -> tuple[int, int, int]:
+    """A tile's dispatch key: (cta class, stages, ring K)."""
+    m, n, k, _wm, _wn, stages, _fast = _FACTS_RE.fullmatch(name).groups()
+    try:
+        return _CLASS_OF[(int(m), int(n))], int(stages), int(k)
+    except KeyError as exc:  # a geometry TileClass does not name
+        raise RuntimeError(
+            f"{name}: CTA geometry not in the TileClass enum "
+            f"(policy.cuh). Add the class there and its ordinal to _CLASS_OF."
+        ) from exc
+
+
+def _load_ladders() -> dict[str, tuple[str, ...]]:
+    """Manifest membership per ladder, in manifest order — that order is the
+    tie preference, because dispatch_tile takes the first key match."""
+    text = POLICY_CUH.read_text()
+    if "using TileManifest" not in text:
+        raise RuntimeError(f"{POLICY_CUH}: no launch ladders found")
+    declared = set(_TILE_RE.findall(text))
+
+    def listed(name: str) -> list[str]:
+        start = text.index(f"using {name}")
+        end = text.index(";", start)
+        return [t for t in _TILE_RE.findall(text[start:end]) if t in declared]
+
+    cross = listed("TileManifestCross =")
+    return {
+        # manifest_for in policy.cuh picks between exactly these three.
+        "TileManifestCross": tuple(cross),
+        "TileManifest": tuple(
+            cross + [t for t in listed("TileManifest =") if t not in cross]
+        ),
+        "TileManifestByte": tuple(
+            cross + [t for t in listed("TileManifestByte =") if t not in cross]
+        ),
+    }
+
+
+def _reachable(tiles: tuple[str, ...]) -> tuple[tuple[str, ...], list[str]]:
+    """Split a ladder into what a row can select (the first tile per dispatch
+    key) and what it cannot (a second tile on a key already taken)."""
+    seen: dict[tuple[int, int, int], str] = {}
+    live: list[str] = []
+    dead: list[str] = []
+    for tile in tiles:
+        key = tile_facts(tile)
+        if key in seen:
+            dead.append(f"{tile} (same (class, stages, kK) as {seen[key]})")
+        else:
+            seen[key] = tile
+            live.append(tile)
+    return tuple(live), dead
+
+
+LADDERS = _load_ladders()
+REACHABLE: dict[str, tuple[str, ...]] = {}
+UNREACHABLE: dict[str, list[str]] = {}
+for _ladder, _tiles in LADDERS.items():
+    REACHABLE[_ladder], UNREACHABLE[_ladder] = _reachable(_tiles)
+# Every recipe the ladders carry, by name: cta class, ring depth, k-tile depth.
+RECIPES: dict[str, tuple[int, int, int]] = {
+    tile: tile_facts(tile) for tiles in REACHABLE.values() for tile in tiles
+}
+_missing = [t for t in _SHARED if t not in RECIPES]
+if _missing:
+    raise RuntimeError(
+        f"vocabulary read from {POLICY_CUH} missed {_missing}: refusing to "
+        f"sweep a partial candidate set (a silent omission is how a winning "
+        f"tile goes unmeasured)."
+    )
+
+
+def ladder_for_widths(ba: int, bb: int) -> str:
+    """Mirror of manifest_for (policy.cuh): 2-byte pairs get the congruent
+    ladder, 1-byte pairs the byte one, a mixed or crosswise problem the shared
+    six. The sweep is NT (crosswise 0), so mixed width is the Cross user here."""
+    if ba == 2 and bb == 2:
+        return "TileManifest"
+    if ba == 1 and bb == 1:
+        return "TileManifestByte"
+    return "TileManifestCross"
+
+
+def ladder_for(perf_class: int) -> str:
+    return ladder_for_widths(*PERF_WIDTH[perf_class])
+
+
+def order_for(perf_class: int) -> tuple[str, ...]:
+    """Tie preference for one dtype class: its ladder's manifest order, with
+    the model (no row) last — a tie carries no information, so it resolves the
+    way dispatch_tile itself would."""
+    return REACHABLE[ladder_for(perf_class)] + ("model",)
+
+
+def short_name(tile: str) -> str:
+    """A tile name without the Tile_ / _Fast dressing, for run headers."""
+    return tile.removeprefix("Tile_").removesuffix("_Fast")
+
+
+def reachability_report() -> list[str]:
+    """One line per tile a row cannot reach, for the run header."""
+    return [f"{ladder}: {dead}" for ladder, dead in UNREACHABLE.items() if dead]
+
 
 # Ring feasibility mirror (policy.cuh ring_smem_bytes vs the device's
 # smem opt-in ceiling): over-budget recipes cannot launch and would be
 # silently measured as the model/degraded — filter them out per combo.
-CTA_GEOM: dict[int, tuple[int, int]] = {2: (128, 128), 1: (128, 64), 0: (64, 64)}
-SMEM_OPTIN = 101376  # sm_120 (RTX 5090) MaxSharedMemoryPerBlockOptin
+# class -> CTA (M, N), the inverse of the same map that names the ordinals
+# (policy.cuh's kTileClassCta is the C++ home for these numbers).
+CTA_GEOM: dict[int, tuple[int, int]] = {v: k for k, v in _CLASS_OF.items()}
+SMEM_OPTIN = 101376  # MaxSharedMemoryPerBlockOptin: 99KB on sm_89 and sm_120
 _DTYPE_BYTES = {
     torch.bfloat16: 2,
     torch.int8: 1,
@@ -113,34 +250,89 @@ BYTES: dict[str, tuple[int, int]] = {
 }
 
 
-def ring_smem_bytes(stages: int, cta: int, ba: int, bb: int) -> int:
+def ring_smem_bytes(stages: int, cta: int, kk: int, ba: int, bb: int) -> int:
     bm, bn = CTA_GEOM[cta]
-    return (stages + 1) * 64 * (bm * ba + bn * bb)
+    return (stages + 1) * kk * (bm * ba + bn * bb)
 
 
 def candidate_recipes(combo: str) -> tuple[str, ...]:
-    """Measurable candidates for one combo, in RECIPE_ORDER."""
+    """Every recipe a row can select for this combo, in preference order, plus
+    the model (no table) reference. Ladder membership carries the width and
+    depth rules for free — a kK=32 tile is in no 1-byte ladder, the wide CTA in
+    no 2-byte one — so the only gate left here is the device's own: the ring
+    against the smem opt-in ceiling. What this gets wrong, the tag probe
+    catches rather than records."""
+    ba, bb = BYTES[combo]
     return tuple(
         recipe
-        for recipe in RECIPE_ORDER
-        if recipe == "model"
-        or ring_smem_bytes(RECIPES[recipe][1], RECIPES[recipe][0], *BYTES[combo])
+        for recipe in REACHABLE[ladder_for_widths(ba, bb)]
+        if ring_smem_bytes(
+            RECIPES[recipe][1], RECIPES[recipe][0], RECIPES[recipe][2], ba, bb
+        )
         <= SMEM_OPTIN
-    )
+    ) + ("model",)
+
+
+_TAG_RE = re.compile(r"\[gemm-plan\] (table|degraded|forced recipe)\b")
+
+
+def _last_tag(text: str) -> str:
+    """The decision tag of the launch that just happened (gemm.cuh logs one
+    decision line per plan_gemm call, then the launch line)."""
+    tags = _TAG_RE.findall(text)
+    if not tags:
+        return "?"
+    return "degraded (no table)" if tags[-1] == "degraded" else tags[-1]
+
+
+def _planned_tag(run) -> str:
+    """The decision tag of one launch, with the plan log on for that launch
+    only: gemm.cuh re-reads ASTR_GEMM_PLAN per call, so the log can be toggled
+    around it and its fprintf stays out of the timed loop. The tag is read from
+    fd 2 — the log is C-level fprintf, not Python's stderr."""
+    log = tempfile.TemporaryFile()
+    saved = os.dup(2)
+    os.environ["ASTR_GEMM_PLAN"] = "1"
+    os.dup2(log.fileno(), 2)
+    try:
+        run()
+        torch.cuda.synchronize()
+    finally:
+        os.environ.pop("ASTR_GEMM_PLAN", None)
+        os.dup2(saved, 2)
+        os.close(saved)
+    # fd 2 shares this file's offset, so the write above left it at the end.
+    log.seek(0)
+    return _last_tag(log.read().decode(errors="replace"))
+
+
+def _check_recipe(perf_class: int, recipe: str) -> None:
+    """A recipe is legal for a class only if that class's ladder carries it —
+    one check covering the width, ring-depth and CTA-geometry rules at once.
+    The sweep only ever measures ladder members, so a name outside them means
+    the input measurements are not this script's: fail loudly rather than emit
+    a row dispatch would silently fail to launch."""
+    if recipe == "model":
+        return
+    if recipe not in REACHABLE[ladder_for(perf_class)]:
+        raise ValueError(
+            f"recipe {recipe!r} is not in {ladder_for(perf_class)}, the ladder "
+            f"perf_class {perf_class} dispatches over — no row naming it could "
+            f"launch. Measurements naming one cannot come from this sweep; "
+            f"re-measure instead of re-searching that JSON."
+        )
 
 
 def _candidate_row_files() -> dict[str, str]:
-    """One synthetic open row per recipe — (cta, stages) on -1/-1 keys, so
-    the row is the only plan source and plan_from_row smem-gates it."""
+    """One synthetic open row per candidate — the recipe's (cta, stages, kK)
+    on -1/-1 keys, so the row is the only plan source and plan_from_row gates
+    it on the ring and the operand widths, exactly like an emitted row."""
     directory = tempfile.mkdtemp(prefix="gemm_recipe_rows_")
     files: dict[str, str] = {}
-    for recipe, spec in RECIPES.items():
-        if spec is None:
-            continue
-        cta, stages = spec
+    for recipe, (cta, stages, kk) in RECIPES.items():
         path = os.path.join(directory, f"row_{recipe}.txt")
         with open(path, "w") as f:
-            f.write(f"0 0 0 0 -1 -1 {cta} {stages} 0\n")
+            f.write(f"0 0 0 0 -1 -1 {cta} {stages} 0 {kk}\n")
         files[recipe] = path
     return files
 
@@ -192,6 +384,7 @@ def sweep(
     warmup: int,
     iterations: int,
     trials: int,
+    wanted: tuple[str, ...] = (),
 ) -> list[dict]:
     """One process, shape outer loop — every candidate measured back-to-back."""
     if not torch.cuda.is_available():
@@ -203,13 +396,13 @@ def sweep(
         )
 
     # Candidates are one-row table files toggled per launch: the row
-    # sources re-read their env per call, so all candidates at a shape
+    # source re-reads that env per call, so all candidates at a shape
     # share its GPU clock/thermal state. The "model" candidate measures
     # the degraded band rows (the cost model is deleted from the C++):
     # it is the "this band has no table row" reference of the min-gain
     # mode, not a planner.
-    os.environ.pop("ASTR_GEMM_RECIPE", None)
     row_files = _candidate_row_files()
+    tags: dict[tuple[str, str], str] = {}
 
     device = torch.device(torch.cuda.current_device())
     torch.manual_seed(0)
@@ -228,6 +421,8 @@ def sweep(
                     return quant_gemm(acts, weight, a_scale, b_scale)
 
                 for recipe in candidate_recipes(combo):
+                    if wanted and recipe not in wanted:
+                        continue
                     if recipe == "model":
                         # "-" = AOT off: skip both override and builtin rows
                         # — the degraded-bands reference (the cost model is
@@ -235,6 +430,21 @@ def sweep(
                         os.environ["ASTR_GEMM_TABLE"] = "-"
                     else:
                         os.environ["ASTR_GEMM_TABLE"] = row_files[recipe]
+                    expected = "degraded (no table)" if recipe == "model" else "table"
+                    if (combo, recipe) not in tags:
+                        tags[(combo, recipe)] = _planned_tag(run)
+                    if tags[(combo, recipe)] != expected:
+                        # The planner demoted the candidate (ring, width or
+                        # depth gate) and served something else: those numbers
+                        # are the fallback's, not this recipe's. Naming them
+                        # after the recipe is how a sweep reports a
+                        # configuration it never ran.
+                        print(
+                            f"  ! {short_name(recipe):28s} {combo:14s}: planner "
+                            f"served {tags[(combo, recipe)]!r}, skipped",
+                            flush=True,
+                        )
+                        continue
                     run()  # steady state for this (shape, recipe)
                     torch.cuda.synchronize()
                     ms = measure(run, warmup, iterations, trials)
@@ -248,6 +458,7 @@ def sweep(
                             "k": k,
                             "batch": batch,
                             "recipe": recipe,
+                            "planned": tags[(combo, recipe)],
                             "ms": ms,
                             "tflops": flops / ms / 1e12,
                         }
@@ -275,128 +486,20 @@ def band_edges(values: tuple[int, ...]) -> list[tuple[int, int]]:
     return edges
 
 
-def _optimal_partition(
-    aggregate: dict[tuple[int, int, int], dict[str, float]],
-    points: list[tuple[int, int, int]],
-    min_gain: float,
-) -> list[tuple[int, int, str]]:
-    """Best (start, end, recipe) partition of points — the band grid search:
-    a segment's recipe minimizes its total time (1/tflops summed over the
-    segment) and a cut pays a min_gain fee of the point median baseline,
-    the same noise floor --min-gain enforces for winner rows. This beats
-    merge-adjacent-equals (which only cuts where the winner stays
-    constant) at the cost of rows whose recipe wins on the segment mean
-    rather than at every sampled M."""
-    n = len(points)
-    recipes = [r for r in RECIPE_ORDER if r != "model"]
-    cost = {
-        r: [
-            1.0 / aggregate[p][r] if r in aggregate.get(p, {}) else float("inf")
-            for p in points
-        ]
-        for r in recipes
-    }
-    penalty = min_gain * sum(
-        sorted(cost[r][i] for r in recipes)[len(recipes) // 2] for i in range(n)
-    )
-    seg_cost: dict[tuple[int, int], float] = {}
-    seg_recipe: dict[tuple[int, int], str] = {}
-    for i in range(n):
-        for j in range(i, n):
-            best = float("inf")
-            best_recipe = recipes[0]
-            for r in recipes:
-                c = sum(cost[r][i : j + 1])
-                if c < best:
-                    best = c
-                    best_recipe = r
-            seg_cost[i, j] = best + penalty
-            seg_recipe[i, j] = best_recipe
-    dp = [float("inf")] * (n + 1)
-    prev = [0] * (n + 1)
-    dp[0] = 0.0
-    for end in range(1, n + 1):
-        for start in range(1, end + 1):
-            cand = dp[start - 1] + seg_cost[start - 1, end - 1]
-            if cand < dp[end]:  # strict < keeps the earlier, longer last
-                dp[end] = cand  # segment — fewer rows on exact ties
-                prev[end] = start - 1
-    segments: list[tuple[int, int, str]] = []
-    end = n
-    while end > 0:
-        start = prev[end]
-        segments.append((start, end - 1, seg_recipe[start, end - 1]))
-        end = start
-    segments.reverse()
-    return segments
-
-
-def _winners_with_lead(
-    aggregate: dict[tuple[int, int, int], dict[str, float]],
-    points: list[tuple[int, int, int]],
-) -> tuple[list[str], list[float]]:
-    """Per-point (winner, lead fraction) over the forced recipes."""
-    winners: list[str] = []
-    leads: list[float] = []
-    for p in points:
-        over = {r: v for r, v in aggregate.get(p, {}).items() if r != "model"}
-        if not over:
-            winners.append("small")
-            leads.append(0.0)
-            continue
-        values = sorted(over.values(), reverse=True)
-        best = values[0]
-        second = values[1] if len(values) > 1 else best
-        leads.append(0.0 if best == 0 else (best - second) / best)
-        for recipe in RECIPE_ORDER:
-            if recipe != "model" and over.get(recipe, 0.0) == best:
-                winners.append(recipe)
-                break
-    return winners, leads
-
-
-def _smooth_winners(
-    winners: list[str], leads: list[float], min_gain: float
-) -> list[str]:
-    """Noise merge: a point whose winner's lead is under the min-gain floor
-    is absorbed into a neighbor's recipe when the neighbors agree (the
-    flip is measurement noise, not a real crossover); run until stable.
-    Same floor the min-gain mode uses, but with a recipe fallback instead
-    of leaving the band unrowed, so full coverage still never misses."""
-    out = list(winners)
-    changed = True
-    while changed:
-        changed = False
-        for i in range(len(out)):
-            if leads[i] >= min_gain:
-                continue
-            left = out[i - 1] if i > 0 else None
-            right = out[i + 1] if i + 1 < len(out) else None
-            adopt = None
-            if left is None and right is not None and right != out[i]:
-                adopt = right  # run start: follow the run
-            elif right is None and left is not None and left != out[i]:
-                adopt = left  # run end: follow the run
-            elif left is not None and left == right and left != out[i]:
-                adopt = left  # sandwiched flip: join the neighbors
-            if adopt is not None:
-                out[i] = adopt
-                changed = True
-    return out
-
-
 def build_rows(
     results: list[dict],
     min_gain: float = 0.0,
     full_coverage: bool = False,
-    band_search: bool = False,
-    smooth: bool = False,
 ) -> list[str]:
     # (perf_class, m, n) -> {recipe: best tflops across the k/batch grid}.
     aggregate: dict[tuple[int, int, int], dict[str, float]] = {}
     m_values: set[int] = set()
     n_values: set[int] = set()
     for point in results:
+        expected = "degraded (no table)" if point["recipe"] == "model" else "table"
+        if "planned" in point and point["planned"] != expected:
+            continue  # demoted candidate: those numbers are the fallback's
+        _check_recipe(point["perf_class"], point["recipe"])
         key = (point["perf_class"], point["m"], point["n"])
         over = aggregate.setdefault(key, {})
         tflops = point["tflops"]
@@ -412,26 +515,12 @@ def build_rows(
     rows: list[str] = []
     for perf_class in sorted({pt[0] for pt in aggregate}):
         for n_idx, (n_min, n_max) in enumerate(n_bands):
-            keys = [(perf_class, m, sorted_n[n_idx]) for m in sorted_m]
-            if full_coverage and band_search:
-                segments = _optimal_partition(aggregate, keys, min_gain)
-                for m_start, m_end, recipe in segments:
-                    m_min, m_max = m_bands[m_start][0], m_bands[m_end][1]
-                    cta, stages = RECIPES[recipe]
-                    rows.append(
-                        f"{m_min} {m_max} {n_min} {n_max} {perf_class} 0 "
-                        f"{cta} {stages} 0"
-                    )
-                continue
             # Winner per m band at this n band; merge adjacent m runs that
             # pick the same recipe into one row.
-            if full_coverage and smooth:
-                winners, leads = _winners_with_lead(aggregate, keys)
-                recipes = _smooth_winners(winners, leads, min_gain)
-            elif full_coverage:
+            if full_coverage:
                 # The table is the only production dispatch: every band
                 # gets a row (no min-gain gate, no model fallback), and
-                # ties resolve to the stable big>narrow>small preference.
+                # ties resolve to the class ladder's own order.
                 recipes = [
                     _best_forced(aggregate, (perf_class, m, sorted_n[n_idx]))
                     for m in sorted_m
@@ -445,12 +534,12 @@ def build_rows(
             for i in range(1, len(recipes) + 1):
                 if i == len(recipes) or recipes[i] != recipes[run_start]:
                     recipe = recipes[run_start]
-                    if full_coverage or recipe != "model":
+                    if recipe != "model":
                         m_min, m_max = m_bands[run_start][0], m_bands[i - 1][1]
-                        cta, stages = RECIPES[recipe]
+                        cta, stages, kk = RECIPES[recipe]
                         rows.append(
                             f"{m_min} {m_max} {n_min} {n_max} {perf_class} 0 "
-                            f"{cta} {stages} 0"
+                            f"{cta} {stages} 0 {kk}"
                         )
                     run_start = i
         if full_coverage:
@@ -461,26 +550,29 @@ def build_rows(
             # corner's winner beats the grid's most common (small-shape
             # biased) winner.
             corner = _best_forced(aggregate, (perf_class, sorted_m[-1], sorted_n[-1]))
-            cta, stages = RECIPES[corner]
-            rows.append(f"0 0 0 0 {perf_class} 0 {cta} {stages} 0")
-    return rows
+            cta, stages, kk = RECIPES[corner]
+            rows.append(f"0 0 0 0 {perf_class} 0 {cta} {stages} 0 {kk}")
+    # A band row that already spans everything (the grid's own merge) makes the
+    # catch-all identical; identical rows are one decision, and the old
+    # compactor that used to drop them is gone.
+    return list(dict.fromkeys(rows))
 
 
 def _best_forced(
     aggregate: dict[tuple[int, int, int], dict[str, float]],
     key: tuple[int, int, int],
 ) -> str:
-    # Best measured forced recipe; ties resolve big > narrow > small (a
-    # tie carries no information, and the model is retired so there is
-    # no fallback).
+    # Best measured recipe; a tie carries no information, so it resolves the
+    # way dispatch_tile itself would: the ladder's manifest order.
+    order = order_for(key[0])
     over = aggregate.get(key, {})
     best = max((v for r, v in over.items() if r != "model"), default=0.0)
-    for recipe in RECIPE_ORDER:
+    for recipe in order:
         if recipe == "model":
             continue
         if over.get(recipe, 0.0) == best:
             return recipe
-    return "small"
+    return order[0]
 
 
 def _winner(
@@ -496,7 +588,7 @@ def _winner(
     if not over:
         return "model"
     best = max(over.values())
-    for recipe in RECIPE_ORDER:
+    for recipe in order_for(key[0]) + ("model",):
         if over.get(recipe, 0.0) == best:
             winner = recipe
             break
@@ -574,25 +666,6 @@ def _winner(
     "miss the table.",
 )
 @click.option(
-    "--band-search",
-    is_flag=True,
-    default=False,
-    help="With --full-coverage: grid-search the M band cuts — DP over all "
-    "possible partitions, each segment taking the recipe with the lowest "
-    "total time and each cut paying --min-gain of the segment baseline "
-    "(the measurement noise floor) instead of merge-adjacent-equals. "
-    "Not combinable with --noise-merge.",
-)
-@click.option(
-    "--noise-merge",
-    is_flag=True,
-    default=False,
-    help="With --full-coverage: merge noise-level band flips — a point whose "
-    "winner leads the runner-up by less than --min-gain follows its "
-    "neighbors' recipe instead (run-to-run flips are measurement noise, "
-    "and per-point winners chase them).",
-)
-@click.option(
     "--save-results",
     type=click.Path(path_type=Path, dir_okay=False),
     default=None,
@@ -604,6 +677,20 @@ def _winner(
     type=click.Path(path_type=Path, dir_okay=False),
     default=None,
     help="Skip the sweep: build rows from a JSON saved by --save-results.",
+)
+@click.option(
+    "--recipes",
+    "recipe_filter",
+    default=None,
+    help="Comma-separated subset of each ladder's recipes to measure "
+    "(default: every reachable one). --list-recipes prints the names.",
+)
+@click.option(
+    "--list-recipes",
+    is_flag=True,
+    default=False,
+    help="Print the candidate vocabulary this process reads out of policy.cuh, "
+    "with the tiles no row can reach, and exit.",
 )
 def plan_table_command(
     m_values: tuple[int, ...],
@@ -618,22 +705,34 @@ def plan_table_command(
     trials: int,
     min_gain: float,
     full_coverage: bool,
-    band_search: bool,
-    noise_merge: bool,
     save_results: Path | None,
     results_json: Path | None,
+    recipe_filter: str | None,
+    list_recipes: bool,
 ) -> None:
     """Sweep every candidate recipe (interleaved) at the M x shape grid."""
+    if list_recipes:
+        for ladder, tiles in REACHABLE.items():
+            click.echo(f"{ladder}:")
+            for tile in tiles:
+                cta, stages, kk = RECIPES[tile]
+                click.echo(f"  {tile:44s} cta{cta} s{stages} k{kk}")
+        for line in reachability_report():
+            click.echo(f"  unreachable - {line}")
+        click.echo("  model  ASTR_GEMM_TABLE=- (degraded bands), the reference")
+        return
+    wanted = tuple(
+        part.strip() for part in (recipe_filter or "").split(",") if part.strip()
+    )
+    unknown_recipes = sorted(set(wanted) - set(RECIPES) - {"model"})
+    if unknown_recipes:
+        raise click.BadParameter(
+            f"unknown recipes: {', '.join(unknown_recipes)}; --list-recipes "
+            f"prints the vocabulary read from policy.cuh"
+        )
     unknown = [combo for combo in combos if combo not in COMBOS]
     if unknown:
         raise click.BadParameter(f"unknown combos: {', '.join(unknown)}")
-    if noise_merge and not full_coverage:
-        raise click.BadParameter("--noise-merge needs --full-coverage")
-    if band_search and noise_merge:
-        raise click.BadParameter(
-            "--band-search and --noise-merge are mutually exclusive"
-        )
-
     if results_json is not None:
         results = json.loads(results_json.read_text())
     else:
@@ -649,7 +748,17 @@ def plan_table_command(
             f"x {len(m_values)} M x b={batch}, recipes measured per shape)"
             + ("; full coverage" if full_coverage else "")
         )
-        results = sweep(m_values, shapes, combos, batch, warmup, iterations, trials)
+        for line in reachability_report():
+            click.echo(f"# unreachable by any row: {line}")
+        for combo in combos:
+            cands = [r for r in candidate_recipes(combo) if not wanted or r in wanted]
+            click.echo(
+                f"# {combo}: {len(cands)} candidates -> "
+                + ", ".join(short_name(c) for c in cands)
+            )
+        results = sweep(
+            m_values, shapes, combos, batch, warmup, iterations, trials, wanted
+        )
         if save_results is not None:
             save_results.write_text(json.dumps(results))
             click.echo(f"saved measurements to {save_results}")
@@ -658,15 +767,20 @@ def plan_table_command(
         results,
         min_gain=min_gain / 100.0,
         full_coverage=full_coverage,
-        band_search=band_search,
-        smooth=noise_merge,
     )
     header = (
         "# AOT dispatch rows: m_min m_max n_min n_max perf_class crosswise "
-        "cta stages raster\n"
+        "cta stages raster [k]\n"
         "# (min, max] bands, 0 = open; perf_class 0..3 (W16A16/W8A16/W8A8/"
-        "F8A8); crosswise 0 = NT; cta 0 small / 1 narrow / 2 big; raster 0 "
+        "F8A8); crosswise 0 = NT; cta 0 small64 / 1 narrow128x64 / 2 big128 / "
+        "3 wide128x256; raster 0 "
         "= auto.\n"
+        "# k is the row's ring K, optional (an omitted field keeps 64): a "
+        "kK=32 row\n"
+        "# only survives a dual-2-byte pair, so the sweep drops that "
+        "candidate for\n"
+        "# every other combo rather than measuring the fallback under its "
+        "name.\n"
         "# The sweep times quant_gemm's fused-linear (NT) layout, so every "
         "row carries\n"
         "# crosswise 0: TT/TN shapes miss this table and take the degraded "

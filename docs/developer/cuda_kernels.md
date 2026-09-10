@@ -13,7 +13,7 @@ and FP8 GEMM. These are built when `nvcc` is available and CUDA is detected.
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
 | `quantize` | `quantize/quantize.cu` | FP8 quantization kernels (sm_89+) |
-| `gemm` | `gemm/gemm.cu` + per-dtype-pair `gemm_*.cu` | dtype-generic tensor-core GEMM binding + one instantiation TU per dtype pair (fp8 / W8A16 / W8A8 / W16A16, sm_89+) |
+| `gemm` | `gemm/gemm.cu` + per-dtype-pair `gemm_*.cu` | dtype-generic tensor-core GEMM binding + one explicit `gemm_dispatch` instantiation per dtype pair (fp8 / W8A16 / W8A8 / W16A16, sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -53,13 +53,13 @@ layered directory:
 | `quantize/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `fp8_cvt_traits<Fp8T>` convert + `quant_in_traits<InT>` unpack (primary templates undefined — one specialization per dtype/format) — no torch |
 | `quantize/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `gemm/common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes — the smem ring budgets; the MMA K extent rides `MmaShapeFor<MmaT>`), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
-| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `Tile_128x128x64_W64x32_S2_Fast` / `Tile_128x128x64_W64x32_S3_Fast` / `Tile_128x64x64_W32x32_S2_Fast` / `Tile_128x64x64_W32x32_S3_Fast` / `Tile_64x64x64_W16x32_S2_Fast` / `Tile_64x64x64_W16x32_S3_Fast`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key and `TileManifest` type list the launch ladders index |
+| `gemm/policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages + loop mode, with the named production manifest `Tile_128x128x64_W64x32_S2_Fast` / `Tile_128x128x64_W64x32_S3_Fast` / `Tile_128x64x64_W32x32_S2_Fast` / `Tile_128x64x64_W32x32_S3_Fast` / `Tile_64x64x64_W16x32_S2_Fast` / `Tile_64x64x64_W16x32_S3_Fast`) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key, the class→CTA-geometry table `kTileClassCta` (static_assert'd against the tiles' CTA shapes) and the `TileManifest` / `TileManifestByte` / `TileManifestCross` ladders the launch ladders index — the congruous and byte ladders compose the crosswise one through `tuple_cat_t`, so their shared six-tile prefix is structural rather than a copy |
 | `gemm/load.cuh` | operand loaders: typed staged tiles (`Tensor<PtrEngine<Elem>, StagedLayout>`, `common/tensor.cuh`) over the tile's declared layout (`common/swizzle.cuh`), congruous cp.async staging (predicated via runtime src-size zfill + interior), `PrefetchCarry`, crosswise LDG+PRMT direct load, async trans staging |
 | `gemm/scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
-| `gemm/plan_table.h` | AOT dispatch rows: (M, N) band × dtype class → measured recipe winner (`TableRow`; band-parse + lookup, `ASTR_GEMM_TABLE` override or the compiled-in rows) — after the calibration knob, `plan_gemm` is table-only (planning section below) |
+| `gemm/plan_table.h` | AOT dispatch rows: (M, N) band × dtype class → measured recipe winner (`TableRow`; band-parse + lookup, `ASTR_GEMM_TABLE` override or the compiled-in rows) — `plan_gemm` is table-only (planning section below); a row's CTA geometry is read from `policy.cuh`'s `kTileClassCta`, not re-spelled here |
 | `quantize/quantize.cu` | binding only: entry checks (`checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
@@ -208,9 +208,9 @@ humming's `_fit_num_stages` rule — the thinner the operand pair, the
 more smem headroom under the 96KB budget). RTX 5090 measured them a
 wash to -1.3% on the cp.async rings (three buffers already hide the
 LDGSTS latency), so table rows keep s2 wherever a sweep point did not
-measure s3 ahead; `ASTR_GEMM_RECIPE` forces s2 only (s3 candidates are
-measured as one-row `ASTR_GEMM_TABLE` files — see
-`csrc/bench/gen_plan_table.py`).
+measure s3 ahead. Candidates are measured as one-row `ASTR_GEMM_TABLE`
+files (see `csrc/bench/gen_plan_table.py`), which name the ring depth
+directly and are smem-gated like a real row.
 
 **MMA cell (sm_120a block_scale).** The plain warp-level fp8 mma
 (`m16n8k32.e4m3/e5m2`) decodes at HALF rate on sm_120 — measured pure issue
@@ -327,17 +327,15 @@ small picks with s2: benchmark_w8 over the llama shapes totals
 with no case regressing >3%.
 
 **AOT dispatch table** (`plan_table.h`): the table is the production
-planner — `plan_gemm` consults a measured row table first: (M, N) bands
+planner — `plan_gemm` consults a measured row table: (M, N) bands
 (min exclusive, max inclusive, 0 = open), keyed per dtype class /
 crosswise count, each row naming a recipe (CTA class + ring depth;
-raster 0 = `plan_raster` with the row's geometry). `plan_gemm` is a
-data-driven chain of row sources in precedence order —
-`ASTR_GEMM_RECIPE=big|narrow|small` (one synthetic open row) first, then
-the AOT table — with `plan_from_row` as the single interpreter:
-geometry from the CTA class, ring depth from the row, raster 0 =
-`plan_raster` at the row's geometry, and one smem gate (a row whose ring
-exceeds the smem opt-in ceiling is a stale tuning artifact — the next
-source runs instead of a failed launch). A miss falls to the degraded
+raster 0 = `plan_raster` with the row's geometry). `plan_from_row` is the
+single interpreter: geometry from the CTA class, ring depth from the row,
+raster 0 = `plan_raster` at the row's geometry, and one smem gate (a row
+whose ring exceeds the smem opt-in ceiling is a stale tuning artifact — it
+falls through to the degraded bands instead of a failed launch). A miss
+falls to the degraded
 band rows — last-resort M-band geometry (small ≤ 512, narrow ≤ 3072,
 big beyond), always matching, so planning is a total function. The
 original cost model is deleted from the codebase (it was retired from
@@ -347,20 +345,26 @@ catch-all row, so a miss means the table is empty or stale, not a shape
 the planner should infer. Rows come
 from two sources, override first: `ASTR_GEMM_TABLE=/path/to/plan_table.txt`
 (one row per line, `m_min m_max n_min n_max perf_class crosswise cta
-stages raster`; re-parsed only when the env path changes; the special
+stages raster [k]`, where the optional `k` is the row's ring K — omitted
+keeps 64, and a kK=32 row only survives a dual-2-byte pair; re-parsed only
+when the env path changes; the special
 value `-` turns AOT off entirely — neither override nor builtin rows —
 so the degraded bands run for dev and
 bench) and the
 compiled-in rows pasted manually between the GENERATED markers (the
 measurement script only emits the row file; a rebuild picks the rows up).
+Every candidate the sweep measures is first probed for the planner's own
+decision tag, so a candidate that some gate demotes (ring, operand width,
+k-tile depth) is dropped rather than recorded under its own name with the
+fallback's numbers.
 The sweep times every
-combo × recipe at the M × shape grid — `ASTR_GEMM_RECIPE=big|narrow|small`
-forces one CTA class (the calibration knob; re-read on every launch, so
-the generator interleaves the four candidates at each shape and the
-comparison shares one GPU clock/thermal state — sweeping whole recipe
-batches in separate processes measured the big CTA first and the small
-CTA 30 minutes later, under different boost states, and picked
-systematically wrong winners), winners per point become rows,
+combo × recipe at the M × shape grid, each candidate as a one-row
+`ASTR_GEMM_TABLE` file toggled per launch: the row source re-reads that env
+on every call, so the generator interleaves the candidates at each shape
+and the comparison shares one GPU clock/thermal state — sweeping whole
+recipe batches in separate processes measured the big CTA first and the
+small CTA 30 minutes later, under different boost states, and picked
+systematically wrong winners — winners per point become rows,
 adjacent M runs with the same winner band-merge at mid-point edges. The
 model-retention mode (`--min-gain`, default 1%) rows only leads above a
 minimum gain and leaves the band to the degraded rows elsewhere; the
@@ -368,11 +372,11 @@ production mode (`--full-coverage`) rows every band, resolves ties by
 the stable big>narrow>small preference and appends the per-class
 catch-all. K is not a row key (the ring K is fixed at 64): a K/batch
 conflict at one (M, N) resolves to the best-tflops point.
-`ASTR_GEMM_PLAN` logs the decision source (`forced recipe` / `table` /
+`ASTR_GEMM_PLAN` logs the decision source (`table` /
 `degraded (no table)`); the row-format details
 are exercised indirectly by the correctness suite
 (the production route runs through the hooked planner) and by the
-smem gate, which turns a stale row into the next source instead of
+smem gate, which turns a stale row into a degraded-band launch instead of
 a launch failure. The sweep times the fused-linear (NT) layout, so
 generated rows carry crosswise 0 — the table covers the NT path;
 non-NT shapes (TT, TN, the mixed dual-row-major NN case) miss into the
@@ -806,7 +810,7 @@ csrc/
 │   │   ├── layout_policies.cuh       #   KV addressing policies: DenseQSchedule/PackedQSchedule, ContigKV/PagedKV
 │   │   ├── mma_utils.cuh             #   ldmatrix/pack helpers + online-softmax (bf16 mma via common/mma.cuh)
 │   │   ├── entry_utils.cuh           #   torch binding helpers: DISPATCH_HEAD_DIM, pack_*_params
-│   │   ├── dispatchers.cuh           #   pure-CUDA launchers: dispatch_decode/prefill (+paged), split-K math
+│   │   ├── dispatchers.cuh           #   pure-CUDA launchers: dispatch_decode/prefill(_impl) funnel (+paged), split-K math
 │   │   ├── decode_split_kv.cuh       #   decode kernel, scalar (split-KV)
 │   │   ├── decode_split_kv_mma.cuh   #   decode kernel, MMA + split-K
 │   │   ├── prefill_split_q.cuh       #   prefill kernel, scalar (split-Q)
@@ -824,13 +828,13 @@ csrc/
 │   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
-│   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy + TileManifest
+│   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy + TileManifest (+ kTileClassCta)
 │   │   ├── plan_table.h              #     AOT dispatch rows (TableRow): override/builtin/degraded row sources
 │   │   ├── load.cuh                  #     operand loaders (typed staged tiles over declared layouts, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
 │   │   ├── scheduler.cuh             #     grouped/plain raster mapping
 │   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
 │   │   ├── epilogue.cuh              #     fused bias + scale folding + bf16/fp32 smem scatter + copy-out
-│   │   ├── gemm_bf16_* / gemm_*.cu   #     per-pair explicit gemm_dispatch instantiation units
+│   │   ├── gemm_bf16_* / gemm_*.cu   #     per-pair explicit gemm_dispatch instantiation units (one nvcc job each)
 │   │   └── gemm.cu                   #   quant_gemm binding + dtype-pair switch (module gemm; extern template decls)
 │   └── quantize/quantize.cu                  #   binding only (module quantize): validation, param packing, launch dispatch, pybind
 └── tests/
@@ -842,4 +846,4 @@ csrc/
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-> Document Update Time: 2026-09-09
+> Document Update Time: 2026-09-10

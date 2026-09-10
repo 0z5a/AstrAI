@@ -6,6 +6,7 @@
 #include <cuda_fp8.h>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 
 #include "common/mma.cuh"
 #include "common/tensor.cuh"
@@ -140,6 +141,16 @@ using Tile_64x64x64_W16x32_S2_Fast =
     GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 2, true>;
 using Tile_64x64x64_W16x32_S3_Fast =
     GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 3, true>;
+// Deep-ring twins. The 64x64 ring is the only class where s4/s5 survive the
+// per-block smem opt-in ceiling on a 2-byte pair (80KB / 96KB against 99KB;
+// 128x64 tops out at s3 and 128x128 at s2), so the deep ring is testable
+// here and nowhere else. The compiled-in rows all carry s2/s3 and the sweep
+// measured the deep rings a wash (s2..s5 within 1-2% at this tile), so only
+// the row-file route reaches one.
+using Tile_64x64x64_W16x32_S4_Fast =
+    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 4, true>;
+using Tile_64x64x64_W16x32_S5_Fast =
+    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 5, true>;
 // 16 warps per CTA on the small geometry (16x16 warp tiles, 512 threads):
 // more parallel slack over the same 64x64x64 ring, for the underfed shapes.
 using Tile_64x64x64_W16x16_S2_Fast =
@@ -180,6 +191,63 @@ constexpr TileClass tile_class() {
         return TileClass::kSmall64;
 }
 
+// CTA geometry per dispatch class — the inverse of tile_class, and the one
+// home for the class -> (M, N) numbers the host plan table prices rows with
+// (plan_row_geometry in plan_table.h). Indexed by TileClass, enum order.
+inline constexpr int kTileClassCta[][2] = {
+    {64, 64},    // kSmall64
+    {128, 64},   // kNarrow128x64
+    {128, 128},  // kBig128
+    {128, 256},  // kWide128x256
+};
+static_assert((int)TileClass::kSmall64 == 0 &&
+                  (int)TileClass::kNarrow128x64 == 1 &&
+                  (int)TileClass::kBig128 == 2 &&
+                  (int)TileClass::kWide128x256 == 3,
+              "kTileClassCta is indexed by TileClass: keep the enum in table order");
+
+// One row per class is kTileClassCta's contract (cta_matches_class pins it to
+// the tiles the ladders instantiate), so its extent is the class count. The
+// row file's cta column (plan_table.h) is bounds-checked against this and then
+// read as the TileClass ordinal: the file's numbering and the enum's are one
+// fact, not two tables to keep in sync.
+inline constexpr int kTileClassCount =
+    (int)(sizeof(kTileClassCta) / sizeof(kTileClassCta[0]));
+
+// A class is a function of its CTA shape alone, so one representative tile per
+// class pins the table to the tiles the ladders actually instantiate.
+template <typename Tile>
+constexpr bool cta_matches_class() {
+    return kTileClassCta[(int)tile_class<Tile>()][0] == Tile::CtaShape::kM &&
+           kTileClassCta[(int)tile_class<Tile>()][1] == Tile::CtaShape::kN;
+}
+static_assert(cta_matches_class<Tile_64x64x64_W16x32_S2_Fast>() &&
+                  cta_matches_class<Tile_128x64x64_W32x32_S2_Fast>() &&
+                  cta_matches_class<Tile_128x128x64_W64x32_S2_Fast>() &&
+                  cta_matches_class<Tile_128x256x64_W64x32_S2_Fast>(),
+              "kTileClassCta must mirror the tiles' CTA shapes");
+
+// Tuple concatenation, so a manifest reads as "the shared ladder plus my own
+// additions" instead of re-listing the shared entries — the prefix relationship
+// between the ladders is then structural, not a copy that can drift.
+template <typename... Ts>
+using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
+
+// The shared ladder: the geometries every staging path instantiates, plus the
+// 64x64 deep-ring twins (see the alias above — they are here rather than in
+// one ladder so that every manifest carries them and a row naming s4/s5
+// always finds a tile, whatever the staging path).
+// load_operand_tile stages a crosswise operand as kK lines of (M or N)*elem/16
+// chunks and needs that product to divide its thread count with a
+// power-of-two quotient, which the kK=32 twins and the 16-warp small CTA both
+// miss once the other operand is 1-byte; the wide CTA is 1-byte-only besides.
+// Every other manifest contains these, so this is the base.
+using TileManifestCross = std::tuple<
+    Tile_128x128x64_W64x32_S2_Fast, Tile_128x128x64_W64x32_S3_Fast,
+    Tile_128x64x64_W32x32_S2_Fast, Tile_128x64x64_W32x32_S3_Fast,
+    Tile_64x64x64_W16x32_S2_Fast, Tile_64x64x64_W16x32_S3_Fast,
+    Tile_64x64x64_W16x32_S4_Fast, Tile_64x64x64_W16x32_S5_Fast>;
+
 // The dispatch manifests (CUTLASS builder-table style): every recipe the
 // launch ladders select over, keyed by the plan's CTA class, ring depth and
 // k-tile depth. Split by operand width because the reclaim budget
@@ -190,39 +258,27 @@ constexpr TileClass tile_class() {
 // 128x256 CTA, whose ring only fits a 1-byte pair. The big entries carry the
 // fast variant; the cp.async ladder downgrades to the non-fast twin for
 // crosswise staging at its resolver.
-// The congruous ladders: these tiles were swept on the dual-congruous (NT)
-// route, and the crosswise load path carries a different, tighter
-// divisibility budget, so the crosswise ladder stays the original six.
-using TileManifest = std::tuple<
-    Tile_128x128x64_W64x32_S2_Fast, Tile_128x128x64_W64x32_S3_Fast,
-    Tile_128x64x64_W32x32_S2_Fast, Tile_128x64x64_W32x32_S3_Fast,
-    Tile_64x64x64_W16x32_S2_Fast, Tile_64x64x64_W16x32_S3_Fast,
-    Tile_64x64x64_W16x16_S2_Fast, Tile_64x64x64_W16x16_S3_Fast,
-    Tile_64x64x32_W16x32_S2_Fast, Tile_64x64x32_W16x32_S3_Fast,
-    Tile_128x64x32_W32x32_S2_Fast, Tile_128x128x32_W64x32_S2_Fast,
-    Tile_128x128x32_W64x32_S3_Fast>;
+//
+// The congruous ladder: the shared six plus the kK=32 twins and the 16-warp
+// small CTA, swept on the dual-congruous (NT) route. Order is load-bearing —
+// dispatch_tile takes the first entry whose (class, stages, kK) matches, and
+// the 16-warp small CTA shares that key with the 32-warp one above it, so it
+// is reached only when the 32-warp twin's resolver declines.
+using TileManifest = tuple_cat_t<
+    TileManifestCross,
+    std::tuple<Tile_64x64x64_W16x16_S2_Fast, Tile_64x64x64_W16x16_S3_Fast,
+               Tile_64x64x32_W16x32_S2_Fast, Tile_64x64x32_W16x32_S3_Fast,
+               Tile_128x64x32_W32x32_S2_Fast, Tile_128x128x32_W64x32_S2_Fast,
+               Tile_128x128x32_W64x32_S3_Fast>>;
 
-// The 1-byte ladder: the six geometries plus the wide CTA, every one of them
-// at kK 64. No kK=32 tile survives a 1-byte operand — a line then holds half
-// as many 16B chunks, so kTileLines*kChunks falls below the thread count (a
+// The 1-byte ladder: the shared six plus the wide CTA, every one of them at
+// kK 64. No kK=32 tile survives a 1-byte operand — a line then holds half as
+// many 16B chunks, so kTileLines*kChunks falls below the thread count (a
 // 64x64x32 tile has 128 chunks against 256 threads) and the load path cannot
 // divide them; the one kK=32 geometry that does divide, 128x128x32, cannot
 // reclaim its own 32KB output tile from a 24KB ring.
-using TileManifestByte = std::tuple<
-    Tile_128x128x64_W64x32_S2_Fast, Tile_128x128x64_W64x32_S3_Fast,
-    Tile_128x64x64_W32x32_S2_Fast, Tile_128x64x64_W32x32_S3_Fast,
-    Tile_64x64x64_W16x32_S2_Fast, Tile_64x64x64_W16x32_S3_Fast,
-    Tile_128x256x64_W64x32_S2_Fast>;
-
-// The crosswise ladder: the six geometries every staging path instantiates.
-// load_operand_tile stages a crosswise operand as kK lines of (M or N)*elem/16
-// chunks and needs that product to divide its thread count with a
-// power-of-two quotient, which the kK=32 twins and the 16-warp small CTA both
-// miss once the other operand is 1-byte; the wide CTA is 1-byte-only besides.
-using TileManifestCross = std::tuple<
-    Tile_128x128x64_W64x32_S2_Fast, Tile_128x128x64_W64x32_S3_Fast,
-    Tile_128x64x64_W32x32_S2_Fast, Tile_128x64x64_W32x32_S3_Fast,
-    Tile_64x64x64_W16x32_S2_Fast, Tile_64x64x64_W16x32_S3_Fast>;
+using TileManifestByte =
+    tuple_cat_t<TileManifestCross, std::tuple<Tile_128x256x64_W64x32_S2_Fast>>;
 
 // The manifest a given operand pair and staging selects over. The widening
 // ladder is only legal where it was measured, so everything else keeps the

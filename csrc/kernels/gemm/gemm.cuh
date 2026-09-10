@@ -136,11 +136,12 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
 // ---------------------------------------------------------------------------
 
 // ASTR_GEMM_PLAN=1: read-only launch log (shape -> recipe / grid / raster)
-// from launch_policy. One getenv at first use; nothing here can change the
-// launch.
+// from launch_policy. The env is re-read on every call, like the table source:
+// a sweep toggles it around one launch to learn which source served that
+// launch, which neither a cached read nor a log left on through the timed loop
+// can do. Nothing here can change the launch.
 inline bool gemm_plan_log() {
-    static const bool on = std::getenv("ASTR_GEMM_PLAN") != nullptr;
-    return on;
+    return std::getenv("ASTR_GEMM_PLAN") != nullptr;
 }
 
 // Experiment/debug knobs, one getenv at first use:
@@ -221,8 +222,7 @@ struct GemmPlan {
 };
 
 // One [gemm-plan] line naming the planner's decision (ASTR_GEMM_PLAN = 1):
-// the row source (forced recipe / table) or the last-resort degraded band
-// that produced the plan.
+// the AOT row table or the last-resort degraded band that produced the plan.
 inline void log_plan_decision(const char* src, const GemmParams& p,
                               const GemmPlan& plan) {
     if (!gemm_plan_log()) return;
@@ -297,7 +297,9 @@ inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
     // for: the wide CTA only exists on the 1-byte manifest, and the manifests
     // carry kK 32 and 64. Such a row would match no tile in dispatch_tile and
     // launch nothing at all, so it is rejected here — the next source, or the
-    // degraded bands, serves the shape instead.
+    // degraded bands, serves the shape instead. The failure is silent (the
+    // launcher just does not fire), so this gate is the only thing standing
+    // between a stale row and an uninitialized output tile.
     if (row.cta == TileClass::kWide128x256 && (ba != 1 || bb != 1))
         return std::nullopt;
     if (!row_k_supported(row.kk)) return std::nullopt;
@@ -306,6 +308,18 @@ inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
     // load path. A row naming one for such a pair matches no tile either, and
     // is rejected on the same terms as the width rule above.
     if (row.kk == 32 && (ba != 2 || bb != 2)) return std::nullopt;
+    // Only the 64x64 kK=64 geometry carries the deep s4/s5 rings (policy.cuh),
+    // and only it has the smem room for them: every other class or depth would
+    // dispatch to nothing. The ring check below cannot catch this — a deep
+    // kK=32 ring is only 40-80KB, well inside the ceiling — so the rule has to
+    // be explicit here. Likewise the wide CTA is a lone s2 entry on the 1-byte
+    // ladder, deeper than the ring check expects: 128x256 s3 is 96KB, which
+    // fits, and still names no tile.
+    if (row.stages > 3 &&
+        (row.cta != TileClass::kSmall64 || row.kk != kTableRowK))
+        return std::nullopt;
+    if (row.cta == TileClass::kWide128x256 && row.stages != 2)
+        return std::nullopt;
     // Crosswise staging runs the conservative ladder, which carries kK 64 and
     // no wide CTA; a row naming more than that would match no tile there.
     if (crosswise != 0 && (row.kk != kTableRowK || row.cta == TileClass::kWide128x256))
@@ -325,23 +339,16 @@ inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
 inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
                           GemmPerfClass perf, int crosswise_ops = 0) {
     const DeviceFacts dev = device_facts();
-    // Table-only dispatch: precedence is the sources array order
-    // (calibration knob > AOT table), and plan_from_row smem-gates every
-    // row, so a stale tuning ring demotes to the next source. The original
-    // cost model is deleted from the codebase — a miss falls to the
-    // degraded bands (open on M, -1 keys; always match, so planning stays
-    // a total function); ASTR_GEMM_TABLE=- skips both row sources.
-    static constexpr TableSource kRowSources[] = {
-        {"forced recipe", env_recipe_row},
-        {"table", table_row},
-    };
-    for (const TableSource& s : kRowSources) {
-        if (auto row = s.find(p, (int)perf, crosswise_ops); row) {
-            if (auto plan = plan_from_row(*row, p, ba, bb, dev,
-                                          crosswise_ops)) {
-                log_plan_decision(s.name, p, *plan);
-                return *plan;
-            }
+    // Table-only dispatch, one source: the AOT rows (override file, then the
+    // compiled-in ones). plan_from_row smem-gates the row, so a stale tuning
+    // ring falls through instead of failing a launch. The original cost model
+    // is deleted from the codebase — a miss falls to the degraded bands (open
+    // on M, -1 keys; always match, so planning stays a total function);
+    // ASTR_GEMM_TABLE=- skips the rows entirely.
+    if (auto row = table_row(p, (int)perf, crosswise_ops); row) {
+        if (auto plan = plan_from_row(*row, p, ba, bb, dev, crosswise_ops)) {
+            log_plan_decision("table", p, *plan);
+            return *plan;
         }
     }
     // The degraded bands are open on N with -1 keys, so a row always
