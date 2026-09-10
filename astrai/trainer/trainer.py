@@ -88,14 +88,13 @@ class Trainer:
                         stand_loss = loss_output["loss"] / executor.grad_accum_steps
                         executor.backward(stand_loss)
                         context.consumed_samples += (
-                            context.config.batch_per_device * context.world_size
+                            context.config.batch_per_device * context.dp_size
                         )
                         self._call_callbacks("on_batch_end", context)
 
                         if executor.sync_gradients:
                             self._call_callbacks("before_optimizer_step", context)
-                            context.optimizer.step()
-                            context.strategy.on_optimizer_step()
+                            context.strategy.optimizer_step(context.optimizer)
                             context.optimizer.zero_grad()
 
                             if context.scheduler:
