@@ -2,7 +2,25 @@
 
 from unittest.mock import MagicMock
 
-from astrai.inference import Task, TaskManager, TaskStatus
+import pytest
+
+from astrai.inference import (
+    STOP,
+    BatchedStreamCallback,
+    Task,
+    TaskManager,
+    TaskStatus,
+)
+
+
+class RecordingSink(BatchedStreamCallback):
+    """Batch-aware callback capturing every dispatch as one batch."""
+
+    def __init__(self):
+        self.batches = []
+
+    def __call__(self, events):
+        self.batches.append(events)
 
 
 def _make_mock_tokenizer():
@@ -178,3 +196,83 @@ def test_task_manager_get_stats():
     assert stats["total_tasks"] == 1
     assert stats["waiting_queue"] == 1
     assert stats["active_tasks"] == 0
+
+
+def test_task_manager_add_task_rejects_empty_prompt():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    tm.tokenizer.encode.return_value = []
+
+    with pytest.raises(ValueError, match="zero tokens"):
+        tm.add_task("")
+
+
+def test_task_manager_cancel_delivers_stop_callback():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    received = []
+    tm.add_task("test", stream_callback=received.append)
+
+    immediate, cancelled = tm.cancel_task("does-not-exist")
+    assert not cancelled and immediate == [] and received == []
+
+    task_id = next(iter(tm._tasks))
+    immediate, cancelled = tm.cancel_task(task_id)
+    assert cancelled
+    assert len(immediate) == 1
+    assert received == [STOP]
+
+
+def test_task_manager_cancel_active_task_delivers_stop_callback():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    received = []
+    task_id = tm.add_task("test", stream_callback=received.append)
+    task = tm._tasks[task_id]
+    tm.waiting_queue.clear()
+    tm.active_tasks.append(task)
+    task.status = TaskStatus.RUNNING
+
+    immediate, cancelled = tm.cancel_task(task_id)
+    assert cancelled and immediate == []
+    assert received == [STOP]
+
+
+def test_invoke_callbacks_batches_sink_events_and_keeps_plain_per_token():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    plain = []
+    tid_plain = tm.add_task("plain", stream_callback=plain.append)
+    sink = RecordingSink()
+    tid_a = tm.add_task("sink a", stream_callback=sink)
+    tid_b = tm.add_task("sink b", stream_callback=sink)
+
+    tm.invoke_callbacks(
+        [
+            (tid_a, "x"),
+            (tid_plain, "p"),
+            (tid_b, "y"),
+            ("unknown-task", "dropped"),
+            (tid_a, STOP),
+        ]
+    )
+
+    assert plain == ["p"]
+    assert sink.batches == [[(tid_a, "x"), (tid_b, "y"), (tid_a, STOP)]]
+
+
+def test_invoke_callback_delivers_single_event_to_batched_sink():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    sink = RecordingSink()
+    task_id = tm.add_task("test", stream_callback=sink)
+
+    tm.invoke_callback(task_id, STOP)
+
+    assert sink.batches == [[(task_id, STOP)]]
+
+
+def test_cancel_delivers_batched_stop_to_sink():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    sink = RecordingSink()
+    task_id = tm.add_task("test", stream_callback=sink)
+
+    immediate, cancelled = tm.cancel_task(task_id)
+
+    assert cancelled
+    assert sink.batches == [[(task_id, STOP)]]

@@ -190,3 +190,12 @@ def attn_paged_prefill(
         mask,
         causal_offset=causal_offset,
     )
+
+
+__all__ = [
+    "TensorLayout",
+    "attn_decode",
+    "attn_paged_decode",
+    "attn_paged_prefill",
+    "attn_prefill",
+]

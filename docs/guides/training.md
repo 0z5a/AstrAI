@@ -71,8 +71,7 @@ on_train_begin
 
         if executor.sync_gradients:
           before_optimizer_step
-          optimizer.step()
-          strategy.on_optimizer_step()
+          strategy.optimizer_step(optimizer)
           optimizer.zero_grad()
           if scheduler:
             scheduler.step()
@@ -148,14 +147,18 @@ $$
 
 where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the
 per-token importance sampling ratio against the behaviour policy
-(`old_model`, synced externally between data-generation rounds) and the
-expectations are over valid response tokens. The KL term regularises
-$\pi_\theta$ towards a frozen reference model (`ref_model`, typically
-the SFT checkpoint).
+and the expectations are over valid response tokens. Online GRPO reuses the
+per-token `logprobs_old` captured by the rollout sampler, avoiding an
+`old_model` copy and a repeated forward pass. Offline GRPO keeps `old_model` as
+a compatibility fallback. The KL term regularises $\pi_\theta$ towards a frozen
+reference model (`ref_model`, typically the SFT checkpoint).
 
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. External sync of `old_model` weights via `sync_old_model()` between data-generation rounds.
+Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. Offline callers that
+do not provide `logprobs_old` must sync `old_model` weights via
+`sync_old_model()` between data-generation rounds.
 
-Keys: `prompts`, `responses`, `masks`, `rewards`.
+Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
+`logprobs_old` (required when `old_model` is not configured).
 
 ### Online Rollout
 
@@ -163,8 +166,32 @@ Keys: `prompts`, `responses`, `masks`, `rewards`.
 a `RolloutRunner`. The runner renders prompts through the tokenizer chat
 template, generates grouped responses through `InferenceScheduler`, then scores
 them with a `BaseRewardModel`. It refreshes cached rollouts every
-`rollout_interval` optimizer steps. `online_grpo` synchronizes `old_model` when
-a fresh rollout is produced.
+`rollout_interval` optimizer steps. `online_grpo` carries the sampler's aligned
+behaviour log-probabilities into the loss, so it does not allocate or synchronize
+a separate old-policy model.
+
+`online_ppo` is actor-critic PPO on the same rollout pipeline. A `ValueModel`
+critic (backbone warm-started from the policy, zero-initialized value head)
+scores the rollout states; advantages come from GAE(`--ppo_gamma`,
+`--ppo_gae_lambda`) with the terminal reward on each response's last token and
+the reference-KL penalty (k3 estimator, `--grpo_kl_coef`) folded into per-token
+rewards. Advantages and returns are computed once per rollout and pinned on the
+`RolloutResult`, so replayed steps optimize fixed targets. The critic has its
+own optimizer, stepped outside the policy-version lock, and persists as
+`value_model.pt`/`value_optimizer.pt` checkpoint extras — resume without them
+fails loudly, and `scripts/train.sh` treats a PPO checkpoint as incomplete when
+they are missing.
+
+Every successful optimizer step mutates the shared model and advances its
+monotonic `policy_version` under the same generation lock. The scheduler
+invalidates reusable KV prefixes before accepting the new version, so an async
+rollout cannot observe partially updated weights under the previous version.
+`RawRollout` and `RolloutResult` retain the version that actually generated
+their behavior log-probabilities, so cached rollout samples remain attributable
+even while later optimizer steps advance the live policy. Results from a future
+version or beyond `rollout_max_policy_lag` are rejected before training. The
+final version check and rollout-cache publication share that policy lock, so a
+concurrent update cannot land between validation and cache insertion.
 
 Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward
@@ -221,7 +248,7 @@ context = TrainContextBuilder(config).with_param_path(param_path, resume=True).b
 ```
 
 - Loads checkpoint weights before the model is wrapped
-- Creates executor via `ExecutorFactory.create(cfg.parallel_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)`
+- Creates executor via `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)`
 - Calls `executor.prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap=...)`; the executor creates, wraps, then builds the optimizer and scheduler for the wrapped model
 - Creates `RDSampler` for shuffle+resume
 - Builds strategy via `StrategyFactory.create(train_type, model, device, **kwargs)`
@@ -232,8 +259,8 @@ context = TrainContextBuilder(config).with_param_path(param_path, resume=True).b
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 nohup python scripts/tools/train.py \
-    --nprocs=4 \
-    --parallel_mode=ddp \
+    --dp_size=4 \
+    --dp_mode=ddp \
     --train_type=seq \
     --data_root_path=/path/to/dataset \
     --param_path=/path/to/model \

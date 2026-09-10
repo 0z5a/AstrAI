@@ -71,6 +71,44 @@ def test_grpo_loss_backward(grpo_strategy):
     assert has_grad
 
 
+def test_grpo_reuses_supplied_behavior_logprobs(grpo_strategy):
+    """A rollout batch must not forward the old policy again."""
+    strategy, device = grpo_strategy
+
+    class _FailingOldPolicy(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("old policy forward should not run")
+
+    strategy.old_model = _FailingOldPolicy()
+    batch = _make_batch(device=device)
+    batch["logprobs_old"] = torch.zeros_like(batch["responses"], dtype=torch.float)
+
+    loss = strategy.compute_loss(batch)
+    assert torch.isfinite(loss).item()
+
+
+def test_grpo_requires_behavior_source(grpo_strategy):
+    strategy, device = grpo_strategy
+    strategy.old_model = None
+    with pytest.raises(ValueError, match="must provide logprobs_old"):
+        strategy.compute_loss(_make_batch(device=device))
+
+
+@pytest.mark.parametrize("invalid", ["shape", "nonfinite"])
+def test_grpo_rejects_invalid_behavior_logprobs(grpo_strategy, invalid):
+    strategy, device = grpo_strategy
+    batch = _make_batch(device=device)
+    if invalid == "shape":
+        batch["logprobs_old"] = torch.zeros(1, device=device)
+        match = "shape must match responses"
+    else:
+        batch["logprobs_old"] = torch.zeros_like(batch["responses"], dtype=torch.float)
+        batch["logprobs_old"][0, 0, 0] = float("nan")
+        match = "only finite values"
+    with pytest.raises(ValueError, match=match):
+        strategy.compute_loss(batch)
+
+
 @pytest.mark.parametrize("model_name", ["ref_model", "old_model"])
 def test_grpo_frozen_models_not_updated(grpo_strategy, model_name):
     """Backward should not populate gradients on ref_model or old_model."""
@@ -124,3 +162,34 @@ def test_grpo_sync_old_model(grpo_strategy):
         if k in old_sd_after
     )
     assert matches
+
+
+def test_grpo_optimizer_step_syncs_old_model(grpo_strategy):
+    """optimizer_step must refresh old_model after each update."""
+    strategy, device = grpo_strategy
+
+    class _SteppedOptimizer:
+        def step(self):
+            with torch.no_grad():
+                for p in strategy.model.parameters():
+                    p.add_(0.05)
+
+    strategy.optimizer_step(_SteppedOptimizer())
+
+    policy_sd = strategy.model.state_dict()
+    old_sd = strategy.old_model.state_dict()
+    assert all(
+        torch.allclose(policy_sd[k], old_sd[k]) for k in policy_sd if k in old_sd
+    )
+
+
+def test_online_grpo_optimizer_step_skips_sync(grpo_strategy):
+    """old_model=None (online) must not attempt a sync."""
+    strategy, device = grpo_strategy
+    strategy.old_model = None
+
+    class _SteppedOptimizer:
+        def step(self):
+            return None
+
+    strategy.optimizer_step(_SteppedOptimizer())

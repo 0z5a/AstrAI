@@ -2,7 +2,7 @@
   "schema_version": "0.5",
   "draft": {
     "id": "astrai-topology-aware-dlo-dpsp-v1",
-    "revision": 1,
+    "revision": 2,
     "state": "D3-contract-proposed",
     "created_by": "0z5a"
   },
@@ -10,11 +10,11 @@
     "mode": "repository",
     "repository": "https://github.com/ViperEkura/AstrAI",
     "revision": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74",
-    "project_profile_sha256": "sha256:1a013d117f58397189ba0f07b8bf417abf4905a165c3098a1957d2fcb228cbf6"
+    "project_profile_sha256": "sha256:d71eacbebce64b98676d9d7b1c9818444a6f234eb5cba9fec208d5219f135de4"
   },
   "candidate": {
     "kind": "git-diff",
-    "revision": "sha256:9ef929c8f646ffebb319c0c5e559d269371261c8a789d20d7409112844f582a9",
+    "revision": "sha256:decb43e7584a3143610d049cb5eb6942445f5f8e2c867817a7c07db6985ff545",
     "intent": "integrate",
     "implementation_kind": "framework",
     "entrypoints": [
@@ -47,7 +47,7 @@
     ],
     "request_or_step_protocol": {
       "id": "astrai-topology-dlo-launch-v1",
-      "sha256": "sha256:e47fd486ddd2fe59959b5a0e585cd3a38c4c816e9fec1912fb71fed752765e05",
+      "sha256": "sha256:93a2930381a721a270cdc135294e4311b3add0b7bda81d893178c022483c794e",
       "path": "docs/guides/distributed.md"
     }
   },
@@ -73,7 +73,7 @@
   },
   "project_objectives": {
     "edge_ecosystem_policy": "experimental",
-    "profile_set_sha256": "sha256:f98050cb02f598b88b6819b288a0768af9c65d996e7684b1bbfb920198dd2005"
+    "profile_set_sha256": "sha256:5821d426e75886d6cd7529b9819b851a53ca6caea0138daf6e51f0a011cb21bb"
   },
   "benchmark_loop": {
     "fast_stage_max_official_fraction": 0.05,

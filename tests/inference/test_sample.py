@@ -3,6 +3,7 @@
 import torch
 
 from astrai.inference.runtime.sample import (
+    BaseSamplingStrategy,
     FrequencyPenaltyStrategy,
     SamplingPipeline,
     TemperatureStrategy,
@@ -61,8 +62,9 @@ def test_top_p_nucleus_filtering():
     logits = torch.tensor([[10.0, 1.0, 1.0, 1.0, 1.0]])
     s = TopPStrategy(top_p=0.5)
     result = s.apply(logits.clone(), filter_value=-1e9)
+    # The dominant logit alone exceeds the nucleus mass; the rest are filtered.
     kept = (result > -1e9).sum().item()
-    assert kept >= 1
+    assert kept == 1
 
 
 def test_top_p_skip_when_one():
@@ -263,22 +265,77 @@ def test_sample_return_logprobs_greedy_path():
 
 
 def test_sample_return_logprobs_matches_manual_computation():
-    """Returned logprob equals log_softmax(transformed_logits)[token]."""
+    """Returned logprob equals log_softmax(raw_logits)[token].
+
+    Logprobs live in the raw (pre-strategy) model distribution so they
+    line up with training-side policy logprobs for RL importance ratios.
+    """
     torch.manual_seed(1)
     logits = torch.randn(2, 30)
     tokens, logprobs = sample(logits, temperature=0.7, top_p=0.95, return_logprobs=True)
-    # Recompute with the same pipeline
-    from astrai.inference.runtime.sample import (
-        SamplingPipeline,
-        TemperatureStrategy,
-        TopPStrategy,
-    )
-
-    pipeline = SamplingPipeline([TemperatureStrategy(0.7), TopPStrategy(0.95)])
-    transformed = pipeline.apply(logits.clone())
     expected = torch.gather(
-        torch.log_softmax(transformed.float(), dim=-1),
+        torch.log_softmax(logits.float(), dim=-1),
         -1,
         tokens.unsqueeze(-1),
     ).squeeze(-1)
     assert torch.allclose(logprobs, expected, atol=1e-5)
+
+
+def test_greedy_respects_frequency_penalty():
+    """temperature=0 must not silently skip the frequency penalty."""
+    torch.manual_seed(0)
+    logits = torch.tensor([[5.0, 4.0, 3.0]])
+
+    plain = sample(logits.clone(), temperature=0.0)
+    assert plain.tolist() == [0]
+
+    penalized = sample(
+        logits.clone(),
+        temperature=0.0,
+        frequency_penalty=2.0,
+        input_ids=torch.tensor([[0, 0, 0, 0]]),
+    )
+    # Token 0 saw four occurrences: 5 - 2*4 < 4, so the argmax flips.
+    assert penalized.tolist() == [1]
+
+
+class _ArgmaxMovingStrategy(BaseSamplingStrategy):
+    """Custom strategy that can move the argmax — must disable greedy."""
+
+    def apply(
+        self, logits, filter_value=-float("inf"), input_ids=None, input_mask=None
+    ):
+        return torch.roll(logits, shifts=1, dims=-1)
+
+
+def test_greedy_detection_is_polymorphic():
+    """Greedy detection asks strategies polymorphically, no isinstance."""
+    base = [TemperatureStrategy(0.0), TopKStrategy(50), TopPStrategy(0.9)]
+    assert SamplingPipeline(list(base)).is_greedy is True
+    assert SamplingPipeline(base + [FrequencyPenaltyStrategy(0.5)]).is_greedy is False
+
+    # A custom argmax-moving strategy disables greedy even though the
+    # pipeline contains a greedy temperature — this is what isinstance
+    # bookkeeping in the old implementation could not see.
+    assert SamplingPipeline(base + [_ArgmaxMovingStrategy()]).is_greedy is False
+
+
+def test_greedy_detection_position_independent():
+    """Greedy temperature anywhere in the pipeline is detected."""
+    pipeline = SamplingPipeline([TopKStrategy(50), TemperatureStrategy(0.0)])
+    assert pipeline.is_greedy is True
+
+
+def test_greedy_detection_composes_across_nested_pipelines():
+    """A nested pipeline participates through the same interface."""
+    inner = SamplingPipeline([TemperatureStrategy(0.0), TopKStrategy(20)])
+    assert inner.is_greedy is True
+    assert SamplingPipeline([TopPStrategy(0.9), inner]).is_greedy is True
+    assert SamplingPipeline([inner, FrequencyPenaltyStrategy(0.5)]).is_greedy is False
+
+
+def test_nongreedy_temperature_is_not_greedy():
+    pipeline = SamplingPipeline(
+        [TemperatureStrategy(0.7), TopKStrategy(0), TopPStrategy(1.0)]
+    )
+    assert pipeline.is_greedy is False

@@ -23,6 +23,27 @@ from astrai.parallel.setup import get_rank, get_world_size
 
 logger = logging.getLogger(__name__)
 
+_COMPILE_PREFIX = "_orig_mod."
+
+
+def strip_compile_prefix(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Drop the ``_orig_mod.`` key prefix ``torch.compile`` adds.
+
+    ``OptimizedModule.state_dict()`` prefixes every key, so checkpoints or
+    reference-model copies taken from a compiled model fail to load into a
+    plain module (strict) or silently load nothing (non-strict).  Stripping
+    here, at the single source every consumer reads from, keeps saved keys
+    canonical regardless of compile mode.
+    """
+    if any(key.startswith(_COMPILE_PREFIX) for key in state_dict):
+        state_dict = {
+            key.removeprefix(_COMPILE_PREFIX): value
+            for key, value in state_dict.items()
+        }
+    return state_dict
+
 
 def broadcast_state_dict(
     state_dict: Optional[Dict[str, torch.Tensor]],
@@ -40,12 +61,13 @@ def broadcast_state_dict(
 
     rank = dist.get_rank()
 
-    # Broadcast metadata (keys, shapes, dtypes, device) so non-src ranks
-    # can allocate matching empty tensors on the correct device.
+    # Broadcast metadata (keys, shapes, dtypes, device kind) so non-src
+    # ranks can allocate matching empty tensors on their own device.
     if rank == src:
-        device = next(iter(state_dict.values())).device
+        first = next(iter(state_dict.values()), None)
+        on_cuda = first is not None and first.is_cuda
         metadata = [
-            (k, tuple(v.shape), v.dtype, str(device)) for k, v in state_dict.items()
+            (k, tuple(v.shape), v.dtype, on_cuda) for k, v in state_dict.items()
         ]
     else:
         metadata = None
@@ -54,10 +76,18 @@ def broadcast_state_dict(
     metadata = metadata_list[0]
 
     # Non-src ranks allocate empty tensors with the broadcasted metadata.
+    # The allocation must sit on *this* rank's local device: process groups
+    # are pinned per-rank via ``device_id=``, so NCCL rejects a tensor
+    # allocated on the src rank's device (and the cross-GPU allocation
+    # would be wrong here anyway).
     if rank != src:
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if any(m[3] for m in metadata)
+            else torch.device("cpu")
+        )
         state_dict = {
-            k: torch.empty(s, dtype=d, device=torch.device(dev))
-            for k, s, d, dev in metadata
+            k: torch.empty(s, dtype=d, device=device) for k, s, d, _ in metadata
         }
 
     # Broadcast each tensor in-place.
@@ -65,39 +95,6 @@ def broadcast_state_dict(
         dist.broadcast(tensor, src=src)
 
     return state_dict
-
-
-def create_ref_model(
-    model_fn: Callable[[], nn.Module],
-    executor: Optional["BaseExecutor"] = None,
-    model: Optional[nn.Module] = None,
-    state_dict: Optional[Dict[str, torch.Tensor]] = None,
-    device: Optional[str] = None,
-) -> Optional[nn.Module]:
-    """Create a frozen reference model from executor or state dict.
-
-    In distributed mode (FSDP), ``unwrap_model`` returns ``None`` on
-    non-rank-0.  The state_dict is broadcast from rank-0 to all ranks
-    so every rank gets a complete copy.
-    """
-    if state_dict is None and executor is not None and model is not None:
-        state_dict = executor.unwrap_model(model)
-
-    # FSDP's unwrap_model returns None on non-rank-0. Broadcast from
-    # rank-0 so every rank receives a complete state_dict.
-    if executor is not None and executor.use_distributed:
-        state_dict = broadcast_state_dict(state_dict)
-
-    if state_dict is None:
-        return None
-
-    ref_model = model_fn()
-    ref_model.load_state_dict(state_dict)
-    ref_model.requires_grad_(False)
-    ref_model.eval()
-    if device is not None:
-        ref_model = ref_model.to(device=device)
-    return ref_model
 
 
 class GradientState:
@@ -206,7 +203,7 @@ class BaseExecutor:
         loss.backward()
 
     def unwrap_model(self, model: nn.Module):
-        return model.state_dict()
+        return strip_compile_prefix(model.state_dict())
 
     @contextmanager
     def checkpoint_context(self, model: nn.Module):
@@ -316,8 +313,8 @@ class DDPExecutor(BaseExecutor):
 
     def unwrap_model(self, model: nn.Module):
         if isinstance(model, DDP):
-            return model.module.state_dict()
-        return model.state_dict()
+            return strip_compile_prefix(model.module.state_dict())
+        return strip_compile_prefix(model.state_dict())
 
 
 @ExecutorFactory.register("fsdp")
@@ -386,17 +383,16 @@ class FSDPExecutor(BaseExecutor):
         if not self.use_distributed:
             return super().clip_grad_norm(model, max_norm)
 
-        # FSDP params are DTensors (sharded across ranks).
-        # torch.nn.utils.clip_grad_norm_ computes LOCAL norm per rank,
-        # so we must all-reduce to get the global norm before clipping.
-        local_norm = torch.nn.utils.get_total_norm(
+        # FSDP params are DTensors (sharded across ranks), and
+        # get_total_norm reduces them to a globally-reduced replicated
+        # DTensor — no extra all-reduce is needed. Manually summing the
+        # local slice again would inflate the norm by sqrt(world_size)
+        # and over-clip every step.
+        total_norm = torch.nn.utils.get_total_norm(
             [p.grad for p in model.parameters() if p.grad is not None],
         )
-        if isinstance(local_norm, DTensor):
-            local_norm = local_norm.to_local()
-        total_norm_sq = local_norm**2
-        dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM)
-        total_norm = total_norm_sq.sqrt()
+        if isinstance(total_norm, DTensor):
+            total_norm = total_norm.full_tensor()
 
         clip_coef = max_norm / (total_norm + 1e-6)
         clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
@@ -419,6 +415,7 @@ class FSDPExecutor(BaseExecutor):
         state_dict = model.state_dict()
         result = {}
         for k, v in state_dict.items():
+            k = k.removeprefix(_COMPILE_PREFIX)
             if isinstance(v, DTensor):
                 full = v.full_tensor()
                 if get_rank() == 0:

@@ -42,6 +42,22 @@ class BaseSamplingStrategy(ABC):
         """
         raise NotImplementedError
 
+    @property
+    def preserves_argmax(self) -> bool:
+        """Whether ``apply`` never moves the argmax token.
+
+        Conservative default: strategies must opt in. The greedy
+        short-circuit in :class:`SamplingPipeline` asks this
+        polymorphically, so a new strategy that can move the argmax
+        automatically disables it — no isinstance bookkeeping.
+        """
+        return False
+
+    @property
+    def is_greedy(self) -> bool:
+        """Whether this strategy collapses sampling onto the argmax token."""
+        return False
+
 
 class TemperatureStrategy(BaseSamplingStrategy):
     """Divides logits by temperature to control randomness.
@@ -52,6 +68,22 @@ class TemperatureStrategy(BaseSamplingStrategy):
 
     def __init__(self, temperature: Union[float, Tensor] = 1.0):
         self.temperature = temperature
+
+    @staticmethod
+    def is_greedy_temperature(temperature: Union[float, Tensor]) -> bool:
+        if isinstance(temperature, Tensor):
+            return bool((temperature == 0).all())
+        return temperature == 0
+
+    @property
+    def is_greedy(self) -> bool:
+        return self.is_greedy_temperature(self.temperature)
+
+    @property
+    def preserves_argmax(self) -> bool:
+        # Scaling by a positive constant (1/t, clamped away from zero)
+        # preserves logit order; t=0 degenerates onto the argmax itself.
+        return True
 
     def apply(
         self,
@@ -77,6 +109,11 @@ class TopKStrategy(BaseSamplingStrategy):
     Args:
         top_k: Scalar or ``[batch]`` tensor (0 disables).
     """
+
+    @property
+    def preserves_argmax(self) -> bool:
+        # The argmax token always ranks first, so any k >= 1 keeps it.
+        return True
 
     def __init__(self, top_k: Union[int, Tensor] = 0):
         self.top_k = top_k
@@ -120,6 +157,11 @@ class TopPStrategy(BaseSamplingStrategy):
     Args:
         top_p: Scalar or ``[batch]`` tensor (1.0 disables).
     """
+
+    @property
+    def preserves_argmax(self) -> bool:
+        # Nucleus filtering always keeps the highest-probability token.
+        return True
 
     def __init__(self, top_p: Union[float, Tensor] = 1.0):
         self.top_p = top_p
@@ -187,49 +229,47 @@ class FrequencyPenaltyStrategy(BaseSamplingStrategy):
 
         p = self.penalty
         if isinstance(p, Tensor):
-            p = p.to(logits.device, non_blocking=True).view(-1, 1)
+            p = p.to(logits.device, non_blocking=True).view(-1)
             if (p == 0.0).all():
                 return logits
         elif p == 0.0:
             return logits
 
         input_ids = input_ids.to(logits.device, non_blocking=True)
-
         if input_mask is not None:
             input_mask = input_mask.to(logits.device, non_blocking=True)
-            masked_ids = input_ids.clone()
-            masked_ids[~input_mask] = -1
-        else:
-            masked_ids = input_ids
 
-        batch_sz, seq_len = masked_ids.shape
+        batch_sz = input_ids.shape[0]
         vocab_size = logits.size(-1)
 
-        if isinstance(p, Tensor):
-            penalty_per_row = p.expand(batch_sz, 1)
-        else:
-            penalty_per_row = torch.full(
-                (batch_sz, 1), float(p), device=logits.device, dtype=logits.dtype
-            )
-
-        counts = torch.zeros(
-            batch_sz, vocab_size, device=logits.device, dtype=logits.dtype
+        # Sync-free update: map each history token to a flat
+        # ``row * vocab + token`` bucket (padding to one trailing sentinel
+        # bucket), count with ``index_add_``, and subtract in one
+        # elementwise pass. No nonzero/unique/boolean-mask indexing, so the
+        # hot path never forces a device-host synchronization.
+        row_offsets = (
+            torch.arange(batch_sz, device=logits.device, dtype=torch.long).unsqueeze(1)
+            * vocab_size
         )
-        valid_mask = masked_ids >= 0
-        if valid_mask.any():
-            valid_ids = masked_ids[valid_mask]
-            row_indices = (
-                torch.arange(batch_sz, device=logits.device)
-                .unsqueeze(1)
-                .expand_as(masked_ids)[valid_mask]
+        if input_mask is not None:
+            flat = torch.where(
+                input_mask,
+                row_offsets + input_ids,
+                torch.full_like(input_ids, batch_sz * vocab_size),
             )
-            counts.index_put_(
-                (row_indices, valid_ids),
-                torch.ones_like(valid_ids, dtype=logits.dtype),
-                accumulate=True,
-            )
-
-        return logits - penalty_per_row * counts
+        else:
+            flat = row_offsets + input_ids
+        flat = flat.reshape(-1)
+        counts = torch.zeros(
+            batch_sz * vocab_size + 1, device=logits.device, dtype=torch.float32
+        )
+        counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
+        counts = counts[: batch_sz * vocab_size].view(batch_sz, vocab_size)
+        if isinstance(p, Tensor):
+            deltas = counts * p.to(torch.float32).view(-1, 1)
+        else:
+            deltas = counts * float(p)
+        return logits - deltas.to(logits.dtype)
 
 
 class SamplingPipeline(BaseSamplingStrategy):
@@ -252,6 +292,22 @@ class SamplingPipeline(BaseSamplingStrategy):
     def __init__(self, strategies: List[BaseSamplingStrategy]):
         self.strategies = strategies
 
+    @property
+    def preserves_argmax(self) -> bool:
+        # A composite preserves the argmax iff every stage does.
+        return all(s.preserves_argmax for s in self.strategies)
+
+    @property
+    def is_greedy(self) -> bool:
+        """Whether sampling always yields the argmax of the raw logits.
+
+        True iff some stage forces greedy and no stage can move the
+        argmax before or after it. Both facts are declared
+        polymorphically by each strategy, so composing in a new strategy
+        type (or a nested pipeline) updates this automatically.
+        """
+        return any(s.is_greedy for s in self.strategies) and self.preserves_argmax
+
     def apply(
         self,
         logits: Tensor,
@@ -262,12 +318,6 @@ class SamplingPipeline(BaseSamplingStrategy):
         for strategy in self.strategies:
             logits = strategy.apply(logits, filter_value, input_ids, input_mask)
         return logits
-
-    @staticmethod
-    def _is_greedy(temperature: Union[float, Tensor]) -> bool:
-        if isinstance(temperature, Tensor):
-            return bool((temperature == 0).all())
-        return temperature == 0
 
     @torch.inference_mode()
     def sample(
@@ -289,14 +339,14 @@ class SamplingPipeline(BaseSamplingStrategy):
             input_mask: Boolean mask for ``input_ids`` padding.
             return_logprobs: If ``True``, return ``(tokens, logprobs)``
                 where ``logprobs[i]`` is the log-probability of
-                ``tokens[i]`` under the (post-strategy) sampling
-                distribution.
+                ``tokens[i]`` under the raw (pre-strategy) model
+                distribution, matching training-side policy logprobs.
 
         Returns:
             Sampled token IDs ``[batch]``, or — when ``return_logprobs``
             is ``True`` — a ``(token_ids, chosen_logprobs)`` tuple.
         """
-        if self._is_greedy_pipeline():
+        if self.is_greedy:
             tokens = logits.argmax(dim=-1)
             if not return_logprobs:
                 return tokens
@@ -304,24 +354,26 @@ class SamplingPipeline(BaseSamplingStrategy):
             chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
             return tokens, chosen
 
+        # Capture the raw distribution before the strategy pipeline runs:
+        # top-k/top-p mutate the logits tensor in place, so computing this
+        # after ``apply`` would read the filtered distribution instead of
+        # the raw model distribution the caller documented.
+        if return_logprobs:
+            raw_log_probs = torch.log_softmax(logits.float(), dim=-1)
+
         transformed = self.apply(logits, filter_value, input_ids, input_mask)
         tokens = torch.multinomial(
             torch.softmax(transformed, dim=-1), num_samples=1
         ).squeeze(-1)
         if not return_logprobs:
             return tokens
-        log_probs = torch.log_softmax(transformed.float(), dim=-1)
-        chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+        # Log-probabilities of the raw (pre-strategy) model distribution,
+        # matching the training-side policy logprobs exactly: the behaviour
+        # logprobs recorded for online RL must live in the same
+        # distribution the trainer differentiates, not the
+        # temperature/top-p filtered one tokens were drawn from.
+        chosen = torch.gather(raw_log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
         return tokens, chosen
-
-    def _is_greedy_pipeline(self) -> bool:
-        """True if the first strategy is greedy temperature (temp=0)."""
-        if not self.strategies:
-            return False
-        first = self.strategies[0]
-        return isinstance(first, TemperatureStrategy) and self._is_greedy(
-            first.temperature
-        )
 
 
 @torch.inference_mode()
@@ -354,9 +406,9 @@ def sample(
         input_ids: Previously generated token IDs ``[batch, seq_len]``.
         input_mask: Boolean mask for ``input_ids`` padding.
         return_logprobs: If ``True``, also return the log-probability
-            of each sampled token under the (post-strategy) sampling
-            distribution — useful for RL rollout (PPO/GRPO importance
-            ratios).
+            of each sampled token under the raw (pre-strategy) model
+            distribution — usable directly for RL rollout (PPO/GRPO
+            importance ratios against the training-side policy logprobs).
 
     Returns:
         Sampled token IDs ``[batch]``, or — when ``return_logprobs`` is
@@ -369,13 +421,19 @@ def sample(
         else frequency_penalty != 0
     )
 
-    strategies: List[BaseSamplingStrategy] = [
-        TemperatureStrategy(temperature),
-        TopKStrategy(top_k),
-        TopPStrategy(top_p),
-    ]
+    strategies: List[BaseSamplingStrategy] = []
     if has_freq:
+        # Penalty first, on the raw logits (OpenAI semantics): applying it
+        # after a temperature scaling would shrink it by the temperature
+        # and annihilate it entirely at temperature=0.
         strategies.append(FrequencyPenaltyStrategy(frequency_penalty))
+    strategies.extend(
+        [
+            TemperatureStrategy(temperature),
+            TopKStrategy(top_k),
+            TopPStrategy(top_p),
+        ]
+    )
 
     return SamplingPipeline(strategies).sample(
         logits,
