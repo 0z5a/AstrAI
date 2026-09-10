@@ -59,15 +59,15 @@ def _scheduler_fn(optimizer):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
 
 
-def _online_train_config(parallel_mode):
+def _online_train_config(dp_mode):
     return TrainConfig(
         strategy="online_grpo",
         model_fn=_ConfigModel,
         dataset=_ConfigDataset(),
         optimizer_fn=_optimizer_fn,
         scheduler_fn=_scheduler_fn,
-        nprocs=2,
-        parallel_mode=parallel_mode,
+        dp_size=2,
+        dp_mode=dp_mode,
         reward_model_fn=object,
     )
 
@@ -94,6 +94,10 @@ def _rollout_config(*, compile_mode=None):
         rollout_top_k=0,
         rollout_top_p=1.0,
         rollout_interval=1,
+        rollout_max_policy_lag=None,
+        cp_size=1,
+        tp_size=1,
+        device_type="cpu",
         reward_model_fn=object,
     )
 
@@ -167,15 +171,15 @@ def test_train_config_accepts_multi_process_ddp_online_rollout():
     config = _online_train_config("ddp")
 
     assert config.nprocs == 2
-    assert config.parallel_mode == "ddp"
+    assert config.dp_mode == "ddp"
 
 
-@pytest.mark.parametrize("parallel_mode", ["none", "fsdp"])
+@pytest.mark.parametrize("dp_mode", ["none", "fsdp"])
 def test_train_config_rejects_multi_process_online_rollout_without_ddp(
-    parallel_mode,
+    dp_mode,
 ):
-    with pytest.raises(ValueError, match="requires parallel_mode='ddp'"):
-        _online_train_config(parallel_mode)
+    with pytest.raises(ValueError, match="requires dp_mode='ddp'"):
+        _online_train_config(dp_mode)
 
 
 def test_distributed_fsdp_rollout_fails_before_model_access(monkeypatch):
