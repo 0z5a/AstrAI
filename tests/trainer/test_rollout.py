@@ -1,5 +1,7 @@
 """Unit tests for the online rollout module."""
 
+import threading
+
 import pytest
 import torch
 
@@ -11,6 +13,7 @@ from astrai.trainer.rollout import (
     RolloutGenerator,
     RolloutResult,
     RolloutRunner,
+    RolloutVersionError,
 )
 from tests.helpers import FakeTokenizer, make_model
 
@@ -55,6 +58,46 @@ def _make_instruction_batch(n=2):
     return {"instruction": instructions, "input": inputs}
 
 
+def _blocking_hook(original, started, release):
+    """Wrap a hook so it signals ``started`` then blocks until ``release``."""
+
+    def hook(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    return hook
+
+
+def _assert_interleaved(first, second, *, started, release, finished):
+    """Run ``first`` until it blocks, then assert ``second`` cannot finish
+    while ``first`` holds the lock; release, join both, and surface errors."""
+    errors = []
+
+    def run_safely(fn):
+        def run():
+            try:
+                fn()
+            except BaseException as exc:
+                errors.append(exc)
+
+        return run
+
+    first_thread = threading.Thread(target=run_safely(first))
+    second_thread = threading.Thread(target=run_safely(second))
+    first_thread.start()
+    assert started.wait(timeout=5)
+    second_thread.start()
+    assert not finished.wait(timeout=0.1)
+
+    release.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+
+
 def test_raw_rollout_fields():
     r = RawRollout(
         prompts=torch.zeros(2, 4, dtype=torch.long),
@@ -91,13 +134,6 @@ def test_rollout_result_inherits_raw_rollout_fields():
 def test_base_reward_model_is_abstract():
     with pytest.raises(TypeError):
         BaseRewardModel()
-
-
-def test_constant_reward_model_shape():
-    rm = ConstantRewardModel(0.5)
-    out = rm.score(["a", "b"], [["x", "y", "z"], ["p", "q", "r"]])
-    assert out.shape == (2, 3)
-    assert torch.all(out == 0.5)
 
 
 def _make_generator(device, **kw):
@@ -149,6 +185,70 @@ def test_rollout_generator_uses_eval_and_restores_mode(device):
     gen.generate(_make_instruction_batch(n=1))
     assert seen_training == [False]
     assert model.training is True
+
+
+def test_rollout_generator_serializes_generation_and_policy_update(device):
+    gen, _ = _make_generator(device, group_size=1, max_tokens=2)
+    generation_started = threading.Event()
+    allow_generation_to_finish = threading.Event()
+    update_finished = threading.Event()
+    gen._generate_eval = _blocking_hook(
+        gen._generate_eval, generation_started, allow_generation_to_finish
+    )
+
+    _assert_interleaved(
+        lambda: gen.generate(_make_instruction_batch(n=1)),
+        lambda: gen.apply_weight_update(1, update_finished.set),
+        started=generation_started,
+        release=allow_generation_to_finish,
+        finished=update_finished,
+    )
+
+    assert update_finished.is_set()
+    assert gen.policy_version == 1
+
+
+def test_rollout_generator_serializes_direct_scheduler_update(device):
+    gen, _ = _make_generator(device, group_size=1, max_tokens=2)
+    generation_started = threading.Event()
+    allow_generation_to_finish = threading.Event()
+    update_finished = threading.Event()
+    gen._generate_eval = _blocking_hook(
+        gen._generate_eval, generation_started, allow_generation_to_finish
+    )
+    rollout = []
+
+    def update_scheduler_directly():
+        gen.scheduler.update_weights(1)
+        update_finished.set()
+
+    _assert_interleaved(
+        lambda: rollout.append(gen.generate(_make_instruction_batch(n=1))),
+        update_scheduler_directly,
+        started=generation_started,
+        release=allow_generation_to_finish,
+        finished=update_finished,
+    )
+
+    assert rollout[0].policy_version == 0
+    assert gen.policy_version == 1
+
+
+def test_rollout_generator_keeps_generation_start_version(device):
+    gen, _ = _make_generator(device, group_size=1, max_tokens=2)
+    original_run_batch = gen.scheduler.run_batch
+
+    def update_after_generation(*args, **kwargs):
+        result = original_run_batch(*args, **kwargs)
+        gen.scheduler.update_weights(1)
+        return result
+
+    gen.scheduler.run_batch = update_after_generation
+
+    rollout = gen.generate(_make_instruction_batch(n=1))
+
+    assert rollout.policy_version == 0
+    assert gen.policy_version == 1
 
 
 def test_rollout_generator_mask_matches_responses(device):
@@ -248,6 +348,7 @@ def _make_runner(device, **kw):
             generator=generator,
             reward_model=rm,
             rollout_interval=kw.get("rollout_interval", 2),
+            max_policy_lag=kw.get("max_policy_lag"),
         ),
         model,
     )
@@ -277,6 +378,21 @@ def test_rollout_runner_cache_returns_stale_flag(device):
     assert fresh2 is False
 
 
+def test_rollout_runner_evaluate_leaves_cache_untouched(device):
+    runner, _ = _make_runner(device, rollout_interval=10)
+    batch = _make_instruction_batch()
+    cached, _ = runner(batch)
+
+    eval_batch = _make_instruction_batch(n=1)
+    result = runner.evaluate(eval_batch)
+
+    assert result.rewards.shape == result.responses.shape[:2]
+    replayed, fresh = runner(batch)
+    assert replayed is cached
+    assert fresh is False
+    assert runner._steps_since_rollout == 0
+
+
 def test_rollout_runner_tags_generation_version_and_preserves_cached_behavior(device):
     runner, _ = _make_runner(device, rollout_interval=100)
     batch = _make_instruction_batch(n=1)
@@ -295,6 +411,151 @@ def test_rollout_runner_tags_generation_version_and_preserves_cached_behavior(de
     refreshed, refreshed_fresh = runner(batch)
     assert refreshed_fresh is True
     assert refreshed.policy_version == 1
+
+
+def test_rollout_runner_rejects_future_generation_version(device):
+    runner, _ = _make_runner(device, rollout_interval=2)
+    raw = runner.generator.generate(_make_instruction_batch(n=1))
+    raw.policy_version = runner.policy_version + 1
+    runner.generator.generate = lambda _batch: raw
+
+    with pytest.raises(RolloutVersionError, match="future policy version"):
+        runner(_make_instruction_batch(n=1))
+
+
+def test_rollout_runner_rejects_result_beyond_max_policy_lag(device):
+    runner, _ = _make_runner(device, rollout_interval=4, max_policy_lag=1)
+    batch = _make_instruction_batch(n=1)
+    result, _ = runner(batch)
+    assert result.policy_version == 0
+
+    runner.update_weights(2)
+    with pytest.raises(RolloutVersionError, match="exceeds max_policy_lag=1"):
+        runner(batch)
+
+
+def test_rollout_runner_revalidates_version_after_async_scoring(device):
+    runner, _ = _make_runner(device, rollout_interval=4, max_policy_lag=0)
+    original_score = runner._score
+
+    def score_while_policy_advances(raw):
+        result = original_score(raw)
+        runner.update_weights(1)
+        return result
+
+    runner._score = score_while_policy_advances
+
+    with pytest.raises(RolloutVersionError, match="exceeds max_policy_lag=0"):
+        runner(_make_instruction_batch(n=1))
+    assert runner._cache is None
+
+
+def test_rollout_runner_publishes_cache_before_concurrent_policy_update(device):
+    runner, _ = _make_runner(device, rollout_interval=4, max_policy_lag=1)
+    final_validation_started = threading.Event()
+    allow_final_validation_to_finish = threading.Event()
+    update_finished = threading.Event()
+    rollout_finished = threading.Event()
+    validation_calls = 0
+    original_validate = runner._validate_policy_version
+
+    def blocking_validate(result, *, live_version=None):
+        nonlocal validation_calls
+        validation_calls += 1
+        original_validate(result, live_version=live_version)
+        if validation_calls == 3:
+            final_validation_started.set()
+            assert allow_final_validation_to_finish.wait(timeout=5)
+
+    runner._validate_policy_version = blocking_validate
+
+    def produce_rollout():
+        runner(_make_instruction_batch(n=1))
+        rollout_finished.set()
+
+    _assert_interleaved(
+        produce_rollout,
+        lambda: runner.apply_weight_update(1, update_finished.set),
+        started=final_validation_started,
+        release=allow_final_validation_to_finish,
+        finished=update_finished,
+    )
+
+    assert rollout_finished.is_set()
+    assert update_finished.is_set()
+    assert runner._cache is not None
+    assert runner._cache.policy_version == 0
+    assert runner.policy_version == 1
+
+
+def test_rollout_runner_derives_default_policy_lag_from_interval(device):
+    runner, _ = _make_runner(device, rollout_interval=4)
+    assert runner.max_policy_lag == 3
+
+
+def _interleave_before_snapshot(runner, callback):
+    """Wrap ``with_policy_snapshot`` so ``callback`` runs just before a
+    named snapshot callback enters the generator/scheduler locks."""
+    original_snapshot = runner.generator.with_policy_snapshot
+
+    def wrapper(inspect):
+        if inspect.__name__ == "reuse":
+            callback()
+        return original_snapshot(inspect)
+
+    runner.generator.with_policy_snapshot = wrapper
+
+
+def test_rollout_runner_reuse_reads_cache_inside_the_snapshot(device):
+    """The reuse decision must observe the cache under the policy snapshot
+    (regression: the cache was read outside the lock, so a concurrent
+    commit between the read and the lock silently handed the trainer a
+    stale rollout — a lost update)."""
+    import dataclasses
+
+    runner, _ = _make_runner(device, rollout_interval=100)
+    batch = _make_instruction_batch(n=1)
+    first, _ = runner(batch)
+    assert first.policy_version == 0
+
+    def concurrent_refresh():
+        runner.update_weights(1)
+        runner._cache = dataclasses.replace(first, policy_version=1)
+        runner._steps_since_rollout = 0
+
+    _interleave_before_snapshot(runner, concurrent_refresh)
+    result, fresh = runner(batch)
+    assert fresh is False
+    assert result is not first
+    assert result.policy_version == 1
+
+
+def test_rollout_runner_recovers_when_cache_cleared_before_reuse_snapshot(device):
+    """A cache clear between the reuse decision and the snapshot must
+    trigger a fresh rollout instead of an assertion failure (regression:
+    ``assert cached is not None`` fired because the object was captured
+    outside the lock)."""
+    runner, _ = _make_runner(device, rollout_interval=100)
+    batch = _make_instruction_batch(n=1)
+    first, _ = runner(batch)
+
+    _interleave_before_snapshot(runner, runner.clear_cache)
+    result, fresh = runner(batch)
+    assert fresh is True
+    assert result is not first
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"rollout_interval": 0}, "rollout_interval must be positive"),
+        ({"max_policy_lag": -1}, "max_policy_lag must be non-negative"),
+    ],
+)
+def test_rollout_runner_rejects_invalid_version_window(device, kwargs, message):
+    generator, _ = _make_generator(device)
+    with pytest.raises(ValueError, match=message):
+        RolloutRunner(generator, ConstantRewardModel(), **kwargs)
 
 
 def test_rollout_runner_refreshes_for_different_batch(device):

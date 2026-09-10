@@ -9,6 +9,8 @@ Layout: x is [batch, seq_len, n_heads, head_dim] (bf16).
 freqs_cis is [batch, seq_len, dim/2, 2] (f32) — [cos, sin] pairs.
 """
 
+from typing import Any, Dict, List
+
 import torch
 from torch import Tensor
 
@@ -41,7 +43,7 @@ def _torch_apply(x: Tensor, freqs_cis: Tensor) -> Tensor:
     return x_out.to(dtype)
 
 
-def _rotary_records() -> list:
+def _rotary_records() -> List[ImplRecord]:
     return [
         ImplRecord(
             family="rotary",
@@ -61,12 +63,15 @@ def _rotary_records() -> list:
     ]
 
 
-register_family(
-    "rotary",
-    lambda x, freqs_cis: tensor_axes(x),
-    _rotary_records,
-    lambda: _rotary_records()[-1],
-)
+def _axes(x: Tensor, freqs_cis: Tensor) -> Dict[str, Any]:
+    return tensor_axes(x)
+
+
+def _fallback_record() -> ImplRecord:
+    return _rotary_records()[-1]
+
+
+register_family("rotary", _axes, _rotary_records, _fallback_record)
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
@@ -80,3 +85,6 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
         [batch, seq_len, n_heads, head_dim] (bf16)
     """
     return resolve("rotary", x, freqs_cis).record.obj(x, freqs_cis)
+
+
+__all__ = ["apply_rotary_emb"]
