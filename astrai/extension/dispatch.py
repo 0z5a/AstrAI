@@ -277,6 +277,18 @@ def env_selection(family: str) -> Optional[str]:
     return env_overrides().get(family)
 
 
+def env_mode(varname: str) -> str:
+    """Read a family's ``0``/``1``/``auto`` mode variable (default ``auto``).
+
+    Invalid values warn once per distinct value and fall back to ``auto``.
+    """
+    mode = os.environ.get(varname, "auto").strip().lower()
+    if mode in ("0", "1", "auto"):
+        return mode
+    _warn_once(f"{varname}={mode!r} is invalid; expected 0, 1, or auto; using auto")
+    return "auto"
+
+
 @dataclass(frozen=True)
 class Resolution:
     record: ImplRecord
@@ -398,3 +410,30 @@ def explain_plan(calls: Mapping[str, Call]) -> str:
     return "\n".join(
         explain(family, *args, **kwargs) for family, (args, kwargs) in calls.items()
     )
+
+
+__all__ = [
+    "Axes",
+    "Call",
+    "ExplicitSelectionError",
+    "ImplRecord",
+    "OpFamily",
+    "Resolution",
+    "Spec",
+    "Axis",
+    "axis",
+    "env_mode",
+    "env_overrides",
+    "env_selection",
+    "explain",
+    "explain_plan",
+    "get_override",
+    "op_backend",
+    "register_env_alias",
+    "register_family",
+    "reset_override",
+    "resolve",
+    "resolve_plan",
+    "set_override",
+    "tensor_axes",
+]

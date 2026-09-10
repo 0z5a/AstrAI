@@ -1,18 +1,21 @@
-"""CUDA attention kernel wrappers with torch fallback.
+"""CUDA kernel wrappers, operator dispatch, and backend selection.
 
 Public API:
-    - ``attn_decode`` — single-query decode attention
-    - ``attn_prefill`` — multi-query prefill attention
-    - ``attn_paged_decode`` — paged decode attention (direct page-table access)
-    - ``AttentionBackend`` — ABC for attention computation strategies
-    - ``TorchNativeBackend`` — default SDPA backend with KV cache I/O
-    - ``CudaBackend`` — CUDA kernel backend with paged decode + prefill
+    - ``attention``, ``apply_rotary_emb`` — op families with safe torch
+      fallbacks (see ``astrai.extension.backend``)
+    - ``attn_decode`` / ``attn_prefill`` / ``attn_paged_decode`` /
+      ``attn_paged_prefill`` — direct attention kernel wrappers
+    - ``AttentionBackend`` / ``TorchNativeBackend`` / ``CudaBackend`` /
+      ``FlashAttnBackend`` — attention backend strategies
+    - ``resolve`` / ``explain`` / ``op_backend`` / ``env_mode`` — the shared
+      operator dispatcher (see ``astrai.extension.dispatch``)
 
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
-(blhd). Scale is always ``1/sqrt(head_dim)``.
-
-Each wrapper calls its compiled CUDA kernel directly. Fallback to torch
-SDPA is handled by the attention backend, not the wrapper functions.
+(blhd). Scale is always ``1/sqrt(head_dim)``. Wrapper functions call their
+compiled CUDA kernels directly; fallback is the backend's responsibility.
+Linear projections and dense-MLP SwiGLU run plain torch (``F.linear`` /
+``Linear`` / ``MLP``); the former bf16_gemm / bf16_swiglu kernels and their
+backends were removed.
 """
 
 from astrai.extension.backend import (
@@ -26,7 +29,6 @@ from astrai.extension.backend import (
     attention,
     attn_backend,
     get_backend,
-    linear,
 )
 from astrai.extension.dispatch import (
     Axes,
@@ -35,6 +37,7 @@ from astrai.extension.dispatch import (
     Resolution,
     Spec,
     axis,
+    env_mode,
     explain,
     explain_plan,
     op_backend,
@@ -49,8 +52,8 @@ from astrai.extension.ops import (
     TensorLayout,
     attn_decode,
     attn_paged_decode,
+    attn_paged_prefill,
     attn_prefill,
-    bf16_gemv,
 )
 
 __all__ = [
@@ -64,11 +67,10 @@ __all__ = [
     "attention",
     "attn_backend",
     "get_backend",
-    "linear",
     "attn_decode",
     "attn_paged_decode",
     "attn_prefill",
-    "bf16_gemv",
+    "attn_paged_prefill",
     "is_available",
     "KERNEL_NAMES",
     "apply_rotary_emb",
@@ -78,6 +80,7 @@ __all__ = [
     "Resolution",
     "Spec",
     "axis",
+    "env_mode",
     "explain",
     "explain_plan",
     "op_backend",
