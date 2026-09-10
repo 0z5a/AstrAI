@@ -16,7 +16,7 @@ Provides:
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 import torch
 from torch import Tensor
@@ -68,9 +68,16 @@ class RolloutResult(RawRollout):
 
     Fields:
         rewards: Reward per response, shape ``[B, G]``.
+        advantages: Optional GAE advantages ``[B, G, R_max]`` pinned at
+            rollout time by actor-critic strategies (PPO).  ``None`` until
+            a strategy computes them.
+        returns: Optional GAE value targets ``[B, G, R_max]`` matching
+            ``advantages``.
     """
 
     rewards: Tensor
+    advantages: Optional[Tensor] = None
+    returns: Optional[Tensor] = None
 
 
 class BaseRewardModel(ABC):
@@ -98,6 +105,11 @@ class BaseRewardModel(ABC):
 
 
 _PAD = 0
+T = TypeVar("T")
+
+
+class RolloutVersionError(RuntimeError):
+    """A rollout cannot be attributed to an acceptable policy version."""
 
 
 class RolloutGenerator:
@@ -142,6 +154,25 @@ class RolloutGenerator:
         with self._weight_lock:
             return self.scheduler.update_weights(policy_version)
 
+    def apply_weight_update(
+        self, policy_version: Optional[int], update: Callable[[], T]
+    ) -> T:
+        """Apply a shared-model mutation at an atomic generation boundary.
+
+        ``policy_version=None`` lets the scheduler derive ``live + 1`` under
+        the policy lock, closing the read-compute-write race for callers
+        that only need to advance by one.
+        """
+        with self._weight_lock:
+            return self.scheduler.apply_weight_update(policy_version, update)
+
+    def with_policy_snapshot(self, inspect: Callable[[int], T]) -> T:
+        """Inspect a version stable against generator and scheduler updates."""
+        if not callable(inspect):
+            raise TypeError("inspect must be callable")
+        with self._weight_lock:
+            return self.scheduler.with_policy_snapshot(inspect)
+
     @torch.no_grad()
     def generate(self, batch: Dict) -> RawRollout:
         """Expand prompts by ``group_size`` and generate one response each.
@@ -159,15 +190,22 @@ class RolloutGenerator:
         format the policy was SFT-trained on.
         """
         with self._weight_lock:
-            model = self.scheduler._executor.model
-            was_training = model.training
-            model.eval()
-            try:
-                return self._generate_eval(batch)
-            finally:
-                model.train(was_training)
 
-    def _generate_eval(self, batch: Dict) -> RawRollout:
+            def generate_snapshot(generation_version: int) -> RawRollout:
+                model = self.scheduler._executor.model
+                was_training = model.training
+                model.eval()
+                try:
+                    return self._generate_eval(batch, generation_version)
+                finally:
+                    model.train(was_training)
+
+            # Capture the version under the scheduler lock as well as the
+            # generator lock. This also serializes callers that update the
+            # scheduler directly instead of going through this wrapper.
+            return self.scheduler.with_policy_snapshot(generate_snapshot)
+
+    def _generate_eval(self, batch: Dict, generation_version: int) -> RawRollout:
         prompt_texts, flat_prompt_ids = self._prepare_prompts(batch)
         B = len(prompt_texts)
         G = self.group_size
@@ -258,7 +296,7 @@ class RolloutGenerator:
             responses=responses,
             response_mask=response_mask,
             logprobs_old=logprobs_old,
-            policy_version=self.policy_version,
+            policy_version=generation_version,
             prompt_texts=prompt_texts,
             response_texts=response_texts,
         )
@@ -375,10 +413,18 @@ class RolloutRunner:
         generator: RolloutGenerator,
         reward_model: BaseRewardModel,
         rollout_interval: int = 512,
+        max_policy_lag: Optional[int] = None,
     ):
+        if rollout_interval <= 0:
+            raise ValueError("rollout_interval must be positive")
+        if max_policy_lag is not None and max_policy_lag < 0:
+            raise ValueError("max_policy_lag must be non-negative or None")
         self.generator = generator
         self.reward_model = reward_model
         self.rollout_interval = rollout_interval
+        self.max_policy_lag = (
+            rollout_interval - 1 if max_policy_lag is None else max_policy_lag
+        )
 
         self._cache: Optional[RolloutResult] = None
         self._cache_key = None
@@ -391,6 +437,12 @@ class RolloutRunner:
     def update_weights(self, policy_version: int) -> int:
         """Publish the shared policy's new version to the rollout backend."""
         return self.generator.update_weights(policy_version)
+
+    def apply_weight_update(
+        self, policy_version: Optional[int], update: Callable[[], T]
+    ) -> T:
+        """Apply a model update and publish its version as one operation."""
+        return self.generator.apply_weight_update(policy_version, update)
 
     def step(self):
         """Advance the internal counter (call once per optimizer step)."""
@@ -442,21 +494,80 @@ class RolloutRunner:
             response_texts=raw.response_texts,
         )
 
+    def _validate_policy_version(
+        self, result: RawRollout, *, live_version: Optional[int] = None
+    ) -> None:
+        version = result.policy_version
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise RolloutVersionError(f"rollout has invalid policy version {version!r}")
+        if live_version is None:
+            live_version = self.policy_version
+        if version > live_version:
+            raise RolloutVersionError(
+                f"rollout has future policy version {version}; "
+                f"live policy version is {live_version}"
+            )
+        lag = live_version - version
+        if lag > self.max_policy_lag:
+            raise RolloutVersionError(
+                f"rollout policy lag {lag} exceeds max_policy_lag="
+                f"{self.max_policy_lag} (rollout={version}, live={live_version})"
+            )
+
     def __call__(self, batch: Dict[str, Tensor]) -> Tuple[RolloutResult, bool]:
         """Return ``(cached or fresh) RolloutResult`` plus an ``is_fresh`` flag.
 
         Triggers a new rollout when ``_steps_since_rollout >= rollout_interval``
-        or when the cache is empty.
+        or when the cache is empty. The reuse decision, its version
+        validation, and the returned object are all captured inside one
+        policy snapshot, so a concurrent commit, refresh, or cache clear
+        can never hand out an object the snapshot has already invalidated.
         """
         cache_key = self._batch_key(batch)
-        if (
-            self._cache is None
-            or cache_key != self._cache_key
-            or self._steps_since_rollout >= self.rollout_interval
-        ):
-            raw = self.generator.generate(batch)
-            self._cache = self._score(raw)
+
+        def reuse(live_version: int) -> Optional[Tuple[RolloutResult, bool]]:
+            cached = self._cache
+            if (
+                cached is None
+                or self._cache_key != cache_key
+                or self._steps_since_rollout >= self.rollout_interval
+            ):
+                return None
+            self._validate_policy_version(cached, live_version=live_version)
+            return cached, False
+
+        outcome = self.generator.with_policy_snapshot(reuse)
+        if outcome is not None:
+            return outcome
+
+        raw = self.generator.generate(batch)
+        self._validate_policy_version(raw)
+        scored = self._score(raw)
+        # Post-scoring check: reward scoring may call slow external services;
+        # surface an over-lag policy move before the commit critical section.
+        self._validate_policy_version(scored)
+
+        def commit(live_version: int) -> Tuple[RolloutResult, bool]:
+            self._validate_policy_version(scored, live_version=live_version)
+            self._cache = scored
             self._cache_key = cache_key
             self._steps_since_rollout = 0
-            return self._cache, True
-        return self._cache, False
+            return scored, True
+
+        # A weight update cannot land between the final version check and
+        # cache publication. Reward scoring itself intentionally remains
+        # outside the policy lock because it may call an external service.
+        return self.generator.with_policy_snapshot(commit)
+
+    def evaluate(self, batch: Dict) -> RolloutResult:
+        """One-off rollout + scoring that leaves the replay cache untouched.
+
+        Used by validation on online strategies: the training cache, its
+        cadence counter, and the cache key stay intact, so evaluation
+        prompts never disturb the rollout replay schedule.
+        """
+        raw = self.generator.generate(batch)
+        self._validate_policy_version(raw)
+        scored = self._score(raw)
+        self._validate_policy_version(scored)
+        return scored

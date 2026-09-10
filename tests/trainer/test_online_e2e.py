@@ -11,6 +11,8 @@ from torch.utils.data import Dataset
 from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer import train_context
+from astrai.model.value import ValueModel
+from astrai.serialization import Checkpoint
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
@@ -70,6 +72,10 @@ def _model_fn(model_config):
     return AutoRegressiveLM(model_config).to(dtype=torch.float32)
 
 
+def _value_model_fn(model_config):
+    return ValueModel(model_config).to(dtype=torch.float32)
+
+
 def _optimizer_fn(m):
     return torch.optim.AdamW(m.parameters(), lr=1e-4)
 
@@ -84,18 +90,34 @@ _ONLINE_STRATEGIES = [
     pytest.param(
         "online_grpo",
         {"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
+        None,
         id="grpo",
     ),
-    pytest.param("online_dpo", {"beta": 0.1, "group_size": 2}, id="dpo"),
+    pytest.param("online_dpo", {"beta": 0.1, "group_size": 2}, None, id="dpo"),
+    pytest.param(
+        "online_ppo",
+        {
+            "clip_eps": 0.2,
+            "kl_coef": 0.01,
+            "group_size": 2,
+            "gamma": 1.0,
+            "gae_lambda": 0.95,
+            "vf_coef": 0.5,
+        },
+        True,
+        id="ppo",
+    ),
 ]
 
 _DDP_TEST_WORLD_SIZE = int(os.environ.get("ASTRAI_DDP_TEST_WORLD_SIZE", "2"))
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(("strategy", "strategy_kwargs"), _ONLINE_STRATEGIES)
+@pytest.mark.parametrize(
+    ("strategy", "strategy_kwargs", "with_critic"), _ONLINE_STRATEGIES
+)
 def test_online_rollout_end_to_end(
-    base_test_env, strategy, strategy_kwargs, monkeypatch
+    base_test_env, strategy, strategy_kwargs, with_critic, monkeypatch
 ):
     """Run one epoch of online RL rollout with KV-cache-backed generation."""
     created_reference_models = []
@@ -115,7 +137,7 @@ def test_online_rollout_end_to_end(
     tokenizer.set_chat_template(CHAT_TEMPLATE)
     tokenizer.save_pretrained(test_dir)
 
-    train_config = TrainConfig(
+    config_kwargs = dict(
         strategy=strategy,
         model_fn=partial(_model_fn, model_config),
         dataset=InstructionDataset(),
@@ -128,10 +150,10 @@ def test_online_rollout_end_to_end(
         grad_accum_steps=1,
         random_seed=42,
         device_type=device,
-        nprocs=1,
-        parallel_mode="none",
+        dp_mode="none",
         strategy_kwargs=strategy_kwargs,
         rollout_interval=1,
+        rollout_max_policy_lag=0,
         rollout_temperature=1.0,
         rollout_top_k=0,
         rollout_top_p=1.0,
@@ -139,12 +161,59 @@ def test_online_rollout_end_to_end(
         reward_model_fn=LengthRewardModel,
         collate_fn=instruction_collate_fn,
     )
+    if with_critic:
+        config_kwargs["critic_model_fn"] = partial(_value_model_fn, model_config)
+        config_kwargs["critic_optimizer_fn"] = _optimizer_fn
+    train_config = TrainConfig(**config_kwargs)
 
     trainer = Trainer(train_config)
     trainer.train(param_path=test_dir)
 
-    assert os.path.isdir(os.path.join(test_dir, "ckpt"))
+    checkpoint_dir = os.path.join(test_dir, "ckpt", "epoch_0_step_2")
+    assert os.path.isdir(checkpoint_dir)
+    checkpoint = Checkpoint.load(checkpoint_dir)
+    assert checkpoint.meta["policy_version"] == 2
     assert len(created_reference_models) == 1
+    if with_critic:
+        assert "value_model" in checkpoint.extra
+        assert "value_optimizer" in checkpoint.extra
+    else:
+        assert "value_model" not in checkpoint.extra
+
+
+def _minimal_online_config(**overrides):
+    """A TrainConfig for online GRPO that only needs field overrides."""
+    defaults = dict(
+        strategy="online_grpo",
+        model_fn=lambda: torch.nn.Linear(2, 2),
+        dataset=InstructionDataset(),
+        optimizer_fn=lambda m: torch.optim.SGD(m.parameters(), lr=0.0),
+        scheduler_fn=lambda o: SchedulerFactory.create(
+            "cosine", o, warmup_steps=1, lr_decay_steps=4, min_rate=0.05
+        ),
+        reward_model_fn=LengthRewardModel,
+    )
+    defaults.update(overrides)
+    return TrainConfig(**defaults)
+
+
+def test_online_config_rejects_contradictory_policy_lag():
+    """rollout_max_policy_lag below rollout_interval - 1 guarantees a fatal
+    RolloutVersionError mid-training; it must fail at config time instead."""
+    with pytest.raises(ValueError, match="rollout_max_policy_lag=0"):
+        _minimal_online_config(rollout_interval=3, rollout_max_policy_lag=0)
+
+    # lag == interval - 1 (including the derived default) stays valid.
+    config = _minimal_online_config(rollout_interval=3, rollout_max_policy_lag=2)
+    assert config.rollout_max_policy_lag == 2
+    config = _minimal_online_config(rollout_interval=3)
+    assert config.rollout_max_policy_lag is None
+
+    # Offline strategies never consult the rollout window.
+    config = _minimal_online_config(
+        strategy="sft", rollout_interval=3, rollout_max_policy_lag=0
+    )
+    assert config.rollout_max_policy_lag == 0
 
 
 @pytest.mark.integration
@@ -175,8 +244,8 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
         grad_accum_steps=1,
         random_seed=42,
         device_type="cuda",
-        nprocs=_DDP_TEST_WORLD_SIZE,
-        parallel_mode="ddp",
+        dp_size=_DDP_TEST_WORLD_SIZE,
+        dp_mode="ddp",
         strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
         rollout_interval=1,
         rollout_temperature=1.0,

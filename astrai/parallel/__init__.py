@@ -9,7 +9,6 @@ from astrai.parallel.executor import (
     NoneExecutor,
     RolloutCapabilities,
     broadcast_state_dict,
-    create_ref_model,
 )
 from astrai.parallel.setup import (
     get_current_device,
@@ -36,6 +35,5 @@ __all__ = [
     "DDPExecutor",
     "FSDPExecutor",
     "RolloutCapabilities",
-    "create_ref_model",
     "broadcast_state_dict",
 ]
