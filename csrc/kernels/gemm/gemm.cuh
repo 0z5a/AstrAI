@@ -613,9 +613,12 @@ struct TmaLauncher {
         // carry a substitution; the narrow and small classes always fit.
         constexpr bool kReclaimGated = tile_class<Tile>() == TileClass::kBig128 ||
                                        tile_class<Tile>() == TileClass::kWide128x256;
+        // The small CTA's warp widening, the same rule the cp.async ladder
+        // applies (warp_widened_t, policy.cuh).
+        using Widened = warp_widened_t<ElemA, ElemB, Tile>;
         using TileT = std::conditional_t<
-            kReclaimGated && !reclaim_fits<Tile, ElemA, ElemB, OutT>(),
-            narrow_fallback_t<Tile>, Tile>;
+            kReclaimGated && !reclaim_fits<Widened, ElemA, ElemB, OutT>(),
+            narrow_fallback_t<Widened>, Widened>;
         return launch_policy_tma<GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileT, LayoutOut,
                        OutT, false, true, UseMx>>(p, stream);
     }
@@ -634,19 +637,25 @@ struct CpAsyncLauncher {
     cudaStream_t stream;
     template <typename Tile>
     bool run() const {
-        using NonFast = GemmTileConfig<typename Tile::CtaShape,
-                                       typename Tile::WarpShape, Tile::kStages,
-                                       false>;
-        constexpr bool kFits = reclaim_fits<Tile, ElemA, ElemB, OutT>();
-        constexpr bool kBig = tile_class<Tile>() == TileClass::kBig128;
-        constexpr bool kWide = tile_class<Tile>() == TileClass::kWide128x256;
+        // The small CTA's warp widening: the 8-warp 64x64 twin starves the
+        // tensor pipe on two-byte operands (measured 1.36-1.66x for the
+        // 16-warp form, parity to -3% on the thinnest shapes). The rule and
+        // its arms live in policy.cuh's warp_widened_t.
+        using Widened = warp_widened_t<ElemA, ElemB, Tile>;
+        using NonFast = GemmTileConfig<typename Widened::CtaShape,
+                                       typename Widened::WarpShape,
+                                       Widened::kStages, false>;
+        constexpr bool kFits = reclaim_fits<Widened, ElemA, ElemB, OutT>();
+        constexpr bool kBig = tile_class<Widened>() == TileClass::kBig128;
+        constexpr bool kWide = tile_class<Widened>() == TileClass::kWide128x256;
         using TileT = std::conditional_t<
             kBig, std::conditional_t<
-                      kFits, std::conditional_t<kBigFast, Tile, NonFast>,
-                      narrow_fallback_t<Tile>>,
+                      kFits, std::conditional_t<kBigFast, Widened, NonFast>,
+                      narrow_fallback_t<Widened>>,
             std::conditional_t<kWide, std::conditional_t<
-                                          kFits, Tile, narrow_fallback_t<Tile>>,
-                               Tile>>;
+                                          kFits, Widened,
+                                          narrow_fallback_t<Widened>>,
+                               Widened>>;
         launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT,
                                  LayoutOut, OutT, false, false, UseMx>>(
             p, stream);

@@ -559,6 +559,36 @@ int main() {
               (int)mixed.size());
     }
 
+    // 8b. The small CTA's warp widening (policy.cuh's warp_widened_t): the
+    //     16-warp substitution resolves only on two-byte operands at kK=64 —
+    //     the 1-byte arm keeps the 8-warp tile (load-bus divisibility) and
+    //     the kK=32 arm has no legal 16-warp form at all. Pinning all three
+    //     arms here is what keeps a future ladder edit from reaching an
+    //     illegal instantiation.
+    {
+        using Small8w = Tile_64x64x64_W16x32_S3_Fast;
+        using Small8w_k32 = Tile_64x64x32_W16x32_S3_Fast;
+        static_assert(
+            std::is_same_v<warp_widened_t<__nv_bfloat16, __nv_bfloat16, Small8w>,
+                           small_16w_t<Small8w>>,
+            "2-byte kK=64 small CTA must widen to the 16-warp twin");
+        static_assert(std::is_same_v<
+                          warp_widened_t<__nv_bfloat16, int8_t, Small8w>,
+                          Small8w>,
+                      "1-byte operand must keep the 8-warp small CTA");
+        static_assert(std::is_same_v<
+                          warp_widened_t<__nv_bfloat16, __nv_bfloat16, Small8w_k32>,
+                          Small8w_k32>,
+                      "kK=32 small CTA has no legal 16-warp twin");
+        using Widened = warp_widened_t<__nv_bfloat16, __nv_bfloat16, Small8w>;
+        constexpr int kWidenedWarpM = Widened::WarpShape::kM;
+        constexpr int kWidenedWarpN = Widened::WarpShape::kN;
+        CHECK(kWidenedWarpM == 16 && kWidenedWarpN == 16,
+              "widened small CTA warp tile is 16x16 (got %dx%d)", kWidenedWarpM,
+              kWidenedWarpN);
+        std::printf("ok   small CTA warp widening: 3 arms pinned\n");
+    }
+
     // 9. Planner cost (informational, one process): the row scan + wave
     //    pricing every launch runs. A 2026-09-13 exact-shape memo measured
     //    45 ns here against this ~110 ns plain path and was retired — the

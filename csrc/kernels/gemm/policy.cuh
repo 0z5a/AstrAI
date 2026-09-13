@@ -181,11 +181,16 @@ using Tile_64x64x64_W16x32_S3_Fast =
 // row file naming one falls to the next source instead of silently
 // launching nothing (plan_from_row in gemm.cuh).
 // 16 warps per CTA on the small geometry (16x16 warp tiles, 512 threads):
-// more parallel slack over the same 64x64x64 ring, for the underfed shapes.
-using Tile_64x64x64_W16x16_S2_Fast =
-    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 16>, 2, true>;
-using Tile_64x64x64_W16x16_S3_Fast =
-    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 16>, 3, true>;
+// the 8-warp small tile starves the tensor pipe on two-byte operands —
+// measured 1.36-1.66x for this twin on 11 of 13 shapes (NT and both
+// crosswise layouts), parity or -3% on the two thinnest. The launch
+// resolvers substitute it for the 8-warp entries (small_16w_t below); the
+// ladder keeps naming the 8-warp tile because 1-byte operands cannot carry
+// 512 threads (the load bus is 256 chunks, load.cuh's divisibility).
+template <typename Tile>
+using small_16w_t = GemmTileConfig<typename Tile::CtaShape, Shape<16, 16>,
+                                   Tile::kStages, true>;
+
 // kK=32 twins: the measured k-tile-depth winner on most shapes, since a
 // 64-deep k-tile spends ring budget and issue slots the short K loop cannot
 // use.
@@ -230,6 +235,18 @@ constexpr TileClass tile_class() {
         return TileClass::kSmall64;
 }
 
+// The one rule the launch resolvers ask: does this tile take the widening?
+// Two-byte operands only (1-byte keeps the 8-warp tile — the load bus is
+// legal there and the 16-warp form is not), the small CTA only, and kK=64
+// only (the kK=32 twin has no legal 16-warp form: 512 threads against its
+// 256 chunks). Named rather than inlined in the resolvers so the tests can
+// pin all three arms without a launch.
+template <typename ElemA, typename ElemB, typename Tile>
+using warp_widened_t =
+    std::conditional_t<sizeof(ElemA) == 2 && sizeof(ElemB) == 2 &&
+                           tile_class<Tile>() == TileClass::kSmall64 &&
+                           Tile::CtaShape::kK == 64,
+                       small_16w_t<Tile>, Tile>;
 // CTA geometry per dispatch class — the inverse of tile_class, and the one
 // home for the class -> (M, N) numbers the host plan table prices rows with
 // (plan_row_geometry in plan_table.h). Indexed by TileClass, enum order.
@@ -294,15 +311,14 @@ using TileManifestCross = std::tuple<
 // fast variant; the cp.async ladder downgrades to the non-fast twin for
 // crosswise staging at its resolver.
 //
-// The congruous ladder: the shared six plus the kK=32 twins and the 16-warp
-// small CTA, swept on the dual-congruous (NT) route. Order is load-bearing —
-// dispatch_tile takes the first entry whose (class, stages, kK) matches, and
-// the 16-warp small CTA shares that key with the 32-warp one above it, so it
-// is reached only when the 32-warp twin's resolver declines.
+// The congruous ladder: the shared six plus the kK=32 twins, swept on the
+// dual-congruous (NT) route. Order is load-bearing — dispatch_tile takes the
+// first entry whose (class, stages, kK) matches. The small CTA's 16-warp
+// widening is not an entry here: it is a resolver substitution (small_16w_t)
+// so the same key stays legal on 1-byte operands.
 using TileManifest = tuple_cat_t<
     TileManifestCross,
-    std::tuple<Tile_64x64x64_W16x16_S2_Fast, Tile_64x64x64_W16x16_S3_Fast,
-               Tile_64x64x32_W16x32_S2_Fast, Tile_64x64x32_W16x32_S3_Fast,
+    std::tuple<Tile_64x64x32_W16x32_S2_Fast, Tile_64x64x32_W16x32_S3_Fast,
                Tile_128x64x32_W32x32_S2_Fast, Tile_128x128x32_W32x32_S2_Fast,
                Tile_128x128x32_W64x32_S3_Fast>>;
 
