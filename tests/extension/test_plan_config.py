@@ -29,30 +29,35 @@ ROW = "511 513 8191 0 0 0 1 3 0 64"  # narrow CTA, 3 stages, kK 64
 @pytest.fixture(autouse=True)
 def _clean_plan_state():
     ops.gemm.set_table("")
-    ops.gemm.set_planner("table")
+    ops.gemm.set_planner("")  # back to the shipped default
     ops.gemm.set_staging()
     ops.gemm.set_log(False)
     yield
     ops.gemm.set_table("")
-    ops.gemm.set_planner("table")
+    ops.gemm.set_planner("")  # back to the shipped default
     ops.gemm.set_staging()
     ops.gemm.set_log(False)
 
 
 class TestMode:
-    def test_default_is_table(self):
+    def test_default_is_hybrid(self):
+        # The shipped default: rows when any exist, else the model. The
+        # compiled-in tables are empty, so a fresh process gets the model.
         state = ops.gemm.state()
-        assert state["planner"] == "table"
-        assert ops.gemm.probe(*SHAPE)["source"] == "builtin"
+        assert state["planner"] == "hybrid"
+        assert ops.gemm.probe(*SHAPE)["source"] == "model"
 
     def test_model_mode_skips_the_rows(self):
         ops.gemm.set_planner("model")
+        ops.gemm.set_table(ROW)
         assert ops.gemm.state()["planner"] == "model"
         assert ops.gemm.probe(*SHAPE)["source"] == "model"
 
-    def test_hybrid_prefers_table_then_model(self):
+    def test_hybrid_prefers_rows_then_model(self):
         ops.gemm.set_planner("hybrid")
-        assert ops.gemm.probe(*SHAPE)["source"] == "builtin"
+        assert ops.gemm.probe(*SHAPE)["source"] == "model"
+        ops.gemm.set_table(ROW)  # a row now owns the shape
+        assert ops.gemm.probe(*SHAPE)["source"] == "override"
         ops.gemm.set_table("-")  # every row tier off
         assert ops.gemm.probe(*SHAPE)["source"] == "model"
 
@@ -67,23 +72,28 @@ class TestMode:
 
 
 class TestTable:
-    def test_override_rows_outrank_builtin(self):
+    def test_override_rows_take_the_shape(self):
         installed = ops.gemm.set_table(ROW)
         assert installed == 1
         info = ops.gemm.probe(*SHAPE)
         assert info["source"] == "override"
         assert (info["cta"], info["stages"], info["kk"]) == (1, 3, 64)
 
-    def test_off_mode_falls_to_degraded(self):
+    def test_off_mode_kills_the_rows_only(self):
+        # "-" disables override, injected and builtin alike; what answers
+        # after that is the planner mode's business: the model under the
+        # shipped hybrid default, the degraded ladder under "table".
         ops.gemm.set_table("-")
-        info = ops.gemm.probe(*SHAPE)
-        assert info["source"] == "degraded"
+        assert ops.gemm.probe(*SHAPE)["source"] == "model"
+        ops.gemm.set_planner("table")
+        assert ops.gemm.probe(*SHAPE)["source"] == "degraded"
 
-    def test_clear_restores_the_builtin(self):
+    def test_clear_restores_the_default(self):
         ops.gemm.set_table(ROW)
         ops.gemm.set_table("")
-        assert ops.gemm.probe(*SHAPE)["source"] == "builtin"
         assert ops.gemm.state()["table"]["override_rows"] == 0
+        # The builtin tables ship empty, so the model answers again.
+        assert ops.gemm.probe(*SHAPE)["source"] == "model"
 
     def test_injected_rows_rank_below_override(self):
         ops.gemm.inject_rows(ROW)
@@ -99,6 +109,14 @@ class TestStaging:
         assert ops.gemm.state()["staging"] == {"tma": False, "mx": True}
         ops.gemm.set_staging(mx=False)
         assert ops.gemm.state()["staging"] == {"tma": False, "mx": False}
+
+
+class TestCompiledInTables:
+    def test_no_rows_ship_compiled_in(self):
+        # Measured rows are device-bound and served at runtime; the
+        # compiled-in tier is empty, so "builtin" never appears.
+        for shape in (SHAPE, (128, 2048, 4096), (2048, 14336, 4096)):
+            assert ops.gemm.probe(*shape)["source"] != "builtin"
 
 
 class TestProbe:

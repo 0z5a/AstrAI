@@ -47,4 +47,4 @@ def _reset_dispatch_state():
 
     if is_available("gemm"):
         ops.gemm.set_table("")
-        ops.gemm.set_planner("table")
+        ops.gemm.set_planner("")  # back to the shipped default

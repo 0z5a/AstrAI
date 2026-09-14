@@ -314,11 +314,51 @@ inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging,
 // requirement, ring depths past s3, the crosswise ladder's conservative
 // set — because a row naming a non-instantiable combination would match no
 // tile in dispatch_tile and launch nothing at all.
+//
+// Scanning the manifest type list directly (no std::vector): this runs once
+// per plan, and building the vocabulary's vector here cost ~2.5us of the
+// ~2.9us a dispatch took — the row scan itself is ~100ns (measured; the
+// vector form stays for tile_vocabulary, which wants a list).
+template <typename Manifest>
+inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb,
+                        GemmRecipe& out) {
+    bool found = false;
+    auto consider = [&](auto tile) {
+        using T = decltype(tile);
+        if (found) return;
+        if ((int)tile_class<T>() != cta || (int)T::kStages != stages ||
+            (int)T::CtaShape::kK != kk)
+            return;
+        out = GemmRecipe{
+            (int)tile_class<T>(), (int)T::kStages, (int)T::CtaShape::kK,
+            T::CtaShape::kM, T::CtaShape::kN,
+            (T::CtaShape::kM / T::WarpShape::kM) *
+                (T::CtaShape::kN / T::WarpShape::kN) * 32,
+            ring_smem_bytes(T::CtaShape::kM, T::CtaShape::kN,
+                            T::CtaShape::kK, T::kStages, ba, bb)};
+        found = true;
+    };
+    std::apply([&](auto... tiles) { (consider(tiles), ...); }, Manifest{});
+    return found;
+}
+
 inline std::optional<GemmRecipe> recipe_of(int cta, int stages, int kk,
                                            bool crosswise, int ba, int bb) {
-    for (const GemmRecipe& r : gemm_recipes_for(crosswise, ba, bb))
-        if (r.cta == cta && r.stages == stages && r.kk == kk) return r;
-    return std::nullopt;
+    GemmRecipe out{};
+    const bool found = [&] {
+        switch (manifest_kind(crosswise, ba, bb)) {
+            case ManifestKind::kTwoByte:
+                return recipe_scan<TileManifest>(cta, stages, kk, ba, bb, out);
+            case ManifestKind::kByte:
+                return recipe_scan<TileManifestByte>(cta, stages, kk, ba, bb,
+                                                     out);
+            default:  // kCrosswise is the fallback kind, manifest_for included
+                return recipe_scan<TileManifestCross>(cta, stages, kk, ba, bb,
+                                                      out);
+        }
+    }();
+    if (!found) return std::nullopt;
+    return out;
 }
 
 // One dispatch decision: the recipe, the resolved raster (a row's literal,
@@ -418,16 +458,28 @@ public:
         for (const GemmRecipe& r : recipes) {
             const double cycles = price(r, q);
             if (cycles < 0.0) continue;
-            // Ties go to the bigger CTA class then the deeper ring K (the
-            // sweep generator's stable big > narrow > small preference plus
-            // kK=64's loop amortization), so equal-cost scans do not
-            // flip-flop with the manifest order. kK is otherwise invisible
-            // to the model — the twins move identical bytes and (on parts
-            // where both are 1-resident) identical slots — which is the
-            // measured-not-modeled axis the row tables own.
+            // Ties: the byte and wave terms cancel exactly when a tile
+            // change halves both the bytes per block and the block count
+            // (any single-wave grid does), so the model cannot separate
+            // those candidates and the tie-break decides. Below one full
+            // wave the machine is under-filled and parallelism is what is
+            // left to buy, so the SMALLER CTA wins (measured: at 128x2048
+            // the bigger tile's tie cost +77%); once the grid saturates,
+            // reuse is the scarce good and the bigger CTA wins, then the
+            // deeper ring K (kK=64's loop amortization). kK is otherwise
+            // invisible to the model — the twins move identical bytes and
+            // identical slots — which is the measured-not-modeled axis the
+            // row tables own.
+            const bool under_filled = is_under_filled(r, q);
             const bool tie_better =
-                !best_d || r.cta > best_d->recipe.cta ||
-                (r.cta == best_d->recipe.cta && r.kk > best_d->recipe.kk);
+                !best_d ||
+                (under_filled
+                     ? (r.cta < best_d->recipe.cta ||
+                        (r.cta == best_d->recipe.cta &&
+                         r.kk < best_d->recipe.kk))
+                     : (r.cta > best_d->recipe.cta ||
+                        (r.cta == best_d->recipe.cta &&
+                         r.kk > best_d->recipe.kk)));
             if (best < 0.0 || cycles < best * (1.0 - 1e-9) ||
                 (cycles <= best * (1.0 + 1e-9) && tie_better)) {
                 best = cycles;
@@ -467,6 +519,21 @@ private:
     // planner.
     static double tc_eff(int cta) {
         return cta == (int)TileClass::kSmall64 ? 0.5 : 1.0;
+    }
+
+    // Is the grid below one full wave (every SM's resident slots)?
+    // Shares price()'s arithmetic so the tie-break cannot drift from the
+    // costing it is breaking ties on.
+    static bool is_under_filled(const GemmRecipe& r, const PlanQuery& q) {
+        const DeviceFacts& dev = q.dev;
+        if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0) return false;
+        const int resident =
+            std::min(dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
+        if (resident <= 0) return false;
+        const int64_t blocks =
+            ((q.m + r.bm - 1) / r.bm) * ((q.n + r.bn - 1) / r.bn) *
+            (int64_t)q.batch;
+        return blocks < (int64_t)dev.sms * resident;
     }
 
     static double price(const GemmRecipe& r, const PlanQuery& q) {
@@ -585,10 +652,12 @@ inline PlanDecision plan_dispatch(const PlanQuery& q) {
             log_dispatch(q, *d);
             return *d;
         }
-    // Unreachable: the degraded planner answers every query (its row
-    // function has the m=0 fallback), so the chain above always returns.
-    // A release build still needs a value here — the first degraded row
-    // is the historical answer for the degenerate shapes.
+    // The chain above returns for every query that has device facts
+    // (the degraded row function has the m=0 fallback and resolves for
+    // any width pair). It cannot answer only when the query carries no
+    // usable device (smem_max 0 fails the ring gate) or a non-positive
+    // dim, so this tail is the no-facts answer: the first degraded row,
+    // the historical choice for degenerate shapes.
     const TableRow& row = kDegradedPlanRows[0];
     PlanDecision d{*recipe_of((int)row.cta, row.stages, row.kk, false, 2, 2),
                    0, "degraded"};

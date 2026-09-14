@@ -12,6 +12,7 @@
 // and their field order: parse_plan_table_file below.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -467,7 +468,7 @@ inline void gemm_config_seed_once() {
 inline int gemm_planner_mode() {
     gemm_config_seed_once();
     const int v = gemm_config().planner.load(std::memory_order_relaxed);
-    return v < 0 ? 0 : v;
+    return v < 0 ? 1 : v;  // default: hybrid (model fills what no row owns)
 }
 inline bool gemm_plan_log_enabled() {
     gemm_config_seed_once();
@@ -487,165 +488,44 @@ inline bool gemm_table_off() {
 }
 
 // BEGIN GENERATED
-// Measured rows, distilled (2026-09-10, power-of-2 grid sweep over M, N, K in
-// 32..4096): 42 rows merged to 14. A row here is a FLOOR, not an optimum —
-// every one is kK=64 with cta <= 2 while the manifest carries more (the kK=32
-// twin of the same band measures ~1.85x on narrow N, and the warp tiling is
-// not addressable from a row at all: the dispatch key is class + stages + kK).
-// One table per dtype class, so a row tuned for one operand pair cannot fire
-// on another.
+// Compiled-in rows are EMPTY by default: a measured row is calibrated to
+// the part it was measured on, and a stale one is worse than no row at all
+// (measured 2026-09-14 on sm_120: the previous W16A16 rows cost +4.3% vs
+// the degraded floor across a holdout, with six shapes past +2% and one at
+// +33%). The shipped default is therefore the analytical planner: with the
+// tables empty the chain runs override rows -> injected rows (the
+// autotuner's) -> [no builtin rows] -> the model -> the degraded floor, so
+// a device gets measured recipes from `plan.set_table` or the autotuner
+// cache at runtime instead of a rebuild.
 //
-// First match wins, so order matters: measured additions sit in front of the
-// rows they shadow.
-static constexpr TableRow kBuiltinPlanW16A16[] = {
-    // Ring-residency rows (2026-09-11, RTX 4090), all on the 128x128 kK=32 s2
-    // ring: its 48KB ring keeps TWO CTAs resident where the kK=64 twin's 96KB
-    // keeps one, so the epilogue (which scatters through the reclaimed rings)
-    // overlaps instead of being exposed, and its 16 warps of 32x32 double the
-    // warps per partition at the same 64-register budget. Worth 7-14% on the
-    // large shapes.
-    // The M<=512 band keeps kK=64 s2 instead: there the K loop is too short
-    // for the 64x64 CTA's 3 resident CTAs to lose.
-    {TileClass::kBig128, 512, 0, 4096, 0, 0, 0, 2, 0, 32},
-    // The wave bound of the narrow-N band (N <= 1536), replacing an M literal
-    // that was hand-calibrated twice and wrong twice — the M that fills the
-    // machine moves with N (grid = m_tiles * n_tiles), so no literal holds it.
-    // Measured against the 64x64 kK=32 row below on a 128-SM part (256 slots
-    // at this ring's resident 2): 288 CTAs = 1.13 waves and 312 = 1.22 and
-    // 336 = 1.31 all went to the 64x64 tile (up to 23% ahead), 360 = 1.41 and
-    // 384 = 1.50 to this one. So 1360 permille, and resident is priced from
-    // the ring per device (plan_resident_ctas), so a part that packs four CTAs
-    // of this ring moves the crossover with it. Table and controls: doc.
-    //
-    // N in (1536,3072] stays on the literal row below: the wave rule splits
-    // 2-2 across the four mid-N points measured — and the two it gets WRONG
-    // are the two best-filled grids (2560x2560 at 1.56 waves is 15% for the
-    // 64x64 tile), so fill is not what decides that band. Left open rather
-    // than guessed at; the doc records the four points.
-    {TileClass::kBig128, 0, 0, 1024, 1536, 0, 0, 2, 0, 32, 0, 0, 0, 1360},
-    // The mid-N half of that band keeps its calibrated literal (29 M-tiles,
-    // see above) and its bare CTAs-per-SM gate.
-    {TileClass::kBig128, 3712, 0, 1536, 3072, 0, 0, 2, 0, 32, 0, 0, 2},
-    {TileClass::kBig128, 512, 0, 3072, 4096, 0, 0, 2, 0, 32},
-    // Small M drops the wide band to the 64x64 tile: a 128x128 grid is
-    // ceil(M/128) x n_tiles — 32 CTAs at M <= 128 — and streaming B from a
-    // thin grid costs more than the big tile's reuse pays. The 384/512 flip
-    // and the kk split are measured literals, not wave arithmetic (at M 512
-    // the big tile wins on a half wave), per the TableRow comment on literal
-    // vs wave bounds.
-    {TileClass::kSmall64, 0, 128, 3072, 0, 0, 0, 3, 0, 64, 4096, 0},
-    {TileClass::kSmall64, 0, 128, 3072, 0, 0, 0, 3, 0, 32, 2048, 0},
-    {TileClass::kSmall64, 0, 384, 3072, 0, 0, 0, 3, 0, 32, 2048, 0},
-    {TileClass::kBig128, 384, 512, 3072, 0, 0, 0, 2, 0, 32, 2048, 0},
-    // The same residency effect as a k-tile depth: N in (768,1536] resolved to
-    // the kK=64 small tile below (64KB ring, one resident CTA) where the kK=32
-    // twin is 32KB. M > 1536 keeps the big-tile row (5.3% ahead there) and
-    // M <= 128 keeps kK=64 (the grid is too thin for residency to pay and the
-    // deeper ring amortizes better).
-    {TileClass::kSmall64, 128, 1536, 768, 1536, 0, 0, 3, 0, 32},
-    // Same swap for N in (1536,3072] and N <= 768, which resolved to the kK=64
-    // floors below (64KB ring vs the twin's 32KB): worth 5-37% where the grid
-    // is thin. The M bounds keep the rows off the shapes where kK=64 measured
-    // ahead instead (3072x2048x1536 +2%, 256x768x3072 +4%).
-    {TileClass::kSmall64, 384, 1024, 1536, 3072, 0, 0, 3, 0, 32},
-    {TileClass::kSmall64, 384, 0, 0, 768, 0, 0, 3, 0, 32},
-    // 2026-09-11 power-of-2 grid sweep (M,N,K in 32..4096, GPU A/B over all
-    // 512 points against the rows below): the kK=32 twin wins the whole
-    // M,N >= 1024 region — -4.32% summed over the grid, 48 points better by
-    // 5-44% (1024x1024x4096 111 -> 62us, 4096x4096x4096 1009 -> 941us); the
-    // rest sit within the ~1us event-timer tick. kK=64 keeps the bands below,
-    // where the 32-deep twin was not measured.
-    {TileClass::kSmall64, 768, 0, 768, 1024, 0, 0, 3, 0, 32},
-    {TileClass::kSmall64, 1024, 0, 1024, 4096, 0, 0, 3, 0, 32},
-    {TileClass::kSmall64, 768, 1024, 3072, 4096, 0, 0, 3, 0, 32},
-    // v2 (2026-09-10, dense sweep): kK=32 on the narrow- and mid-N bands where
-    // the 64-deep ring spends issue slots the short K loop cannot use.
-    {TileClass::kSmall64, 1536, 4096, 0, 768, 0, 0, 3, 0, 32},
-    {TileClass::kSmall64, 768, 4096, 256, 768, 0, 0, 3, 0, 32},
-    {TileClass::kSmall64, 384, 768, 1024, 3072, 0, 0, 3, 0, 32},
-    {TileClass::kSmall64, 128, 384, 1536, 3072, 0, 0, 3, 0, 32},
-    {TileClass::kSmall64, 128, 512, 3072, 0, 0, 0, 3, 0, 32},
-    // v1 floor (2026-09-10, full-coverage sweep).
-    {TileClass::kSmall64, 0, 0, 0, 768, 0, 0, 3, 0},
-    {TileClass::kSmall64, 0, 768, 768, 1536, 0, 0, 3, 0},
-    {TileClass::kBig128, 768, 0, 768, 1536, 0, 0, 2, 0},
-    {TileClass::kSmall64, 0, 384, 1536, 3072, 0, 0, 3, 0},
-    {TileClass::kBig128, 384, 0, 1536, 0, 0, 0, 2, 0},
-    {TileClass::kSmall64, 0, 96, 3072, 0, 0, 0, 3, 0},
-    {TileClass::kNarrow128x64, 96, 384, 3072, 0, 0, 0, 2, 0},
-};
-
-static constexpr TableRow kBuiltinPlanW8A16[] = {
-    {TileClass::kBig128, 3072, 4096, 256, 2048, 1, 0, 2, 0, 64},
-    {TileClass::kSmall64, 0, 0, 0, 1536, 1, 0, 3, 0},
-    {TileClass::kSmall64, 0, 768, 1536, 3072, 1, 0, 3, 0},
-    {TileClass::kBig128, 768, 0, 1536, 3072, 1, 0, 2, 0},
-    {TileClass::kSmall64, 0, 384, 3072, 0, 1, 0, 3, 0},
-    {TileClass::kBig128, 384, 0, 3072, 0, 1, 0, 2, 0},
-};
-
-static constexpr TableRow kBuiltinPlanW8A8[] = {
-    // The wide CTA (128x256, resident 1) needs >= 1 wave to pay off — measured
-    // <0.5 wave 0.79x, >=1 wave 1.08x, >=4 waves 1.42x against the small CTA —
-    // so these bands start where M/128 * N/256 >= 128, i.e. one wave here.
-    // Every wide row also carries the K > 512 band: that crossover is epilogue
-    // dependent, so it takes the value that holds under both per-tensor and
-    // per-row/per-channel scales (a strict win rather than one a cheap-scale
-    // harness reads as a regression).
-    {TileClass::kWide128x256, 2048, 4096, 3072, 11008, 2, 0, 2, 0, 64, 512, 0},
-    {TileClass::kWide128x256, 512, 4096, 8192, 11008, 2, 0, 2, 0, 64, 512, 0},
-    // Mid-N at large M is the grid-sweep gap those bands leave: measured
-    // 1.22-1.54x for K > 512 there, so the same tile and the same band.
-    {TileClass::kWide128x256, 1024, 0, 1024, 0, 2, 0, 2, 0, 64, 512, 0},
-    {TileClass::kSmall64, 0, 0, 0, 0, 2, 0, 3, 0},
-};
-
-static constexpr TableRow kBuiltinPlanF8A8[] = {
-    // fp8 has no row of its own yet: the sweep's fp8 optima sat within the
-    // small CTA's noise, and its roof is close (293 vs 313 TFLOPS measured on
-    // this part), so the catch-all is the measured-best row on the grid.
-    {TileClass::kSmall64, 0, 0, 0, 0, 3, 0, 3, 0},
-};
+// A device-specific build can still paste measured rows here, between the
+// GENERATED markers: `csrc/bench/tune_plan_table.py sweep --emit cpp`
+// writes them as initializers grouped per class. Rows are data, so they
+// carry no kernel pointers; the class keying is checked below.
+static constexpr std::array<TableRow, 0> kBuiltinPlanW16A16 = {};
+static constexpr std::array<TableRow, 0> kBuiltinPlanW8A16 = {};
+static constexpr std::array<TableRow, 0> kBuiltinPlanW8A8 = {};
+static constexpr std::array<TableRow, 0> kBuiltinPlanF8A8 = {};
 // END GENERATED
 
-// A builtin row must belong to the table it sits in: repeating the class id
-// documents intent, -1 says "any", anything else means the row was filed
-// under the wrong table and would be filtered out at lookup.
-template <int Class>
-constexpr bool builtin_rows_keyed_for(const TableRow* rows, int count) {
-    for (int i = 0; i < count; ++i)
-        if (rows[i].perf_class != -1 && rows[i].perf_class != Class)
-            return false;
-    return true;
-}
 
-#define ASTR_GEMM_ROWS_MATCH_CLASS(Table, Class)                              \
-    static_assert(                                                            \
-        builtin_rows_keyed_for<Class>(                                        \
-            Table, (int)(sizeof(Table) / sizeof(TableRow))),                  \
-        #Table " carries a row keyed for another dtype class")
-
-ASTR_GEMM_ROWS_MATCH_CLASS(kBuiltinPlanW16A16, 0);
-ASTR_GEMM_ROWS_MATCH_CLASS(kBuiltinPlanW8A16, 1);
-ASTR_GEMM_ROWS_MATCH_CLASS(kBuiltinPlanW8A8, 2);
-ASTR_GEMM_ROWS_MATCH_CLASS(kBuiltinPlanF8A8, 3);
-#undef ASTR_GEMM_ROWS_MATCH_CLASS
-
-// Builtin table for one dtype class; count receives its row count.
+// Builtin table for one dtype class; count receives its row count. An empty
+// table (the shipped default) returns a valid pointer and a zero count, so
+// plan_row_for matches nothing and the chain falls through to the model.
 inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) {
     switch (perf_class) {
         case 0:
-            count = (int)(sizeof(kBuiltinPlanW16A16) / sizeof(TableRow));
-            return kBuiltinPlanW16A16;
+            count = (int)kBuiltinPlanW16A16.size();
+            return kBuiltinPlanW16A16.data();
         case 1:
-            count = (int)(sizeof(kBuiltinPlanW8A16) / sizeof(TableRow));
-            return kBuiltinPlanW8A16;
+            count = (int)kBuiltinPlanW8A16.size();
+            return kBuiltinPlanW8A16.data();
         case 2:
-            count = (int)(sizeof(kBuiltinPlanW8A8) / sizeof(TableRow));
-            return kBuiltinPlanW8A8;
+            count = (int)kBuiltinPlanW8A8.size();
+            return kBuiltinPlanW8A8.data();
         case 3:
-            count = (int)(sizeof(kBuiltinPlanF8A8) / sizeof(TableRow));
-            return kBuiltinPlanF8A8;
+            count = (int)kBuiltinPlanF8A8.size();
+            return kBuiltinPlanF8A8.data();
         default:
             count = 0;
             return nullptr;

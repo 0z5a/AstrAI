@@ -260,6 +260,13 @@ py::dict configure(py::object table, py::object planner, py::object log,
         int mode = -1;
         if (py::isinstance<py::str>(planner)) {
             const std::string name = planner.cast<std::string>();
+            if (name.empty()) {
+                // "" restores the shipped default (back to "unset": the
+                // env seed decides, and hybrid is what an unseeded process
+                // resolves to).
+                gemm_config().planner = -1;
+                return config_state_dict();
+            }
             if (!parse_planner_mode(name, mode))
                 throw std::invalid_argument(
                     "planner must be 'table', 'hybrid' or 'model', got '" +
@@ -311,6 +318,18 @@ std::vector<std::vector<int>> tile_vocabulary() {
                 out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk,
                                r.bm, r.bn, r.threads, r.smem});
     return out;
+}
+
+// The TileClass spellings, in enum order — what a row's cta ordinal expands
+// to in the compiled-in tables (the GENERATED block's paste target). Owned
+// here so the sweep's C++ emitter needs no Python-side copy of the names.
+std::vector<const char*> tile_class_names() {
+    static constexpr const char* kNames[] = {
+        "kSmall64", "kNarrow128x64", "kBig128", "kWide128x256"};
+    static_assert((int)TileClass::kWide128x256 ==
+                      (int)(sizeof(kNames) / sizeof(kNames[0])) - 1,
+                  "kNames is indexed by TileClass: keep it in enum order");
+    return std::vector<const char*>(kNames, kNames + sizeof(kNames) / sizeof(kNames[0]));
 }
 
 py::dict device_facts_info() {
@@ -452,6 +471,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("planner") = py::none(), py::arg("log") = py::none(),
           py::arg("staging") = py::none());
     m.def("config_state", &astrai::gemm::config_state_dict);
+    m.def("tile_class_names", &astrai::gemm::tile_class_names);
     m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary);
     m.def("device_facts_info", &astrai::gemm::device_facts_info);
 }

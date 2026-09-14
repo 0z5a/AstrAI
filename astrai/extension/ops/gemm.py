@@ -139,9 +139,11 @@ def inject_rows(rows: Rows) -> int:
 
 
 def set_planner(mode: str) -> dict:
-    """Pick the planner: ``table`` (AOT rows only), ``hybrid`` (rows, then
-    the analytical model on a miss), or ``model`` (analytical only)."""
-    if mode not in PLANNER_MODES:
+    """Pick the planner: ``table`` (rows only, the degraded ladder when no
+    row matches), ``hybrid`` (rows, then the model, then the ladder — the
+    shipped default), or ``model`` (analytical only). ``""`` restores the
+    shipped default instead of pinning a mode."""
+    if mode and mode not in PLANNER_MODES:
         raise ValueError(f"planner must be one of {PLANNER_MODES}, got {mode!r}")
     return get_module("gemm").configure(planner=mode)
 
