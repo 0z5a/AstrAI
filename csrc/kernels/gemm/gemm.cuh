@@ -296,6 +296,8 @@ inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging,
     std::vector<GemmRecipe> out;
     switch (manifest_kind(crosswise_staging, ba, bb)) {
         case ManifestKind::kTwoByte:
+        case ManifestKind::kMixed:  // the congruous ladder carries the
+                                    // mixed bus on the predicated skip
             collect_recipes<TileManifest>(out, ba, bb);
             break;
         case ManifestKind::kByte:
@@ -310,10 +312,10 @@ inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging,
 
 // The instantiation oracle: does this staging pair's ladder carry a tile
 // for (class, stages, kK)? This is the ONE gate a row's recipe fields must
-// pass — the wide CTA's 1-byte-only rule, kK=32's dual-2-byte line
-// requirement, ring depths past s3, the crosswise ladder's conservative
-// set — because a row naming a non-instantiable combination would match no
-// tile in dispatch_tile and launch nothing at all.
+// pass — the wide CTA's 1-byte-only rule, ring depths past s3, the
+// crosswise ladder's conservative set — because a row naming a
+// non-instantiable combination would match no tile in dispatch_tile and
+// launch nothing at all.
 //
 // Scanning the manifest type list directly (no std::vector): this runs once
 // per plan, and building the vocabulary's vector here cost ~2.5us of the
@@ -348,6 +350,7 @@ inline std::optional<GemmRecipe> recipe_of(int cta, int stages, int kk,
     const bool found = [&] {
         switch (manifest_kind(crosswise, ba, bb)) {
             case ManifestKind::kTwoByte:
+            case ManifestKind::kMixed:
                 return recipe_scan<TileManifest>(cta, stages, kk, ba, bb, out);
             case ManifestKind::kByte:
                 return recipe_scan<TileManifestByte>(cta, stages, kk, ba, bb,

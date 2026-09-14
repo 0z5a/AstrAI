@@ -185,8 +185,10 @@ using Tile_64x64x64_W16x32_S3_Fast =
 // measured 1.36-1.66x for this twin on 11 of 13 shapes (NT and both
 // crosswise layouts), parity or -3% on the two thinnest. The launch
 // resolvers substitute it for the 8-warp entries (small_16w_t below); the
-// ladder keeps naming the 8-warp tile because 1-byte operands cannot carry
-// 512 threads (the load bus is 256 chunks, load.cuh's divisibility).
+// ladder keeps naming the 8-warp tile, and a 1-byte operand's thinner load
+// bus no longer blocks the substitution — the surplus threads take the
+// predicated skip (load.cuh) and the dequant fragments each lane owes
+// halve with the 16-wide N partition.
 template <typename Tile>
 using small_16w_t = GemmTileConfig<typename Tile::CtaShape, Shape<16, 16>,
                                    Tile::kStages, true>;
@@ -236,14 +238,16 @@ constexpr TileClass tile_class() {
 }
 
 // The one rule the launch resolvers ask: does this tile take the widening?
-// Two-byte operands only (1-byte keeps the 8-warp tile — the load bus is
-// legal there and the 16-warp form is not), the small CTA only, and kK=64
-// only (the kK=32 twin has no legal 16-warp form: 512 threads against its
-// 256 chunks). Named rather than inlined in the resolvers so the tests can
-// pin all three arms without a launch.
+// Any pair with a 2-byte operand (a 1-byte x 1-byte pair keeps the 8-warp
+// tile — its ladder is out of scope here, and W8A8's own cell is not
+// issue-starved), the small CTA only, and kK=64 only (a kK=32 16-warp form
+// would leave half the threads idle on the 2-byte side and three quarters
+// on the 1-byte side; the skip makes it legal, not worthwhile). Named
+// rather than inlined in the resolvers so the tests can pin all three arms
+// without a launch.
 template <typename ElemA, typename ElemB, typename Tile>
 using warp_widened_t =
-    std::conditional_t<sizeof(ElemA) == 2 && sizeof(ElemB) == 2 &&
+    std::conditional_t<sizeof(ElemA) + sizeof(ElemB) >= 3 &&
                            tile_class<Tile>() == TileClass::kSmall64 &&
                            Tile::CtaShape::kK == 64,
                        small_16w_t<Tile>, Tile>;
@@ -291,10 +295,12 @@ using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
 
 // The shared ladder: the geometries every staging path instantiates.
 // load_operand_tile stages a crosswise operand as kK lines of (M or N)*elem/16
-// chunks and needs that product to divide its thread count with a
-// power-of-two quotient, which the kK=32 twins and the 16-warp small CTA both
-// miss once the other operand is 1-byte; the wide CTA is 1-byte-only besides.
-// Every other manifest contains these, so this is the base.
+// chunks; an under-subscribed bus (fewer chunks than threads, the 1-byte
+// side of a kK=32 twin) is a predicated skip there, so membership is a
+// choice, not a bus constraint — the shared six is simply what every
+// staging path wants; the wide CTA is 1-byte-only besides. The 16-warp
+// small is a resolver substitution, never a manifest entry, so the bus
+// never gated it either way. Every other manifest contains these.
 using TileManifestCross = std::tuple<
     Tile_128x128x64_W64x32_S2_Fast, Tile_128x128x64_W64x32_S3_Fast,
     Tile_128x64x64_W32x32_S2_Fast, Tile_128x64x64_W32x32_S3_Fast,
@@ -305,8 +311,9 @@ using TileManifestCross = std::tuple<
 // k-tile depth. Split by operand width because the reclaim budget
 // (bm*bn*sizeof(OutT) <= ring) and the load-path divisibility both bind
 // harder on the narrowest ring: the byte manifest cannot carry the kK=32
-// big CTA (32KB of output over a 24KB ring) or the 16-warp small CTA (512
-// threads against 256 chunks), and the two-byte manifest has no use for the
+// big CTA (32KB of output over a 24KB ring) — the 16-warp small is a
+// resolver substitution, not an entry, and stays off a byte pair by rule —
+// and the two-byte manifest has no use for the
 // 128x256 CTA, whose ring only fits a 1-byte pair. The big entries carry the
 // fast variant; the cp.async ladder downgrades to the non-fast twin for
 // crosswise staging at its resolver.
@@ -323,11 +330,13 @@ using TileManifest = tuple_cat_t<
                Tile_128x128x32_W64x32_S3_Fast>>;
 
 // The 1-byte ladder: the shared six plus the wide CTA, every one of them at
-// kK 64. No kK=32 tile survives a 1-byte operand — a line then holds half as
-// many 16B chunks, so kTileLines*kChunks falls below the thread count (a
-// 64x64x32 tile has 128 chunks against 256 threads) and the load path cannot
-// divide them; the one kK=32 geometry that does divide, 128x128x32, cannot
-// reclaim its own 32KB output tile from a 24KB ring.
+// kK 64. No kK=32 tile pays on a 1-byte pair — a line then holds half as
+// many 16B chunks, so the small twin's bus runs half idle behind the skip
+// (expressible, not worthwhile), and the one kK=32 geometry with a full
+// bus, 128x128x32, cannot reclaim its own 32KB output tile from a 24KB
+// ring. The 16-warp small substitution stays off this ladder by rule (see
+// warp_widened_t): its starvation fix is about the bf16-cell issue stream,
+// and the byte pair rides its own cells.
 using TileManifestByte =
     tuple_cat_t<TileManifestCross, std::tuple<Tile_128x256x64_W64x32_S2_Fast>>;
 
@@ -339,18 +348,22 @@ constexpr int crosswise_of() {
     return (direct_a<LayoutA>() ? 1 : 0) + (direct_b<LayoutB>() ? 1 : 0);
 }
 
-// Which of the three ladders a (staging path, operand widths) pair selects —
+// Which of the ladders a (staging path, operand widths) pair selects —
 // the one rule behind both the type-level alias and the planner's runtime
 // lookup, so the two cannot disagree about which tiles a plan may reach.
-// The widening ladders are only legal where they were measured, so everything
-// else keeps the conservative six: crosswise staging (different staging
-// budget), a mixed width pair (one 1-byte operand halves the chunk count the
-// same way), 1-byte pairs (no kK=32 tile divides, see TileManifestByte).
-enum class ManifestKind { kCrosswise, kTwoByte, kByte };
+// The widening ladders are only legal where they were measured, so the
+// crosswise staging keeps the conservative six (different staging budget)
+// and 1-byte pairs keep their own ladder (no kK=32 tile pays there, see
+// TileManifestByte); a mixed width pair rides the congruous ladder — the
+// predicated skip carries its thinner 1-byte bus, the small CTA widens on
+// it, and every kK=32 twin's ring and reclaim budget hold at the mixed
+// widths (the big twin's 32KB output against its 48KB ring included).
+enum class ManifestKind { kCrosswise, kTwoByte, kMixed, kByte };
 
 constexpr ManifestKind manifest_kind(bool crosswise_staging, int ba, int bb) {
     if (crosswise_staging) return ManifestKind::kCrosswise;
     if (ba == 2 && bb == 2) return ManifestKind::kTwoByte;
+    if (ba + bb == 3) return ManifestKind::kMixed;
     if (ba == 1 && bb == 1) return ManifestKind::kByte;
     return ManifestKind::kCrosswise;
 }
@@ -365,7 +378,10 @@ constexpr ManifestKind manifest_kind_of() {
 // mapped to its ladder (kCrosswise is the fallback, so it needs no arm).
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
 using manifest_for = std::conditional_t<
-    manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kTwoByte,
+    manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() ==
+            ManifestKind::kTwoByte ||
+        manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() ==
+            ManifestKind::kMixed,
     TileManifest,
     std::conditional_t<
         manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kByte,

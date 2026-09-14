@@ -180,10 +180,13 @@ if _missing:
 
 
 def ladder_for_widths(ba: int, bb: int) -> str:
-    """Mirror of manifest_for (policy.cuh): 2-byte pairs get the congruent
-    ladder, 1-byte pairs the byte one, a mixed or crosswise problem the shared
-    six. The sweep is NT (crosswise 0), so mixed width is the Cross user here."""
+    """Mirror of manifest_for (policy.cuh): 2-byte and mixed pairs get the
+    congruous ladder, 1-byte pairs the byte one, a crosswise problem the
+    shared six. The sweep is NT (crosswise 0), so a mixed width pair rides
+    the kK=32 twins now (the 1-byte bus is a predicated skip)."""
     if ba == 2 and bb == 2:
+        return "TileManifest"
+    if ba + bb == 3:
         return "TileManifest"
     if ba == 1 and bb == 1:
         return "TileManifestByte"

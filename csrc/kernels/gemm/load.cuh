@@ -47,17 +47,26 @@ load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
     constexpr int kChunkElems = 16 / sizeof(ElemT);
     constexpr int kTileLines = SmemLayout::kRows;  // lines staged per tile
     constexpr int kChunks = SmemLayout::kChunks;   // chunks per line
-    static_assert(kTileLines * kChunks % kThreads == 0,
-                  "tile chunks must divide evenly across threads");
-    constexpr int kCpt = kTileLines * kChunks / kThreads;  // chunks per thread
-    // The XOR chunk stepping below (dst ^ (j << 4)) is the swizzle of
-    // c0c + j only because a thread's chunks are one aligned power-of-two
-    // run inside the line — j's bits never reach c0c's.
+    constexpr int kTotalChunks = kTileLines * kChunks;
+    // The bus may be under-subscribed: a 1-byte operand halves the chunks a
+    // line carries, so a narrow tile can hold fewer chunks than there are
+    // threads (a 16-warp small CTA against a 1-byte B, or any kK=32 1-byte
+    // side). Threads then take one chunk each and the rest stage nothing —
+    // the same true-skip shape load_crosswise_direct's grid-stride loop has
+    // always had. What cannot relax is the aligned run: the XOR chunk
+    // stepping below (dst ^ (j << 4)) is the swizzle of c0c + j only
+    // because a thread's chunks are one aligned power-of-two run inside
+    // the line — j's bits never reach c0c's.
+    static_assert(kTotalChunks % kThreads == 0 || kTotalChunks < kThreads,
+                  "tile chunks must divide the threads or under-subscribe the bus");
+    constexpr int kCpt =  // chunks per thread
+        kTotalChunks < kThreads ? 1 : kTotalChunks / kThreads;
     static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
                   "XOR chunk stepping needs a power-of-two chunks-per-thread");
     constexpr int kCpr = kChunks / kCpt;  // chunks per line slice
     const int r = tid / kCpr;             // line within the tile
     const int c0 = (tid % kCpr) * kCpt * kChunkElems;
+    if (r >= kTileLines) return;  // no chunks for this thread on this bus
     // The mirror is three axes: the tile line sources from block_row
     // (canonical) or k_base (transposed) rows; the 16B run starts at
     // k_base (canonical) or block_row (transposed); and each axis is cut
@@ -131,9 +140,15 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
     using SmemLayout = typename RingT::Layout::Stage;  // per-stage layout
     static constexpr int kChunkElems = 16 / sizeof(ElemT);
     // The layout carries the tile geometry (rows x chunks per row),
-    // whichever way round the staging runs.
+    // whichever way round the staging runs. Same bus rule as
+    // load_operand_tile: an under-subscribed bus (fewer chunks than
+    // threads) leaves the surplus threads inactive rather than illegal.
+    static constexpr int kTotalChunks =
+        SmemLayout::kRows * SmemLayout::kChunks;
+    static_assert(kTotalChunks % kThreads == 0 || kTotalChunks < kThreads,
+                  "tile chunks must divide the threads or under-subscribe the bus");
     static constexpr int kCpt =
-        SmemLayout::kRows * SmemLayout::kChunks / kThreads;
+        kTotalChunks < kThreads ? 1 : kTotalChunks / kThreads;
     static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
                   "XOR chunk stepping needs a power-of-two chunks-per-thread");
     static constexpr int kCpr = SmemLayout::kChunks / kCpt;
@@ -147,11 +162,16 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
     unsigned wrEnd = 0; // one-past-the-ring sentinel
     const char* src = nullptr;      // current tile's global source bytes
     int64_t srcStep = 0;            // per-tile source advance (bytes)
+    bool active = true;             // false: bus under-subscribed, no chunks
 
     __device__ __forceinline__ PrefetchCarry(
         const RingT& ring, const ElemT* operand,
         int64_t ld, int64_t blockRow, int tid, int firstTile) {
-        const int r = tid / kCpr;
+        const int rRaw = tid / kCpr;
+        active = rRaw < SmemLayout::kRows;
+        // An inactive thread's (r, c0) maps to no staged chunk; the carried
+        // offsets are computed at a clamped r and never dereferenced.
+        const int r = active ? rRaw : 0;
         const int c0 = (tid % kCpr) * kCpt * kChunkElems;
         const ElemT* slot0 = astrai::stage_of(ring, firstTile).engine.ptr;
         const unsigned laneOff = static_cast<unsigned>(
@@ -176,8 +196,10 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
     }
 
     // Emit this thread's chunks for the current tile; pf false (loop tail)
-    // zero-fills into the slot compute(i-1) already released.
+    // zero-fills into the slot compute(i-1) already released. An inactive
+    // thread owns no chunks, so it emits nothing at all.
     __device__ __forceinline__ void emit(bool pf) const {
+        if (!active) return;
 #pragma unroll
         for (int j = 0; j < kCpt; ++j)
             astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);

@@ -107,6 +107,16 @@ using CtaGeoms = std::tuple<Geom<64, 64>, Geom<128, 64>, Geom<128, 128>,
 using WarpGeoms = std::tuple<Geom<16, 16>, Geom<16, 32>, Geom<32, 32>,
                              Geom<64, 32>>;
 
+// The load bus rule, one spelling with load.cuh's loader: a side's chunks
+// either divide the threads (each thread one aligned power-of-two run) or
+// under-subscribe the bus (each participating thread one chunk, the
+// surplus skips). A side that can do neither has no schedule.
+constexpr bool bus_fits(int chunks, int threads) {
+    const int cpt = chunks < threads ? 1 : chunks / threads;
+    return cpt > 0 && (cpt & (cpt - 1)) == 0 &&
+           (chunks % threads == 0 || chunks < threads);
+}
+
 template <typename EA, typename EB, typename Cta, typename Warp, int KK, int S>
 constexpr bool tile_ok() {
     using MmaT = typename gemm_mma_traits<EA, EB>::MmaT;
@@ -114,15 +124,13 @@ constexpr bool tile_ok() {
     constexpr int kThreads = (Cta::kM / Warp::kM) * (Cta::kN / Warp::kN) * 32;
     constexpr int kChunksA = Cta::kM * (KK * (int)sizeof(EA) / 16);
     constexpr int kChunksB = Cta::kN * (KK * (int)sizeof(EB) / 16);
-    constexpr int kCptA = kChunksA / kThreads;
-    constexpr int kCptB = kChunksB / kThreads;
     constexpr int kRing = ring_smem_bytes(Cta::kM, Cta::kN, KK, S,
                                           (int)sizeof(EA), (int)sizeof(EB));
-    return Warp::kM % 16 == 0 && Warp::kN % 8 == 0 && Cta::kM % Warp::kM == 0 &&
+    return kThreads <= 1024 && Warp::kM % 16 == 0 && Warp::kN % 8 == 0 &&
+           Cta::kM % Warp::kM == 0 &&
            Cta::kN % Warp::kN == 0 && KK % kMmaK == 0 &&
            KK * (int)sizeof(EA) <= 128 && KK * (int)sizeof(EB) <= 128 &&
-           kChunksA % kThreads == 0 && kChunksB % kThreads == 0 && kCptA > 0 &&
-           kCptB > 0 && (kCptA & (kCptA - 1)) == 0 && (kCptB & (kCptB - 1)) == 0 &&
+           bus_fits(kChunksA, kThreads) && bus_fits(kChunksB, kThreads) &&
            Cta::kM * Cta::kN * 2 <= kRing;
 }
 
@@ -493,14 +501,29 @@ int main(int argc, char** argv) {
                 (int)std::tuple_size_v<typename Space<__nv_bfloat16, __nv_bfloat16>::Tiles>,
                 (int)std::tuple_size_v<typename Space<int8_t, int8_t>::Tiles>, warmup,
                 iters, grid.size());
+#ifdef ASTRAI_SWEEP_MIXED
+    std::printf("# mixed_candidates=%d\n",
+                (int)std::tuple_size_v<
+                    typename Space<__nv_bfloat16, int8_t>::Tiles>);
+#endif
     std::printf("dtype,shape,tile,prod,ms,tflops,ms_wall,checksum,launch_err\n");
 
-    const bool want_bf16 = std::strcmp(dtype_arg, "int8") != 0;
-    const bool want_int8 = std::strcmp(dtype_arg, "bf16") != 0;
+    const bool want_bf16 =
+        std::strcmp(dtype_arg, "int8") != 0 && std::strcmp(dtype_arg, "mixed") != 0;
+    const bool want_int8 =
+        std::strcmp(dtype_arg, "bf16") != 0 && std::strcmp(dtype_arg, "mixed") != 0;
+    const bool want_mixed = std::strcmp(dtype_arg, "mixed") == 0;
 #ifndef ASTRAI_SWEEP_INT8
     if (want_int8) {
         std::printf("# int8 candidates are not built; recompile with "
                     "-DASTRAI_SWEEP_INT8=1\n");
+        return 2;
+    }
+#endif
+#ifndef ASTRAI_SWEEP_MIXED
+    if (want_mixed) {
+        std::printf("# mixed (bf16 x int8) candidates are not built; recompile "
+                    "with -DASTRAI_SWEEP_MIXED=1\n");
         return 2;
     }
 #endif
@@ -516,6 +539,15 @@ int main(int argc, char** argv) {
             report_shape<__nv_bfloat16, __nv_bfloat16>(cfg, rows, m, n, k, dev,
                                                        "bf16");
         }
+#ifdef ASTRAI_SWEEP_MIXED
+        if (want_mixed) {
+            const auto rows =
+                sweep_shape<__nv_bfloat16, int8_t, __nv_bfloat16>(
+                    m, n, k, /*use_scale=*/true, warmup, iters);
+            report_shape<__nv_bfloat16, int8_t>(cfg, rows, m, n, k, dev,
+                                                "mixed");
+        }
+#endif
 #ifdef ASTRAI_SWEEP_INT8
         if (want_int8) {
             const auto rows = sweep_shape<int8_t, int8_t, __nv_bfloat16>(

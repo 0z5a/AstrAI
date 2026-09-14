@@ -64,7 +64,7 @@ VOCAB = [
         (0, 2, 32),
         (2, 2, 32),
     )
-    if not (kk == 32 and (ba, bb) != (2, 2))  # kK=32 is dual-2-byte only
+    if not (kk == 32 and (ba, bb) == (1, 1))  # kK=32 rides the congruous ladder
 ] + [
     [0, 1, 1, 3, 2, 64, *_GEOMETRY[3], 256, _ring(*_GEOMETRY[3], 64, 2, 1, 1)],
 ]
