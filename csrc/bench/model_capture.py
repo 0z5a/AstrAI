@@ -48,11 +48,19 @@ tpt = _load_tune()
 
 
 def device_facts() -> dict:
+    """The queried device geometry, the same fields the C++ prices against
+    (common/device.cuh DeviceFacts). smem is the PER-SM figure and smem_max
+    the PER-BLOCK opt-in ceiling: residency prices from the former, ring
+    feasibility from the latter. Both are read, never written down — a
+    hard-coded 100KB made every rule below mis-price on a part with a
+    different smem/SM (228KB on Hopper/Blackwell datacenter)."""
     props = torch.cuda.get_device_properties(0)
     return {
         "sms": props.multi_processor_count,
         "threads": props.max_threads_per_multi_processor,
-        "smem": 102400,
+        "smem": props.shared_memory_per_multiprocessor,
+        "smem_max": props.shared_memory_per_block_optin,
+        "regs": props.regs_per_multiprocessor,
     }
 
 
@@ -81,13 +89,21 @@ def priced(name: str, m: int, n: int, k: int, ba: int, bb: int, dev: dict) -> di
     # added its own thread cap and simulated picks the kernel never makes,
     # which is how a rule that scored +2.6pp here regressed 8 cells
     # end-to-end. Fidelity is now checked against the binding (--check).
-    resident = max(1, min(dev["smem"] // ring, 2 if ring <= 48 * 1024 else 1))
+    resident = min(dev["smem"] // ring, 2 if ring <= 48 * 1024 else 1)
+    # Feasibility is the ring's, not a floor on residency: the C++'s
+    # plan_resident_ctas returns 0 (not 1) for a ring past the opt-in
+    # ceiling, and a rule that prices it anyway simulates a launch the
+    # binding never makes. The rule loop skips ok=false.
+    ok = resident > 0 and ring <= dev["smem_max"]
     blocks = ((m + g["bm"] - 1) // g["bm"]) * ((n + g["bn"] - 1) // g["bn"])
-    waves = (blocks + dev["sms"] * resident - 1) // (dev["sms"] * resident)
-    wave_eff = blocks / (waves * dev["sms"] * resident)
+    waves = max(1, (blocks + dev["sms"] * max(resident, 1) - 1) // (dev["sms"] * max(resident, 1)))
+    wave_eff = blocks / (waves * dev["sms"] * max(resident, 1))
     return {
-        **g, "ring": ring, "resident": resident, "blocks": blocks,
-        "wave_eff": wave_eff, "widened": widened, "threads": threads,
+        **g, "ring": ring, "resident": resident, "blocks": blocks, "ok": ok,
+        "waves": waves, "wave_eff": wave_eff, "widened": widened,
+        "threads": threads,
+        # the dispatch key's first column, for orderings that prefer a class
+        "cta": tpt.tile_facts(name)[0],
         # per-block operand bytes through L2 (the tile's own traffic; the
         # problem's total is this times blocks)
         "b2": k * (g["bm"] * ba + g["bn"] * bb),
@@ -101,11 +117,15 @@ def rules() -> dict:
     takes (features, problem) so a rule may consult the shape, like the
     model's own byte-pair floor does."""
     def shipped(p, q):
-        # gemm.cuh ModelPlanner: the byte-pair m<=8 floor picks the
-        # smallest ring; everything else ranks by (resident, stages).
-        if q["ba"] == 1 and q["bb"] == 1 and q["m"] <= 8:
-            return (-p["ring"],)
-        return (p["resident"], p["stages"])
+        # gemm.cuh ModelPlanner, mirrored term for term: cost_of() is
+        # (operand bytes + output bytes) * waves * resident — DeepGEMM's
+        # max(L1,L2)/wave_efficiency collapsed, see the C++ comment. Byte
+        # pairs rank on the cost alone (their candidates all tie on
+        # residency); every other pair ranks (resident, stages, cost).
+        cost = (p["b2"] + 2 * p["fat"]) * p["waves"] * p["resident"]
+        if q["ba"] == 1 and q["bb"] == 1:
+            return (-cost,)
+        return (p["resident"], p["stages"], -cost)
 
     return {
         "model_exact": shipped,
@@ -166,7 +186,10 @@ def main(results_json, rule, class_filter, check):
             key = table[name]
             pick, pick_key = None, None
             for r in order:
-                if r not in feats:
+                # A candidate the device cannot launch is not a candidate
+                # (C++'s price() gate): pricing it would simulate a pick the
+                # binding never makes.
+                if r not in feats or not feats[r]["ok"]:
                     continue
                 v = key(feats[r], ctx)
                 if pick is None or v > pick_key:
@@ -195,14 +218,18 @@ def main(results_json, rule, class_filter, check):
             real = (info["cta"], info["stages"], info["kk"])
             ba, bb = tpt.BYTES[combo]
             ctx = {"m": m, "n": n, "k": k, "ba": ba, "bb": bb}
-            cands = [r for r in by_point[(combo, n, k, m)] if r != "model"]
+            # The binding chooses among the whole ladder, so the fidelity
+            # comparison must too. Restricting to the recipes this dataset
+            # measured reported every cell where the model picks a tile the
+            # dataset predates as a mismatch (meas_w16a16 has no tall entry).
+            cands = list(tpt.REACHABLE[tpt.ladder_for_widths(ba, bb)])
             feats = {r: priced(r, m, n, k, ba, bb, dev) for r in cands}
             order = tpt.order_for(perf_class)[:-1]
             for name in names:
                 key = table[name]
                 pick, pick_key = None, None
                 for r in order:
-                    if r not in feats:
+                    if r not in feats or not feats[r]["ok"]:
                         continue
                     v = key(feats[r], ctx)
                     if pick is None or v > pick_key:

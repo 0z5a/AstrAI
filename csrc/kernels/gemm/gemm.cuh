@@ -446,19 +446,25 @@ private:
 // not an efficient one. Wave count ranks those shapes at rho -0.90 against
 // the measurement.
 //
-// So the model does not count waves at all, and it does not price them
+// So the model does not rank by wave COUNT, and it does not price waves
 // either: written with a fractional last wave the makespan is
 // (blocks/slots) * concurrency * solo, `solo` grows with bm*bn while
 // `blocks` shrinks with it, and the product is the same MN for every
-// candidate of a problem. That is what the measurements show — every
-// production cell lands within 1.13-1.38x of every other on a given shape,
-// and the ordering is driven by the CTA class, not by any wave or traffic
-// count (wave count ranks the shapes at rho -0.90 against the mesurement,
-// the L1/L2/FLOP terms change no decision at all). What is left to choose
-// between is the resource the ring buys: how many CTAs it keeps resident
-// per SM, and how deep it can prefetch. Ranking on those picks the small
-// 16-warp 64x64 cell with the kK=32 ring, which is the measured best or
-// second-best cell on 9 of 9 swept shapes.
+// candidate of a problem. What is left to choose between is the resource
+// the ring buys — how many CTAs it keeps resident per SM, how deep it can
+// prefetch — and, where two candidates tie on both, the tile's own traffic
+// (cost_of below).
+//
+// Two earlier claims in this comment did not survive measurement on the
+// saved sweeps and are recorded here so they are not re-derived: (a) "every
+// production cell lands within 1.13-1.38x of every other on a given shape"
+// holds only from m >= 256 (26-65% spread) — at m <= 64 the within-cell
+// spread reaches 143-203%, and that is exactly the band the model decides
+// worst; (b) "the L1/L2 terms change no decision at all" is false within a
+// cell, where the per-block byte count and the wave fill are the two
+// strongest correlates of the measured time (rank rho -0.255 and +0.282
+// against the resource keys' +0.134/+0.169). Across cells they do not
+// order anything, which is what the original claim was about.
 //
 // The per-CTA efficiency that separates the classes at a given (M, N) is
 // the one axis no such formula reaches; it is the measured-not-modeled
@@ -477,30 +483,27 @@ public:
             return std::nullopt;
         const std::vector<GemmRecipe> recipes =
             gemm_recipes_for(q.crosswise > 0, q.ba, q.bb);
-        // The measured floor (2026-09-14, sm_120, N 1024..28672 x K
-        // 1536..8192): a byte pair at m <= 8 is bandwidth-floor-bound —
-        // every ladder candidate ran identically at every N measured
-        // (0.0% spread), so the ring buys nothing and latency hiding is
-        // not a choice; the cheapest launch (smallest ring) is the pick.
-        // The threshold is structural, not fitted: 8 is the bottom half
-        // of the byte pair's m16n8k32 mma shape, i.e. every M row
-        // already lives inside one fragment's M extent. Mixed and
-        // two-byte pairs are NOT floor-bound there (2-18% spread at wide
-        // N), so the rule owns byte pairs only.
-        if (q.ba == 1 && q.bb == 1 && q.m <= 8) {
-            std::optional<PlanDecision> floor_d;
-            int floor_smem = 0;
-            for (const GemmRecipe& r : recipes) {
-                const Priced candidate = price(r, q);
-                if (!candidate.ok) continue;
-                if (!floor_d || r.smem < floor_smem) {
-                    floor_smem = r.smem;
-                    floor_d = PlanDecision{r, plan_raster(q, r.bm, r.bn),
-                                           name()};
-                }
-            }
-            if (floor_d) return floor_d;
-        }
+        // A byte pair ranks on the cost alone. Every candidate's ring sits
+        // under the 48KB watermark there, so the residency key scores them
+        // all 2 and only its tie-break — the manifest's append order — was
+        // choosing; the cost replaces that choice with the tile's own
+        // traffic. Measured over the two saved sweeps (330 + 768 cells,
+        // ladder-restricted candidate sets): capture 0.812 -> 0.983 and
+        // 0.807 -> 0.962, with no band regressing. This also retires the
+        // byte-pair m<=8 "smallest ring" floor: the cost makes the floor's
+        // pick everywhere the floor applied (identical picks, its 4-byte
+        // m1-8 cells included), and the floor's stated rationale — a 0.0%
+        // spread across the ladder at m<=8 — does not reproduce (the
+        // within-cell spread there is 143% median).
+        //
+        // Two-byte and mixed pairs keep the resource keys first: their
+        // measured winner tracks the ring (capture 0.920/0.927 against
+        // 0.913/0.754 for the cost alone), and the cost then decides what
+        // residency cannot. That is where the append-order tie-break cost
+        // the most: in the w16a16 large-M bands the model picked
+        // 64x64x32_W16x32_S3 in all 273 cells where a 128-row twin
+        // measured 8-11% faster.
+        const bool byte_pair = q.ba == 1 && q.bb == 1;
         std::optional<PlanDecision> best_d;
         Priced best;
         for (const GemmRecipe& r : recipes) {
@@ -508,7 +511,7 @@ public:
             if (!candidate.ok) continue;
             // beats() owns the ordering; an exact tie keeps the candidate
             // seen first, the manifest's own order.
-            if (!best_d || beats(candidate, best)) {
+            if (!best_d || beats(candidate, best, byte_pair)) {
                 best = candidate;
                 best_d = PlanDecision{r, plan_raster(q, r.bm, r.bn),
                                       name()};
@@ -518,27 +521,66 @@ public:
     }
 
 private:
-    // One candidate under the resource rule. `ok` false means the ring
-    // cannot be resident on this device at all, so the candidate is not a
-    // choice — the same feasibility test the row planners gate on.
+    // Output element bytes the cost's output-tile term prices: 2 = the bf16
+    // fused-linear default. OutT is not a PlanQuery field (plan_query knows
+    // only the operand types), so an fp32-out policy weights this term twice
+    // as heavily; that only shifts picks where the output tile is comparable
+    // to the operand traffic (small K), and threading OutT in is the
+    // follow-up that would settle it.
+    static constexpr int kOutElemBytes = 2;
+
+    // One candidate under the model. `ok` false means the ring cannot be
+    // resident on this device at all, so the candidate is not a choice — the
+    // same feasibility test the row planners gate on.
     struct Priced {
-        int resident = 0;  // CTAs per SM the ring leaves room for
-        int stages = 0;    // ring depth
+        int resident = 0;       // CTAs per SM the ring leaves room for
+        int stages = 0;         // ring depth
+        std::int64_t cost = 0;  // modelled on-chip cycles (cost_of)
         bool ok = false;
     };
 
-    // More CTAs resident per SM first, then deeper prefetch. There is no
-    // FLOP or tile term to order them by: with a fractional last wave the
-    // makespan is (blocks/slots) * concurrency * solo, solo grows with
-    // bm*bn and blocks shrinks with it, so the product is the same MN for
-    // every candidate of a problem — which is what the measurements show
-    // (all production cells within 1.13-1.38x of each other, and the
-    // ranking driven by the CTA class rather than by any wave or traffic
-    // count). What is left to choose between is what the ring buys.
-    // An exact tie keeps the candidate seen first — the manifest's order.
-    static bool beats(const Priced& a, const Priced& b) {
+    // More CTAs resident per SM first, then deeper prefetch, then the
+    // modelled cost. The cost is the tie-break the resource keys cannot
+    // supply: two rings that both fit two CTAs are otherwise separated by
+    // the manifest's append order, which is history and not preference.
+    // An exact cost tie still keeps the candidate seen first.
+    static bool beats(const Priced& a, const Priced& b, bool byte_pair) {
+        if (byte_pair) return a.cost < b.cost;
         if (a.resident != b.resident) return a.resident > b.resident;
-        return a.stages > b.stages;
+        if (a.stages != b.stages) return a.stages > b.stages;
+        return a.cost < b.cost;
+    }
+
+    // The modelled cost of one tile: per-block on-chip bytes, times the waves
+    // the problem needs, times its resident CTAs. Derived from DeepGEMM's
+    // get_best_config (jit_kernels/heuristics/sm90.hpp), whose
+    // `num_cycles = max(L1, L2) / wave_efficiency` collapses — per-SM
+    // bandwidths b1/b2, wave_efficiency = blocks/(waves*resident) — to
+    // `max(l1*b2, l2*b1) * waves * resident`, so `blocks` cancels and only
+    // the bandwidth RATIO survives. On every supported part the L2 term binds
+    // (per-SM L2 bandwidth sits an order below per-SM L1), which leaves the
+    // ratio inert and the cost constant-free:
+    //
+    //     cost = (operand_bytes + output_bytes) * waves * resident
+    //
+    // Checked against the two sweeps: this collapsed form picks the same tile
+    // as the two-bandwidth version in all 1088 cells, and the output term is
+    // load-bearing (dropping it costs the byte-pair classes 0.983/0.962 ->
+    // 0.800/0.785). kK never enters directly — it moves residency through the
+    // ring, which is how the kK=32 twin wins where a deeper ring costs a CTA.
+    static std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q,
+                                int resident) {
+        const std::int64_t operand =
+            (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
+        const std::int64_t output =
+            (std::int64_t)kOutElemBytes * r.bm * r.bn;
+        const std::int64_t blocks =
+            (std::int64_t)((q.m + r.bm - 1) / r.bm) *
+            (std::int64_t)((q.n + r.bn - 1) / r.bn);
+        const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
+        const std::int64_t waves =
+            slots > 0 ? (blocks + slots - 1) / slots : 1;
+        return (operand + output) * waves * resident;
     }
 
     static Priced price(const GemmRecipe& r, const PlanQuery& q) {
@@ -548,6 +590,7 @@ private:
         p.resident = std::min(dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
         if (p.resident <= 0) return p;  // ring cannot be resident
         p.stages = r.stages;
+        p.cost = cost_of(r, q, p.resident);
         p.ok = true;
         return p;
     }

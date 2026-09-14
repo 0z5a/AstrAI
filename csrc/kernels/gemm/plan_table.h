@@ -509,7 +509,14 @@ inline bool gemm_table_off() {
 // [no builtin] -> model -> degraded. Another part gets its rows from a
 // sweep of its own, never from these.
 
-static constexpr std::array<TableRow, 28> kBuiltinPlanW16A16 = {{
+static constexpr std::array<TableRow, 29> kBuiltinPlanW16A16 = {{
+    // Prepended so its band wins first over the 128x128 kk32 row below,
+    // which is 3.0-3.2x off here: at n <= 256 that tile has 40 blocks over
+    // 170 SMs (a quarter-full machine), where this one fills 160. Measured
+    // in an interleaved A/B (2026-09-14, this box, n=256 x k {2048,4096} x
+    // m {1792..2560}); the band is the measured one, so n > 256 keeps the
+    // older row until a sweep of its own says otherwise.
+    {TileClass::kSmall64, 1536, 3072, 0, 256, 0, 0, 3, 0, 64},
     {TileClass::kTall64x128, 3072, 0, 5120, 8576, 0, 0, 2, 0, 32},
     {TileClass::kTall64x128, 0, 12, 8576, 19840, 0, 0, 3, 0, 32},
     {TileClass::kTall64x128, 12, 96, 8576, 19840, 0, 0, 2, 0, 32},
@@ -539,7 +546,12 @@ static constexpr std::array<TableRow, 28> kBuiltinPlanW16A16 = {{
     {TileClass::kNarrow128x64, 384, 768, 19840, 0, 0, 0, 2, 0, 64},
     {TileClass::kBig128, 768, 0, 19840, 0, 0, 0, 2, 0, 64},
 }};
-static constexpr std::array<TableRow, 22> kBuiltinPlanW8A16 = {{
+static constexpr std::array<TableRow, 23> kBuiltinPlanW8A16 = {{
+    // Same narrow-N pathology as the W16A16 row above it, same fix and same
+    // band: the 128x128 kk64 row below is 2.9-3.1x off at n=256, m 1792..2560
+    // (interleaved A/B, 2026-09-14, k=4096), where the small kk=64 cell is
+    // the winner. The band is the measured one; n > 256 is unmeasured here.
+    {TileClass::kSmall64, 1536, 3072, 0, 256, 1, 0, 3, 0, 64},
     {TileClass::kTall64x128, 0, 96, 8576, 19840, 1, 0, 3, 0, 32},
     {TileClass::kTall64x128, 0, 4, 19840, 0, 1, 0, 2, 0, 32},
     {TileClass::kTall64x128, 96, 192, 19840, 0, 1, 0, 3, 0, 32},
@@ -563,7 +575,11 @@ static constexpr std::array<TableRow, 22> kBuiltinPlanW8A16 = {{
     {TileClass::kNarrow128x64, 384, 768, 19840, 0, 1, 0, 2, 0, 32},
     {TileClass::kBig128, 768, 0, 19840, 0, 1, 0, 3, 0, 64},
 }};
-static constexpr std::array<TableRow, 28> kBuiltinPlanW8A8 = {{
+static constexpr std::array<TableRow, 29> kBuiltinPlanW8A8 = {{
+    // The narrow-N pathology of the W16A16/W8A16 rows above, same band and
+    // same winner: the 128x128 kk64 row below measured 1.56-1.74x off at n=256,
+    // m 1792..2560 (interleaved A/B, 2026-09-14, k=4096).
+    {TileClass::kSmall64, 1536, 3072, 0, 256, 2, 0, 3, 0, 64},
     {TileClass::kSmall64, 12, 768, 0, 1280, 2, 0, 3, 0, 64},
     {TileClass::kBig128, 1536, 3072, 0, 1280, 2, 0, 3, 0, 64},
     {TileClass::kWide128x256, 3072, 0, 0, 1280, 2, 0, 2, 0, 64},
@@ -593,7 +609,11 @@ static constexpr std::array<TableRow, 28> kBuiltinPlanW8A8 = {{
     {TileClass::kBig128, 192, 384, 19840, 0, 2, 0, 3, 0, 64},
     {TileClass::kWide128x256, 384, 0, 19840, 0, 2, 0, 2, 0, 64},
 }};
-static constexpr std::array<TableRow, 28> kBuiltinPlanF8A8 = {{
+static constexpr std::array<TableRow, 29> kBuiltinPlanF8A8 = {{
+    // The narrow-N pathology of the W16A16/W8A16 rows above, same band and
+    // same winner: the 128x128 kk64 row below measured 1.72-1.91x off at n=256,
+    // m 1792..2560 (interleaved A/B, 2026-09-14, k=4096).
+    {TileClass::kSmall64, 1536, 3072, 0, 256, 3, 0, 3, 0, 64},
     {TileClass::kSmall64, 12, 768, 0, 1280, 3, 0, 3, 0, 64},
     {TileClass::kBig128, 1536, 3072, 0, 1280, 3, 0, 3, 0, 64},
     {TileClass::kWide128x256, 3072, 0, 0, 1280, 3, 0, 2, 0, 64},
