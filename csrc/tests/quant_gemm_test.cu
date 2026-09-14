@@ -409,6 +409,11 @@ static bool test_dtype_combos() {
     using MixedSmall =
         GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3_Fast,
                    RowMajor, __nv_bfloat16>;
+    // The tall 64x128 CTA: plan rows route production shapes to it, so its
+    // ring and epilogue reclaim need a cell the correctness suite launches.
+    using MixedTall =
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_64x128x32_W32x32_S3_Fast,
+                   RowMajor, __nv_bfloat16>;
     using MixedTT =
         GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2,
                    RowMajor, __nv_bfloat16>;
@@ -441,6 +446,9 @@ static bool test_dtype_combos() {
         all &= check_pinned<__nv_bfloat16, int8_t, MixedSmall>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
             "w8a16 small 64x64", 0.02f, scale);
+        all &= check_pinned<__nv_bfloat16, int8_t, MixedTall>(
+            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
+            "w8a16 tall 64x128 kk32 s3", 0.02f, scale);
         if (k == 320) {
             // Crosswise/dual-row-major big CTA pinned (the planner routes
             // 256x256 crosswise to the small CTA).

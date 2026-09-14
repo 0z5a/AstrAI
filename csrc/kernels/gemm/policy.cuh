@@ -200,6 +200,14 @@ using Tile_64x64x32_W16x32_S2_Fast =
     GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 2, true>;
 using Tile_64x64x32_W16x32_S3_Fast =
     GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 3, true>;
+// The tall 64x128 CTA (N:M = 2:1): the tile sweep's champion at wide N and
+// at the parity square on the congruous ladder (up to 1.089x over the best
+// previously reachable recipe), so it joins the manifest rather than living
+// in the sweep grid only.
+using Tile_64x128x32_W32x32_S2_Fast =
+    GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 2, true>;
+using Tile_64x128x32_W32x32_S3_Fast =
+    GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 3, true>;
 using Tile_128x64x32_W32x32_S2_Fast =
     GemmTileConfig<Shape<128, 64, 32>, Shape<32, 32>, 2, true>;
 using Tile_128x128x32_W64x32_S2_Fast =
@@ -223,7 +231,8 @@ using Tile_128x256x64_W64x32_S2_Fast =
 
 // CTA class of a tile config, derived from its CTA geometry — one axis of
 // the dispatch key the launch ladders select on (GemmPlan in gemm.cuh).
-enum class TileClass { kSmall64, kNarrow128x64, kBig128, kWide128x256 };
+enum class TileClass { kSmall64, kNarrow128x64, kBig128, kWide128x256,
+                       kTall64x128 };
 
 template <typename Tile>
 constexpr TileClass tile_class() {
@@ -233,6 +242,8 @@ constexpr TileClass tile_class() {
         return TileClass::kBig128;
     else if constexpr (Tile::CtaShape::kM == 128 && Tile::CtaShape::kN == 64)
         return TileClass::kNarrow128x64;
+    else if constexpr (Tile::CtaShape::kM == 64 && Tile::CtaShape::kN == 128)
+        return TileClass::kTall64x128;
     else
         return TileClass::kSmall64;
 }
@@ -259,11 +270,13 @@ inline constexpr int kTileClassCta[][2] = {
     {128, 64},   // kNarrow128x64
     {128, 128},  // kBig128
     {128, 256},  // kWide128x256
+    {64, 128},   // kTall64x128
 };
 static_assert((int)TileClass::kSmall64 == 0 &&
                   (int)TileClass::kNarrow128x64 == 1 &&
                   (int)TileClass::kBig128 == 2 &&
-                  (int)TileClass::kWide128x256 == 3,
+                  (int)TileClass::kWide128x256 == 3 &&
+                  (int)TileClass::kTall64x128 == 4,
               "kTileClassCta is indexed by TileClass: keep the enum in table order");
 
 // One row per class is kTileClassCta's contract (cta_matches_class pins it to
@@ -284,7 +297,8 @@ constexpr bool cta_matches_class() {
 static_assert(cta_matches_class<Tile_64x64x64_W16x32_S2_Fast>() &&
                   cta_matches_class<Tile_128x64x64_W32x32_S2_Fast>() &&
                   cta_matches_class<Tile_128x128x64_W64x32_S2_Fast>() &&
-                  cta_matches_class<Tile_128x256x64_W64x32_S2_Fast>(),
+                  cta_matches_class<Tile_128x256x64_W64x32_S2_Fast>() &&
+                  cta_matches_class<Tile_64x128x32_W32x32_S2_Fast>(),
               "kTileClassCta must mirror the tiles' CTA shapes");
 
 // Tuple concatenation, so a manifest reads as "the shared ladder plus my own
@@ -327,7 +341,8 @@ using TileManifest = tuple_cat_t<
     TileManifestCross,
     std::tuple<Tile_64x64x32_W16x32_S2_Fast, Tile_64x64x32_W16x32_S3_Fast,
                Tile_128x64x32_W32x32_S2_Fast, Tile_128x128x32_W32x32_S2_Fast,
-               Tile_128x128x32_W64x32_S3_Fast>>;
+               Tile_128x128x32_W64x32_S3_Fast, Tile_64x128x32_W32x32_S2_Fast,
+               Tile_64x128x32_W32x32_S3_Fast>>;
 
 // The 1-byte ladder: the shared six plus the wide CTA, every one of them at
 // kK 64. No kK=32 tile pays on a 1-byte pair — a line then holds half as

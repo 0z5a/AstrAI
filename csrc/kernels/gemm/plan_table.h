@@ -509,7 +509,11 @@ inline bool gemm_table_off() {
 // [no builtin] -> model -> degraded. Another part gets its rows from a
 // sweep of its own, never from these.
 
-static constexpr std::array<TableRow, 24> kBuiltinPlanW16A16 = {{
+static constexpr std::array<TableRow, 28> kBuiltinPlanW16A16 = {{
+    {TileClass::kTall64x128, 3072, 0, 5120, 8576, 0, 0, 2, 0, 32},
+    {TileClass::kTall64x128, 0, 12, 8576, 19840, 0, 0, 3, 0, 32},
+    {TileClass::kTall64x128, 12, 96, 8576, 19840, 0, 0, 2, 0, 32},
+    {TileClass::kTall64x128, 0, 4, 19840, 0, 0, 0, 3, 0, 32},
     {TileClass::kSmall64, 0, 768, 0, 1280, 0, 0, 3, 0, 64},
     {TileClass::kNarrow128x64, 768, 1536, 0, 1280, 0, 0, 3, 0, 64},
     {TileClass::kBig128, 1536, 3072, 0, 1280, 0, 0, 3, 0, 32},
@@ -535,7 +539,10 @@ static constexpr std::array<TableRow, 24> kBuiltinPlanW16A16 = {{
     {TileClass::kNarrow128x64, 384, 768, 19840, 0, 0, 0, 2, 0, 64},
     {TileClass::kBig128, 768, 0, 19840, 0, 0, 0, 2, 0, 64},
 }};
-static constexpr std::array<TableRow, 19> kBuiltinPlanW8A16 = {{
+static constexpr std::array<TableRow, 22> kBuiltinPlanW8A16 = {{
+    {TileClass::kTall64x128, 0, 96, 8576, 19840, 1, 0, 3, 0, 32},
+    {TileClass::kTall64x128, 0, 4, 19840, 0, 1, 0, 2, 0, 32},
+    {TileClass::kTall64x128, 96, 192, 19840, 0, 1, 0, 3, 0, 32},
     {TileClass::kNarrow128x64, 768, 1536, 0, 1280, 1, 0, 3, 0, 64},
     {TileClass::kBig128, 1536, 0, 0, 1280, 1, 0, 3, 0, 64},
     {TileClass::kNarrow128x64, 384, 768, 1280, 2816, 1, 0, 3, 0, 64},

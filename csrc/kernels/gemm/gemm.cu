@@ -325,8 +325,9 @@ std::vector<std::vector<int>> tile_vocabulary() {
 // here so the sweep's C++ emitter needs no Python-side copy of the names.
 std::vector<const char*> tile_class_names() {
     static constexpr const char* kNames[] = {
-        "kSmall64", "kNarrow128x64", "kBig128", "kWide128x256"};
-    static_assert((int)TileClass::kWide128x256 ==
+        "kSmall64", "kNarrow128x64", "kBig128", "kWide128x256",
+        "kTall64x128"};
+    static_assert((int)TileClass::kTall64x128 ==
                       (int)(sizeof(kNames) / sizeof(kNames[0])) - 1,
                   "kNames is indexed by TileClass: keep it in enum order");
     return std::vector<const char*>(kNames, kNames + sizeof(kNames) / sizeof(kNames[0]));

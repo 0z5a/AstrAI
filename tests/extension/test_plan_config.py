@@ -168,7 +168,7 @@ class TestProbe:
                 (0, 1, 1),
                 (1, 1, 1),
             )
-            assert cta in (0, 1, 2, 3)
+            assert cta in (0, 1, 2, 3, 4)
             assert stages in (2, 3)
             assert kk in (32, 64)
             assert bm in (64, 128) and bn in (64, 128, 256)
