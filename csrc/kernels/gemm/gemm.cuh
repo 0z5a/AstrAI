@@ -708,18 +708,21 @@ constexpr bool reclaim_fits() {
 // instances the fragment readers consume, so the map cannot drift from
 // the staging.
 template <typename Policy>
-bool tma_maps_for(const GemmParams& p, const CUtensorMap** ma,
-                  const CUtensorMap** mb) {
+bool tma_maps_for(const GemmParams& p, CUtensorMap* ma, CUtensorMap* mb) {
     using Mainloop = GemmCollectiveMainloop<Policy>;
-    *ma = astrai::tma_map_cache().lookup(
+    const auto a = astrai::tma_map_cache().lookup(
         astrai::tma_spec<typename Mainloop::ElemA, typename Mainloop::SmemLayoutA,
                         Mainloop::kBlockM>(p.a_ptr, p.m, p.k, p.a_ld, p.batch,
                                            p.a_batch_stride));
-    *mb = astrai::tma_map_cache().lookup(
+    if (!a) return false;
+    *ma = *a;
+    const auto b = astrai::tma_map_cache().lookup(
         astrai::tma_spec<typename Mainloop::ElemB, typename Mainloop::SmemLayoutB,
                         Mainloop::kBlockN>(p.b_ptr, p.n, p.k, p.b_ld, p.batch,
                                            p.b_batch_stride));
-    return *ma != nullptr && *mb != nullptr;
+    if (!b) return false;
+    *mb = *b;
+    return true;
 }
 
 // TMA launch for one Policy; false (nothing launched) when an operand
@@ -732,7 +735,7 @@ bool launch_policy_tma(const GemmParams& p, cudaStream_t stream) {
     // adds the alignment pad + barriers and can tip past the opt-in
     // ceiling on the fattest pair — fall back rather than fail.
     if (Policy::kSmemBytes > astrai::device_facts().smem_max) return false;
-    const CUtensorMap *ma = nullptr, *mb = nullptr;
+    CUtensorMap ma{}, mb{};
     if (!tma_maps_for<Policy>(p, &ma, &mb)) return false;
     dim3 grid = gemm_grid<Traits>(p);
     log_gemm_plan(p, grid, Traits::kBlockM, Traits::kBlockN, Traits::kStages,
@@ -744,7 +747,7 @@ bool launch_policy_tma(const GemmParams& p, cudaStream_t stream) {
         launch_with_smem<gemm_kernel_tma<Policy, decltype(rank3a)::value,
                                          decltype(rank3b)::value>>(
             Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads), stream, p,
-            *ma, *mb);
+            ma, mb);
     };
     if (p.batch > 1 && p.a_batch_stride > 0 && p.b_batch_stride > 0)
         launch_rank(std::true_type{}, std::true_type{});

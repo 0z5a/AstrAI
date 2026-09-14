@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <dlfcn.h>
 #include <mutex>
+#include <optional>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -219,18 +220,32 @@ inline bool tma_encode(const TmaMapSpec& s, CUtensorMap* map) {
 // Exact-match descriptor cache: steady-state calls (same tensors, same
 // tile) hit; a rotating buffer (dynamic M) cycles the small ring. The
 // CUtensorMap is a POD the launcher copies into the kernel parameter.
+//
+// The descriptor is returned BY VALUE, and that is load-bearing. A miss
+// overwrites the ring's oldest slot, and a hit can hand back the very slot
+// the next miss is about to reuse — so a pointer into the ring is only
+// valid until the following lookup, not for the caller's lifetime. The
+// operand pair is exactly two lookups: holding A's pointer across B's let
+// B's eviction rewrite A in place, and both operands then went out as the
+// same map. That is not a wrong answer a cheap test catches — the A tile's
+// TMA transfers B's box, the byte count stops matching the pipeline's
+// expected transaction, and the mbarrier never completes (measured
+// 2026-09-14: hard hang on w8a8 m=1 n=6144 k=1536 with the 128x64x64 s2
+// tile, reproducible on devices 0-3, absent under compute-sanitizer
+// because its allocator shifts the operand addresses and rotates the ring
+// differently).
 class TmaMapCache {
   public:
-    const CUtensorMap* lookup(const TmaMapSpec& s) {
+    std::optional<CUtensorMap> lookup(const TmaMapSpec& s) {
         const std::lock_guard<std::mutex> lock(mu_);
         for (Entry& e : entries_)
-            if (e.used && matches(e, s)) return &e.map;
+            if (e.used && matches(e, s)) return e.map;
         Entry& e = entries_[next_];
-        if (!tma_encode(s, &e.map)) return nullptr;
+        if (!tma_encode(s, &e.map)) return std::nullopt;
         e.used = true;
         e.spec = s;
         next_ = (next_ + 1) % kCap;
-        return &e.map;
+        return e.map;
     }
 
   private:
