@@ -74,14 +74,21 @@ def geometry(name: str) -> dict:
     # mis-price every small 2-byte candidate (that mistake cost the first
     # bytes-rule prototype its class-1 capture).
     threads = (bm // wm) * (bn // wn) * 32
-    return {"bm": bm, "bn": bn, "kk": kk, "stages": stages, "threads": threads,
-            "wm": wm, "wn": wn}
+    return {
+        "bm": bm,
+        "bn": bn,
+        "kk": kk,
+        "stages": stages,
+        "threads": threads,
+        "wm": wm,
+        "wn": wn,
+    }
 
 
 def priced(name: str, m: int, n: int, k: int, ba: int, bb: int, dev: dict) -> dict:
     g = geometry(name)
     # widening: 2-byte operand, small CTA, kk=64 (policy.cuh warp_widened_t)
-    widened = (ba + bb >= 3 and g["bm"] == 64 and g["bn"] == 64 and g["kk"] == 64)
+    widened = ba + bb >= 3 and g["bm"] == 64 and g["bn"] == 64 and g["kk"] == 64
     threads = 512 if widened else g["threads"]
     ring = (g["stages"] + 1) * g["kk"] * (g["bm"] * ba + g["bn"] * bb)
     # policy.cuh: min_ctas_for_ring is bytes <= 48KB ? 2 : 1 — residency is
@@ -96,11 +103,20 @@ def priced(name: str, m: int, n: int, k: int, ba: int, bb: int, dev: dict) -> di
     # binding never makes. The rule loop skips ok=false.
     ok = resident > 0 and ring <= dev["smem_max"]
     blocks = ((m + g["bm"] - 1) // g["bm"]) * ((n + g["bn"] - 1) // g["bn"])
-    waves = max(1, (blocks + dev["sms"] * max(resident, 1) - 1) // (dev["sms"] * max(resident, 1)))
+    waves = max(
+        1,
+        (blocks + dev["sms"] * max(resident, 1) - 1) // (dev["sms"] * max(resident, 1)),
+    )
     wave_eff = blocks / (waves * dev["sms"] * max(resident, 1))
     return {
-        **g, "ring": ring, "resident": resident, "blocks": blocks, "ok": ok,
-        "waves": waves, "wave_eff": wave_eff, "widened": widened,
+        **g,
+        "ring": ring,
+        "resident": resident,
+        "blocks": blocks,
+        "ok": ok,
+        "waves": waves,
+        "wave_eff": wave_eff,
+        "widened": widened,
         "threads": threads,
         # the dispatch key's first column, for orderings that prefer a class
         "cta": tpt.tile_facts(name)[0],
@@ -116,6 +132,7 @@ def rules() -> dict:
     """Candidate orderings: (name, key fn) — larger key wins. Each key fn
     takes (features, problem) so a rule may consult the shape, like the
     model's own byte-pair floor does."""
+
     def shipped(p, q):
         # gemm.cuh ModelPlanner, mirrored term for term: cost_of() is
         # (operand bytes + output bytes) * waves * resident — DeepGEMM's
@@ -132,8 +149,10 @@ def rules() -> dict:
         # the pre-floor ranking, to size the floor rule's contribution
         "resource": lambda p, q: (p["resident"], p["stages"]),
         # fattest tile that still fills, fill-first when nothing fills
-        "fat_fill": lambda p, q: (p["fat"] if p["wave_eff"] >= 0.5 else 0.0,
-                               p["wave_eff"]),
+        "fat_fill": lambda p, q: (
+            p["fat"] if p["wave_eff"] >= 0.5 else 0.0,
+            p["wave_eff"],
+        ),
         # fill-weighted harmonic tile size: bigger tiles amortise traffic,
         # fill decides how much of the tile's work overlaps
         "fill_harm": lambda p, q: p["wave_eff"] * p["fat"] / max(1, p["bm"] + p["bn"]),
@@ -150,11 +169,16 @@ def rules() -> dict:
 @click.command()
 @click.argument("results_json", type=click.Path(exists=True, path_type=Path))
 @click.option("--rule", default=None, help="Only this rule (default: all).")
-@click.option("--class-filter", default=None, type=int,
-              help="Only this GemmPerfClass id.")
-@click.option("--check", is_flag=True, default=False,
-              help="Fidelity: compare each rule's pick with ops.gemm.probe on "
-                   "the measured points (the model rule must match 100%).")
+@click.option(
+    "--class-filter", default=None, type=int, help="Only this GemmPerfClass id."
+)
+@click.option(
+    "--check",
+    is_flag=True,
+    default=False,
+    help="Fidelity: compare each rule's pick with ops.gemm.probe on "
+    "the measured points (the model rule must match 100%).",
+)
 def main(results_json, rule, class_filter, check):
     dev = device_facts()
     by_point: dict[tuple, dict[str, float]] = defaultdict(dict)
@@ -206,7 +230,7 @@ def main(results_json, rule, class_filter, check):
         ops.gemm.inject_rows("")
         ops.gemm.set_planner("model")
         seen: set[tuple] = set()
-        for (combo, n, k, m) in sorted(by_point):
+        for combo, n, k, m in sorted(by_point):
             perf_class = tpt.PERF_CLASS[combo]
             if class_filter is not None and perf_class != class_filter:
                 continue
@@ -239,12 +263,17 @@ def main(results_json, rule, class_filter, check):
                 got = tpt.RECIPES[pick]
                 if got != real and len(check_seen[name]) < 5:
                     check_seen[name].append(
-                        f"combo={combo} m{m} n{n} k{k}: harness {got} vs binding {real}")
+                        f"combo={combo} m{m} n{n} k{k}: harness {got} vs binding {real}"
+                    )
         ops.gemm.set_planner("")
         click.echo("fidelity vs the binding (mismatches, first 5 per rule):")
         for name in names + ["model(measured)"]:
             bad = check_seen.get(name, [])
-            status = "n/a" if name == "model(measured)" else ("MATCH" if not bad else f"{len(bad)}+")
+            status = (
+                "n/a"
+                if name == "model(measured)"
+                else ("MATCH" if not bad else f"{len(bad)}+")
+            )
             click.echo(f"  {name:16s} {status}")
             for line in bad:
                 click.echo(f"      {line}")
@@ -263,8 +292,12 @@ def main(results_json, rule, class_filter, check):
             gm = math.exp(sum(math.log(max(v, 1e-3)) for v in vals) / len(vals))
             cells.append(f"{gm:8.3f}")
         click.echo(name.ljust(16) + "".join(cells))
-    click.echo("\npoints per class: " + ", ".join(
-        f"class{c}={len(captures[('model(measured)', c)])}" for c in classes))
+    click.echo(
+        "\npoints per class: "
+        + ", ".join(
+            f"class{c}={len(captures[('model(measured)', c)])}" for c in classes
+        )
+    )
 
 
 if __name__ == "__main__":

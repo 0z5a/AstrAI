@@ -94,8 +94,7 @@ POLICY_CUH = Path(__file__).resolve().parents[1] / "kernels" / "gemm" / "policy.
 _TILE_RE = re.compile(r"(Tile_\d+x\d+x\d+_W\d+x\d+_S\d+(?:_Fast)?)")
 _FACTS_RE = re.compile(r"Tile_(\d+)x(\d+)x(\d+)_W(\d+)x(\d+)_S(\d+)(_Fast)?")
 # TileClass ordinals, policy.cuh enum order (what a row's cta column means).
-_CLASS_OF = {(64, 64): 0, (128, 64): 1, (128, 128): 2, (128, 256): 3,
-             (64, 128): 4}
+_CLASS_OF = {(64, 64): 0, (128, 64): 1, (128, 128): 2, (128, 256): 3, (64, 128): 4}
 # The shared ladder every staging path carries: six geometries, one per class
 # and ring depth. If the parse below cannot see these, it is broken.
 _SHARED = (
@@ -967,10 +966,14 @@ def validate(
 @click.option("--warmup", type=click.IntRange(min=1), default=3, show_default=True)
 @click.option("--iterations", type=click.IntRange(min=1), default=30, show_default=True)
 @click.option("--trials", type=click.IntRange(min=1), default=3, show_default=True)
-@click.option("--mode", type=click.Choice(("table", "hybrid")), default="table",
-              show_default=True,
-              help="table pins table-only dispatch; hybrid keeps the shipped "
-                   "chain (rows -> model) — required for diff row tables.")
+@click.option(
+    "--mode",
+    type=click.Choice(("table", "hybrid")),
+    default="table",
+    show_default=True,
+    help="table pins table-only dispatch; hybrid keeps the shipped "
+    "chain (rows -> model) — required for diff row tables.",
+)
 @click.option(
     "--output",
     type=click.Path(path_type=Path, dir_okay=False),
@@ -997,7 +1000,13 @@ def validate_command(
 
     baseline = list(table_map)[0]
     records = validate(
-        table_map, shapes, combos, batch, warmup, iterations, trials,
+        table_map,
+        shapes,
+        combos,
+        batch,
+        warmup,
+        iterations,
+        trials,
         hybrid=(mode == "hybrid"),
     )
 

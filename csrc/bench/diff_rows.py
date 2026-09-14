@@ -62,19 +62,40 @@ def scale_for(dtype: torch.dtype, device: torch.device) -> torch.Tensor | None:
 @click.command()
 @click.option("--sweep-json", required=True, type=click.Path(path_type=Path))
 @click.option("--output", required=True, type=click.Path(path_type=Path))
-@click.option("--emit", type=click.Choice(("rows", "cpp")), default="rows",
-              help="cpp emits std::array initializers for the GENERATED block.")
+@click.option(
+    "--emit",
+    type=click.Choice(("rows", "cpp")),
+    default="rows",
+    help="cpp emits std::array initializers for the GENERATED block.",
+)
 @click.option("--shapes", "shape_values", multiple=True, required=True, help="NAME:N:K")
-@click.option("--m-values", default="1,8,16,32,64,128,256,512,1024,2048,4096",
-              callback=lambda _c, _p, v: tpt.parse_positive_ints(v))
+@click.option(
+    "--m-values",
+    default="1,8,16,32,64,128,256,512,1024,2048,4096",
+    callback=lambda _c, _p, v: tpt.parse_positive_ints(v),
+)
 @click.option("--combos", default=",".join(tpt.COMBOS))
-@click.option("--min-gain", type=click.FloatRange(min=0.0), default=2.0,
-              help="Relative gain (%) the winner must show over the model.")
+@click.option(
+    "--min-gain",
+    type=click.FloatRange(min=0.0),
+    default=2.0,
+    help="Relative gain (%) the winner must show over the model.",
+)
 @click.option("--warmup", type=click.IntRange(min=1), default=4)
 @click.option("--iterations", type=click.IntRange(min=1), default=20)
 @click.option("--trials", type=click.IntRange(min=1), default=4)
-def main(sweep_json, output, emit, shape_values, m_values, combos, min_gain,
-         warmup, iterations, trials):
+def main(
+    sweep_json,
+    output,
+    emit,
+    shape_values,
+    m_values,
+    combos,
+    min_gain,
+    warmup,
+    iterations,
+    trials,
+):
     winners: dict[tuple[str, int, int, int], tuple[str, float]] = {}
     for point in json.loads(sweep_json.read_text()):
         if point["recipe"] == "model":
@@ -118,25 +139,44 @@ def main(sweep_json, output, emit, shape_values, m_values, combos, min_gain,
                         for _ in range(iterations):
                             run()
                         torch.cuda.synchronize()
-                        best[arm] = min(best[arm], (time.perf_counter() - start) / iterations)
+                        best[arm] = min(
+                            best[arm], (time.perf_counter() - start) / iterations
+                        )
                 flops = 2.0 * m * n * k
                 ba, bb = tpt.BYTES[combo]
                 floor = ba == 1 and bb == 1 and m <= FLOOR_MMAX
                 model_tf = flops / best["model"]
                 winner_tf = model_tf if floor else flops / best[recipe]
-                for arm, tflops, planned in ((recipe, winner_tf, "override"),
-                                             ("model", model_tf, "model")):
-                    results.append({
-                        "combo": combo, "perf_class": tpt.PERF_CLASS[combo], "m": m,
-                        "n": n, "k": k, "batch": 1, "recipe": arm,
-                        "planned": planned, "ms": best["model"] if arm == "model" else best[recipe],
-                        "tflops": tflops,
-                    })
+                for arm, tflops, planned in (
+                    (recipe, winner_tf, "override"),
+                    ("model", model_tf, "model"),
+                ):
+                    results.append(
+                        {
+                            "combo": combo,
+                            "perf_class": tpt.PERF_CLASS[combo],
+                            "m": m,
+                            "n": n,
+                            "k": k,
+                            "batch": 1,
+                            "recipe": arm,
+                            "planned": planned,
+                            "ms": best["model"] if arm == "model" else best[recipe],
+                            "tflops": tflops,
+                        }
+                    )
                 gain = best["model"] / best[recipe]
-                flag = " floor" if floor else (" KEEP" if gain >= 1 + min_gain / 100 else "")
-                print(f"{combo:13s} {_name:10s} m{m:5d} {recipe[5:-5]:26s} "
-                      f"model {model_tf:7.1f} winner {flops / best[recipe]:7.1f} "
-                      f"x{gain:.3f}{flag}", flush=True)
+                flag = (
+                    " floor"
+                    if floor
+                    else (" KEEP" if gain >= 1 + min_gain / 100 else "")
+                )
+                print(
+                    f"{combo:13s} {_name:10s} m{m:5d} {recipe[5:-5]:26s} "
+                    f"model {model_tf:7.1f} winner {flops / best[recipe]:7.1f} "
+                    f"x{gain:.3f}{flag}",
+                    flush=True,
+                )
     ops.gemm.set_table("")
 
     rows = tpt.build_rows(results, min_gain=min_gain / 100.0, full_coverage=False)
