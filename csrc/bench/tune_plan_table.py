@@ -1,53 +1,22 @@
-"""Generate AOT plan-table rows from measured shape sweeps.
+"""Plan-table tuning pipeline: sweep candidates, validate holdouts, install.
 
-The candidate recipes are not a list in this file: they are read out of
-csrc/kernels/gemm/policy.cuh — the tile aliases and the three launch ladders
-that dispatch_tile resolves a row against. A hand-written candidate list
-drifts both ways: it keeps recipes the ladders dropped (so the sweep measures
-the degraded fallback and files it under that recipe's name) and it omits
-tiles they carry (so a tile that wins on the shapes at hand is never
-measured — how the wide CTA and the two kK=32 s3 tiles went missing). The
-vocabulary here is whatever the ladders say, each recipe named by its tile's
-own structural token, with the entries no row can reach reported rather than
-quietly ignored.
+One CLI, three stages (each subcommand is what one of the old standalone
+scripts did):
 
-Every dtype combo is swept at each (M, N, K, batch) grid point under every
-candidate its ladder carries; the measured winner per point becomes a
-dispatch-table row (csrc/kernels/gemm/plan_table.h). Rows are keyed (M, N)
-bands per dtype class and carry the winning recipe's CTA class, ring depth and
-k-tile depth, so a conflict across K or batch at one (M, N) resolves to the
-recipe with the best tflops.
+    sweep     measure every candidate recipe per shape and emit a row file
+    validate  interleaved holdout comparison of candidate tables
+    run       sweep -> validate -> install into the autotuner cache (the
+              default flow; ``--skip-validate`` sweeps and installs only)
 
-The candidates are measured back-to-back at each shape in a single process
-(shape outer loop, recipe inner loop): each candidate runs as a one-row
-ASTR_GEMM_TABLE file toggled per launch (the row source re-reads its env per
-call, so the comparison happens under the same GPU clock/thermal state). A
-sweep that measured whole recipe batches in separate processes compared the
-big CTA (measured first) against the small CTA (measured 30 minutes later)
-under different boost states and picked systematically wrong winners.
+Stages run as separate processes (``run`` re-invokes this file), so each
+stage gets its own GPU clock/thermal state — the isolation the three
+standalone scripts had.
 
-A candidate whose row the planner demotes (ring, operand width or depth gate)
-is served by the degraded bands instead, so a sweep that recorded tflops alone
-would report the fallback's number under that recipe's name — how the big CTA's
-s3 ring and the wide CTA once came to look measured. Every candidate is probed
-first, with the plan log on for a single launch, and a candidate that does not
-land on its own row is dropped before any measurement is attributed to it.
-
-Usage (rows to a runtime-override file, no rebuild):
-    python csrc/bench/gen_plan_table.py \
-        --m-values 512,2048,4096 \
-        --shapes "qkv:4096:4096,up_gate:14336:4096" \
-        --batch 1 --combos w16a16 --output plan_table.txt
-
---list-recipes prints the vocabulary this process would sweep (and the tiles no
-row can reach); --recipes narrows it. --save-results dumps the raw measurements
-to JSON so the bands can be re-cut offline with --results-json instead of
-re-measuring.
-
-This script only measures and emits the row file: use it with
-ASTR_GEMM_TABLE=plan_table.txt to serve the rows without a rebuild, or paste
-them into the compiled-in GENERATED block of plan_table.h by hand (pasting
-maps the cta column onto TileClass; the rest is literal).
+Row tables are served at runtime through ``ops.gemm.set_table`` (no
+rebuild, no environment variable); an emitted row file can also be pasted
+into csrc/kernels/gemm/plan_table.h's GENERATED block, which does require a
+rebuild. The special ``model`` candidate measures every row tier off (the
+degraded rows) — the reference of the min-gain mode.
 """
 
 from __future__ import annotations
@@ -56,15 +25,25 @@ import itertools
 import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import time
+from datetime import date
 from pathlib import Path
 
 import click
 import torch
 
-from astrai.extension import is_available
-from astrai.extension.ops.gemm import quant_gemm
+from astrai.extension import is_available, ops
+from astrai.extension.ops.gemm import device_signature, quant_gemm
+
+
+@click.group(help=__doc__)
+def cli() -> None:
+    """Plan-table tuning pipeline."""
+
+
 
 # Combo name -> (activation dtype, weight dtype). Scales: int8 operands
 # require their dequant scale, fp8 accept one optionally (a [1] per-tensor
@@ -273,12 +252,14 @@ def candidate_recipes(combo: str) -> tuple[str, ...]:
     ) + ("model",)
 
 
-_TAG_RE = re.compile(r"\[gemm-plan\] (table|degraded|forced recipe)\b")
+_TAG_RE = re.compile(
+    r"\[gemm-plan\] (override|injected|builtin|model|degraded)\b"
+)
 
 
 def _last_tag(text: str) -> str:
-    """The decision tag of the launch that just happened (gemm.cuh logs one
-    decision line per plan_gemm call, then the launch line)."""
+    """The decision source of the launch that just happened (the planner
+    logs one decision line per dispatch, then the launch line)."""
     tags = _TAG_RE.findall(text)
     if not tags:
         return "?"
@@ -286,19 +267,19 @@ def _last_tag(text: str) -> str:
 
 
 def _planned_tag(run) -> str:
-    """The decision tag of one launch, with the plan log on for that launch
-    only: gemm.cuh re-reads ASTR_GEMM_PLAN per call, so the log can be toggled
-    around it and its fprintf stays out of the timed loop. The tag is read from
-    fd 2 — the log is C-level fprintf, not Python's stderr."""
+    """The decision source of one launch, with the plan log on for that
+    launch only (ops.gemm.set_log toggles the C-side flag around it, so its
+    fprintf stays out of the timed loop). The tag is read from fd 2 — the
+    log is C-level fprintf, not Python's stderr."""
     log = tempfile.TemporaryFile()
     saved = os.dup(2)
-    os.environ["ASTR_GEMM_PLAN"] = "1"
+    ops.gemm.set_log(True)
     os.dup2(log.fileno(), 2)
     try:
         run()
         torch.cuda.synchronize()
     finally:
-        os.environ.pop("ASTR_GEMM_PLAN", None)
+        ops.gemm.set_log(False)
         os.dup2(saved, 2)
         os.close(saved)
     # fd 2 shares this file's offset, so the write above left it at the end.
@@ -323,18 +304,15 @@ def _check_recipe(perf_class: int, recipe: str) -> None:
         )
 
 
-def _candidate_row_files() -> dict[str, str]:
-    """One synthetic open row per candidate — the recipe's (cta, stages, kK)
-    on -1/-1 keys, so the row is the only plan source and plan_from_row gates
-    it on the ring and the operand widths, exactly like an emitted row."""
-    directory = tempfile.mkdtemp(prefix="gemm_recipe_rows_")
-    files: dict[str, str] = {}
-    for recipe, (cta, stages, kk) in RECIPES.items():
-        path = os.path.join(directory, f"row_{recipe}.txt")
-        with open(path, "w") as f:
-            f.write(f"0 0 0 0 -1 -1 {cta} {stages} 0 {kk}\n")
-        files[recipe] = path
-    return files
+def _candidate_rows() -> dict[str, str]:
+    """One synthetic open row per candidate, as inline row text — the
+    recipe's (cta, stages, kK) on -1/-1 keys, so the row is the only plan
+    source and the planner gates it on the ring and the operand widths,
+    exactly like an emitted row."""
+    return {
+        recipe: f"0 0 0 0 -1 -1 {cta} {stages} 0 {kk}"
+        for recipe, (cta, stages, kk) in RECIPES.items()
+    }
 
 
 def parse_positive_ints(value: str) -> tuple[int, ...]:
@@ -395,13 +373,12 @@ def sweep(
             "the extension with CSRC_KERNELS=true first)"
         )
 
-    # Candidates are one-row table files toggled per launch: the row
-    # source re-reads that env per call, so all candidates at a shape
-    # share its GPU clock/thermal state. The "model" candidate measures
-    # the degraded band rows (the cost model is deleted from the C++):
-    # it is the "this band has no table row" reference of the min-gain
-    # mode, not a planner.
-    row_files = _candidate_row_files()
+    # Candidates are one-row tables toggled per launch through the plan API
+    # (ops.gemm.set_table), so all candidates at a shape share its GPU
+    # clock/thermal state. The "model" candidate measures the degraded
+    # rows: it is the "this band has no table row" reference of the
+    # min-gain mode, not a planner.
+    candidate_rows = _candidate_rows()
     tags: dict[tuple[str, str], str] = {}
 
     device = torch.device(torch.cuda.current_device())
@@ -424,13 +401,14 @@ def sweep(
                     if wanted and recipe not in wanted:
                         continue
                     if recipe == "model":
-                        # "-" = AOT off: skip both override and builtin rows
-                        # — the degraded-bands reference (the cost model is
-                        # deleted from the C++).
-                        os.environ["ASTR_GEMM_TABLE"] = "-"
+                        # "-" = every row tier off: the degraded-bands
+                        # reference of the min-gain mode.
+                        ops.gemm.set_table("-")
                     else:
-                        os.environ["ASTR_GEMM_TABLE"] = row_files[recipe]
-                    expected = "degraded (no table)" if recipe == "model" else "table"
+                        ops.gemm.set_table(candidate_rows[recipe])
+                    expected = (
+                        "degraded (no table)" if recipe == "model" else "override"
+                    )
                     if (combo, recipe) not in tags:
                         tags[(combo, recipe)] = _planned_tag(run)
                     if tags[(combo, recipe)] != expected:
@@ -469,7 +447,7 @@ def sweep(
                         f"TFLOPS",
                         flush=True,
                     )
-    os.environ.pop("ASTR_GEMM_TABLE", None)
+    ops.gemm.set_table("")
     return results
 
 
@@ -496,7 +474,9 @@ def build_rows(
     m_values: set[int] = set()
     n_values: set[int] = set()
     for point in results:
-        expected = "degraded (no table)" if point["recipe"] == "model" else "table"
+        expected = (
+            "degraded (no table)" if point["recipe"] == "model" else "override"
+        )
         if "planned" in point and point["planned"] != expected:
             continue  # demoted candidate: those numbers are the fallback's
         _check_recipe(point["perf_class"], point["recipe"])
@@ -602,7 +582,7 @@ def _winner(
     return winner
 
 
-@click.command()
+@cli.command("sweep")
 @click.option(
     "--m-values",
     default="512,2048,4096",
@@ -641,7 +621,7 @@ def _winner(
     "--output",
     required=True,
     type=click.Path(path_type=Path, dir_okay=False),
-    help="Plan-table row file (ASTR_GEMM_TABLE=/path/to/this).",
+    help="Plan-table row file (plan.set_table(path) serves it).",
 )
 @click.option("--warmup", type=click.IntRange(min=1), default=10, show_default=True)
 @click.option("--iterations", type=click.IntRange(min=1), default=50, show_default=True)
@@ -719,7 +699,7 @@ def plan_table_command(
                 click.echo(f"  {tile:44s} cta{cta} s{stages} k{kk}")
         for line in reachability_report():
             click.echo(f"  unreachable - {line}")
-        click.echo("  model  ASTR_GEMM_TABLE=- (degraded bands), the reference")
+        click.echo("  model  degraded bands (every row tier off), the reference")
         return
     wanted = tuple(
         part.strip() for part in (recipe_filter or "").split(",") if part.strip()
@@ -785,14 +765,460 @@ def plan_table_command(
         "row carries\n"
         "# crosswise 0: TT/TN shapes miss this table and take the degraded "
         "bands in C++.\n"
-        "# Generated by csrc/bench/gen_plan_table.py; tune the grid then "
+        "# Generated by csrc/bench/tune_plan_table.py sweep; tune the grid then "
         "re-run.\n"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(header + "\n".join(rows) + ("\n" if rows else ""))
     click.echo(f"wrote {len(rows)} rows to {output}")
-    click.echo(f"use: ASTR_GEMM_TABLE={output}")
+    click.echo(f"use: plan.set_table({output!r})")
+
+
+
+
+def parse_holdout_shape(value: str) -> tuple[str, int, int, int]:
+    name, m, n, k = value.split(":")
+    return name, int(m), int(n), int(k)
+
+
+def apply_table(name: str, path: str | None) -> None:
+    # "model" runs the analytical planner alone; "none" turns every row
+    # tier off (the degraded reference) — the aliases keep old
+    # invocations working.
+    if name == "model":
+        ops.gemm.set_table("")
+        ops.gemm.set_planner("model")
+        return
+    ops.gemm.set_planner("table")
+    if name == "none":
+        # Every row tier off: the degraded-bands reference.
+        ops.gemm.set_table("-")
+    else:
+        ops.gemm.set_table(path or "")
+
+
+def validate(
+    tables: dict[str, str | None],
+    shapes: list[tuple[str, int, int, int]],
+    combos: tuple[str, ...],
+    batch: int,
+    warmup: int,
+    iterations: int,
+    trials: int,
+) -> dict[tuple[str, str], dict[str, float]]:
+    """(combo, shape name) -> {table: best ms}, tables round-robin interleaved."""
+    if not torch.cuda.is_available():
+        raise click.ClickException("CUDA is required")
+    if not is_available("gemm"):
+        raise click.ClickException(
+            "the built gemm kernel is required (rebuild "
+            "the extension with CSRC_KERNELS=true first)"
+        )
+
+    device = torch.device(torch.cuda.current_device())
+    torch.manual_seed(0)
+    names = list(tables)
+    records: dict[tuple[str, str], dict[str, float]] = {}
+    for shape_idx, (name, m, n, k) in enumerate(shapes):
+        # Alternate the table order per shape so a slow GPU clock drift
+        # does not favor whichever table runs first throughout.
+        order = names[:: -1 if shape_idx % 2 else 1]
+        for combo in combos:
+            act_dtype, weight_dtype = COMBOS[combo]
+            a_scale = make_scale(act_dtype, device)
+            b_scale = make_scale(weight_dtype, device)
+            weight = random_operand((batch, n, k), weight_dtype, device)
+            acts = random_operand((batch, m, k), act_dtype, device)
+
+            def run(acts=acts, weight=weight, a_scale=a_scale, b_scale=b_scale):
+                return quant_gemm(acts, weight, a_scale, b_scale)
+
+            best = {table: float("inf") for table in names}
+            for _ in range(trials):
+                for table in order:
+                    apply_table(table, tables[table])
+                    for _ in range(warmup):
+                        run()
+                    torch.cuda.synchronize()
+                    start = time.perf_counter()
+                    for _ in range(iterations):
+                        run()
+                    torch.cuda.synchronize()
+                    ms = (time.perf_counter() - start) / iterations
+                    best[table] = min(best[table], ms)
+            records[(combo, name)] = best
+            for table, ms in best.items():
+                print(
+                    f"{table:10s} {combo:12s} {name:14s} m{m:5d} n{n:6d} "
+                    f"k{k:5d} {ms * 1e3:8.3f} ms",
+                    flush=True,
+                )
+    return records
+
+
+@cli.command("validate")
+@click.option(
+    "--table",
+    "tables",
+    multiple=True,
+    required=True,
+    help="NAME:PATH (or NAME:none / NAME:model) — candidate table to score.",
+)
+@click.option(
+    "--shapes",
+    "shape_values",
+    multiple=True,
+    required=True,
+    help="NAME:M:N:K — holdout shape (NT layout).",
+)
+@click.option(
+    "--combos",
+    default=",".join(COMBOS),
+    show_default=True,
+    callback=lambda _c, _p, v: tuple(
+        part.strip() for part in v.split(",") if part.strip()
+    ),
+)
+@click.option("--batch", default=1, show_default=True, help="Batch dim b.")
+@click.option("--warmup", type=click.IntRange(min=1), default=3, show_default=True)
+@click.option("--iterations", type=click.IntRange(min=1), default=30, show_default=True)
+@click.option("--trials", type=click.IntRange(min=1), default=3, show_default=True)
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Optional JSON dump of the per-task best-ms records.",
+)
+def validate_command(
+    tables: tuple[str, ...],
+    shape_values: tuple[str, ...],
+    combos: tuple[str, ...],
+    batch: int,
+    warmup: int,
+    iterations: int,
+    trials: int,
+    output: Path | None,
+) -> None:
+    """Holdout: score candidate tables on out-of-grid and llm-ish shapes."""
+    table_map: dict[str, str | None] = {}
+    for spec in tables:
+        name, _, path = spec.partition(":")
+        table_map[name] = path if path else None
+    shapes = [parse_holdout_shape(value) for value in shape_values]
+
+    baseline = list(table_map)[0]
+    records = validate(table_map, shapes, combos, batch, warmup, iterations, trials)
+
+    totals = {table: 0.0 for table in table_map}
+    for (_combo, _name), best in records.items():
+        for table, ms in best.items():
+            totals[table] += ms
+
+    click.echo("\n=== totals (sum of best ms over all shapes) ===")
+    for table, total in totals.items():
+        delta = (
+            0.0
+            if table == baseline
+            else (total - totals[baseline]) / totals[baseline] * 100.0
+        )
+        click.echo(f"{table:14s} {total * 1e3:10.1f} ms  {delta:+7.2f}%")
+    click.echo("\n=== per-shape deltas vs baseline (%) ===")
+    worst: list[tuple[str, str, float]] = []
+    for (combo, name), best in records.items():
+        base = best[baseline]
+        parts = []
+        for table in table_map:
+            if table == baseline:
+                continue
+            delta = (best[table] - base) / base * 100.0
+            parts.append(f"{table} {delta:+.1f}")
+            if delta > 2.0:
+                worst.append((table, f"{combo}/{name}", delta))
+        click.echo(f"{combo:12s} {name:14s} " + " | ".join(parts))
+    if worst:
+        click.echo("\n>=2% regressions:")
+        for table, where, delta in sorted(worst, key=lambda w: -w[2]):
+            click.echo(f"  {table:10s} {where:26s} +{delta:.1f}%")
+    else:
+        click.echo("\nno >=2% regressions")
+    if output is not None:
+        output.write_text(json.dumps({f"{c}/{n}": b for (c, n), b in records.items()}))
+        click.echo(f"saved records to {output}")
+
+
+
+
+# Repo root: the stage subprocesses run with it as their cwd (the astrai
+# package must import from the checkout).
+REPO = Path(__file__).resolve().parents[2]
+
+# Holdout grid: decode-thin, decode-wide, prefill, a wide-MLP N, a
+# narrow-N large-M point, the mid-K cell where the 2026-09-13 sweep's fp8
+# data proved optimistic (it caught a whole class of bad rows), and the
+# parity square. All NT (the layout the sweep times).
+DEFAULT_HOLDOUT = (
+    "decode1:1:4096:4096",
+    "decode128:128:4096:4096",
+    "prefill:2048:4096:4096",
+    "wide_mlp:512:11008:4096",
+    "narrow_nm:4096:1024:4096",
+    "midk:1024:4096:2048",
+    "parity:4096:4096:4096",
+)
+
+# Combo name -> plan-table class (the perf_class column rows key on).
+_COMBO_CLASS = {"w16a16": 0, "w8a16": 1, "w8a8": 2, "f8a8": 3}
+
+
+def _class_of_combo(combo: str) -> int:
+    return _COMBO_CLASS[combo.split("_", 1)[0]]
+
+
+def _clamp_m_domain(rows_path: Path, floor: int) -> None:
+    """Clamp every row's M band into the swept domain. A full-coverage
+    catch-all leaves gen with m_min=0, claiming every M below the sweep's
+    grid — the decode shapes there are unmeasured, and the first baseline
+    install lost up to 400% on exactly that (2026-09-13: class-3 wide and
+    class-0 big catch-alls at m=1). Below the floor the builtin table
+    serves, which is what the (min, max] band semantics make natural."""
+    out = []
+    for line in rows_path.read_text().splitlines():
+        body = line.split("#", 1)[0].strip()
+        if not body:
+            out.append(line)
+            continue
+        f = body.split()
+        m_min, m_max = int(f[0]), int(f[1])
+        if m_max and m_max <= floor:
+            continue  # row lies wholly under the swept floor
+        if m_min < floor:
+            f[0] = str(floor)
+        out.append(" ".join(f))
+    rows_path.write_text("\n".join(out) + "\n")
+
+
+def _drop_classes(rows_path: Path, classes: set[int]) -> None:
+    """Remove every row keyed for `classes`; their shapes fall through the
+    injected file to the class's builtin table at lookup."""
+    kept = [
+        line
+        for line in rows_path.read_text().splitlines()
+        if not (line.split("#", 1)[0].strip() and int(line.split()[4]) in classes)
+    ]
+    rows_path.write_text("\n".join(kept) + "\n")
+
+
+def _device_facts() -> dict:
+    """The device facts the planner prices against, straight from the
+    binding (the cache key cannot drift from the autotuner's)."""
+    if not torch.cuda.is_available():
+        raise click.ClickException("CUDA is required")
+    from astrai.extension.ops.gemm import facts
+
+    return facts()
+
+
+def _run(cmd: list[str]) -> str:
+    click.echo(f"+ {' '.join(str(c) for c in cmd)}")
+    proc = subprocess.run(
+        [str(c) for c in cmd], capture_output=True, text=True, cwd=REPO
+    )
+    if proc.returncode != 0:
+        click.echo(proc.stdout)
+        click.echo(proc.stderr)
+        raise click.ClickException(f"stage failed: {cmd[1]}")
+    return proc.stdout + proc.stderr
+
+
+def _install(rows_path: Path, out_dir: Path, sig: str, argv: list[str]) -> Path:
+    assert device_signature(_device_facts()) == sig, "signature drifted mid-run"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / f"{sig}.rows"
+    header = (
+        f"# baseline rows for {sig}\n"
+        f"# generated {date.today():%Y-%m-%d} by csrc/bench/tune_plan_table.py run\n"
+        f"# argv: {' '.join(argv)}\n"
+    )
+    dest.write_text(header + rows_path.read_text())
+    return dest
+
+
+@cli.command("run")
+@click.option("--m-values", default=None, help="Passthrough to sweep.")
+@click.option(
+    "--shapes",
+    "shape_values",
+    multiple=True,
+    help="NAME:N:K passthrough to sweep.",
+)
+@click.option(
+    "--n-values",
+    default=None,
+    help="Explicit N grid passthrough (used when --shapes is empty).",
+)
+@click.option(
+    "--k-values",
+    default=None,
+    help="Explicit K grid passthrough (used when --shapes is empty).",
+)
+@click.option(
+    "--combos", default=None, help="Comma list passthrough to sweep."
+)
+@click.option(
+    "--batch", default=1, show_default=True, help="Passthrough to both stages."
+)
+@click.option(
+    "--warmup", type=int, default=None, help="Passthrough (per-stage defaults)."
+)
+@click.option(
+    "--iterations", type=int, default=None, help="Passthrough (per-stage defaults)."
+)
+@click.option(
+    "--trials", type=int, default=None, help="Passthrough (per-stage defaults)."
+)
+@click.option(
+    "--validate-shapes",
+    "holdout",
+    multiple=True,
+    help="NAME:M:N:K holdout shapes ADDED to the default regression gate.",
+)
+@click.option(
+    "--skip-validate", is_flag=True, default=False, help="Sweep and install only."
+)
+@click.option(
+    "--out-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Install dir (default: the autotuner cache dir — ASTR_GEMM_TUNE_DIR"
+    " or ~/.astrai/cache/gemm_plans).",
+)
+def main(
+    m_values: str | None,
+    shape_values: tuple[str, ...],
+    n_values: str | None,
+    k_values: str | None,
+    combos: str | None,
+    batch: int,
+    warmup: int | None,
+    iterations: int | None,
+    trials: int | None,
+    holdout: tuple[str, ...],
+    skip_validate: bool,
+    out_dir: Path | None,
+) -> None:
+    facts = _device_facts()
+    sig = device_signature(facts)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    click.echo(f"device: {props.name} ({sig})")
+
+    if out_dir is None:
+        out_dir = Path(
+            os.environ.get("ASTR_GEMM_TUNE_DIR", "~/.astrai/cache/gemm_plans")
+        ).expanduser()
+
+    timing = ["--batch", str(batch)]
+    for name, value in (
+        ("--warmup", warmup),
+        ("--iterations", iterations),
+        ("--trials", trials),
+    ):
+        if value is not None:
+            timing += [name, str(value)]
+
+    with tempfile.TemporaryDirectory(prefix="gemm_baseline_") as tmp:
+        candidate = Path(tmp) / "candidate.rows"
+        gen_cmd = [
+            sys.executable,
+            str(Path(__file__)),
+            "sweep",
+            "--full-coverage",
+            "--output",
+            candidate,
+        ]
+        if m_values:
+            gen_cmd += ["--m-values", m_values]
+        for shape in shape_values:
+            gen_cmd += ["--shapes", shape]
+        if n_values:
+            gen_cmd += ["--n-values", n_values]
+        if k_values:
+            gen_cmd += ["--k-values", k_values]
+        if combos:
+            gen_cmd += ["--combos", combos]
+        gen_cmd += timing
+        click.echo(_run(gen_cmd).strip().splitlines()[-1])  # the "wrote N rows" line
+        # Rows only over the swept M domain (see _clamp_m_domain): the
+        # floor is the smallest M this run asked gen to sweep.
+        floor = min(
+            int(v) for v in (m_values or "512,2048,4096").split(",") if v.strip()
+        )
+        _clamp_m_domain(candidate, floor - 1)
+
+        if not skip_validate:
+            all_holdout = list(dict.fromkeys(DEFAULT_HOLDOUT + tuple(holdout)))
+            val_cmd = [
+                sys.executable,
+                str(Path(__file__)),
+                "validate",
+                "--table",
+                "builtin:",
+                "--table",
+                f"tuned:{candidate}",
+            ]
+            for shape in all_holdout:
+                val_cmd += ["--shapes", shape]
+            if combos:
+                val_cmd += ["--combos", combos]
+            val_cmd += timing
+
+            def summarize(report: str) -> list[str]:
+                regressions = [
+                    line for line in report.splitlines() if line.startswith("  tuned ")
+                ]
+                click.echo(
+                    "\n".join(
+                        line
+                        for line in report.splitlines()
+                        if "totals" in line
+                        or "no >=" in line
+                        or line.startswith("  tuned ")
+                    )
+                )
+                return regressions
+
+            regressions = summarize(_run(val_cmd))
+            if regressions:
+                # One class's bad rows must not reject the classes that
+                # measured clean: drop the regressing classes (their shapes
+                # fall through the injected file to the builtin table) and
+                # re-gate once. Recipe-level surgery inside a class stays
+                # manual — that judgement wants the dispute adjudicated,
+                # not a rule.
+                bad = {_class_of_combo(line.split()[1]) for line in regressions}
+                click.echo(
+                    f"regressions in classes {sorted(bad)}; dropping their rows "
+                    "and re-validating"
+                )
+                _drop_classes(candidate, bad)
+                regressions = summarize(_run(val_cmd))
+            if regressions:
+                debug_copy = out_dir / f"{sig}.rejected.rows"
+                debug_copy.parent.mkdir(parents=True, exist_ok=True)
+                debug_copy.write_text(candidate.read_text())
+                raise click.ClickException(
+                    f"candidate regressed {len(regressions)} holdout shapes by >=2%; "
+                    f"rows kept at {debug_copy} for inspection"
+                )
+
+        dest = _install(candidate, out_dir, sig, sys.argv[1:])
+    click.echo(f"installed: {dest}")
+    click.echo(
+        f"serve without rebuild: ops.gemm.set_table(\"{dest}\")\n"
+        "(the runtime autotuner picks it up as its cache automatically)"
+    )
+
+
 
 
 if __name__ == "__main__":
-    plan_table_command()
+    cli()

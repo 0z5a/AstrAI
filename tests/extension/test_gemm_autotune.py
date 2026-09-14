@@ -10,16 +10,15 @@ growth, and the per-device persistence roundtrip.
 import pytest
 import torch
 
-from astrai.extension.gemm_autotune import (
-    CTA_GEOMETRY,
+from astrai.extension.ops.gemm import (
     GemmAutotuner,
     Row,
+    _problem_key,
     device_signature,
     heuristic_rows,
-    perf_class_of,
-    problem_of,
-    ring_bytes,
 )
+
+WIDTH_PERF = {(2, 2): 0, (2, 1): 1, (1, 1): 2}
 
 FACTS = {
     "sms": 128,
@@ -30,33 +29,61 @@ FACTS = {
     "cc": 89,
 }
 
-# The cross six as tile_vocabulary rows (cw, ba, bb, cta, stages, kk).
+# The cross-section of tile_vocabulary rows the fake serves, in the
+# binding's 10-field form (cw, ba, bb, cta, stages, kk, bm, bn, threads,
+# smem). smem follows policy.cuh's ring formula so the feasibility paths
+# behave like the real vocabulary.
+def _ring(bm, bn, kk, stages, ba, bb):
+    return (stages + 1) * kk * (bm * ba + bn * bb)
+
+
+_GEOMETRY = {0: (64, 64), 1: (128, 64), 2: (128, 128), 3: (128, 256)}
+
 VOCAB = [
-    [0, 2, 2, 0, 2, 64],
-    [0, 2, 2, 0, 3, 64],
-    [0, 2, 2, 1, 2, 64],
-    [0, 2, 2, 1, 3, 64],
-    [0, 2, 2, 2, 2, 64],
-    [0, 2, 2, 2, 3, 64],
-    [0, 2, 2, 0, 2, 32],
-    [0, 2, 2, 2, 2, 32],
-    [1, 2, 2, 0, 2, 64],
-    [1, 2, 2, 0, 3, 64],
-    [1, 2, 2, 1, 2, 64],
-    [1, 2, 2, 1, 3, 64],
-    [1, 2, 2, 2, 2, 64],
-    [1, 2, 2, 2, 3, 64],
-    [0, 1, 1, 3, 2, 64],  # wide, 1-byte only
+    [cw, ba, bb, cta, stages, kk, *_GEOMETRY[cta], 256,
+     _ring(*_GEOMETRY[cta], kk, stages, ba, bb)]
+    for cw in (0, 1)
+    for ba, bb in ((2, 2), (2, 1), (1, 1))
+    for cta, stages, kk in (
+        (0, 2, 64), (0, 3, 64), (1, 2, 64), (1, 3, 64),
+        (2, 2, 64), (2, 3, 64), (0, 2, 32), (2, 2, 32),
+    )
+    if not (kk == 32 and (ba, bb) != (2, 2))  # kK=32 is dual-2-byte only
+] + [
+    [0, 1, 1, 3, 2, 64, *_GEOMETRY[3], 256, _ring(*_GEOMETRY[3], 64, 2, 1, 1)],
 ]
 
 
 class FakeGemm:
     """The planner bindings as call records."""
 
-    def __init__(self, source: str = "degraded"):
+    def __init__(self, source: str = "degraded", override_rows: int = 0):
         self.source = source
+        self.override_rows = override_rows
         self.installs: list[str] = []
         self.probes = 0
+
+    def config_state(self):
+        return {
+            "planner": "table",
+            "log": False,
+            "table": {
+                "mode": "rows",
+                "override_rows": self.override_rows,
+                "injected_rows": 0,
+            },
+            "staging": {"tma": True, "mx": True},
+        }
+
+    _PERF = {
+        (torch.bfloat16, torch.bfloat16): 0,
+        (torch.bfloat16, torch.int8): 1,
+        (torch.bfloat16, torch.float8_e4m3fn): 1,
+        (torch.bfloat16, torch.float8_e5m2): 1,
+        (torch.int8, torch.int8): 2,
+        (torch.float8_e4m3fn, torch.float8_e4m3fn): 3,
+        (torch.float8_e5m2, torch.float8_e5m2): 3,
+    }
 
     def plan_probe(self, m, n, k, dt_a, dt_b, trans_a, trans_b, batch=1):
         self.probes += 1
@@ -66,11 +93,11 @@ class FakeGemm:
             "stages": 2,
             "raster": 0,
             "kk": 64,
-            "perf_class": 0,
+            "perf_class": self._PERF.get((dt_a, dt_b), 0),
             "crosswise": 0,
         }
 
-    def set_plan_table_override(self, source):
+    def inject_plan_rows(self, source):
         self.installs.append(source)
         return source.count("\n") + 1
 
@@ -86,7 +113,6 @@ class FakeGemm:
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch, tmp_path):
-    monkeypatch.delenv("ASTR_GEMM_TABLE", raising=False)
     monkeypatch.delenv("ASTR_GEMM_AUTOTUNE", raising=False)
     monkeypatch.setenv("ASTR_GEMM_TUNE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("ASTR_GEMM_TUNE_TRIGGER", "1")
@@ -100,27 +126,23 @@ def nt_operands(m=64, n=128, k=256):
     return a, b
 
 
-class TestProblemDerivation:
+class TestProblemKey:
     def test_nt_production_route(self):
         a, b = nt_operands()
-        prob = problem_of(a, b, trans_a=False, trans_b=True)
-        assert (prob.m, prob.n, prob.k) == (64, 128, 256)
-        assert prob.perf_class == 0
-        assert prob.crosswise == 0  # dual-congruous, the fused-linear shape
+        m, n, k, batch, crosswise, dt_a, dt_b = _problem_key(a, b, False, True)
+        assert (m, n, k, batch) == (64, 128, 256, 1)
+        assert crosswise == 0  # dual-congruous, the fused-linear shape
+        assert (dt_a, dt_b) == ("torch.bfloat16", "torch.bfloat16")
 
     def test_tt_is_crosswise(self):
         a = torch.zeros(256, 64, dtype=torch.bfloat16)  # [K][M]
         b = torch.zeros(128, 256, dtype=torch.bfloat16)  # [N][K]
-        prob = problem_of(a, b, trans_a=True, trans_b=True)
-        assert prob.crosswise == 1
-        assert (prob.m, prob.n, prob.k) == (64, 128, 256)
+        assert _problem_key(a, b, True, True)[4] == 1
 
     def test_tn_is_dual_crosswise(self):
         a = torch.zeros(256, 64, dtype=torch.bfloat16)  # [K][M]
         b = torch.zeros(256, 128, dtype=torch.bfloat16)  # [K][N]
-        prob = problem_of(a, b, trans_a=True, trans_b=False)
-        assert prob.crosswise == 2
-        assert (prob.m, prob.n, prob.k) == (64, 128, 256)
+        assert _problem_key(a, b, True, False)[4] == 2
 
     def test_col_major_view_folds_the_tag(self):
         base = torch.zeros(64, 256, dtype=torch.bfloat16)
@@ -128,49 +150,38 @@ class TestProblemDerivation:
         assert a.stride(-1) != 1 and a.stride(-2) == 1
         b = torch.zeros(128, 256, dtype=torch.bfloat16)
         # trans_a=False over a .t() view folds to a transposed layout tag.
-        prob = problem_of(a, b, trans_a=False, trans_b=False)
-        assert prob.crosswise == 2  # folded A (crosswise) + non-transposed B
-
-    @pytest.mark.parametrize(
-        ("dt_a", "dt_b", "want"),
-        [
-            (torch.bfloat16, torch.bfloat16, 0),
-            (torch.bfloat16, torch.int8, 1),
-            (torch.bfloat16, torch.float8_e4m3fn, 1),
-            (torch.int8, torch.int8, 2),
-            (torch.float8_e4m3fn, torch.float8_e4m3fn, 3),
-            (torch.float8_e5m2, torch.float8_e5m2, 3),
-        ],
-    )
-    def test_perf_class_pairs(self, dt_a, dt_b, want):
-        assert perf_class_of(dt_a, dt_b) == want
-
-    def test_unsupported_pair_raises(self):
-        with pytest.raises(ValueError):
-            perf_class_of(torch.float32, torch.bfloat16)
+        assert _problem_key(a, b, False, False)[4] == 2
 
 
 class TestHeuristicRows:
     def test_covers_crosswise_only_and_shadows_nothing(self):
-        rows = heuristic_rows(FACTS)
-        assert len(rows) == 4 * 2 * 3  # classes x crosswise x M bands
+        rows = heuristic_rows(FACTS, VOCAB, WIDTH_PERF)
+        pairs = len({(e[1], e[2]) for e in VOCAB})
+        assert len(rows) == pairs * 2 * 3  # width pairs x crosswise x M bands
         assert all(r.crosswise in (1, 2) for r in rows)
+        assert {r.perf_class for r in rows} == set(WIDTH_PERF.values())
 
     def test_ring_feasible_and_demotes(self):
-        rows = heuristic_rows(FACTS)
-        for r in rows:
-            bm, bn = CTA_GEOMETRY[r.cta]
-            ba, bb = {0: (2, 2), 1: (2, 1), 2: (1, 1), 3: (1, 1)}[r.perf_class]
-            assert ring_bytes(r.cta, r.stages, r.kk, ba, bb) <= FACTS["smem_max"]
+        ring = {(e[3], e[4], e[5], e[1], e[2]): e[9] for e in VOCAB}
+        widths_of_perf = {perf: widths for widths, perf in WIDTH_PERF.items()}
+
+        def ring_of(r):
+            ba, bb = widths_of_perf[r.perf_class]
+            return ring[(r.cta, r.stages, r.kk, ba, bb)]
+
+        for r in heuristic_rows(FACTS, VOCAB, WIDTH_PERF):
+            assert ring_of(r) <= FACTS["smem_max"]
         # A part that cannot opt in past 48KB keeps every ring inside it:
-        # class 0's s3 small ring (64KB) demotes to s2, while the thinner
-        # class 1 ring (exactly 48KB) legitimately keeps its depth.
-        small = heuristic_rows({**FACTS, "smem_max": 48 * 1024})
-        widths = {0: (2, 2), 1: (2, 1), 2: (1, 1), 3: (1, 1)}
+        # the 2-byte s3 small ring (64KB) demotes to s2 while the thinner
+        # (2, 1)-width ring (48KB) legitimately keeps its depth.
+        small = heuristic_rows(
+            {**FACTS, "smem_max": 48 * 1024}, VOCAB, WIDTH_PERF
+        )
         for r in small:
-            ba, bb = widths[r.perf_class]
-            assert ring_bytes(r.cta, r.stages, r.kk, ba, bb) <= 48 * 1024
-        assert all(r.stages == 2 for r in small if r.perf_class == 0)
+            assert ring_of(r) <= 48 * 1024
+        assert all(
+            r.stages == 2 for r in small if r.perf_class == 0
+        )  # the 2-byte class demoted
 
     def test_row_text_is_row_file_syntax(self):
         row = Row(63, 64, 127, 128, 0, 1, 2, 3, 32)
@@ -190,22 +201,33 @@ class TestTuneFlow:
         fake = FakeGemm()
         self._tuner(fake)
         assert len(fake.installs) == 1
-        assert fake.installs[0].count("\n") == 4 * 2 * 3 - 1  # 24 rows
+        pairs = len({(e[1], e[2]) for e in VOCAB})
+        assert fake.installs[0].count("\n") == pairs * 2 * 3 - 1
 
     def test_builtin_shapes_never_tune(self):
         fake = FakeGemm(source="builtin")
         tuner = self._tuner(fake)
         a, b = nt_operands()
+        seeded = fake.probes  # start() seeds one probe per supported pair
         tuner.note(a, b, None, None, False, True, None)
         tuner.note(a, b, None, None, False, True, None)
-        assert fake.probes == 1  # one probe per distinct shape
+        assert fake.probes == seeded + 1  # one more probe per distinct shape
         assert len(fake.installs) == 1  # start() only: no candidates forced
+
+    def test_model_answers_are_coverage(self):
+        # The analytical planner serving a shape is ownership too: the
+        # tuner never sweeps what the model already plans.
+        fake = FakeGemm(source="model")
+        tuner = self._tuner(fake, lambda *a: pytest.fail("must not measure"))
+        a, b = nt_operands()
+        tuner.note(a, b, None, None, False, True, None)
+        assert len(fake.installs) == 1
 
     def test_degraded_shape_tunes_and_persists(self, tmp_path):
         fake = FakeGemm(source="degraded")
         measured: list = []
 
-        def fake_measure(prob, candidates, *call_args):
+        def fake_measure(key, candidates, *call_args):
             measured.extend(candidates)
             return candidates[-1]  # the "winner": last candidate
 
@@ -216,6 +238,7 @@ class TestTuneFlow:
         # Candidates were the cw-0 two-byte recipes that fit the smem.
         assert all(c.crosswise == 0 for c in measured)
         assert all(c.perf_class == 0 for c in measured)
+        assert all(c.kk in (32, 64) for c in measured)
         # start() + merged install = 2 installs.
         assert len(fake.installs) == 2
         # The winner merged in front of the heuristic floor.
@@ -239,9 +262,8 @@ class TestTuneFlow:
         tuner.note(a, b, None, None, False, True, None)
         assert len(fake.installs) == installs_after_tune
 
-    def test_env_table_idles_the_tuner(self, monkeypatch):
-        monkeypatch.setenv("ASTR_GEMM_TABLE", "/nonexistent/rows.txt")
-        fake = FakeGemm(source="degraded")
+    def test_override_table_idles_the_tuner(self):
+        fake = FakeGemm(source="degraded", override_rows=3)
         tuner = self._tuner(fake, lambda *a: pytest.fail("must not measure"))
         a, b = nt_operands()
         tuner.note(a, b, None, None, False, True, None)

@@ -12,6 +12,7 @@
 // and their field order: parse_plan_table_file below.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -349,61 +350,140 @@ inline int parse_plan_table_text(const std::string& text, const char* label,
 // autotuner can top up only the shapes nothing else covers (the env file is
 // the experimenter's, the builtin table is the AOT baseline; neither is the
 // autotuner's to shadow, which is also why injected rows rank below the env
-// file at lookup).
-enum class RowTier { kOverride = 0, kInjected, kBuiltin, kDegraded };
-
-// Runtime-injected rows (the set_plan_table_override binding): the Python
-// autotuner's persistent-cache path installs measured winners here, in the
-// same row syntax as the file override. The container is replaced, never
-// mutated in place, and lookups copy the row out under the mutex — a
-// concurrent install therefore cannot dangle a pointer a launched plan
-// still holds (the same race the env re-parse tolerates by convention is
-// not tolerable here: installs happen during serving warmups).
-inline std::mutex& plan_table_injected_mutex() {
-    static std::mutex m;
-    return m;
-}
-inline std::vector<TableRow>& plan_table_injected_storage() {
-    static std::vector<TableRow> rows;
-    return rows;
-}
-
-// Replace the injected rows wholesale. Takes parsed rows (the binding layer
-// parses text/file first so the return value can name what survived).
-inline void set_plan_table_injected_rows(std::vector<TableRow> rows) {
-    std::lock_guard<std::mutex> g(plan_table_injected_mutex());
-    plan_table_injected_storage() = std::move(rows);
-}
-
-inline void clear_plan_table_injected_rows() {
-    set_plan_table_injected_rows({});
-}
-
-// First-match over the injected rows, copied out under the lock.
-inline std::optional<TableRow> plan_table_injected_lookup(const PlanQuery& q) {
-    std::lock_guard<std::mutex> g(plan_table_injected_mutex());
-    const std::vector<TableRow>& rows = plan_table_injected_storage();
-    if (const TableRow* row =
-            plan_row_for(rows.data(), (int)rows.size(), q);
-        row != nullptr)
-        return *row;
-    return std::nullopt;
-}
-
-// Cache of the override file, re-parsed only when the env path changes
-// (a single setenv per process in practice; the parse result is
-// idempotent, so a concurrent writer races benignly like device_facts).
-inline const std::vector<TableRow>& plan_table_override_rows() {
-    static std::vector<TableRow> rows;
-    static std::string loaded_path;
-    const char* env = std::getenv("ASTR_GEMM_TABLE");
-    const std::string path = env != nullptr ? std::string(env) : std::string();
-    if (path != loaded_path) {
-        rows.clear();
-        if (!path.empty() && path != "-") parse_plan_table_file(path, rows);
-        loaded_path = path;
+// file at lookup). kModel names the analytical planner (gemm.cuh's
+// plan_model_scan): it is not a row source, but the probe's question —
+// "who served this shape" — has the same answer shape for it.
+// One row tier's backing store: a mutex-guarded row container. The
+// container is replaced wholesale (set/clear), never mutated in place, and
+// lookups copy the row out under the mutex — a concurrent install therefore
+// cannot dangle a pointer a launched plan still holds (installs happen
+// during serving warmups). Two mutable instances exist: the override source
+// (the plan.set_table / configure channel, which outranks everything) and
+// the injected source (the autotuner's measured winners, via the
+// inject_plan_rows binding); the builtin and degraded tiers read static
+// rows and need no container.
+class RowSource {
+public:
+    void set(std::vector<TableRow> rows) {
+        std::lock_guard<std::mutex> g(mutex_);
+        rows_ = std::move(rows);
     }
-    return rows;
+    void clear() { set({}); }
+    std::optional<TableRow> lookup(const PlanQuery& q) const {
+        std::lock_guard<std::mutex> g(mutex_);
+        const TableRow* row =
+            plan_row_for(rows_.data(), (int)rows_.size(), q);
+        if (row == nullptr) return std::nullopt;
+        return *row;
+    }
+    size_t size() const {
+        std::lock_guard<std::mutex> g(mutex_);
+        return rows_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<TableRow> rows_;
+};
+
+inline RowSource& plan_table_override_source() {
+    static RowSource source;
+    return source;
+}
+
+inline RowSource& plan_table_injected_source() {
+    static RowSource source;
+    return source;
+}
+
+
+// Runtime configuration: the backing state of the runtime plan API
+// (astrai.extension.ops.gemm's set_* functions and the gemm ``configure``
+// binding). One knob per launch-time switch, each a tri-state atomic —
+// -1 means "unset, the one-time env seed decides", any other value is
+// explicit and wins. The environment is consulted exactly once per
+// process (a migration seed; the vars are documented as deprecated),
+// never per call: sweeps toggle this state through the binding instead,
+// which is the same one-set-per-launch cadence the env file supported
+// without paying getenv on the hot path.
+struct GemmConfig {
+    std::atomic<int> planner{-1};      // 0 table-only, 1 hybrid (table -> model), 2 model-only
+    std::atomic<int> log{-1};          // [gemm-plan] stderr log on/off
+    std::atomic<int> tma_disabled{-1};  // cp.async staging forced everywhere
+    std::atomic<int> mx_disabled{-1};   // sm_120a block-scale cell knocked out
+    std::atomic<int> table_off{-1};    // 1 = "-" (no override, no injected, no builtin rows)
+};
+
+// The planner-rank vocabulary, one place: the strings configure() takes
+// and config_state() returns for GemmConfig::planner.
+inline constexpr const char* kPlannerModeNames[] = {"table", "hybrid",
+                                                    "model"};
+inline constexpr int kPlannerModeCount = 3;
+inline bool parse_planner_mode(const std::string& name, int& out) {
+    for (int i = 0; i < kPlannerModeCount; ++i)
+        if (name == kPlannerModeNames[i]) {
+            out = i;
+            return true;
+        }
+    return false;
+}
+
+inline GemmConfig& gemm_config() {
+    static GemmConfig cfg;
+    return cfg;
+}
+
+// The migration seed: legacy ASTR_GEMM_* variables read once, on the first
+// planner/table touch. Explicit configure() calls bypass it entirely — they
+// write the atomics directly.
+inline void gemm_config_seed_once() {
+    static const bool seeded = [] {
+        GemmConfig& c = gemm_config();
+        auto env = [](const char* name) {
+            const char* e = std::getenv(name);
+            return e == nullptr ? std::string() : std::string(e);
+        };
+        if (const std::string v = env("ASTR_GEMM_MODEL"); !v.empty())
+            c.planner = std::atoi(v.c_str());
+        if (const std::string v = env("ASTR_GEMM_PLAN"); !v.empty() && v != "0")
+            c.log = 1;
+        if (env("ASTR_GEMM_NO_TMA") == "1") c.tma_disabled = 1;
+        if (env("ASTR_GEMM_NO_MX") == "1") c.mx_disabled = 1;
+        if (const std::string v = env("ASTR_GEMM_TABLE"); !v.empty()) {
+            if (v == "-") {
+                c.table_off = 1;
+            } else {
+                std::vector<TableRow> rows;
+                if (parse_plan_table_file(v, rows))
+                    plan_table_override_source().set(std::move(rows));
+            }
+        }
+        return true;
+    }();
+    (void)seeded;
+}
+
+// Resolved views (unset falls to the default, never to a later env read).
+inline int gemm_planner_mode() {
+    gemm_config_seed_once();
+    const int v = gemm_config().planner.load(std::memory_order_relaxed);
+    return v < 0 ? 0 : v;
+}
+inline bool gemm_plan_log_enabled() {
+    gemm_config_seed_once();
+    return gemm_config().log.load(std::memory_order_relaxed) > 0;
+}
+inline bool gemm_tma_staging_disabled() {
+    gemm_config_seed_once();
+    return gemm_config().tma_disabled.load(std::memory_order_relaxed) > 0;
+}
+inline bool gemm_mx_cell_disabled() {
+    gemm_config_seed_once();
+    return gemm_config().mx_disabled.load(std::memory_order_relaxed) > 0;
+}
+inline bool gemm_table_off() {
+    gemm_config_seed_once();
+    return gemm_config().table_off.load(std::memory_order_relaxed) > 0;
 }
 
 // BEGIN GENERATED
@@ -572,86 +652,18 @@ inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) 
     }
 }
 
-// Override file first (one file for every class, keyed by its perf_class
-// column), then the runtime-injected rows, then the class's own builtin
-// table — the ranking that keeps every owner in its lane: the env file is
-// the experimenter's A/B channel and outranks everything, the injected rows
-// are the autotuner's measured winners (they shadow the AOT baseline only
-// where they match), and the builtin table is the baseline the other two
-// top up. ASTR_GEMM_TABLE="-" is the explicit "AOT off" escape hatch:
-// neither override nor injected nor builtin rows, so dispatch falls through
-// to the degraded band rows (dev/bench). Row copies come back by value so
-// an injected-row install racing a lookup cannot dangle (see
-// plan_table_injected_lookup). dev/batch are the running device and the
-// problem's batch, the inputs a row's wave gates need; dev.sms <= 0 (no
-// device facts) skips gated rows instead of inventing a count. ba/bb are
-// the operand widths.
-inline std::optional<TableRow> plan_table_lookup(const PlanQuery& q,
-                                                 RowTier* tier = nullptr) {
-    const char* env = std::getenv("ASTR_GEMM_TABLE");
-    if (env != nullptr && std::strcmp(env, "-") == 0) {
-        if (tier != nullptr) *tier = RowTier::kDegraded;
-        return std::nullopt;
-    }
-    const std::vector<TableRow>& rows = plan_table_override_rows();
-    if (const TableRow* row = plan_row_for(rows.data(), (int)rows.size(), q);
-        row != nullptr) {
-        if (tier != nullptr) *tier = RowTier::kOverride;
-        return *row;
-    }
-    if (std::optional<TableRow> row = plan_table_injected_lookup(q)) {
-        if (tier != nullptr) *tier = RowTier::kInjected;
-        return row;
-    }
-    int count = 0;
-    const TableRow* builtin = builtin_plan_table(q.perf_class, count);
-    if (builtin == nullptr) {
-        if (tier != nullptr) *tier = RowTier::kDegraded;
-        return std::nullopt;
-    }
-    if (const TableRow* row = plan_row_for(builtin, count, q);
-        row != nullptr) {
-        if (tier != nullptr) *tier = RowTier::kBuiltin;
-        return *row;
-    }
-    if (tier != nullptr) *tier = RowTier::kDegraded;
-    return std::nullopt;
-}
-
-// The planner's row source: override file first, then the injected rows,
-// then the compiled-in rows.
-inline std::optional<TableRow> table_row(const PlanQuery& q,
-                                         RowTier* tier = nullptr) {
-    return plan_table_lookup(q, tier);
-}
-
-// Last-resort rows for a table miss with the model retired: the M band's
-// dominant recipe from the full-coverage sweep (small for short M, narrow
-// mid, big past mid) — a safe default, never best. Open N with -1 keys
-// matches every shape, so planning stays a total function.
+// Last-resort rows for the chain's tail: the M band's dominant recipe from
+// the full-coverage sweep (small for short M, narrow mid, big past mid) —
+// a safe default, never best. Open N with -1 keys matches every shape, so
+// planning stays a total function; the RowSetPlanner over them reads the
+// M band alone (the m-only query below carries the matcher's "strictly
+// past the min" caveat: an n of 0 sits ON the open bound, so a 1 stands
+// for "some real n").
 static constexpr TableRow kDegradedPlanRows[] = {
     {TileClass::kSmall64, 0, 512, 0, 0, -1, -1, 2, 0},
     {TileClass::kNarrow128x64, 512, 3072, 0, 0, -1, -1, 2, 0},
     {TileClass::kBig128, 3072, 0, 0, 0, -1, -1, 2, 0},
 };
-
-inline const TableRow& degraded_row_for(int64_t m) {
-    // Only the M band decides here: the degraded rows are open on N and K with
-    // -1 keys and carry no gate, so the rest of the query is left at its
-    // defaults (k = 0 asks the open-K reading, and an empty device skips
-    // nothing because nothing is gated). n is the exception: the row
-    // matcher's band test is "strictly past the min", and an n of 0 sits
-    // ON the open bound instead of past it — every degraded row would
-    // skip and the m-only query would fall to the small-CTA fallback for
-    // every m. A 1 stands for "some real n", the least the bands need.
-    PlanQuery q;
-    q.m = m;
-    q.n = 1;
-    if (const TableRow* row = plan_row_for(kDegradedPlanRows, 3, q);
-        row != nullptr)
-        return *row;
-    return kDegradedPlanRows[0];  // the degenerate m=0 matches no band
-}
 
 }  // namespace gemm
 }  // namespace astrai

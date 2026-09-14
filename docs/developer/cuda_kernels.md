@@ -59,7 +59,7 @@ layered directory:
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
-| `gemm/plan_table.h` | AOT dispatch rows: (M, N, K) band × dtype class → measured recipe winner (`TableRow`; band-parse + lookup, `ASTR_GEMM_TABLE` override or the per-class compiled-in tables `kBuiltinPlanW16A16`/`W8A16`/`W8A8`/`F8A8`) — `plan_gemm` is table-only (planning section below); a row's CTA geometry is read from `policy.cuh`'s `kTileClassCta`, not re-spelled here |
+| `gemm/plan_table.h` | AOT dispatch rows: (M, N, K) band × dtype class → measured recipe winner (`TableRow`; band-parse + lookup, `set_table` override rows or the per-class compiled-in tables `kBuiltinPlanW16A16`/`W8A16`/`W8A8`/`F8A8`), the `GemmConfig` runtime state and the `RowSource` containers — the planner itself (the chain of `RowSetPlanner`/`ModelPlanner`) lives in `gemm.cuh` |
 | `quantize/quantize.cu` | binding only: entry checks (`checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
@@ -200,7 +200,7 @@ link-line changes) and cached exact-match, so steady-state calls pay the
 few-microsecond encode once. The planner gates TMA on the device's
 compute capability, dual-congruous layouts, 1-/2-byte dtypes and
 descriptor encodability (misaligned base/ld falls back to the cp.async
-twin, which stays compiled); `ASTR_GEMM_NO_TMA=1` forces the fallback
+twin, which stays compiled); `set_staging(tma=False)` forces the fallback
 for experiments.
 
 **Stage depth.** The manifest carries s3 deep-ring siblings of every
@@ -209,8 +209,8 @@ humming's `_fit_num_stages` rule — the thinner the operand pair, the
 more smem headroom under the 96KB budget). RTX 5090 measured them a
 wash to -1.3% on the cp.async rings (three buffers already hide the
 LDGSTS latency), so table rows keep s2 wherever a sweep point did not
-measure s3 ahead. Candidates are measured as one-row `ASTR_GEMM_TABLE`
-files (see `csrc/bench/gen_plan_table.py`), which name the ring depth
+measure s3 ahead. Candidates are measured as one-row tables (`set_table`)
+files (see `csrc/bench/tune_plan_table.py sweep`), which name the ring depth
 directly and are smem-gated like a real row.
 
 **MMA cell (sm_120a block_scale).** The plain warp-level fp8 mma
@@ -234,7 +234,7 @@ which the driver picks on sm_120; every other pass/device falls back to the
 plain cell inside the same tree, so routing can only trade speed, never
 correctness.
 `launch_plan` routes the symmetric-fp8 pair through the mx tree on sm_120
-unless `ASTR_GEMM_NO_MX=1` knocks it out (the A/B knob; the env is read
+unless `set_staging(mx=False)` knocks it out (the A/B knob; read
 once per process — separate processes to compare). End to end the fp8
 pair's benchmark geomean went 356 → 508 TFLOPS (+43%, peak 619; non-fp8
 classes unchanged — their kernels are SASS-identical in both images). The
@@ -320,7 +320,7 @@ llama-shape W16A16 mean went 184 → 194 TF with the weak bands
 (+10..27%) landing at 0.99-1.00× cuBLAS while the saturated bands and
 the quantized-class means held within ±1.2% (single shapes trade up to
 −7% inside the fitted regret envelope).
-`ASTR_GEMM_PLAN=1` adds a read-only launch log (shape →
+`set_log(True)` adds a read-only launch log (shape →
 recipe/stages/grid/raster) from `launch_policy`. On RTX 5090 (170 SM, 96 MB L2) the model replaced the
 L20 ladder's mid/large-M narrow picks with the big CTA and its sub-wave
 small picks with s2: benchmark_w8 over the llama shapes totals
@@ -354,7 +354,7 @@ production in this revision and never called again); full-coverage
 tables end each class with a
 catch-all row, so a miss means the table is empty or stale, not a shape
 the planner should infer. Rows come
-from two sources, override first: `ASTR_GEMM_TABLE=/path/to/plan_table.txt`
+from two sources, override first: `set_table("/path/to/plan_table.txt")`
 (one row per line, `m_min m_max n_min n_max perf_class crosswise cta
 stages raster [k [k_min k_max [min_ctas_per_sm]]]`, where the optional `k` is
 the row's ring K
@@ -391,7 +391,7 @@ k-tile depth) is dropped rather than recorded under its own name with the
 fallback's numbers.
 The sweep times every
 combo × recipe at the M × shape grid, each candidate as a one-row
-`ASTR_GEMM_TABLE` file toggled per launch: the row source re-reads that env
+one-row table toggled per launch through `set_table`: one set per launch
 on every call, so the generator interleaves the candidates at each shape
 and the comparison shares one GPU clock/thermal state — sweeping whole
 recipe batches in separate processes measured the big CTA first and the
@@ -404,7 +404,7 @@ production mode (`--full-coverage`) rows every band, resolves ties by
 the stable big>narrow>small preference and appends the per-class
 catch-all. K is not a row key (the ring K is fixed at 64): a K/batch
 conflict at one (M, N) resolves to the best-tflops point.
-`ASTR_GEMM_PLAN` logs the decision source (`table` /
+`set_log` emits the decision source (`override` / `injected` /
 `degraded (no table)`); the row-format details
 are exercised indirectly by the correctness suite
 (the production route runs through the hooked planner) and by the
@@ -644,35 +644,63 @@ capability dispatch must use the public `attention(...)` entry point instead.
 
 ### GEMM Plan Autotuning
 
-The `gemm` module exposes the planner the launch path uses (it is host-only
-and GPU-free — `plan_table_test.cu` pins that):
+The planner the launch path uses is configured at runtime from Python —
+**no rebuild, no environment variable**. Everything lives in
+`astrai.extension.ops.gemm` (the gemm adapter) and is re-exported from
+`astrai.extension`:
 
-- `plan_probe(m, n, k, dt_a, dt_b, trans_a, trans_b, batch)` — the decision
-  `gemm_dispatch` would make, with the row tier that made it:
-  `"override"` (the `ASTR_GEMM_TABLE` file), `"injected"` (rows installed
-  through `set_plan_table_override`, ranked below the env file and above the
-  compiled-in table), `"builtin"`, or `"degraded"`.
-- `tile_vocabulary()` — the `(crosswise, ba, bb, cta, stages, kk)` set the
-  manifest ladders instantiate, deduped on the dispatch key; the candidate
-  space for anything choosing recipes from Python.
-- `set_plan_table_override(source)` — install rows from a file path or
-  inline row text (returns the count that survived parsing).
-- `device_facts_info()` — the `DeviceFacts` geometry as a dict.
+```python
+from astrai.extension import ops
+ops.gemm.set_planner("hybrid")        # "table" | "hybrid" | "model"
+ops.gemm.set_table("rows.txt")         # a row file, inline text, or "-"
+ops.gemm.set_log(True)                 # the [gemm-plan] decision log
+ops.gemm.set_staging(tma=False)        # the A/B staging switches
+ops.gemm.probe(512, 11008, 4096)       # the decision + who made it
+ops.gemm.state()                       # the effective configuration
+ops.gemm.tile_vocabulary()             # the recipe vocabulary (with geometry)
+ops.gemm.facts()                       # the DeviceFacts geometry
+```
 
-`astrai.extension.gemm_autotune` builds the tuning loop on those: a shape no
-measured row serves (the builtin and env tables count; the heuristic
-crosswise floor does not) tunes once — candidates from `tile_vocabulary`
-filtered to the staging pair and smem ceiling, forced one row at a time,
-interleaved CUDA-event medians over the caller's own tensors — and the
-winner persists under `~/.astrai/cache/gemm_plans/<device-sig>.rows`, so a
-new process (or a different part, via the geometry key) re-derives nothing
-measured. Enable with `ASTR_GEMM_AUTOTUNE=1` or
-`astrai.extension.gemm_autotune.enable()`; the hook costs one flag check
-when disabled and idles while `ASTR_GEMM_TABLE` is set. The offline
-whole-table recalibration stays a separate command:
-`csrc/bench/tune_baseline.py` sweeps (`gen_plan_table.py --full-coverage`),
+`probe` returns the decision `gemm_dispatch` would make, with the planner
+that made it: `"override"` (rows from `set_table`), `"injected"` (rows from
+`inject_rows`, ranked below override and above the compiled-in table),
+`"builtin"`, `"model"` (the analytical planner), or `"degraded"` (the
+band ladder).
+
+The planners compose as a chain — override rows, injected rows, the
+compiled-in table, the analytical model, the degraded bands — and the mode
+above only picks which chain runs. `set_table("-")` disables every row tier
+at once.
+
+`ops.gemm.enable()` installs the runtime autotuner (shapes no row serves
+tune once: candidates from `tile_vocabulary` filtered to the staging pair
+and smem ceiling, forced as one-row tables, interleaved CUDA-event medians
+over the caller's own tensors; the winner persists under
+`~/.astrai/cache/gemm_plans/<device-sig>.rows` so a new process or a
+different part re-derives nothing measured). The hook costs one flag check
+when disabled and idles while an override table owns the source. The
+offline whole-table recalibration stays a separate command:
+`csrc/bench/tune_plan_table.py run` sweeps (`sweep --full-coverage`),
 gates on the holdout validator (a ≥2% per-shape regression rejects), and
 installs under the same device signature.
+
+#### Deprecated environment variables
+
+The knobs above were environment variables; they are now read **once per
+process as a migration seed** (explicit API calls win) and documented as
+deprecated:
+
+| Variable | Replaced by |
+|---|---|
+| `ASTR_GEMM_TABLE` (row file, `-` = all rows off) | `ops.gemm.set_table(...)` |
+| `ASTR_GEMM_MODEL` (planner rank 0/1/2) | `ops.gemm.set_planner(...)` |
+| `ASTR_GEMM_PLAN` (decision log) | `ops.gemm.set_log(...)` |
+| `ASTR_GEMM_NO_TMA` | `ops.gemm.set_staging(tma=False)` |
+| `ASTR_GEMM_NO_MX` | `ops.gemm.set_staging(mx=False)` |
+| `ASTR_GEMM_AUTOTUNE` | `ops.gemm.enable()` |
+| `ASTR_GEMM_TUNE_DIR` / `_MAX_SHAPES` / `_TRIGGER` | `ops.gemm.enable(cache_dir=..., max_shapes=..., trigger=...)` |
+| `ASTR_OPS` (`family=impl` list) | `astrai.extension.set_op(family, impl)` |
+| `ASTR_BACKEND` (attention backend) | `astrai.extension.set_op("attention", "...")` |
 
 ### Backend Layer
 
@@ -839,7 +867,6 @@ Test files:
 - `attn_test.cu` — decode + prefill kernels (correctness tables + benchmarks)
 - `attn_paged_test.cu` — paged decode/prefill kernels
 - `quant_gemm_test.cu` — quantized GEMM correctness: every dtype pair (fp8/int8/bf16 × layouts/K tiles/ragged shapes/scales/fp32 out) + a per-combo TFLOPS bench (sm_89+)
-- `plan_table_test.cu` — planner checks: dtype-class keying, per-class table selection (a row cannot leak across classes), the K band's edge cases, row-file parsing for the 9/10/12-field forms, the injected-row tier ranking (env file > injected > builtin, `-` kills all), the host-only probe against the dispatch branches, the recipe vocabulary per staging pair, and an informational planner-cost line (~110 ns/query on sm_89)
 
 ## Benchmarks
 
@@ -908,7 +935,6 @@ csrc/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
     ├── attn_test.cu                  # Decode + prefill kernels
     ├── attn_paged_test.cu            # Paged decode/prefill kernels
-    ├── plan_table_test.cu            # Planner: class keying, per-class tables, K band, row-file forms
     └── quant_gemm_test.cu           # GEMM correctness: fp8/bf16/int8 pairs across layouts/K tiles/ragged shapes + dtype-combo TFLOPS bench
 ```
 

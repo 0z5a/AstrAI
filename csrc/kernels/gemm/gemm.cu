@@ -155,8 +155,9 @@ GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
 
 // The probe twin of the switch above: same pairs, host-only functions that
 // run the planner without a launch (the autotuner's coverage check).
-using GemmProbeFn = PlanProbe (*)(int64_t, int64_t, int64_t, int64_t, bool,
-                                  bool, const DeviceFacts&);
+using GemmProbeFn =
+    std::pair<PlanDecision, PlanQuery> (*)(int64_t, int64_t, int64_t, int64_t,
+                                           bool, bool, const DeviceFacts&);
 
 GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
     switch (pack_dtypes(a, b)) {
@@ -187,56 +188,113 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
 
 // ---------------------------------------------------------------------------
 // Planner introspection + runtime row injection: the Python autotuner's C++
-// face. The planner is GPU-free (plan_table_test.cu pins that), so the probe
-// launches nothing. Injected rows rank BELOW the ASTR_GEMM_TABLE file at
-// lookup (plan_table.h), keeping the sweep scripts' env channel authoritative.
+// face. The planner is GPU-free by design, so the probe launches nothing.
+// Injected rows rank BELOW the override rows (plan_table.h), keeping the
+// plan.set_table channel authoritative.
+// ---------------------------------------------------------------------------
+
+py::dict plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
+                    at::ScalarType dt_b, bool trans_a, bool trans_b,
+                    int64_t batch) {
+    const auto [decision, query] = find_gemm_probe(dt_a, dt_b)(
+        m, n, k, batch, trans_a, trans_b, astrai::device_facts());
+    py::dict d;
+    d["source"] = decision.source;
+    d["cta"] = decision.recipe.cta;
+    d["stages"] = decision.recipe.stages;
+    d["raster"] = decision.raster;
+    d["kk"] = decision.recipe.kk;
+    d["perf_class"] = query.perf_class;
+    d["crosswise"] = query.crosswise;
+    return d;
+}
+
+// Replace the runtime-injected rows wholesale (the autotuner's tier:
+// below the user's override rows, above the compiled-in ones). `source`
+// is a row-file path when one opens, else inline row text (same syntax
+// as the file); the return value is the row count installed, so a
+// mistyped path that parses as zero rows is visible to the caller
+// rather than silent.
+int inject_plan_rows(const std::string& source) {
+    std::vector<TableRow> rows;
+    if (!parse_plan_table_file(source, rows))
+        parse_plan_table_text(source, "injected rows", rows);
+    const int installed = (int)rows.size();
+    plan_table_injected_source().set(std::move(rows));
+    return installed;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime configuration: the backing of astrai.extension.plan. Every knob
+// is tri-state — py::none leaves it unchanged, an explicit value wins over
+// the one-time env seed. `table` accepts a row-file path, inline row text,
+// "-" (every row tier off) or "" (clear the override rows, tiers back on).
+// `staging` keys are positive enables: tma=False forces cp.async staging,
+// mx=False knocks the sm_120a block-scale cell out (the A/B knobs).
 // ---------------------------------------------------------------------------
 
 namespace {
 
-py::dict probe_dict(const PlanProbe& p) {
-    const char* source = "?";
-    switch (p.tier) {
-        case RowTier::kOverride: source = "override"; break;
-        case RowTier::kInjected: source = "injected"; break;
-        case RowTier::kBuiltin: source = "builtin"; break;
-        case RowTier::kDegraded: source = "degraded"; break;
-    }
-    py::dict d;
-    d["source"] = source;
-    d["cta"] = (int)p.plan.cta;
-    d["stages"] = p.plan.stages;
-    d["raster"] = p.plan.raster;
-    d["kk"] = p.plan.kk;
-    d["perf_class"] = p.perf_class;
-    d["crosswise"] = p.crosswise;
+py::dict config_state_dict() {
+    py::dict d, table, staging;
+    d["planner"] = kPlannerModeNames[gemm_planner_mode()];
+    d["log"] = gemm_plan_log_enabled();
+    table["mode"] = gemm_table_off() ? "off" : "rows";
+    table["override_rows"] =
+        (int)plan_table_override_source().size();
+    table["injected_rows"] =
+        (int)plan_table_injected_source().size();
+    staging["tma"] = !gemm_tma_staging_disabled();
+    staging["mx"] = !gemm_mx_cell_disabled();
+    d["table"] = table;
+    d["staging"] = staging;
     return d;
 }
 
 }  // namespace
 
-py::dict plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
-                    at::ScalarType dt_b, bool trans_a, bool trans_b,
-                    int64_t batch) {
-    return probe_dict(find_gemm_probe(dt_a, dt_b)(
-        m, n, k, batch, trans_a, trans_b, astrai::device_facts()));
-}
-
-// Replace the runtime-injected rows wholesale. `source` is a row-file path
-// when one opens, else inline row text (same syntax as the file); the
-// return value is the row count installed, so a mistyped path that parses
-// as zero rows is visible to the caller rather than silent.
-int set_plan_table_override(const std::string& source) {
-    std::vector<TableRow> rows;
-    if (parse_plan_table_file(source, rows)) {
-        const int installed = (int)rows.size();
-        set_plan_table_injected_rows(std::move(rows));
-        return installed;
+py::dict configure(py::object table, py::object planner, py::object log,
+                   py::object staging) {
+    gemm_config_seed_once();
+    if (!planner.is_none()) {
+        int mode = -1;
+        if (py::isinstance<py::str>(planner)) {
+            const std::string name = planner.cast<std::string>();
+            if (!parse_planner_mode(name, mode))
+                throw std::invalid_argument(
+                    "planner must be 'table', 'hybrid' or 'model', got '" +
+                    name + "'");
+        } else {
+            mode = planner.cast<int>();
+            if (mode < 0 || mode >= kPlannerModeCount)
+                throw std::invalid_argument("planner mode must be 0..2");
+        }
+        gemm_config().planner = mode;
     }
-    parse_plan_table_text(source, "injected rows", rows);
-    const int installed = (int)rows.size();
-    set_plan_table_injected_rows(std::move(rows));
-    return installed;
+    if (!log.is_none()) gemm_config().log = log.cast<bool>() ? 1 : 0;
+    if (!staging.is_none()) {
+        py::dict s = staging.cast<py::dict>();
+        if (s.contains("tma"))
+            gemm_config().tma_disabled = s["tma"].cast<bool>() ? 0 : 1;
+        if (s.contains("mx"))
+            gemm_config().mx_disabled = s["mx"].cast<bool>() ? 0 : 1;
+    }
+    if (!table.is_none()) {
+        const std::string source = table.cast<std::string>();
+        if (source == "-") {
+            gemm_config().table_off = 1;
+        } else if (source.empty()) {
+            gemm_config().table_off = 0;
+            plan_table_override_source().clear();
+        } else {
+            gemm_config().table_off = 0;
+            std::vector<TableRow> rows;
+            if (!parse_plan_table_file(source, rows))
+                parse_plan_table_text(source, "override rows", rows);
+            plan_table_override_source().set(std::move(rows));
+        }
+    }
+    return config_state_dict();
 }
 
 // The recipe vocabulary per (crosswise, operand widths) — every
@@ -250,7 +308,8 @@ std::vector<std::vector<int>> tile_vocabulary() {
     for (int crosswise = 0; crosswise <= 1; ++crosswise)
         for (const auto& [ba, bb] : widths)
             for (const GemmRecipe& r : gemm_recipes_for(crosswise != 0, ba, bb))
-                out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk});
+                out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk,
+                               r.bm, r.bn, r.threads, r.smem});
     return out;
 }
 
@@ -387,8 +446,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("k"), py::arg("dt_a"), py::arg("dt_b"),
           py::arg("trans_a") = false, py::arg("trans_b") = true,
           py::arg("batch") = 1);
-    m.def("set_plan_table_override", &astrai::gemm::set_plan_table_override,
+    m.def("inject_plan_rows", &astrai::gemm::inject_plan_rows,
           py::arg("source"));
+    m.def("configure", &astrai::gemm::configure, py::arg("table") = py::none(),
+          py::arg("planner") = py::none(), py::arg("log") = py::none(),
+          py::arg("staging") = py::none());
+    m.def("config_state", &astrai::gemm::config_state_dict);
     m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary);
     m.def("device_facts_info", &astrai::gemm::device_facts_info);
 }

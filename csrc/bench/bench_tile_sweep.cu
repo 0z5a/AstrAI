@@ -371,15 +371,16 @@ std::vector<Row> sweep_shape(int m, int n, int k, bool use_scale, int warmup,
     return rows;
 }
 
-// The production-manifest entry a plan names, by (cta class, stages).
+// The production-manifest entry a decision names, by (cta class, stages).
 template <typename EA, typename EB>
-int planned_candidate_index(const GemmPlan& plan) {
+int planned_candidate_index(const PlanDecision& d) {
     int found = -1;
     for_each_candidate<typename Space<EA, EB>::Tiles>(
         [&]<typename Tile, int I>() {
         if constexpr (Space<EA, EB>::template is_prod<Tile>()) {
-            if (found < 0 && tile_class<Tile>() == plan.cta &&
-                Tile::kStages == plan.stages)
+            if (found < 0 &&
+                tile_class<Tile>() == static_cast<TileClass>(d.recipe.cta) &&
+                Tile::kStages == d.recipe.stages)
                 found = I;
         }
     });
@@ -406,7 +407,8 @@ void report_shape(const char* cfg, const std::vector<Row>& rows, int m, int n,
     // The sweep only times the NT (fused-linear) route, which is the layout
     // pair the candidates above are built with; the plan derives its own
     // perf class, widths and crosswise count from those same tags.
-    const GemmPlan plan = plan_of<EA, EB, RowMajor, ColMajor>(p);
+    const PlanDecision plan =
+        plan_dispatch_for<EA, EB, RowMajor, ColMajor>(p);
     const int pi = planned_candidate_index<EA, EB>(plan);
     const char* planned = pi >= 0 ? rows[(size_t)pi].tile.c_str() : "?";
 
