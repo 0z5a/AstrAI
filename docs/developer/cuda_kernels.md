@@ -228,11 +228,11 @@ byte-identical). Warp-level block_scale is an sm_120-FAMILY instruction
 datacenter Blackwell does MX through tcgen05, which needs 13.1+), so the
 cell gates on the family pass (`ASTRAI_ARCH_FAMILY >= 1200`,
 common/mma.cuh's value-macro twin of `ASTRAI_DEVICE_ARCH`) and the gemm
-fatbin carries a sm_120a image next to the plain ones (CMake appends the
-`-gencode` — the 3.22 `CUDA_ARCHITECTURES` grammar rejects the `a` suffix)
-which the driver picks on sm_120; every other pass/device falls back to the
-plain cell inside the same tree, so routing can only trade speed, never
-correctness.
+fatbin carries the sm_120a image (the arch token names it —
+`ASTRAI_CUDA_ARCH=120a`; CMake's native `a` grammar emits one image per
+token, and a plain `120` list warns at configure time) which the driver
+picks on sm_120; every other pass/device falls back to the plain cell
+inside the same tree, so routing can only trade speed, never correctness.
 `launch_plan` routes the symmetric-fp8 pair through the mx tree on sm_120
 unless `set_staging(mx=False)` knocks it out (the A/B knob; read
 once per process — separate processes to compare). End to end the fp8
@@ -557,9 +557,16 @@ cmake --build build/cmake -j 16
 ### Architecture flags
 
 `setup.py` passes the GPU compute capability to CMake via `ASTRAI_CUDA_ARCH`
-(a semicolon list, e.g. `"80;89;120"`, produces one multi-arch fatbin). When
-unset, `setup.py` auto-detects the real GPU capability through
-`torch.cuda.get_device_capability()`; the CMake fallback default is `80` (sm_80):
+(a semicolon list, e.g. `"80;89;120a"`, produces one multi-arch fatbin: one
+image per token, the driver picks the slice per device). A token is `<CC
+digits>` with an optional arch-specific `a` suffix; every numeric gate
+compares the suffix-stripped value.
+
+There is **no CMake default**: an unset or empty `ASTRAI_CUDA_ARCH` builds no
+kernel targets at all, so a GPU-less configure installs the pure-Python
+package and `loader.py` simply finds no `.so` files. When the env is unset,
+`setup.py` auto-detects the real GPU through `torch.cuda.get_device_capability()`
+(CC 12.0 reports `120a`, so a dev build gets the full-rate fp8 cell):
 
 - **sm_80+** (Ampere and later): enables the tensor-core MMA path
   (`mma.sync.m16n8k16.bf16` for bf16 attention, `mma.sync.m16n8k32` for FP8).
@@ -567,6 +574,11 @@ unset, `setup.py` auto-detects the real GPU capability through
   instructions only exist on Ada/Hopper and newer. On older architectures,
   CMake emits a warning and skips the `quantize` target so the remaining CUDA
   kernels still build successfully.
+- **sm_120a** (consumer Blackwell): the arch-specific pass that activates the
+  fp8 `block_scale` cell. Listing plain `120` for the gemm target warns at
+  configure time — the plain fp8 instruction decodes at half rate on sm_120,
+  and the runtime route keys on the device's `cc == 120`, so the mismatch is
+  silent without the warning.
 - **`-DASTRAI_NO_MMA`** is a manual escape hatch only — the build never defines
   it automatically. To disable the MMA path, add it to `NVCC_FLAGS` yourself;
   all supported build targets are sm_80+.
@@ -577,10 +589,15 @@ unset, `setup.py` auto-detects the real GPU capability through
 
 ```
 NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
-             --ptxas-options=-O3,-v --extra-device-vectorization --threads=16
+             --ptxas-options=-O3,-v --extra-device-vectorization
+             -Xfatbin --compress-all --threads=16
 ```
 
-Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all registered kernel targets in parallel via `cmake --build -j N` (the five base targets always; `quantize` additionally on sm_89+). The target list is the **single source of truth**: `KERNEL_NAMES` and the parallel `KERNEL_SRCS` list in `csrc/CMakeLists.txt`; `astrai/extension/loader.py` auto-discovers the compiled `.so` files.
+`--compress-all` stores every fatbin entry (SASS and PTX) compressed; the
+driver decompresses at module load, so the executed code is unchanged and the
+`.so` is ~4x smaller (measured per gemm TU: 8.03 MB -> 1.89 MB).
+
+Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all registered kernel targets in parallel via `cmake --build -j N` (the five base targets always; `quantize` additionally on sm_89+; nothing at all when `ASTRAI_CUDA_ARCH` is unset). The target list is the **single source of truth**: `KERNEL_NAMES` and the parallel `KERNEL_SRCS` list in `csrc/CMakeLists.txt`; `astrai/extension/loader.py` auto-discovers the compiled `.so` files.
 
 ## Python Extension Architecture
 
