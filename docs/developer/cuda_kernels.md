@@ -271,9 +271,11 @@ collectives only read the derived `Traits::kBlockM/kBlockN/...` constants,
 so this is purely a configuration surface — the generated SASS is unchanged.
 
 **Launch planning (retired 2026-09-09).** The wave-count cost model
-described here was deleted from `gemm.cuh` — production dispatch is
-table-only (AOT dispatch table below), with the degraded band rows as
-the last resort; kept below as the record of the approach and its
+described here was deleted from `gemm.cuh` — dispatch became table-only
+(AOT dispatch table below), with the degraded band rows as the last
+resort — and an analytical planner was re-added afterwards, now the
+shipped default of the hybrid chain (`ModelPlanner`, see GEMM Plan
+Autotuning). Kept below as the record of the first approach and its
 calibration (the reference planner the sweep tables were validated
 against). The congruous (NT) band picked its recipe by the wave-count
 model over the manifest —
@@ -349,8 +351,9 @@ falls through to the degraded bands instead of a failed launch). A miss
 falls to the degraded
 band rows — last-resort M-band geometry (small ≤ 512, narrow ≤ 3072,
 big beyond), always matching, so planning is a total function. The
-original cost model is deleted from the codebase (it was retired from
-production in this revision and never called again); full-coverage
+wave-count cost model is deleted from the codebase (it was retired in
+this revision, and the analytical planner of GEMM Plan Autotuning — which
+came later and now fills a table miss — is a separate thing); full-coverage
 tables end each class with a
 catch-all row, so a miss means the table is empty or stale, not a shape
 the planner should infer. Rows come
@@ -677,6 +680,38 @@ only shipped when a device-specific build pastes one in (measured 2026-09-14
 on sm_120: the previous W16A16 rows were +4.3% behind the degraded ladder
 across a holdout, six shapes past +2%). `set_planner("")` restores the
 default instead of pinning a mode.
+
+The analytical model is a port of DeepGEMM's config search
+(`get_best_configs`) that keeps only what survives measurement. DeepGEMM
+ranks candidates by **wave count**; that is a valid proxy only when every
+candidate's wave costs the same, which holds for it because its blocks are
+pinned to instruction shapes. Here a 64x64 CTA's wave carries a quarter of
+a 128x128's work, so counting waves prefers the coarse tile — measured over
+the production cells (9 shapes, sm_89), wave count ranks the shapes at
+**rho -0.90** against the measurement and picks the *worst* cell on the
+narrow-N band. Pricing the wave instead does not rescue it: written with a
+fractional last wave the makespan is `(blocks/slots) * concurrency * solo`,
+`solo` grows with `bm*bn` while `blocks` shrinks with it, and the product is
+the same `MN` for every candidate of a problem. That matches what the sweep
+measures (every production cell within 1.13-1.38x of every other on a given
+shape), so the model keeps no FLOP or traffic term at all and ranks on the
+one axis that is left:
+
+```
+better = (resident desc, stages desc, manifest order)   # resident = CTAs/SM the ring allows
+```
+
+More CTAs resident per SM, then deeper prefetch. That picks the 16-warp
+64x64 cell on the kK=32 ring, which is the measured best or second-best cell
+on **9 of 9** swept shapes. `kK` is not a model axis — DeepGEMM fixes
+`block_k` — and falls out of the same residency rule: the kK=32 twin's 48KB
+ring holds two CTAs where kK=64's 96KB holds one.
+
+Dropping the L1/L2/FLOP rates also drops the last per-architecture
+constant, so the model carries **none** and behaves the same on every part.
+What it cannot express is the per-CTA efficiency that separates the classes
+at a given `(M, N)` — the measured axis the row tables own, and the reason
+the hybrid chain keeps rows first.
 
 `ops.gemm.enable()` installs the runtime autotuner (shapes no row serves
 tune once: candidates from `tile_vocabulary` filtered to the staging pair

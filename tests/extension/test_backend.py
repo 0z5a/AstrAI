@@ -15,8 +15,6 @@ import importlib
 import pytest
 import torch
 
-from astrai.extension import dispatch
-
 from astrai.extension import (
     ATTN_BACKEND,
     AttentionBackend,
@@ -26,6 +24,7 @@ from astrai.extension import (
     TorchNativeBackend,
     attention,
     attn_backend,
+    dispatch,
     get_backend,
 )
 

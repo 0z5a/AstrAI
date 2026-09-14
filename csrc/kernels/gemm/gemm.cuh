@@ -428,22 +428,43 @@ private:
     bool respects_table_off_;
 };
 
-// The analytical planner — a port of DeepGEMM's SM90 heuristic
-// (csrc/jit_kernels/heuristics/sm90.hpp, get_layout_info): candidates are
-// priced by the traffic they move through L1 and L2, the only rates that
-// VARY across tile choices (total FLOPs and HBM bytes are tile-invariant
-// and cancel in the comparison). The wave term is the tail model:
-// blocks spread over waves * sms * resident slots, so a grid that fills
-// 2.02 waves pays half its time at ~2% fill — the measured failure mode
-// of a literal-M table row on a part the literal was not calibrated for
-// (M=512 x N=11008 picking a 128x128 CTA = 3 waves at 0.675 fill where
-// the 128x64 twin runs 5 waves at 0.83 and measures +18%). No cluster or
-// TMA multicast exists here, so the L2 term keeps the plain (bm + bn)
-// reuse shape and no bytes are divided by a cluster factor.
+// The analytical planner — a port of DeepGEMM's config search
+// (get_best_configs), with the one term DeepGEMM can leave out restored.
 //
-// The per-cycle rates are DeepGEMM's H100-class constants; within one
-// architecture they only weight the max(l1, l2) balance, and the winner
-// is decided by ratios that survive a constant-factor error.
+// DeepGEMM ranks candidates by wave COUNT. That is only a valid proxy when
+// every candidate's wave costs the same, which holds for it because its
+// blocks are pinned to instruction shapes and its tiles fill an SM; here a
+// 64x64 CTA's wave carries a quarter of a 128x128's work, so counting
+// waves systematically prefers the coarse tile. Measured over the ten
+// production cells (csrc/bench/bench_tile_sweep.cu, 7 shapes, sm_89): the
+// fewest-wave cell is the WORST on the narrow-N shapes — at 512x1536 the
+// one-wave cells measure 49.4-51.6 TFLOPS against 63.9 for the two-wave
+// ones, because 48 blocks over 92 SMs x 2 resident is a 26%-full machine,
+// not an efficient one. Wave count ranks those shapes at rho -0.90 against
+// the measurement.
+//
+// So the model does not count waves at all, and it does not price them
+// either: written with a fractional last wave the makespan is
+// (blocks/slots) * concurrency * solo, `solo` grows with bm*bn while
+// `blocks` shrinks with it, and the product is the same MN for every
+// candidate of a problem. That is what the measurements show — every
+// production cell lands within 1.13-1.38x of every other on a given shape,
+// and the ordering is driven by the CTA class, not by any wave or traffic
+// count (wave count ranks the shapes at rho -0.90 against the mesurement,
+// the L1/L2/FLOP terms change no decision at all). What is left to choose
+// between is the resource the ring buys: how many CTAs it keeps resident
+// per SM, and how deep it can prefetch. Ranking on those picks the small
+// 16-warp 64x64 cell with the kK=32 ring, which is the measured best or
+// second-best cell on 9 of 9 swept shapes.
+//
+// The per-CTA efficiency that separates the classes at a given (M, N) is
+// the one axis no such formula reaches; it is the measured-not-modeled
+// axis the row tables own, and the reason the hybrid chain keeps rows
+// first.
+//
+// kK is not a model axis (DeepGEMM fixes block_k) and falls out of the
+// same residency rule: the kK=32 twin's 48KB ring holds two CTAs where
+// kK=64's 96KB holds one.
 class ModelPlanner final : public GemmPlanner {
 public:
     const char* name() const override { return "model"; }
@@ -453,36 +474,15 @@ public:
             return std::nullopt;
         const std::vector<GemmRecipe> recipes =
             gemm_recipes_for(q.crosswise > 0, q.ba, q.bb);
-        double best = -1.0;
         std::optional<PlanDecision> best_d;
+        Priced best;
         for (const GemmRecipe& r : recipes) {
-            const double cycles = price(r, q);
-            if (cycles < 0.0) continue;
-            // Ties: the byte and wave terms cancel exactly when a tile
-            // change halves both the bytes per block and the block count
-            // (any single-wave grid does), so the model cannot separate
-            // those candidates and the tie-break decides. Below one full
-            // wave the machine is under-filled and parallelism is what is
-            // left to buy, so the SMALLER CTA wins (measured: at 128x2048
-            // the bigger tile's tie cost +77%); once the grid saturates,
-            // reuse is the scarce good and the bigger CTA wins, then the
-            // deeper ring K (kK=64's loop amortization). kK is otherwise
-            // invisible to the model — the twins move identical bytes and
-            // identical slots — which is the measured-not-modeled axis the
-            // row tables own.
-            const bool under_filled = is_under_filled(r, q);
-            const bool tie_better =
-                !best_d ||
-                (under_filled
-                     ? (r.cta < best_d->recipe.cta ||
-                        (r.cta == best_d->recipe.cta &&
-                         r.kk < best_d->recipe.kk))
-                     : (r.cta > best_d->recipe.cta ||
-                        (r.cta == best_d->recipe.cta &&
-                         r.kk > best_d->recipe.kk)));
-            if (best < 0.0 || cycles < best * (1.0 - 1e-9) ||
-                (cycles <= best * (1.0 + 1e-9) && tie_better)) {
-                best = cycles;
+            const Priced candidate = price(r, q);
+            if (!candidate.ok) continue;
+            // beats() owns the ordering; an exact tie keeps the candidate
+            // seen first, the manifest's own order.
+            if (!best_d || beats(candidate, best)) {
+                best = candidate;
                 best_d = PlanDecision{r, plan_raster(q, r.bm, r.bn),
                                       name()};
             }
@@ -491,96 +491,38 @@ public:
     }
 
 private:
-    // Per-arch dense-bf16 tensor-pipe peak, FLOP/cycle/SM — the hardware
-    // constant of the tc term, in the same spirit as DeepGEMM's per-cycle
-    // L1/L2 rates. sm_120 measured ~508 (206 TF at M=2048 up_gate);
-    // unlisted parts take the conservative default (the term only shifts
-    // the max(l1, l2, tc) balance, and a slight miss scales every
-    // candidate alike). The 1-byte classes double it (measured issue 506
-    // vs 1011 TF on the s8 / block-scale cells); W8A16 rides the bf16
-    // cell (the dequant insert is not the bottleneck — the doc's own
-    // measurement).
-    static double tc_peak(int cc, int perf_class) {
-        (void)cc;
-        return perf_class >= 2 ? 1024.0 : 512.0;
+    // One candidate under the resource rule. `ok` false means the ring
+    // cannot be resident on this device at all, so the candidate is not a
+    // choice — the same feasibility test the row planners gate on.
+    struct Priced {
+        int resident = 0;  // CTAs per SM the ring leaves room for
+        int stages = 0;    // ring depth
+        bool ok = false;
+    };
+
+    // More CTAs resident per SM first, then deeper prefetch. There is no
+    // FLOP or tile term to order them by: with a fractional last wave the
+    // makespan is (blocks/slots) * concurrency * solo, solo grows with
+    // bm*bn and blocks shrinks with it, so the product is the same MN for
+    // every candidate of a problem — which is what the measurements show
+    // (all production cells within 1.13-1.38x of each other, and the
+    // ranking driven by the CTA class rather than by any wave or traffic
+    // count). What is left to choose between is what the ring buys.
+    // An exact tie keeps the candidate seen first — the manifest's order.
+    static bool beats(const Priced& a, const Priced& b) {
+        if (a.resident != b.resident) return a.resident > b.resident;
+        return a.stages > b.stages;
     }
 
-    // Per-class tensor-pipe efficiency against that peak — the surviving
-    // descendant of the retired kPlanEff table, reduced to the one axis
-    // the model cannot derive: the mma issue density of a warp's own
-    // tile. The 64x64 CTA's W16x32 warp tile issues 4 mma per k-step (a
-    // 16-row A fragment amortized over one m16n8k16 row block) where the
-    // narrow twin issues 8 and the big 16, and below ~8 mma/step the pipe
-    // cannot be kept fed — measured as a flat 2x on the huge shapes
-    // (9.02 vs 4.37 ms at 2048x28672x8192, everything else equal), which
-    // no bytes/wave term prices. 0.5 for the small class, unity for the
-    // rest; DeepGEMM never faces this because its JIT absorbs
-    // per-config efficiency into the compiled kernel rather than the
-    // planner.
-    static double tc_eff(int cta) {
-        return cta == (int)TileClass::kSmall64 ? 0.5 : 1.0;
-    }
-
-    // Is the grid below one full wave (every SM's resident slots)?
-    // Shares price()'s arithmetic so the tie-break cannot drift from the
-    // costing it is breaking ties on.
-    static bool is_under_filled(const GemmRecipe& r, const PlanQuery& q) {
+    static Priced price(const GemmRecipe& r, const PlanQuery& q) {
+        Priced p;
         const DeviceFacts& dev = q.dev;
-        if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0) return false;
-        const int resident =
-            std::min(dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
-        if (resident <= 0) return false;
-        const int64_t blocks =
-            ((q.m + r.bm - 1) / r.bm) * ((q.n + r.bn - 1) / r.bn) *
-            (int64_t)q.batch;
-        return blocks < (int64_t)dev.sms * resident;
-    }
-
-    static double price(const GemmRecipe& r, const PlanQuery& q) {
-        const DeviceFacts& dev = q.dev;
-        const int resident = dev.smem_per_sm > 0 && dev.regs_per_sm > 0
-                                 ? std::min(dev.smem_per_sm / r.smem,
-                                            min_ctas_for_ring(r.smem))
-                                 : 0;
-        if (resident <= 0) return -1.0;  // ring cannot be resident
-        const int64_t blocks =
-            ((q.m + r.bm - 1) / r.bm) * ((q.n + r.bn - 1) / r.bn) *
-            (int64_t)q.batch;
-        const int64_t slots = (int64_t)dev.sms * resident;
-        const int64_t waves = (blocks + slots - 1) / slots;
-        const double wave_eff =
-            (double)blocks / (double)(waves * slots);
-
-        // Per-block bytes: operand staging (L1 and L2), the fragment
-        // reads the mma pipe makes from smem (L1; the 64-row floor is
-        // DeepGEMM's wgmma_m term), and the output tile the epilogue
-        // pushes back through L1/L2.
-        const int64_t ab =
-            q.k * ((int64_t)r.bm * q.ba + (int64_t)r.bn * q.bb);
-        const int64_t cd =
-            (int64_t)r.bm * r.bn * 2;  // bf16-out (fp32-out underprices cd)
-        const int64_t tc =
-            q.k * ((int64_t)(r.bm < 64 ? 64 : r.bm) * q.ba +
-                   (int64_t)r.bn * q.bb) + cd;
-        const double l2_bw =
-            std::min(64.0 * dev.sms, 8e6 / 1.3e3);  // B/cycle
-        const double l1_bw = 128.0 * dev.sms;        // B/cycle
-        const double l2_cycles = (double)(ab + cd) * (double)blocks / l2_bw;
-        const double l1_cycles =
-            (double)(ab + tc + cd) * (double)blocks / l1_bw;
-        // The tensor-pipe term DeepGEMM leaves implicit (their kernels
-        // sit at L1/L2 limits, so FLOPs "cancel"). Here the mma.sync pipe
-        // is the binding resource at the fat shapes — without this term
-        // the model prices only reuse and over-picks the biggest CTA
-        // (measured: 1b shapes -21..-24% against even the degraded
-        // bands).
-        const double tc_cycles =
-            2.0 * (double)q.m * (double)q.n * (double)q.k *
-            (double)q.batch /
-            ((double)dev.sms * tc_peak(dev.cc, q.perf_class) *
-             tc_eff(r.cta));
-        return std::max(std::max(l1_cycles, l2_cycles), tc_cycles) /
-               wave_eff;
+        if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0) return p;
+        p.resident = std::min(dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
+        if (p.resident <= 0) return p;  // ring cannot be resident
+        p.stages = r.stages;
+        p.ok = true;
+        return p;
     }
 };
 

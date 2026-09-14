@@ -1,10 +1,10 @@
 """Runtime plan API tests (the gemm adapter's set_*/probe surface).
 
 These exercise the C++ planner through the real binding, so they need a
-built gemm module and a CUDA device. The dispatch behavior itself (which
-recipe wins, tier ranking) is covered by the pure-planner tests in C++ and
-by the sweep scripts; what is under test here is the configuration API's
-contract: precedence, modes, table install/clear, and the probe report.
+built gemm module and a CUDA device. The configuration API's contract —
+precedence, modes, table install/clear, the probe report — is what the
+first classes cover; the analytical planner's own selection RULE is
+covered by TestModelRule below.
 """
 
 import pytest
@@ -14,12 +14,8 @@ from astrai.extension import ops
 from astrai.extension.loader import is_available
 
 pytestmark = [
-    pytest.mark.skipif(
-        not torch.cuda.is_available(), reason="CUDA not available"
-    ),
-    pytest.mark.skipif(
-        not is_available("gemm"), reason="gemm kernel not built"
-    ),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"),
+    pytest.mark.skipif(not is_available("gemm"), reason="gemm kernel not built"),
 ]
 
 SHAPE = (512, 11008, 4096)  # the wide-N band the analytical model wins
@@ -28,12 +24,17 @@ ROW = "511 513 8191 0 0 0 1 3 0 64"  # narrow CTA, 3 stages, kK 64
 
 @pytest.fixture(autouse=True)
 def _clean_plan_state():
+    # Both row tiers, not just the override: set_table("") clears the
+    # override rows only, so an injected row leaked from another test would
+    # keep answering ahead of the planner under test.
     ops.gemm.set_table("")
+    ops.gemm.inject_rows("")
     ops.gemm.set_planner("")  # back to the shipped default
     ops.gemm.set_staging()
     ops.gemm.set_log(False)
     yield
     ops.gemm.set_table("")
+    ops.gemm.inject_rows("")
     ops.gemm.set_planner("")  # back to the shipped default
     ops.gemm.set_staging()
     ops.gemm.set_log(False)
@@ -141,8 +142,14 @@ class TestProbe:
                 threads,
                 smem,
             ) = entry
-            assert (crosswise, ba, bb) in ((0, 2, 2), (1, 2, 2), (0, 2, 1),
-                                           (1, 2, 1), (0, 1, 1), (1, 1, 1))
+            assert (crosswise, ba, bb) in (
+                (0, 2, 2),
+                (1, 2, 2),
+                (0, 2, 1),
+                (1, 2, 1),
+                (0, 1, 1),
+                (1, 1, 1),
+            )
             assert cta in (0, 1, 2, 3)
             assert stages in (2, 3)
             assert kk in (32, 64)
@@ -154,3 +161,66 @@ class TestProbe:
         assert facts["sms"] > 0
         assert facts["cc"] >= 80
         assert facts["l2_bytes"] > 0
+
+
+class TestModelRule:
+    """The planner's resource rule, asserted as a RULE rather than as a
+    recipe so it holds on any device.
+
+    No wave count and no traffic term survives in the model: with a
+    fractional last wave the FLOP term cancels across the candidates of one
+    problem, which is what the sweep measures (every production cell lands
+    within 1.13-1.38x of every other on a given shape, and wave count ranks
+    them at rho -0.90 against the measurement). What is left to choose
+    between is the resource the ring buys — CTAs resident per SM, then
+    prefetch depth. This pins the planner to that, and pins that it never
+    trades residency away for ring depth.
+    """
+
+    SHAPES = (
+        (512, 11008, 4096),
+        (4096, 1536, 1536),
+        (4096, 4096, 4096),
+        (4096, 11008, 4096),
+        (2048, 28672, 8192),
+    )
+
+    @staticmethod
+    def _resource(entry, facts):
+        """(resident, stages) for one vocabulary entry, or None when the
+        ring is not resident on this device at all.
+
+        Mirrors policy.cuh's min_ctas_for_ring against the per-SM smem
+        budget — the only way to assert the rule from Python. Deliberately
+        independent of the shape: the rule does not consult it.
+        """
+        smem = entry[9]
+        resident = min(facts["smem_per_sm"] // smem, 2 if smem <= 48 * 1024 else 1)
+        if resident <= 0:
+            return None
+        return resident, entry[4]  # (resident, stages)
+
+    def test_pick_attains_the_best_ring_resource(self):
+        facts = ops.gemm.facts()
+        vocab = [
+            entry
+            for entry in ops.gemm.tile_vocabulary()
+            if (entry[0], entry[1], entry[2]) == (0, 2, 2)  # NT, bf16 x bf16
+        ]
+        assert vocab, "the vocabulary carries no bf16 x bf16 candidates"
+        for shape in self.SHAPES:
+            by_recipe = {}
+            for entry in vocab:
+                resource = self._resource(entry, facts)
+                if resource is not None:
+                    by_recipe[tuple(entry[3:6])] = resource
+            assert by_recipe, f"no resident candidate for {shape}"
+
+            info = ops.gemm.probe(*shape)
+            assert info["source"] == "model", shape
+            picked = (info["cta"], info["stages"], info["kk"])
+            assert picked in by_recipe, f"{shape}: {picked} is not a candidate"
+            assert by_recipe[picked] == max(by_recipe.values()), (
+                f"{shape}: picked {picked} with ring resource "
+                f"{by_recipe[picked]}, the best is {max(by_recipe.values())}"
+            )

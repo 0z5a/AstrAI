@@ -29,6 +29,7 @@ FACTS = {
     "cc": 89,
 }
 
+
 # The cross-section of tile_vocabulary rows the fake serves, in the
 # binding's 10-field form (cw, ba, bb, cta, stages, kk, bm, bn, threads,
 # smem). smem follows policy.cuh's ring formula so the feasibility paths
@@ -40,13 +41,28 @@ def _ring(bm, bn, kk, stages, ba, bb):
 _GEOMETRY = {0: (64, 64), 1: (128, 64), 2: (128, 128), 3: (128, 256)}
 
 VOCAB = [
-    [cw, ba, bb, cta, stages, kk, *_GEOMETRY[cta], 256,
-     _ring(*_GEOMETRY[cta], kk, stages, ba, bb)]
+    [
+        cw,
+        ba,
+        bb,
+        cta,
+        stages,
+        kk,
+        *_GEOMETRY[cta],
+        256,
+        _ring(*_GEOMETRY[cta], kk, stages, ba, bb),
+    ]
     for cw in (0, 1)
     for ba, bb in ((2, 2), (2, 1), (1, 1))
     for cta, stages, kk in (
-        (0, 2, 64), (0, 3, 64), (1, 2, 64), (1, 3, 64),
-        (2, 2, 64), (2, 3, 64), (0, 2, 32), (2, 2, 32),
+        (0, 2, 64),
+        (0, 3, 64),
+        (1, 2, 64),
+        (1, 3, 64),
+        (2, 2, 64),
+        (2, 3, 64),
+        (0, 2, 32),
+        (2, 2, 32),
     )
     if not (kk == 32 and (ba, bb) != (2, 2))  # kK=32 is dual-2-byte only
 ] + [
@@ -174,9 +190,7 @@ class TestHeuristicRows:
         # A part that cannot opt in past 48KB keeps every ring inside it:
         # the 2-byte s3 small ring (64KB) demotes to s2 while the thinner
         # (2, 1)-width ring (48KB) legitimately keeps its depth.
-        small = heuristic_rows(
-            {**FACTS, "smem_max": 48 * 1024}, VOCAB, WIDTH_PERF
-        )
+        small = heuristic_rows({**FACTS, "smem_max": 48 * 1024}, VOCAB, WIDTH_PERF)
         for r in small:
             assert ring_of(r) <= 48 * 1024
         assert all(

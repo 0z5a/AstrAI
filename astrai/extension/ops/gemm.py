@@ -62,6 +62,7 @@ def _dtype_of(name: str):
     """The torch dtype for a _WIDTHS_OF key spelling."""
     return getattr(torch, name.removeprefix("torch."))
 
+
 # The autotune hook (GemmAutotuner.note): None unless
 # ASTR_GEMM_AUTOTUNE=1 or enable() installed one — the off path costs one
 # flag check.
@@ -192,8 +193,6 @@ def tile_vocabulary() -> list:
     return get_module("gemm").tile_vocabulary()
 
 
-
-
 # ---------------------------------------------------------------------------
 # Runtime autotuner: humming's prepare-time dispatch, AOT form. The run
 # path stays a row lookup in C++; this half only fills holes the AOT table
@@ -282,8 +281,7 @@ def heuristic_rows(facts: dict, vocab, width_perf: dict) -> List[Row]:
     here mirrors policy.cuh or gemm.cu by hand.
     """
     ring = {
-        (entry[3], entry[4], entry[5], entry[1], entry[2]): entry[9]
-        for entry in vocab
+        (entry[3], entry[4], entry[5], entry[1], entry[2]): entry[9] for entry in vocab
     }  # (cta, stages, kk, ba, bb) -> ring smem, from tile_vocabulary
     rows: List[Row] = []
     for (ba, bb), perf in sorted(width_perf.items()):
@@ -329,9 +327,7 @@ class GemmAutotuner:
             else max_shapes
         )
         self._trigger = int(
-            os.environ.get(ENV_TRIGGER, DEFAULT_TRIGGER)
-            if trigger is None
-            else trigger
+            os.environ.get(ENV_TRIGGER, DEFAULT_TRIGGER) if trigger is None else trigger
         )
         self._cache_dir = cache_dir
         self._cache_path: Optional[Path] = None
@@ -386,8 +382,7 @@ class GemmAutotuner:
         ).expanduser()
         self._cache_path = cache_dir / f"{device_signature(self._facts)}.rows"
         self._rows = self._load_rows(self._cache_path)
-        self._base_rows = heuristic_rows(self._facts, self._vocab,
-                                       self._width_perf)
+        self._base_rows = heuristic_rows(self._facts, self._vocab, self._width_perf)
         self._install()
         if time_budget_s > 0:
             self._deadline = time.monotonic() + time_budget_s
@@ -583,7 +578,12 @@ class GemmAutotuner:
                 m, n, k, batch, crosswise, _, _ = key
                 logger.info(
                     "gemm autotune %dx%dx%d b=%d cw %d -> cta%d s%d k%d",
-                    m, n, k, batch, crosswise, *winner.recipe(),
+                    m,
+                    n,
+                    k,
+                    batch,
+                    crosswise,
+                    *winner.recipe(),
                 )
             # Refresh the coverage answer whatever happened: a winner's
             # grown band covers the shape, a failure leaves it uncovered
@@ -591,9 +591,7 @@ class GemmAutotuner:
             info = self._probe(a, b, key, trans_a, trans_b)
             self._tiers[key] = str(info["source"])
             prob = Problem(*key[:3], key[3], int(info["perf_class"]), key[4])
-            self._covered[key] = any(
-                self._row_matches(prob, r) for r in self._rows
-            )
+            self._covered[key] = any(self._row_matches(prob, r) for r in self._rows)
         finally:
             self._tuning = False
 

@@ -45,7 +45,6 @@ def cli() -> None:
     """Plan-table tuning pipeline."""
 
 
-
 # Combo name -> (activation dtype, weight dtype). Scales: int8 operands
 # require their dequant scale, fp8 accept one optionally (a [1] per-tensor
 # scalar), bf16 rejects one. Matches the csrc dispatch (gemm.cu).
@@ -253,9 +252,7 @@ def candidate_recipes(combo: str) -> tuple[str, ...]:
     ) + ("model",)
 
 
-_TAG_RE = re.compile(
-    r"\[gemm-plan\] (override|injected|builtin|model|degraded)\b"
-)
+_TAG_RE = re.compile(r"\[gemm-plan\] (override|injected|builtin|model|degraded)\b")
 
 
 def _last_tag(text: str) -> str:
@@ -401,9 +398,7 @@ def sweep(
     # default answers with the analytical model; a table-pinned process
     # with the degraded ladder).
     no_row_source = (
-        "degraded (no table)"
-        if ops.gemm.state()["planner"] == "table"
-        else "model"
+        "degraded (no table)" if ops.gemm.state()["planner"] == "table" else "model"
     )
     torch.manual_seed(0)
     results = []
@@ -429,9 +424,7 @@ def sweep(
                         ops.gemm.set_table("-")
                     else:
                         ops.gemm.set_table(candidate_rows[recipe])
-                    expected = (
-                        no_row_source if recipe == "model" else "override"
-                    )
+                    expected = no_row_source if recipe == "model" else "override"
                     if (combo, recipe) not in tags:
                         tags[(combo, recipe)] = _planned_tag(run)
                     if tags[(combo, recipe)] != expected:
@@ -846,8 +839,6 @@ def plan_table_command(
         click.echo(f"use: plan.set_table({output!r})")
 
 
-
-
 def parse_holdout_shape(value: str) -> tuple[str, int, int, int]:
     name, m, n, k = value.split(":")
     return name, int(m), int(n), int(k)
@@ -1018,8 +1009,6 @@ def validate_command(
         click.echo(f"saved records to {output}")
 
 
-
-
 # Repo root: the stage subprocesses run with it as their cwd (the astrai
 # package must import from the checkout).
 REPO = Path(__file__).resolve().parents[2]
@@ -1133,9 +1122,7 @@ def _install(rows_path: Path, out_dir: Path, sig: str, argv: list[str]) -> Path:
     default=None,
     help="Explicit K grid passthrough (used when --shapes is empty).",
 )
-@click.option(
-    "--combos", default=None, help="Comma list passthrough to sweep."
-)
+@click.option("--combos", default=None, help="Comma list passthrough to sweep.")
 @click.option(
     "--batch", default=1, show_default=True, help="Passthrough to both stages."
 )
@@ -1285,11 +1272,9 @@ def main(
         dest = _install(candidate, out_dir, sig, sys.argv[1:])
     click.echo(f"installed: {dest}")
     click.echo(
-        f"serve without rebuild: ops.gemm.set_table(\"{dest}\")\n"
+        f'serve without rebuild: ops.gemm.set_table("{dest}")\n'
         "(the runtime autotuner picks it up as its cache automatically)"
     )
-
-
 
 
 if __name__ == "__main__":
