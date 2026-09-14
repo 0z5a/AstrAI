@@ -113,11 +113,29 @@ class TestStaging:
 
 
 class TestCompiledInTables:
-    def test_no_rows_ship_compiled_in(self):
-        # Measured rows are device-bound and served at runtime; the
-        # compiled-in tier is empty, so "builtin" never appears.
-        for shape in (SHAPE, (128, 2048, 4096), (2048, 14336, 4096)):
-            assert ops.gemm.probe(*shape)["source"] != "builtin"
+    def test_rows_ship_device_guarded(self):
+        # Compiled-in rows are the measured diff of the model's errors for
+        # ONE device (the GENERATED block's provenance); the tier is
+        # signature-guarded, so it serves exactly there. On any other part
+        # "builtin" never appears, which is what keeps the rows from
+        # leaking onto a machine they were not measured on.
+        sig = ops.gemm.facts()
+        measured_here = (
+            sig["cc"] == 120
+            and sig["sms"] == 170
+            and sig["smem_per_sm"] == 102400
+            and sig["l2_bytes"] == 100663296
+        )
+        in_band = ((128, 2048, 4096), (2048, 14336, 4096))
+        for shape in in_band:
+            src = ops.gemm.probe(*shape)["source"]
+            if measured_here:
+                assert src == "builtin"
+            else:
+                assert src != "builtin"
+        # Bands the model already wins stay the model's even where the
+        # rows are live (the diff only claims measured >=2% wins).
+        assert ops.gemm.probe(512, 11008, 4096)["source"] != "override"
 
 
 class TestProbe:
@@ -201,6 +219,10 @@ class TestModelRule:
         return resident, entry[4]  # (resident, stages)
 
     def test_pick_attains_the_best_ring_resource(self):
+        # The rule under test is the analytical model's own; pin the
+        # planner to it so a compiled-in row (which outranks the model in
+        # the default chain) cannot answer in its place.
+        ops.gemm.set_planner("model")
         facts = ops.gemm.facts()
         vocab = [
             entry

@@ -488,24 +488,147 @@ inline bool gemm_table_off() {
 }
 
 // BEGIN GENERATED
-// Compiled-in rows are EMPTY by default: a measured row is calibrated to
-// the part it was measured on, and a stale one is worse than no row at all
-// (measured 2026-09-14 on sm_120: the previous W16A16 rows cost +4.3% vs
-// the degraded floor across a holdout, with six shapes past +2% and one at
-// +33%). The shipped default is therefore the analytical planner: with the
-// tables empty the chain runs override rows -> injected rows (the
-// autotuner's) -> [no builtin rows] -> the model -> the degraded floor, so
-// a device gets measured recipes from `plan.set_table` or the autotuner
-// cache at runtime instead of a rebuild.
+// Compiled-in rows are the measured DIFF of the analytical model, not a
+// full-coverage table: a row is emitted only where its recipe beat the
+// model's own dispatch by >=2% in an INTERLEAVED A/B re-measure (four
+// alternating trials per point) — the sweep itself always measures the
+// model reference last at each point, i.e. at the hottest clock state,
+// which underprices it by 10-20% on heavy shapes and made batch-ordered
+// diff tables overclaim (measured 2026-09-14; the same bias explains
+// phase-ordered validate swings on the llama-sized holdouts). Ties and
+// unmeasured bands therefore serve the model tier, and the rows below
+// are exactly the model's confirmed errors, measured 2026-09-14 on this
+// box's sm_120 / RTX 5090 / 170 SMs over M {1..4096} x N {1024..28672}
+// x K {1536,4096,8192}, gated by a production-semantics holdout at 2%.
 //
-// A device-specific build can still paste measured rows here, between the
-// GENERATED markers: `csrc/bench/tune_plan_table.py sweep --emit cpp`
-// writes them as initializers grouped per class. Rows are data, so they
-// carry no kernel pointers; the class keying is checked below.
-static constexpr std::array<TableRow, 0> kBuiltinPlanW16A16 = {};
-static constexpr std::array<TableRow, 0> kBuiltinPlanW8A16 = {};
-static constexpr std::array<TableRow, 0> kBuiltinPlanW8A8 = {};
-static constexpr std::array<TableRow, 0> kBuiltinPlanF8A8 = {};
+// A row is calibrated to the part it was measured on, and a stale one is
+// worse than no row at all (the 2026-09-14 +33% lesson). The tier is
+// therefore signature-guarded: kBuiltinPlanMeasuredOn below must equal
+// the running device's facts or the builtin tier serves nothing and the
+// chain runs override -> injected (autotuner cache, device-keyed) ->
+// [no builtin] -> model -> degraded. Another part gets its rows from a
+// sweep of its own, never from these.
+
+static constexpr std::array<TableRow, 24> kBuiltinPlanW16A16 = {{
+    {TileClass::kSmall64, 0, 768, 0, 1280, 0, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 768, 1536, 0, 1280, 0, 0, 3, 0, 64},
+    {TileClass::kBig128, 1536, 3072, 0, 1280, 0, 0, 3, 0, 32},
+    {TileClass::kSmall64, 0, 384, 1280, 2816, 0, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 384, 768, 1280, 2816, 0, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 3072, 0, 1280, 2816, 0, 0, 2, 0, 32},
+    {TileClass::kSmall64, 0, 192, 2816, 5120, 0, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 192, 384, 2816, 5120, 0, 0, 3, 0, 64},
+    {TileClass::kBig128, 384, 768, 2816, 5120, 0, 0, 2, 0, 64},
+    {TileClass::kSmall64, 0, 24, 5120, 8576, 0, 0, 3, 0, 64},
+    {TileClass::kSmall64, 24, 48, 5120, 8576, 0, 0, 2, 0, 64},
+    {TileClass::kSmall64, 48, 96, 5120, 8576, 0, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 96, 192, 5120, 8576, 0, 0, 3, 0, 64},
+    {TileClass::kSmall64, 192, 384, 5120, 8576, 0, 0, 2, 0, 32},
+    {TileClass::kNarrow128x64, 768, 1536, 5120, 8576, 0, 0, 2, 0, 32},
+    {TileClass::kSmall64, 0, 4, 8576, 19840, 0, 0, 3, 0, 64},
+    {TileClass::kSmall64, 4, 12, 8576, 19840, 0, 0, 2, 0, 32},
+    {TileClass::kNarrow128x64, 1536, 3072, 8576, 19840, 0, 0, 2, 0, 64},
+    {TileClass::kBig128, 3072, 0, 8576, 19840, 0, 0, 2, 0, 64},
+    {TileClass::kSmall64, 0, 96, 19840, 0, 0, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 96, 192, 19840, 0, 0, 0, 3, 0, 64},
+    {TileClass::kBig128, 192, 384, 19840, 0, 0, 0, 2, 0, 64},
+    {TileClass::kNarrow128x64, 384, 768, 19840, 0, 0, 0, 2, 0, 64},
+    {TileClass::kBig128, 768, 0, 19840, 0, 0, 0, 2, 0, 64},
+}};
+static constexpr std::array<TableRow, 19> kBuiltinPlanW8A16 = {{
+    {TileClass::kNarrow128x64, 768, 1536, 0, 1280, 1, 0, 3, 0, 64},
+    {TileClass::kBig128, 1536, 0, 0, 1280, 1, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 384, 768, 1280, 2816, 1, 0, 3, 0, 64},
+    {TileClass::kSmall64, 768, 3072, 1280, 2816, 1, 0, 2, 0, 64},
+    {TileClass::kNarrow128x64, 3072, 0, 1280, 2816, 1, 0, 2, 0, 32},
+    {TileClass::kNarrow128x64, 192, 384, 2816, 5120, 1, 0, 3, 0, 64},
+    {TileClass::kBig128, 384, 1536, 2816, 5120, 1, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 1536, 0, 2816, 5120, 1, 0, 2, 0, 32},
+    {TileClass::kNarrow128x64, 96, 192, 5120, 8576, 1, 0, 3, 0, 64},
+    {TileClass::kSmall64, 192, 768, 5120, 8576, 1, 0, 2, 0, 64},
+    {TileClass::kNarrow128x64, 768, 0, 5120, 8576, 1, 0, 2, 0, 32},
+    {TileClass::kSmall64, 0, 768, 8576, 19840, 1, 0, 2, 0, 64},
+    {TileClass::kNarrow128x64, 768, 3072, 8576, 19840, 1, 0, 2, 0, 32},
+    {TileClass::kBig128, 3072, 0, 8576, 19840, 1, 0, 3, 0, 64},
+    {TileClass::kSmall64, 4, 96, 19840, 0, 1, 0, 2, 0, 64},
+    {TileClass::kNarrow128x64, 96, 192, 19840, 0, 1, 0, 3, 0, 64},
+    {TileClass::kBig128, 192, 384, 19840, 0, 1, 0, 3, 0, 64},
+    {TileClass::kNarrow128x64, 384, 768, 19840, 0, 1, 0, 2, 0, 32},
+    {TileClass::kBig128, 768, 0, 19840, 0, 1, 0, 3, 0, 64},
+}};
+static constexpr std::array<TableRow, 28> kBuiltinPlanW8A8 = {{
+    {TileClass::kSmall64, 12, 768, 0, 1280, 2, 0, 3, 0, 64},
+    {TileClass::kBig128, 1536, 3072, 0, 1280, 2, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 3072, 0, 0, 1280, 2, 0, 2, 0, 64},
+    {TileClass::kSmall64, 12, 192, 1280, 2816, 2, 0, 3, 0, 64},
+    {TileClass::kSmall64, 192, 384, 1280, 2816, 2, 0, 2, 0, 64},
+    {TileClass::kBig128, 768, 1536, 1280, 2816, 2, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 1536, 3072, 1280, 2816, 2, 0, 2, 0, 64},
+    {TileClass::kBig128, 3072, 0, 1280, 2816, 2, 0, 3, 0, 64},
+    {TileClass::kSmall64, 12, 48, 2816, 5120, 2, 0, 3, 0, 64},
+    {TileClass::kSmall64, 48, 96, 2816, 5120, 2, 0, 2, 0, 64},
+    {TileClass::kSmall64, 96, 192, 2816, 5120, 2, 0, 3, 0, 64},
+    {TileClass::kBig128, 384, 768, 2816, 5120, 2, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 768, 3072, 2816, 5120, 2, 0, 2, 0, 64},
+    {TileClass::kBig128, 3072, 0, 2816, 5120, 2, 0, 2, 0, 64},
+    {TileClass::kSmall64, 12, 96, 5120, 8576, 2, 0, 3, 0, 64},
+    {TileClass::kBig128, 192, 384, 5120, 8576, 2, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 384, 768, 5120, 8576, 2, 0, 2, 0, 64},
+    {TileClass::kBig128, 768, 3072, 5120, 8576, 2, 0, 2, 0, 64},
+    {TileClass::kWide128x256, 3072, 0, 5120, 8576, 2, 0, 2, 0, 64},
+    {TileClass::kSmall64, 12, 24, 8576, 19840, 2, 0, 3, 0, 64},
+    {TileClass::kSmall64, 24, 96, 8576, 19840, 2, 0, 2, 0, 64},
+    {TileClass::kBig128, 96, 192, 8576, 19840, 2, 0, 2, 0, 64},
+    {TileClass::kWide128x256, 192, 384, 8576, 19840, 2, 0, 2, 0, 64},
+    {TileClass::kBig128, 384, 768, 8576, 19840, 2, 0, 3, 0, 64},
+    {TileClass::kBig128, 768, 3072, 8576, 19840, 2, 0, 2, 0, 64},
+    {TileClass::kWide128x256, 3072, 0, 8576, 19840, 2, 0, 2, 0, 64},
+    {TileClass::kBig128, 192, 384, 19840, 0, 2, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 384, 0, 19840, 0, 2, 0, 2, 0, 64},
+}};
+static constexpr std::array<TableRow, 28> kBuiltinPlanF8A8 = {{
+    {TileClass::kSmall64, 12, 768, 0, 1280, 3, 0, 3, 0, 64},
+    {TileClass::kBig128, 1536, 3072, 0, 1280, 3, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 3072, 0, 0, 1280, 3, 0, 2, 0, 64},
+    {TileClass::kSmall64, 12, 384, 1280, 2816, 3, 0, 3, 0, 64},
+    {TileClass::kBig128, 768, 1536, 1280, 2816, 3, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 1536, 3072, 1280, 2816, 3, 0, 2, 0, 64},
+    {TileClass::kBig128, 3072, 0, 1280, 2816, 3, 0, 2, 0, 64},
+    {TileClass::kSmall64, 12, 192, 2816, 5120, 3, 0, 3, 0, 64},
+    {TileClass::kBig128, 384, 768, 2816, 5120, 3, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 768, 1536, 2816, 5120, 3, 0, 2, 0, 64},
+    {TileClass::kBig128, 1536, 3072, 2816, 5120, 3, 0, 2, 0, 64},
+    {TileClass::kBig128, 3072, 0, 2816, 5120, 3, 0, 3, 0, 64},
+    {TileClass::kSmall64, 12, 24, 5120, 8576, 3, 0, 2, 0, 64},
+    {TileClass::kSmall64, 24, 96, 5120, 8576, 3, 0, 3, 0, 64},
+    {TileClass::kBig128, 192, 384, 5120, 8576, 3, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 384, 768, 5120, 8576, 3, 0, 2, 0, 64},
+    {TileClass::kBig128, 768, 3072, 5120, 8576, 3, 0, 2, 0, 64},
+    {TileClass::kWide128x256, 3072, 0, 5120, 8576, 3, 0, 2, 0, 64},
+    {TileClass::kSmall64, 12, 24, 8576, 19840, 3, 0, 3, 0, 64},
+    {TileClass::kSmall64, 24, 96, 8576, 19840, 3, 0, 2, 0, 64},
+    {TileClass::kBig128, 96, 192, 8576, 19840, 3, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 192, 384, 8576, 19840, 3, 0, 2, 0, 64},
+    {TileClass::kBig128, 384, 0, 8576, 19840, 3, 0, 2, 0, 64},
+    {TileClass::kSmall64, 12, 96, 19840, 0, 3, 0, 2, 0, 64},
+    {TileClass::kBig128, 192, 384, 19840, 0, 3, 0, 3, 0, 64},
+    {TileClass::kWide128x256, 384, 768, 19840, 0, 3, 0, 2, 0, 64},
+    {TileClass::kBig128, 768, 1536, 19840, 0, 3, 0, 2, 0, 64},
+    {TileClass::kWide128x256, 1536, 0, 19840, 0, 3, 0, 2, 0, 64},
+}};
+
+// The device the rows above were measured on; see the block comment.
+static constexpr DeviceFacts kBuiltinPlanMeasuredOn = {
+    /*sms=*/170, /*smem_max=*/101376, /*smem_per_sm=*/102400,
+    /*regs_per_sm=*/65536, /*l2_bytes=*/100663296, /*cc=*/120};
+
+inline bool builtin_rows_match_device(const DeviceFacts& dev) {
+    const DeviceFacts& m = kBuiltinPlanMeasuredOn;
+    return dev.cc == m.cc && dev.sms == m.sms && dev.smem_max == m.smem_max &&
+           dev.smem_per_sm == m.smem_per_sm && dev.regs_per_sm == m.regs_per_sm &&
+           dev.l2_bytes == m.l2_bytes;
+}
+
 // END GENERATED
 
 

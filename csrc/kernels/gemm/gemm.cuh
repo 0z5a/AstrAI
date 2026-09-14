@@ -477,6 +477,30 @@ public:
             return std::nullopt;
         const std::vector<GemmRecipe> recipes =
             gemm_recipes_for(q.crosswise > 0, q.ba, q.bb);
+        // The measured floor (2026-09-14, sm_120, N 1024..28672 x K
+        // 1536..8192): a byte pair at m <= 8 is bandwidth-floor-bound —
+        // every ladder candidate ran identically at every N measured
+        // (0.0% spread), so the ring buys nothing and latency hiding is
+        // not a choice; the cheapest launch (smallest ring) is the pick.
+        // The threshold is structural, not fitted: 8 is the bottom half
+        // of the byte pair's m16n8k32 mma shape, i.e. every M row
+        // already lives inside one fragment's M extent. Mixed and
+        // two-byte pairs are NOT floor-bound there (2-18% spread at wide
+        // N), so the rule owns byte pairs only.
+        if (q.ba == 1 && q.bb == 1 && q.m <= 8) {
+            std::optional<PlanDecision> floor_d;
+            int floor_smem = 0;
+            for (const GemmRecipe& r : recipes) {
+                const Priced candidate = price(r, q);
+                if (!candidate.ok) continue;
+                if (!floor_d || r.smem < floor_smem) {
+                    floor_smem = r.smem;
+                    floor_d = PlanDecision{r, plan_raster(q, r.bm, r.bn),
+                                           name()};
+                }
+            }
+            if (floor_d) return floor_d;
+        }
         std::optional<PlanDecision> best_d;
         Priced best;
         for (const GemmRecipe& r : recipes) {
@@ -551,6 +575,11 @@ inline PlanDecision plan_dispatch(const PlanQuery& q) {
     static const RowSetPlanner builtin_planner(
         "builtin",
         [](const PlanQuery& query) {
+            // Compiled-in rows are calibrated to the part they were
+            // measured on (see the GENERATED block); anywhere else the
+            // tier is inert and the model answers instead.
+            if (!builtin_rows_match_device(query.dev))
+                return std::optional<TableRow>{};
             int count = 0;
             const TableRow* rows =
                 builtin_plan_table(query.perf_class, count);
