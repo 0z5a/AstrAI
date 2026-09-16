@@ -133,30 +133,26 @@ def rules() -> dict:
     model's own byte-pair floor does."""
 
     def shipped(p, q):
-        # gemm.cuh ModelPlanner, mirrored term for term (2026-09-16 re-fit):
-        # cost_of() is (operand + output + k-tile issue) * waves * resident,
-        # the issue term pricing kK at 8 output-cell-bytes per k-iteration
-        # (byte pairs take none — their ladder is all kK=64). Byte AND
-        # two-byte pairs rank on the cost alone; mixed pairs gate on
-        # residency then cost. The stages tier is gone everywhere.
-        cost = (
-            (
-                p["b2"]
-                + 2 * p["fat"]
-                + (
-                    0
-                    if (q["ba"] == 1 and q["bb"] == 1)
-                    else 8.0 * p["fat"] * p["kiters"]
-                )
-            )
-            * p["waves"]
-            * p["resident"]
+        # gemm.cuh ModelPlanner, mirrored term for term (2026-09-16
+        # three-arm re-fit): per_cta = max(operand + output + k-tile
+        # issue, mma arm) with the issue term pricing kK at 8
+        # output-cell-bytes per k-iteration (byte pairs take none — their
+        # ladder is all kK=64) and the mma arm at 64 bytes per mma
+        # instruction (one per 16x8xkMmaK cell; kMmaK 32 on byte pairs,
+        # 16 otherwise). W_eff = waves*resident on two-byte pairs,
+        # ceil(blocks/sms) resident-blind on byte and mixed. Every pair
+        # ranks on the cost alone (the mixed residency gate is gone).
+        byte = q["ba"] == 1 and q["bb"] == 1
+        dev = device_facts()
+        mem = p["b2"] + 2 * p["fat"] + (
+            0 if byte else 8.0 * p["fat"] * p["kiters"]
         )
-        if q["ba"] == 1 and q["bb"] == 1:
-            return (-cost,)
+        mma = 64 * p["fat"] * q["k"] // (128 * (32 if byte else 16))
         if q["ba"] == 2 and q["bb"] == 2:
-            return (-cost,)
-        return (p["resident"], -cost)
+            weff = p["waves"] * p["resident"]
+        else:
+            weff = (p["blocks"] + dev["sms"] - 1) // dev["sms"]
+        return (-max(mem, mma) * weff,)
 
     def cost_of(p, issue=0.0):
         # shipped cost plus, when issue > 0, a per-k-tile overhead every

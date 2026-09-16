@@ -486,102 +486,53 @@ public:
             return std::nullopt;
         const std::vector<GemmRecipe> recipes =
             gemm_recipes_for(q.crosswise > 0, q.ba, q.bb);
-        // Width-pair ranking (2026-09-16 full-grid re-fit: 768 cells x 4
-        // classes, cross-checked on both 09-14 grids):
-        // - byte pairs rank on the cost alone (unchanged since 2026-09-14;
-        //   that re-fit took their capture 0.812 -> 0.983 and retired the
-        //   m<=8 smallest-ring floor, whose 0.0%-spread rationale never
-        //   reproduced — within-cell spread there is 143% median).
-        // - two-byte pairs rank on the cost alone TOO: the full grid
-        //   measured the resource prefix a net loss on them. The stages
-        //   tier handed 485/768 w16a16 cells to the S3 twin while S2
-        //   measured faster, and what residency was right about is
-        //   recoverable by the cost once kK is priced (cost_of's issue
-        //   term). Capture 0.9155 -> 0.9623 on the grid, 0.9239 -> 0.9664
-        //   and 0.8906 -> 0.9854 on the 09-14 sets.
-        // - mixed pairs keep the residency gate, drop only the stages tier
-        //   (0.9056 -> 0.9504 grid, 0.9387 -> 0.9588 on 09-14): their
-        //   winner still tracks the ring, but not its depth.
-        const bool byte_pair = q.ba == 1 && q.bb == 1;
-        const bool mixed_pair = q.ba + q.bb == 3;
-        std::optional<PlanDecision> best_d;
-        RankKey best_key{};
+        const GemmRecipe* best = nullptr;
+        std::int64_t best_cost = 0;
         for (const GemmRecipe& r : recipes) {
-            const Priced candidate = price(r, q, byte_pair);
-            if (!candidate.ok) continue;
-            // key_of owns the ordering; a key equal on every field keeps
-            // the candidate seen first, the manifest's own order.
-            const RankKey key = key_of(candidate, mixed_pair);
-            if (!best_d || key < best_key) {
-                best_key = key;
-                best_d = PlanDecision{r, plan_raster(q, r.bm, r.bn),
-                                      name()};
+            const int resident = resident_of(r, q);
+            if (resident <= 0) continue;  // ring cannot be resident
+            const std::int64_t cost = cost_of(r, q, resident);
+            // every width pair ranks on the cost alone; a tie keeps the
+            // candidate seen first, the manifest's own order
+            if (!best || cost < best_cost) {
+                best = &r;
+                best_cost = cost;
             }
         }
-        return best_d;
+        if (!best) return std::nullopt;
+        return PlanDecision{*best, plan_raster(q, best->bm, best->bn),
+                            name()};
     }
 
 private:
-    // Per-k-tile overhead every block pays ceil(q.k/kK) times — the
-    // mainloop's own tile_count, tail partial tile included (ring-refill
-    // barrier, mma issue, load scheduling), priced as this many
-    // output-cell-bytes per k-iteration — the term that makes kK a model
-    // axis. Fitted at 8 on the 2026-09-16 768-cell w16a16 grid (RTX 5090,
-    // bf16 out) and cross-checked on both 09-14 grids; the fit is that
-    // box+dtype's, so re-fit before trusting it elsewhere. Byte pairs take
-    // none: their ladder is all kK=64, the term degenerates to an output
-    // re-weight there, and the 09-14 grids measured that a wash.
+    // Both constants are 2026-09-16 RTX 5090 grid fits — re-fit per box.
+    // kKTileIssueBytes: per-k-tile overhead (ring-refill barrier, mma
+    // issue, load scheduling) priced as output-cell-bytes per k-iteration
+    // — the term that makes kK a model axis. Byte pairs take none: their
+    // ladder is all kK=64, the term degenerates to an output re-weight.
     static constexpr std::int64_t kKTileIssueBytes = 8;
+    // kMmaArmBytesPerInstr: the tensor-pipe arm — one mma instruction per
+    // 16x8xkMmaK cell (kMmaK 32 on byte pairs, 16 otherwise; mma.cuh's
+    // 256-bit A-fragment invariant), priced at this many bytes per
+    // instruction.
+    static constexpr std::int64_t kMmaArmBytesPerInstr = 64;
 
-    // One candidate under the model. `ok` false means the ring cannot be
-    // resident on this device at all, so the candidate is not a choice — the
-    // same feasibility test the row planners gate on.
-    struct Priced {
-        int resident = 0;       // CTAs per SM the ring leaves room for
-        std::int64_t cost = 0;  // modelled on-chip cycles (cost_of)
-        bool ok = false;
-    };
-
-    // The ranking key, one lexicographic comparison: mixed pairs gate on
-    // residency first (their winner tracks the ring — higher tier wins),
-    // byte and two-byte pairs carry no tier, so the cost alone ranks them.
-    // The stages tier is gone everywhere (2026-09-16 full grid: it preferred
-    // the S3 twin in the 485/768 cells where S2 measured faster). A key
-    // equal on every field keeps the candidate seen first — the manifest's
-    // own order.
-    struct RankKey {
-        int resident_tier;  // 0 unless a mixed pair's residency gate
-        std::int64_t cost;
-        bool operator<(const RankKey& o) const {
-            return resident_tier != o.resident_tier
-                       ? resident_tier > o.resident_tier
-                       : cost < o.cost;
-        }
-    };
-    static RankKey key_of(const Priced& p, bool mixed_pair) {
-        return RankKey{mixed_pair ? p.resident : 0, p.cost};
+    static int resident_of(const GemmRecipe& r, const PlanQuery& q) {
+        if (q.dev.smem_per_sm <= 0 || q.dev.regs_per_sm <= 0) return 0;
+        return std::min(q.dev.smem_per_sm / r.smem,
+                        min_ctas_for_ring(r.smem));
     }
 
-    // The modelled cost of one tile: per-block on-chip bytes, times the waves
-    // the problem needs, times its resident CTAs. Derived from DeepGEMM's
-    // get_best_config (jit_kernels/heuristics/sm90.hpp), whose
-    // `num_cycles = max(L1, L2) / wave_efficiency` collapses — per-SM
-    // bandwidths b1/b2, wave_efficiency = blocks/(waves*resident) — to
-    // `max(l1*b2, l2*b1) * waves * resident`, so `blocks` cancels and only
-    // the bandwidth RATIO survives. On every supported part the L2 term binds
-    // (per-SM L2 bandwidth sits an order below per-SM L1), which leaves the
-    // ratio inert and the cost constant-free:
-    //
-    //     cost = (operand_bytes + output_bytes + issue_bytes) * waves * resident
-    //
-    // Checked against the two 09-14 sweeps: the collapsed form picks the
-    // same tile as the two-bandwidth version in all 1088 cells, and the
-    // output term is load-bearing (dropping it costs the byte-pair classes
-    // 0.983/0.962 -> 0.800/0.785). kK enters only through the issue term —
-    // and through residency via the ring, which is how the kK=32 twin wins
-    // where a deeper ring costs a CTA.
+    // cost = max(memory-side bytes, mma arm) * W_eff, per CTA. Loads and
+    // mma run on independent hardware and overlap, so the arms take max —
+    // a non-binding arm must not tax the ranking. W_eff keeps the coarse
+    // resident-scaled waves on two-byte pairs only: a byte/mixed ring is
+    // half-size for the same tile, those winners sit at resident=2, and
+    // the resident-scaled phantom tail misprices them (resident-blind
+    // measured ahead on all three of those grids, 2026-09-16).
     static std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q,
-                                int resident, bool byte_pair) {
+                                int resident) {
+        const bool byte_pair = q.ba == 1 && q.bb == 1;
         const std::int64_t operand =
             (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
         const std::int64_t output =
@@ -590,25 +541,20 @@ private:
             ? 0
             : kKTileIssueBytes * (std::int64_t)r.bm * r.bn *
                   ((q.k + r.kk - 1) / r.kk);
+        const std::int64_t mma_arm = kMmaArmBytesPerInstr *
+            (std::int64_t)r.bm * r.bn * q.k / (128 * (byte_pair ? 32 : 16));
+        const std::int64_t per_cta =
+            std::max(operand + output + issue, mma_arm);
         const std::int64_t blocks =
             (std::int64_t)((q.m + r.bm - 1) / r.bm) *
             (std::int64_t)((q.n + r.bn - 1) / r.bn);
         const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
         const std::int64_t waves =
             slots > 0 ? (blocks + slots - 1) / slots : 1;
-        return (operand + output + issue) * waves * resident;
-    }
-
-    static Priced price(const GemmRecipe& r, const PlanQuery& q,
-                        bool byte_pair) {
-        Priced p;
-        const DeviceFacts& dev = q.dev;
-        if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0) return p;
-        p.resident = std::min(dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
-        if (p.resident <= 0) return p;  // ring cannot be resident
-        p.cost = cost_of(r, q, p.resident, byte_pair);
-        p.ok = true;
-        return p;
+        const std::int64_t w_eff = q.ba == 2 && q.bb == 2
+            ? waves * resident
+            : (blocks + q.dev.sms - 1) / q.dev.sms;
+        return per_cta * w_eff;
     }
 };
 
