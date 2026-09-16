@@ -135,6 +135,11 @@ struct PlanQuery {
                              // term prices; 2 = the bf16 fused-linear
                              // default (plan_query's OutT parameter — an
                              // fp32-out caller is priced at 4, not 2)
+    bool tma = true;  // the staging this launch will take (plan_query fills
+                      // it from launch_plan_impl's predicate): the planner
+                      // prices residency per variant — the sign flips with
+                      // staging (TMA shares bandwidth, cp.async's software
+                      // ring IS the latency hiding)
     DeviceFacts dev{};
 };
 

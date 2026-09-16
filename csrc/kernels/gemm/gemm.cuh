@@ -523,15 +523,38 @@ private:
                         min_ctas_for_ring(r.smem));
     }
 
-    // cost = max(memory-side bytes, mma arm) * W_eff, per CTA. Loads and
-    // mma run on independent hardware and overlap, so the arms take max —
-    // a non-binding arm must not tax the ranking. W_eff keeps the coarse
-    // resident-scaled waves on two-byte pairs only: a byte/mixed ring is
-    // half-size for the same tile, those winners sit at resident=2, and
-    // the resident-scaled phantom tail misprices them (resident-blind
-    // measured ahead on all three of those grids, 2026-09-16).
+    // cost = max(memory-side bytes, mma arm) * W_eff, per CTA, on the TMA
+    // staging. Loads and mma run on independent hardware and overlap, so
+    // the arms take max — a non-binding arm must not tax the ranking.
+    // W_eff keeps the coarse resident-scaled waves on two-byte pairs only:
+    // a byte/mixed ring is half-size for the same tile, those winners sit
+    // at resident=2, and the resident-scaled phantom tail misprices them
+    // (resident-blind measured ahead on all three of those grids,
+    // 2026-09-16). cp.async staging prices differently (below): the
+    // software ring is the ONLY latency hiding there, so residency divides
+    // the makespan instead of sharing bandwidth — the axis flips with
+    // staging, and each form loses badly on the other's grids.
     static std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q,
                                 int resident) {
+        const std::int64_t blocks =
+            q.batch * ((std::int64_t)((q.m + r.bm - 1) / r.bm) *
+                       (std::int64_t)((q.n + r.bn - 1) / r.bn));
+        if (!q.tma) {
+            // cp.async (the zero-constant L20 form, 2026-09-16): raw-floor
+            // residency in the wave denominator, the k-tail priced whole,
+            // no fitted constants. On the cp.async grid this measures
+            // 0.9552 against the TMA form's 0.8445 (and the reverse on
+            // every TMA grid).
+            const std::int64_t operand =
+                ((q.k + r.kk - 1) / r.kk) * (std::int64_t)r.kk *
+                (r.bm * q.ba + r.bn * q.bb);
+            const std::int64_t mu = q.dev.smem_per_sm / r.smem;
+            const std::int64_t slots = (std::int64_t)q.dev.sms * mu;
+            const std::int64_t waves =
+                slots > 0 ? (blocks + slots - 1) / slots : 1;
+            return (operand +
+                    (std::int64_t)q.out_elem_bytes * r.bm * r.bn) * waves;
+        }
         const bool byte_pair = q.ba == 1 && q.bb == 1;
         const std::int64_t operand =
             (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
@@ -545,9 +568,6 @@ private:
             (std::int64_t)r.bm * r.bn * q.k / (128 * (byte_pair ? 32 : 16));
         const std::int64_t per_cta =
             std::max(operand + output + issue, mma_arm);
-        const std::int64_t blocks =
-            (std::int64_t)((q.m + r.bm - 1) / r.bm) *
-            (std::int64_t)((q.n + r.bn - 1) / r.bn);
         const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
         const std::int64_t waves =
             slots > 0 ? (blocks + slots - 1) / slots : 1;
@@ -663,6 +683,13 @@ PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
     q.ba = (int)sizeof(ElemA);
     q.bb = (int)sizeof(ElemB);
     q.out_elem_bytes = (int)sizeof(OutT);
+    // The staging the launch that follows will take — launch_plan_impl's
+    // predicate minus the descriptor-encodable runtime check: TMA only for
+    // the dual-congruous layout pair with descriptor-encodable dtypes on
+    // sm_90+ without the kill switch, cp.async otherwise.
+    q.tma = crosswise_of<LayoutA, LayoutB>() == 0 && sizeof(ElemA) <= 2 &&
+            sizeof(ElemB) <= 2 && dev.cc >= 90 &&
+            !gemm_tma_staging_disabled();
     q.dev = dev;
     return q;
 }

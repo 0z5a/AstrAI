@@ -211,33 +211,47 @@ class TestModelRule:
         (2048, 28672, 8192),
     )
 
-    # gemm.cuh kKTileIssueBytes — keep in sync (fitted on the 2026-09-16
-    # grid, RTX 5090, bf16 out).
+    # gemm.cuh kKTileIssueBytes / kMmaArmBytesPerInstr — keep in sync
+    # (both fitted on the 2026-09-16 grid, RTX 5090, bf16 out).
     K_TILE_ISSUE_BYTES = 8
+    MMA_ARM_BYTES_PER_INSTR = 64
 
     @classmethod
     def _cost(cls, entry, m, n, k, facts):
         """cost_of mirrored from gemm.cuh, or None when the ring is not
         resident on this device at all — the only way to assert the rule
-        from Python.
+        from Python. Both staging forms: the planner branches on the
+        device's cc (TMA needs sm_90+), so on an sm_89 part (L20/4090)
+        the zero-constant cp.async form is the one under test.
         """
         _cw, _ba, _bb, _cta, _stages, kk, bm, bn, _wm, _wn, _threads, smem = entry
         resident = min(facts["smem_per_sm"] // smem, 2 if smem <= 48 * 1024 else 1)
         if resident <= 0:
             return None
-        operand = k * (bm * 2 + bn * 2)
-        output = 2 * bm * bn
-        issue = cls.K_TILE_ISSUE_BYTES * bm * bn * ((k + kk - 1) // kk)
         blocks = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
+        output = 2 * bm * bn
+        if facts["cc"] < 90:  # cp.async staging: raw-floor residency divides
+            operand = ((k + kk - 1) // kk) * kk * (bm * 2 + bn * 2)
+            mu = facts["smem_per_sm"] // smem
+            slots = facts["sms"] * mu
+            waves = (blocks + slots - 1) // slots if slots > 0 else 1
+            return (operand + output) * waves
+        operand = k * (bm * 2 + bn * 2)
+        issue = cls.K_TILE_ISSUE_BYTES * bm * bn * ((k + kk - 1) // kk)
+        mma_arm = cls.MMA_ARM_BYTES_PER_INSTR * bm * bn * k // (128 * 16)
+        per_cta = max(operand + output + issue, mma_arm)
         slots = facts["sms"] * resident
         waves = (blocks + slots - 1) // slots if slots > 0 else 1
-        return (operand + output + issue) * waves * resident
+        return per_cta * waves * resident
 
     def test_two_byte_pick_attains_the_minimum_cost(self):
         # The rule under test is the analytical model's own; pin the
         # planner to it so a compiled-in row (which outranks the model in
-        # the default chain) cannot answer in its place.
+        # the default chain) cannot answer in its place. Staging is pinned
+        # on too: the cost branches on it, and a leaked tma=False from an
+        # earlier test would silently move the pick to the cp.async form.
         ops.gemm.set_planner("model")
+        ops.gemm.set_staging(tma=True)
         facts = ops.gemm.facts()
         vocab = [
             entry

@@ -48,3 +48,7 @@ def _reset_dispatch_state():
     if is_available("gemm"):
         ops.gemm.set_table("")
         ops.gemm.set_planner("")  # back to the shipped default
+        # staging too: the planner prices per staging variant (gemm.cuh
+        # cost_of branches on q.tma), so a test leaving tma disabled would
+        # silently move every later probe to the cp.async cost form
+        ops.gemm.set_staging(tma=True, mx=True)

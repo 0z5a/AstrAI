@@ -60,6 +60,7 @@ def device_facts() -> dict:
         "smem": props.shared_memory_per_multiprocessor,
         "smem_max": props.shared_memory_per_block_optin,
         "regs": props.regs_per_multiprocessor,
+        "cc": props.major * 10 + props.minor,
     }
 
 
@@ -133,20 +134,25 @@ def rules() -> dict:
     model's own byte-pair floor does."""
 
     def shipped(p, q):
-        # gemm.cuh ModelPlanner, mirrored term for term (2026-09-16
-        # three-arm re-fit): per_cta = max(operand + output + k-tile
-        # issue, mma arm) with the issue term pricing kK at 8
-        # output-cell-bytes per k-iteration (byte pairs take none — their
-        # ladder is all kK=64) and the mma arm at 64 bytes per mma
-        # instruction (one per 16x8xkMmaK cell; kMmaK 32 on byte pairs,
-        # 16 otherwise). W_eff = waves*resident on two-byte pairs,
-        # ceil(blocks/sms) resident-blind on byte and mixed. Every pair
-        # ranks on the cost alone (the mixed residency gate is gone).
+        # gemm.cuh ModelPlanner, mirrored term for term. Two staging forms
+        # (the residency sign flips with staging — 2026-09-16):
+        # - cp.async (q["tma"] false): zero-constant L20 form — raw-floor
+        #   residency in the wave denominator, the k-tail priced whole.
+        # - TMA: per_cta = max(operand + output + k-tile issue, mma arm),
+        #   the issue pricing kK at 8 output-cell-bytes per k-iteration
+        #   (byte pairs none — all-kK=64 ladder), the mma arm at 64 bytes
+        #   per instruction; W_eff = waves*resident on two-byte pairs,
+        #   ceil(blocks/sms) resident-blind on byte and mixed. Every pair
+        #   ranks on the cost alone.
         byte = q["ba"] == 1 and q["bb"] == 1
         dev = device_facts()
-        mem = p["b2"] + 2 * p["fat"] + (
-            0 if byte else 8.0 * p["fat"] * p["kiters"]
-        )
+        if not q.get("tma", True):
+            operand = p["kiters"] * p["kk"] * (p["bm"] * q["ba"] + p["bn"] * q["bb"])
+            mu = dev["smem"] // p["ring"]
+            slots = dev["sms"] * mu
+            waves = (p["blocks"] + slots - 1) // slots if slots else 1
+            return (-(operand + 2 * p["fat"]) * waves,)
+        mem = p["b2"] + 2 * p["fat"] + (0 if byte else 8.0 * p["fat"] * p["kiters"])
         mma = 64 * p["fat"] * q["k"] // (128 * (32 if byte else 16))
         if q["ba"] == 2 and q["bb"] == 2:
             weff = p["waves"] * p["resident"]
@@ -248,8 +254,23 @@ def rules() -> dict:
     help="Fidelity: compare each rule's pick with ops.gemm.probe on "
     "the measured points (the model rule must match 100%).",
 )
-def main(results_json, rule, class_filter, check):
+@click.option(
+    "--staging",
+    type=click.Choice(["tma", "cpasync"]),
+    default="tma",
+    show_default=True,
+    help="The staging SWITCH (set_staging): the priced form still follows "
+    "the device — TMA needs sm_90+, so on an sm_89 part (L20/4090) the "
+    "cp.async cost runs whatever this says. '*_cpasync' datasets from "
+    "sm_90+ boxes want --staging cpasync; the --check probes run with "
+    "set_staging(tma=False) to match.",
+)
+def main(results_json, rule, class_filter, check, staging):
     dev = device_facts()
+    # The C++ predicate: TMA needs sm_90+, so the switch alone does not
+    # make the binding stage via TMA — an sm_89 part (L20/4090) prices
+    # the cp.async form whatever the switch says.
+    use_tma = staging == "tma" and dev["cc"] >= 90
     by_point: dict[tuple, dict[str, float]] = defaultdict(dict)
     for point in json.loads(results_json.read_text()):
         key = (point["combo"], point["n"], point["k"], point["m"])
@@ -272,7 +293,7 @@ def main(results_json, rule, class_filter, check):
             continue
         best = max(over[r] for r in cands)
         ba, bb = tpt.BYTES[combo]
-        ctx = {"m": m, "n": n, "k": k, "ba": ba, "bb": bb}
+        ctx = {"m": m, "n": n, "k": k, "ba": ba, "bb": bb, "tma": use_tma}
         feats = {r: priced(r, m, n, k, ba, bb, dev) for r in cands}
         # order_for mirrors dispatch_tile's first-match tie-break
         order = tpt.order_for(perf_class)[:-1]
@@ -299,6 +320,8 @@ def main(results_json, rule, class_filter, check):
         ops.gemm.set_table("")
         ops.gemm.inject_rows("")
         ops.gemm.set_planner("model")
+        if staging == "cpasync":
+            ops.gemm.set_staging(tma=False)  # price what this dataset ran
         seen: set[tuple] = set()
         for combo, n, k, m in sorted(by_point):
             perf_class = tpt.PERF_CLASS[combo]
@@ -311,7 +334,7 @@ def main(results_json, rule, class_filter, check):
             info = ops.gemm.probe(m, n, k, act, weight)
             real = (info["cta"], info["stages"], info["kk"])
             ba, bb = tpt.BYTES[combo]
-            ctx = {"m": m, "n": n, "k": k, "ba": ba, "bb": bb}
+            ctx = {"m": m, "n": n, "k": k, "ba": ba, "bb": bb, "tma": use_tma}
             # The binding chooses among the whole ladder, so the fidelity
             # comparison must too. Restricting to the recipes this dataset
             # measured reported every cell where the model picks a tile the
@@ -336,6 +359,8 @@ def main(results_json, rule, class_filter, check):
                         f"combo={combo} m{m} n{n} k{k}: harness {got} vs binding {real}"
                     )
         ops.gemm.set_planner("")
+        if staging == "cpasync":
+            ops.gemm.set_staging(tma=True)
         click.echo("fidelity vs the binding (mismatches, first 5 per rule):")
         for name in names + ["model(measured)"]:
             bad = check_seen.get(name, [])
