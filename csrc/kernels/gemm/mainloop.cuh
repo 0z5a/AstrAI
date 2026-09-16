@@ -50,7 +50,6 @@ struct GemmCollectiveMainloop {
     using LayoutA = typename Policy::LayoutTagA;
     using LayoutB = typename Policy::LayoutTagB;
     using Smem = GemmSmem<Traits, LayoutA, LayoutB>;
-    static constexpr bool kFastLoop = Policy::kFastLoop;
     static constexpr bool kUseTma = Policy::kUseTma;
     static_assert(!kUseTma || (!Smem::kDirectA && !Smem::kDirectB),
                   "TMA staging is congruous-only");
@@ -175,12 +174,14 @@ struct GemmCollectiveMainloop {
     const int a_row0;  // + mt * 16 in the loop
     const int b_row0;  // + nt * 8
     const int64_t tile_count;
-    // Interior-CTA peel (kFastLoop instantiations only): whole-CTA,
-    // 16B-aligned, K without tail — the mainloop then runs a compile-time
-    // specialized copy with no per-chunk predication (measured +4.5..10% on
-    // the issue-bound small CTA; the 128x128 CTA regressed, so only the
-    // small CTA opts in). The verdict is uniform per CTA.
-    const bool fast_cta;
+    // Interior-copy verdict, uniform per CTA: whole-CTA, 16B-aligned, K
+    // without tail — the mainloop then runs the compile-time specialized
+    // copy with no per-chunk predication (load.cuh's kInterior arm).
+    // Re-measured interleaved on this part 2026-09-16: the specialized copy
+    // wins everywhere it applies — 9-19% on both big kk twins and ~1% on
+    // the small CTA (an earlier sm_89-era note claimed a 128x128
+    // regression and gated a now-removed fast/non-fast tile axis on it).
+    const bool use_interior_copy;
 
     __device__ GemmCollectiveMainloop(char* smem,
                                      const ElemA* a, const ElemB* b,
@@ -195,7 +196,7 @@ struct GemmCollectiveMainloop {
           a_row0(warp_m * Traits::kWarpM),
           b_row0(warp_n * Traits::kWarpN),
           tile_count((k + kK - 1) / kK),
-          fast_cta(kFastLoop && !kSyncA && !kSyncB &&
+          use_interior_copy(!kSyncA && !kSyncB &&
                    ((int64_t)block.x * kBlockM + kBlockM <= m) &&
                    ((int64_t)block.y * kBlockN + kBlockN <= n) &&
                    ((reinterpret_cast<uintptr_t>(a) | (uint64_t)a_ld) & 15) == 0 &&
@@ -206,16 +207,16 @@ struct GemmCollectiveMainloop {
     // staging class: congruous and 16-bit crosswise cp.async into the
     // canonical / transposed rings, 8-bit crosswise LDG+PRMT (the tiles
     // arrive typed by each ring's staged layout, so a mismatched
-    // loader/tile pairing is a compile error). kFast selects the
+    // loader/tile pairing is a compile error). kInterior selects the
     // predication-free interior copy (async phase only — trans staging
     // qualifies: it is cp.async like the congruous path). kSyncPhase picks
     // the call-site phase: true = the synchronous direct loads (8-bit
     // crosswise only; in the steady state this runs right after barrier 1,
     // so the LDG latency and the PRMT transpose overlap the MMA phase
     // instead of stalling the inter-barrier window), false = the async
-    // loads (kFast applies, and in the generic loop they run after the
+    // loads (kInterior applies, and in the generic loop they run after the
     // MMA phase alongside the commit).
-    template <bool kFast = false, bool kSyncPhase = false>
+    template <bool kInterior = false, bool kSyncPhase = false>
     __device__ __forceinline__ void
     load_stage(TileA a_tile, TileB b_tile,
                int64_t k_base) const {
@@ -231,10 +232,10 @@ struct GemmCollectiveMainloop {
             // cp.async: congruous goes canonical, 16-bit crosswise goes
             // transposed.
             if constexpr (!kSyncA)
-                load_operand_tile<StagedLayoutA, ElemA, kCtaThreads, kTransA, kFast>(
+                load_operand_tile<StagedLayoutA, ElemA, kCtaThreads, kTransA, kInterior>(
                     a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
             if constexpr (!kSyncB)
-                load_operand_tile<StagedLayoutB, ElemB, kCtaThreads, kTransB, kFast>(
+                load_operand_tile<StagedLayoutB, ElemB, kCtaThreads, kTransB, kInterior>(
                     b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
         }
     }
@@ -290,7 +291,7 @@ struct GemmCollectiveMainloop {
 #pragma unroll
         for (int stage = 0; stage < kStages; ++stage) {
             if (stage < tile_count) {
-                if (fast_cta)
+                if (use_interior_copy)
                     load_stage<true>(astrai::stage_of(ring_a, stage),
                                      astrai::stage_of(ring_b, stage),
                                      (int64_t)stage * kK);
@@ -306,16 +307,15 @@ struct GemmCollectiveMainloop {
         }
     }
 
-    // Steady-state mainloop, compile-time specialized on kFast: the fast
-    // copy runs predication-free loads with loop-carried read/write
-    // pointers; the generic copy keeps full predication. kFastLoop=false
-    // instantiates only the generic copy. kTma swaps the staging
+    // Steady-state mainloop, compile-time specialized on kInterior: the
+    // interior copy runs predication-free loads with loop-carried read/
+    // write pointers; the generic copy keeps full predication. kTma swaps the staging
     // discipline: the per-thread cp.async chunks and the wait_group+
     // syncthreads consumer fence become one elected-thread TMA issue and
     // an mbarrier phase wait (plus the same CTA barrier, which stays the
     // slot-release guarantee: it proves every thread finished reading
     // tile i-1 before tile i+kStages's boxes overwrite its slot).
-    template <bool kFast, bool kTma = false, bool kRank3A = false,
+    template <bool kInterior, bool kTma = false, bool kRank3A = false,
               bool kRank3B = false>
     __device__ __forceinline__ void
     run_loop(AccTensor& acc,
@@ -464,14 +464,14 @@ struct GemmCollectiveMainloop {
         }
         // Next tile's LDGSTS chunks inside the MMA phase: A's after the
         // first k_seg's MMA batch, B's after the last.
-        if constexpr (kFast && !kTma) {
+        if constexpr (kInterior && !kTma) {
             if (k_seg == 0) carry_a.emit(prefetch);
             if (k_seg == kSegs - 1) carry_b.emit(prefetch);
         }
         }
         // Generic loop (no interleaved prefetch): the next tile's predicated
         // loads run after the MMA phase.
-        if constexpr (!kFast && !kTma) {
+        if constexpr (!kInterior && !kTma) {
             if (prefetch) {
                 load_stage(astrai::stage_of(ring_a, tile_index + kStages),
                            astrai::stage_of(ring_b, tile_index + kStages),
@@ -491,7 +491,7 @@ struct GemmCollectiveMainloop {
         if (a_rd == a_rd_end) a_rd = a_rd0;
         b_rd += (unsigned)kBStageBytes;
         if (b_rd == b_rd_end) b_rd = b_rd0;
-        if constexpr (kFast && !kTma) {
+        if constexpr (kInterior && !kTma) {
             carry_a.advance();
             carry_b.advance();
         }
@@ -504,13 +504,11 @@ struct GemmCollectiveMainloop {
                const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         if constexpr (kUseTma) {
             run_loop<false, true, kRank3A, kRank3B>(acc, tma);
-        } else if constexpr (kFastLoop) {
-            if (fast_cta)
+        } else {
+            if (use_interior_copy)
                 run_loop<true>(acc);
             else
                 run_loop<false>(acc);
-        } else {
-            run_loop<false>(acc);
         }
     }
 

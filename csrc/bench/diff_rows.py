@@ -172,7 +172,7 @@ def main(
                     else (" KEEP" if gain >= 1 + min_gain / 100 else "")
                 )
                 print(
-                    f"{combo:13s} {_name:10s} m{m:5d} {recipe[5:-5]:26s} "
+                    f"{combo:13s} {_name:10s} m{m:5d} {recipe[5:]:26s} "
                     f"model {model_tf:7.1f} winner {flops / best[recipe]:7.1f} "
                     f"x{gain:.3f}{flag}",
                     flush=True,

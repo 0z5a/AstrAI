@@ -138,21 +138,29 @@ struct GemmSmem {
 };
 
 // Tile recipe (CUTLASS-style configuration type): one named bundle of CTA
-// shape, warp tiling, pipeline depth and loop specialization. Extending the
-// launch ladder = one alias here + one planner branch (never re-spelled
-// positional ints).
-template <typename CtaShape_, typename WarpShape_, int Stages_, bool FastLoop_>
+// shape, warp tiling and pipeline depth. Extending the launch ladder = one
+// alias here + one planner branch (never re-spelled positional ints).
+//
+// There is no loop-specialization axis: every tile carries both mainloop
+// copies and the per-CTA runtime verdict (use_interior_copy, mainloop.cuh)
+// picks one — interior, 16B-aligned, K-tail-free CTAs take the predication-
+// free copy. A compile-time kFastLoop flag once spelled the "fast twin"
+// here, but its one remaining effect (the big CTA downgraded to the
+// predicated twin on crosswise staging) measured BACKWARDS on this part:
+// interleaved A/B 2026-09-16 (sm_120, TT route, cp.async) has the
+// predication-free copy 9-19% FASTER on both big kk twins, and the
+// downgrade was unreachable through the planner anyway (the model's
+// residency rule never picks big on the crosswise ladder).
+template <typename CtaShape_, typename WarpShape_, int Stages_>
 struct GemmTileConfig {
     using CtaShape = CtaShape_;
     using WarpShape = WarpShape_;
     static constexpr int kStages = Stages_;
-    static constexpr bool kFastLoop = FastLoop_;
 };
 
-// Tile recipes, named Tile_<cta M>x<N>x<kK>_W<warp M>x<N>_S<stages>[_Fast]:
-// the CTA Shape, the warp Shape, the ring depth and the loop specialization,
-// in the order GemmTileConfig carries them. An absent _Fast is the
-// non-fast (predicated) twin, which crosswise staging needs.
+// Tile recipes, named Tile_<cta M>x<N>x<kK>_W<warp M>x<N>_S<stages>: the
+// CTA Shape, the warp Shape and the ring depth, in the order GemmTileConfig
+// carries them.
 //
 // kK is capped at 128/elem_bytes by the staging swizzle: ComposedLayout
 // requires kRowShift = kShift - log2(kChunks) >= 0 with kChunks =
@@ -162,19 +170,17 @@ struct GemmTileConfig {
 // so a 1-byte line holds half as many 16B chunks as a 2-byte one and the
 // widest warp tilings do not instantiate for 1-byte operands.
 using Tile_128x128x64_W64x32_S2 =
-    GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2, false>;
-using Tile_128x128x64_W64x32_S2_Fast =
-    GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2, true>;
-using Tile_128x128x64_W64x32_S3_Fast =
-    GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3, true>;
-using Tile_128x64x64_W32x32_S2_Fast =
-    GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 2, true>;
-using Tile_128x64x64_W32x32_S3_Fast =
-    GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 3, true>;
-using Tile_64x64x64_W16x32_S2_Fast =
-    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 2, true>;
-using Tile_64x64x64_W16x32_S3_Fast =
-    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 3, true>;
+    GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2>;
+using Tile_128x128x64_W64x32_S3 =
+    GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3>;
+using Tile_128x64x64_W32x32_S2 =
+    GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 2>;
+using Tile_128x64x64_W32x32_S3 =
+    GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 3>;
+using Tile_64x64x64_W16x32_S2 =
+    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 2>;
+using Tile_64x64x64_W16x32_S3 =
+    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 3>;
 // Deep-ring s4/s5 twins of this geometry were removed: the sweep measured
 // them a wash against s2..s3 (within 1-2% at this tile) and no compiled-in
 // row reaches past s3. The planner rejects stages > 3 outright, so a stale
@@ -191,29 +197,29 @@ using Tile_64x64x64_W16x32_S3_Fast =
 // halve with the 16-wide N partition.
 template <typename Tile>
 using small_16w_t = GemmTileConfig<typename Tile::CtaShape, Shape<16, 16>,
-                                   Tile::kStages, true>;
+                                   Tile::kStages>;
 
 // kK=32 twins: the measured k-tile-depth winner on most shapes, since a
 // 64-deep k-tile spends ring budget and issue slots the short K loop cannot
 // use.
-using Tile_64x64x32_W16x32_S2_Fast =
-    GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 2, true>;
-using Tile_64x64x32_W16x32_S3_Fast =
-    GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 3, true>;
+using Tile_64x64x32_W16x32_S2 =
+    GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 2>;
+using Tile_64x64x32_W16x32_S3 =
+    GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 3>;
 // The tall 64x128 CTA (N:M = 2:1): the tile sweep's champion at wide N and
 // at the parity square on the congruous ladder (up to 1.089x over the best
 // previously reachable recipe), so it joins the manifest rather than living
 // in the sweep grid only.
-using Tile_64x128x32_W32x32_S2_Fast =
-    GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 2, true>;
-using Tile_64x128x32_W32x32_S3_Fast =
-    GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 3, true>;
-using Tile_128x64x32_W32x32_S2_Fast =
-    GemmTileConfig<Shape<128, 64, 32>, Shape<32, 32>, 2, true>;
-using Tile_128x128x32_W64x32_S2_Fast =
-    GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 2, true>;
-using Tile_128x128x32_W64x32_S3_Fast =
-    GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 3, true>;
+using Tile_64x128x32_W32x32_S2 =
+    GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 2>;
+using Tile_64x128x32_W32x32_S3 =
+    GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 3>;
+using Tile_128x64x32_W32x32_S2 =
+    GemmTileConfig<Shape<128, 64, 32>, Shape<32, 32>, 2>;
+using Tile_128x128x32_W64x32_S2 =
+    GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 2>;
+using Tile_128x128x32_W64x32_S3 =
+    GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 3>;
 // 16 warps per CTA on the 128x128x32 ring (32x32 warp tiles, 512 threads):
 // same CTA geometry, same 48KB ring, twice the warps. The 8-warp twin above
 // leaves the tensor pipe waiting at every fragment boundary; doubling the warps
@@ -222,12 +228,12 @@ using Tile_128x128x32_W64x32_S3_Fast =
 // 1.2%, and that shape is served by the 64x64 rows). The residency budget
 // still holds: 512 threads x 2 CTAs needs <= 64 registers, which the smaller
 // 32x32 warp tile's accumulator (32 fp32 cells) leaves room for.
-using Tile_128x128x32_W32x32_S2_Fast =
-    GemmTileConfig<Shape<128, 128, 32>, Shape<32, 32>, 2, true>;
+using Tile_128x128x32_W32x32_S2 =
+    GemmTileConfig<Shape<128, 128, 32>, Shape<32, 32>, 2>;
 // 1-byte operands only: the ring is 147KB for a 2-byte pair (past the smem
 // opt-in ceiling) against 74KB for a 1-byte one.
-using Tile_128x256x64_W64x32_S2_Fast =
-    GemmTileConfig<Shape<128, 256, 64>, Shape<64, 32>, 2, true>;
+using Tile_128x256x64_W64x32_S2 =
+    GemmTileConfig<Shape<128, 256, 64>, Shape<64, 32>, 2>;
 
 // CTA class of a tile config, derived from its CTA geometry — one axis of
 // the dispatch key the launch ladders select on (GemmPlan in gemm.cuh).
@@ -294,11 +300,11 @@ constexpr bool cta_matches_class() {
     return kTileClassCta[(int)tile_class<Tile>()][0] == Tile::CtaShape::kM &&
            kTileClassCta[(int)tile_class<Tile>()][1] == Tile::CtaShape::kN;
 }
-static_assert(cta_matches_class<Tile_64x64x64_W16x32_S2_Fast>() &&
-                  cta_matches_class<Tile_128x64x64_W32x32_S2_Fast>() &&
-                  cta_matches_class<Tile_128x128x64_W64x32_S2_Fast>() &&
-                  cta_matches_class<Tile_128x256x64_W64x32_S2_Fast>() &&
-                  cta_matches_class<Tile_64x128x32_W32x32_S2_Fast>(),
+static_assert(cta_matches_class<Tile_64x64x64_W16x32_S2>() &&
+                  cta_matches_class<Tile_128x64x64_W32x32_S2>() &&
+                  cta_matches_class<Tile_128x128x64_W64x32_S2>() &&
+                  cta_matches_class<Tile_128x256x64_W64x32_S2>() &&
+                  cta_matches_class<Tile_64x128x32_W32x32_S2>(),
               "kTileClassCta must mirror the tiles' CTA shapes");
 
 // Tuple concatenation, so a manifest reads as "the shared ladder plus my own
@@ -316,9 +322,9 @@ using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
 // small is a resolver substitution, never a manifest entry, so the bus
 // never gated it either way. Every other manifest contains these.
 using TileManifestCross = std::tuple<
-    Tile_128x128x64_W64x32_S2_Fast, Tile_128x128x64_W64x32_S3_Fast,
-    Tile_128x64x64_W32x32_S2_Fast, Tile_128x64x64_W32x32_S3_Fast,
-    Tile_64x64x64_W16x32_S2_Fast, Tile_64x64x64_W16x32_S3_Fast>;
+    Tile_128x128x64_W64x32_S2, Tile_128x128x64_W64x32_S3,
+    Tile_128x64x64_W32x32_S2, Tile_128x64x64_W32x32_S3,
+    Tile_64x64x64_W16x32_S2, Tile_64x64x64_W16x32_S3>;
 
 // The dispatch manifests (CUTLASS builder-table style): every recipe the
 // launch ladders select over, keyed by the plan's CTA class, ring depth and
@@ -339,10 +345,10 @@ using TileManifestCross = std::tuple<
 // so the same key stays legal on 1-byte operands.
 using TileManifest = tuple_cat_t<
     TileManifestCross,
-    std::tuple<Tile_64x64x32_W16x32_S2_Fast, Tile_64x64x32_W16x32_S3_Fast,
-               Tile_128x64x32_W32x32_S2_Fast, Tile_128x128x32_W32x32_S2_Fast,
-               Tile_128x128x32_W64x32_S3_Fast, Tile_64x128x32_W32x32_S2_Fast,
-               Tile_64x128x32_W32x32_S3_Fast>>;
+    std::tuple<Tile_64x64x32_W16x32_S2, Tile_64x64x32_W16x32_S3,
+               Tile_128x64x32_W32x32_S2, Tile_128x128x32_W32x32_S2,
+               Tile_128x128x32_W64x32_S3, Tile_64x128x32_W32x32_S2,
+               Tile_64x128x32_W32x32_S3>>;
 
 // The 1-byte ladder: the shared six plus the wide CTA, every one of them at
 // kK 64. No kK=32 tile pays on a 1-byte pair — a line then holds half as
@@ -353,7 +359,7 @@ using TileManifest = tuple_cat_t<
 // warp_widened_t): its starvation fix is about the bf16-cell issue stream,
 // and the byte pair rides its own cells.
 using TileManifestByte =
-    tuple_cat_t<TileManifestCross, std::tuple<Tile_128x256x64_W64x32_S2_Fast>>;
+    tuple_cat_t<TileManifestCross, std::tuple<Tile_128x256x64_W64x32_S2>>;
 
 // How many operands take that direct path (0 = dual-congruous NT). The
 // planner's crosswise field and the launcher's ladder selection are this one
@@ -432,7 +438,6 @@ struct GemmPolicy {
     static constexpr bool kUseTma = UseTma_;
     static_assert(!UseTma_ || (sizeof(ElemA_) <= 2 && sizeof(ElemB_) <= 2),
                   "TMA staging covers the 1-/2-byte congruous dtypes");
-    static constexpr bool kFastLoop = Tile_::kFastLoop;
     using Smem = GemmSmem<Traits, LayoutA_, LayoutB_>;
     // TMA budgets the 1024B ring-base alignment pad plus the full/empty
     // mbarrier pair per ring slot (tma.cuh); the residency hint stays

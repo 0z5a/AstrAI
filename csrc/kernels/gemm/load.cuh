@@ -63,6 +63,16 @@ load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
         kTotalChunks < kThreads ? 1 : kTotalChunks / kThreads;
     static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
                   "XOR chunk stepping needs a power-of-two chunks-per-thread");
+    // A thread's run must stay inside ONE line: the r/c0 decomposition
+    // (kCpr below) divides kChunks BY kCpt, and a run wider than the line
+    // sends kCpr to zero — tid/0 garbage addresses and a wedged cp.async
+    // (observed 2026-09-16 on 128x256x32 with 4 warps: kernel hangs at
+    // 100% GPU on the first launch). Fully subscribed this says the staged
+    // extent (bm, bn) must not exceed the thread count; the under-subscribed
+    // arm keeps kCpt 1 and cannot violate it.
+    static_assert(kCpt <= kChunks,
+                  "a thread's 16B run must fit one staged line: the staged "
+                  "extent cannot exceed the thread count");
     constexpr int kCpr = kChunks / kCpt;  // chunks per line slice
     const int r = tid / kCpr;             // line within the tile
     const int c0 = (tid % kCpr) * kCpt * kChunkElems;

@@ -66,7 +66,7 @@ def device_facts() -> dict:
 
 def geometry(name: str) -> dict:
     m = tpt._FACTS_RE.fullmatch(name)
-    bm, bn, kk, wm, wn, stages, _fast = m.groups()
+    bm, bn, kk, wm, wn, stages = m.groups()
     bm, bn, kk, wm, wn, stages = map(int, (bm, bn, kk, wm, wn, stages))
     # The 16-warp widening (warp_widened_t) doubles the load threads of a
     # small kk=64 tile on any pair with a 2-byte operand; a byte pair keeps

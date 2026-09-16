@@ -827,9 +827,9 @@ bool dispatch_tile(const PlanDecision& d, const Resolver& resolve) {
 // s3, so a deep kK=32 big tile falls back to its s2 twin.
 template <typename Tile>
 using narrow_fallback_t = std::conditional_t<
-    Tile::CtaShape::kK == 32, Tile_128x64x32_W32x32_S2_Fast,
-    std::conditional_t<(Tile::kStages >= 3), Tile_128x64x64_W32x32_S3_Fast,
-                       Tile_128x64x64_W32x32_S2_Fast>>;
+    Tile::CtaShape::kK == 32, Tile_128x64x32_W32x32_S2,
+    std::conditional_t<(Tile::kStages >= 3), Tile_128x64x64_W32x32_S3,
+                       Tile_128x64x64_W32x32_S2>>;
 
 // TMA ladder resolver. The gate in launch_plan already guarantees
 // dual-congruous 1-/2-byte operands, so the fast tile stays; only an
@@ -858,14 +858,17 @@ struct TmaLauncher {
     }
 };
 
-// cp.async ladder resolver. Two substitutions, both on the CTA classes whose
-// output tile can outgrow their own rings: the fast loop exists only for
-// dual-congruous staging (crosswise operands take the predicated generic loop
-// — the NonFast twin), and a fat output (fp32, 4B) that cannot reclaim the
-// ring routes to the narrow CTA — same math at lower reuse. Narrow and small
-// entries pass through.
+// cp.async ladder resolver. One substitution, on the CTA classes whose
+// output tile can outgrow their own rings: a fat output (fp32, 4B) that
+// cannot reclaim the ring routes to the narrow CTA — same math at lower
+// reuse. (A second substitution once downgraded the big CTA to a
+// predicated-loop twin on crosswise staging; interleaved A/B 2026-09-16
+// measured that twin 9-19% SLOWER on this part and the planner never
+// routed big on the crosswise ladder anyway — see policy.cuh's
+// GemmTileConfig note for the burial record.) Narrow and small entries
+// pass through.
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
-          typename LayoutOut, typename OutT, bool kBigFast, bool UseMx = false>
+          typename LayoutOut, typename OutT, bool UseMx = false>
 struct CpAsyncLauncher {
     GemmParams p;
     cudaStream_t stream;
@@ -876,20 +879,12 @@ struct CpAsyncLauncher {
         // 16-warp form, parity to -3% on the thinnest shapes). The rule and
         // its arms live in policy.cuh's warp_widened_t.
         using Widened = warp_widened_t<ElemA, ElemB, Tile>;
-        using NonFast = GemmTileConfig<typename Widened::CtaShape,
-                                       typename Widened::WarpShape,
-                                       Widened::kStages, false>;
         constexpr bool kFits = reclaim_fits<Widened, ElemA, ElemB, OutT>();
         constexpr bool kBig = tile_class<Widened>() == TileClass::kBig128;
         constexpr bool kWide = tile_class<Widened>() == TileClass::kWide128x256;
-        using TileT = std::conditional_t<
-            kBig, std::conditional_t<
-                      kFits, std::conditional_t<kBigFast, Widened, NonFast>,
-                      narrow_fallback_t<Widened>>,
-            std::conditional_t<kWide, std::conditional_t<
-                                          kFits, Widened,
-                                          narrow_fallback_t<Widened>>,
-                               Widened>>;
+        using TileT =
+            std::conditional_t<(kBig || kWide) && !kFits,
+                               narrow_fallback_t<Widened>, Widened>;
         launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT,
                                  LayoutOut, OutT, false, false, UseMx>>(
             p, stream);
@@ -910,14 +905,14 @@ template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
 void launch_plan_impl(GemmParams p, const PlanDecision& d,
                       cudaStream_t stream) {
     p.raster = d.raster;
-    // Dual-congruous (crosswise 0), the only pair whose plan can reach the
-    // fast-loop ladder entries: both operands staged as-is.
-    constexpr bool kBigFast = crosswise_of<LayoutA, LayoutB>() == 0;
+    // Dual-congruous (crosswise 0): the only layout pair TMA can describe —
+    // both operands staged as-is, so the descriptors are encodable.
+    constexpr bool kCongruous = crosswise_of<LayoutA, LayoutB>() == 0;
     // TMA staging first when the layout pair and dtypes allow it (the
     // planner's stage/tile decisions are shared): sm_90+ device, no
     // kill switch, and every descriptor encodable — else the cp.async
     // twin below runs unchanged.
-    if constexpr (kBigFast && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
+    if constexpr (kCongruous && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
         if (!gemm_tma_staging_disabled() && astrai::device_facts().cc >= 90 &&
             dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
                 d, TmaLauncher<ElemA, ElemB, LayoutOut, OutT, UseMx>{
@@ -926,7 +921,7 @@ void launch_plan_impl(GemmParams p, const PlanDecision& d,
     }
     dispatch_tile<manifest_for<ElemA, ElemB, LayoutA, LayoutB>>(
         d, CpAsyncLauncher<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT,
-                           kBigFast, UseMx>{p, stream});
+                           UseMx>{p, stream});
 }
 
 // The planner entry: symmetric fp8 rides the sm_120 block_scale cell unless

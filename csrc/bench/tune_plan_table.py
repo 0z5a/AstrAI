@@ -77,7 +77,7 @@ PERF_CLASS: dict[str, int] = {
 # key dispatch_tile matches on. The set of recipes is therefore the set of
 # tiles the ladders carry, so it is parsed from policy.cuh instead of being
 # maintained here. Names are the tile's own structural token
-# (Tile_<M>x<N>x<kK>_W<wM>x<wN>_S<stages>[_Fast]), so a recipe name cannot
+# (Tile_<M>x<N>x<kK>_W<wM>x<wN>_S<stages>), so a recipe name cannot
 # describe a tile that is not there.
 #
 # One consequence worth reading twice: dispatch_tile matches (class, stages,
@@ -92,24 +92,24 @@ PERF_WIDTH: dict[int, tuple[int, int]] = {0: (2, 2), 1: (2, 1), 2: (1, 1), 3: (1
 
 POLICY_CUH = Path(__file__).resolve().parents[1] / "kernels" / "gemm" / "policy.cuh"
 _TILE_RE = re.compile(r"(Tile_\d+x\d+x\d+_W\d+x\d+_S\d+(?:_Fast)?)")
-_FACTS_RE = re.compile(r"Tile_(\d+)x(\d+)x(\d+)_W(\d+)x(\d+)_S(\d+)(_Fast)?")
+_FACTS_RE = re.compile(r"Tile_(\d+)x(\d+)x(\d+)_W(\d+)x(\d+)_S(\d+)(?:_Fast)?")
 # TileClass ordinals, policy.cuh enum order (what a row's cta column means).
 _CLASS_OF = {(64, 64): 0, (128, 64): 1, (128, 128): 2, (128, 256): 3, (64, 128): 4}
 # The shared ladder every staging path carries: six geometries, one per class
 # and ring depth. If the parse below cannot see these, it is broken.
 _SHARED = (
-    "Tile_64x64x64_W16x32_S2_Fast",
-    "Tile_64x64x64_W16x32_S3_Fast",
-    "Tile_128x64x64_W32x32_S2_Fast",
-    "Tile_128x64x64_W32x32_S3_Fast",
-    "Tile_128x128x64_W64x32_S2_Fast",
-    "Tile_128x128x64_W64x32_S3_Fast",
+    "Tile_64x64x64_W16x32_S2",
+    "Tile_64x64x64_W16x32_S3",
+    "Tile_128x64x64_W32x32_S2",
+    "Tile_128x64x64_W32x32_S3",
+    "Tile_128x128x64_W64x32_S2",
+    "Tile_128x128x64_W64x32_S3",
 )
 
 
 def tile_facts(name: str) -> tuple[int, int, int]:
     """A tile's dispatch key: (cta class, stages, ring K)."""
-    m, n, k, _wm, _wn, stages, _fast = _FACTS_RE.fullmatch(name).groups()
+    m, n, k, _wm, _wn, stages = _FACTS_RE.fullmatch(name).groups()
     try:
         return _CLASS_OF[(int(m), int(n))], int(stages), int(k)
     except KeyError as exc:  # a geometry TileClass does not name
@@ -205,7 +205,7 @@ def order_for(perf_class: int) -> tuple[str, ...]:
 
 
 def short_name(tile: str) -> str:
-    """A tile name without the Tile_ / _Fast dressing, for run headers."""
+    """A tile name without the Tile_ dressing, for run headers."""
     return tile.removeprefix("Tile_").removesuffix("_Fast")
 
 
