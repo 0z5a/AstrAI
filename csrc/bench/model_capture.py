@@ -123,7 +123,7 @@ def priced(name: str, m: int, n: int, k: int, ba: int, bb: int, dev: dict) -> di
         # problem's total is this times blocks)
         "b2": k * (g["bm"] * ba + g["bn"] * bb),
         "fat": g["bm"] * g["bn"],
-        "kiters": k // g["kk"],
+        "kiters": (k + g["kk"] - 1) // g["kk"],
     }
 
 
@@ -160,7 +160,8 @@ def rules() -> dict:
 
     def cost_of(p, issue=0.0):
         # shipped cost plus, when issue > 0, a per-k-tile overhead every
-        # block pays k/kk times (ring refill, barrier, mma issue): the one
+        # block pays ceil(k/kk) times — the mainloop's own tile_count, tail
+        # partial tile included (ring refill, barrier, mma issue): the one
         # term kk never had, which is why the model cannot price kk32 vs
         # kk64 (2026-09-16 grid diagnosis: 64x64x64_S3 beats kk32 at k3584).
         return (
@@ -177,6 +178,11 @@ def rules() -> dict:
         # degenerates to ranking -(b2 + 2*fat)*waves*resident, i.e. cost
         # alone with the (resident, stages) prefix gone. Kept as the real
         # formula so a future bm<64 tile re-opens the L1 domain honestly.
+        # NOTE the degeneracy above is DeepGEMM's (wgmma reads smem
+        # directly); sm_120 has no wgmma — AstrAI's mma re-reads fragments
+        # at K*bm*bn*(wa/wn + wb/wm), which on this vocabulary stays at
+        # 0.4-0.6x of the L2 flow and never binds either (checked on the
+        # 2026-09-16 grid, benchmark/sweep-grid-2026-09-16/README.md).
         dev = device_facts()
         l1_bw = 128.0 * dev["sms"]
         l2_bw = min(64.0 * dev["sms"], 8e6 / 1.3e3)

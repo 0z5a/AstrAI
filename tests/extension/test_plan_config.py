@@ -157,6 +157,8 @@ class TestProbe:
                 kk,
                 bm,
                 bn,
+                wm,
+                wn,
                 threads,
                 smem,
             ) = entry
@@ -172,6 +174,9 @@ class TestProbe:
             assert stages in (2, 3)
             assert kk in (32, 64)
             assert bm in (64, 128) and bn in (64, 128, 256)
+            # the warp tiling spells the recipe name's W<x>x<y>, and the
+            # threads count follows it ((bm/wm)*(bn/wn)*32)
+            assert (bm // wm) * (bn // wn) * 32 == threads
             assert threads > 0 and smem > 0
 
     def test_facts_are_populated(self):
@@ -216,13 +221,13 @@ class TestModelRule:
         resident on this device at all — the only way to assert the rule
         from Python.
         """
-        _cw, _ba, _bb, _cta, _stages, kk, bm, bn, _threads, smem = entry
+        _cw, _ba, _bb, _cta, _stages, kk, bm, bn, _wm, _wn, _threads, smem = entry
         resident = min(facts["smem_per_sm"] // smem, 2 if smem <= 48 * 1024 else 1)
         if resident <= 0:
             return None
         operand = k * (bm * 2 + bn * 2)
         output = 2 * bm * bn
-        issue = cls.K_TILE_ISSUE_BYTES * bm * bn * (k // kk)
+        issue = cls.K_TILE_ISSUE_BYTES * bm * bn * ((k + kk - 1) // kk)
         blocks = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
         slots = facts["sms"] * resident
         waves = (blocks + slots - 1) // slots if slots > 0 else 1

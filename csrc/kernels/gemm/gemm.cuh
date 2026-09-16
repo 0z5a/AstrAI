@@ -257,6 +257,7 @@ struct GemmRecipe {
     int stages;   // ring depth
     int kk;       // k-tile depth (the kK twins are separate recipes)
     int bm, bn;   // CTA geometry
+    int wm, wn;   // warp tiling (the recipe name's W<x>x<y>)
     int threads;  // the manifest entry's warp tiling (first match wins)
     int smem;     // ring bytes at this staging pair's operand widths
 };
@@ -270,6 +271,7 @@ inline void append_recipe(std::vector<GemmRecipe>& out, int ba, int bb) {
     const GemmRecipe r{
         (int)tile_class<Tile>(), Tile::kStages, (int)Tile::CtaShape::kK,
         Tile::CtaShape::kM, Tile::CtaShape::kN,
+        Tile::WarpShape::kM, Tile::WarpShape::kN,
         (Tile::CtaShape::kM / Tile::WarpShape::kM) *
             (Tile::CtaShape::kN / Tile::WarpShape::kN) * 32,
         ring_smem_bytes(Tile::CtaShape::kM, Tile::CtaShape::kN,
@@ -334,6 +336,7 @@ inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb,
         out = GemmRecipe{
             (int)tile_class<T>(), (int)T::kStages, (int)T::CtaShape::kK,
             T::CtaShape::kM, T::CtaShape::kN,
+            T::WarpShape::kM, T::WarpShape::kN,
             (T::CtaShape::kM / T::WarpShape::kM) *
                 (T::CtaShape::kN / T::WarpShape::kN) * 32,
             ring_smem_bytes(T::CtaShape::kM, T::CtaShape::kN,
@@ -500,16 +503,17 @@ public:
         //   (0.9056 -> 0.9504 grid, 0.9387 -> 0.9588 on 09-14): their
         //   winner still tracks the ring, but not its depth.
         const bool byte_pair = q.ba == 1 && q.bb == 1;
-        const bool two_byte = q.ba == 2 && q.bb == 2;
+        const bool mixed_pair = q.ba + q.bb == 3;
         std::optional<PlanDecision> best_d;
-        Priced best;
+        RankKey best_key{};
         for (const GemmRecipe& r : recipes) {
             const Priced candidate = price(r, q, byte_pair);
             if (!candidate.ok) continue;
-            // beats() owns the ordering; an exact tie keeps the candidate
-            // seen first, the manifest's own order.
-            if (!best_d || beats(candidate, best, byte_pair, two_byte)) {
-                best = candidate;
+            // key_of owns the ordering; a key equal on every field keeps
+            // the candidate seen first, the manifest's own order.
+            const RankKey key = key_of(candidate, mixed_pair);
+            if (!best_d || key < best_key) {
+                best_key = key;
                 best_d = PlanDecision{r, plan_raster(q, r.bm, r.bn),
                                       name()};
             }
@@ -518,7 +522,8 @@ public:
     }
 
 private:
-    // Per-k-tile overhead every block pays q.k/kK times (ring-refill
+    // Per-k-tile overhead every block pays ceil(q.k/kK) times — the
+    // mainloop's own tile_count, tail partial tile included (ring-refill
     // barrier, mma issue, load scheduling), priced as this many
     // output-cell-bytes per k-iteration — the term that makes kK a model
     // axis. Fitted at 8 on the 2026-09-16 768-cell w16a16 grid (RTX 5090,
@@ -533,22 +538,28 @@ private:
     // same feasibility test the row planners gate on.
     struct Priced {
         int resident = 0;       // CTAs per SM the ring leaves room for
-        int stages = 0;         // ring depth
         std::int64_t cost = 0;  // modelled on-chip cycles (cost_of)
         bool ok = false;
     };
 
-    // The width-pair orderings (2026-09-16): byte and two-byte pairs rank
-    // on the cost alone; mixed pairs gate on residency first, then the
-    // cost. The stages tier is gone everywhere — measured on the full
-    // grid it preferred the S3 twin in the 485/768 cells where S2 was
-    // faster, and its correct calls are recovered by the cost once kK is
-    // priced. An exact cost tie still keeps the candidate seen first.
-    static bool beats(const Priced& a, const Priced& b, bool byte_pair,
-                      bool two_byte) {
-        if (byte_pair || two_byte) return a.cost < b.cost;
-        if (a.resident != b.resident) return a.resident > b.resident;
-        return a.cost < b.cost;
+    // The ranking key, one lexicographic comparison: mixed pairs gate on
+    // residency first (their winner tracks the ring — higher tier wins),
+    // byte and two-byte pairs carry no tier, so the cost alone ranks them.
+    // The stages tier is gone everywhere (2026-09-16 full grid: it preferred
+    // the S3 twin in the 485/768 cells where S2 measured faster). A key
+    // equal on every field keeps the candidate seen first — the manifest's
+    // own order.
+    struct RankKey {
+        int resident_tier;  // 0 unless a mixed pair's residency gate
+        std::int64_t cost;
+        bool operator<(const RankKey& o) const {
+            return resident_tier != o.resident_tier
+                       ? resident_tier > o.resident_tier
+                       : cost < o.cost;
+        }
+    };
+    static RankKey key_of(const Priced& p, bool mixed_pair) {
+        return RankKey{mixed_pair ? p.resident : 0, p.cost};
     }
 
     // The modelled cost of one tile: per-block on-chip bytes, times the waves
@@ -578,7 +589,7 @@ private:
         const std::int64_t issue = byte_pair
             ? 0
             : kKTileIssueBytes * (std::int64_t)r.bm * r.bn *
-                  (q.k / r.kk);
+                  ((q.k + r.kk - 1) / r.kk);
         const std::int64_t blocks =
             (std::int64_t)((q.m + r.bm - 1) / r.bm) *
             (std::int64_t)((q.n + r.bn - 1) / r.bn);
@@ -595,7 +606,6 @@ private:
         if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0) return p;
         p.resident = std::min(dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
         if (p.resident <= 0) return p;  // ring cannot be resident
-        p.stages = r.stages;
         p.cost = cost_of(r, q, p.resident, byte_pair);
         p.ok = true;
         return p;

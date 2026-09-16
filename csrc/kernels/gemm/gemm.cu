@@ -306,9 +306,14 @@ py::dict configure(py::object table, py::object planner, py::object log,
 
 // The recipe vocabulary per (crosswise, operand widths) — every
 // (CTA class, stages, kK) the launch ladders instantiate for that staging
-// pair, deduped on the dispatch key. (2,1) covers the mixed W8A16 / W-F8A16
-// classes, whose congruent staging runs the conservative ladder too
-// (manifest_kind's fallback); (1,2) matches no supported pair.
+// pair, deduped on the dispatch key, in dispatch (manifest) order. Rows are
+// (crosswise, ba, bb, cta, stages, kk, bm, bn, wm, wn, threads, smem);
+// a row's numbers spell its canonical name,
+// Tile_<bm>x<bn>x<kk>_W<wm>x<wn>_S<stages> — the bench's own spelling —
+// which is how the Python tooling joins rows with dataset recipe strings
+// without keeping a second copy of the vocabulary. (2,1) covers the mixed
+// W8A16 / W-F8A16 classes, whose congruent staging runs the conservative
+// ladder too (manifest_kind's fallback); (1,2) matches no supported pair.
 std::vector<std::vector<int>> tile_vocabulary() {
     const std::pair<int, int> widths[] = {{2, 2}, {2, 1}, {1, 1}};
     std::vector<std::vector<int>> out;
@@ -316,7 +321,7 @@ std::vector<std::vector<int>> tile_vocabulary() {
         for (const auto& [ba, bb] : widths)
             for (const GemmRecipe& r : gemm_recipes_for(crosswise != 0, ba, bb))
                 out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk,
-                               r.bm, r.bn, r.threads, r.smem});
+                               r.bm, r.bn, r.wm, r.wn, r.threads, r.smem});
     return out;
 }
 

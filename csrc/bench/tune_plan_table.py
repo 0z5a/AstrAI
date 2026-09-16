@@ -74,29 +74,24 @@ PERF_CLASS: dict[str, int] = {
 #
 # A recipe is one tile: its CTA class, its ring depth and its k-tile depth,
 # written as a row file's (cta, stages, kK) — which is exactly the dispatch
-# key dispatch_tile matches on. The set of recipes is therefore the set of
-# tiles the ladders carry, so it is parsed from policy.cuh instead of being
-# maintained here. Names are the tile's own structural token
-# (Tile_<M>x<N>x<kK>_W<wM>x<wN>_S<stages>), so a recipe name cannot
-# describe a tile that is not there.
-#
-# One consequence worth reading twice: dispatch_tile matches (class, stages,
-# kK) and takes the FIRST entry, so two tiles on the same key are one
-# reachable recipe and one dead entry — the warp tiling is not part of the
-# key. Those dead entries are reported (see UNREACHABLE) rather than measured,
-# because a row can never select them whatever the shape.
+# key dispatch_tile matches on. The vocabulary is single-sourced from the
+# compiled binding (ops.gemm.tile_vocabulary -> gemm.cuh gemm_recipes_for):
+# the extension returns, per staging pair, every dispatch key the ladders
+# carry in dispatch (manifest) order, deduped by its own first-match rule —
+# the same rule dispatch_tile applies — so this file cannot disagree with
+# policy.cuh's manifests. Names are reconstructed from a row's own numbers
+# (Tile_<bm>x<bn>x<kk>_W<wm>x<wn>_S<stages>, the bench's spelling), which is
+# how dataset recipe strings join without a second mapping.
 # ---------------------------------------------------------------------------
 
 # Operand widths per GemmPerfClass id: W16A16 / W8A16 / W8A8 / F8A8.
 PERF_WIDTH: dict[int, tuple[int, int]] = {0: (2, 2), 1: (2, 1), 2: (1, 1), 3: (1, 1)}
 
-POLICY_CUH = Path(__file__).resolve().parents[1] / "kernels" / "gemm" / "policy.cuh"
-_TILE_RE = re.compile(r"(Tile_\d+x\d+x\d+_W\d+x\d+_S\d+(?:_Fast)?)")
+# Name tokens in dataset rows and run headers (the structural spelling the
+# bench writes; the vocabulary itself comes from the binding below).
 _FACTS_RE = re.compile(r"Tile_(\d+)x(\d+)x(\d+)_W(\d+)x(\d+)_S(\d+)(?:_Fast)?")
-# TileClass ordinals, policy.cuh enum order (what a row's cta column means).
-_CLASS_OF = {(64, 64): 0, (128, 64): 1, (128, 128): 2, (128, 256): 3, (64, 128): 4}
 # The shared ladder every staging path carries: six geometries, one per class
-# and ring depth. If the parse below cannot see these, it is broken.
+# and ring depth. If the binding below cannot see these, the build is stale.
 _SHARED = (
     "Tile_64x64x64_W16x32_S2",
     "Tile_64x64x64_W16x32_S3",
@@ -114,58 +109,46 @@ def tile_facts(name: str) -> tuple[int, int, int]:
         return _CLASS_OF[(int(m), int(n))], int(stages), int(k)
     except KeyError as exc:  # a geometry TileClass does not name
         raise RuntimeError(
-            f"{name}: CTA geometry not in the TileClass enum "
-            f"(policy.cuh). Add the class there and its ordinal to _CLASS_OF."
+            f"{name}: CTA geometry absent from the tile_vocabulary binding "
+            f"— a stale extension build? Rebuild gemm before tuning."
         ) from exc
 
 
-def _load_ladders() -> dict[str, tuple[str, ...]]:
-    """Manifest membership per ladder, in manifest order — that order is the
-    tie preference, because dispatch_tile takes the first key match."""
-    text = POLICY_CUH.read_text()
-    if "using TileManifest" not in text:
-        raise RuntimeError(f"{POLICY_CUH}: no launch ladders found")
-    declared = set(_TILE_RE.findall(text))
+def _binding_vocabulary():
+    """(ladders in dispatch order, geometry -> TileClass ordinal) from the
+    extension binding — the same rows the extension's own planner ranks,
+    so the vocabulary cannot drift from the compiled manifests."""
+    from astrai.extension import ops  # host-only: no kernel, no device
 
-    def listed(name: str) -> list[str]:
-        start = text.index(f"using {name}")
-        end = text.index(";", start)
-        return [t for t in _TILE_RE.findall(text[start:end]) if t in declared]
-
-    cross = listed("TileManifestCross =")
-    return {
-        # manifest_for in policy.cuh picks between exactly these three.
-        "TileManifestCross": tuple(cross),
-        "TileManifest": tuple(
-            cross + [t for t in listed("TileManifest =") if t not in cross]
-        ),
-        "TileManifestByte": tuple(
-            cross + [t for t in listed("TileManifestByte =") if t not in cross]
-        ),
+    ladders: dict[str, list[str]] = {
+        "TileManifestCross": [],
+        "TileManifest": [],
+        "TileManifestByte": [],
     }
+    class_of: dict[tuple[int, int], int] = {}
+    for row in ops.gemm.tile_vocabulary():
+        cw, ba, bb, cta, stages, kk, bm, bn, wm, wn, _threads, _smem = row
+        name = f"Tile_{bm}x{bn}x{kk}_W{wm}x{wn}_S{stages}"
+        ladder = (
+            "TileManifestCross"
+            if cw
+            else "TileManifestByte"
+            if (ba, bb) == (1, 1)
+            else "TileManifest"
+        )
+        if name not in ladders[ladder]:
+            ladders[ladder].append(name)
+        class_of.setdefault((bm, bn), cta)
+    return ladders, class_of
 
 
-def _reachable(tiles: tuple[str, ...]) -> tuple[tuple[str, ...], list[str]]:
-    """Split a ladder into what a row can select (the first tile per dispatch
-    key) and what it cannot (a second tile on a key already taken)."""
-    seen: dict[tuple[int, int, int], str] = {}
-    live: list[str] = []
-    dead: list[str] = []
-    for tile in tiles:
-        key = tile_facts(tile)
-        if key in seen:
-            dead.append(f"{tile} (same (class, stages, kK) as {seen[key]})")
-        else:
-            seen[key] = tile
-            live.append(tile)
-    return tuple(live), dead
-
-
-LADDERS = _load_ladders()
-REACHABLE: dict[str, tuple[str, ...]] = {}
-UNREACHABLE: dict[str, list[str]] = {}
-for _ladder, _tiles in LADDERS.items():
-    REACHABLE[_ladder], UNREACHABLE[_ladder] = _reachable(_tiles)
+# The binding's rows are deduped on the dispatch key already (first manifest
+# match per key — the extension's own rule), so the ladders are the reachable
+# sets as-is.
+LADDERS, _CLASS_OF = _binding_vocabulary()
+REACHABLE: dict[str, tuple[str, ...]] = {
+    ladder: tuple(tiles) for ladder, tiles in LADDERS.items()
+}
 # Every recipe the ladders carry, by name: cta class, ring depth, k-tile depth.
 RECIPES: dict[str, tuple[int, int, int]] = {
     tile: tile_facts(tile) for tiles in REACHABLE.values() for tile in tiles
@@ -173,17 +156,18 @@ RECIPES: dict[str, tuple[int, int, int]] = {
 _missing = [t for t in _SHARED if t not in RECIPES]
 if _missing:
     raise RuntimeError(
-        f"vocabulary read from {POLICY_CUH} missed {_missing}: refusing to "
-        f"sweep a partial candidate set (a silent omission is how a winning "
-        f"tile goes unmeasured)."
+        f"vocabulary read from the tile_vocabulary binding missed {_missing}: "
+        f"a stale extension build? Rebuild gemm before tuning (the binding "
+        f"and policy.cuh ship in the same library)."
     )
 
 
 def ladder_for_widths(ba: int, bb: int) -> str:
-    """Mirror of manifest_for (policy.cuh): 2-byte and mixed pairs get the
-    congruous ladder, 1-byte pairs the byte one, a crosswise problem the
-    shared six. The sweep is NT (crosswise 0), so a mixed width pair rides
-    the kK=32 twins now (the 1-byte bus is a predicated skip)."""
+    """The grouping the binding uses (manifest_for in policy.cuh): 2-byte
+    and mixed pairs get the congruous ladder, 1-byte pairs the byte one, a
+    crosswise problem the shared six. The sweep is NT (crosswise 0), so a
+    mixed width pair rides the kK=32 twins now (the 1-byte bus is a
+    predicated skip)."""
     if ba == 2 and bb == 2:
         return "TileManifest"
     if ba + bb == 3:
@@ -210,8 +194,10 @@ def short_name(tile: str) -> str:
 
 
 def reachability_report() -> list[str]:
-    """One line per tile a row cannot reach, for the run header."""
-    return [f"{ladder}: {dead}" for ladder, dead in UNREACHABLE.items() if dead]
+    """No lines since the vocabulary came from the binding: the extension
+    dedupes on the dispatch key itself (first manifest match per key), so
+    every entry this file can see is reachable by construction."""
+    return []
 
 
 # Ring feasibility mirror (policy.cuh ring_smem_bytes vs the device's
