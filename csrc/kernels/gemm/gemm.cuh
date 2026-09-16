@@ -483,35 +483,32 @@ public:
             return std::nullopt;
         const std::vector<GemmRecipe> recipes =
             gemm_recipes_for(q.crosswise > 0, q.ba, q.bb);
-        // A byte pair ranks on the cost alone. Every candidate's ring sits
-        // under the 48KB watermark there, so the residency key scores them
-        // all 2 and only its tie-break — the manifest's append order — was
-        // choosing; the cost replaces that choice with the tile's own
-        // traffic. Measured over the two saved sweeps (330 + 768 cells,
-        // ladder-restricted candidate sets): capture 0.812 -> 0.983 and
-        // 0.807 -> 0.962, with no band regressing. This also retires the
-        // byte-pair m<=8 "smallest ring" floor: the cost makes the floor's
-        // pick everywhere the floor applied (identical picks, its 4-byte
-        // m1-8 cells included), and the floor's stated rationale — a 0.0%
-        // spread across the ladder at m<=8 — does not reproduce (the
-        // within-cell spread there is 143% median).
-        //
-        // Two-byte and mixed pairs keep the resource keys first: their
-        // measured winner tracks the ring (capture 0.920/0.927 against
-        // 0.913/0.754 for the cost alone), and the cost then decides what
-        // residency cannot. That is where the append-order tie-break cost
-        // the most: in the w16a16 large-M bands the model picked
-        // 64x64x32_W16x32_S3 in all 273 cells where a 128-row twin
-        // measured 8-11% faster.
+        // Width-pair ranking (2026-09-16 full-grid re-fit: 768 cells x 4
+        // classes, cross-checked on both 09-14 grids):
+        // - byte pairs rank on the cost alone (unchanged since 2026-09-14;
+        //   that re-fit took their capture 0.812 -> 0.983 and retired the
+        //   m<=8 smallest-ring floor, whose 0.0%-spread rationale never
+        //   reproduced — within-cell spread there is 143% median).
+        // - two-byte pairs rank on the cost alone TOO: the full grid
+        //   measured the resource prefix a net loss on them. The stages
+        //   tier handed 485/768 w16a16 cells to the S3 twin while S2
+        //   measured faster, and what residency was right about is
+        //   recoverable by the cost once kK is priced (cost_of's issue
+        //   term). Capture 0.9155 -> 0.9623 on the grid, 0.9239 -> 0.9664
+        //   and 0.8906 -> 0.9854 on the 09-14 sets.
+        // - mixed pairs keep the residency gate, drop only the stages tier
+        //   (0.9056 -> 0.9504 grid, 0.9387 -> 0.9588 on 09-14): their
+        //   winner still tracks the ring, but not its depth.
         const bool byte_pair = q.ba == 1 && q.bb == 1;
+        const bool two_byte = q.ba == 2 && q.bb == 2;
         std::optional<PlanDecision> best_d;
         Priced best;
         for (const GemmRecipe& r : recipes) {
-            const Priced candidate = price(r, q);
+            const Priced candidate = price(r, q, byte_pair);
             if (!candidate.ok) continue;
             // beats() owns the ordering; an exact tie keeps the candidate
             // seen first, the manifest's own order.
-            if (!best_d || beats(candidate, best, byte_pair)) {
+            if (!best_d || beats(candidate, best, byte_pair, two_byte)) {
                 best = candidate;
                 best_d = PlanDecision{r, plan_raster(q, r.bm, r.bn),
                                       name()};
@@ -521,13 +518,15 @@ public:
     }
 
 private:
-    // Output element bytes the cost's output-tile term prices: 2 = the bf16
-    // fused-linear default. OutT is not a PlanQuery field (plan_query knows
-    // only the operand types), so an fp32-out policy weights this term twice
-    // as heavily; that only shifts picks where the output tile is comparable
-    // to the operand traffic (small K), and threading OutT in is the
-    // follow-up that would settle it.
-    static constexpr int kOutElemBytes = 2;
+    // Per-k-tile overhead every block pays q.k/kK times (ring-refill
+    // barrier, mma issue, load scheduling), priced as this many
+    // output-cell-bytes per k-iteration — the term that makes kK a model
+    // axis. Fitted at 8 on the 2026-09-16 768-cell w16a16 grid (RTX 5090,
+    // bf16 out) and cross-checked on both 09-14 grids; the fit is that
+    // box+dtype's, so re-fit before trusting it elsewhere. Byte pairs take
+    // none: their ladder is all kK=64, the term degenerates to an output
+    // re-weight there, and the 09-14 grids measured that a wash.
+    static constexpr std::int64_t kKTileIssueBytes = 8;
 
     // One candidate under the model. `ok` false means the ring cannot be
     // resident on this device at all, so the candidate is not a choice — the
@@ -539,15 +538,16 @@ private:
         bool ok = false;
     };
 
-    // More CTAs resident per SM first, then deeper prefetch, then the
-    // modelled cost. The cost is the tie-break the resource keys cannot
-    // supply: two rings that both fit two CTAs are otherwise separated by
-    // the manifest's append order, which is history and not preference.
-    // An exact cost tie still keeps the candidate seen first.
-    static bool beats(const Priced& a, const Priced& b, bool byte_pair) {
-        if (byte_pair) return a.cost < b.cost;
+    // The width-pair orderings (2026-09-16): byte and two-byte pairs rank
+    // on the cost alone; mixed pairs gate on residency first, then the
+    // cost. The stages tier is gone everywhere — measured on the full
+    // grid it preferred the S3 twin in the 485/768 cells where S2 was
+    // faster, and its correct calls are recovered by the cost once kK is
+    // priced. An exact cost tie still keeps the candidate seen first.
+    static bool beats(const Priced& a, const Priced& b, bool byte_pair,
+                      bool two_byte) {
+        if (byte_pair || two_byte) return a.cost < b.cost;
         if (a.resident != b.resident) return a.resident > b.resident;
-        if (a.stages != b.stages) return a.stages > b.stages;
         return a.cost < b.cost;
     }
 
@@ -561,36 +561,42 @@ private:
     // (per-SM L2 bandwidth sits an order below per-SM L1), which leaves the
     // ratio inert and the cost constant-free:
     //
-    //     cost = (operand_bytes + output_bytes) * waves * resident
+    //     cost = (operand_bytes + output_bytes + issue_bytes) * waves * resident
     //
-    // Checked against the two sweeps: this collapsed form picks the same tile
-    // as the two-bandwidth version in all 1088 cells, and the output term is
-    // load-bearing (dropping it costs the byte-pair classes 0.983/0.962 ->
-    // 0.800/0.785). kK never enters directly — it moves residency through the
-    // ring, which is how the kK=32 twin wins where a deeper ring costs a CTA.
+    // Checked against the two 09-14 sweeps: the collapsed form picks the
+    // same tile as the two-bandwidth version in all 1088 cells, and the
+    // output term is load-bearing (dropping it costs the byte-pair classes
+    // 0.983/0.962 -> 0.800/0.785). kK enters only through the issue term —
+    // and through residency via the ring, which is how the kK=32 twin wins
+    // where a deeper ring costs a CTA.
     static std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q,
-                                int resident) {
+                                int resident, bool byte_pair) {
         const std::int64_t operand =
             (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
         const std::int64_t output =
-            (std::int64_t)kOutElemBytes * r.bm * r.bn;
+            (std::int64_t)q.out_elem_bytes * r.bm * r.bn;
+        const std::int64_t issue = byte_pair
+            ? 0
+            : kKTileIssueBytes * (std::int64_t)r.bm * r.bn *
+                  (q.k / r.kk);
         const std::int64_t blocks =
             (std::int64_t)((q.m + r.bm - 1) / r.bm) *
             (std::int64_t)((q.n + r.bn - 1) / r.bn);
         const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
         const std::int64_t waves =
             slots > 0 ? (blocks + slots - 1) / slots : 1;
-        return (operand + output) * waves * resident;
+        return (operand + output + issue) * waves * resident;
     }
 
-    static Priced price(const GemmRecipe& r, const PlanQuery& q) {
+    static Priced price(const GemmRecipe& r, const PlanQuery& q,
+                        bool byte_pair) {
         Priced p;
         const DeviceFacts& dev = q.dev;
         if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0) return p;
         p.resident = std::min(dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
         if (p.resident <= 0) return p;  // ring cannot be resident
         p.stages = r.stages;
-        p.cost = cost_of(r, q, p.resident);
+        p.cost = cost_of(r, q, p.resident, byte_pair);
         p.ok = true;
         return p;
     }
@@ -686,8 +692,10 @@ inline PlanDecision plan_dispatch(const PlanQuery& q) {
 // dispatch key is derived: perf class, operand widths and the crosswise count
 // are all functions of the typed call, so they are computed rather than passed
 // in and a caller cannot hand the planner a key that contradicts its own types
-// and layouts.
-template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
+// and layouts. OutT (default bf16, the fused-linear convention) prices the
+// model cost's output term at its real element size.
+template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
+          typename OutT = __nv_bfloat16>
 PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
     PlanQuery q;
     q.m = p.m;
@@ -698,6 +706,7 @@ PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
     q.crosswise = crosswise_of<LayoutA, LayoutB>();
     q.ba = (int)sizeof(ElemA);
     q.bb = (int)sizeof(ElemB);
+    q.out_elem_bytes = (int)sizeof(OutT);
     q.dev = dev;
     return q;
 }
@@ -706,10 +715,11 @@ PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
 // tags as types is what ties the decision to the launch that follows it —
 // every derived field comes from the same tags the launcher instantiates
 // with.
-template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
+template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
+          typename OutT = __nv_bfloat16>
 PlanDecision plan_dispatch_for(const GemmParams& p) {
     return plan_dispatch(
-        plan_query<ElemA, ElemB, LayoutA, LayoutB>(p, device_facts()));
+        plan_query<ElemA, ElemB, LayoutA, LayoutB, OutT>(p, device_facts()));
 }
 template <typename Policy>
 void launch_policy(GemmParams p, cudaStream_t stream) {
@@ -1000,7 +1010,8 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
     const auto launch = [&](auto la, auto lb, auto lout) {
         launch_plan<ElemA, ElemB, decltype(la), decltype(lb), decltype(lout),
                     OutT>(
-            p, plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb)>(p),
+            p, plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb),
+                                 OutT>(p),
             stream);
     };
     if (trans_a && trans_b) {

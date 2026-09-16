@@ -18,8 +18,11 @@ so no row can override a rule with noise.
 
     python csrc/bench/diff_rows.py --sweep-json /tmp/sweep.json \
         --shapes square:1536:1536 --shapes qkv:6144:1536 \
-        --m-values 1,8,16,32,64,128,256,512,1024,2048,4096 \
+        -m 1,8,16,32,64,128,256,512,1024,2048,4096 \
         --combos w16a16,w8a16,w8a8 --output /tmp/diff.rows
+    # or the product grid instead of named shapes (START:END:STEP, end incl.):
+    python csrc/bench/diff_rows.py --sweep-json /tmp/sweep.json \
+        -m 256:4096:256 -n 256:4096:256 -k 512:3584:1536 --output /tmp/diff.rows
 """
 
 from __future__ import annotations
@@ -68,11 +71,27 @@ def scale_for(dtype: torch.dtype, device: torch.device) -> torch.Tensor | None:
     default="rows",
     help="cpp emits std::array initializers for the GENERATED block.",
 )
-@click.option("--shapes", "shape_values", multiple=True, required=True, help="NAME:N:K")
+@click.option("--shapes", "shape_values", multiple=True, help="NAME:N:K")
 @click.option(
+    "-m",
     "--m-values",
     default="1,8,16,32,64,128,256,512,1024,2048,4096",
     callback=lambda _c, _p, v: tpt.parse_positive_ints(v),
+    help="M grid: START:END:STEP (end inclusive) or a comma list.",
+)
+@click.option(
+    "-n",
+    "--n-values",
+    default=None,
+    callback=lambda _c, _p, v: tpt.parse_positive_ints(v) if v else None,
+    help="N grid; with -k, the product grid instead of --shapes.",
+)
+@click.option(
+    "-k",
+    "--k-values",
+    default=None,
+    callback=lambda _c, _p, v: tpt.parse_positive_ints(v) if v else None,
+    help="K grid; with -n, the product grid instead of --shapes.",
 )
 @click.option("--combos", default=",".join(tpt.COMBOS))
 @click.option(
@@ -90,6 +109,8 @@ def main(
     emit,
     shape_values,
     m_values,
+    n_values,
+    k_values,
     combos,
     min_gain,
     warmup,
@@ -101,11 +122,21 @@ def main(
         if point["recipe"] == "model":
             continue
         key = (point["combo"], point["n"], point["k"], point["m"])
+        # datasets saved before 2026-09-16 spell names with a `_Fast` suffix
+        recipe = point["recipe"].removesuffix("_Fast")
         if key not in winners or point["tflops"] > winners[key][1]:
-            winners[key] = (point["recipe"], point["tflops"])
+            winners[key] = (recipe, point["tflops"])
 
     combos = tuple(c for c in combos.split(",") if c)
     shapes = [tpt.parse_shape(v) for v in shape_values]
+    if n_values or k_values:
+        if not (n_values and k_values):
+            raise click.BadParameter(
+                "-n and -k go together — the grid is their product"
+            )
+        shapes += [(f"n{n}k{k}", n, k) for n in n_values for k in k_values]
+    if not shapes:
+        raise click.BadParameter("give --shapes NAME:N:K and/or the -n/-k grid")
     device = torch.device(torch.cuda.current_device())
     torch.manual_seed(0)
 

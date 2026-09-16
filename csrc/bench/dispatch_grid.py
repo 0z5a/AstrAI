@@ -9,13 +9,13 @@ decision diversity, builtin-row coverage, where along m the pick flips,
 whether k moves the pick at all — and emits a CSV when the per-cell
 decisions are wanted (e.g. diffing two planner modes or two tables).
 
-    python csrc/bench/dispatch_grid.py --step 256 --max 4096
-    python csrc/bench/dispatch_grid.py --step 512 --max 4096 --combos w16a16 \
+    python csrc/bench/dispatch_grid.py -m 256:4096:256
+    python csrc/bench/dispatch_grid.py -m 256:4096:256 -n 256:4096:512 --combos w16a16 \
         --planner model --csv /tmp/logic_model.csv
 
-The measurement side stays what it always was: sparse named shapes
-(tune_plan_table.py sweep), then interleaved A/B for anything that ships
-(diff_rows.py). A dense grid here nominates band boundaries; it proves
+The measurement side stays what it always was: the product-grid sweep
+(tune_plan_table.py sweep -m/-n/-k), then interleaved A/B for anything that
+ships (diff_rows.py). A dense grid here nominates band boundaries; it proves
 nothing about performance.
 """
 
@@ -39,8 +39,13 @@ COMBOS = {
 }
 
 
-def grid(step: int, hi: int) -> list[int]:
-    return list(range(step, hi + 1, step))
+def parse_range(value: str) -> list[int]:
+    """START:END:STEP (end inclusive) — the same grid format as -m/-n/-k
+    everywhere else in the bench scripts."""
+    start, stop, step = (int(x) for x in value.split(":"))
+    if step <= 0 or stop < start:
+        raise click.BadParameter(f"bad range {value!r}: want START:END:STEP")
+    return list(range(start, stop + 1, step))
 
 
 def recipe_name(probe: dict, names: list[str]) -> str:
@@ -48,8 +53,30 @@ def recipe_name(probe: dict, names: list[str]) -> str:
 
 
 @click.command()
-@click.option("--step", default=256, show_default=True, help="Grid stride.")
-@click.option("--max", "hi", default=4096, show_default=True, help="Grid top.")
+@click.option(
+    "-m",
+    "--m-grid",
+    default="256:4096:256",
+    show_default=True,
+    callback=lambda _c, _p, v: parse_range(v),
+    help="M grid: START:END:STEP, end inclusive.",
+)
+@click.option(
+    "-n",
+    "--n-grid",
+    default="256:4096:256",
+    show_default=True,
+    callback=lambda _c, _p, v: parse_range(v),
+    help="N grid: START:END:STEP, end inclusive.",
+)
+@click.option(
+    "-k",
+    "--k-grid",
+    default="256:4096:256",
+    show_default=True,
+    callback=lambda _c, _p, v: parse_range(v),
+    help="K grid: START:END:STEP, end inclusive.",
+)
 @click.option("--combos", default=",".join(COMBOS), show_default=True)
 @click.option(
     "--planner",
@@ -59,7 +86,14 @@ def recipe_name(probe: dict, names: list[str]) -> str:
     help="Which chain to map (the shipped default is hybrid).",
 )
 @click.option("--csv", "csv_path", default=None, type=click.Path(path_type=Path))
-def main(step: int, hi: int, combos: str, planner: str, csv_path: Path | None):
+def main(
+    m_grid: list[int],
+    n_grid: list[int],
+    k_grid: list[int],
+    combos: str,
+    planner: str,
+    csv_path: Path | None,
+):
     # A clean logic map: the shipped builtin rows, no runtime override or
     # injected tier shadowing them (model_capture's --check does the same).
     ops.gemm.set_table("")
@@ -67,10 +101,7 @@ def main(step: int, hi: int, combos: str, planner: str, csv_path: Path | None):
     ops.gemm.set_planner(planner)
     names = ops.gemm.get_module("gemm").tile_class_names()
 
-    rows_out: list[dict] | None = (
-        [] if csv_path is not None else None
-    )
-    values = grid(step, hi)
+    rows_out: list[dict] | None = [] if csv_path is not None else None
     for combo in (c for c in combos.split(",") if c):
         act, weight = COMBOS[combo]
         decisions: Counter[tuple[str, str]] = Counter()
@@ -79,21 +110,23 @@ def main(step: int, hi: int, combos: str, planner: str, csv_path: Path | None):
         m_flips: Counter[int] = Counter()
         k_varies = 0
         prev_by_nk: dict[tuple[int, int], tuple[str, str]] = {}
-        for m in values:
-            for n in values:
+        prev_m: dict[tuple[int, int], int] = {}
+        for m in m_grid:
+            for n in n_grid:
                 pick_by_k: dict[tuple[str, str], int] = {}
-                for k in values:
+                for k in k_grid:
                     d = ops.gemm.probe(m, n, k, act, weight)
                     dec = (d["source"], recipe_name(d, names))
                     decisions[dec] += 1
                     pick_by_k[dec] = k
                     if dec != prev_by_nk.get((n, k)):
                         if (n, k) in prev_by_nk:
-                            m_flips[m - step // 2] += 1
+                            m_flips[(m + prev_m[(n, k)]) // 2] += 1
                         prev_by_nk[(n, k)] = dec
+                    prev_m[(n, k)] = m
                 if len(pick_by_k) > 1:
                     k_varies += 1
-        cells = len(values) ** 3
+        cells = len(m_grid) * len(n_grid) * len(k_grid)
         print(f"=== {combo}  planner={planner}  cells={cells}")
         print(f"    distinct decisions: {len(decisions)}")
         for (source, recipe), count in decisions.most_common(8):
@@ -111,12 +144,12 @@ def main(step: int, hi: int, combos: str, planner: str, csv_path: Path | None):
             print(f"      {flips}")
         print(
             f"    (m,n) cells whose pick varies with k: "
-            f"{k_varies}/{len(values) ** 2}"
+            f"{k_varies}/{len(m_grid) * len(n_grid)}"
         )
         if rows_out is not None:
-            for m in values:
-                for n in values:
-                    for k in values:
+            for m in m_grid:
+                for n in n_grid:
+                    for k in k_grid:
                         d = ops.gemm.probe(m, n, k, act, weight)
                         rows_out.append(
                             {

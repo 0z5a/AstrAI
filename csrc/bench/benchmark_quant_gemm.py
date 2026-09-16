@@ -60,10 +60,21 @@ OP_ORDER = ("bf16", *(label for label, _, _ in GEMM_COMBOS))
 
 
 def parse_positive_ints(value: str) -> tuple[int, ...]:
-    try:
-        values = tuple(dict.fromkeys(int(item.strip()) for item in value.split(",")))
-    except ValueError as exc:
-        raise click.BadParameter("expected comma-separated integers") from exc
+    """START:END:STEP (end inclusive) or a comma list — same grid format as
+    the -m/-n/-k options in the other bench scripts."""
+    value = value.strip()
+    if ":" in value:
+        start, stop, step = (int(x) for x in value.split(":"))
+        if step <= 0 or stop < start:
+            raise click.BadParameter("want START:END:STEP with positive step")
+        values = tuple(range(start, stop + 1, step))
+    else:
+        try:
+            values = tuple(
+                dict.fromkeys(int(item.strip()) for item in value.split(","))
+            )
+        except ValueError as exc:
+            raise click.BadParameter("expected comma-separated integers") from exc
     if not values or any(item <= 0 for item in values):
         raise click.BadParameter("values must be positive integers")
     return values
@@ -218,10 +229,12 @@ def benchmark_gemm(
     help="Optional JSON evidence path (kept out of the repository).",
 )
 @click.option(
+    "-m",
     "--m-values",
     default="512,2048,4096",
     show_default=True,
     callback=lambda _c, _p, v: parse_positive_ints(v),
+    help="M grid: START:END:STEP (end inclusive) or a comma list.",
 )
 @click.option(
     "--shape",

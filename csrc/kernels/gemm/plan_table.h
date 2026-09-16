@@ -131,6 +131,10 @@ struct PlanQuery {
     int crosswise = 0;    // direct-load operand count, see gemm_dispatch
     int ba = 2;           // operand element bytes
     int bb = 2;
+    int out_elem_bytes = 2;  // output element bytes the model cost's output
+                             // term prices; 2 = the bf16 fused-linear
+                             // default (plan_query's OutT parameter — an
+                             // fp32-out caller is priced at 4, not 2)
     DeviceFacts dev{};
 };
 

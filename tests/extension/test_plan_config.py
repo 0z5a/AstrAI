@@ -182,17 +182,20 @@ class TestProbe:
 
 
 class TestModelRule:
-    """The planner's resource rule, asserted as a RULE rather than as a
+    """The planner's model rule, asserted as a RULE rather than as a
     recipe so it holds on any device.
 
-    No wave count and no traffic term survives in the model: with a
-    fractional last wave the FLOP term cancels across the candidates of one
-    problem, which is what the sweep measures (every production cell lands
-    within 1.13-1.38x of every other on a given shape, and wave count ranks
-    them at rho -0.90 against the measurement). What is left to choose
-    between is the resource the ring buys — CTAs resident per SM, then
-    prefetch depth. This pins the planner to that, and pins that it never
-    trades residency away for ring depth.
+    Two-byte pairs rank on the cost alone (2026-09-16 full-grid re-fit):
+    the (resident, stages) prefix measured a net loss there — the stages
+    tier preferred the S3 twin in the cells where S2 measured faster — and
+    kK now has a term of its own, so what residency was right about is
+    recovered by the cost. The cost is (operand + output + issue) bytes
+    times waves times resident, where the issue term prices every
+    k-iteration at a fixed charge per accumulator cell (a deeper kK
+    amortises it). This pins the planner to that cost and checks the pick
+    attains its minimum. The mixed-pair residency gate and the byte-pair
+    form are covered by model_capture's --check fidelity gate, which walks
+    whole datasets.
     """
 
     SHAPES = (
@@ -203,22 +206,29 @@ class TestModelRule:
         (2048, 28672, 8192),
     )
 
-    @staticmethod
-    def _resource(entry, facts):
-        """(resident, stages) for one vocabulary entry, or None when the
-        ring is not resident on this device at all.
+    # gemm.cuh kKTileIssueBytes — keep in sync (fitted on the 2026-09-16
+    # grid, RTX 5090, bf16 out).
+    K_TILE_ISSUE_BYTES = 8
 
-        Mirrors policy.cuh's min_ctas_for_ring against the per-SM smem
-        budget — the only way to assert the rule from Python. Deliberately
-        independent of the shape: the rule does not consult it.
+    @classmethod
+    def _cost(cls, entry, m, n, k, facts):
+        """cost_of mirrored from gemm.cuh, or None when the ring is not
+        resident on this device at all — the only way to assert the rule
+        from Python.
         """
-        smem = entry[9]
+        _cw, _ba, _bb, _cta, _stages, kk, bm, bn, _threads, smem = entry
         resident = min(facts["smem_per_sm"] // smem, 2 if smem <= 48 * 1024 else 1)
         if resident <= 0:
             return None
-        return resident, entry[4]  # (resident, stages)
+        operand = k * (bm * 2 + bn * 2)
+        output = 2 * bm * bn
+        issue = cls.K_TILE_ISSUE_BYTES * bm * bn * (k // kk)
+        blocks = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
+        slots = facts["sms"] * resident
+        waves = (blocks + slots - 1) // slots if slots > 0 else 1
+        return (operand + output + issue) * waves * resident
 
-    def test_pick_attains_the_best_ring_resource(self):
+    def test_two_byte_pick_attains_the_minimum_cost(self):
         # The rule under test is the analytical model's own; pin the
         # planner to it so a compiled-in row (which outranks the model in
         # the default chain) cannot answer in its place.
@@ -231,18 +241,19 @@ class TestModelRule:
         ]
         assert vocab, "the vocabulary carries no bf16 x bf16 candidates"
         for shape in self.SHAPES:
+            m, n, k = shape
             by_recipe = {}
             for entry in vocab:
-                resource = self._resource(entry, facts)
-                if resource is not None:
-                    by_recipe[tuple(entry[3:6])] = resource
+                cost = self._cost(entry, m, n, k, facts)
+                if cost is not None:
+                    by_recipe[tuple(entry[3:6])] = cost
             assert by_recipe, f"no resident candidate for {shape}"
 
             info = ops.gemm.probe(*shape)
             assert info["source"] == "model", shape
             picked = (info["cta"], info["stages"], info["kk"])
             assert picked in by_recipe, f"{shape}: {picked} is not a candidate"
-            assert by_recipe[picked] == max(by_recipe.values()), (
-                f"{shape}: picked {picked} with ring resource "
-                f"{by_recipe[picked]}, the best is {max(by_recipe.values())}"
+            assert by_recipe[picked] == min(by_recipe.values()), (
+                f"{shape}: picked {picked} with cost {by_recipe[picked]}, "
+                f"the best is {min(by_recipe.values())}"
             )

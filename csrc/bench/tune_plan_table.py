@@ -317,19 +317,20 @@ def _candidate_rows() -> dict[str, str]:
 
 
 def parse_positive_ints(value: str) -> tuple[int, ...]:
-    """START:STOP:STEP (STOP exclusive) or a comma list.
+    """START:END:STEP (end inclusive) or a comma list.
 
-    The stride form is what a tuning grid is usually described in
-    (``256:4096:256`` is every 256 up to 4096; ``256:4352:256`` includes
-    4096), and the list form stays for irregular grids.
+    The stride form is what a tuning grid is described in
+    (``256:4096:256`` is the 16 values 256 through 4096); the list form
+    stays for irregular grids. Every -m/-n/-k option in the bench scripts
+    takes this format.
     """
     value = value.strip()
     parts = [p for p in value.split(",") if p.strip()]
     if len(parts) == 1 and ":" in value:
         start, stop, step = (int(x) for x in value.split(":"))
-        if step <= 0 or stop <= start:
-            raise click.BadParameter(f"bad range {value!r}: want START:STOP:STEP")
-        return tuple(range(start, stop, step))
+        if step <= 0 or stop < start:
+            raise click.BadParameter(f"bad range {value!r}: want START:END:STEP")
+        return tuple(range(start, stop + 1, step))
     return tuple(int(part) for part in parts)
 
 
@@ -500,11 +501,13 @@ def build_rows(
         )
         if "planned" in point and point["planned"] != expected:
             continue  # demoted candidate: those numbers are the fallback's
-        _check_recipe(point["perf_class"], point["recipe"])
+        # datasets saved before 2026-09-16 spell names with a `_Fast` suffix
+        recipe = point["recipe"].removesuffix("_Fast")
+        _check_recipe(point["perf_class"], recipe)
         key = (point["perf_class"], point["m"], point["n"])
         over = aggregate.setdefault(key, {})
         tflops = point["tflops"]
-        over[point["recipe"]] = max(over.get(point["recipe"], 0.0), tflops)
+        over[recipe] = max(over.get(recipe, 0.0), tflops)
         m_values.add(point["m"])
         n_values.add(point["n"])
 
@@ -642,29 +645,33 @@ def _winner(
 
 @cli.command("sweep")
 @click.option(
+    "-m",
     "--m-values",
     default="512,2048,4096",
     show_default=True,
     callback=lambda _c, _p, v: parse_positive_ints(v),
+    help="M grid: START:END:STEP (end inclusive) or a comma list.",
 )
 @click.option(
     "--shapes",
     "shape_values",
     multiple=True,
-    help="NAME:N:K — the sweep's weight shapes (N, K); a small probe grid "
-    "is used when omitted.",
+    help="NAME:N:K — named weight shapes; give the grid via -n/-k instead "
+    "for the product sweep.",
 )
 @click.option(
+    "-n",
     "--n-values",
     default=None,
     callback=lambda _c, _p, v: parse_positive_ints(v) if v else None,
-    help="Explicit N grid (used when --shapes is empty).",
+    help="N grid (START:END:STEP, end inclusive); with -k, the sweep grid.",
 )
 @click.option(
+    "-k",
     "--k-values",
     default=None,
     callback=lambda _c, _p, v: parse_positive_ints(v) if v else None,
-    help="Explicit K grid (used when --shapes is empty).",
+    help="K grid (START:END:STEP, end inclusive); with -n, the sweep grid.",
 )
 @click.option("--batch", default=1, show_default=True, help="Batch dim b.")
 @click.option(
@@ -785,7 +792,11 @@ def plan_table_command(
     else:
         if shape_values:
             shapes = [parse_shape(value) for value in shape_values]
-        elif n_values and k_values:
+        elif n_values or k_values:
+            if not (n_values and k_values):
+                raise click.BadParameter(
+                    "-n and -k go together — the sweep grid is their product"
+                )
             shapes = [(f"n{n}k{k}", n, k) for n in n_values for k in k_values]
         else:
             shapes = [("n4096k4096", 4096, 4096), ("n14336k4096", 14336, 4096)]
@@ -951,8 +962,28 @@ def validate(
     "--shapes",
     "shape_values",
     multiple=True,
-    required=True,
-    help="NAME:M:N:K — holdout shape (NT layout).",
+    help="NAME:M:N:K — named holdout shape (NT layout).",
+)
+@click.option(
+    "-m",
+    "--m-grid",
+    default=None,
+    callback=lambda _c, _p, v: parse_positive_ints(v) if v else None,
+    help="Holdout M grid (START:END:STEP, end inclusive); with -n/-k.",
+)
+@click.option(
+    "-n",
+    "--n-grid",
+    default=None,
+    callback=lambda _c, _p, v: parse_positive_ints(v) if v else None,
+    help="Holdout N grid (START:END:STEP, end inclusive); with -m/-k.",
+)
+@click.option(
+    "-k",
+    "--k-grid",
+    default=None,
+    callback=lambda _c, _p, v: parse_positive_ints(v) if v else None,
+    help="Holdout K grid (START:END:STEP, end inclusive); with -m/-n.",
 )
 @click.option(
     "--combos",
@@ -983,6 +1014,9 @@ def validate(
 def validate_command(
     tables: tuple[str, ...],
     shape_values: tuple[str, ...],
+    m_grid: tuple[int, ...] | None,
+    n_grid: tuple[int, ...] | None,
+    k_grid: tuple[int, ...] | None,
     combos: tuple[str, ...],
     batch: int,
     warmup: int,
@@ -997,6 +1031,16 @@ def validate_command(
         name, _, path = spec.partition(":")
         table_map[name] = path if path else None
     shapes = [parse_holdout_shape(value) for value in shape_values]
+    if m_grid or n_grid or k_grid:
+        if not (m_grid and n_grid and k_grid):
+            raise click.BadParameter(
+                "-m/-n/-k go together — the holdout grid is their product"
+            )
+        shapes += [
+            (f"m{m}n{n}k{k}", m, n, k) for m in m_grid for n in n_grid for k in k_grid
+        ]
+    if not shapes:
+        raise click.BadParameter("give --shapes NAME:M:N:K and/or the -m/-n/-k grid")
 
     baseline = list(table_map)[0]
     records = validate(

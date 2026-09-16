@@ -27,7 +27,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
-import statistics
 from collections import defaultdict
 from pathlib import Path
 
@@ -134,20 +133,88 @@ def rules() -> dict:
     model's own byte-pair floor does."""
 
     def shipped(p, q):
-        # gemm.cuh ModelPlanner, mirrored term for term: cost_of() is
-        # (operand bytes + output bytes) * waves * resident — DeepGEMM's
-        # max(L1,L2)/wave_efficiency collapsed, see the C++ comment. Byte
-        # pairs rank on the cost alone (their candidates all tie on
-        # residency); every other pair ranks (resident, stages, cost).
-        cost = (p["b2"] + 2 * p["fat"]) * p["waves"] * p["resident"]
+        # gemm.cuh ModelPlanner, mirrored term for term (2026-09-16 re-fit):
+        # cost_of() is (operand + output + k-tile issue) * waves * resident,
+        # the issue term pricing kK at 8 output-cell-bytes per k-iteration
+        # (byte pairs take none — their ladder is all kK=64). Byte AND
+        # two-byte pairs rank on the cost alone; mixed pairs gate on
+        # residency then cost. The stages tier is gone everywhere.
+        cost = (
+            (
+                p["b2"]
+                + 2 * p["fat"]
+                + (
+                    0
+                    if (q["ba"] == 1 and q["bb"] == 1)
+                    else 8.0 * p["fat"] * p["kiters"]
+                )
+            )
+            * p["waves"]
+            * p["resident"]
+        )
         if q["ba"] == 1 and q["bb"] == 1:
             return (-cost,)
-        return (p["resident"], p["stages"], -cost)
+        if q["ba"] == 2 and q["bb"] == 2:
+            return (-cost,)
+        return (p["resident"], -cost)
+
+    def cost_of(p, issue=0.0):
+        # shipped cost plus, when issue > 0, a per-k-tile overhead every
+        # block pays k/kk times (ring refill, barrier, mma issue): the one
+        # term kk never had, which is why the model cannot price kk32 vs
+        # kk64 (2026-09-16 grid diagnosis: 64x64x64_S3 beats kk32 at k3584).
+        return (
+            (p["b2"] + 2 * p["fat"] + issue * p["fat"] * p["kiters"])
+            * p["waves"]
+            * p["resident"]
+        )
+
+    def deepgemm(p, q):
+        # sm90 heuristics.hpp get_layout_info, term for term: cycles =
+        # max(L1, L2 bytes)/bandwidth / wave_eff. On this tile set every
+        # bm >= 64, so wgmma_m=64 never rereads (max(wgmma_m, bm) == bm)
+        # and the L1 side is a constant multiple of the L2 side — the rule
+        # degenerates to ranking -(b2 + 2*fat)*waves*resident, i.e. cost
+        # alone with the (resident, stages) prefix gone. Kept as the real
+        # formula so a future bm<64 tile re-opens the L1 domain honestly.
+        dev = device_facts()
+        l1_bw = 128.0 * dev["sms"]
+        l2_bw = min(64.0 * dev["sms"], 8e6 / 1.3e3)
+        eb = float(q["ba"])
+        cd = p["fat"] * 2.0  # bf16 output, no accumulate
+        blocks = p["blocks"]
+        l2_c = (p["b2"] + cd) * blocks / l2_bw
+        tc = q["k"] * (max(64, p["bm"]) + p["bn"]) * eb + cd
+        l1_c = (p["b2"] + tc + cd) * blocks / l1_bw
+        return (-max(l1_c, l2_c) / max(p["wave_eff"], 1e-9),)
 
     return {
         "model_exact": shipped,
         # the pre-floor ranking, to size the floor rule's contribution
         "resource": lambda p, q: (p["resident"], p["stages"]),
+        # cost alone for every pair: what DeepGEMM's formula collapses to
+        # here (see deepgemm above) — no resource prefix at all
+        "cost_only": lambda p, q: (-cost_of(p),),
+        # ---- 2026-09-16 full-grid winners (768-cell x 3 datasets) ----
+        # two-byte pairs: pure cost + issue(8), the whole (resident,
+        # stages) prefix dropped. 0.9155->0.9623 new grid, 0.9239->0.9664
+        # and 0.8906->0.9854 on both 09-14 grids. The prefix's stages tier
+        # was the S3-over-S3 confusion (485/768 measured winners are S2).
+        "cost_kt8": lambda p, q: (-cost_of(p, issue=8.0),),
+        # mixed pairs: keep resident, drop only the stages tier.
+        # 0.9056->0.9504 new grid, 0.9387->0.9588 on the 09-14 grid.
+        "res_kt8": lambda p, q: (p["resident"], -cost_of(p, issue=8.0)),
+        # byte pairs: issue(2) re-weights fat only (their ladder is all
+        # kk=64); +0.5-0.8pp new grid but a wash on 09-14 — kept for the
+        # record, not a change worth shipping over cost_only.
+        "cost_kt2": lambda p, q: (-cost_of(p, issue=2.0),),
+        # DeepGEMM sm90 cycles, the honest port
+        "deepgemm": deepgemm,
+        # ---- documented losers (2026-09-16 grid), do not retry ----
+        # flipping the stages tier alone (s2_first) loses the resident-tied
+        # cells the prefix was right about: 0.9155 -> 0.8852. Tied with
+        # no_stages on this menu.
+        "s2_first": lambda p, q: (p["resident"], -p["stages"], -cost_of(p)),
         # fattest tile that still fills, fill-first when nothing fills
         "fat_fill": lambda p, q: (
             p["fat"] if p["wave_eff"] >= 0.5 else 0.0,
@@ -184,7 +251,8 @@ def main(results_json, rule, class_filter, check):
     by_point: dict[tuple, dict[str, float]] = defaultdict(dict)
     for point in json.loads(results_json.read_text()):
         key = (point["combo"], point["n"], point["k"], point["m"])
-        by_point[key][point["recipe"]] = point["tflops"]
+        # datasets saved before 2026-09-16 spell names with a `_Fast` suffix
+        by_point[key][point["recipe"].removesuffix("_Fast")] = point["tflops"]
 
     table = rules()
     if rule:
