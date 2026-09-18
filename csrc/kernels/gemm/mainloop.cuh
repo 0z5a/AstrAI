@@ -336,6 +336,10 @@ struct GemmCollectiveMainloop {
             carry_a(ring_a, a, a_ld, block_m * kBlockM, tid, kStages);
         PrefetchCarry<!kSyncB && !kTma, RingB, kCtaThreads, kTransB>
             carry_b(ring_b, b, b_ld, block_n * kBlockN, tid, kStages);
+        // The 8-bit crosswise operands' register carry: issue() runs the
+        // LDG.128s before the MMA phase, commit() the transpose after it.
+        CrosswiseCarry<StagedLayoutA, ElemA, kCtaThreads, kSyncA> sync_a;
+        CrosswiseCarry<StagedLayoutB, ElemB, kCtaThreads, kSyncB> sync_b;
         const unsigned a_rd0 = __cvta_generic_to_shared(ring_a.engine.ptr) +
                                (kTransA ? a_trans_lane_off(lane)
                                         : a_lane_off(lane));
@@ -367,16 +371,19 @@ struct GemmCollectiveMainloop {
 
         // Staging for tile i+kStages (its slot = (i-1)'s, released by the
         // barrier above): the elected thread arms and issues both TMA
-        // boxes; the cp.async path issues its direct chunks (LDG+PRMT,
-        // 8-bit crosswise) now so the global-load latency hides behind the
-        // MMA phase below.
+        // boxes; the 8-bit crosswise operands issue their LDG.128 runs here
+        // (the transpose and the STS follow the MMA phase below, so the
+        // global latency overlaps tensor-pipe work).
         if constexpr (kTma) {
             if (prefetch && tid == 0)
                 tma_issue_stage(tma, (int)(tile_index + kStages));
         } else if (prefetch) {
-            load_stage<false, true>(astrai::stage_of(ring_a, tile_index + kStages),
-                                    astrai::stage_of(ring_b, tile_index + kStages),
-                                    (tile_index + kStages) * kK);
+            if constexpr (kSyncA)
+                sync_a.issue(a, m, k, a_ld, tid,
+                             (tile_index + kStages) * kK, block_m * kBlockM);
+            if constexpr (kSyncB)
+                sync_b.issue(b, n, k, b_ld, tid,
+                             (tile_index + kStages) * kK, block_n * kBlockN);
         }
 
         const unsigned a_addr = a_rd;
@@ -470,12 +477,22 @@ struct GemmCollectiveMainloop {
         }
         }
         // Generic loop (no interleaved prefetch): the next tile's predicated
-        // loads run after the MMA phase.
+        // loads run after the MMA phase — for the congruous operands the
+        // cp.async chunks, and for the 8-bit crosswise ones the transpose
+        // and STS of the runs issue() fetched.
         if constexpr (!kInterior && !kTma) {
             if (prefetch) {
                 load_stage(astrai::stage_of(ring_a, tile_index + kStages),
                            astrai::stage_of(ring_b, tile_index + kStages),
                            (tile_index + kStages) * kK);
+                if constexpr (kSyncA)
+                    sync_a.commit(astrai::stage_of(ring_a, tile_index + kStages),
+                                  a, m, k, a_ld, tid,
+                                  (tile_index + kStages) * kK, block_m * kBlockM);
+                if constexpr (kSyncB)
+                    sync_b.commit(astrai::stage_of(ring_b, tile_index + kStages),
+                                  b, n, k, b_ld, tid,
+                                  (tile_index + kStages) * kK, block_n * kBlockN);
             }
         }
         // Unconditional commit: empty in the tail, it pads the group

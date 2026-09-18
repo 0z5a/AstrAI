@@ -235,8 +235,8 @@ struct PrefetchCarry<false, RingT, kThreads, kTrans> {
 // LDG.128 runs (4 x 16B of the non-contract dim) + in-register transpose
 // (PRMT) + 16 STS.32. Crosswise operands cannot cp.async into the
 // canonical tile (a 16B global run holds contract positions for a run of
-// the other dim), so they take this path; a staged smem->smem variant
-// measured 15-20% slower and was removed (see git history).
+// the other dim), so they take the register route; a staged smem->smem
+// variant measured 15-20% slower and was removed (see git history).
 //
 // One chunk = 64B of global memory staging one 16-row group:
 //   1-byte elements: 4 runs of 16 rows x 4 contract positions; the PRMT
@@ -245,12 +245,18 @@ struct PrefetchCarry<false, RingT, kThreads, kTrans> {
 //     covers only 8 rows, and the transpose selects halfwords — one
 //     PRMT per output word (the byte selector already spans both source
 //     words: 0x5410 low pair, 0x7632 high pair).
+//
+// This is the GENERAL form: a grid-stride loop over the tile's chunks, so
+// any tile geometry stages correctly however few threads it has. The 1-byte
+// path the ladders actually instantiate has a narrower-chunk, two-phase
+// sibling (CrosswiseCarry, below) which load_crosswise_direct selects — this
+// one keeps the 2-byte formulas and the bus under-subscription case.
 template <typename SmemLayout, typename ElemT, int kThreads>
 __device__ __forceinline__ void
-load_crosswise_direct(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
-                      const ElemT* __restrict__ operand, int64_t rows,
-                      int64_t contract, int64_t ld, int tid, int64_t k_base,
-                      int64_t block_row) {
+load_crosswise_direct_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
+                              const ElemT* __restrict__ operand, int64_t rows,
+                              int64_t contract, int64_t ld, int tid,
+                              int64_t k_base, int64_t block_row) {
     static_assert(sizeof(ElemT) == 1 || sizeof(ElemT) == 2,
                   "crosswise LDG+PRMT staging requires 1- or 2-byte elements");
     constexpr int kRowsTile = SmemLayout::kRows;
@@ -342,6 +348,181 @@ load_crosswise_direct(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two-phase register staging for the 8-bit crosswise operand.
+//
+// The general loader is a synchronous round trip in front of the k-tile's MMA
+// phase, so its global latency sits on the critical path of every iteration.
+// At the 64x64 CTA that costs 243 TF against 350 TF for the same tile staged
+// congruously (interleaved A/B 2026-09-18, qkv fp8) — the sync staging's
+// whole share, and the kernel's top stall.
+//
+// The carry splits it across the phase boundary: issue() fires the global runs
+// one phase ahead of the transpose, commit() does PRMT + STS after the MMA
+// phase, so the latency hides behind tensor-pipe work (ncu long-scoreboard
+// 1.18 -> 0.42, barrier 5.35 -> 3.53, the 64x64 kernel 1.54 -> 1.34 ms).
+// One thread owns the whole 64B chunk: the four contract runs have to meet in
+// one register file for the byte-perm, which is also why the 1-byte operand
+// cannot ride the cp.async trans staging the 2-byte side uses.
+//
+// Spreading that chunk over more threads was tried TWICE and lost both times,
+// which is what pins this path as instruction-throughput bound rather than
+// latency or parallelism bound (profile: issue 39%, not_selected 0.63, i.e.
+// the scheduler is not saturated and the CTA waits on its two loader warps):
+//
+//   * 8-row chunks (32B, LDG.64, 2x the loader threads): qkv fp8 TT -1.7%,
+//     NN -6.2%, TN -7.6% — the LDG count doubles and the loads narrow.
+//   * lane pair per chunk (2 runs each + one shfl_xor per row, LDG.128 kept,
+//     identical LDG/PRMT/STS totals): qkv fp8 TT -7.6%, NN -13%, TN -15%,
+//     square -13..-18% — the exchange costs more than the balance buys.
+//
+// The ladder's tiles all keep the chunk count at or below the thread count,
+// so one chunk per thread is the whole carried state. A thinner bus (more
+// chunks than threads), 2-byte elements and the predicated boundary chunks
+// fall back to load_crosswise_direct_general; the carry owns the interior,
+// aligned chunks.
+template <typename SmemLayout, typename ElemT, int kThreads, bool kOn>
+struct CrosswiseCarry;
+
+template <typename SmemLayout, typename ElemT, int kThreads>
+struct CrosswiseCarry<SmemLayout, ElemT, kThreads, false> {
+    __device__ __forceinline__ void issue(const ElemT*, int64_t, int64_t,
+                                          int64_t, int, int64_t, int64_t) {}
+    template <typename TileT>
+    __device__ __forceinline__ void commit(TileT, const ElemT*, int64_t,
+                                           int64_t, int64_t, int, int64_t,
+                                           int64_t) const {}
+};
+
+template <typename SmemLayout, typename ElemT, int kThreads>
+struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
+    static_assert(sizeof(ElemT) == 1,
+                  "the register carry stages the 8-bit crosswise path");
+    static constexpr int kCw = 4;          // contract elems per chunk
+    static constexpr int kRowsChunk = 16;  // rows per chunk (4 contract runs)
+    static constexpr int kK = SmemLayout::kChunks * 16;
+    static constexpr int kGroups = SmemLayout::kRows / kRowsChunk;
+    static constexpr int kTChunks = (kK / kCw) * kGroups;
+    static constexpr bool kFits = kTChunks <= kThreads;
+
+    uint4 v[4];      // the chunk's four 16-row contract runs
+    int span = 0;    // contract span this thread owns
+    int rg = 0;      // its 16-row group
+    bool active = false;
+    bool fast = false;  // interior + aligned: the arm the carry can stage
+
+    __device__ __forceinline__ void issue(const ElemT* __restrict__ operand,
+                                          int64_t rows, int64_t contract,
+                                          int64_t ld, int tid, int64_t k_base,
+                                          int64_t block_row) {
+        if constexpr (!kFits) return;
+        active = tid < kTChunks;
+        if (!active) return;
+        span = tid / kGroups;
+        rg = tid % kGroups;
+        const int64_t r0 = block_row + rg * kRowsChunk;
+        // r0 is a multiple of 16 and p*ld preserves alignment whenever ld has
+        // it, so every run of a chunk shares one verdict (same rule as the
+        // general loader).
+        const bool run_aligned =
+            ((reinterpret_cast<uintptr_t>(operand) |
+              (ld * (int64_t)sizeof(ElemT))) &
+             15) == 0;
+        fast = (r0 + kRowsChunk - 1 < rows) && run_aligned;
+        const int64_t p0 = k_base + span * kCw;
+        if (fast) {
+#pragma unroll
+            for (int i = 0; i < kCw; ++i)
+                v[i] = p0 + i < contract
+                           ? __ldg(reinterpret_cast<const uint4*>(
+                                 operand + (p0 + i) * ld + r0))
+                           : make_uint4(0u, 0u, 0u, 0u);
+        } else {
+            v[0] = make_uint4(0u, 0u, 0u, 0u);
+            v[1] = make_uint4(0u, 0u, 0u, 0u);
+            v[2] = make_uint4(0u, 0u, 0u, 0u);
+            v[3] = make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+
+    // PRMT + STS for the chunk issue() fetched; the element-granular fallback
+    // (row tail, misaligned base) keeps the synchronous gather so the carry
+    // never has to hold predicated state.
+    template <typename TileT>
+    __device__ __forceinline__ void commit(TileT tile,
+                                           const ElemT* __restrict__ operand,
+                                           int64_t rows, int64_t contract,
+                                           int64_t ld, int tid, int64_t k_base,
+                                           int64_t block_row) const {
+        if constexpr (!kFits) {
+            // Thin bus: issue() staged nothing, so the whole round trip stays
+            // synchronous here.
+            load_crosswise_direct_general<SmemLayout, ElemT, kThreads>(
+                tile, operand, rows, contract, ld, tid, k_base, block_row);
+            return;
+        }
+        if (!active) return;
+        if (fast) {
+            const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
+#pragma unroll
+            for (int i = 0; i < kRowsChunk; ++i) {
+                // Word i = row r0+i's span: byte i of each of the four runs —
+                // [v0.b(i), v1.b(i), v2.b(i), v3.b(i)], the same byte-perm the
+                // general loader spells inline. Each run is one uint4 (16 bytes
+                // = 16 rows), so word i>>2 of run s is bytes[4*s + (i>>2)].
+                const unsigned nib = i & 3;
+                const unsigned sel = nib | ((nib + 4) << 4);
+                const unsigned w01 =
+                    __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
+                const unsigned w23 =
+                    __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
+                *reinterpret_cast<unsigned*>(
+                    tile(rg * kRowsChunk + i, span * kCw)) =
+                    __byte_perm(w01, w23, 0x5410u);
+            }
+            return;
+        }
+        const int64_t r0 = block_row + rg * kRowsChunk;
+#pragma unroll
+        for (int s = 0; s < kCw; ++s) {
+            const int col = span * kCw + s;
+            if (k_base + col >= contract) {
+#pragma unroll
+                for (int i = 0; i < kRowsChunk; ++i)
+                    *tile(rg * kRowsChunk + i, col) = ElemT(0.0f);
+                continue;
+            }
+#pragma unroll
+            for (int i = 0; i < kRowsChunk; ++i)
+                *tile(rg * kRowsChunk + i, col) =
+                    r0 + i < rows ? operand[(k_base + col) * ld + r0 + i]
+                                  : ElemT(0.0f);
+        }
+    }
+};
+
+// The 1-byte route the ladders instantiate: the two-phase carry when the bus
+// fits it, the general grid-stride loader otherwise (and for 2-byte elements,
+// which the 16-bit trans staging handles instead — this stays for the general
+// form's sake).
+template <typename SmemLayout, typename ElemT, int kThreads>
+__device__ __forceinline__ void
+load_crosswise_direct(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
+                      const ElemT* __restrict__ operand, int64_t rows,
+                      int64_t contract, int64_t ld, int tid, int64_t k_base,
+                      int64_t block_row) {
+    if constexpr (sizeof(ElemT) == 1 &&
+                  CrosswiseCarry<SmemLayout, ElemT, kThreads, true>::kFits) {
+        CrosswiseCarry<SmemLayout, ElemT, kThreads, true> carry;
+        carry.issue(operand, rows, contract, ld, tid, k_base, block_row);
+        carry.commit(tile, operand, rows, contract, ld, tid, k_base,
+                     block_row);
+    } else {
+        load_crosswise_direct_general<SmemLayout, ElemT, kThreads>(
+            tile, operand, rows, contract, ld, tid, k_base, block_row);
     }
 }
 
