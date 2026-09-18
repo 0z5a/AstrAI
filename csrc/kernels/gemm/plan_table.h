@@ -510,6 +510,19 @@ inline bool gemm_table_off() {
 // box's sm_120 / RTX 5090 / 170 SMs over M {1..4096} x N {1024..28672}
 // x K {1536,4096,8192}, gated by a production-semantics holdout at 2%.
 //
+// The crosswise F8A8 rows below are the 2026-09-19 addition: the wide CTA
+// joined the byte ladders for crosswise staging (manifest_kind routes
+// 1-byte pairs to TileManifestByte regardless of staging), which moved the
+// L2 re-read wall — the 64x64 model pick streams 4.8GB of operands through
+// L2 on the qkv cell (84.7% L2 SOL, 48% compute) where a 128-row CTA
+// streams 2.4GB and the wide 1.8GB. Measured at the production micro-batch
+// m=16384 over the astrai_1b projections, four alternating A/B rounds per
+// point (shipped model dispatch vs the pinned recipe). NN rows band the
+// CANONICALIZED aspect — canonicalize_gemm plans symmetric NN as the
+// transposed problem — and the (16384,1536) aspect is split by an exact k
+// band into square (k=1536) and mlp_down (k=6912). Bands are the measured
+// points only: another m or projection needs a sweep of its own.
+//
 // A row is calibrated to the part it was measured on, and a stale one is
 // worse than no row at all (the 2026-09-14 +33% lesson). The tier is
 // therefore signature-guarded: kBuiltinPlanMeasuredOn below must equal
@@ -618,7 +631,7 @@ static constexpr std::array<TableRow, 29> kBuiltinPlanW8A8 = {{
     {TileClass::kBig128, 192, 384, 19840, 0, 2, 0, 3, 0, 64},
     {TileClass::kWide128x256, 384, 0, 19840, 0, 2, 0, 2, 0, 64},
 }};
-static constexpr std::array<TableRow, 29> kBuiltinPlanF8A8 = {{
+static constexpr std::array<TableRow, 41> kBuiltinPlanF8A8 = {{
     // The narrow-N pathology of the W16A16/W8A16 rows above, same band and
     // same winner: the 128x128 kk64 row below measured 1.72-1.91x off at n=256,
     // m 1792..2560 (interleaved A/B, 2026-09-14, k=4096).
@@ -651,6 +664,25 @@ static constexpr std::array<TableRow, 29> kBuiltinPlanF8A8 = {{
     {TileClass::kWide128x256, 384, 768, 19840, 0, 3, 0, 2, 0, 64},
     {TileClass::kBig128, 768, 1536, 19840, 0, 3, 0, 2, 0, 64},
     {TileClass::kWide128x256, 1536, 0, 19840, 0, 3, 0, 2, 0, 64},
+    // Crosswise rows, 2026-09-19 (see the block comment): qkv. NN's row
+    // bands the swapped aspect (canonicalize_gemm plans NN as 6144x16384).
+    {TileClass::kBig128, 6143, 6144, 16383, 16384, 3, 1, 2, 0, 64, 1535, 1536},
+    {TileClass::kBig128, 16383, 16384, 6143, 6144, 3, 1, 2, 0, 64, 1535, 1536},
+    {TileClass::kWide128x256, 16383, 16384, 6143, 6144, 3, 2, 2, 0, 64, 1535, 1536},
+    // square (k=1536) and mlp_down (k=6912) share the (16384,1536) aspect;
+    // the exact k band splits them. NN prefers the narrow twin here, TT/TN
+    // the wide CTA.
+    {TileClass::kNarrow128x64, 1535, 1536, 16383, 16384, 3, 1, 2, 0, 64, 1535, 1536},
+    {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 1, 2, 0, 64, 1535, 1536},
+    {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 2, 2, 0, 64, 1535, 1536},
+    // mlp_up.
+    {TileClass::kBig128, 6911, 6912, 16383, 16384, 3, 1, 2, 0, 64, 1535, 1536},
+    {TileClass::kBig128, 16383, 16384, 6911, 6912, 3, 1, 2, 0, 64, 1535, 1536},
+    {TileClass::kWide128x256, 16383, 16384, 6911, 6912, 3, 2, 2, 0, 64, 1535, 1536},
+    // mlp_down (k=6912).
+    {TileClass::kWide128x256, 1535, 1536, 16383, 16384, 3, 1, 2, 0, 64, 6911, 6912},
+    {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 1, 2, 0, 64, 6911, 6912},
+    {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 2, 2, 0, 64, 6911, 6912},
 }};
 
 // The device the rows above were measured on; see the block comment.

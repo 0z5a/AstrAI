@@ -372,20 +372,24 @@ constexpr int crosswise_of() {
 // Which of the ladders a (staging path, operand widths) pair selects —
 // the one rule behind both the type-level alias and the planner's runtime
 // lookup, so the two cannot disagree about which tiles a plan may reach.
-// The widening ladders are only legal where they were measured, so the
-// crosswise staging keeps the conservative six (different staging budget)
-// and 1-byte pairs keep their own ladder (no kK=32 tile pays there, see
-// TileManifestByte); a mixed width pair rides the congruous ladder — the
-// predicated skip carries its thinner 1-byte bus, the small CTA widens on
-// it, and every kK=32 twin's ring and reclaim budget hold at the mixed
-// widths (the big twin's 32KB output against its 48KB ring included).
+// 1-byte pairs keep their own ladder regardless of staging — the wide CTA
+// rides it for the congruous route, and crosswise staging measures into it
+// too (its ring is (stages+1)*kK*(bm+bn) = 72KB at 512 threads, and both
+// direct sides fit the packed carry: 256 units for the 128-row side, an
+// exact 512 for the 256-row one); no kK=32 tile pays on a 1-byte pair (see
+// TileManifestByte). Crosswise staging keeps the conservative six for the
+// 2-byte and mixed widths (different staging budget); a mixed width pair
+// rides the congruous ladder — the predicated skip carries its thinner
+// 1-byte bus, the small CTA widens on it, and every kK=32 twin's ring and
+// reclaim budget hold at the mixed widths (the big twin's 32KB output
+// against its 48KB ring included).
 enum class ManifestKind { kCrosswise, kTwoByte, kMixed, kByte };
 
 constexpr ManifestKind manifest_kind(bool crosswise_staging, int ba, int bb) {
+    if (ba == 1 && bb == 1) return ManifestKind::kByte;
     if (crosswise_staging) return ManifestKind::kCrosswise;
     if (ba == 2 && bb == 2) return ManifestKind::kTwoByte;
     if (ba + bb == 3) return ManifestKind::kMixed;
-    if (ba == 1 && bb == 1) return ManifestKind::kByte;
     return ManifestKind::kCrosswise;
 }
 
