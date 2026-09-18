@@ -127,6 +127,39 @@ struct GemmCollectiveMainloop {
                             log2_const<kChunksBT>::value>{},
                     Layout<Shape<kK, kChunksBT>, Stride<kChunksBT, 1>>{}));
 
+    // The k-pair packed grid (8-bit crosswise operands): the operand staged as
+    // 16-bit (row, k-pair) units — packed row j carries the contract pair
+    // (2j, 2j+1) — so the 16-bit crosswise reader's ldmatrix.trans contract
+    // applies unchanged (16 packed rows = one mma k-segment of 32 contract
+    // bytes). The staged byte count is the canonical tile's (kK/2 rows x
+    // kBlockM bytes), so the ring carve and the epilogue's reclaim budget are
+    // untouched.
+    static constexpr int kPackChunksA = kBlockM / 8;  // 16B chunks per row
+    static constexpr int kPackChunksB = kBlockN / 8;
+    using SmemLayoutAPack = decltype(
+        composition(Swizzle<log2_const<kPackChunksA < 8 ? kPackChunksA : 8>::value,
+                            log2_const<kPackChunksA>::value>{},
+                    Layout<Shape<kK / 2, kPackChunksA>,
+                           Stride<kPackChunksA, 1>>{}));
+    using SmemLayoutBPack = decltype(
+        composition(Swizzle<log2_const<kPackChunksB < 8 ? kPackChunksB : 8>::value,
+                            log2_const<kPackChunksB>::value>{},
+                    Layout<Shape<kK / 2, kPackChunksB>,
+                           Stride<kPackChunksB, 1>>{}));
+
+    // Packed staging is admissible on a 1-byte crosswise operand that the
+    // dequant readers do not own (they read the canonical tile) and whose tile
+    // carries an even kK plus a power-of-two chunk count of at least 8 (the
+    // swizzle's row budget: 8 rows per ldmatrix matrix).
+    static constexpr bool kPackOkA =
+        sizeof(ElemA) == 1 && (kK % 2 == 0) && kPackChunksA >= 8 &&
+        (kPackChunksA & (kPackChunksA - 1)) == 0;
+    static constexpr bool kPackOkB =
+        sizeof(ElemB) == 1 && (kK % 2 == 0) && kPackChunksB >= 8 &&
+        (kPackChunksB & (kPackChunksB - 1)) == 0;
+    static constexpr bool kPackA = kDirectA && !kDequantA && kPackOkA;
+    static constexpr bool kPackB = kDirectB && !kDequantB && kPackOkB;
+
     // One ring type per operand (common/tensor.cuh): the staged-layout
     // instance each path addresses — the trans tile when the 16-bit
     // crosswise staging is active, the canonical tile otherwise (congruous
@@ -136,10 +169,12 @@ struct GemmCollectiveMainloop {
     // the slot rotation, the stage/ring byte budget and the typed tile
     // view — the smem carve and every stage consumer below read them off
     // the type instead of re-deriving strides.
-    using StagedLayoutA =
-        std::conditional_t<kTransA, SmemLayoutATrans, SmemLayoutA>;
-    using StagedLayoutB =
-        std::conditional_t<kTransB, SmemLayoutBTrans, SmemLayoutB>;
+    using StagedLayoutA = std::conditional_t<
+        kPackA, SmemLayoutAPack,
+        std::conditional_t<kTransA, SmemLayoutATrans, SmemLayoutA>>;
+    using StagedLayoutB = std::conditional_t<
+        kPackB, SmemLayoutBPack,
+        std::conditional_t<kTransB, SmemLayoutBTrans, SmemLayoutB>>;
     using RingA = Tensor<PtrEngine<ElemA>, RingLayout<StagedLayoutA, kARing>>;
     using RingB = Tensor<PtrEngine<ElemB>, RingLayout<StagedLayoutB, kBRing>>;
     using TileA = Tensor<PtrEngine<ElemA>, StagedLayoutA>;
@@ -221,10 +256,18 @@ struct GemmCollectiveMainloop {
     load_stage(TileA a_tile, TileB b_tile,
                int64_t k_base) const {
         if constexpr (kSyncPhase) {
-            if constexpr (kSyncA)
+            // 8-bit crosswise: the k-pair packed grid when the tile admits it,
+            // the canonical-tile register carry otherwise.
+            if constexpr (kPackA)
+                load_crosswise_paired<StagedLayoutA, ElemA, kCtaThreads>(
+                    a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+            else if constexpr (kSyncA)
                 load_crosswise_direct<StagedLayoutA, ElemA, kCtaThreads>(
                     a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
-            if constexpr (kSyncB)
+            if constexpr (kPackB)
+                load_crosswise_paired<StagedLayoutB, ElemB, kCtaThreads>(
+                    b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+            else if constexpr (kSyncB)
                 load_crosswise_direct<StagedLayoutB, ElemB, kCtaThreads>(
                     b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
         } else {
@@ -336,17 +379,26 @@ struct GemmCollectiveMainloop {
             carry_a(ring_a, a, a_ld, block_m * kBlockM, tid, kStages);
         PrefetchCarry<!kSyncB && !kTma, RingB, kCtaThreads, kTransB>
             carry_b(ring_b, b, b_ld, block_n * kBlockN, tid, kStages);
-        // The 8-bit crosswise operands' register carry: issue() runs the
-        // LDG.128s before the MMA phase, commit() the transpose after it.
-        CrosswiseCarry<StagedLayoutA, ElemA, kCtaThreads, kSyncA> sync_a;
-        CrosswiseCarry<StagedLayoutB, ElemB, kCtaThreads, kSyncB> sync_b;
+        // The 8-bit crosswise operands' register carry: issue() runs the global
+        // runs before the MMA phase, commit() the byte-perm and STS after it.
+        // Packed-grid operands ride the same seam with the two-run sibling.
+        std::conditional_t<kPackA,
+                           PairPackCarry<StagedLayoutA, ElemA, kCtaThreads, true>,
+                           CrosswiseCarry<StagedLayoutA, ElemA, kCtaThreads, kSyncA>>
+            sync_a;
+        std::conditional_t<kPackB,
+                           PairPackCarry<StagedLayoutB, ElemB, kCtaThreads, true>,
+                           CrosswiseCarry<StagedLayoutB, ElemB, kCtaThreads, kSyncB>>
+            sync_b;
         const unsigned a_rd0 = __cvta_generic_to_shared(ring_a.engine.ptr) +
-                               (kTransA ? a_trans_lane_off(lane)
-                                        : a_lane_off(lane));
+                               (kPackA ? a_pack_lane_off(lane)
+                                       : (kTransA ? a_trans_lane_off(lane)
+                                                  : a_lane_off(lane)));
         const unsigned b_rd0 =
             __cvta_generic_to_shared(ring_b.engine.ptr) +
-            (kTransB ? b_trans_lane_off(lane)
-                     : (kPairB ? b4_lane_off(lane) : b_lane_off(lane)));
+            (kPackB ? b_pack_lane_off(lane)
+                    : (kTransB ? b_trans_lane_off(lane)
+                               : (kPairB ? b4_lane_off(lane) : b_lane_off(lane))));
         const unsigned a_rd_end = a_rd0 + (unsigned)(kARing * kAStageBytes);
         const unsigned b_rd_end = b_rd0 + (unsigned)(kBRing * kBStageBytes);
         unsigned a_rd = a_rd0, b_rd = b_rd0;
@@ -396,10 +448,12 @@ struct GemmCollectiveMainloop {
         unsigned a_seg[kSegs], b_seg[kSegs];
 #pragma unroll
         for (int s = 0; s < kSegs; ++s) {
-            a_seg[s] = kTransA ? (a_addr + (unsigned)(s * kTransSegA))
-                               : (a_addr ^ (unsigned)(s * kSegXorA));
-            b_seg[s] = kTransB ? (b_addr + (unsigned)(s * kTransSegB))
-                               : (b_addr ^ (unsigned)(s * kSegXorB));
+            a_seg[s] = (kTransA || kPackA)
+                           ? (a_addr + (unsigned)(s * kTransSegA))
+                           : (a_addr ^ (unsigned)(s * kSegXorA));
+            b_seg[s] = (kTransB || kPackB)
+                           ? (b_addr + (unsigned)(s * kTransSegB))
+                           : (b_addr ^ (unsigned)(s * kSegXorB));
         }
 
         // kNt ldmatrix.x2 (B) + kMt ldmatrix.x4 (A) feed kMt*kNt*2 mma.sync
@@ -440,7 +494,7 @@ struct GemmCollectiveMainloop {
             for (int mt = 0; mt < kMt; ++mt)
                 load_a_frags_at(a_frag[mt], a_tile, k_seg,
                                 mt, lane);
-        } else if constexpr (kTransA) {
+        } else if constexpr (kTransA || kPackA) {
             astrai::ldmatrix_x4_lane<true>(a_frag[0], a_seg[k_seg]);
         } else {
             astrai::ldmatrix_x4_lane(a_frag[0], a_seg[k_seg]);
@@ -450,9 +504,10 @@ struct GemmCollectiveMainloop {
             if constexpr (!kDequantA) {
                 if (mt + 1 < kMt) {
                     const unsigned a_next =
-                        kTransA ? (a_seg[k_seg] ^ (unsigned)((mt + 1) * kMtXor))
-                                : (a_seg[k_seg] + (mt + 1) * kMtStep);
-                    if constexpr (kTransA)
+                        (kTransA || kPackA)
+                            ? (a_seg[k_seg] ^ (unsigned)((mt + 1) * kMtXor))
+                            : (a_seg[k_seg] + (mt + 1) * kMtStep);
+                    if constexpr (kTransA || kPackA)
                         astrai::ldmatrix_x4_lane<true>(a_frag[mt + 1], a_next);
                     else
                         astrai::ldmatrix_x4_lane(a_frag[mt + 1], a_next);
@@ -616,7 +671,8 @@ struct GemmCollectiveMainloop {
     static constexpr unsigned kNtStep = 8u * kK * sizeof(ElemB);   // n-tile row step
     static constexpr unsigned kSegXorA = (unsigned)Traits::kMmaK * sizeof(ElemA);
     static constexpr unsigned kSegXorB = (unsigned)Traits::kMmaK * sizeof(ElemB);
-    static constexpr bool kPairB = !kDequantB && kK * sizeof(ElemB) / 16 <= 4;
+    static constexpr bool kPairB =
+        !kDequantB && !kPackB && kK * sizeof(ElemB) / 16 <= 4;
     static_assert(!kPairB || kNt % 2 == 0, "B pairing needs even kNt");
     static_assert(!kPairB || !kTransB,
                   "2-byte crosswise B never pairs (chunk budget)");
@@ -643,6 +699,21 @@ struct GemmCollectiveMainloop {
             (lane & 7) + (((lane >> 3) & 1) << 3), b_row0, kBlockN);
     }
 
+    // Packed-grid lane offsets: the trans formula one width down — a packed
+    // row is a header of 16-bit units (8 per 16B chunk), so the row extent is
+    // kBlockM/kBlockN UNITS and every address scales by the unit width. The
+    // lane contract, the m/n-tile XOR steps and the per-k-segment ADD are the
+    // trans reader's: 16 packed rows carry exactly one mma k-segment.
+    __device__ __forceinline__ unsigned a_pack_lane_off(int lane) const {
+        return trans_lane_off<SmemLayoutAPack, unsigned short>(
+            (lane & 7) + ((lane >> 4) << 3),
+            a_row0 + (((lane >> 3) & 1) << 3), kBlockM);
+    }
+    __device__ __forceinline__ unsigned b_pack_lane_off(int lane) const {
+        return trans_lane_off<SmemLayoutBPack, unsigned short>(
+            (lane & 7) + (((lane >> 3) & 1) << 3), b_row0, kBlockN);
+    }
+
     // One k_seg's B-fragment loads, shared by the initial fill and the
     // double-buffer's next-seg fill. frag2/frag4 are one b_frag /
     // b_frag4 buffer (the unused one is never touched) — typed cells, so
@@ -653,9 +724,10 @@ struct GemmCollectiveMainloop {
                  unsigned seg_base) const {
 #pragma unroll
         for (int p = 0; p < kNt / 2; ++p) {
-            if constexpr (kTransB) {
-                // Trans tile: each x2.trans reads 16 k rows at one n
-                // chunk; the nt windows step by one XORed chunk.
+            if constexpr (kTransB || kPackB) {
+                // Trans/packed tile: each x2.trans reads 16 k rows (16 packed
+                // pairs on the packed grid) at one n chunk; the nt windows
+                // step by one XORed chunk.
                 astrai::ldmatrix_x2_lane<true>(
                     frag2[p * 2], seg_base ^ (unsigned)(p * 2 * kNtXor));
                 astrai::ldmatrix_x2_lane<true>(
