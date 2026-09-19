@@ -36,6 +36,14 @@ enum class QuantLayout : int {
     Dual = 2,
 };
 
+// Ring-fold scratch lines: the fused amax is RMW-spread across this many
+// float slots (block id mod kFoldSlots) instead of one contended address —
+// a 49k-block grid otherwise serializes every block completion on a single
+// L2 atomic (ncu: ~6% of the tiled dual kernel). The last-finishing block
+// folds the slots, publishes the scale and re-zeroes them (self-cleaning,
+// same protocol as the old single slot).
+inline constexpr int kFoldSlots = 32;
+
 // Quantize-kernel parameter POD: float input -> FP8 with fused amax.
 struct QuantParams {
     const void* __restrict__ input_ptr = nullptr;
@@ -49,12 +57,14 @@ struct QuantParams {
     // Optional delayed-scaling ring fold: when fold_ring is set, the kernel's
     // last-finishing block folds the final amax into hist[hist_idx], reduces
     // the window and publishes the next scale — replacing the host-side
-    // update chain. amax then points at a persistent self-cleaning slot
-    // (zeroed by the same last block) inside the caller's ring state.
+    // update chain. Blocks RMW their block amax into amax_scratch[block id
+    // mod kFoldSlots] (one contended address serializes every completion);
+    // the last block folds the scratch, zeroes it and publishes.
     bool fold_ring = false;
     float* __restrict__ hist = nullptr;  // [hist_len] amax history window
     float* __restrict__ scale_out = nullptr;
-    unsigned int* __restrict__ done = nullptr;  // block-completion counter
+    float* __restrict__ amax_scratch = nullptr;  // [kFoldSlots] RMW lines
+    unsigned int* __restrict__ done = nullptr;   // block-completion counter
     int hist_len = 0;
     int hist_idx = 0;
     float fp8_max = 448.0f;   // scale = max(hist) / fp8_max / pow2_margin
@@ -65,6 +75,14 @@ struct QuantParams {
     int total = 0;
     int rows = 0;
     int cols = 0;
+
+    // Unified-strided experiment: element strides of output_ptr in (row,
+    // col) input coordinates — the row-major placement is (cols, 1). The
+    // transposed copy's placement is NOT this pair's swap (that only holds
+    // on square shapes); it is the canonical consumer contract (1, rows),
+    // derived from p.rows inside the kernel — no second pair rides the POD.
+    int out_row_stride = 0;
+    int out_col_stride = 0;
 };
 
 }  // namespace quant

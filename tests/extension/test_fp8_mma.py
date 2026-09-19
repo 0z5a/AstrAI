@@ -482,8 +482,9 @@ def test_fp8_tensor_meta_delayed_update():
     meta.w.seed(w, torch.float8_e4m3fn)
     assert meta.w.initialized
     torch.testing.assert_close(meta.w.scale, (w.abs().amax() / 448.0).reshape(1))
-    # [hist | scale | legacy | amax | done] packing: views alias one buffer.
-    assert meta.w.state.numel() == 4 + 4
+    # [hist | scale | legacy | amax | done | fold scratch] packing: views
+    # alias one buffer; the scratch is the fold's per-block RMW target.
+    assert meta.w.state.numel() == 4 + 4 + _ScaleRing.kFoldSlots
     assert meta.w.hist.data_ptr() == meta.w.state.data_ptr()
     assert meta.w.scale.data_ptr() == meta.w.state[4:].data_ptr()
     meta.w.advance()
@@ -536,7 +537,7 @@ def test_quantize_ring_fold_matches_host_update(fmt, fmax, margin):
     scale = (hist.max() / fmax / pow2m).clamp_min(1e-12).reshape(1)
 
     # Fused: same window, fold inside the quantize kernel's last block.
-    ring = torch.zeros(n + 4, device=dev)
+    ring = torch.zeros(n + 4 + _ScaleRing.kFoldSlots, device=dev)
     ring[:n].fill_(1.0)
     x8, _ = quantize(
         x,
@@ -575,7 +576,7 @@ def test_quantize_ring_fold_tall_dual_grid(fmt, fmax):
     hist[idx] = x.float().abs().amax().reshape(1)
     scale = (hist.max() / fmax).clamp_min(1e-12).reshape(1)
 
-    ring = torch.zeros(n + 4, device=dev)
+    ring = torch.zeros(n + 4 + _ScaleRing.kFoldSlots, device=dev)
     ring[:n].fill_(1.0)
     d8, d8T, _ = quantize_dual(
         x, mult, fmt, ring_state=ring, hist_idx=idx, fp8_max=fmax, pow2_margin=1.0
@@ -619,8 +620,8 @@ def test_quantize_amax_presence():
     assert amax_dual is None
     assert torch.equal(d8.view(torch.uint8), x8.view(torch.uint8))
     assert torch.equal(d8T.view(torch.uint8), x8.t().contiguous().view(torch.uint8))
-    # ring: the in-kernel fold writes the amax slot, then self-cleans it.
-    ring = torch.zeros(8, device="cuda")
+    # ring: the in-kernel fold writes the amax scratch, then self-cleans it.
+    ring = torch.zeros(8 + _ScaleRing.kFoldSlots, device="cuda")
     ring[:4].fill_(1.0)
     x8r, amax_ring = quantize(
         x,

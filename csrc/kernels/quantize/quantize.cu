@@ -13,21 +13,21 @@ using namespace astrai::quant;
 
 namespace {
 
-// Dtype dispatch over the unified quantize launcher: one case per
-// supported input dtype; the default is a hard error (entry-checked, so
-// unreachable — never a silent bf16 re-route).
-template <bool Tiled, typename Fp8T>
+// Dtype dispatch over the merged quantize launcher: one case per supported
+// input dtype; the default is a hard error (entry-checked, so unreachable —
+// never a silent bf16 re-route).
+template <typename Fp8T>
 void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
                       cudaStream_t stream) {
     switch (x.scalar_type()) {
     case torch::kBFloat16:
-        launch_fp8_quantize<Fp8T, __nv_bfloat16, Tiled>(p, stream);
+        launch_fp8_quantize<Fp8T, __nv_bfloat16>(p, stream);
         break;
     case torch::kHalf:
-        launch_fp8_quantize<Fp8T, __half, Tiled>(p, stream);
+        launch_fp8_quantize<Fp8T, __nv_half>(p, stream);
         break;
     case torch::kFloat32:
-        launch_fp8_quantize<Fp8T, float, Tiled>(p, stream);
+        launch_fp8_quantize<Fp8T, float>(p, stream);
         break;
     default:
         TORCH_CHECK(false, "unsupported quantize input dtype: ",
@@ -35,14 +35,14 @@ void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
     }
 }
 
-template <bool Tiled>
 void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
                          bool e5m2, cudaStream_t stream) {
     if (e5m2)
-        launch_for_dtype<Tiled, __nv_fp8_e5m2>(x, p, stream);
+        launch_for_dtype<__nv_fp8_e5m2>(x, p, stream);
     else
-        launch_for_dtype<Tiled, __nv_fp8_e4m3>(x, p, stream);
+        launch_for_dtype<__nv_fp8_e4m3>(x, p, stream);
 }
+
 
 // Shared binding body for the two quantize entry points: RowMajor /
 // Transposed (single output) serve quantize(), Dual (both orientations from
@@ -77,7 +77,7 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
     auto input = x.contiguous();
     auto out_opts = input.options().dtype(out_dtype);
     torch::Tensor amax;
-    float *ring_hist = nullptr, *ring_scale_out = nullptr;
+    float *ring_hist = nullptr, *ring_scale_out = nullptr, *ring_scratch = nullptr;
     unsigned int* ring_done = nullptr;
     int ring_len = 0;
     if (!ring.is_none()) {
@@ -85,13 +85,17 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
         TORCH_CHECK(st.is_cuda() && st.dim() == 1 &&
                         st.scalar_type() == torch::kFloat32,
                     "ring state must be a 1D float32 CUDA tensor");
-        const int64_t n = st.numel() - 4;
+        // Layout: [hist n | scale | legacy | amax | done | fold scratch
+        // kFoldSlots] — the scratch lines absorb the per-block amax RMWs
+        // (a single contended address serializes a 49k-block grid).
+        const int64_t n = st.numel() - 4 - kFoldSlots;
         TORCH_CHECK(n > 0 && hist_idx >= 0 && hist_idx < n,
                     "ring state too small or hist_idx out of range");
         float* base = st.data_ptr<float>();
         amax = st.narrow(0, n + 2, 1);
         ring_hist = base;
         ring_scale_out = base + n;
+        ring_scratch = base + n + 4;
         ring_done = reinterpret_cast<unsigned int*>(base + n + 3);
         ring_len = static_cast<int>(n);
     }
@@ -104,30 +108,43 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
         p.fold_ring = true;
         p.hist = ring_hist;
         p.scale_out = ring_scale_out;
+        p.amax_scratch = ring_scratch;
         p.done = ring_done;
         p.hist_len = ring_len;
         p.hist_idx = static_cast<int>(hist_idx);
         p.fp8_max = static_cast<float>(fp8_max);
         p.pow2_margin = static_cast<float>(pow2_margin);
     }
-    p.total = static_cast<int>(input.numel());
+    // The merged kernel views the whole buffer as one flat [rows][cols]
+    // tile grid: leading dims fold into rows so 1D and 3D inputs are fully
+    // covered (the former elementwise kernel's p.total behavior). An empty
+    // tensor folds to rows=0 with a 1-wide cols axis — the launcher still
+    // fires one block so the ring fold publishes.
+    const int64_t numel = input.numel();
+    const int64_t cols = numel == 0 ? 1 : input.size(-1);
+    const int64_t rows = numel / cols;
+    TORCH_CHECK(cols <= INT32_MAX && rows <= INT32_MAX,
+                "quantize tensor too large for the tiled grid");
+    p.total = static_cast<int>(numel);
     p.out_layout = layout;
-    p.rows = static_cast<int>(input.size(-2));
-    p.cols = static_cast<int>(input.size(-1));
+    p.rows = static_cast<int>(rows);
+    p.cols = static_cast<int>(cols);
+    // The merged kernel takes placement as data: the stride pair for the
+    // row-major side ((cols, 1)); the transposed side derives its canonical
+    // (1, rows) contract in-kernel.
+    p.out_row_stride = p.cols;
+    p.out_col_stride = 1;
     torch::Tensor output, output_t;
     if (layout != QuantLayout::Transposed) {
         output = torch::empty_like(input, out_opts);
         p.output_ptr = output.data_ptr();
     }
     if (layout != QuantLayout::RowMajor) {
-        output_t = torch::empty({input.size(-1), input.size(-2)}, out_opts);
+        output_t = torch::empty({cols, rows}, out_opts);
         p.output_transposed_ptr = output_t.data_ptr();
     }
     const bool e5m2 = out_dtype == torch::kFloat8_e5m2;
-    if (layout == QuantLayout::RowMajor)
-        launch_quantize_for<false>(input, p, e5m2, stream.stream());
-    else
-        launch_quantize_for<true>(input, p, e5m2, stream.stream());
+    launch_quantize_for(input, p, e5m2, stream.stream());
     C10_CUDA_CHECK(cudaGetLastError());
     if (layout == QuantLayout::Dual)
         return py::make_tuple(output, output_t, amax);

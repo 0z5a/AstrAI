@@ -140,20 +140,27 @@ class FP8Recipe:
 
 class _ScaleRing:
     """One operand's delayed-scaling state: a float32 buffer
-    ``[hist[n] | scale | legacy | amax | done]`` (views). The quantize
-    kernel folds its fused amax into ``hist[idx]`` and publishes the next
-    scale from the window in its own last block (``fold_args`` passes the
-    buffer + recipe constants); ``idx`` advances host-side each use. The
-    ``amax``/``done`` tail slots are kernel scratch (self-cleaning across
-    launches); the legacy slot keeps state-buffer compatibility.
+    ``[hist[n] | scale | legacy | amax | done | fold scratch]`` (views). The
+    quantize kernel folds its fused amax into ``hist[idx]`` and publishes
+    the next scale from the window in its own last block (``fold_args``
+    passes the buffer + recipe constants); ``idx`` advances host-side each
+    use. The ``amax``/``done``/scratch tail slots are kernel scratch
+    (self-cleaning across launches); the legacy slot keeps state-buffer
+    compatibility. The scratch is the fold's per-block amax RMW target
+    spread over 32 lines (one contended address serializes a 49k-block
+    grid) — must match quant::kFoldSlots: the binding derives the history
+    length as ``numel - 4 - 32``.
     """
 
     __slots__ = ("recipe", "state", "hist", "scale", "idx", "initialized")
 
+    kFoldSlots = 32
+
     def __init__(self, device: torch.device, recipe: FP8Recipe):
         self.recipe = recipe
         n = recipe.history_len
-        self.state = torch.zeros(n + 4, device=device, dtype=torch.float32)
+        self.state = torch.zeros(n + 4 + self.kFoldSlots, device=device,
+                                 dtype=torch.float32)
         self.hist = self.state[:n]
         self.scale = self.state[n : n + 1]
         self.idx = 0
