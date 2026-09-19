@@ -926,6 +926,21 @@ Test files:
 - `attn_paged_test.cu` — paged decode/prefill kernels
 - `quant_gemm_test.cu` — quantized GEMM correctness: every dtype pair (fp8/int8/bf16 × layouts/K tiles/ragged shapes/scales/fp32 out) + a per-combo TFLOPS bench (sm_89+)
 
+### Behavior-preservation gate (SASS digest)
+
+A refactor that claims to change nothing must prove it: `csrc/bench/sass_digest.py`
+hashes every kernel symbol's SASS (`cuobjdump -sass`) out of the compile-tree
+`.o` files, with REG usage riding along, and `--compare` exits nonzero on any
+added/removed/changed function. Device-side dead-code deletion and host-side
+dedup gate on 658/658 identity instead of re-benchmarking (2026-09-19 audit).
+The one drift class a POD layout change causes (param-field offsets shift,
+ptxas re-selects load widths and renumbers registers) is adjudicated by
+instruction-count + mnemonic-histogram equality and the bitwise pytest suite.
+The same audit falsified shared-helper extraction in hot device code: pulling
+verbatim-duplicated straight-line blocks into `__forceinline__` helpers moved
+ptxas scheduling (26 crosswise kernels drifted SASS, REG −1/−2), so that
+refactor family requires a full re-benchmark budget, not the digest.
+
 ## Benchmarks
 
 Hardware: NVIDIA L20 (sm_89, 46 GB), CUDA 12.8, driver 570.86.
