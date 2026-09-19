@@ -638,6 +638,106 @@ def test_quantize_amax_presence():
     assert int(ring[7].view(torch.int32)) == 0  # done counter reset
 
 
+@skip_no_fp8
+def test_quantize_empty_input_ring_still_publishes():
+    """An empty tensor still fires one block so the delayed-scaling fold
+    publishes: hist records the round's amax 0, scale comes off the window,
+    and the amax slot / done counter / fold scratch all self-clean."""
+    dev = torch.device("cuda")
+    n, idx = 4, 1
+    ring = torch.zeros(n + 4 + _ScaleRing.kFoldSlots, device=dev)
+    ring[:n].fill_(1.0)
+    x = torch.empty(0, 1536, dtype=torch.bfloat16, device=dev)
+    mult = torch.tensor([1.0], device=dev)
+    x8, amax = quantize(
+        x,
+        mult,
+        torch.float8_e4m3fn,
+        ring_state=ring,
+        hist_idx=idx,
+        fp8_max=448.0,
+        pow2_margin=1.0,
+    )
+    assert x8.shape == (0, 1536)
+    assert amax is not None and float(amax) == 0.0
+    assert float(ring[idx]) == 0.0  # the empty round's amax
+    expected_scale = (ring[:n].max() / 448.0).clamp_min(1e-12).reshape(1)
+    torch.testing.assert_close(ring[n : n + 1], expected_scale, rtol=0, atol=0)
+    assert float(ring[n + 2]) == 0.0  # amax slot self-cleaned
+    assert int(ring[n + 3].view(torch.int32)) == 0  # done counter reset
+    assert float(ring[n + 4 :].abs().sum()) == 0.0  # fold scratch self-cleaned
+
+
+@skip_no_fp8
+def test_quantize_ring_scratch_self_clean_across_reuse():
+    """Two rounds on one ring with a shrinking amax: the fold scratch must
+    zero itself each round so round 2's scale tracks round 2's amax, not a
+    leftover from round 1's larger blocks."""
+    dev = torch.device("cuda")
+    n, idx = 4, 0
+    ring = torch.zeros(n + 4 + _ScaleRing.kFoldSlots, device=dev)
+    ring[:n].fill_(0.1)
+    big = torch.randn(64, 96, dtype=torch.bfloat16, device=dev) * 50
+    small = torch.randn(64, 96, dtype=torch.bfloat16, device=dev) * 0.05
+    mult = torch.tensor([1.0], device=dev)
+    kw = dict(ring_state=ring, hist_idx=idx, fp8_max=448.0, pow2_margin=1.0)
+
+    quantize(big, mult, torch.float8_e4m3fn, **kw)
+    assert float(ring[n + 4 :].abs().sum()) == 0.0
+    scale1 = float(ring[n])
+
+    quantize(small, mult, torch.float8_e4m3fn, **kw)
+    assert float(ring[n + 4 :].abs().sum()) == 0.0
+    amax2 = small.float().abs().amax().reshape(1)
+    torch.testing.assert_close(ring[idx].reshape(1), amax2, rtol=0, atol=0)
+    expected2 = (torch.tensor(max(0.1, float(amax2)), device=dev) / 448.0).clamp_min(
+        1e-12
+    )
+    torch.testing.assert_close(ring[n : n + 1], expected2.reshape(1), rtol=0, atol=0)
+    assert float(ring[n]) < scale1  # round 1's amax did not leak
+
+
+@skip_no_fp8
+@pytest.mark.parametrize(
+    ("rows", "cols"),
+    [(32, 256), (33, 255), (33, 257), (37, 260), (64, 512), (65, 64)],
+)
+def test_quantize_tile_boundary_shapes(rows, cols):
+    """Bitwise parity across RM/T/Dual on shapes around the tile geometry:
+    exact multiples, col/row tails beyond the block width, and rows%4!=0
+    (which must fall back to the scalar transposed store)."""
+    torch.manual_seed(rows * 1000 + cols)
+    x = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16) * 3
+    mult = _scale(x).reciprocal()
+    ref = (x.float() * mult).to(torch.float8_e4m3fn)
+    x8, _ = quantize(x, mult, torch.float8_e4m3fn)
+    x8T, _ = quantize(x, mult, torch.float8_e4m3fn, transposed=True)
+    d8, d8T, _ = quantize_dual(x, mult, torch.float8_e4m3fn)
+    assert x8T.shape == (cols, rows)
+    assert torch.equal(x8.view(torch.uint8), ref.view(torch.uint8))
+    assert torch.equal(d8.view(torch.uint8), ref.view(torch.uint8))
+    assert torch.equal(x8T.view(torch.uint8), d8T.view(torch.uint8))
+    assert torch.equal(x8T.t().contiguous().view(torch.uint8), ref.view(torch.uint8))
+
+
+@skip_no_fp8
+def test_quantize_fp32_transposed_and_dual():
+    """fp32 inputs through T/Dual stay bitwise-identical to the explicit
+    reference (the fp32 traits path had transposed/dual coverage only via
+    indirect consumers before)."""
+    torch.manual_seed(13)
+    x = torch.randn(96, 320, device="cuda", dtype=torch.float32) * 3
+    mult = _scale(x).reciprocal()
+    ref = (x * mult).to(torch.float8_e4m3fn)
+    x8, _ = quantize(x, mult, torch.float8_e4m3fn)
+    x8T, _ = quantize(x, mult, torch.float8_e4m3fn, transposed=True)
+    d8, d8T, _ = quantize_dual(x, mult, torch.float8_e4m3fn)
+    assert torch.equal(x8.view(torch.uint8), ref.view(torch.uint8))
+    assert torch.equal(d8.view(torch.uint8), ref.view(torch.uint8))
+    assert torch.equal(x8T.view(torch.uint8), d8T.view(torch.uint8))
+    assert torch.equal(x8T.t().contiguous().view(torch.uint8), ref.view(torch.uint8))
+
+
 # --------------------------------------------------------------------------
 # torch-autocast parity: context semantics (nesting, thread locality, switch)
 # --------------------------------------------------------------------------
