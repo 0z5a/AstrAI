@@ -27,20 +27,13 @@ namespace gemm {
 // address-of forms are references to the externally defined symbols only.
 // (They must sit here, outside the anonymous namespace — nvcc rejects
 // extern template declarations in an anonymous namespace.)
-extern template void gemm_dispatch<__nv_bfloat16, __nv_bfloat16>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_bfloat16, int8_t>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<int8_t, int8_t>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_fp8_e5m2, __nv_fp8_e5m2>(
-    GemmParams, cudaStream_t, bool, bool);
+extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, __nv_bfloat16);
+extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, int8_t);
+extern ASTRAI_GEMM_INSTANTIATE(int8_t, int8_t);
+extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, __nv_fp8_e4m3);
+extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, __nv_fp8_e5m2);
+extern ASTRAI_GEMM_INSTANTIATE(__nv_fp8_e4m3, __nv_fp8_e4m3);
+extern ASTRAI_GEMM_INSTANTIATE(__nv_fp8_e5m2, __nv_fp8_e5m2);
 
 namespace {
 
@@ -109,18 +102,12 @@ torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
     }
 }
 
-// The dtype-pair dispatch switch below replaces a hand-maintained if/else
-// chain: each supported (activation, weight) pair selects its
-// gemm_dispatch specialization exactly once, and an unsupported pair raises
-// with the actual operand dtypes in the message instead of a hardcoded
-// list that can drift out of sync. The specializations are explicitly
-// instantiated in their own TUs (one nvcc job per dtype pair), so the
-// switch is nothing but a jump table over resolved function pointers —
-// the extern template declarations above keep any re-instantiation out of
-// this TU. pack_dtypes is constexpr, so every case label is a compile-time
-// constant and the switch lowers to one indexed branch, no
-// runtime-initialized state. The function is not constexpr only because
-// the default arm throws.
+// The one dtype-pair table (scalar-type key -> element type): the dispatch
+// and probe lookups below stamp it, so a pair added for one can never be
+// missed in the other — and an unsupported pair raises with the actual
+// operand dtypes in the message instead of a hardcoded list that can drift.
+// pack_dtypes is constexpr, so every case label is a compile-time constant
+// and the switch lowers to one indexed branch, no runtime-initialized state.
 using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
 
 constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
@@ -128,60 +115,47 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
            static_cast<uint8_t>(b);
 }
 
-GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
-    switch (pack_dtypes(a, b)) {
-        case pack_dtypes(torch::kBFloat16, torch::kBFloat16):
-            return &gemm_dispatch<__nv_bfloat16, __nv_bfloat16>;
-        case pack_dtypes(torch::kBFloat16, torch::kChar):
-            return &gemm_dispatch<__nv_bfloat16, int8_t>;
-        case pack_dtypes(torch::kChar, torch::kChar):
-            return &gemm_dispatch<int8_t, int8_t>;
-        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e4m3fn):
-            return &gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>;
-        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e5m2):
-            return &gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>;
-        case pack_dtypes(torch::kFloat8_e4m3fn, torch::kFloat8_e4m3fn):
-            return &gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>;
-        case pack_dtypes(torch::kFloat8_e5m2, torch::kFloat8_e5m2):
-            return &gemm_dispatch<__nv_fp8_e5m2, __nv_fp8_e5m2>;
-        default:
-            TORCH_CHECK(false,
-                        "unsupported operand dtype pair ", toString(a), " x ", toString(b),
-                        ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "
-                        "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or "
-                        "matching fp8 x fp8");
-    }
+#define ASTRAI_GEMM_PAIRS(X)                                                 \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)      \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                 \
+    X(torch::kChar, int8_t, torch::kChar, int8_t)                            \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kFloat8_e4m3fn, __nv_fp8_e4m3) \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kFloat8_e5m2, __nv_fp8_e5m2)   \
+    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn,           \
+      __nv_fp8_e4m3)                                                         \
+    X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
+
+[[noreturn]] void unsupported_pair(c10::ScalarType a, c10::ScalarType b) {
+    TORCH_CHECK(false,
+                "unsupported operand dtype pair ", toString(a), " x ",
+                toString(b),
+                ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "
+                "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or matching "
+                "fp8 x fp8");
 }
 
-// The probe twin of the switch above: same pairs, host-only functions that
-// run the planner without a launch (the autotuner's coverage check).
+GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
+#define GEMM_CASE(SA, TA, SB, TB) \
+    case pack_dtypes(SA, SB):     \
+        return &gemm_dispatch<TA, TB>;
+    switch (pack_dtypes(a, b)) { ASTRAI_GEMM_PAIRS(GEMM_CASE) }
+#undef GEMM_CASE
+    unsupported_pair(a, b);
+}
+
+// Host-only functions that run the planner without a launch (the
+// autotuner's coverage check).
 using GemmProbeFn =
     std::pair<PlanDecision, PlanQuery> (*)(int64_t, int64_t, int64_t, int64_t,
                                            bool, bool, const DeviceFacts&);
 
 GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
-    switch (pack_dtypes(a, b)) {
-        case pack_dtypes(torch::kBFloat16, torch::kBFloat16):
-            return &plan_probe_for<__nv_bfloat16, __nv_bfloat16>;
-        case pack_dtypes(torch::kBFloat16, torch::kChar):
-            return &plan_probe_for<__nv_bfloat16, int8_t>;
-        case pack_dtypes(torch::kChar, torch::kChar):
-            return &plan_probe_for<int8_t, int8_t>;
-        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e4m3fn):
-            return &plan_probe_for<__nv_bfloat16, __nv_fp8_e4m3>;
-        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e5m2):
-            return &plan_probe_for<__nv_bfloat16, __nv_fp8_e5m2>;
-        case pack_dtypes(torch::kFloat8_e4m3fn, torch::kFloat8_e4m3fn):
-            return &plan_probe_for<__nv_fp8_e4m3, __nv_fp8_e4m3>;
-        case pack_dtypes(torch::kFloat8_e5m2, torch::kFloat8_e5m2):
-            return &plan_probe_for<__nv_fp8_e5m2, __nv_fp8_e5m2>;
-        default:
-            TORCH_CHECK(false,
-                        "unsupported operand dtype pair ", toString(a), " x ", toString(b),
-                        ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "
-                        "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or "
-                        "matching fp8 x fp8");
-    }
+#define PROBE_CASE(SA, TA, SB, TB) \
+    case pack_dtypes(SA, SB):      \
+        return &plan_probe_for<TA, TB>;
+    switch (pack_dtypes(a, b)) { ASTRAI_GEMM_PAIRS(PROBE_CASE) }
+#undef PROBE_CASE
+    unsupported_pair(a, b);
 }
 
 }  // namespace

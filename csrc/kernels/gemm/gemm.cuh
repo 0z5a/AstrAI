@@ -262,13 +262,13 @@ struct GemmRecipe {
     int smem;     // ring bytes at this staging pair's operand widths
 };
 
-// Deduped on the dispatch key: two tiles sharing (class, stages, kK) — the
-// 16-warp small CTA behind its 32-warp twin — are one candidate, because
-// dispatch_tile takes the first manifest match. smem prices against the
-// operand widths the caller asks about, so a vocabulary is pair-specific.
+// One manifest tile -> its recipe row, priced against the operand widths
+// the caller asks about (smem is pair-specific). append_recipe and
+// recipe_scan below share this — the vector form and the scan form must
+// never disagree about a tile's geometry.
 template <typename Tile>
-inline void append_recipe(std::vector<GemmRecipe>& out, int ba, int bb) {
-    const GemmRecipe r{
+inline GemmRecipe recipe_for_tile(int ba, int bb) {
+    return GemmRecipe{
         (int)tile_class<Tile>(), Tile::kStages, (int)Tile::CtaShape::kK,
         Tile::CtaShape::kM, Tile::CtaShape::kN,
         Tile::WarpShape::kM, Tile::WarpShape::kN,
@@ -276,6 +276,14 @@ inline void append_recipe(std::vector<GemmRecipe>& out, int ba, int bb) {
             (Tile::CtaShape::kN / Tile::WarpShape::kN) * 32,
         ring_smem_bytes(Tile::CtaShape::kM, Tile::CtaShape::kN,
                         Tile::CtaShape::kK, Tile::kStages, ba, bb)};
+}
+
+// Deduped on the dispatch key: two tiles sharing (class, stages, kK) — the
+// 16-warp small CTA behind its 32-warp twin — are one candidate, because
+// dispatch_tile takes the first manifest match.
+template <typename Tile>
+inline void append_recipe(std::vector<GemmRecipe>& out, int ba, int bb) {
+    const GemmRecipe r = recipe_for_tile<Tile>(ba, bb);
     for (const GemmRecipe& have : out)
         if (have.cta == r.cta && have.stages == r.stages && have.kk == r.kk)
             return;
@@ -291,24 +299,31 @@ inline void collect_recipes(std::vector<GemmRecipe>& out, int ba, int bb) {
         Manifest{});
 }
 
-// Every recipe the ladders instantiate for one staging pair — the runtime
-// half of manifest_for's rule (manifest_kind over crosswise + widths).
-inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging,
-                                                int ba, int bb) {
-    std::vector<GemmRecipe> out;
+// manifest_kind -> THE one manifest type list that ladder instantiates —
+// the runtime half of manifest_for's rule, spelled once: the vocabulary
+// builder and the scan oracle below dispatch through it, so they can never
+// disagree about which ladder serves a staging pair.
+template <typename F>
+inline auto with_manifest(bool crosswise_staging, int ba, int bb, F&& fn) {
     switch (manifest_kind(crosswise_staging, ba, bb)) {
         case ManifestKind::kTwoByte:
         case ManifestKind::kMixed:  // the congruous ladder carries the
                                     // mixed bus on the predicated skip
-            collect_recipes<TileManifest>(out, ba, bb);
-            break;
+            return fn(TileManifest{});
         case ManifestKind::kByte:
-            collect_recipes<TileManifestByte>(out, ba, bb);
-            break;
+            return fn(TileManifestByte{});
         default:  // kCrosswise is the fallback kind, manifest_for included
-            collect_recipes<TileManifestCross>(out, ba, bb);
-            break;
+            return fn(TileManifestCross{});
     }
+}
+
+// Every recipe the ladders instantiate for one staging pair.
+inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging,
+                                                int ba, int bb) {
+    std::vector<GemmRecipe> out;
+    with_manifest(crosswise_staging, ba, bb, [&](auto manifest) {
+        collect_recipes<decltype(manifest)>(out, ba, bb);
+    });
     return out;
 }
 
@@ -333,14 +348,7 @@ inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb,
         if ((int)tile_class<T>() != cta || (int)T::kStages != stages ||
             (int)T::CtaShape::kK != kk)
             return;
-        out = GemmRecipe{
-            (int)tile_class<T>(), (int)T::kStages, (int)T::CtaShape::kK,
-            T::CtaShape::kM, T::CtaShape::kN,
-            T::WarpShape::kM, T::WarpShape::kN,
-            (T::CtaShape::kM / T::WarpShape::kM) *
-                (T::CtaShape::kN / T::WarpShape::kN) * 32,
-            ring_smem_bytes(T::CtaShape::kM, T::CtaShape::kN,
-                            T::CtaShape::kK, T::kStages, ba, bb)};
+        out = recipe_for_tile<T>(ba, bb);
         found = true;
     };
     std::apply([&](auto... tiles) { (consider(tiles), ...); }, Manifest{});
@@ -350,19 +358,9 @@ inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb,
 inline std::optional<GemmRecipe> recipe_of(int cta, int stages, int kk,
                                            bool crosswise, int ba, int bb) {
     GemmRecipe out{};
-    const bool found = [&] {
-        switch (manifest_kind(crosswise, ba, bb)) {
-            case ManifestKind::kTwoByte:
-            case ManifestKind::kMixed:
-                return recipe_scan<TileManifest>(cta, stages, kk, ba, bb, out);
-            case ManifestKind::kByte:
-                return recipe_scan<TileManifestByte>(cta, stages, kk, ba, bb,
-                                                     out);
-            default:  // kCrosswise is the fallback kind, manifest_for included
-                return recipe_scan<TileManifestCross>(cta, stages, kk, ba, bb,
-                                                      out);
-        }
-    }();
+    const bool found = with_manifest(crosswise, ba, bb, [&](auto manifest) {
+        return recipe_scan<decltype(manifest)>(cta, stages, kk, ba, bb, out);
+    });
     if (!found) return std::nullopt;
     return out;
 }
@@ -1031,6 +1029,13 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
             launch(RowMajor{}, RowMajor{}, RowMajor{});
     }
 }
+
+// The explicit-instantiation spelling shared by the per-pair TUs (bare, the
+// definition form) and gemm.cu's declaration block (`extern`-prefixed): one
+// place names the signature, so the stub units and the extern table cannot
+// drift apart.
+#define ASTRAI_GEMM_INSTANTIATE(W, A) \
+    template void gemm_dispatch<W, A>(GemmParams, cudaStream_t, bool, bool)
 
 // Host-only planner probe (the Python autotuner's coverage check): the
 // decision gemm_dispatch would make for this problem, without a launch —
