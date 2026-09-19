@@ -23,8 +23,8 @@ namespace astrai {
 namespace quant {
 // Input element traits: the specialization supplies the scalar widen and,
 // for 2-lane 16-bit inputs, names the native pair type; the shared base in
-// detail below builds the 16B vector unpack and the pair load on top —
-// adding a dtype is one thin specialization.
+// detail below builds the pair load on top — adding a dtype is one thin
+// specialization.
 template <typename InT>
 struct quant_in_traits;
 
@@ -38,22 +38,11 @@ __device__ __forceinline__ float2 widen(__half2 v) {
     return __half22float2(v);
 }
 
-// 2-lane 16-bit input body: 8 elements per 16B load, one native pair load
-// per row. Everything but the widen above is dtype-independent.
+// 2-lane 16-bit input body: one native pair load per row. Everything but
+// the widen above is dtype-independent.
 template <typename InT, typename PairT>
 struct pair_in_traits {
     using native_pair = PairT;
-    static constexpr int kVecElems = 8;
-    static __device__ __forceinline__ void load_vec(const uint4& raw,
-                                                    float* f) {
-        const PairT* p2 = reinterpret_cast<const PairT*>(&raw);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 p = widen(p2[j]);
-            f[2 * j] = p.x;
-            f[2 * j + 1] = p.y;
-        }
-    }
     static __device__ __forceinline__ void load_pair(const InT* p,
                                                      float* f) {
         const float2 v = widen(*reinterpret_cast<const PairT*>(p));
@@ -82,14 +71,7 @@ struct quant_in_traits<__half> : detail::pair_in_traits<__half, __half2> {
 template <>
 struct quant_in_traits<float> {
     using native_pair = float2;
-    static constexpr int kVecElems = 4;
     static __device__ __forceinline__ float to_float(float v) { return v; }
-    static __device__ __forceinline__ void load_vec(const uint4& raw,
-                                                    float* f) {
-        const float* w = reinterpret_cast<const float*>(&raw);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) f[j] = w[j];
-    }
     static __device__ __forceinline__ void load_pair(const float* p,
                                                      float* f) {
         f[0] = p[0];

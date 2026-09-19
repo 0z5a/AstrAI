@@ -216,8 +216,6 @@ using Tile_64x128x32_W32x32_S3 =
     GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 3>;
 using Tile_128x64x32_W32x32_S2 =
     GemmTileConfig<Shape<128, 64, 32>, Shape<32, 32>, 2>;
-using Tile_128x128x32_W64x32_S2 =
-    GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 2>;
 using Tile_128x128x32_W64x32_S3 =
     GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 3>;
 // 16 warps per CTA on the 128x128x32 ring (32x32 warp tiles, 512 threads):

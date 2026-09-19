@@ -117,16 +117,13 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
     }
     // The merged kernel views the whole buffer as one flat [rows][cols]
     // tile grid: leading dims fold into rows so 1D and 3D inputs are fully
-    // covered (the former elementwise kernel's p.total behavior). An empty
-    // tensor folds to rows=0 with a 1-wide cols axis — the launcher still
-    // fires one block so the ring fold publishes.
+    // covered. An empty tensor folds to rows=0 with a 1-wide cols axis —
+    // the launcher still fires one block so the ring fold publishes.
     const int64_t numel = input.numel();
     const int64_t cols = numel == 0 ? 1 : input.size(-1);
     const int64_t rows = numel / cols;
     TORCH_CHECK(cols <= INT32_MAX && rows <= INT32_MAX,
                 "quantize tensor too large for the tiled grid");
-    p.total = static_cast<int>(numel);
-    p.out_layout = layout;
     p.rows = static_cast<int>(rows);
     p.cols = static_cast<int>(cols);
     // The merged kernel takes placement as data: the stride pair for the

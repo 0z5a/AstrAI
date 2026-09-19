@@ -265,11 +265,11 @@ load_crosswise_direct_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                               const ElemT* __restrict__ operand, int64_t rows,
                               int64_t contract, int64_t ld, int tid,
                               int64_t k_base, int64_t block_row) {
-    static_assert(sizeof(ElemT) == 1 || sizeof(ElemT) == 2,
-                  "crosswise LDG+PRMT staging requires 1- or 2-byte elements");
+    static_assert(sizeof(ElemT) == 1,
+                  "crosswise LDG+PRMT staging requires 1-byte elements");
     constexpr int kRowsTile = SmemLayout::kRows;
-    constexpr int kK = SmemLayout::kChunks * (16 / (int)sizeof(ElemT));
-    constexpr int kCw = sizeof(ElemT) == 1 ? 4 : 2;  // contract elems per chunk
+    constexpr int kK = SmemLayout::kChunks * 16;
+    constexpr int kCw = 4;  // contract elems per chunk
     constexpr int kSpans = kK / kCw;    // contract spans per tile
     constexpr int kGroups = kRowsTile / 16;
     constexpr int kTChunks = kSpans * kGroups;  // 64B chunks per tile
@@ -289,50 +289,28 @@ load_crosswise_direct_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 // Contract tail: a run past k carries zero bytes; they flow
-                // through the transpose like any other value.
-                if constexpr (sizeof(ElemT) == 1) {
-                    // v[s] = 16 rows at contract p0+s (run index i = s).
-                    if (p0 + i < contract)
-                        v[i] = __ldg(reinterpret_cast<const uint4*>(
-                            operand + (p0 + i) * ld + r0));
-                    else
-                        v[i] = make_uint4(0u, 0u, 0u, 0u);
-                } else {
-                    // v[s][h] = 8 rows at contract p0+s (flat i = s*2+h).
-                    const int s = i >> 1, h = i & 1;
-                    if (p0 + s < contract)
-                        v[i] = __ldg(reinterpret_cast<const uint4*>(
-                            operand + (p0 + s) * ld + r0 + h * 8));
-                    else
-                        v[i] = make_uint4(0u, 0u, 0u, 0u);
-                }
+                // through the transpose like any other value. v[i] = 16 rows
+                // at contract p0+i.
+                if (p0 + i < contract)
+                    v[i] = __ldg(reinterpret_cast<const uint4*>(
+                        operand + (p0 + i) * ld + r0));
+                else
+                    v[i] = make_uint4(0u, 0u, 0u, 0u);
             }
             const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                unsigned w;
-                if constexpr (sizeof(ElemT) == 1) {
-                    // word i = row r0+i's span: byte i of each of the four
-                    // runs [v0.b(i), v1.b(i), v2.b(i), v3.b(i)].
-                    const unsigned nib = i & 3;
-                    const unsigned sel = nib | ((nib + 4) << 4);
-                    const unsigned w01 =
-                        __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
-                    const unsigned w23 =
-                        __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
-                    w = __byte_perm(w01, w23, 0x5410u);
-                } else {
-                    // word i = row r0+i's element pair (contracts p0, p0+1):
-                    // uint4 v[s*2+h] holds 8 rows of contract p0+s (h =
-                    // i>>3), word (i>>1)&3, halfword i&1 — one selector
-                    // spans both source words: 0x5410 low pair, 0x7632 high.
-                    const unsigned* v0 =
-                        bytes + ((i >> 3) * 4 + ((i >> 1) & 3));
-                    const unsigned* v1 = v0 + 8;  // p0+1 run, same h/j
-                    w = __byte_perm(*v0, *v1, (i & 1) ? 0x7632u : 0x5410u);
-                }
+                // Word i = row r0+i's span: byte i of each of the four
+                // runs [v0.b(i), v1.b(i), v2.b(i), v3.b(i)].
+                const unsigned nib = i & 3;
+                const unsigned sel = nib | ((nib + 4) << 4);
+                const unsigned w01 =
+                    __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
+                const unsigned w23 =
+                    __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
                 *reinterpret_cast<unsigned*>(
-                    tile(rg * 16 + i, span * kCw)) = w;
+                    tile(rg * 16 + i, span * kCw)) =
+                    __byte_perm(w01, w23, 0x5410u);
             }
         } else {
             // Row-tail or misaligned chunk: element-granular gather with
@@ -689,9 +667,7 @@ load_crosswise_paired(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
 }
 
 // The 1-byte route the ladders instantiate: the two-phase carry when the bus
-// fits it, the general grid-stride loader otherwise (and for 2-byte elements,
-// which the 16-bit trans staging handles instead — this stays for the general
-// form's sake).
+// fits it, the general grid-stride loader otherwise.
 template <typename SmemLayout, typename ElemT, int kThreads>
 __device__ __forceinline__ void
 load_crosswise_direct(Tensor<PtrEngine<ElemT>, SmemLayout> tile,

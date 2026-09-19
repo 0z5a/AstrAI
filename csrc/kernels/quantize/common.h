@@ -49,7 +49,6 @@ struct QuantParams {
     const void* __restrict__ input_ptr = nullptr;
     void* __restrict__ output_ptr = nullptr;
     void* __restrict__ output_transposed_ptr = nullptr;  // [cols][rows]
-    QuantLayout out_layout = QuantLayout::RowMajor;
 
     const float* __restrict__ scale = nullptr;  // device multiplier
     float* __restrict__ amax = nullptr;         // raw-domain max out
@@ -70,9 +69,7 @@ struct QuantParams {
     float fp8_max = 448.0f;   // scale = max(hist) / fp8_max / pow2_margin
     float pow2_margin = 1.0f;
 
-    // Element count (elementwise kernel); the tiled kernel views the same
-    // buffer as [rows][cols] row-major.
-    int total = 0;
+    // The tiled kernel views the buffer as [rows][cols] row-major.
     int rows = 0;
     int cols = 0;
 
