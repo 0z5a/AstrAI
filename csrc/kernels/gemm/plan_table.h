@@ -521,7 +521,12 @@ inline bool gemm_table_off() {
 // CANONICALIZED aspect — canonicalize_gemm plans symmetric NN as the
 // transposed problem — and the (16384,1536) aspect is split by an exact k
 // band into square (k=1536) and mlp_down (k=6912). Bands are the measured
-// points only: another m or projection needs a sweep of its own.
+// points only: another m or projection needs a sweep of its own. The same
+// session's kK=32 unlock (byte ladder gains the 32-deep-ring big CTA and
+// the kK=32 narrow) replaced three of these rows after a four-round confirm:
+// square NN/TT and mlp_down NN run the kK=32 big CTA (the 18KB-ring kK=32
+// narrow lost everywhere, -8..-34%, its packed grid half-busy); the kK=64
+// rows keep the other nine points.
 //
 // A row is calibrated to the part it was measured on, and a stale one is
 // worse than no row at all (the 2026-09-14 +33% lesson). The tier is
@@ -670,17 +675,18 @@ static constexpr std::array<TableRow, 41> kBuiltinPlanF8A8 = {{
     {TileClass::kBig128, 16383, 16384, 6143, 6144, 3, 1, 2, 0, 64, 1535, 1536},
     {TileClass::kWide128x256, 16383, 16384, 6143, 6144, 3, 2, 2, 0, 64, 1535, 1536},
     // square (k=1536) and mlp_down (k=6912) share the (16384,1536) aspect;
-    // the exact k band splits them. NN prefers the narrow twin here, TT/TN
-    // the wide CTA.
-    {TileClass::kNarrow128x64, 1535, 1536, 16383, 16384, 3, 1, 2, 0, 64, 1535, 1536},
-    {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 1, 2, 0, 64, 1535, 1536},
+    // the exact k band splits them. The kK=32 big CTA carries NN/TT here
+    // (its deeper 32KB ring prices the same 2.4GB of L2 traffic at higher
+    // occupancy than the kK=64 twins), TN keeps the wide CTA at kK=64.
+    {TileClass::kBig128, 1535, 1536, 16383, 16384, 3, 1, 3, 0, 32, 1535, 1536},
+    {TileClass::kBig128, 16383, 16384, 1535, 1536, 3, 1, 3, 0, 32, 1535, 1536},
     {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 2, 2, 0, 64, 1535, 1536},
     // mlp_up.
     {TileClass::kBig128, 6911, 6912, 16383, 16384, 3, 1, 2, 0, 64, 1535, 1536},
     {TileClass::kBig128, 16383, 16384, 6911, 6912, 3, 1, 2, 0, 64, 1535, 1536},
     {TileClass::kWide128x256, 16383, 16384, 6911, 6912, 3, 2, 2, 0, 64, 1535, 1536},
     // mlp_down (k=6912).
-    {TileClass::kWide128x256, 1535, 1536, 16383, 16384, 3, 1, 2, 0, 64, 6911, 6912},
+    {TileClass::kBig128, 1535, 1536, 16383, 16384, 3, 1, 3, 0, 32, 6911, 6912},
     {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 1, 2, 0, 64, 6911, 6912},
     {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 2, 2, 0, 64, 6911, 6912},
 }};

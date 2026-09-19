@@ -350,16 +350,20 @@ using TileManifest = tuple_cat_t<
                Tile_128x128x32_W64x32_S3, Tile_64x128x32_W32x32_S2,
                Tile_64x128x32_W32x32_S3>>;
 
-// The 1-byte ladder: the shared six plus the wide CTA, every one of them at
-// kK 64. No kK=32 tile pays on a 1-byte pair — a line then holds half as
-// many 16B chunks, so the small twin's bus runs half idle behind the skip
-// (expressible, not worthwhile), and the one kK=32 geometry with a full
-// bus, 128x128x32, cannot reclaim its own 32KB output tile from a 24KB
-// ring. The 16-warp small substitution stays off this ladder by rule (see
-// warp_widened_t): its starvation fix is about the bf16-cell issue stream,
-// and the byte pair rides its own cells.
+// The 1-byte ladder: the shared six plus the wide CTA at kK 64, and the
+// 32-deep-ring kK=32 big CTA. The kK=32 crosswise feed runs its packed grid
+// at half bus, and the kK=32 narrow twin measured that penalty losing
+// everywhere (-8..-34% vs its own kK=64 twin across m=8192/16384, and the
+// model mis-picked it on unmeasured bands) — it stays off this ladder; the
+// 128x128x32 S3, whose deeper 32KB ring exactly reclaims its output, is the
+// one kK=32 point that pays. The S2 big twin (24KB ring) still cannot
+// reclaim its 32KB output — it waits on a direct-store epilogue. The
+// 16-warp small substitution stays off this ladder by rule (see
+// warp_widened_t).
 using TileManifestByte =
-    tuple_cat_t<TileManifestCross, std::tuple<Tile_128x256x64_W64x32_S2>>;
+    tuple_cat_t<TileManifestCross,
+                std::tuple<Tile_128x256x64_W64x32_S2,
+                           Tile_128x128x32_W64x32_S3>>;
 
 // How many operands take that direct path (0 = dual-congruous NT). The
 // planner's crosswise field and the launcher's ladder selection are this one

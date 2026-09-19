@@ -824,6 +824,21 @@ using narrow_fallback_t = std::conditional_t<
     std::conditional_t<(Tile::kStages >= 3), Tile_128x64x64_W32x32_S3,
                        Tile_128x64x64_W32x32_S2>>;
 
+// The full reclaim chain a dispatch instantiation must terminate in: a tile
+// whose output outgrows its ring falls to its narrow twin, and the kK=32
+// narrow twin (18KB ring) still cannot hold a 4B/elem output — that ends at
+// the small CTA, whose 24KB ring reclaims every output the dispatch
+// instantiates (<= 4B/elem). Identity whenever the tile itself fits, so the
+// launchers can apply it unconditionally; the dispatch walks name every
+// manifest tile as a potential substitute, which makes the chain load-bearing
+// even for geometries production never plans to.
+template <typename Tile, typename ElemA, typename ElemB, typename OutT>
+using reclaim_fallback_t = std::conditional_t<
+    reclaim_fits<Tile, ElemA, ElemB, OutT>(), Tile,
+    std::conditional_t<
+        reclaim_fits<narrow_fallback_t<Tile>, ElemA, ElemB, OutT>(),
+        narrow_fallback_t<Tile>, Tile_64x64x64_W16x32_S2>>;
+
 // TMA ladder resolver. The gate in launch_plan already guarantees
 // dual-congruous 1-/2-byte operands, so the fast tile stays; only an
 // output-reclaim overflow swaps the CTA for its narrow twin. std::conditional_t
@@ -836,16 +851,12 @@ struct TmaLauncher {
     cudaStream_t stream;
     template <typename Tile>
     bool run() const {
-        // Only the geometries whose output tile can outgrow their own rings
-        // carry a substitution; the narrow and small classes always fit.
-        constexpr bool kReclaimGated = tile_class<Tile>() == TileClass::kBig128 ||
-                                       tile_class<Tile>() == TileClass::kWide128x256;
-        // The small CTA's warp widening, the same rule the cp.async ladder
-        // applies (warp_widened_t, policy.cuh).
+        // The reclaim chain is applied unconditionally (identity whenever the
+        // tile fits): the dispatch walks name every manifest tile, so even
+        // the narrow/small classes need an out when an instantiation's output
+        // outgrows their rings (the kK=32 narrow vs a 4B/elem output).
         using Widened = warp_widened_t<ElemA, ElemB, Tile>;
-        using TileT = std::conditional_t<
-            kReclaimGated && !reclaim_fits<Widened, ElemA, ElemB, OutT>(),
-            narrow_fallback_t<Widened>, Widened>;
+        using TileT = reclaim_fallback_t<Widened, ElemA, ElemB, OutT>;
         return launch_policy_tma<GemmPolicy<ElemA, ElemB, RowMajor, ColMajor, TileT, LayoutOut,
                        OutT, false, true, UseMx>>(p, stream);
     }
@@ -870,14 +881,11 @@ struct CpAsyncLauncher {
         // The small CTA's warp widening: the 8-warp 64x64 twin starves the
         // tensor pipe on two-byte operands (measured 1.36-1.66x for the
         // 16-warp form, parity to -3% on the thinnest shapes). The rule and
-        // its arms live in policy.cuh's warp_widened_t.
+        // its arms live in policy.cuh's warp_widened_t. The reclaim chain
+        // rides unconditionally (identity whenever the tile itself fits —
+        // same reasoning as TmaLauncher's).
         using Widened = warp_widened_t<ElemA, ElemB, Tile>;
-        constexpr bool kFits = reclaim_fits<Widened, ElemA, ElemB, OutT>();
-        constexpr bool kBig = tile_class<Widened>() == TileClass::kBig128;
-        constexpr bool kWide = tile_class<Widened>() == TileClass::kWide128x256;
-        using TileT =
-            std::conditional_t<(kBig || kWide) && !kFits,
-                               narrow_fallback_t<Widened>, Widened>;
+        using TileT = reclaim_fallback_t<Widened, ElemA, ElemB, OutT>;
         launch_policy<GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT,
                                  LayoutOut, OutT, false, false, UseMx>>(
             p, stream);
