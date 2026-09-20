@@ -54,7 +54,7 @@ import functools
 import threading
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import NamedTuple
 
 import torch
 from torch.library import Library
@@ -67,7 +67,7 @@ from astrai.extension.ops.quantize import quantize, quantize_dual
 # ---------------------------------------------------------------------------
 
 
-def quantize_weight_int8(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_weight_int8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric per-channel int8 quantization of a linear weight.
 
     ``w`` is ``[N, K]`` (the nn.Linear convention); returns
@@ -81,7 +81,7 @@ def quantize_weight_int8(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q.to(torch.int8).contiguous(), scale.contiguous()
 
 
-def quantize_act_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric per-row dynamic int8 quantization of activations.
 
     ``x`` is ``[..., K]``; returns ``(q int8 with x's shape, scale f32
@@ -106,7 +106,7 @@ def quantize_act_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 # tuple; dtype validation stays in the C++ binding.
 
 
-def fp8_format_pair(fmt: Union[str, torch.dtype]) -> Tuple[torch.dtype, torch.dtype]:
+def fp8_format_pair(fmt: str | torch.dtype) -> tuple[torch.dtype, torch.dtype]:
     """Format spec -> (fwd, bwd) fp8 dtype pair.
 
     A dtype is symmetric; ``'hybrid'`` is E4M3 forward / E5M2 backward
@@ -152,7 +152,7 @@ class _ScaleRing:
     length as ``numel - 4 - 32``.
     """
 
-    __slots__ = ("recipe", "state", "hist", "scale", "idx", "initialized")
+    __slots__ = ("hist", "idx", "initialized", "recipe", "scale", "state")
 
     kFoldSlots = 32
 
@@ -186,6 +186,29 @@ class _ScaleRing:
             "pow2_margin": float(2**self.recipe.margin),
         }
 
+    def state_dict(self) -> dict:
+        """Checkpoint snapshot (A1): the whole state buffer — hist, the
+        published scale and the kernel scratch — plus the write index and
+        the seed flag. TE persists the same triple (scale / amax_history /
+        index) inside its per-module fp8_meta."""
+        return {
+            "state": self.state.detach().clone(),
+            "idx": self.idx,
+            "initialized": self.initialized,
+        }
+
+    def load_state_dict(self, sd: dict) -> bool:
+        """Restore a snapshot. False means the buffer geometry changed since
+        the save (a recipe change across the checkpoint boundary): the ring
+        stays fresh and re-seeds on next use — the same one-step transient
+        TE's recipe-change workspace clear produces."""
+        if sd["state"].numel() != self.state.numel():
+            return False
+        self.state.copy_(sd["state"].to(self.state.device))
+        self.idx = int(sd["idx"])
+        self.initialized = bool(sd["initialized"])
+        return True
+
 
 class FP8TensorMeta(NamedTuple):
     """Per-weight delayed-scaling rings for ``w``, ``x`` and ``g``.
@@ -205,14 +228,14 @@ class _ActiveConfig:
 
     enabled: bool
     recipe: FP8Recipe
-    fp8_format: Tuple[torch.dtype, torch.dtype]
+    fp8_format: tuple[torch.dtype, torch.dtype]
 
 
 # Thread-local active configuration (torch's autocast TLS analog): set by
 # fp8_autocast on __enter__, absent outside any region. Autograd engine
 # threads run backwards with their own empty context — fine, since backward
 # only reads state captured on ctx at forward time.
-_active_config: ContextVar[Optional[_ActiveConfig]] = ContextVar(
+_active_config: ContextVar[_ActiveConfig | None] = ContextVar(
     "astrai_fp8_active_config", default=None
 )
 
@@ -231,15 +254,25 @@ class FP8State:
     def __init__(self):
         self.default_enabled = False
         self.default_recipe: FP8Recipe = FP8Recipe()
-        self.default_format: Tuple[torch.dtype, torch.dtype] = (
+        self.default_format: tuple[torch.dtype, torch.dtype] = (
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         )
-        self._metas: Dict[tuple, FP8TensorMeta] = {}
+        self._metas: dict[tuple, FP8TensorMeta] = {}
+        # Ring snapshots queued by load_state_dict, consumed FIFO as forwards
+        # recreate the registry (the registry is lazily built, so at resume
+        # time — right after model build — nothing exists to bind into yet).
+        self._pending: list[dict] = []
 
     def get_weight_meta(self, w: torch.Tensor, recipe: FP8Recipe) -> FP8TensorMeta:
         key = (w.data_ptr(), w.shape, w.dtype)
         meta = self._metas.get(key)
+        if meta is not None and meta.w.recipe != recipe:
+            # Recipe changed under the same weight: the rings' geometry
+            # (history_len) and fold constants (margin) are stale. TE clears
+            # its fp8 workspaces on a recipe change for the same reason; the
+            # fresh rings re-seed on the next forward (one-step transient).
+            meta = None
         if meta is None:
             meta = FP8TensorMeta(
                 _ScaleRing(w.device, recipe),
@@ -247,7 +280,50 @@ class FP8State:
                 _ScaleRing(w.device, recipe),
             )
             self._metas[key] = meta
+            self._restore_pending(key, meta)
         return meta
+
+    def state_dict(self) -> dict:
+        """Checkpoint snapshot of the ring registry (A1).
+
+        Entries bind by insertion order + (shape, dtype): data_ptr is
+        meaningless across processes, and re-binding relies on the same
+        contract TE documents for amax reduction — identical registration
+        order on every rank/process. Dynamic scaling allocates no metas, so
+        an empty snapshot is expected there."""
+        return {
+            "version": 1,
+            "entries": [
+                {
+                    "shape": list(key[1]),
+                    "dtype": str(key[2]),
+                    "w": meta.w.state_dict(),
+                    "x": meta.x.state_dict(),
+                    "g": meta.g.state_dict(),
+                }
+                for key, meta in self._metas.items()
+            ],
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        """Queue a snapshot for restore (A1). Existing metas consume their
+        entries immediately; the rest wait in ``_pending`` for the resumed
+        run's forwards to recreate the registry in the same order."""
+        self._pending = list(sd.get("entries", []))
+        for key, meta in list(self._metas.items()):
+            self._restore_pending(key, meta)
+
+    def _restore_pending(self, key: tuple, meta: FP8TensorMeta) -> None:
+        for i, entry in enumerate(self._pending):
+            if list(key[1]) != entry["shape"] or str(key[2]) != entry["dtype"]:
+                continue
+            if (
+                meta.w.load_state_dict(entry["w"])
+                and meta.x.load_state_dict(entry["x"])
+                and meta.g.load_state_dict(entry["g"])
+            ):
+                self._pending.pop(i)
+            break
 
     def reset(self) -> None:
         """Restore construction defaults (switch, recipe, format) and drop all
@@ -256,6 +332,7 @@ class FP8State:
         self.default_recipe = FP8Recipe()
         self.default_format = (torch.float8_e4m3fn, torch.float8_e5m2)
         self._metas.clear()
+        self._pending = []
 
 
 # Process-wide singleton; per-thread/per-region state lives in _active_config.
@@ -266,7 +343,20 @@ def fp8_state() -> FP8State:
     return _state
 
 
-def _active() -> Optional[_ActiveConfig]:
+def fp8_state_dict() -> dict:
+    """Checkpoint snapshot of the delayed-scaling state (A1): save it beside
+    the optimizer state. Empty under dynamic scaling (no rings exist)."""
+    return fp8_state().state_dict()
+
+
+def fp8_load_state_dict(sd: dict) -> None:
+    """Restore a :func:`fp8_state_dict` snapshot. Unmatched entries (a model
+    shape/topology change across the checkpoint) re-seed on next use — the
+    same resume transient a ring-less restart would pay on every step."""
+    fp8_state().load_state_dict(sd)
+
+
+def _active() -> _ActiveConfig | None:
     """The active config when fp8 dispatch is on, else ``None`` (fast guard).
 
     A region config wins (honoring nested ``enabled=False`` regions); with no
@@ -311,14 +401,14 @@ class fp8_autocast:
         self,
         enabled: bool = True,
         update_interval: int = 16,
-        recipe: Optional[FP8Recipe] = None,
-        fp8_format: Union[str, torch.dtype] = "hybrid",
+        recipe: FP8Recipe | None = None,
+        fp8_format: str | torch.dtype = "hybrid",
         margin: int = 0,
     ):
         if recipe is None:
             recipe = FP8Recipe(history_len=update_interval, margin=margin)
         self._config = _ActiveConfig(bool(enabled), recipe, fp8_format_pair(fp8_format))
-        self._tokens: List[Token] = []
+        self._tokens: list[Token] = []
 
     def __enter__(self) -> "fp8_autocast":
         if self._config.enabled:
@@ -358,7 +448,11 @@ def _is_fp8(dtype: torch.dtype) -> bool:
 
 
 def fp8_linear_forward(
-    x: torch.Tensor, w: torch.Tensor, bias=None, cfg: Optional[_ActiveConfig] = None
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias=None,
+    cfg: _ActiveConfig | None = None,
+    update_rings: bool = True,
 ):
     """Scaled fp8 linear forward (called from the aten::linear impl).
 
@@ -369,6 +463,16 @@ def fp8_linear_forward(
     scaling measures the current amax itself. Training quantizes the weight
     every step (the optimizer bumps its version, so there is no cast cache,
     matching ``cached_cast``-less behavior).
+
+    ``update_rings=False`` marks the no-grad passes — gradient-checkpointing
+    recompute, and plain inference. The ring is read but never folded or
+    advanced, so the recomputed forward quantizes with exactly the scale the
+    original pass used; without this the recompute would consume the *next*
+    step's scale and disagree numerically with the pass that produced the
+    loss. TE clones its fp8 meta for the same invariant ("to ensure both
+    forward steps are numerically same"); the host-side seed here covers the
+    first-ever-forward-is-no-grad case (an eval pass before training) so the
+    cast always has a valid scale.
     """
     state = fp8_state()
     if cfg is None:
@@ -378,7 +482,7 @@ def fp8_linear_forward(
         sx = _dynamic_scale(x.reshape(-1, w.size(1)), cfg.recipe, fmt)
         sw = _dynamic_scale(w, cfg.recipe, fmt)
         # amax was already measured by _dynamic_scale: no ring means the
-        # kernel runs a pure scale+cast (no fused-amax pass) on this path.
+        # kernel runs a pure scale+cast (no fused amax pass) on this path.
         x8, _ = quantize(x, sx.reciprocal(), fmt)
         w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
         # Bias fuses into the GEMM epilogue (fp32 add before the single bf16
@@ -395,19 +499,37 @@ def fp8_linear_forward(
         return out, sx, sw
 
     meta = state.get_weight_meta(w, cfg.recipe)
-    if not meta.w.initialized:
-        meta.w.seed(w, fmt)
-    if not meta.x.initialized:
-        meta.x.seed(x, fmt)
-    sx, sw = meta.x.scale.clone(), meta.w.scale.clone()
+    if update_rings:
+        if not meta.w.initialized:
+            meta.w.seed(w, fmt)
+        if not meta.x.initialized:
+            meta.x.seed(x, fmt)
+    else:
+        # Host-side seed only (both branches need a valid scale to cast
+        # with); the window itself stays untouched.
+        if not meta.w.initialized:
+            meta.w.seed(w, fmt)
+        if not meta.x.initialized:
+            meta.x.seed(x, fmt)
     # The clones feed this call's kernels (stream-ordered before the in-kernel
     # fold overwrites the ring scale slots); the fp8 quantize kernel folds the
     # amax into the history window and publishes the next scale itself.
-    x8, _ = quantize(x, sx.reciprocal(), fmt, **meta.x.fold_args(fmt))
-    if _is_fp8(w.dtype):
-        w8 = w
+    sx, sw = meta.x.scale.clone(), meta.w.scale.clone()
+    if update_rings:
+        x8, _ = quantize(x, sx.reciprocal(), fmt, **meta.x.fold_args(fmt))
+        if _is_fp8(w.dtype):
+            w8 = w
+        else:
+            w8, _ = quantize(w, sw.reciprocal(), fmt, **meta.w.fold_args(fmt))
     else:
-        w8, _ = quantize(w, sw.reciprocal(), fmt, **meta.w.fold_args(fmt))
+        # Ring-free cast — the dynamic path's shape ("no ring => pure
+        # scale+cast, no fused amax"): folding here would advance the window
+        # a second time per step and desynchronize the recompute.
+        x8, _ = quantize(x, sx.reciprocal(), fmt)
+        if _is_fp8(w.dtype):
+            w8 = w
+        else:
+            w8, _ = quantize(w, sw.reciprocal(), fmt)
     out = quant_gemm(
         x8.reshape(-1, x8.size(-1)),
         w8,
@@ -416,9 +538,10 @@ def fp8_linear_forward(
         trans_b=True,
         bias=bias,
     ).reshape(*x.shape[:-1], w.size(0))
-    meta.x.advance()
-    if not _is_fp8(w.dtype):
-        meta.w.advance()
+    if update_rings:
+        meta.x.advance()
+        if not _is_fp8(w.dtype):
+            meta.w.advance()
     return out, sx, sw
 
 
@@ -430,12 +553,17 @@ class _LinearFp8(torch.autograd.Function):
     ``loss.backward()`` may run after the context exits. The gradient is
     quantized once (E5M2 in hybrid) and both dX/dW GEMMs share it; the output
     masks come from ``needs_input_grad``.
+
+    ``update_rings`` is read at the dispatcher (``_linear_cuda_impl``) from
+    the caller's grad mode — inside a Function forward it is always off — and
+    gates the delayed-scaling bookkeeping: no-grad calls (checkpointing
+    recompute, inference) read the rings without folding or advancing.
     """
 
     @staticmethod
-    def forward(ctx, x, w, bias):
+    def forward(ctx, x, w, bias, update_rings):
         cfg = _current_config()
-        out, sx, sw = fp8_linear_forward(x, w, bias, cfg)
+        out, sx, sw = fp8_linear_forward(x, w, bias, cfg, update_rings)
         ctx.save_for_backward(x, w, sx, sw)
         ctx.fmt_bwd = cfg.fp8_format[1]
         ctx.recipe = cfg.recipe
@@ -499,7 +627,7 @@ class _LinearFp8(torch.autograd.Function):
         grad_b = g2.sum(0).to(torch.bfloat16) if ctx.needs_input_grad[2] else None
         if not ctx.is_dynamic:
             meta.g.advance()
-        return grad_x, grad_w, grad_b
+        return grad_x, grad_w, grad_b, None
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +663,13 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
         and w.dtype is torch.bfloat16
         and _fp8_supported(x, w)
     ):
-        return _LinearFp8.apply(x, w, bias)
+        # The caller's grad mode gates the delayed-scaling bookkeeping, and
+        # it must be read HERE: inside a Function forward grad is always
+        # disabled, so the mode would be invisible one frame deeper. A no-grad
+        # linear (checkpointing recompute, inference) reads the rings without
+        # folding or advancing them. The host bool is also the seam a
+        # CUDA-graph device flag replaces (TE's skip_fp8_weight_update).
+        return _LinearFp8.apply(x, w, bias, torch.is_grad_enabled())
     return torch.ops.aten.linear.default.redispatch(
         torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd),
         x,
@@ -544,7 +678,7 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
     )
 
 
-_linear_libs: Optional[List[Library]] = None
+_linear_libs: list[Library] | None = None
 _install_lock = threading.Lock()
 
 

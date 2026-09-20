@@ -4,13 +4,14 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import IO, Callable, Dict, List, Optional, Protocol, runtime_checkable
+from typing import IO, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
+from torch import nn
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from tqdm import tqdm
 
@@ -26,6 +27,7 @@ from astrai.trainer.metric_util import (
     ctx_get_moe_metric,
     ctx_get_val_loss,
 )
+from astrai.trainer.optional_extras import checkpoint_extras
 from astrai.trainer.train_context import TrainContext
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,7 @@ _TOKENIZER_FILES = (
 )
 
 
-def _copy_tokenizer_files(param_path: Optional[str], save_path: str):
+def _copy_tokenizer_files(param_path: str | None, save_path: str):
     """Snapshot tokenizer files into the checkpoint directory.
 
     ``param_path`` is the launch model directory (or, on resume, a
@@ -128,7 +130,7 @@ class GradientCheckpointingCallback(TrainCallback):
         modules: Module types to apply checkpointing to.
     """
 
-    def __init__(self, modules: Optional[List[type]] = None):
+    def __init__(self, modules: list[type] | None = None):
         self.modules = tuple(modules) if modules else ()
 
     def _enable(self, module: nn.Module):
@@ -168,7 +170,7 @@ class CheckpointCallback(TrainCallback):
         save_dir: str,
         interval: int,
         weight_only: bool = False,
-        save_extra_fn: Optional[Callable[["TrainContext"], dict]] = None,
+        save_extra_fn: Callable[["TrainContext"], dict] | None = None,
     ):
         self.save_dir = save_dir
         self.interval = interval
@@ -231,6 +233,9 @@ class CheckpointCallback(TrainCallback):
             obj = getattr(context, name, None)
             if obj:
                 extra[name] = obj.state_dict()
+        # Optional components (fp8 rings today) join via the extras registry —
+        # the checkpoint itself stays unaware of them.
+        extra.update(checkpoint_extras())
         critic = getattr(context.strategy, "critic", None)
         if critic is not None:
             extra["value_model"] = critic.state_dict()
@@ -247,7 +252,7 @@ class ProgressBarCallback(TrainCallback):
     """
 
     def __init__(
-        self, num_epoch: int, log_interval: int = 100, file: Optional[IO[str]] = None
+        self, num_epoch: int, log_interval: int = 100, file: IO[str] | None = None
     ):
         self.num_epoch = num_epoch
         self.log_interval = log_interval
@@ -291,7 +296,7 @@ class MetricCallback(TrainCallback):
         self,
         ckpt_dir: str,
         save_interval: int,
-        metrics: List[str] = None,
+        metrics: list[str] = None,
         val_step: int = 0,
     ):
         self.last_log_flush_step = None
@@ -387,7 +392,7 @@ class MetricCallback(TrainCallback):
         context.model.train()
         return avg_loss
 
-    def _run_rollout_validation(self, context: TrainContext) -> Dict[str, float]:
+    def _run_rollout_validation(self, context: TrainContext) -> dict[str, float]:
         """Validation for online strategies via :class:`RolloutEvaluator`.
 
         Reports reward statistics under the evaluator's own sampling
@@ -396,7 +401,7 @@ class MetricCallback(TrainCallback):
         eval mode itself, so no global mode switch is needed here; the
         replay cache and its cadence stay untouched by construction.
         """
-        totals: Dict[str, float] = {}
+        totals: dict[str, float] = {}
         num_batches = 0
         for batch in context.val_dataloader:
             metrics = context.val_evaluator.evaluate(batch)
@@ -415,8 +420,7 @@ class MetricCallback(TrainCallback):
         log_file = self.ckpt_dir / f"epoch_{epoch}_step_{step}" / "metric.jsonl"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(log_file, "w") as f:
-            for log in self.log_cache:
-                f.write(json.dumps(log) + "\n")
+            f.writelines(json.dumps(log) + "\n" for log in self.log_cache)
 
     def before_optimizer_step(self, context):
         context.grad_snr_tracker.update(context.model)

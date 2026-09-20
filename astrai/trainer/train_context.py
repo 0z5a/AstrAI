@@ -1,11 +1,12 @@
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Self
+from typing import Any, Optional, Self
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import DataLoader, random_split
 
 from astrai.config.model_config import ConfigFactory
@@ -38,6 +39,7 @@ from astrai.trainer.backend import (
     ReplicaBackend,
 )
 from astrai.trainer.metric_util import GradSNRTracker
+from astrai.trainer.optional_extras import restore_checkpoint_extras
 from astrai.trainer.rollout import (
     RolloutEvaluator,
     RolloutGenerator,
@@ -63,20 +65,20 @@ class TrainContext:
     epoch: int = field(default=0)
     consumed_samples: int = field(default=0)
     loss: float = field(default=0.0)
-    metrics: Dict[str, float] = field(default_factory=dict)
-    grad_norm: Optional[float] = field(default=None)
+    metrics: dict[str, float] = field(default_factory=dict)
+    grad_norm: float | None = field(default=None)
     grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
-    val_dataloader: Optional[DataLoader] = field(default=None)
-    val_loss: Optional[float] = field(default=None)
+    val_dataloader: DataLoader | None = field(default=None)
+    val_loss: float | None = field(default=None)
     #: Online-strategy validation: reward-statistics evaluator under its
     #: own sampling params. ``None`` keeps the legacy validate_online path.
     val_evaluator: Optional["RolloutEvaluator"] = field(default=None)
 
     world_size: int = field(default=1)
     rank: int = field(default=0)
-    topology: Optional[ParallelTopology] = field(default=None)
-    kwargs: Dict[str, Any] = field(default_factory=dict)
-    param_path: Optional[str] = field(default=None)
+    topology: ParallelTopology | None = field(default=None)
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    param_path: str | None = field(default=None)
 
     _stop_event: threading.Event = field(default_factory=threading.Event)
 
@@ -114,19 +116,19 @@ class TrainContext:
 @dataclass
 class _PreloadedState:
     model_config: dict = field(default_factory=dict)
-    state_dict: Optional[dict] = None
+    state_dict: dict | None = None
     epoch: int = 0
     consumed_samples: int = 0
-    checkpoint: Optional[Checkpoint] = None
+    checkpoint: Checkpoint | None = None
 
 
 def create_ref_model(
     model_fn: Callable[[], nn.Module],
-    executor: Optional[BaseExecutor] = None,
-    model: Optional[nn.Module] = None,
-    state_dict: Optional[Dict[str, torch.Tensor]] = None,
-    device: Optional[str] = None,
-) -> Optional[nn.Module]:
+    executor: BaseExecutor | None = None,
+    model: nn.Module | None = None,
+    state_dict: dict[str, torch.Tensor] | None = None,
+    device: str | None = None,
+) -> nn.Module | None:
     """Create a frozen reference model from executor or state dict.
 
     Training-domain helper for the DPO/GRPO reference and old policies: it
@@ -164,11 +166,11 @@ class TrainContextBuilder:
         config: TrainConfig,
     ):
         self.config = config
-        self._param_path: Optional[str] = None
+        self._param_path: str | None = None
         self._resume: bool = False
-        self._topology: Optional[ParallelTopology] = None
+        self._topology: ParallelTopology | None = None
 
-    def with_param_path(self, param_path: Optional[str], resume: bool = False) -> Self:
+    def with_param_path(self, param_path: str | None, resume: bool = False) -> Self:
         self._param_path = param_path
         self._resume = resume
         return self
@@ -400,6 +402,7 @@ class TrainContextBuilder:
                     getattr(context, name).load_state_dict(
                         context.checkpoint.extra[name]
                     )
+            restore_checkpoint_extras(context.checkpoint.extra)
 
     def _create_strategy(self, context: TrainContext, executor: BaseExecutor) -> dict:
         cfg = self.config
@@ -562,7 +565,7 @@ class TrainContextBuilder:
         max_seq_len = getattr(context.model.config, "max_position_embeddings", None)
         train_device = next(context.model.parameters()).device
 
-        def _resolve_device(name: str, value: Optional[str]) -> Optional[str]:
+        def _resolve_device(name: str, value: str | None) -> str | None:
             if value is None:
                 return None
             if value.startswith("cuda"):
