@@ -16,7 +16,15 @@ import torch.nn.functional as F
 import astrai.extension.quantize as f8mod
 from astrai.extension.loader import get_module
 from astrai.extension.ops.gemm import quant_gemm
-from astrai.extension.ops.quantize import K_FOLD_SLOTS, quantize, quantize_dual
+from astrai.extension.ops.quantize import quantize, quantize_dual
+
+try:
+    from astrai.extension.ops.quantize import K_FOLD_SLOTS
+except RuntimeError:
+    # The binding must stay import-safe on boxes without the extension;
+    # every K_FOLD_SLOTS use sits inside kernel-level tests that skip
+    # via skip_no_fp8/skip_no_kernel when the kernel is not built.
+    K_FOLD_SLOTS = None
 from astrai.extension.quantize import (
     FP8Recipe,
     fp8_autocast,
