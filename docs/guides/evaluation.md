@@ -1,18 +1,22 @@
 # Evaluation
 
-AstrAI provides 7 evaluation scripts in `scripts/eval/` covering code generation, knowledge QA, perplexity, summarization, data quality, instruction following, and weight analysis.
+AstrAI provides 9 evaluation scripts in `scripts/eval/` covering code generation, knowledge QA, commonsense QA, perplexity, summarization, data quality, instruction following, and weight analysis, plus suite tooling (`run_suite.py`, `collect.py`) built on the shared `astrai.bench` module.
 
 ## Contents
 
 - [Prerequisites](#prerequisites)
 - [Overview](#overview)
 - [HumanEval](#humaneval-code-generation)
+- [MBPP](#mbpp-code-generation)
 - [MMLU](#mmlu-knowledge-qa)
+- [HellaSwag](#hellaswag-commonsense-qa)
 - [Perplexity](#perplexity-ppl)
 - [ROUGE](#rouge)
 - [IFD](#ifd-instruction-following-difficulty)
 - [IFEval](#ifeval-instruction-following)
 - [Weight Analysis](#weight-analysis)
+- [Suite runner](#suite-runner)
+- [Collecting results](#collecting-results)
 - [Tips](#tips)
 
 ## Prerequisites
@@ -30,12 +34,16 @@ The generation-based scripts require CUDA because they load the model on `cuda` 
 | Script | Metric | Model Invocation | External Dataset |
 |--------|--------|-------------------|-------------------|
 | `evaluate_humaneval.py` | Code-gen pass@1/10/100 | `InferenceEngine.generate` | HF `openai/openai_humaneval` (auto-download) |
+| `evaluate_mbpp.py` | Code-gen pass@1/10 (chat zero-shot) | `InferenceEngine.generate` | HF `google-research-datasets/mbpp` (auto-download) |
 | `evaluate_mmlu.py` | MCQ accuracy (log-likelihood) | Direct `model()` forward | HF `cais/mmlu` (auto-download) |
+| `evaluate_hellaswag.py` | Commonsense acc / acc_norm (log-likelihood) | Direct `model()` forward | HF `Rowan/hellaswag` (auto-download) |
 | `evaluate_ppl.py` | Perplexity / token loss | Direct `model()` forward | User JSONL |
 | `evaluate_rouge.py` | ROUGE-1/2/L | None (pure metric) | User JSONL |
 | `evaluate_ifd.py` | Instruction-Following Difficulty | Direct `model()` forward | User JSONL |
 | `evaluate_ifeval.py` | Instruction-following constraints | `InferenceEngine.generate` | HF `google/IFEval` (auto-download) |
 | `analyze_weights.py` | SVD effective rank / weight stats | None (loads safetensors) | Checkpoint dir |
+| `run_suite.py` | Standard suite per checkpoint, with retries | Launches the above | Local data caches |
+| `collect.py` | Markdown comparison table from results JSONs | None | `results/` directory |
 
 Two invocation patterns exist:
 - **Generation benchmarks** (HumanEval, IFEval): use `InferenceEngine` to generate responses, then score them.
@@ -90,6 +98,24 @@ python scripts/eval/evaluate_humaneval.py \
 
 ---
 
+## MBPP (Code Generation)
+
+Mostly Basic Python Problems, full test split (500 tasks, ids 11-510), chat zero-shot: task text + asserts + the canonical function signature go through the chat template. Raw few-shot completion transcripts derail SFT models, and without the signature ~65% of failures are invented function names — so absolute numbers are not comparable to published few-shot MBPP; cross-checkpoint comparisons are the payload.
+
+```bash
+python scripts/eval/evaluate_mbpp.py \
+    --param_path ./params \
+    --num_samples 20 \
+    --batch_size 64 \
+    --output results/mbpp.json
+```
+
+Key parameters mirror HumanEval (`--num_samples`, `--temperature`, `--batch_size`, `--test_only`, `--problems`); data auto-downloads to `mbpp/mbpp_test.jsonl` on first run. Execution = completion + `test_list` asserts (challenge tests excluded).
+
+**Output**: stdout prints `pass@1`/`pass@10`; with `--output`, per-problem results + `_summary` and a `_completions.json` file.
+
+---
+
 ## MMLU (Knowledge QA)
 
 57-subject multiple-choice accuracy via log-likelihood comparison. Supports n-shot few-shot prompting and option permutation.
@@ -121,6 +147,32 @@ python scripts/eval/evaluate_mmlu.py \
 **Output**: stdout prints per-subject accuracy and overall. With `--output`, writes per-subject `{accuracy, correct, total}` + `_overall` aggregate.
 
 **Data**: Auto-downloads `cais/mmlu` from HuggingFace. Stored as per-subject CSVs in `<data_dir>/<split>/` and `<data_dir>/dev/` (for few-shot). `--subjects` accepts canonical MMLU names such as `abstract_algebra`, `college_computer_science`, `high_school_us_history`, and `world_religions`.
+
+---
+
+## HellaSwag (Commonsense QA)
+
+Sentence-completion MCQ over the full validation split (10,042 questions), zero-shot, following the lm-evaluation-harness protocol (same text normalization; each ending scored as a continuation). Reports raw accuracy and length-normalized `acc_norm`.
+
+```bash
+python scripts/eval/evaluate_hellaswag.py \
+    --param_path ./params \
+    --batch_size 16 \
+    --output results/hellaswag.json
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--param_path` | `./params` | Model directory |
+| `--data_path` | `./hellaswag/val.jsonl` | HellaSwag validation JSONL (auto-downloaded if missing) |
+| `--limit` | 0 | Score only the first N questions (0 = all) |
+| `--batch_size` | 8 | Questions per batch (4 continuation rows each) |
+| `--device` / `--dtype` | cuda / bfloat16 | Device and dtype |
+| `--output` | None | Save `_summary` JSON |
+
+**Output**: stdout prints `acc` and `acc_norm`; with `--output`, a `_summary` JSON. A full run takes ~2.5 minutes per arm on one RTX 5090 — short-sequence forward passes are cheap; prefer full runs over sampling.
+
+**Data**: Auto-downloads `Rowan/hellaswag` (validation split) on first run.
 
 ---
 
@@ -277,10 +329,48 @@ python scripts/eval/analyze_weights.py \
 
 ---
 
+## Suite runner
+
+`run_suite.py` runs the standard benchmark set for one checkpoint, one benchmark per free GPU, with per-job retries (a job is retried when its process dies without writing the output file — idempotent, so rerunning skips completed benchmarks).
+
+```bash
+nohup python -u scripts/eval/run_suite.py \
+    --ckpt checkpoints/sft-mix3/epoch_1_step_4385 \
+    --tag mix3 \
+    --benchmarks mmlu,ifeval,humaneval,mbpp,hellaswag \
+    > logs/suite_mix3.log 2>&1 &
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--ckpt` | required | Checkpoint path, passed through as `--param_path` |
+| `--tag` | required | Output naming: `results/<bench>_<tag>.json` |
+| `--benchmarks` | `mmlu,ifeval,humaneval` | Comma-separated subset (`mbpp`, `mbpp2`, `hellaswag` available) |
+| `--gpus` | auto | Preferred GPU indices (free GPUs below 100 MiB; otherwise 4-7 first) |
+| `--attempts` | 3 | Retries per benchmark |
+| `--smoke` | False | Cheap per-benchmark invocations for a plumbing test (IFEval has no cheap mode and is skipped) |
+| `--dry-run` | False | Print the job plan and exit |
+
+Standard per-benchmark parameters are baked in (MMLU 5-shot bs4; IFEval ns1 bs64 temp 0.1; HumanEval/MBPP ns20 bs64; HellaSwag bs16) and match the eval reports. Wrap in `nohup`: if the runner itself dies, rerunning the same command skips finished benchmarks. A summary table prints at the end.
+
+## Collecting results
+
+`collect.py` walks `results/` for `<bench>_<benchmark>.json` files (skipping `*_completions.json`) and renders a markdown comparison table — rows are standardized metrics per benchmark, columns are tags.
+
+```bash
+python scripts/eval/collect.py \
+    --results-dir results \
+    --benchmarks mmlu,ifeval,humaneval,mbpp2,hellaswag \
+    --tags mix3,mix3_lr5e5,mix3_lr2e5 \
+    --output results/compare.md
+```
+
+Metric names: `acc`; `pass@1`/`pass@10` plus `zero_pass`/`strong_pass` counts (code benchmarks); `acc`/`acc_norm` (HellaSwag); IFEval `json_format`/`num_bullet_lists` sub-items. `mbpp2` denotes the signature-protocol MBPP (see the MBPP section). Omitting `--output` prints to stdout.
+
 ## Tips
 
-- **Quick test**: Use `--limit` (IFEval) or `--problems` (HumanEval) to run on a small subset first.
-- **Auto-download**: After installing `datasets`, HumanEval, MMLU, and IFEval auto-download their datasets on first run. The other scripts expect user-provided data.
+- **Quick test**: Use `--limit` (IFEval, HellaSwag) or `--problems` (HumanEval, MBPP) to run on a small subset first — or `run_suite.py --smoke`.
+- **Auto-download**: After installing `datasets`, HumanEval, MBPP, MMLU, HellaSwag, and IFEval auto-download their datasets on first run (set `HF_ENDPOINT` if the default endpoint is unreachable). The other scripts expect user-provided data.
 - **Output formats**: `--output` writes a single JSON for most scripts. PPL and IFD write an `--output_dir` containing `summary.json` plus per-file artifacts.
 - **CPU mode**: MMLU, PPL, and IFD support `--device cpu --dtype float32`; weight analysis supports `--device cpu`. HumanEval generation and IFEval are CUDA-only.
 
