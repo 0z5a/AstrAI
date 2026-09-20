@@ -936,10 +936,15 @@ dedup gate on 658/658 identity instead of re-benchmarking (2026-09-19 audit).
 The one drift class a POD layout change causes (param-field offsets shift,
 ptxas re-selects load widths and renumbers registers) is adjudicated by
 instruction-count + mnemonic-histogram equality and the bitwise pytest suite.
-The same audit falsified shared-helper extraction in hot device code: pulling
-verbatim-duplicated straight-line blocks into `__forceinline__` helpers moved
-ptxas scheduling (26 crosswise kernels drifted SASS, REG −1/−2), so that
-refactor family requires a full re-benchmark budget, not the digest.
+The same audit closed the sass digest for shared-helper extraction in hot
+device code: pulling verbatim-duplicated straight-line blocks into
+`__forceinline__` helpers moves ptxas scheduling across inline boundaries
+(42 mixed-pair kernels drifted SASS). That family lands under a benchmark
+gate instead (2026-09-20, `d521f14`): big-shape A-B-A-B x3 (ms-scale
+kernels, ±0.3% noise) plus a 6-round alternating re-measurement of the
+worst cell, with the sass-identical kernels as a noise control — measured
+flat (1.00x on every combo, several mixed pairs slightly faster, matching
+the -0.56% instruction delta and -1..-2 registers).
 
 ## Benchmarks
 

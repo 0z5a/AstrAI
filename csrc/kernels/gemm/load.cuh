@@ -239,6 +239,57 @@ struct PrefetchCarry<false, RingT, kThreads, kTrans> {
     __device__ __forceinline__ void advance() {}
 };
 
+// The two arms one 16-row crosswise chunk can take, shared by the general
+// grid-stride loader and the register carry below — the pair must never
+// diverge on the perm sequence or the predication, or the same operand
+// would stage differently depending on bus width.
+//
+// Fast arm: four contract runs (uint4 each, already fetched into the
+// register file) -> one PRMT pass -> 16 packed span words in the staging
+// tile. Slow arm (row tail / misaligned base): element-granular gather
+// with per-row predication; contract-tail columns zero-fill.
+template <typename TileT>
+__device__ __forceinline__ void crosswise_perm_span(TileT tile, int rg,
+                                                    int span, const uint4* v) {
+    const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        // Word i = row r0+i's span: byte i of each of the four runs
+        // [v0.b(i), v1.b(i), v2.b(i), v3.b(i)]; run s is one uint4 (16
+        // bytes = 16 rows), so word i>>2 of run s is bytes[4*s + (i>>2)].
+        const unsigned nib = i & 3;
+        const unsigned sel = nib | ((nib + 4) << 4);
+        const unsigned w01 =
+            __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
+        const unsigned w23 =
+            __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
+        *reinterpret_cast<unsigned*>(tile(rg * 16 + i, span * 4)) =
+            __byte_perm(w01, w23, 0x5410u);
+    }
+}
+
+template <typename TileT, typename ElemT>
+__device__ __forceinline__ void crosswise_gather_span(
+    TileT tile, const ElemT* __restrict__ operand, int64_t rows,
+    int64_t contract, int64_t ld, int64_t k_base, int64_t r0, int rg,
+    int span) {
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const int col = span * 4 + s;
+        if (k_base + col >= contract) {
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+                *tile(rg * 16 + i, col) = ElemT(0.0f);
+            continue;
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+            *tile(rg * 16 + i, col) = r0 + i < rows
+                                           ? operand[(k_base + col) * ld + r0 + i]
+                                           : ElemT(0.0f);
+    }
+}
+
 // Direct (synchronous) crosswise load into a canonical rotating stage:
 // LDG.128 runs (4 x 16B of the non-contract dim) + in-register transpose
 // (PRMT) + 16 STS.32. Crosswise operands cannot cp.async into the
@@ -246,19 +297,15 @@ struct PrefetchCarry<false, RingT, kThreads, kTrans> {
 // the other dim), so they take the register route; a staged smem->smem
 // variant measured 15-20% slower and was removed (see git history).
 //
-// One chunk = 64B of global memory staging one 16-row group:
-//   1-byte elements: 4 runs of 16 rows x 4 contract positions; the PRMT
-//     byte-perm gathers one 32-bit word per row across the four runs;
-//   2-byte elements: 2 contract positions x 2 eight-row halves; a 16B run
-//     covers only 8 rows, and the transpose selects halfwords — one
-//     PRMT per output word (the byte selector already spans both source
-//     words: 0x5410 low pair, 0x7632 high pair).
+// One chunk = 64B of global memory staging one 16-row group: 4 runs of
+// 16 rows x 4 contract positions; the PRMT byte-perm gathers one 32-bit
+// word per row across the four runs.
 //
 // This is the GENERAL form: a grid-stride loop over the tile's chunks, so
-// any tile geometry stages correctly however few threads it has. The 1-byte
-// path the ladders actually instantiate has a narrower-chunk, two-phase
-// sibling (CrosswiseCarry, below) which load_crosswise_direct selects — this
-// one keeps the 2-byte formulas and the bus under-subscription case.
+// any tile geometry stages correctly however few threads it has. The path
+// the ladders actually instantiate has a two-phase sibling (CrosswiseCarry,
+// below) which load_crosswise_direct selects; this one covers the bus
+// under-subscription case.
 template <typename SmemLayout, typename ElemT, int kThreads>
 __device__ __forceinline__ void
 load_crosswise_direct_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
@@ -297,42 +344,10 @@ load_crosswise_direct_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                 else
                     v[i] = make_uint4(0u, 0u, 0u, 0u);
             }
-            const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
-#pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                // Word i = row r0+i's span: byte i of each of the four
-                // runs [v0.b(i), v1.b(i), v2.b(i), v3.b(i)].
-                const unsigned nib = i & 3;
-                const unsigned sel = nib | ((nib + 4) << 4);
-                const unsigned w01 =
-                    __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
-                const unsigned w23 =
-                    __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
-                *reinterpret_cast<unsigned*>(
-                    tile(rg * 16 + i, span * kCw)) =
-                    __byte_perm(w01, w23, 0x5410u);
-            }
+            crosswise_perm_span(tile, rg, span, v);
         } else {
-            // Row-tail or misaligned chunk: element-granular gather with
-            // per-row predication; contract-tail columns zero-fill.
-#pragma unroll
-            for (int s = 0; s < kCw; ++s) {
-                const int col = span * kCw + s;
-                if (k_base + col >= contract) {
-#pragma unroll
-                    for (int i = 0; i < 16; ++i)
-                        *tile(rg * 16 + i, col) = ElemT(0.0f);
-                    continue;
-                }
-#pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    const int64_t r_idx = r0 + i;
-                    *tile(rg * 16 + i, col) =
-                        r_idx < rows
-                            ? operand[(k_base + col) * ld + r_idx]
-                            : ElemT(0.0f);
-                }
-            }
+            crosswise_gather_span(tile, operand, rows, contract, ld, k_base,
+                                  r0, rg, span);
         }
     }
 }
@@ -434,9 +449,10 @@ struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
         }
     }
 
-    // PRMT + STS for the chunk issue() fetched; the element-granular fallback
-    // (row tail, misaligned base) keeps the synchronous gather so the carry
-    // never has to hold predicated state.
+    // PRMT + STS for the chunk issue() fetched, through the shared span
+    // arms — the element-granular fallback (row tail, misaligned base)
+    // keeps the synchronous gather so the carry never has to hold
+    // predicated state.
     template <typename TileT>
     __device__ __forceinline__ void commit(TileT tile,
                                            const ElemT* __restrict__ operand,
@@ -452,41 +468,11 @@ struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
         }
         if (!active) return;
         if (fast) {
-            const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
-#pragma unroll
-            for (int i = 0; i < kRowsChunk; ++i) {
-                // Word i = row r0+i's span: byte i of each of the four runs —
-                // [v0.b(i), v1.b(i), v2.b(i), v3.b(i)], the same byte-perm the
-                // general loader spells inline. Each run is one uint4 (16 bytes
-                // = 16 rows), so word i>>2 of run s is bytes[4*s + (i>>2)].
-                const unsigned nib = i & 3;
-                const unsigned sel = nib | ((nib + 4) << 4);
-                const unsigned w01 =
-                    __byte_perm(bytes[0 + (i >> 2)], bytes[4 + (i >> 2)], sel);
-                const unsigned w23 =
-                    __byte_perm(bytes[8 + (i >> 2)], bytes[12 + (i >> 2)], sel);
-                *reinterpret_cast<unsigned*>(
-                    tile(rg * kRowsChunk + i, span * kCw)) =
-                    __byte_perm(w01, w23, 0x5410u);
-            }
+            crosswise_perm_span(tile, rg, span, v);
             return;
         }
-        const int64_t r0 = block_row + rg * kRowsChunk;
-#pragma unroll
-        for (int s = 0; s < kCw; ++s) {
-            const int col = span * kCw + s;
-            if (k_base + col >= contract) {
-#pragma unroll
-                for (int i = 0; i < kRowsChunk; ++i)
-                    *tile(rg * kRowsChunk + i, col) = ElemT(0.0f);
-                continue;
-            }
-#pragma unroll
-            for (int i = 0; i < kRowsChunk; ++i)
-                *tile(rg * kRowsChunk + i, col) =
-                    r0 + i < rows ? operand[(k_base + col) * ld + r0 + i]
-                                  : ElemT(0.0f);
-        }
+        crosswise_gather_span(tile, operand, rows, contract, ld, k_base,
+                              block_row + rg * kRowsChunk, rg, span);
     }
 };
 
