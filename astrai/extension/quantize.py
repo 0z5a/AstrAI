@@ -1,6 +1,6 @@
 """Quantization: every scheme's policy and integration in one module.
 
-The python mirror of the kernel side's single quantize family
+The policy layer over the kernel side's single quantize family
 (``csrc/kernels/quantize/`` — the fp8 quantize kernels plus the int8
 dequant the GEMM family consumes). Stateless kernel adapters live one
 layer down (``ops/quantize.py`` / ``ops/gemm.py`` — the only modules
@@ -22,11 +22,14 @@ FP8 (training stack):
 
 - ``FP8Recipe`` — scaling recipes (TE-style delayed scaling over an amax
   history window, or dynamic current-amax scaling)
-- per-tensor scale rings + process-wide ``FP8State``
+- ``gemm.fp8_linear`` (``csrc/kernels/gemm/fp8_linear.cu``) — the
+  composed fwd+bwd: quantize, ring fold/advance, the weight-cast cache
+  and all three GEMMs run in C++ behind a single Python->C++ crossing
 - ``fp8_autocast`` — the torch.autocast-style context (plus the
   ``fp8_linear_enable`` global switch) routing ``aten::linear`` through
-  ``fp8_linear_forward/backward``; hybrid E4M3 forward / E5M2 backward by
-  default
+  that op; hybrid E4M3 forward / E5M2 backward by default
+- ``fp8_state_dict``/``fp8_load_state_dict`` — checkpoint snapshots of
+  the delayed-scaling rings (delegating to the C++ state)
 
 Usage::
 
@@ -54,14 +57,12 @@ dispatcher.
 import functools
 import threading
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
-from typing import NamedTuple
+from dataclasses import dataclass
 
 import torch
 from torch.library import Library
 
-from astrai.extension.ops.gemm import quant_gemm
-from astrai.extension.ops.quantize import quantize, quantize_dual
+from astrai.extension.loader import get_module, is_available
 
 # ---------------------------------------------------------------------------
 # INT8: stateless strategies (inference)
@@ -97,7 +98,7 @@ def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 # ---------------------------------------------------------------------------
-# FP8: formats, recipes, per-tensor state
+# FP8: formats, recipes, region config
 # ---------------------------------------------------------------------------
 
 # FP8 format vocabulary: the canonical key is the fp8 dtype itself
@@ -105,6 +106,11 @@ def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 # dispatches and validates on). The only policy-level notion beyond a
 # dtype is the hybrid per-direction pair, carried as a plain (fwd, bwd)
 # tuple; dtype validation stays in the C++ binding.
+
+
+def _is_fp8(dtype: torch.dtype) -> bool:
+    """A pre-quantized weight takes the GEMM directly (no re-quantize)."""
+    return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 def fp8_format_pair(fmt: str | torch.dtype) -> tuple[torch.dtype, torch.dtype]:
@@ -120,201 +126,22 @@ def fp8_format_pair(fmt: str | torch.dtype) -> tuple[torch.dtype, torch.dtype]:
 
 @dataclass
 class FP8Recipe:
-    """Scale-from-amax policy: ``scale = (amax / finfo(fmt).max) / 2^margin``.
+    """Scale-from-amax policy knobs: ``scale = (amax / finfo(fmt).max) / 2^margin``.
 
     ``dynamic=False`` (default) is TE-style delayed scaling: max over the
     amax history window (amax from *previous* steps; the window trades
     responsiveness against stability). ``dynamic=True`` is current-amax
     scaling (torchao DYNAMIC): measure, then quantize — no history, at an
-    extra pass. ``scale_from_history`` receives the operand's amax tensor
-    (a ring window / the current amax) and returns the quantization step.
+    extra pass. The formula itself lives in the C++ op (the single home;
+    the seed and in-kernel fold both apply it there).
     """
 
     history_len: int = 16
     margin: int = 0
     dynamic: bool = False
 
-    def scale_from_history(self, amax: torch.Tensor, fmt: torch.dtype) -> torch.Tensor:
-        peak = amax.max()
-        return ((peak / torch.finfo(fmt).max) / (2**self.margin)).clamp_min(1e-12)
-
-
-class _ScaleRing:
-    """One operand's delayed-scaling state: a float32 buffer
-    ``[hist[n] | scale | scale_recip | amax | done | fold scratch]`` (views).
-    The quantize kernel folds its fused amax into ``hist[idx]`` and publishes
-    the next scale — plus its correctly rounded reciprocal (``__frcp_rn``,
-    bit-identical to the ``torch.reciprocal`` the host used to compute) —
-    from the window in its own last block (``fold_args`` passes the buffer +
-    recipe constants); ``idx`` advances host-side each use.
-    ``scale_recip`` is the multiplier the quantize kernels read, so policy
-    code never materializes a reciprocal; its slot is the layout slot
-    earlier revisions reserved unused, so the buffer geometry — and with it
-    every A1 checkpoint — is unchanged. The ``amax``/``done``/scratch tail
-    slots are kernel scratch (self-cleaning across launches). The scratch is
-    the fold's per-block amax RMW target spread over 32 lines (one contended
-    address serializes a 49k-block grid) — must match quant::kFoldSlots: the
-    binding derives the history length as ``numel - 4 - 32``.
-
-    ``scale`` and ``scale_recip`` are read by *this step's* kernels while the
-    same launch's fold republishes both slots: every block reads them before
-    its amax lands, and the republish only fires from the last-finishing
-    block's ticket — which is why the policy still snapshots ``scale`` (the
-    backward dequant scale must survive the overwrite) with a clone.
-    """
-
-    __slots__ = (
-        "hist",
-        "idx",
-        "initialized",
-        "recipe",
-        "scale",
-        "scale_recip",
-        "state",
-    )
-
-    kFoldSlots = 32
-
-    def __init__(self, device: torch.device, recipe: FP8Recipe):
-        self.recipe = recipe
-        n = recipe.history_len
-        self.state = torch.zeros(
-            n + 4 + self.kFoldSlots, device=device, dtype=torch.float32
-        )
-        self.hist = self.state[:n]
-        self.scale = self.state[n : n + 1]
-        self.scale_recip = self.state[n + 1 : n + 2]
-        self.idx = 0
-        self.initialized = False
-
-    def advance(self) -> None:
-        """Rotate to the next history slot after metadata update."""
-        self.idx = (self.idx + 1) % self.hist.numel()
-
-    def publish_recip(self) -> None:
-        """Mirror the scale's reciprocal into its slot — the seed / restore
-        path only; the fold republishes both slots in-kernel every step."""
-        torch.reciprocal(self.scale, out=self.scale_recip)
-
-    def seed(self, t: torch.Tensor, fmt: torch.dtype) -> None:
-        amax = t.abs().amax().to(torch.float32).clamp_min(1e-12)
-        self.hist.fill_(amax)
-        self.scale.copy_(self.recipe.scale_from_history(self.hist, fmt))
-        self.publish_recip()
-        self.initialized = True
-
-    def fold_args(self, fmt: torch.dtype) -> dict:
-        """Keyword arguments for quantize()'s in-kernel history fold."""
-        return {
-            "ring_state": self.state,
-            "hist_idx": self.idx,
-            "fp8_max": float(torch.finfo(fmt).max),
-            "pow2_margin": float(2**self.recipe.margin),
-        }
-
-    def state_dict(self) -> dict:
-        """Checkpoint snapshot (A1): the whole state buffer — hist, the
-        published scale and the kernel scratch — plus the write index and
-        the seed flag. TE persists the same triple (scale / amax_history /
-        index) inside its per-module fp8_meta."""
-        return {
-            "state": self.state.detach().clone(),
-            "idx": self.idx,
-            "initialized": self.initialized,
-        }
-
-    def load_state_dict(self, sd: dict) -> bool:
-        """Restore a snapshot. False means the buffer geometry changed since
-        the save (a recipe change across the checkpoint boundary): the ring
-        stays fresh and re-seeds on next use — the same one-step transient
-        TE's recipe-change workspace clear produces."""
-        if sd["state"].numel() != self.state.numel():
-            return False
-        self.state.copy_(sd["state"].to(self.state.device))
-        self.publish_recip()  # snapshots older than the recip slot restore 0
-        self.idx = int(sd["idx"])
-        self.initialized = bool(sd["initialized"])
-        return True
-
-
-class _WeightCast:
-    """Version-keyed weight cast cache: the fp8 pair together with the scale
-    they were cast with, so the entry is self-consistent — the GEMM dequant
-    reads the very scale the values were quantized with, whatever the ring
-    has published since.
-
-    Valid while ``version`` (the weight's autograd version counter — bumped
-    by every in-place update, optimizer steps included), ``generation`` (the
-    process-wide ring generation, bumped by checkpoint restores) and the
-    active ``(fwd, bwd)`` fp8 format pair are all unchanged — ``w8`` is cast
-    in the forward format, ``w8T`` in the backward one, so a format change
-    invalidates the pair. A hit skips the weight quantize *and* its in-kernel
-    amax fold: an unchanged weight has an unchanged amax, so the fold would
-    rewrite the history window with the same value and republish the same
-    scale. The ring is therefore left untouched while the cast is cached —
-    its history tracks optimizer steps instead of forward calls, the only
-    steps that can move a weight's amax — and resumes folding on the first
-    miss (version bump / restore / format change / recipe rebuild).
-
-    A weight buffer recycled by the allocator under a live meta is out of
-    contract for the ring registry itself (its data_ptr key predates this
-    cache), so the version check is a strengthening, not the whole guard.
-    """
-
-    __slots__ = ("version", "generation", "fmts", "w8", "w8T", "sw")
-
-    def __init__(self):
-        self.version: int | None = None
-        self.generation = -1
-        self.fmts: tuple[torch.dtype, torch.dtype] | None = None
-        self.w8: torch.Tensor | None = None
-        self.w8T: torch.Tensor | None = None
-        self.sw: torch.Tensor | None = None
-
-    def valid(
-        self, w: torch.Tensor, fmts: tuple[torch.dtype, torch.dtype], generation: int
-    ) -> bool:
-        return (
-            self.w8 is not None
-            and self.version == w._version
-            and self.generation == generation
-            and self.fmts == fmts
-        )
-
-    def fill(
-        self,
-        w: torch.Tensor,
-        fmts: tuple[torch.dtype, torch.dtype],
-        generation: int,
-        w8: torch.Tensor,
-        w8T: torch.Tensor,
-        sw: torch.Tensor,
-    ) -> None:
-        self.version = w._version
-        self.generation = generation
-        self.fmts = fmts
-        self.w8 = w8
-        self.w8T = w8T
-        self.sw = sw
-
 
 @dataclass
-class FP8TensorMeta:
-    """Per-weight delayed-scaling rings for ``w``, ``x`` and ``g``, plus the
-    version-keyed weight cast cache.
-
-    Dynamic scaling never allocates a meta; it measures the current amax
-    inline. Mutable by design: the registry hands the same instance to every
-    forward of the same weight, and the cast cache is filled in place.
-    """
-
-    w: _ScaleRing
-    x: _ScaleRing
-    g: _ScaleRing
-    cast: _WeightCast = field(default_factory=_WeightCast)
-
-
-@dataclass(frozen=True)
 class _ActiveConfig:
     """The immutable (enabled, recipe, format-pair) triple of one open
     region; ``fp8_format`` is the (fwd, bwd) fp8 dtype pair."""
@@ -332,127 +159,40 @@ _active_config: ContextVar[_ActiveConfig | None] = ContextVar(
     "astrai_fp8_active_config", default=None
 )
 
-
-class FP8State:
-    """Global fp8 training state: per-tensor metas + out-of-region defaults.
-
-    The active ``(enabled, recipe, fp8_format)`` triple is a ``ContextVar``
-    set by ``fp8_autocast`` (see ``_active``/``_current_config``); these plain
-    attributes are the persistent defaults applied outside any region —
-    ``fp8_linear_enable`` writes ``default_enabled``. The metas registry is
-    shared across threads (GIL-protected); fp8 backward runs on autograd
-    engine threads and only touches metas captured on ``ctx`` at forward time.
-    """
-
-    def __init__(self):
-        self.default_enabled = False
-        self.default_recipe: FP8Recipe = FP8Recipe()
-        self.default_format: tuple[torch.dtype, torch.dtype] = (
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        )
-        self._metas: dict[tuple, FP8TensorMeta] = {}
-        # Ring snapshots queued by load_state_dict, consumed FIFO as forwards
-        # recreate the registry (the registry is lazily built, so at resume
-        # time — right after model build — nothing exists to bind into yet).
-        self._pending: list[dict] = []
-        # Bumped whenever the rings' *content* is replaced under live metas
-        # (restore / reset): the weight cast cache keys on it, because a
-        # restored ring may publish a different scale than the cast in hand.
-        self.generation = 0
-
-    def get_weight_meta(self, w: torch.Tensor, recipe: FP8Recipe) -> FP8TensorMeta:
-        key = (w.data_ptr(), w.shape, w.dtype)
-        meta = self._metas.get(key)
-        if meta is not None and meta.w.recipe != recipe:
-            # Recipe changed under the same weight: the rings' geometry
-            # (history_len) and fold constants (margin) are stale. TE clears
-            # its fp8 workspaces on a recipe change for the same reason; the
-            # fresh rings re-seed on the next forward (one-step transient).
-            meta = None
-        if meta is None:
-            meta = FP8TensorMeta(
-                _ScaleRing(w.device, recipe),
-                _ScaleRing(w.device, recipe),
-                _ScaleRing(w.device, recipe),
-            )
-            self._metas[key] = meta
-            self._restore_pending(key, meta)
-        return meta
-
-    def state_dict(self) -> dict:
-        """Checkpoint snapshot of the ring registry (A1).
-
-        Entries bind by insertion order + (shape, dtype): data_ptr is
-        meaningless across processes, and re-binding relies on the same
-        contract TE documents for amax reduction — identical registration
-        order on every rank/process. Dynamic scaling allocates no metas, so
-        an empty snapshot is expected there."""
-        return {
-            "version": 1,
-            "entries": [
-                {
-                    "shape": list(key[1]),
-                    "dtype": str(key[2]),
-                    "w": meta.w.state_dict(),
-                    "x": meta.x.state_dict(),
-                    "g": meta.g.state_dict(),
-                }
-                for key, meta in self._metas.items()
-            ],
-        }
-
-    def load_state_dict(self, sd: dict) -> None:
-        """Queue a snapshot for restore (A1). Existing metas consume their
-        entries immediately; the rest wait in ``_pending`` for the resumed
-        run's forwards to recreate the registry in the same order."""
-        self._pending = list(sd.get("entries", []))
-        self.generation += 1
-        for key, meta in list(self._metas.items()):
-            self._restore_pending(key, meta)
-
-    def _restore_pending(self, key: tuple, meta: FP8TensorMeta) -> None:
-        for i, entry in enumerate(self._pending):
-            if list(key[1]) != entry["shape"] or str(key[2]) != entry["dtype"]:
-                continue
-            if (
-                meta.w.load_state_dict(entry["w"])
-                and meta.x.load_state_dict(entry["x"])
-                and meta.g.load_state_dict(entry["g"])
-            ):
-                self._pending.pop(i)
-            break
-
-    def reset(self) -> None:
-        """Restore construction defaults (switch, recipe, format) and drop all
-        per-weight metas — a full state reset for tests / reconfiguration."""
-        self.default_enabled = False
-        self.default_recipe = FP8Recipe()
-        self.default_format = (torch.float8_e4m3fn, torch.float8_e5m2)
-        self._metas.clear()
-        self._pending = []
-        self.generation += 1
-
-
-# Process-wide singleton; per-thread/per-region state lives in _active_config.
-_state = FP8State()
-
-
-def fp8_state() -> FP8State:
-    return _state
+# Persistent out-of-region defaults. Everything else the old Python state
+# machine owned — the per-weight meta registry (delayed-scaling rings, the
+# version-keyed weight-cast cache, the checkpoint pending queue, the
+# generation counter invalidating that cache) — lives in the C++ op's
+# translation unit (``csrc/kernels/gemm/fp8_linear.cu``), keyed the
+# same way (data_ptr, shape, dtype) with the same registration-order
+# snapshot contract.
+_default_enabled = False
+_default_recipe = FP8Recipe()
+_default_format = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 def fp8_state_dict() -> dict:
-    """Checkpoint snapshot of the delayed-scaling state (A1): save it beside
-    the optimizer state. Empty under dynamic scaling (no rings exist)."""
-    return fp8_state().state_dict()
+    """Checkpoint snapshot of the delayed-scaling rings (A1): save it beside
+    the optimizer state. Empty under dynamic scaling (no rings exist) and on
+    a box without the extension (bf16 training never allocated any)."""
+    if not is_available("gemm"):
+        return {"version": 1, "entries": []}
+    return get_module("gemm").fp8_state_dict()
 
 
 def fp8_load_state_dict(sd: dict) -> None:
     """Restore a :func:`fp8_state_dict` snapshot. Unmatched entries (a model
     shape/topology change across the checkpoint) re-seed on next use — the
     same resume transient a ring-less restart would pay on every step."""
-    fp8_state().load_state_dict(sd)
+    if not sd.get("entries"):
+        return
+    get_module("gemm").fp8_load_state_dict(sd)
+
+
+def fp8_reset() -> None:
+    """Drop the C++-side registry (tests / reconfiguration)."""
+    if is_available("gemm"):
+        get_module("gemm").fp8_reset()
 
 
 def _active() -> _ActiveConfig | None:
@@ -465,8 +205,8 @@ def _active() -> _ActiveConfig | None:
     cfg = _active_config.get()
     if cfg is not None:
         return cfg if cfg.enabled else None
-    if _state.default_enabled:
-        return _ActiveConfig(True, _state.default_recipe, _state.default_format)
+    if _default_enabled:
+        return _ActiveConfig(True, _default_recipe, _default_format)
     return None
 
 
@@ -476,9 +216,7 @@ def _current_config() -> _ActiveConfig:
     cfg = _active_config.get()
     if cfg is not None:
         return cfg
-    return _ActiveConfig(
-        _state.default_enabled, _state.default_recipe, _state.default_format
-    )
+    return _ActiveConfig(_default_enabled, _default_recipe, _default_format)
 
 
 class fp8_autocast:
@@ -529,275 +267,13 @@ class fp8_autocast:
         return decorate
 
 
-# ---------------------------------------------------------------------------
-# Strategy-level forward / backward (called from the aten::linear impl)
-# ---------------------------------------------------------------------------
-
-
-def _dynamic_scale(
-    t: torch.Tensor, recipe: FP8Recipe, fmt: torch.dtype
-) -> torch.Tensor:
-    amax = t.abs().amax().to(torch.float32).clamp_min(1e-12)
-    return recipe.scale_from_history(amax, fmt)
-
-
-def _is_fp8(dtype: torch.dtype) -> bool:
-    """A pre-quantized weight takes the GEMM directly (no re-quantize)."""
-    return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-
-
-class FP8LinearOut(NamedTuple):
-    """Composed fp8 forward result: the output plus the exact operands its
-    backward needs — the dequant scales (immutable snapshots of the ring
-    values the fwd GEMM used) and the K-contiguous transposed casts already
-    produced for the backward GEMMs. ``w8T`` is cast in the *backward*
-    format (the two sides of a backward GEMM share one format); ``x8T`` is
-    ``None`` when the backward format differs from the forward one — under
-    hybrid the forward's dual pass cannot serve it — and under dynamic
-    scaling nothing is cached at all."""
-
-    out: torch.Tensor
-    scale_x: torch.Tensor
-    scale_w: torch.Tensor
-    x8T: torch.Tensor | None
-    w8T: torch.Tensor | None
-
-
-def fp8_linear_forward(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias=None,
-    cfg: _ActiveConfig | None = None,
-    update_rings: bool = True,
-) -> FP8LinearOut:
-    """Scaled fp8 linear forward (called from the aten::linear impl).
-
-    Composed from the two stateless primitives: quantize x/w with the active
-    scales, run the pre-quantized GEMM with the bias fused into its epilogue.
-    Delayed scaling lets the quantize kernel fold the fused amax into the
-    history ring and publish the next scale *and its reciprocal* in its own
-    last block (the reciprocal slot is what the kernels multiply by, so the
-    host never computes one); dynamic scaling measures the current amax
-    itself.
-
-    The weight cast is cached on the meta while its version counter (bumped
-    by every in-place update, optimizer steps included) and the ring
-    generation are unchanged — so a gradient-accumulation loop quantizes w
-    once per optimizer step instead of once per micro-batch, and the
-    backward's transposed copy comes from the same cache. Training
-    quantizes x in both orientations in one pass, so the backward never
-    re-reads it.
-
-    ``update_rings=False`` marks the no-grad passes — gradient-checkpointing
-    recompute, and plain inference. The ring is read but never folded or
-    advanced, so the recomputed forward quantizes with exactly the scale the
-    original pass used; without this the recompute would consume the *next*
-    step's scale and disagree numerically with the pass that produced the
-    loss. TE clones its fp8 meta for the same invariant ("to ensure both
-    forward steps are numerically same"); the host-side seed here covers the
-    first-ever-forward-is-no-grad case (an eval pass before training) so the
-    cast always has a valid scale.
-    """
-    state = fp8_state()
-    if cfg is None:
-        cfg = _current_config()
-    fmt = cfg.fp8_format[0]  # fwd dtype of the active format pair ([1] = bwd)
-    if cfg.recipe.dynamic:
-        sx = _dynamic_scale(x.reshape(-1, w.size(1)), cfg.recipe, fmt)
-        sw = _dynamic_scale(w, cfg.recipe, fmt)
-        # amax was already measured by _dynamic_scale: no ring means the
-        # kernel runs a pure scale+cast (no fused amax pass) on this path.
-        x8, _ = quantize(x, sx.reciprocal(), fmt)
-        w8 = w if _is_fp8(w.dtype) else quantize(w, sw.reciprocal(), fmt)[0]
-        # Bias fuses into the GEMM epilogue (fp32 add before the single bf16
-        # rounding — one rounding fewer than the separate out + bias pass);
-        # None passes through to the kernel's no-bias path.
-        out = quant_gemm(
-            x8.reshape(-1, x8.size(-1)),
-            w8,
-            a_scale=sx,
-            b_scale=sw,
-            trans_b=True,
-            bias=bias,
-        ).reshape(*x.shape[:-1], w.size(0))
-        return FP8LinearOut(out, sx, sw, None, None)
-
-    meta = state.get_weight_meta(w, cfg.recipe)
-    # Host-side seed only when a ring has never been used (the window itself
-    # is untouched by the no-grad pass): both branches need a valid scale to
-    # cast with.
-    if not meta.w.initialized:
-        meta.w.seed(w, fmt)
-    if not meta.x.initialized:
-        meta.x.seed(x, fmt)
-    # The clones feed this call's GEMMs (stream-ordered before the in-kernel
-    # fold overwrites the ring scale slots); the fp8 quantize kernels fold
-    # the amax into the history window and publish the next scale and its
-    # reciprocal themselves.
-    sx = meta.x.scale.clone()
-    cast = meta.cast
-    fmts = (fmt, cfg.fp8_format[1])
-    # A transposed operand serves a *backward* GEMM, whose two sides must
-    # share one format — so the transposed casts are made in the backward
-    # format. Under a symmetric pair that is the forward's own format and one
-    # dual pass yields both orientations; under hybrid (E4M3 fwd / E5M2 bwd)
-    # it is a second cast, paid once per optimizer step with the weight
-    # cache and left to the backward for x.
-    same_fmt = fmts[0] == fmts[1]
-    if cast.valid(w, fmts, state.generation) and not _is_fp8(w.dtype):
-        # Cache hit: the weight is bit-identical to the cached cast (its
-        # version did not move) and an unchanged weight folds the same amax
-        # it folded when the entry was written — skip the quantize, its
-        # in-kernel fold and the ring advance entirely.
-        w8, w8T, sw = cast.w8, cast.w8T, cast.sw
-    else:
-        sw = meta.w.scale.clone()
-        if _is_fp8(w.dtype):
-            w8 = w
-            w8T = None
-        elif update_rings:
-            if same_fmt:
-                w8, w8T, _ = quantize_dual(
-                    w, meta.w.scale_recip, fmt, **meta.w.fold_args(fmt)
-                )
-            else:
-                w8, _ = quantize(w, meta.w.scale_recip, fmt, **meta.w.fold_args(fmt))
-                w8T, _ = quantize(w, sw.reciprocal(), fmts[1], transposed=True)
-            meta.w.advance()
-            cast.fill(w, fmts, state.generation, w8, w8T, sw)
-        else:
-            # Ring-free cast — the dynamic path's shape ("no ring => pure
-            # scale+cast, no fused amax"): folding here would advance the
-            # window a second time per step and desynchronize the recompute.
-            w8, _ = quantize(w, meta.w.scale_recip, fmt)
-            w8T = None
-    if update_rings:
-        if same_fmt:
-            x8, x8T, _ = quantize_dual(
-                x, meta.x.scale_recip, fmt, **meta.x.fold_args(fmt)
-            )
-        else:
-            x8, _ = quantize(x, meta.x.scale_recip, fmt, **meta.x.fold_args(fmt))
-            x8T = None
-        meta.x.advance()
-    else:
-        x8, _ = quantize(x, meta.x.scale_recip, fmt)
-        x8T = None
-    out = quant_gemm(
-        x8.reshape(-1, x8.size(-1)),
-        w8,
-        a_scale=sx,
-        b_scale=sw,
-        trans_b=True,
-        bias=bias,
-    ).reshape(*x.shape[:-1], w.size(0))
-    return FP8LinearOut(out, sx, sw, x8T, w8T)
-
-
-class _LinearFp8(torch.autograd.Function):
-    """The fp8 linear forward/backward pair (standard Function style).
-
-    The forward runs inside ``fp8_autocast`` and captures the active
-    fmt/recipe/meta on ``ctx``; the backward reads only that captured state, so
-    ``loss.backward()`` may run after the context exits. The gradient is
-    quantized once (E5M2 in hybrid) and both dX/dW GEMMs share it; the output
-    masks come from ``needs_input_grad``.
-
-    The forward hands the backward its transposed operands (``x8T`` for dW,
-    ``w8T`` for dX — the weight's comes from the cast cache when it hits), so
-    the backward quantizes only ``g``; both are saved on ``ctx``, which is
-    what pins them until the graph that used them has backpropagated.
-
-    ``update_rings`` is read at the dispatcher (``_linear_cuda_impl``) from
-    the caller's grad mode — inside a Function forward it is always off — and
-    gates the delayed-scaling bookkeeping: no-grad calls (checkpointing
-    recompute, inference) read the rings without folding or advancing.
-    """
-
-    @staticmethod
-    def forward(ctx, x, w, bias, update_rings):
-        cfg = _current_config()
-        res = fp8_linear_forward(x, w, bias, cfg, update_rings)
-        ctx.save_for_backward(x, w, res.scale_x, res.scale_w, res.x8T, res.w8T)
-        ctx.fmt_bwd = cfg.fp8_format[1]
-        ctx.recipe = cfg.recipe
-        ctx.is_dynamic = cfg.recipe.dynamic
-        ctx.meta = None if ctx.is_dynamic else _state.get_weight_meta(w, cfg.recipe)
-        return res.out
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, g):
-        x, w, sx, sw, x8T, w8T = ctx.saved_tensors
-        fmt = ctx.fmt_bwd
-        # Flatten leading dims (the forward GEMMs ran on [-1, N] / [-1, K]
-        # views; the kernels only accept 2D operands).
-        g2 = g.reshape(-1, g.size(-1))
-        if ctx.is_dynamic:
-            sg = _dynamic_scale(g2, ctx.recipe, fmt)
-            sw = _dynamic_scale(w, ctx.recipe, fmt)
-            sx = _dynamic_scale(x, ctx.recipe, fmt)
-        else:
-            meta = ctx.meta
-            if not meta.g.initialized:
-                meta.g.seed(g2, fmt)
-            sg = meta.g.scale.clone()
-        # Backward GEMMs route through the NT fast path via transposed
-        # quantize outputs: g8 [m,n] with w8T [k,n] (trans_b=True) gives
-        # grad_x, g8T [n,m] with x8T [k,m] gives grad_w — no NN-swap or TT
-        # crosswise kernel in the training path. g is consumed in both
-        # orientations, so quantize_dual's single pass feeds both.
-        # The delayed g quantize folds the gradient amax into its ring
-        # in-kernel (the ring's published reciprocal is read before that
-        # fold lands, so no host reciprocal is needed); the transposed
-        # x8T/w8T copies came from the forward — the re-quantize fallbacks
-        # below serve only the paths that skip the cache (dynamic scaling,
-        # pre-quantized weights).
-        if ctx.is_dynamic:
-            g8, g8T, _ = quantize_dual(g2, sg.reciprocal(), fmt)
-        else:
-            g8, g8T, _ = quantize_dual(
-                g2, meta.g.scale_recip, fmt, **meta.g.fold_args(fmt)
-            )
-        if x8T is None:
-            x8T, _ = quantize(
-                x.reshape(-1, x.size(-1)),
-                sx.reciprocal(),
-                fmt,
-                transposed=True,
-            )
-        if _is_fp8(w.dtype):
-            # Pre-quantized weight has no transposed copy: keep the swap
-            # path for grad_x (grad_w is unaffected).
-            grad_x = quant_gemm(g8, w, a_scale=sg, b_scale=sw, trans_b=False).reshape(
-                x.shape
-            )
-        else:
-            if w8T is None:
-                w8T, _ = quantize(w, sw.reciprocal(), fmt, transposed=True)
-            grad_x = quant_gemm(g8, w8T, a_scale=sg, b_scale=sw, trans_b=True).reshape(
-                x.shape
-            )
-        grad_w = quant_gemm(g8T, x8T, a_scale=sg, b_scale=sx, trans_b=True)  # g8.T @ x8
-        # bias-free linears must not pay the column-sum
-        # reduce: g2.sum(0) is another full read of the gradient.
-        grad_b = g2.sum(0).to(torch.bfloat16) if ctx.needs_input_grad[2] else None
-        if not ctx.is_dynamic:
-            meta.g.advance()
-        return grad_x, grad_w, grad_b, None
-
-
-# ---------------------------------------------------------------------------
-# aten::linear integration
-# ---------------------------------------------------------------------------
-
-
 def fp8_linear_enable(enabled: bool = True) -> None:
     """Toggle fp8 dispatch for aten::linear globally (the out-of-region default;
     ``fp8_autocast`` regions override it thread-locally)."""
+    global _default_enabled
     if enabled:
         _install_linear_override()
-    fp8_state().default_enabled = enabled
+    _default_enabled = bool(enabled)
 
 
 def fp8_linear_enabled() -> bool:
@@ -814,19 +290,35 @@ def _fp8_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
 
 
 def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
+    cfg = _active()
     if (
-        _active() is not None
+        cfg is not None
         and x.dtype is torch.bfloat16
         and w.dtype is torch.bfloat16
         and _fp8_supported(x, w)
     ):
-        # The caller's grad mode gates the delayed-scaling bookkeeping, and
-        # it must be read HERE: inside a Function forward grad is always
-        # disabled, so the mode would be invisible one frame deeper. A no-grad
-        # linear (checkpointing recompute, inference) reads the rings without
-        # folding or advancing them. The host bool is also the seam a
-        # CUDA-graph device flag replaces (TE's skip_fp8_weight_update).
-        return _LinearFp8.apply(x, w, bias, torch.is_grad_enabled())
+        # One Python->C++ crossing per linear: quantize, the ring
+        # fold/advance, the weight-cast cache and all three GEMMs run inside
+        # gemm.fp8_linear. The caller's grad mode gates the delayed-scaling
+        # bookkeeping, and it must be read HERE: inside a Function forward
+        # grad is always disabled, so the mode would be invisible one frame
+        # deeper. A no-grad linear (checkpointing recompute, inference) reads
+        # the rings without folding or advancing them. This host bool is also
+        # the seam a CUDA-graph device flag replaces (TE's
+        # skip_fp8_weight_update).
+        recipe = cfg.recipe
+        return get_module("gemm").fp8_linear(
+            x,
+            w,
+            bias,
+            torch.is_grad_enabled(),  # update_rings
+            bool(bias is not None and bias.requires_grad),
+            recipe.dynamic,
+            recipe.history_len,
+            recipe.margin,
+            cfg.fp8_format[0],
+            cfg.fp8_format[1],
+        )
     return torch.ops.aten.linear.default.redispatch(
         torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd),
         x,
@@ -858,7 +350,7 @@ def _install_linear_override() -> None:
                 # Also replace torch's generated linear autograd formula
                 # (which would call aten::linear_backward after the
                 # fp8_autocast region exits). The fp8 backward is owned by
-                # _LinearFp8 with state captured at forward time, so
+                # the C++ node with state captured at forward time, so
                 # loss.backward() works wherever it is called; the CUDA
                 # registration still covers inference_mode.
                 lib_autograd = Library("aten", "IMPL", "AutogradCUDA")

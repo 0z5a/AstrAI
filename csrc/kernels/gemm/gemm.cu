@@ -13,7 +13,14 @@
 #include <torch/extension.h>
 
 #include "gemm.cuh"
+#include "gemm/api.h"
 #include "quantize/checks.h"
+
+namespace astrai {
+namespace fp8 {
+void bind_fp8(py::module& m);
+}  // namespace fp8
+}  // namespace astrai
 
 using namespace astrai;
 using namespace astrai::quant;
@@ -337,9 +344,11 @@ py::dict device_facts_info() {
 // rejects one (nothing to dequant). The body packs GemmParams (batch
 // broadcast rules, zero-copy transposed views, fused bf16 bias) and hands
 // it to the dtype-pair dispatch.
-torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
-                         py::object b_scale, bool trans_a, bool trans_b,
-                         py::object bias) {
+torch::Tensor quant_gemm_impl(torch::Tensor a, torch::Tensor b,
+                              c10::optional<torch::Tensor> a_scale,
+                              c10::optional<torch::Tensor> b_scale,
+                              bool trans_a, bool trans_b,
+                              c10::optional<torch::Tensor> bias) {
     const auto dt_a = a.scalar_type(), dt_b = b.scalar_type();
     const bool i8a = dt_a == torch::kChar, i8b = dt_b == torch::kChar;
     const bool f8a = dt_a == torch::kFloat8_e4m3fn || dt_a == torch::kFloat8_e5m2;
@@ -353,17 +362,17 @@ torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
     }
     const int64_t m = trans_a ? a.size(-1) : a.size(-2);
     const int64_t n = trans_b ? b.size(-2) : b.size(-1);
-    auto opt_scale = [&](py::object s, int64_t extent, const char* name,
-                         bool i8_side, bool bf16_side) -> QuantScale {
-        if (s.is_none()) {
+    auto opt_scale = [&](const c10::optional<torch::Tensor>& s, int64_t extent,
+                         const char* name, bool i8_side,
+                         bool bf16_side) -> QuantScale {
+        if (!s.has_value()) {
             TORCH_CHECK(!i8_side, "quant_gemm: ", name,
                         " is required for an int8 operand");
             return {nullptr, 0};
         }
-        torch::Tensor t = cast_tensor_arg(s, name);
         TORCH_CHECK(!bf16_side, "quant_gemm: ", name,
                     " given for a bf16 operand (nothing to dequant)");
-        return resolve_quant_scale(t, extent, name);
+        return resolve_quant_scale(*s, extent, name);
     };
     const QuantScale sa = opt_scale(a_scale, m, "a_scale", i8a, b16a);
     const QuantScale sb = opt_scale(b_scale, n, "b_scale", i8b, b16b);
@@ -374,7 +383,7 @@ torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
                 "a and b must be 2D or 3D (batched)");
     TORCH_CHECK(a.device() == b.device(), "a and b must share device");
     torch::Tensor bias_t;
-    if (!bias.is_none()) bias_t = cast_tensor_arg(bias, "bias");
+    if (bias.has_value()) bias_t = *bias;
     const at::cuda::OptionalCUDAGuard guard(a.device());
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -433,10 +442,30 @@ torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
     return output;
 }
 
+// pybind surface: None-tolerant operand scales and bias (``cast_tensor_arg``
+// keeps the "must be a torch.Tensor or None" message), then the shared
+// implementation the composed fp8 linear also calls (see gemm/api.h).
+torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
+                         py::object b_scale, bool trans_a, bool trans_b,
+                         py::object bias) {
+    auto opt = [](const py::object& o,
+                  const char* name) -> c10::optional<torch::Tensor> {
+        if (o.is_none()) return c10::nullopt;
+        return cast_tensor_arg(o, name);
+    };
+    return quant_gemm_impl(a, b, opt(a_scale, "a_scale"),
+                           opt(b_scale, "b_scale"), trans_a, trans_b,
+                           opt(bias, "bias"));
+}
+
 }  // namespace gemm
 }  // namespace astrai
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // The fp8 training linear (forward + backward) lives in this module:
+    // its composition launches through the GEMM dispatch below, whose
+    // plan table / planner state must stay single-source.
+    astrai::fp8::bind_fp8(m);
     m.def("quant_gemm", &astrai::gemm::quant_gemm, py::arg("a"), py::arg("b"),
           py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
           py::arg("trans_a") = false, py::arg("trans_b") = true,

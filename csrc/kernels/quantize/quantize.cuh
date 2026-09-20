@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 #include "common.h"
 #include "common/launch.cuh"
@@ -176,7 +177,40 @@ __device__ __forceinline__ void publish_amax(const QuantParams& p,
 // warp runs, transposed stores as 32B warp runs staged through the
 // pitch-permuted shared tile (stride 17 words — coprime with the 32
 // banks). Other stride pairs stay correct, just uncoalesced.
-template <typename Fp8T, typename InT>
+// Per-element dual conversion: the row-major orientation uses ``Fp8TA``, the
+// transposed one ``Fp8TB``. A single format (the default) converts once and
+// both orientations share the byte — only the hybrid training pair (E4M3
+// forward / E5M2 backward, whose two GEMM sides must match) instantiates the
+// second conversion, and ``if constexpr`` keeps the codegen of the
+// single-format instantiations identical.
+template <typename Fp8TA, typename Fp8TB>
+struct dual_cvt {
+    static constexpr bool kMixed = !std::is_same_v<Fp8TA, Fp8TB>;
+
+    static __device__ __forceinline__ void store(uint8_t (*q)[2], uint8_t (*q2)[2],
+                                                 int j, int k, float v) {
+        q[j][k] = fp8_cvt_traits<Fp8TA>::cvt(v);
+        if constexpr (kMixed) q2[j][k] = fp8_cvt_traits<Fp8TB>::cvt(v);
+    }
+
+    static __device__ __forceinline__ void zero(uint8_t (*q)[2], uint8_t (*q2)[2],
+                                                int j) {
+        q[j][0] = 0;
+        q[j][1] = 0;
+        if constexpr (kMixed) {
+            q2[j][0] = 0;
+            q2[j][1] = 0;
+        }
+    }
+
+    static __device__ __forceinline__ uint8_t pick(const uint8_t (*q)[2],
+                                                   const uint8_t (*q2)[2], int j,
+                                                   int k) {
+        return kMixed ? q2[j][k] : q[j][k];
+    }
+};
+
+template <typename Fp8T, typename InT, typename Fp8T2 = Fp8T>
 __global__ void fp8_quantize_strided_kernel(QuantParams p) {
     constexpr int kTileC = 64, kTileR = 32;
     __shared__ uint8_t tile[kTileC][kTileR + 2];
@@ -187,7 +221,9 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
     const int r = r0 + threadIdx.y * 4;
     const int c = c0 + threadIdx.x * 2;
 
+    using Cvt = dual_cvt<Fp8T, Fp8T2>;
     uint8_t q[4][2];
+    uint8_t q2[4][2];  // live only when the two orientations differ in format
     float local_amax = 0.0f;
     constexpr int kPairAlign = 2 * (int)sizeof(InT);
     using PairT = typename quant_in_traits<InT>::native_pair;
@@ -208,14 +244,13 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
             quant_in_traits<InT>::load_pair(
                 reinterpret_cast<const InT*>(&raws[j]), f);
             local_amax = fmaxf(local_amax, fmaxf(fabsf(f[0]), fabsf(f[1])));
-            q[j][0] = fp8_cvt_traits<Fp8T>::cvt(f[0] * mult);
-            q[j][1] = fp8_cvt_traits<Fp8T>::cvt(f[1] * mult);
+            Cvt::store(q, q2, j, 0, f[0] * mult);
+            Cvt::store(q, q2, j, 1, f[1] * mult);
         }
     } else {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            q[j][0] = 0;
-            q[j][1] = 0;
+            Cvt::zero(q, q2, j);
             if (r + j < p.rows && c < p.cols) {
                 const InT* a = x + (int64_t)(r + j) * p.cols + c;
                 if (c + 1 < p.cols &&
@@ -225,16 +260,16 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
 #pragma unroll
                     for (int k = 0; k < 2; ++k) {
                         local_amax = fmaxf(local_amax, fabsf(f[k]));
-                        q[j][k] = fp8_cvt_traits<Fp8T>::cvt(f[k] * mult);
+                        Cvt::store(q, q2, j, k, f[k] * mult);
                     }
                 } else {
                     const float v0 = quant_in_traits<InT>::to_float(a[0]);
                     local_amax = fmaxf(local_amax, fabsf(v0));
-                    q[j][0] = fp8_cvt_traits<Fp8T>::cvt(v0 * mult);
+                    Cvt::store(q, q2, j, 0, v0 * mult);
                     if (c + 1 < p.cols) {
                         const float v1 = quant_in_traits<InT>::to_float(a[1]);
                         local_amax = fmaxf(local_amax, fabsf(v1));
-                        q[j][1] = fp8_cvt_traits<Fp8T>::cvt(v1 * mult);
+                        Cvt::store(q, q2, j, 1, v1 * mult);
                     }
                 }
             }
@@ -267,7 +302,8 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
         for (int j = 0; j < 4; ++j)
 #pragma unroll
             for (int k = 0; k < 2; ++k)
-                tile[threadIdx.x * 2 + k][threadIdx.y * 4 + j] = q[j][k];
+                tile[threadIdx.x * 2 + k][threadIdx.y * 4 + j] =
+                    Cvt::pick(q, q2, j, k);
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -281,14 +317,17 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
 }
 
 // Quantize launcher: the mode (which pointers are live, the stride pair)
-// is data, not template — one instantiation per (Fp8T, InT). A degenerate
-// axis still launches one block so the ring fold fires on empty tensors
-// (the delayed-scaling publish must happen even when nothing quantizes).
-template <typename Fp8T, typename InT>
+// is data, not template — one instantiation per (Fp8T, InT) for a single
+// format, per (Fp8TA, Fp8TB, InT) when the two orientations differ. A
+// degenerate axis still launches one block so the ring fold fires on empty
+// tensors (the delayed-scaling publish must happen even when nothing
+// quantizes).
+template <typename Fp8T, typename InT, typename Fp8T2 = Fp8T>
 void launch_fp8_quantize(const QuantParams& p, cudaStream_t stream) {
     const dim3 grid(std::max(1, (p.cols + 63) / 64),
                     std::max(1, (p.rows + 31) / 32));
-    fp8_quantize_strided_kernel<Fp8T, InT><<<grid, dim3(32, 8), 0, stream>>>(p);
+    fp8_quantize_strided_kernel<Fp8T, InT, Fp8T2>
+        <<<grid, dim3(32, 8), 0, stream>>>(p);
     ASTRAI_LAUNCH_CHECK();
 }
 
