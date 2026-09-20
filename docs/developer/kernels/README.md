@@ -1,11 +1,12 @@
-# CUDA Operators
+# CUDA Kernels
 
 AstrAI includes optional custom CUDA kernels for attention, rotary
 embedding, and the quantized GEMM family. They are built when `nvcc` is
 available and CUDA is detected. This folder is the home of the
-per-operator documentation — math contract first, then design notes; the
-family-wide infrastructure (build system, python extension layers,
-testing, file layout) lives at the bottom of this file.
+per-kernel-family documentation — math contract first, then design notes;
+the family-wide infrastructure (build system, python extension layers,
+testing, file layout) lives at the bottom of this file. One folder here
+maps to one folder in `csrc/kernels/`.
 
 ## Overview
 | Kernel | File | Description |
@@ -25,7 +26,7 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 | Split-KV MMA decode | `attention/decode_split_kv_mma.cuh` | Split KV across warps + MMA (sm_80+) |
 | Split-Q MMA prefill | `attention/prefill_split_q_mma.cuh` | Split Q across warps + MMA (sm_80+) |
 
-## Operator index
+## Kernel index
 
 | Operator | Doc | Kernel module | Python entry |
 |---|---|---|---|
