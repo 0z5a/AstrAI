@@ -16,6 +16,7 @@ AstrAI provides 9 evaluation scripts in `scripts/eval/` covering code generation
 - [IFEval](#ifeval-instruction-following)
 - [Weight Analysis](#weight-analysis)
 - [Suite runner](#suite-runner)
+- [Online evaluation](#online-evaluation-checkpoint-watcher)
 - [Collecting results](#collecting-results)
 - [Tips](#tips)
 
@@ -352,6 +353,43 @@ nohup python -u scripts/eval/run_suite.py \
 | `--dry-run` | False | Print the job plan and exit |
 
 Standard per-benchmark parameters are baked in (MMLU 5-shot bs4; IFEval ns1 bs64 temp 0.1; HumanEval/MBPP ns20 bs64; HellaSwag bs16) and match the eval reports. Wrap in `nohup`: if the runner itself dies, rerunning the same command skips finished benchmarks. A summary table prints at the end.
+
+## Online evaluation (checkpoint watcher)
+
+`watch_ckpts.py` polls a training `ckpt_dir` and evaluates each new checkpoint as soon as it lands, on GPUs that training is **not** using — the training run itself is never touched. Results land under `results/` while training continues, so the score curve across checkpoints is visible without waiting for the run to finish.
+
+```bash
+# terminal 1: training on GPUs 4-7
+# terminal 2 (from the repo root): watcher on the spare GPUs
+nohup python -u scripts/eval/watch_ckpts.py \
+    --ckpt_dir checkpoints/sft-run1 \
+    --tag run1 \
+    --gpus 0,1,2 \
+    > logs/watch_run1.log 2>&1 &
+```
+
+Each checkpoint produces `<bench>_<tag>_epoch_<e>_step_<n>.json` (bare `epoch_<e>_step_<n>` tag without `--tag`), directly readable by `collect.py`. A summary table prints after each checkpoint's suite finishes.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--ckpt_dir` | required | Training checkpoint directory to watch |
+| `--gpus` | required | Comma-separated spare GPU ids — must not overlap the training GPUs (the watcher never auto-picks, to avoid OOMing a training card) |
+| `--benchmarks` | `ifeval,humaneval,mbpp2` | Comma-separated subset of `mmlu,ifeval,humaneval,mbpp,mbpp2,hellaswag` |
+| `--tag` | none | Prefix for result tags |
+| `--every` | 1 | Only evaluate checkpoints whose step is a multiple of N (align with `--ckpt_interval`) |
+| `--once` | False | Evaluate existing checkpoints and exit instead of polling |
+| `--poll` | 30 | Poll interval in seconds |
+| `--attempts` | 3 | Retries per benchmark |
+| `--smoke` | False | Cheap per-benchmark invocations for a plumbing test |
+
+Behavior notes:
+
+- **Default benchmark set is the generation trio** (`ifeval`, `humaneval`, `mbpp2`). MMLU and HellaSwag score through the log-likelihood path, which sits at chance for every current checkpoint (a pretraining-side context pathology — see those sections), so they carry no online signal; pass them explicitly in `--benchmarks` if wanted anyway.
+- **Idempotent**: benchmarks whose output file already exists are skipped, so restarting the watcher (or rerunning `--once`) resumes where it left off, including after a crash.
+- **GPU contention is retried, not fatal**: if the spare GPUs are busy when a checkpoint lands, the watcher logs it and retries on the next poll.
+- More benchmarks than GPUs is fine: they run in waves of `len(--gpus)` per checkpoint, one checkpoint's suite at a time (oldest first).
+- **One watcher per `ckpt_dir`, one run per `ckpt_dir`**: checkpoint dir names (`epoch_<e>_step_<n>`) are reused across runs, and a second training into the same dir overwrites the old one — pointing two runs at one dir mixes their results.
+- Stop with Ctrl-C (or kill): benchmarks already in flight run to completion; the watcher itself needs no cleanup.
 
 ## Collecting results
 

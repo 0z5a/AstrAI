@@ -8,6 +8,8 @@ Results-side: parse benchmark output JSONs into standardized metrics, collect
 `results/<bench>_<tag>.json` files into comparison tables.
 Suite-side: plan/launch the standard benchmark set for one checkpoint with
 per-job retry (output-file + process-liveness polling).
+Watcher-side: poll a training ckpt_dir and evaluate checkpoints as they
+land, pinned to GPUs training is not using.
 
 Protocol decisions stay in each benchmark script (prompt format, stop
 sequences, extraction); only mechanism lives here.
@@ -16,6 +18,7 @@ sequences, extraction); only mechanism lives here.
 import collections
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -510,3 +513,119 @@ def run_suite(
                 del active[bench]
                 queue.append(job)
     return status
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint watcher: evaluate checkpoints as they land during training
+# ---------------------------------------------------------------------------
+
+CKPT_DIR_RE = re.compile(r"^epoch_(\d+)_step_(\d+)$")
+
+
+def find_checkpoints(ckpt_dir: str) -> List[Tuple[str, str]]:
+    """Complete checkpoint subdirs of ckpt_dir as (name, path), ordered by
+    (epoch, step). Checkpoint.save renames its staging dir into place
+    atomically, so a visible name is fully written; the file checks only
+    guard against a tree someone deleted halfway."""
+    found = []
+    for name in os.listdir(ckpt_dir):
+        m = CKPT_DIR_RE.match(name)
+        path = os.path.join(ckpt_dir, name)
+        if (
+            m
+            and os.path.isdir(path)
+            and os.path.exists(os.path.join(path, "meta.json"))
+            and os.path.exists(os.path.join(path, "model.safetensors"))
+        ):
+            found.append((int(m.group(1)), int(m.group(2)), name, path))
+    return [(name, path) for _, _, name, path in sorted(found)]
+
+
+def _suite_in_waves(
+    ckpt: str,
+    tag: str,
+    benchmarks: Sequence[str],
+    gpus: Sequence[int],
+    smoke: bool,
+    results_dir: str,
+    logs_dir: str,
+    attempts: int,
+) -> Dict[str, str]:
+    status: Dict[str, str] = {}
+    for i in range(0, len(benchmarks), len(gpus)):
+        jobs, _ = plan_jobs(
+            ckpt,
+            tag,
+            benchmarks[i : i + len(gpus)],
+            gpus=gpus,
+            smoke=smoke,
+            results_dir=results_dir,
+            logs_dir=logs_dir,
+        )
+        status.update(run_suite(jobs, attempts=attempts))
+    return status
+
+
+def watch_checkpoints(
+    ckpt_dir: str,
+    benchmarks: Sequence[str],
+    gpus: Sequence[int],
+    tag: str = "",
+    poll_s: int = 30,
+    once: bool = False,
+    every: int = 1,
+    smoke: bool = False,
+    results_dir: str = "results",
+    logs_dir: str = "logs",
+    attempts: int = 3,
+) -> None:
+    """Poll ckpt_dir and evaluate each new checkpoint on the given GPUs.
+
+    Checkpoints are processed oldest-first, one suite at a time, with
+    benchmarks in waves of len(gpus). plan_jobs' RuntimeError (not enough
+    free GPUs right now) is logged and the checkpoint retried on a later
+    poll — skipped instead when once=True. Result tags are
+    "<tag>_epoch_<e>_step_<n>" (bare dir name without tag); run_suite's
+    output-file idempotence makes restarts and repeated polls safe.
+    """
+    if not gpus:
+        raise ValueError("watch_checkpoints needs an explicit non-empty GPU list")
+    seen = set()
+    while True:
+        for name, path in find_checkpoints(ckpt_dir):
+            if name in seen:
+                continue
+            m = CKPT_DIR_RE.match(name)
+            if every > 1 and int(m.group(2)) % every != 0:
+                seen.add(name)
+                continue
+            tag_out = f"{tag}_{name}" if tag else name
+            print(
+                f"[watch] {name} -> tag {tag_out}: {', '.join(benchmarks)}", flush=True
+            )
+            try:
+                status = _suite_in_waves(
+                    path,
+                    tag_out,
+                    benchmarks,
+                    gpus,
+                    smoke,
+                    results_dir,
+                    logs_dir,
+                    attempts,
+                )
+            except RuntimeError as exc:
+                print(f"[watch] {name}: {exc}", flush=True)
+                if once:
+                    seen.add(name)
+                continue
+            for bench, state in status.items():
+                print(f"[watch] {name}: {bench} {state}", flush=True)
+            if os.path.isdir(results_dir):
+                collected = collect_results(results_dir, tags=[tag_out])
+                if collected:
+                    print(render_table(collected), flush=True)
+            seen.add(name)
+        if once:
+            return
+        time.sleep(poll_s)
