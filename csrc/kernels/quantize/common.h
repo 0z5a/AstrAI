@@ -62,6 +62,10 @@ struct QuantParams {
     bool fold_ring = false;
     float* __restrict__ hist = nullptr;  // [hist_len] amax history window
     float* __restrict__ scale_out = nullptr;
+    // The published scale's correctly rounded reciprocal (__frcp_rn), in the
+    // ring slot the next quantize reads as its multiplier: publishing both
+    // here is what keeps the host out of the per-step scale chain.
+    float* __restrict__ scale_recip_out = nullptr;
     float* __restrict__ amax_scratch = nullptr;  // [kFoldSlots] RMW lines
     unsigned int* __restrict__ done = nullptr;   // block-completion counter
     int hist_len = 0;

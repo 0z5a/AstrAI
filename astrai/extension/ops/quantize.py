@@ -51,9 +51,11 @@ def quantize(
     arity.
 
     ``ring_state`` (a 1D float32 CUDA buffer laid out
-    ``[hist n | scale | legacy | amax | done]``) switches on the in-kernel
+    ``[hist n | scale | scale_recip | amax | done]``) switches on the
+    in-kernel
     delayed-scaling fold: the kernel's last block folds the amax into
-    ``hist[hist_idx]`` and publishes the next scale as
+    ``hist[hist_idx]`` and publishes the next scale — plus its correctly
+    rounded reciprocal, the slot the next call reads as its multiplier — as
     ``max(hist) / fp8_max / pow2_margin``. The returned ``amax`` is then the
     self-cleaned persistent slot (reads zero).
 

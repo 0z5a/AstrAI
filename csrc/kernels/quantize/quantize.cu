@@ -48,7 +48,7 @@ void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
 // Transposed (single output) serve quantize(), Dual (both orientations from
 // one read) serves quantize_dual(). A ring tensor switches
 // on the in-kernel delayed-scaling fold: state layout
-// [hist n | scale | legacy | amax | done-as-int], and the returned amax is
+// [hist n | scale | scale_recip | amax | done-as-int], and the returned amax is
 // the (self-cleaned) persistent slot — its only reducer. Without a ring the
 // kernel runs a pure scale+cast (no fused amax: p.amax stays null) and the
 // returned amax is None; callers that need one measure it themselves
@@ -77,7 +77,8 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
     auto input = x.contiguous();
     auto out_opts = input.options().dtype(out_dtype);
     torch::Tensor amax;
-    float *ring_hist = nullptr, *ring_scale_out = nullptr, *ring_scratch = nullptr;
+    float *ring_hist = nullptr, *ring_scale_out = nullptr,
+          *ring_scale_recip_out = nullptr, *ring_scratch = nullptr;
     unsigned int* ring_done = nullptr;
     int ring_len = 0;
     if (!ring.is_none()) {
@@ -85,7 +86,7 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
         TORCH_CHECK(st.is_cuda() && st.dim() == 1 &&
                         st.scalar_type() == torch::kFloat32,
                     "ring state must be a 1D float32 CUDA tensor");
-        // Layout: [hist n | scale | legacy | amax | done | fold scratch
+        // Layout: [hist n | scale | scale_recip | amax | done | fold scratch
         // kFoldSlots] — the scratch lines absorb the per-block amax RMWs
         // (a single contended address serializes a 49k-block grid).
         const int64_t n = st.numel() - 4 - kFoldSlots;
@@ -95,6 +96,7 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
         amax = st.narrow(0, n + 2, 1);
         ring_hist = base;
         ring_scale_out = base + n;
+        ring_scale_recip_out = base + n + 1;
         ring_scratch = base + n + 4;
         ring_done = reinterpret_cast<unsigned int*>(base + n + 3);
         ring_len = static_cast<int>(n);
@@ -108,6 +110,7 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
         p.fold_ring = true;
         p.hist = ring_hist;
         p.scale_out = ring_scale_out;
+        p.scale_recip_out = ring_scale_recip_out;
         p.amax_scratch = ring_scratch;
         p.done = ring_done;
         p.hist_len = ring_len;

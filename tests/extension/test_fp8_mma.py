@@ -24,7 +24,9 @@ from astrai.extension.quantize import (
     fp8_format_pair,
     fp8_linear_enable,
     fp8_linear_enabled,
+    fp8_load_state_dict,
     fp8_state,
+    fp8_state_dict,
 )
 from tests.conftest import skip_no_fp8
 
@@ -246,7 +248,7 @@ def test_delayed_scaling_forward_uses_snapshot_scale():
         bias = torch.zeros(n, device=dev, dtype=torch.bfloat16)
 
         f8mod.fp8_linear_forward(x1, w, bias)  # step 1: seeds the rings
-        out2, _, _ = f8mod.fp8_linear_forward(x2, w, bias)  # amax changes
+        out2 = f8mod.fp8_linear_forward(x2, w, bias).out  # amax changes
         torch.cuda.synchronize()
 
         # The delayed scale for step 2 is amax(x1)/448 (history_len=1); the
@@ -275,7 +277,7 @@ def test_fp8_linear_forward_and_backward():
     state.reset()
     state.default_recipe = FP8Recipe(dynamic=True)
     try:
-        out, _, _ = f8mod.fp8_linear_forward(x, weight, bias)
+        out = f8mod.fp8_linear_forward(x, weight, bias).out
 
         sx, sw = _scale(x), _scale(weight)
         qx = _quantize(x, sx)
@@ -796,3 +798,135 @@ def test_autocast_state_is_thread_local():
         t.join()
     assert seen["enabled"] is False
     assert not fp8_linear_enabled()
+
+
+# --------------------------------------------------------------------------
+# Delayed-scaling plumbing: the kernel-published reciprocal and the
+# version-keyed weight cast cache (host-overhead work, 2026-09-21)
+# --------------------------------------------------------------------------
+
+
+@skip_no_fp8
+@pytest.mark.parametrize("fmt", ["hybrid", torch.float8_e5m2])
+@pytest.mark.parametrize("margin", [0, 1])
+def test_ring_publishes_reciprocal_bitwise(fmt, margin):
+    """The fold publishes the next scale *and* its reciprocal in one block:
+    the recip slot stays bit-identical to ``torch.reciprocal(scale)`` step
+    after step and ring after ring. That identity is what lets the policy
+    hand the kernels the ring's recip instead of computing one per call
+    (``__frcp_rn`` and ATen's 1/x are both correctly rounded)."""
+    torch.manual_seed(17)
+    dev = torch.device("cuda")
+    state = fp8_state()
+    state.default_recipe = FP8Recipe(history_len=2, margin=margin)
+    state.default_format = fp8_format_pair(fmt)
+    fp8_linear_enable(True)  # installs the aten::linear override
+    n, k = 16, 64
+    w = torch.randn(n, k, device=dev, dtype=torch.bfloat16) * 0.3
+    w.requires_grad_(True)
+    bias = torch.zeros(n, device=dev, dtype=torch.bfloat16)
+    try:
+        for step, mag in enumerate((0.5, 0.9, 0.2, 0.7)):
+            # Growing then shrinking amax: consecutive steps publish
+            # different scales, so a stale recipient slot cannot hide.
+            x = torch.randn(8 + step, k, device=dev, dtype=torch.bfloat16) * mag
+            F.linear(x, w, bias).float().pow(2).sum().backward()
+            meta = state.get_weight_meta(w, state.default_recipe)
+            for name, ring in (("x", meta.x), ("w", meta.w), ("g", meta.g)):
+                assert ring.initialized
+                assert torch.equal(
+                    ring.scale_recip.flatten(),
+                    torch.reciprocal(ring.scale).flatten(),
+                ), f"step {step} ring {name}: published reciprocal drifted"
+    finally:
+        state.reset()
+
+
+@skip_no_fp8
+def test_weight_cast_cache_reuses_and_invalidates(monkeypatch):
+    """The weight cast is reused while the weight's version counter is
+    unchanged (one cast per optimizer step, not per micro-batch), and
+    invalidated by an in-place update, a format change and a checkpoint
+    restore. Reuse must be numerically inert: identical inputs under an
+    unchanged weight give bit-identical outputs."""
+    torch.manual_seed(23)
+    dev = torch.device("cuda")
+    state = fp8_state()
+    counts = {"quantize": 0, "quantize_dual": 0}
+    q_orig, qd_orig = f8mod.quantize, f8mod.quantize_dual
+
+    def spy(name, orig):
+        def wrapper(*args, **kwargs):
+            counts[name] += 1
+            return orig(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(f8mod, "quantize", spy("quantize", q_orig))
+    monkeypatch.setattr(f8mod, "quantize_dual", spy("quantize_dual", qd_orig))
+    x = torch.randn(8, 64, device=dev, dtype=torch.bfloat16)
+    w = torch.randn(32, 64, device=dev, dtype=torch.bfloat16)
+    bias = torch.zeros(32, device=dev, dtype=torch.bfloat16)
+    try:
+
+        def run():
+            counts["quantize"] = counts["quantize_dual"] = 0
+            with fp8_autocast(enabled=True):
+                return f8mod.fp8_linear_forward(x, w, bias).out
+
+        o1 = run()
+        # Casts: x (row-major), w8 (fwd fmt), w8T (bwd fmt) — hybrid makes
+        # the transposed copy a second cast.
+        assert counts == {"quantize": 3, "quantize_dual": 0}
+        o2 = run()
+        # Cache hit: only x is cast again.
+        assert counts == {"quantize": 1, "quantize_dual": 0}
+        assert torch.equal(o1, o2)
+
+        with torch.no_grad():
+            w.add_(0.01)  # the optimizer-step shape: in-place => version bump
+        o3 = run()
+        assert counts["quantize"] == 3
+        assert not torch.equal(o2, o3)
+
+        # The ring's history also folds on a miss only: a hit leaves both the
+        # window and the write index untouched.
+        meta = state.get_weight_meta(w, FP8Recipe())
+        idx, hist = meta.w.idx, meta.w.hist.clone()
+        run()
+        assert meta.w.idx == idx and torch.equal(meta.w.hist, hist)
+        assert meta.cast.version == w._version
+
+        fp8_load_state_dict(fp8_state_dict())
+        run()
+        assert counts["quantize"] == 3  # a restore re-publishes scales
+    finally:
+        state.reset()
+
+
+@skip_no_fp8
+@pytest.mark.parametrize("fmt", ["hybrid", torch.float8_e4m3fn])
+def test_forward_transposed_casts_match_on_demand_quantize(fmt):
+    """The transposed operands the forward hands the backward are bit-equal
+    to the casts the backward used to make on demand (same scale, same
+    format) — so hoisting them changes cost, not numerics. Hybrid leaves
+    ``x8T`` to the backward (the fwd dual pass is E4M3, the backward GEMM
+    needs E5M2); the symmetric pair yields both."""
+    torch.manual_seed(29)
+    dev = torch.device("cuda")
+    state = fp8_state()
+    state.default_format = fp8_format_pair(fmt)
+    x = torch.randn(12, 64, device=dev, dtype=torch.bfloat16)
+    w = torch.randn(32, 64, device=dev, dtype=torch.bfloat16)
+    try:
+        res = f8mod.fp8_linear_forward(x, w, None)
+        fmt_bwd = state.default_format[1]
+        w8T_ref, _ = quantize(w, res.scale_w.reciprocal(), fmt_bwd, transposed=True)
+        assert torch.equal(res.w8T, w8T_ref)
+        if state.default_format[0] == fmt_bwd:
+            x8T_ref, _ = quantize(x, res.scale_x.reciprocal(), fmt_bwd, transposed=True)
+            assert torch.equal(res.x8T, x8T_ref)
+        else:
+            assert res.x8T is None  # the backward makes it, as before
+    finally:
+        state.reset()

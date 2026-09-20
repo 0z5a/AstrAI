@@ -150,7 +150,12 @@ __device__ __forceinline__ void publish_amax(const QuantParams& p,
         p.hist[p.hist_idx] = peak;
         float win = p.hist[0];
         for (int i = 1; i < p.hist_len; ++i) win = fmaxf(win, p.hist[i]);
-        *p.scale_out = fmaxf(win / p.fp8_max / p.pow2_margin, 1e-12f);
+        const float next = fmaxf(win / p.fp8_max / p.pow2_margin, 1e-12f);
+        *p.scale_out = next;
+        // __frcp_rn is the correctly rounded reciprocal — bit-identical to
+        // the ATen 1/x the host used to materialize (never fast-math: the
+        // intrinsic pins the rounding mode).
+        if (p.scale_recip_out) *p.scale_recip_out = __frcp_rn(next);
         for (int s = 0; s < kFoldSlots; ++s) p.amax_scratch[s] = 0.0f;
         *p.done = 0u;
     }
