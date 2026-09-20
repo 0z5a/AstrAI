@@ -4,13 +4,17 @@ Provides:
 - :class:`RawRollout` — generation output container (no reward yet)
 - :class:`RolloutResult` — a :class:`RawRollout` with rewards attached
 - :class:`BaseRewardModel` — pluggable reward interface
+- :class:`SamplingParams` — per-call sampling configuration (training
+  defaults live on the generator; validation overrides per call)
 - :class:`RolloutGenerator` — KV-cache-backed generation of grouped
   responses + decoding (no reward); delegates the generation loop to
   :class:`~astrai.inference.scheduler.InferenceScheduler.run_batch`
   so rollout and the production inference server share one code path
 - :class:`RolloutRunner` — orchestrates generation + scoring with a
   step-driven cache; its ``__call__`` returns ``(RolloutResult, is_fresh)``
-  so callers do not need to rely on object identity to detect refreshes.
+  so callers do not need to rely on object identity to detect refreshes
+- :class:`RolloutEvaluator` — validation-time rollout scoring under its
+  own sampling params, reporting reward statistics instead of RL loss
 """
 
 import threading
@@ -135,6 +139,26 @@ class RolloutVersionError(RuntimeError):
     """A rollout cannot be attributed to an acceptable policy version."""
 
 
+@dataclass(frozen=True)
+class SamplingParams:
+    """Sampling configuration for one rollout call.
+
+    A :class:`RolloutGenerator` holds the *training* defaults; validation
+    (and any other caller) derives its own instance via
+    :func:`dataclasses.replace` so only the fields that differ from the
+    training rollout need to be stated — ``temperature=0.0`` selects the
+    greedy decode path.
+    """
+
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = 0
+    max_tokens: int = 1024
+    group_size: int = 8
+    frequency_penalty: float = 0.0
+    rep_window: int = 64
+
+
 class RolloutGenerator:
     """Pure generation + decoding for a group of responses per prompt.
 
@@ -149,23 +173,11 @@ class RolloutGenerator:
         self,
         scheduler: InferenceScheduler,
         tokenizer,
-        max_tokens: int = 1024,
-        group_size: int = 8,
-        temperature: float = 1.0,
-        top_k: int = 0,
-        top_p: float = 1.0,
-        frequency_penalty: float = 0.0,
-        rep_window: int = 64,
+        params: SamplingParams,
     ):
         self.scheduler = scheduler
         self.tokenizer = tokenizer
-        self.max_tokens = max_tokens
-        self.group_size = group_size
-        self.temperature = temperature
-        self.top_k = top_k
-        self.top_p = top_p
-        self.frequency_penalty = frequency_penalty
-        self.rep_window = rep_window
+        self.params = params
         self._weight_lock = threading.RLock()
 
     @property
@@ -199,8 +211,14 @@ class RolloutGenerator:
             return self.scheduler.with_policy_snapshot(inspect)
 
     @torch.no_grad()
-    def generate(self, batch: Dict) -> RawRollout:
+    def generate(
+        self, batch: Dict, params: Optional[SamplingParams] = None
+    ) -> RawRollout:
         """Expand prompts by ``group_size`` and generate one response each.
+
+        ``params=None`` uses the generator's training defaults; passing a
+        :class:`SamplingParams` instance overrides sampling for this call
+        only (validation uses this to decode greedily, for example).
 
         Accepted batch formats (per sample, repeated B times):
 
@@ -214,6 +232,7 @@ class RolloutGenerator:
         ``add_generation_prompt=True`` so rollout prompts match the
         format the policy was SFT-trained on.
         """
+        effective = self.params if params is None else params
         with self._weight_lock:
 
             def generate_snapshot(generation_version: int) -> RawRollout:
@@ -221,7 +240,7 @@ class RolloutGenerator:
                 was_training = model.training
                 model.eval()
                 try:
-                    return self._generate_eval(batch, generation_version)
+                    return self._generate_eval(batch, generation_version, effective)
                 finally:
                     model.train(was_training)
 
@@ -230,10 +249,12 @@ class RolloutGenerator:
             # scheduler directly instead of going through this wrapper.
             return self.scheduler.with_policy_snapshot(generate_snapshot)
 
-    def _generate_eval(self, batch: Dict, generation_version: int) -> RawRollout:
+    def _generate_eval(
+        self, batch: Dict, generation_version: int, params: SamplingParams
+    ) -> RawRollout:
         prompt_texts, flat_prompt_ids = self._prepare_prompts(batch)
         B = len(prompt_texts)
-        G = self.group_size
+        G = params.group_size
         # Re-expand flat list to G copies per prompt for run_batch.
         expanded_prompt_ids: List[List[int]] = []
         for ids in flat_prompt_ids:
@@ -241,12 +262,12 @@ class RolloutGenerator:
 
         results = self.scheduler.run_batch(
             expanded_prompt_ids,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-            frequency_penalty=self.frequency_penalty,
-            rep_window=self.rep_window,
+            max_tokens=params.max_tokens,
+            temperature=params.temperature,
+            top_k=params.top_k,
+            top_p=params.top_p,
+            frequency_penalty=params.frequency_penalty,
+            rep_window=params.rep_window,
             return_logprobs=True,
             return_details=True,
         )
@@ -426,7 +447,7 @@ class RolloutRunner:
 
     Usage::
 
-        generator = RolloutGenerator(policy, tokenizer, pipeline, ...)
+        generator = RolloutGenerator(scheduler, tokenizer, SamplingParams(...))
         runner = RolloutRunner(generator, reward_model, rollout_interval=512)
         result, is_fresh = runner(prompt_batch)
         if is_fresh:
@@ -495,17 +516,7 @@ class RolloutRunner:
         )
 
     def _score(self, raw: RawRollout) -> RolloutResult:
-        rewards = self.reward_model.score(raw.prompt_texts, raw.response_texts)
-        if not isinstance(rewards, Tensor):
-            rewards = torch.as_tensor(rewards, dtype=torch.float32)
-        expected_shape = raw.responses.shape[:2]
-        if rewards.shape != expected_shape:
-            raise ValueError(
-                f"Reward model returned shape {tuple(rewards.shape)}, "
-                f"expected {tuple(expected_shape)}"
-            )
-        if not torch.isfinite(rewards).all():
-            raise ValueError("Reward model returned non-finite values")
+        rewards = _score_rewards(self.reward_model, raw)
         device = raw.prompts.device
         return RolloutResult(
             prompts=raw.prompts,
@@ -584,15 +595,71 @@ class RolloutRunner:
         # outside the policy lock because it may call an external service.
         return self.generator.with_policy_snapshot(commit)
 
-    def evaluate(self, batch: Dict) -> RolloutResult:
+    def evaluate(
+        self, batch: Dict, params: Optional[SamplingParams] = None
+    ) -> RolloutResult:
         """One-off rollout + scoring that leaves the replay cache untouched.
 
         Used by validation on online strategies: the training cache, its
         cadence counter, and the cache key stay intact, so evaluation
-        prompts never disturb the rollout replay schedule.
+        prompts never disturb the rollout replay schedule.  ``params``
+        overrides the generator's training sampling defaults for this
+        call only.
         """
-        raw = self.generator.generate(batch)
+        raw = self.generator.generate(batch, params)
         self._validate_policy_version(raw)
         scored = self._score(raw)
         self._validate_policy_version(scored)
         return scored
+
+
+class RolloutEvaluator:
+    """Validation-time rollout scoring with its own sampling configuration.
+
+    Unlike :meth:`RolloutRunner.evaluate` — a one-off rollout on the
+    *training* runner, still scored as an RL loss — the evaluator owns
+    its :class:`SamplingParams` outright (typically greedy, with a
+    val-specific group size) and reports reward statistics instead.  The
+    RL loss is degenerate as a validation signal under greedy decoding
+    or ``group_size == 1`` (zero group advantage), so it is not computed.
+    """
+
+    def __init__(
+        self,
+        generator: RolloutGenerator,
+        reward_model: BaseRewardModel,
+        params: SamplingParams,
+    ):
+        self.generator = generator
+        self.reward_model = reward_model
+        self.params = params
+
+    def evaluate(self, batch: Dict) -> Dict[str, float]:
+        """Generate + score one batch; return scalar validation metrics."""
+        raw = self.generator.generate(batch, self.params)
+        rewards = _score_rewards(self.reward_model, raw)
+        lengths = raw.response_mask.sum(dim=-1).to(torch.float32)
+        std = rewards.std(unbiased=False).item() if rewards.numel() > 1 else 0.0
+        return {
+            "reward_mean": rewards.mean().item(),
+            "reward_std": std,
+            "reward_max": rewards.max().item(),
+            "response_len_mean": lengths.mean().item(),
+            "num_responses": float(rewards.numel()),
+        }
+
+
+def _score_rewards(reward_model: BaseRewardModel, raw: RawRollout) -> Tensor:
+    """Score a rollout's decoded responses, validating shape and finiteness."""
+    rewards = reward_model.score(raw.prompt_texts, raw.response_texts)
+    if not isinstance(rewards, Tensor):
+        rewards = torch.as_tensor(rewards, dtype=torch.float32)
+    expected_shape = raw.responses.shape[:2]
+    if rewards.shape != expected_shape:
+        raise ValueError(
+            f"Reward model returned shape {tuple(rewards.shape)}, "
+            f"expected {tuple(expected_shape)}"
+        )
+    if not torch.isfinite(rewards).all():
+        raise ValueError("Reward model returned non-finite values")
+    return rewards

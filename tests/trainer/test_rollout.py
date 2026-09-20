@@ -10,10 +10,12 @@ from astrai.inference.task import GenerationResult
 from astrai.trainer.rollout import (
     BaseRewardModel,
     RawRollout,
+    RolloutEvaluator,
     RolloutGenerator,
     RolloutResult,
     RolloutRunner,
     RolloutVersionError,
+    SamplingParams,
 )
 from tests.helpers import FakeTokenizer, make_model
 
@@ -148,11 +150,13 @@ def _make_generator(device, **kw):
     generator = RolloutGenerator(
         scheduler=scheduler,
         tokenizer=tokenizer,
-        max_tokens=kw.get("max_tokens", 8),
-        group_size=kw.get("group_size", 2),
-        temperature=kw.get("temperature", 1.0),
-        top_k=kw.get("top_k", 0),
-        top_p=kw.get("top_p", 1.0),
+        params=SamplingParams(
+            max_tokens=kw.get("max_tokens", 8),
+            group_size=kw.get("group_size", 2),
+            temperature=kw.get("temperature", 1.0),
+            top_k=kw.get("top_k", 0),
+            top_p=kw.get("top_p", 1.0),
+        ),
     )
     return generator, model
 
@@ -185,6 +189,51 @@ def test_rollout_generator_uses_eval_and_restores_mode(device):
     gen.generate(_make_instruction_batch(n=1))
     assert seen_training == [False]
     assert model.training is True
+
+
+def test_generate_params_override_training_defaults(device):
+    """A per-call SamplingParams overrides group size and token budget."""
+    gen, _ = _make_generator(device, group_size=2, max_tokens=8)
+    batch = _make_instruction_batch(n=2)
+
+    default = gen.generate(batch)
+    assert default.responses.shape[1] == 2
+
+    override = gen.generate(
+        batch, SamplingParams(group_size=1, max_tokens=1, temperature=1.0)
+    )
+    assert override.responses.shape[:2] == (2, 1)
+    assert override.responses.shape[2] <= 1
+    # The generator's training defaults are untouched by the override.
+    assert gen.params.group_size == 2
+    assert gen.generate(batch).responses.shape[1] == 2
+
+
+def test_rollout_evaluator_reports_reward_metrics_and_leaves_cache(device):
+    """The val evaluator scores under its own params; the replay cache,
+    its cadence counter, and the cache key stay exactly as they were."""
+    runner, _ = _make_runner(device, group_size=2, max_tokens=4, rollout_interval=10)
+    batch = _make_instruction_batch(n=2)
+
+    result, is_fresh = runner(batch)
+    assert is_fresh
+    cache_before = runner._cache
+    steps_before = runner._steps_since_rollout
+
+    evaluator = RolloutEvaluator(
+        generator=runner.generator,
+        reward_model=ConstantRewardModel(2.0),
+        params=SamplingParams(group_size=1, max_tokens=2, temperature=0.0),
+    )
+    metrics = evaluator.evaluate(batch)
+
+    assert metrics["reward_mean"] == pytest.approx(2.0)
+    assert metrics["reward_std"] == pytest.approx(0.0)
+    assert metrics["num_responses"] == 2.0  # B=2 prompts x G=1 override
+    assert metrics["response_len_mean"] <= 2.0
+    assert runner._cache is cache_before
+    assert runner._cache_key == runner._batch_key(batch)
+    assert runner._steps_since_rollout == steps_before
 
 
 def test_rollout_generator_serializes_generation_and_policy_update(device):

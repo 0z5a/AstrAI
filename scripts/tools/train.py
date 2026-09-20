@@ -290,6 +290,31 @@ _SPECS = [
     OptSpec("rollout_top_k", "Algorithm", help="Rollout top-k (0=disable)."),
     OptSpec("rollout_top_p", "Algorithm", help="Rollout top-p."),
     OptSpec("rollout_max_tokens", "Algorithm", help="Max tokens per rollout response."),
+    OptSpec(
+        "rollout_val_temperature",
+        "Algorithm",
+        help="Validation rollout temperature (0=greedy; unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_top_p",
+        "Algorithm",
+        help="Validation rollout top-p (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_top_k",
+        "Algorithm",
+        help="Validation rollout top-k (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_max_tokens",
+        "Algorithm",
+        help="Validation rollout max tokens (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_group_size",
+        "Algorithm",
+        help="Validation responses per prompt (unset inherits training group).",
+    ),
     OptSpec("neftune_alpha", "Algorithm", help="NEFTune noise alpha."),
     OptSpec("val_split", "Validation", help="Validation split ratio."),
     OptSpec("val_step", "Validation", help="Steps between validation runs."),
@@ -623,6 +648,11 @@ def train(
     rollout_top_k = kwargs.pop("rollout_top_k", 0)
     rollout_top_p = kwargs.pop("rollout_top_p", 0.9)
     rollout_max_tokens = kwargs.pop("rollout_max_tokens", 1024)
+    rollout_val_temperature = kwargs.pop("rollout_val_temperature", None)
+    rollout_val_top_k = kwargs.pop("rollout_val_top_k", None)
+    rollout_val_top_p = kwargs.pop("rollout_val_top_p", None)
+    rollout_val_max_tokens = kwargs.pop("rollout_val_max_tokens", None)
+    rollout_val_group_size = kwargs.pop("rollout_val_group_size", None)
     reward_model_fn: Callable[[], BaseRewardModel] | None = None
     critic_model_fn = None
     if train_type == "online_ppo":
@@ -789,6 +819,11 @@ def train(
         rollout_top_k=rollout_top_k,
         rollout_top_p=rollout_top_p,
         rollout_max_tokens=rollout_max_tokens,
+        rollout_val_temperature=rollout_val_temperature,
+        rollout_val_top_k=rollout_val_top_k,
+        rollout_val_top_p=rollout_val_top_p,
+        rollout_val_max_tokens=rollout_val_max_tokens,
+        rollout_val_group_size=rollout_val_group_size,
         reward_model_fn=reward_model_fn,
         critic_model_fn=critic_model_fn,
         moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),

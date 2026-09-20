@@ -1,6 +1,6 @@
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Self
 
@@ -33,7 +33,12 @@ from astrai.serialization import (
 )
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.metric_util import GradSNRTracker
-from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
+from astrai.trainer.rollout import (
+    RolloutEvaluator,
+    RolloutGenerator,
+    RolloutRunner,
+    SamplingParams,
+)
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 
 logger = logging.getLogger(__name__)
@@ -58,6 +63,9 @@ class TrainContext:
     grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
     val_dataloader: Optional[DataLoader] = field(default=None)
     val_loss: Optional[float] = field(default=None)
+    #: Online-strategy validation: reward-statistics evaluator under its
+    #: own sampling params. ``None`` keeps the legacy validate_online path.
+    val_evaluator: Optional["RolloutEvaluator"] = field(default=None)
 
     world_size: int = field(default=1)
     rank: int = field(default=0)
@@ -555,17 +563,29 @@ class TrainContextBuilder:
         generator = RolloutGenerator(
             scheduler=scheduler,
             tokenizer=tokenizer,
-            max_tokens=cfg.rollout_max_tokens,
-            group_size=group_size,
-            temperature=cfg.rollout_temperature,
-            top_k=cfg.rollout_top_k,
-            top_p=cfg.rollout_top_p,
+            params=SamplingParams(
+                max_tokens=cfg.rollout_max_tokens,
+                group_size=group_size,
+                temperature=cfg.rollout_temperature,
+                top_k=cfg.rollout_top_k,
+                top_p=cfg.rollout_top_p,
+            ),
         )
+        reward_model = cfg.reward_model_fn()
         context.strategy.set_rollout_runner(
             RolloutRunner(
                 generator=generator,
-                reward_model=cfg.reward_model_fn(),
+                reward_model=reward_model,
                 rollout_interval=cfg.rollout_interval,
                 max_policy_lag=cfg.rollout_max_policy_lag,
             )
+        )
+        # Validation rolls out under its own sampling params (e.g. greedy
+        # decode, val-specific group size), inheriting every unset field
+        # from the training rollout.
+        val_params = replace(generator.params, **cfg.rollout_val_overrides())
+        context.val_evaluator = RolloutEvaluator(
+            generator=generator,
+            reward_model=reward_model,
+            params=val_params,
         )

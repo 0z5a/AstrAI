@@ -74,6 +74,11 @@ class TrainConfig(BaseConfig):
         rollout_top_k (int): Top-k filtering for online rollout, 0=disable. Defaults to 0.
         rollout_top_p (float): Top-p (nucleus) filtering for online rollout. Defaults to 0.9.
         rollout_max_tokens (int): Maximum generated tokens per response in rollout. Defaults to 1024.
+        rollout_val_temperature (Optional[float]): Validation rollout temperature override; 0.0 selects greedy decode. None inherits ``rollout_temperature``. Defaults to None.
+        rollout_val_top_p (Optional[float]): Validation top-p override. None inherits ``rollout_top_p``. Defaults to None.
+        rollout_val_top_k (Optional[int]): Validation top-k override. None inherits ``rollout_top_k``. Defaults to None.
+        rollout_val_max_tokens (Optional[int]): Validation max generated tokens override. None inherits ``rollout_max_tokens``. Defaults to None.
+        rollout_val_group_size (Optional[int]): Validation responses per prompt override. None inherits the strategy's ``group_size``. Defaults to None.
         reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
         critic_model_fn (Optional[Callable]): Factory for the value (critic) model, required for online_ppo. Defaults to None.
         critic_optimizer_fn (Optional[Callable]): Factory for the critic optimizer; None reuses optimizer_fn. Defaults to None.
@@ -133,6 +138,11 @@ class TrainConfig(BaseConfig):
     rollout_top_k: int = 0
     rollout_top_p: float = 0.9
     rollout_max_tokens: int = 1024
+    rollout_val_temperature: Optional[float] = None
+    rollout_val_top_p: Optional[float] = None
+    rollout_val_top_k: Optional[int] = None
+    rollout_val_max_tokens: Optional[int] = None
+    rollout_val_group_size: Optional[int] = None
     reward_model_fn: Optional[Callable] = None
     critic_model_fn: Optional[Callable] = None
     critic_optimizer_fn: Optional[Callable] = None
@@ -244,6 +254,57 @@ class TrainConfig(BaseConfig):
         if v is not None and v < 0:
             raise ValueError(f"rollout_max_policy_lag must be non-negative, got {v}")
         return v
+
+    @field_validator("rollout_val_temperature")
+    def _validate_rollout_val_temperature(cls, v: Optional[float]) -> Optional[float]:
+        # 0.0 is legal here (unlike rollout_temperature): validation may
+        # want greedy decode while training keeps a positive temperature.
+        if v is not None and v < 0:
+            raise ValueError(f"rollout_val_temperature must be non-negative, got {v}")
+        return v
+
+    @field_validator("rollout_val_top_p")
+    def _validate_rollout_val_top_p(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and not 0 < v <= 1:
+            raise ValueError(f"rollout_val_top_p must be in (0, 1], got {v}")
+        return v
+
+    @field_validator("rollout_val_top_k")
+    def _validate_rollout_val_top_k(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError(f"rollout_val_top_k must be non-negative, got {v}")
+        return v
+
+    @field_validator("rollout_val_max_tokens")
+    def _validate_rollout_val_max_tokens(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError(f"rollout_val_max_tokens must be positive, got {v}")
+        return v
+
+    @field_validator("rollout_val_group_size")
+    def _validate_rollout_val_group_size(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError(f"rollout_val_group_size must be >= 1, got {v}")
+        return v
+
+    def rollout_val_overrides(self) -> Dict[str, Any]:
+        """Only the validation sampling fields explicitly set by the user.
+
+        Meant for ``dataclasses.replace`` over the training sampling
+        params: absent (``None``) fields keep the training values.
+        """
+        overrides: Dict[str, Any] = {}
+        for name in (
+            "rollout_val_temperature",
+            "rollout_val_top_p",
+            "rollout_val_top_k",
+            "rollout_val_max_tokens",
+            "rollout_val_group_size",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                overrides[name.removeprefix("rollout_val_")] = value
+        return overrides
 
     @field_validator("max_grad_norm")
     def _validate_max_grad_norm(cls, v: Optional[float]) -> Optional[float]:

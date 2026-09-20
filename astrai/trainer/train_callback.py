@@ -6,7 +6,7 @@ import sys
 import time
 from functools import partial
 from pathlib import Path
-from typing import IO, Callable, List, Optional, Protocol, runtime_checkable
+from typing import IO, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
@@ -387,6 +387,26 @@ class MetricCallback(TrainCallback):
         context.model.train()
         return avg_loss
 
+    def _run_rollout_validation(self, context: TrainContext) -> Dict[str, float]:
+        """Validation for online strategies via :class:`RolloutEvaluator`.
+
+        Reports reward statistics under the evaluator's own sampling
+        params instead of the training RL loss (degenerate under greedy
+        decode or group_size == 1).  The generator toggles the model into
+        eval mode itself, so no global mode switch is needed here; the
+        replay cache and its cadence stay untouched by construction.
+        """
+        totals: Dict[str, float] = {}
+        num_batches = 0
+        for batch in context.val_dataloader:
+            metrics = context.val_evaluator.evaluate(batch)
+            for name, value in metrics.items():
+                totals[name] = totals.get(name, 0.0) + value
+            num_batches += 1
+        if num_batches == 0:
+            return {}
+        return {name: total / num_batches for name, total in totals.items()}
+
     def on_train_begin(self, context: TrainContext):
         self.last_log_flush_step = context.optimizer_step
 
@@ -406,9 +426,15 @@ class MetricCallback(TrainCallback):
             and self.val_step > 0
             and context.optimizer_step >= self._next_val_step
         ):
-            context.val_loss = self._run_validation(context)
-            self._next_val_step = context.optimizer_step + self.val_step
-            self._append("validation", context, val_loss=context.val_loss)
+            if context.val_evaluator is not None:
+                context.val_loss = None
+                val_metrics = self._run_rollout_validation(context)
+                self._next_val_step = context.optimizer_step + self.val_step
+                self._append("validation", context, **val_metrics)
+            else:
+                context.val_loss = self._run_validation(context)
+                self._next_val_step = context.optimizer_step + self.val_step
+                self._append("validation", context, val_loss=context.val_loss)
 
         step_metrics = [m for m in self.metrics if m != "val_loss"]
         self._append("step", context, **self._metrics(context, step_metrics))
