@@ -4,16 +4,24 @@ Generation-side (HumanEval / MBPP): engine batch loop, code-execution pool,
 pass@k scoring, JSON I/O, result report.
 Scoring-side (MMLU / HellaSwag): model+tokenizer loader and batched
 (context, continuation) log-likelihood.
+Results-side: parse benchmark output JSONs into standardized metrics, collect
+`results/<bench>_<tag>.json` files into comparison tables.
+Suite-side: plan/launch the standard benchmark set for one checkpoint with
+per-job retry (output-file + process-liveness polling).
 
 Protocol decisions stay in each benchmark script (prompt format, stop
 sequences, extraction); only mechanism lives here.
 """
 
+import collections
 import json
+import os
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from math import prod
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -215,3 +223,290 @@ def loglikelihood_batched(
             ].item()
         scores[ri] = score
     return scores
+
+
+def extract_metrics(payload: dict, bench_key: str) -> Dict[str, Optional[float]]:
+    """Standardized metrics from one benchmark output JSON.
+
+    Fraction-valued metrics are 0..1; counts are ints (see COUNT_METRICS).
+    """
+    if bench_key in ("humaneval", "mbpp", "mbpp2"):
+        summary = payload.get("_summary", {})
+        problems = [
+            v
+            for k, v in payload.items()
+            if not k.startswith("_") and isinstance(v, dict)
+        ]
+        return {
+            "pass@1": summary.get("pass@1"),
+            "pass@10": summary.get("pass@10"),
+            "zero_pass": sum(
+                1
+                for v in problems
+                if v.get("pass@1", 0) == 0 and v.get("pass@10", 0) == 0
+            ),
+            "strong_pass": sum(1 for v in problems if (v.get("pass@1") or 0) >= 0.5),
+        }
+    if bench_key == "mmlu":
+        return {"acc": payload.get("_overall", {}).get("accuracy")}
+    if bench_key == "hellaswag":
+        s = payload.get("_summary", {})
+        return {"acc": s.get("acc"), "acc_norm": s.get("acc_norm")}
+    if bench_key == "ifeval":
+        sub: Dict[str, List[int]] = {}
+        total_passed = total_constraints = 0
+        for v in payload.values():
+            if not isinstance(v, dict) or "constraints" not in v:
+                continue
+            total_passed += v.get("num_passed", 0)
+            total_constraints += v.get("num_constraints", 0)
+            for con in v["constraints"]:
+                st = sub.setdefault(con.get("instruction_id"), [0, 0])
+                st[1] += 1
+                st[0] += 1 if con.get("passed") else 0
+        # Prefer the script's own aggregate: its denominator excludes
+        # unsupported constraints (e.g. 793 of 834), unlike the per-problem sum.
+        summary = payload.get("_summary", {})
+        if "overall_accuracy" in summary:
+            acc: Optional[float] = summary["overall_accuracy"]
+        else:
+            acc = (total_passed / total_constraints) if total_constraints else None
+        out: Dict[str, Optional[float]] = {"acc": acc}
+        for iid, name in (
+            ("detectable_format:json_format", "json_format"),
+            ("detectable_format:number_bullet_lists", "num_bullet_lists"),
+        ):
+            p, t = sub.get(iid, [0, 0])
+            out[name] = (p / t) if t else None
+        return out
+    raise KeyError(f"no extractor for benchmark {bench_key!r}")
+
+
+# prefix -> (display label, bench_key); longer prefixes first when matching
+RESULTS_REGISTRY = {
+    "mbpp2": ("MBPP-sig", "mbpp2"),
+    "mbpp": ("MBPP", "mbpp"),
+    "hellaswag": ("HellaSwag", "hellaswag"),
+    "humaneval": ("HumanEval", "humaneval"),
+    "ifeval": ("IFEval", "ifeval"),
+    "mmlu": ("MMLU", "mmlu"),
+}
+
+COUNT_METRICS = {"zero_pass", "strong_pass"}
+
+
+def parse_results_name(filename: str) -> Optional[Tuple[str, str]]:
+    """'mbpp2_mix3.json' -> ('mbpp2', 'mix3'); None for non-results files."""
+    if not filename.endswith(".json") or filename.endswith("_completions.json"):
+        return None
+    stem = filename[: -len(".json")]
+    for prefix in sorted(RESULTS_REGISTRY, key=len, reverse=True):
+        if stem.startswith(prefix + "_"):
+            return prefix, stem[len(prefix) + 1 :]
+    return None
+
+
+def collect_results(
+    results_dir: str,
+    benchmarks: Optional[Sequence[str]] = None,
+    tags: Optional[Sequence[str]] = None,
+) -> Dict[str, Dict[str, Dict[str, Optional[float]]]]:
+    """{tag: {bench_key: metrics}} for every parseable file in results_dir."""
+    collected: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {}
+    for fn in sorted(os.listdir(results_dir)):
+        parsed = parse_results_name(fn)
+        if parsed is None:
+            continue
+        bench_key, tag = parsed
+        if benchmarks and bench_key not in benchmarks:
+            continue
+        if tags and tag not in tags:
+            continue
+        with open(os.path.join(results_dir, fn), encoding="utf-8") as f:
+            payload = json.load(f)
+        collected.setdefault(tag, {})[bench_key] = extract_metrics(payload, bench_key)
+    return collected
+
+
+def render_table(collected: Dict[str, Dict[str, Dict[str, Optional[float]]]]) -> str:
+    """Markdown comparison table: rows = benchmark metrics, columns = tags."""
+    tags = sorted(collected)
+    row_order: List[Tuple[str, str, str]] = []  # (display_label, metric, bench_key)
+    cells: Dict[Tuple[str, str, str], Dict[str, Optional[float]]] = {}
+    for tag in tags:
+        for bench_key in RESULTS_REGISTRY:
+            metrics = collected.get(tag, {}).get(bench_key)
+            if not metrics:
+                continue
+            label = RESULTS_REGISTRY[bench_key][0]
+            for metric, value in metrics.items():
+                row = (label, metric, bench_key)
+                if row not in cells:
+                    cells[row] = {}
+                    row_order.append(row)
+                cells[row][tag] = value
+
+    def fmt(metric: str, value: Optional[float]) -> str:
+        if value is None:
+            return "—"
+        if metric in COUNT_METRICS:
+            return str(int(value))
+        return f"{value * 100:.2f}%"
+
+    lines = ["| metric | " + " | ".join(tags) + " |", "|---" * (len(tags) + 1) + "|"]
+    for label, metric, bench_key in row_order:
+        row = [fmt(metric, cells[(label, metric, bench_key)].get(tag)) for tag in tags]
+        lines.append(f"| {label} {metric} | " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def summarize_tag(tag: str, results_dir: str = "results") -> str:
+    return render_table(collect_results(results_dir, tags=[tag]))
+
+
+# ---------------------------------------------------------------------------
+# Suite runner: the standard benchmark set for one checkpoint, with retries
+# ---------------------------------------------------------------------------
+
+STANDARD_PARAMS = {
+    "mmlu": "--n_shot 5 --batch_size 4",
+    "ifeval": "--num_samples 1 --batch_size 64 --temperature 0.1",
+    "humaneval": "--num_samples 20 --batch_size 64",
+    "mbpp": "--num_samples 20 --batch_size 64",
+    "mbpp2": "--num_samples 20 --batch_size 64",
+    "hellaswag": "--batch_size 16",
+}
+
+# Cheap invocations for a plumbing smoke test. IFEval has no cheap mode — it
+# is skipped (None) and must run full or not at all.
+SMOKE_PARAMS = {
+    "mmlu": "--n_shot 5 --batch_size 4 --subjects abstract_algebra",
+    "ifeval": None,
+    "humaneval": "--num_samples 2 --batch_size 2 --problems 0 1 2",
+    "mbpp": "--num_samples 2 --batch_size 2 --problems 0 1 2",
+    "mbpp2": "--num_samples 2 --batch_size 2 --problems 0 1 2",
+    "hellaswag": "--limit 64 --batch_size 8",
+}
+
+SUITE_SCRIPTS = {
+    "mmlu": "scripts/eval/evaluate_mmlu.py",
+    "ifeval": "scripts/eval/evaluate_ifeval.py",
+    "humaneval": "scripts/eval/evaluate_humaneval.py",
+    "mbpp": "scripts/eval/evaluate_mbpp.py",
+    "mbpp2": "scripts/eval/evaluate_mbpp.py",
+    "hellaswag": "scripts/eval/evaluate_hellaswag.py",
+}
+
+DEFAULT_GPU_ORDER = [4, 5, 6, 7, 0, 1, 2, 3]
+
+
+@dataclass
+class SuiteJob:
+    bench: str
+    cmd: str
+    outfile: str
+    logfile: str
+
+
+def pick_free_gpus(n: int, preferred: Optional[Sequence[int]] = None) -> List[int]:
+    """n GPUs with <100 MiB allocated, caller's order first, else 4-7 first."""
+    q = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    free = set()
+    for line in q.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) < 100:
+            free.add(int(parts[0]))
+    order = list(preferred or []) + [
+        g for g in DEFAULT_GPU_ORDER if g not in set(preferred or [])
+    ]
+    picked = [g for g in order if g in free]
+    return picked[:n]
+
+
+def plan_jobs(
+    ckpt: str,
+    tag: str,
+    benchmarks: Sequence[str],
+    gpus: Optional[Sequence[int]] = None,
+    smoke: bool = False,
+    results_dir: str = "results",
+    logs_dir: str = "logs",
+) -> Tuple[List[SuiteJob], List[str]]:
+    """One SuiteJob per benchmark (pinning one GPU each) + skipped-bench list.
+
+    Command strings use repo-root-relative paths: run from the AstrAI root.
+    """
+    params = SMOKE_PARAMS if smoke else STANDARD_PARAMS
+    runnable = [b for b in benchmarks if params.get(b) is not None]
+    skipped = [b for b in benchmarks if params.get(b) is None]
+    gpus = pick_free_gpus(len(runnable), preferred=gpus)
+    if len(gpus) < len(runnable):
+        raise RuntimeError(f"need {len(runnable)} free GPUs, found {len(gpus)}")
+    jobs = []
+    for bench, gpu in zip(runnable, gpus):
+        outfile = f"{results_dir}/{bench}_{tag}.json"
+        cmd = (
+            f"CUDA_VISIBLE_DEVICES={gpu} {sys.executable} -u {SUITE_SCRIPTS[bench]} "
+            f"--param_path {ckpt} {params[bench]} --output {outfile}"
+        )
+        jobs.append(SuiteJob(bench, cmd, outfile, f"{logs_dir}/{bench}_{tag}.log"))
+    return jobs, skipped
+
+
+def run_suite(
+    jobs: List[SuiteJob], attempts: int = 3, poll_s: int = 15
+) -> Dict[str, str]:
+    """Run jobs concurrently; retry a job when its process dies without
+    writing its output file. Jobs whose output already exists are skipped
+    (idempotent restarts). Returns per-bench final status strings."""
+    status: Dict[str, str] = {}
+    queue: List[SuiteJob] = []
+    for job in jobs:
+        if os.path.exists(job.outfile):
+            status[job.bench] = "skipped (output exists)"
+        else:
+            queue.append(job)
+    active: Dict[str, Tuple[SuiteJob, subprocess.Popen, int, float]] = {}
+    launched: Dict[str, int] = collections.Counter()
+    while queue or active:
+        while queue:
+            job = queue.pop(0)
+            if launched[job.bench] >= attempts:
+                status[job.bench] = f"failed after {attempts} attempts"
+                continue
+            launched[job.bench] += 1
+            log = open(job.logfile, "a", encoding="utf-8")
+            log.write(
+                f"\n=== attempt {launched[job.bench]} ({time.strftime('%H:%M:%S')}) ===\n"
+            )
+            log.flush()
+            proc = subprocess.Popen(
+                job.cmd, shell=True, stdout=log, stderr=log, start_new_session=True
+            )
+            active[job.bench] = (job, proc, launched[job.bench], time.time())
+        time.sleep(poll_s)
+        for bench, (job, proc, n, t0) in list(active.items()):
+            if os.path.exists(job.outfile):
+                status[bench] = "ok"
+                del active[bench]
+            elif proc.poll() is not None:
+                print(
+                    f"[suite] {bench}: attempt {n} died (rc={proc.returncode}), retrying"
+                )
+                del active[bench]
+                queue.append(job)
+            elif time.time() - t0 > 3600:
+                print(f"[suite] {bench}: attempt {n} timed out after 1h, killing")
+                proc.kill()
+                del active[bench]
+                queue.append(job)
+    return status
