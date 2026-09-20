@@ -173,6 +173,13 @@ provide a command-line option for configuring one.
 | `--rollout_top_k` | Rollout top-k filtering (`0` disables) | 0 |
 | `--rollout_top_p` | Rollout nucleus sampling threshold | 0.9 |
 | `--rollout_max_tokens` | Maximum generated tokens per response | 1024 |
+| `--rollout_val_temperature` | Validation rollout temperature (`0` = greedy); unset inherits `rollout_temperature` | None |
+| `--rollout_val_top_p` | Validation top-p; unset inherits `rollout_top_p` | None |
+| `--rollout_val_top_k` | Validation top-k; unset inherits `rollout_top_k` | None |
+| `--rollout_val_max_tokens` | Validation max tokens; unset inherits `rollout_max_tokens` | None |
+| `--rollout_val_group_size` | Validation responses per prompt; unset inherits the strategy's group size | None |
+| `--rollout_device` | Device for the training rollout backend (e.g. `cuda:1`): a frozen replica with its own scheduler/KV pool, synced inside the policy-version lock each step; unset keeps the in-process colocated backend | None |
+| `--rollout_val_device` | Device for a dedicated validation rollout backend; unset shares the training backend | None |
 
 ### Scheduler
 
@@ -294,4 +301,4 @@ See [Preprocessing Guide](preprocessing.md) for config file format and examples.
 
 ---
 
-> Document Update Time: 2026-08-22
+> Document Update Time: 2026-09-20

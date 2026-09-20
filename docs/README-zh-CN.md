@@ -53,7 +53,7 @@ AstrAI 是一个覆盖模型构建、训练、评测与部署的端到端 Transf
 | 领域 | 能力 |
 |---|---|
 | **模型** | 自回归语言模型与嵌入模型，支持 GQA、MLA、MoE、RoPE，以及可扩展的 Attention/FFN 组件 |
-| **训练** | 预训练（`seq`）、监督微调（`sft`）、DPO 和 GRPO，支持梯度累积、检查点、DDP 与 FSDP |
+| **训练** | 预训练（`seq`）、监督微调（`sft`）、DPO 和在线 RL（GRPO/PPO，rollout 后端可进程内或跨卡），支持梯度累积、检查点、DDP 与 FSDP |
 | **数据** | 声明式 JSON 预处理、可配置掩码与样本打包、二进制/JSONL 存储和流式数据集 |
 | **推理** | 连续批处理、分页 KV Cache、Radix 前缀缓存、流式生成，以及 Torch/CUDA/FlashAttention 后端 |
 | **服务** | 基于 FastAPI 的 OpenAI 与 Anthropic 聊天补全协议，支持 SSE 流式输出和工具调用 |

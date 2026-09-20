@@ -194,8 +194,9 @@ rewards. Advantages and returns are computed once per rollout and pinned on the
 `RolloutResult`, so replayed steps optimize fixed targets. The critic has its
 own optimizer, stepped outside the policy-version lock, and persists as
 `value_model.pt`/`value_optimizer.pt` checkpoint extras — resume without them
-fails loudly, and `scripts/train.sh` treats a PPO checkpoint as incomplete when
-they are missing.
+fails loudly, and `scripts/docker/lib/train-common.sh` (via
+`CHECKPOINT_EXTRA_FILES` in `scripts/train.sh`) treats a PPO checkpoint as
+incomplete when they are missing.
 
 Every successful optimizer step mutates the shared model and advances its
 monotonic `policy_version` under the same generation lock. The scheduler
@@ -317,4 +318,4 @@ nohup python scripts/tools/train.py \
 
 Full parameter reference at [params.md](params.md).
 
-> Document Update Time: 2026-08-02
+> Document Update Time: 2026-09-20
