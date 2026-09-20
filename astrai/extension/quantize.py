@@ -159,8 +159,9 @@ class _ScaleRing:
     def __init__(self, device: torch.device, recipe: FP8Recipe):
         self.recipe = recipe
         n = recipe.history_len
-        self.state = torch.zeros(n + 4 + self.kFoldSlots, device=device,
-                                 dtype=torch.float32)
+        self.state = torch.zeros(
+            n + 4 + self.kFoldSlots, device=device, dtype=torch.float32
+        )
         self.hist = self.state[:n]
         self.scale = self.state[n : n + 1]
         self.idx = 0
