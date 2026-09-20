@@ -8,6 +8,7 @@
 // bindings instead of re-deriving it.
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/EmptyTensor.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Optional.h>
 #include <cstdint>
@@ -205,11 +206,15 @@ inline QuantizeOutputs run_quantize(torch::Tensor x, torch::Tensor scale,
     p.out_row_stride = p.cols;
     p.out_col_stride = 1;
     if (layout != QuantLayout::Transposed) {
-        outs.out = torch::empty_like(input, out_opts);
+        // Direct-to-allocator empty (no dispatcher round trip): the outputs
+        // are fresh kernel destinations, never autograd-visible on their own.
+        outs.out = torch::Tensor(at::detail::empty_cuda(
+            input.sizes(), out_dtype, input.device(), std::nullopt));
         p.output_ptr = outs.out.data_ptr();
     }
     if (layout != QuantLayout::RowMajor) {
-        outs.out_t = torch::empty({cols, rows}, out_opts_t);
+        outs.out_t = torch::Tensor(at::detail::empty_cuda(
+            {cols, rows}, t_dtype, input.device(), std::nullopt));
         p.output_transposed_ptr = outs.out_t.data_ptr();
     }
     launch_quantize_for(input, p, out_dtype == torch::kFloat8_e5m2,

@@ -635,7 +635,17 @@ Tensor fp8_linear(const Tensor& x, const Tensor& w,
         TORCH_CHECK(bias->numel() > 0, "fp8 linear: bias must be non-empty");
         bias_t = *bias;
     } else {
-        bias_t = torch::empty({0}, x.options());
+        // One empty placeholder per device, forever: the no-bias call is the
+        // hot path (AstrAI's Linear defaults to bias=False) and a per-call
+        // torch::empty({0}) is a free-floating allocation each linear pays.
+        static std::mutex mu;
+        static std::unordered_map<c10::DeviceIndex, Tensor> cache;
+        const auto dev = x.device().index();
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = cache.find(dev);
+        if (it == cache.end())
+            it = cache.emplace(dev, torch::empty({0}, x.options())).first;
+        bias_t = it->second;
     }
     return Fp8Linear::apply(x, w, bias_t, update_rings, need_bias_grad,
                             dynamic, history_len, margin, fmt_a, fmt_b);
