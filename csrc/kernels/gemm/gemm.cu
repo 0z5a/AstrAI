@@ -1,26 +1,26 @@
-// GEMM family binding (module `gemm`): the single quantized-GEMM entry
-// ``quant_gemm`` — every dtype pairing (bf16 / int8 / fp8 operands, per-
-// operand scales) dispatches over one dtype-generic kernel family. The
-// policy instantiation space compiles one explicit instantiation per dtype
+// GEMM family, typed host layer (module `gemm`): the dtype-pair registry, the
+// single quantized-GEMM entry, and the planner's C++ face — probe, row
+// injection, runtime configuration and the tile vocabulary, all declared in
+// gemm/api.h. The pybind surface (argument marshalling, the dict shapes, the
+// module registration) lives in bindings.cu; this TU holds no py:: type.
+// torch/extension.h is here for the torch::Tensor spelling only.
+//
+// The policy instantiation space compiles one explicit instantiation per dtype
 // pair (one per .cu below), so the heavy template work runs as parallel
-// nvcc jobs. This TU keeps the dtype-pair switch + pybind; the C tests
-// instantiate from the headers instead.
+// nvcc jobs. This TU keeps the dtype-pair switch; the C tests instantiate from
+// the headers instead.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/core/ScalarType.h>
 #include <cstdint>
-#include <torch/extension.h>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "gemm.cuh"
 #include "gemm/api.h"
 #include "quantize/checks.h"
-
-namespace astrai {
-namespace fp8 {
-void bind_fp8(py::module& m);
-}  // namespace fp8
-}  // namespace astrai
 
 using namespace astrai;
 using namespace astrai::quant;
@@ -30,8 +30,8 @@ namespace gemm {
 
 // The per-pair specializations are explicitly instantiated in their own TUs
 // (gemm_bf16_bf16.cu etc.), one nvcc job per dtype pair. These extern
-// template declarations keep the bindings below from re-instantiating: the
-// address-of forms are references to the externally defined symbols only.
+// template declarations keep the dispatch switch below from re-instantiating:
+// the address-of forms are references to the externally defined symbols only.
 // (They must sit here, outside the anonymous namespace — nvcc rejects
 // extern template declarations in an anonymous namespace.)
 extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, __nv_bfloat16);
@@ -98,17 +98,6 @@ QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent,
     return {s.data_ptr<float>(), s.numel() == 1 ? 0 : (int)extent};
 }
 
-// py::object -> torch::Tensor with a uniform error message; a none object
-// stays undefined (callers gate on is_none()).
-torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
-    try {
-        return o.cast<torch::Tensor>();
-    } catch (const py::cast_error&) {
-        TORCH_CHECK(false, name, " must be a torch.Tensor or None");
-        return {};
-    }
-}
-
 // The one dtype-pair table (scalar-type key -> element type): the dispatch
 // and probe lookups below stamp it, so a pair added for one can never be
 // missed in the other — and an unsupported pair raises with the actual
@@ -132,22 +121,27 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
       __nv_fp8_e4m3)                                                         \
     X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
 
-[[noreturn]] void unsupported_pair(c10::ScalarType a, c10::ScalarType b) {
-    TORCH_CHECK(false,
-                "unsupported operand dtype pair ", toString(a), " x ",
-                toString(b),
-                ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "
-                "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or matching "
-                "fp8 x fp8");
-}
+// The unsupported-pair arm, one spelling for the two lookups below: the
+// switch's own default carries it, so the non-void lookups cannot fall off
+// their end. The message names the operand dtypes it actually got instead of
+// a hardcoded list that can drift.
+#define ASTRAI_GEMM_UNSUPPORTED_PAIR(SA, SB)                               \
+    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(SA),    \
+                " x ", toString(SB),                                       \
+                ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "     \
+                "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or matching " \
+                "fp8 x fp8")
 
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
 #define GEMM_CASE(SA, TA, SB, TB) \
     case pack_dtypes(SA, SB):     \
         return &gemm_dispatch<TA, TB>;
-    switch (pack_dtypes(a, b)) { ASTRAI_GEMM_PAIRS(GEMM_CASE) }
+    switch (pack_dtypes(a, b)) {
+        ASTRAI_GEMM_PAIRS(GEMM_CASE)
+    default:
+        ASTRAI_GEMM_UNSUPPORTED_PAIR(a, b);
+    }
 #undef GEMM_CASE
-    unsupported_pair(a, b);
 }
 
 // Host-only functions that run the planner without a launch (the
@@ -160,9 +154,12 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
 #define PROBE_CASE(SA, TA, SB, TB) \
     case pack_dtypes(SA, SB):      \
         return &plan_probe_for<TA, TB>;
-    switch (pack_dtypes(a, b)) { ASTRAI_GEMM_PAIRS(PROBE_CASE) }
+    switch (pack_dtypes(a, b)) {
+        ASTRAI_GEMM_PAIRS(PROBE_CASE)
+    default:
+        ASTRAI_GEMM_UNSUPPORTED_PAIR(a, b);
+    }
 #undef PROBE_CASE
-    unsupported_pair(a, b);
 }
 
 }  // namespace
@@ -174,28 +171,22 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
 // plan.set_table channel authoritative.
 // ---------------------------------------------------------------------------
 
-py::dict plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
-                    at::ScalarType dt_b, bool trans_a, bool trans_b,
-                    int64_t batch) {
+PlanProbe plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
+                     at::ScalarType dt_b, bool trans_a, bool trans_b,
+                     int64_t batch) {
     const auto [decision, query] = find_gemm_probe(dt_a, dt_b)(
         m, n, k, batch, trans_a, trans_b, astrai::device_facts());
-    py::dict d;
-    d["source"] = decision.source;
-    d["cta"] = decision.recipe.cta;
-    d["stages"] = decision.recipe.stages;
-    d["raster"] = decision.raster;
-    d["kk"] = decision.recipe.kk;
-    d["perf_class"] = query.perf_class;
-    d["crosswise"] = query.crosswise;
-    return d;
+    PlanProbe r;
+    r.source = decision.source;
+    r.cta = decision.recipe.cta;
+    r.stages = decision.recipe.stages;
+    r.raster = decision.raster;
+    r.kk = decision.recipe.kk;
+    r.perf_class = query.perf_class;
+    r.crosswise = query.crosswise;
+    return r;
 }
 
-// Replace the runtime-injected rows wholesale (the autotuner's tier:
-// below the user's override rows, above the compiled-in ones). `source`
-// is a row-file path when one opens, else inline row text (same syntax
-// as the file); the return value is the row count installed, so a
-// mistyped path that parses as zero rows is visible to the caller
-// rather than silent.
 int inject_plan_rows(const std::string& source) {
     std::vector<TableRow> rows;
     if (!parse_plan_table_file(source, rows))
@@ -207,68 +198,49 @@ int inject_plan_rows(const std::string& source) {
 
 // ---------------------------------------------------------------------------
 // Runtime configuration: the backing of astrai.extension.plan. Every knob
-// is tri-state — py::none leaves it unchanged, an explicit value wins over
-// the one-time env seed. `table` accepts a row-file path, inline row text,
-// "-" (every row tier off) or "" (clear the override rows, tiers back on).
-// `staging` keys are positive enables: tma=False forces cp.async staging,
-// mx=False knocks the sm_120a block-scale cell out (the A/B knobs).
+// is tri-state — an absent patch field leaves it unchanged, an explicit value
+// wins over the one-time env seed. `table` accepts a row-file path, inline row
+// text, "-" (every row tier off) or "" (clear the override rows, tiers back
+// on). `staging` keys are positive enables: tma=false forces cp.async staging,
+// mx=false knocks the sm_120a block-scale cell out (the A/B knobs).
 // ---------------------------------------------------------------------------
 
-namespace {
-
-py::dict config_state_dict() {
-    py::dict d, table, staging;
-    d["planner"] = kPlannerModeNames[gemm_planner_mode()];
-    d["log"] = gemm_plan_log_enabled();
-    table["mode"] = gemm_table_off() ? "off" : "rows";
-    table["override_rows"] =
-        (int)plan_table_override_source().size();
-    table["injected_rows"] =
-        (int)plan_table_injected_source().size();
-    staging["tma"] = !gemm_tma_staging_disabled();
-    staging["mx"] = !gemm_mx_cell_disabled();
-    d["table"] = table;
-    d["staging"] = staging;
-    return d;
+GemmConfigState config_state() {
+    GemmConfigState s;
+    s.planner = kPlannerModeNames[gemm_planner_mode()];
+    s.log = gemm_plan_log_enabled();
+    s.table_mode = gemm_table_off() ? "off" : "rows";
+    s.override_rows = (int)plan_table_override_source().size();
+    s.injected_rows = (int)plan_table_injected_source().size();
+    s.staging_tma = !gemm_tma_staging_disabled();
+    s.staging_mx = !gemm_mx_cell_disabled();
+    return s;
 }
 
-}  // namespace
-
-py::dict configure(py::object table, py::object planner, py::object log,
-                   py::object staging) {
+GemmConfigState configure(const GemmConfigPatch& patch) {
     gemm_config_seed_once();
-    if (!planner.is_none()) {
-        int mode = -1;
-        if (py::isinstance<py::str>(planner)) {
-            const std::string name = planner.cast<std::string>();
-            if (name.empty()) {
-                // "" restores the shipped default (back to "unset": the
-                // env seed decides, and hybrid is what an unseeded process
-                // resolves to).
-                gemm_config().planner = -1;
-                return config_state_dict();
-            }
-            if (!parse_planner_mode(name, mode))
-                throw std::invalid_argument(
-                    "planner must be 'table', 'hybrid' or 'model', got '" +
-                    name + "'");
-        } else {
-            mode = planner.cast<int>();
-            if (mode < 0 || mode >= kPlannerModeCount)
-                throw std::invalid_argument("planner mode must be 0..2");
+    if (patch.planner_mode.has_value()) {
+        const int mode = *patch.planner_mode;
+        if (mode < -1 || mode >= kPlannerModeCount)
+            throw std::invalid_argument("planner mode must be 0..2");
+        if (mode == -1) {
+            // "" from the binding: back to "unset", where the env seed decides
+            // (hybrid is what an unseeded process resolves to). This returns
+            // early and skips the rest of the patch — the binding's
+            // long-standing one-knob reset, kept verbatim.
+            gemm_config().planner = -1;
+            return config_state();
         }
         gemm_config().planner = mode;
     }
-    if (!log.is_none()) gemm_config().log = log.cast<bool>() ? 1 : 0;
-    if (!staging.is_none()) {
-        py::dict s = staging.cast<py::dict>();
-        if (s.contains("tma"))
-            gemm_config().tma_disabled = s["tma"].cast<bool>() ? 0 : 1;
-        if (s.contains("mx"))
-            gemm_config().mx_disabled = s["mx"].cast<bool>() ? 0 : 1;
-    }
-    if (!table.is_none()) {
-        const std::string source = table.cast<std::string>();
+    if (patch.log.has_value())
+        gemm_config().log = *patch.log ? 1 : 0;
+    if (patch.staging_tma.has_value())
+        gemm_config().tma_disabled = *patch.staging_tma ? 0 : 1;
+    if (patch.staging_mx.has_value())
+        gemm_config().mx_disabled = *patch.staging_mx ? 0 : 1;
+    if (patch.table.has_value()) {
+        const std::string& source = *patch.table;
         if (source == "-") {
             gemm_config().table_off = 1;
         } else if (source.empty()) {
@@ -282,7 +254,7 @@ py::dict configure(py::object table, py::object planner, py::object log,
             plan_table_override_source().set(std::move(rows));
         }
     }
-    return config_state_dict();
+    return config_state();
 }
 
 // The recipe vocabulary per (crosswise, operand widths) — every
@@ -319,20 +291,9 @@ std::vector<const char*> tile_class_names() {
     return std::vector<const char*>(kNames, kNames + sizeof(kNames) / sizeof(kNames[0]));
 }
 
-py::dict device_facts_info() {
-    const DeviceFacts dev = astrai::device_facts();
-    py::dict d;
-    d["sms"] = dev.sms;
-    d["smem_max"] = dev.smem_max;
-    d["smem_per_sm"] = dev.smem_per_sm;
-    d["regs_per_sm"] = dev.regs_per_sm;
-    d["l2_bytes"] = dev.l2_bytes;
-    d["cc"] = dev.cc;
-    return d;
-}
-
+// ---------------------------------------------------------------------------
 // The single quantized-GEMM entry (one kernel for every cell, the only
-// export). The dtype pair picks the mma mode:
+// kernel-facing export). The dtype pair picks the mma mode:
 //   bf16 x bf16 (W16A16)        — no scales
 //   bf16 x int8 (W8A16)         — b_scale required
 //   int8 x int8 (W8A8)          — both scales required
@@ -344,6 +305,7 @@ py::dict device_facts_info() {
 // rejects one (nothing to dequant). The body packs GemmParams (batch
 // broadcast rules, zero-copy transposed views, fused bf16 bias) and hands
 // it to the dtype-pair dispatch.
+// ---------------------------------------------------------------------------
 torch::Tensor quant_gemm_impl(torch::Tensor a, torch::Tensor b,
                               c10::optional<torch::Tensor> a_scale,
                               c10::optional<torch::Tensor> b_scale,
@@ -442,45 +404,5 @@ torch::Tensor quant_gemm_impl(torch::Tensor a, torch::Tensor b,
     return output;
 }
 
-// pybind surface: None-tolerant operand scales and bias (``cast_tensor_arg``
-// keeps the "must be a torch.Tensor or None" message), then the shared
-// implementation the composed fp8 linear also calls (see gemm/api.h).
-torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
-                         py::object b_scale, bool trans_a, bool trans_b,
-                         py::object bias) {
-    auto opt = [](const py::object& o,
-                  const char* name) -> c10::optional<torch::Tensor> {
-        if (o.is_none()) return c10::nullopt;
-        return cast_tensor_arg(o, name);
-    };
-    return quant_gemm_impl(a, b, opt(a_scale, "a_scale"),
-                           opt(b_scale, "b_scale"), trans_a, trans_b,
-                           opt(bias, "bias"));
-}
-
 }  // namespace gemm
 }  // namespace astrai
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // The fp8 training linear (forward + backward) lives in this module:
-    // its composition launches through the GEMM dispatch below, whose
-    // plan table / planner state must stay single-source.
-    astrai::fp8::bind_fp8(m);
-    m.def("quant_gemm", &astrai::gemm::quant_gemm, py::arg("a"), py::arg("b"),
-          py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
-          py::arg("trans_a") = false, py::arg("trans_b") = true,
-          py::arg("bias") = py::none());
-    m.def("plan_probe", &astrai::gemm::plan_probe, py::arg("m"), py::arg("n"),
-          py::arg("k"), py::arg("dt_a"), py::arg("dt_b"),
-          py::arg("trans_a") = false, py::arg("trans_b") = true,
-          py::arg("batch") = 1);
-    m.def("inject_plan_rows", &astrai::gemm::inject_plan_rows,
-          py::arg("source"));
-    m.def("configure", &astrai::gemm::configure, py::arg("table") = py::none(),
-          py::arg("planner") = py::none(), py::arg("log") = py::none(),
-          py::arg("staging") = py::none());
-    m.def("config_state", &astrai::gemm::config_state_dict);
-    m.def("tile_class_names", &astrai::gemm::tile_class_names);
-    m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary);
-    m.def("device_facts_info", &astrai::gemm::device_facts_info);
-}

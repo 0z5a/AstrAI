@@ -22,6 +22,10 @@ layered directory:
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
 | `gemm/plan_table.h` | The row vocabulary and its chain: `TableRow` (band + recipe + optional gates), the `RowSource` containers, the `GemmConfig` runtime state, the empty-by-default per-class tables (`kBuiltinPlanW16A16`/`W8A16`/`W8A8`/`F8A8` — a device-specific build pastes rows in) and the degraded ladder that ends every chain. The planners themselves (`RowSetPlanner`, `ModelPlanner`) live in `gemm.cuh` |
+| `gemm/api.h` | The family's C++ surface — declarations only, and template-free so including it instantiates no dtype-pair kernel: `quant_gemm_impl` (the one GEMM entry), the planner face (`PlanProbe` + `plan_probe`, `inject_plan_rows`, `GemmConfigPatch` / `GemmConfigState` + `configure` / `config_state`) and the vocabulary (`tile_vocabulary` / `tile_class_names`). No Python type in a signature — the composed fp8 linear and the bindings TU call the same functions |
+| `gemm/gemm.cu` | The typed host layer: the dtype-pair registry (`ASTRAI_GEMM_PAIRS`, one entry feeding both the `gemm_dispatch` and the `plan_probe_for` lookup; one extern-template declaration per pair, which is what keeps this TU from re-instantiating them) plus the `api.h` implementations. Holds no `py::` type |
+| `gemm/fp8_linear.cu` | The composed fp8 training linear (forward *and* backward) in one C++ `autograd::Function`, so only one entry call stays in Python; its per-call state machine (rings, weight cast cache, checkpoint snapshot) is `fp8_state.cuh` |
+| `gemm/bindings.cu` | The pybind surface of the module: None-tolerant argument marshalling, the dict shapes the Python tooling reads (one key list per struct — that contract lives here, spelled once) and `PYBIND11_MODULE` → module `gemm` |
 | `quantize/quantize.cu` | binding only: entry checks (`checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
@@ -389,7 +393,7 @@ int8 path: the only model-facing quantization integration is the fp8
 autocast (same module, routing `aten::linear`), and quantized callers
 compose the primitives directly.
 
-Benchmark (L20, llama weight shapes, `csrc/bench/benchmark_w8.py`,
+Benchmark (L20, llama weight shapes, `csrc/bench/benchmark_quant_gemm.py`,
 M=2048/4096): W8A16 reaches 0.83–1.08× of cuBLAS bf16 `F.linear`
 (28–42 TFLOPS, faster than bf16 on the wide up_gate shapes where halved
 weight traffic pays), W8A8 0.73–0.86×, W16A16 0.83–0.94× — the dequant
