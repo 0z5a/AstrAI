@@ -79,6 +79,8 @@ class TrainConfig(BaseConfig):
         rollout_val_top_k (Optional[int]): Validation top-k override. None inherits ``rollout_top_k``. Defaults to None.
         rollout_val_max_tokens (Optional[int]): Validation max generated tokens override. None inherits ``rollout_max_tokens``. Defaults to None.
         rollout_val_group_size (Optional[int]): Validation responses per prompt override. None inherits the strategy's ``group_size``. Defaults to None.
+        rollout_device (Optional[str]): Device for the training rollout backend, e.g. ``"cuda:1"``. None keeps the in-process colocated backend (generation shares the training model object; weight updates are free). Setting it builds a frozen replica whose weights are copied to inside the policy-version lock every optimizer step — the copy is a full state transfer (e.g. ~2GB/step for 1B bf16), so pay it only when backend isolation is worth it. Defaults to None.
+        rollout_val_device (Optional[str]): Device for a dedicated validation rollout backend. None shares the training backend; setting it builds a separate replica so validation generation never touches the training scheduler's KV pool. Defaults to None.
         reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
         critic_model_fn (Optional[Callable]): Factory for the value (critic) model, required for online_ppo. Defaults to None.
         critic_optimizer_fn (Optional[Callable]): Factory for the critic optimizer; None reuses optimizer_fn. Defaults to None.
@@ -143,6 +145,8 @@ class TrainConfig(BaseConfig):
     rollout_val_top_k: Optional[int] = None
     rollout_val_max_tokens: Optional[int] = None
     rollout_val_group_size: Optional[int] = None
+    rollout_device: Optional[str] = None
+    rollout_val_device: Optional[str] = None
     reward_model_fn: Optional[Callable] = None
     critic_model_fn: Optional[Callable] = None
     critic_optimizer_fn: Optional[Callable] = None
@@ -285,6 +289,15 @@ class TrainConfig(BaseConfig):
     def _validate_rollout_val_group_size(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v < 1:
             raise ValueError(f"rollout_val_group_size must be >= 1, got {v}")
+        return v
+
+    @field_validator("rollout_device", "rollout_val_device")
+    def _validate_rollout_device(cls, v: Optional[str]) -> Optional[str]:
+        # Index-range and availability checks happen at build time (the
+        # config may be constructed on a different machine); here we only
+        # reject empty strings and obvious non-devices.
+        if v is not None and not v.strip():
+            raise ValueError("rollout device must be a device string or None")
         return v
 
     def rollout_val_overrides(self) -> Dict[str, Any]:

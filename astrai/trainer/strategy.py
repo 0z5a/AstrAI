@@ -26,7 +26,8 @@ from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
 from astrai.parallel.cp import LossReduction, TokenLoss
 from astrai.parallel.executor import broadcast_state_dict
-from astrai.trainer.rollout import RolloutResult, WeightPublisher
+from astrai.trainer.backend import WeightPublisher
+from astrai.trainer.rollout import RolloutResult
 
 
 class LossOutput(TypedDict):

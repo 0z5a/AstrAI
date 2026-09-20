@@ -32,6 +32,11 @@ from astrai.serialization import (
     looks_like_hf_state_dict,
 )
 from astrai.tokenize import AutoTokenizer
+from astrai.trainer.backend import (
+    ColocatedBackend,
+    P2PCopyPublisher,
+    ReplicaBackend,
+)
 from astrai.trainer.metric_util import GradSNRTracker
 from astrai.trainer.rollout import (
     RolloutEvaluator,
@@ -549,19 +554,74 @@ class TrainContextBuilder:
             )
         tokenizer = AutoTokenizer.from_pretrained(self._param_path)
         group_size = strategy_kwargs.get("group_size", 1)
-        scheduler = InferenceScheduler(
-            model=context.model,
-            tokenizer=tokenizer,
-            max_batch_size=group_size * max(1, cfg.batch_per_device),
-            max_seq_len=getattr(context.model.config, "max_position_embeddings", None),
-            policy_version=(
-                context.checkpoint.meta.get("policy_version", context.optimizer_step)
-                if context.checkpoint is not None
-                else context.optimizer_step
-            ),
+        policy_version = (
+            context.checkpoint.meta.get("policy_version", context.optimizer_step)
+            if context.checkpoint is not None
+            else context.optimizer_step
         )
+        max_seq_len = getattr(context.model.config, "max_position_embeddings", None)
+        train_device = next(context.model.parameters()).device
+
+        def _resolve_device(name: str, value: Optional[str]) -> Optional[str]:
+            if value is None:
+                return None
+            if value.startswith("cuda"):
+                count = torch.cuda.device_count()
+                if count == 0:
+                    raise ValueError(
+                        f"{name}={value!r} but no CUDA device is available"
+                    )
+                if ":" in value and int(value.split(":", 1)[1]) >= count:
+                    raise ValueError(
+                        f"{name}={value!r} exceeds available CUDA devices ({count})"
+                    )
+            return value
+
+        rollout_device = _resolve_device("rollout_device", cfg.rollout_device)
+        val_device = _resolve_device("rollout_val_device", cfg.rollout_val_device)
+
+        def _colocated(max_batch_size: int) -> ColocatedBackend:
+            return ColocatedBackend(
+                InferenceScheduler(
+                    model=context.model,
+                    tokenizer=tokenizer,
+                    max_batch_size=max_batch_size,
+                    max_seq_len=max_seq_len,
+                    policy_version=policy_version,
+                )
+            )
+
+        def _replica(device: str, max_batch_size: int) -> ReplicaBackend:
+            model = create_ref_model(
+                model_fn=cfg.model_fn,
+                executor=context.executor,
+                model=context.model,
+                device=device,
+            )
+            if model is None:
+                raise RuntimeError(f"cannot build rollout replica on {device!r}")
+            # Match the training dtype so the replica's sampling space
+            # agrees with the training-side logprob recomputation.
+            model.to(dtype=next(context.model.parameters()).dtype)
+            return ReplicaBackend(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                max_batch_size=max_batch_size,
+                max_seq_len=max_seq_len,
+                policy_version=policy_version,
+            )
+
+        batch_capacity = group_size * max(1, cfg.batch_per_device)
+        publishers: list = []
+        if rollout_device is None:
+            train_backend = _colocated(batch_capacity)
+        else:
+            train_backend = _replica(rollout_device, batch_capacity)
+            publishers.append(P2PCopyPublisher(train_backend))
+
         generator = RolloutGenerator(
-            scheduler=scheduler,
+            backend=train_backend,
             tokenizer=tokenizer,
             params=SamplingParams(
                 max_tokens=cfg.rollout_max_tokens,
@@ -570,6 +630,7 @@ class TrainContextBuilder:
                 top_k=cfg.rollout_top_k,
                 top_p=cfg.rollout_top_p,
             ),
+            output_device=train_device,
         )
         reward_model = cfg.reward_model_fn()
         context.strategy.set_rollout_runner(
@@ -582,10 +643,26 @@ class TrainContextBuilder:
         )
         # Validation rolls out under its own sampling params (e.g. greedy
         # decode, val-specific group size), inheriting every unset field
-        # from the training rollout.
+        # from the training rollout; with rollout_val_device set it runs
+        # on a dedicated replica instead of the training backend.
         val_params = replace(generator.params, **cfg.rollout_val_overrides())
+        if val_device is None:
+            val_generator = generator
+        else:
+            val_backend = _replica(
+                val_device, val_params.group_size * max(1, cfg.batch_per_device)
+            )
+            publishers.append(P2PCopyPublisher(val_backend))
+            val_generator = RolloutGenerator(
+                backend=val_backend,
+                tokenizer=tokenizer,
+                params=val_params,
+                output_device=train_device,
+            )
         context.val_evaluator = RolloutEvaluator(
-            generator=generator,
+            generator=val_generator,
             reward_model=reward_model,
             params=val_params,
         )
+        if publishers:
+            context.strategy.set_weight_publishers(publishers)

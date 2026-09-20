@@ -212,6 +212,28 @@ Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward
 model factory.
 
+### Rollout backends and validation sampling
+
+Where generation physically runs is a *backend* choice
+(`astrai/trainer/backend.py`): by default the scheduler wraps the training
+model object in-process (`ColocatedBackend`, weight updates are free).
+`--rollout_device cuda:1` instead builds a frozen replica on that device
+with its own scheduler and KV pool; a `P2PCopyPublisher` copies the
+training weights into the replica inside the policy-version lock on every
+optimizer step, so the replica's generations stay version-attributable. The
+copy is a full state transfer (~2GB/step for a 1B bf16 policy) — pay it only
+when backend isolation is worth it.
+
+`--rollout_val_device` gives *validation* its own replica, so evaluation
+generation never disturbs the training scheduler's KV pool. Validation
+sampling is decoupled from training via the `rollout_val_*` overrides
+(`--rollout_val_temperature 0` decodes greedily; group size, top-p, top-k,
+and max tokens inherit the training rollout when unset). Online validation
+runs through a `RolloutEvaluator` that reports reward statistics
+(`reward_mean`/`reward_std`/`reward_max`/`response_len_mean`) in the
+`validation` metric events instead of the training RL loss, which is
+degenerate under greedy decoding or `group_size == 1`.
+
 ## LR Schedulers
 
 | Type | Class | Description |

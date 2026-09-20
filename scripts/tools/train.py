@@ -315,6 +315,16 @@ _SPECS = [
         "Algorithm",
         help="Validation responses per prompt (unset inherits training group).",
     ),
+    OptSpec(
+        "rollout_device",
+        "Algorithm",
+        help="Device for the training rollout backend, e.g. cuda:1 (unset: in-process).",
+    ),
+    OptSpec(
+        "rollout_val_device",
+        "Algorithm",
+        help="Device for a dedicated validation rollout backend (unset: shared).",
+    ),
     OptSpec("neftune_alpha", "Algorithm", help="NEFTune noise alpha."),
     OptSpec("val_split", "Validation", help="Validation split ratio."),
     OptSpec("val_step", "Validation", help="Steps between validation runs."),
@@ -653,6 +663,8 @@ def train(
     rollout_val_top_p = kwargs.pop("rollout_val_top_p", None)
     rollout_val_max_tokens = kwargs.pop("rollout_val_max_tokens", None)
     rollout_val_group_size = kwargs.pop("rollout_val_group_size", None)
+    rollout_device = kwargs.pop("rollout_device", None)
+    rollout_val_device = kwargs.pop("rollout_val_device", None)
     reward_model_fn: Callable[[], BaseRewardModel] | None = None
     critic_model_fn = None
     if train_type == "online_ppo":
@@ -824,6 +836,8 @@ def train(
         rollout_val_top_p=rollout_val_top_p,
         rollout_val_max_tokens=rollout_val_max_tokens,
         rollout_val_group_size=rollout_val_group_size,
+        rollout_device=rollout_device,
+        rollout_val_device=rollout_val_device,
         reward_model_fn=reward_model_fn,
         critic_model_fn=critic_model_fn,
         moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),

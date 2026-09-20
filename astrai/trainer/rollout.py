@@ -20,13 +20,13 @@ Provides:
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Protocol, Tuple, TypeVar
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 
-from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.task import GenerationResult
+from astrai.trainer.backend import RolloutBackend
 
 
 @dataclass(kw_only=True)
@@ -108,29 +108,6 @@ class BaseRewardModel(ABC):
         ...
 
 
-class WeightPublisher(Protocol):
-    """Fan out the training model's new weights to a rollout backend.
-
-    Implementations run inside the policy-version lock as part of the
-    atomic commit (see
-    :meth:`BaseStrategy.optimizer_step
-    <astrai.trainer.strategy.BaseStrategy.optimizer_step>`): copying the
-    weights and advancing the receiving backend's version must be
-    indivisible from the trainer's own version publication, otherwise a
-    generation could observe new-version weights that are actually stale.
-    """
-
-    def publish(self, policy_version: int, source: nn.Module) -> None:
-        """Copy ``source`` weights and acknowledge ``policy_version``.
-
-        Args:
-            policy_version: The version the receiving backend must expose
-                after this call; monotonically increasing.
-            source: The (unwrapped) training model to copy from.
-        """
-        ...
-
-
 _PAD = 0
 T = TypeVar("T")
 
@@ -162,32 +139,42 @@ class SamplingParams:
 class RolloutGenerator:
     """Pure generation + decoding for a group of responses per prompt.
 
-    Delegates the prefill/decode loop to
-    :meth:`~astrai.inference.scheduler.InferenceScheduler.run_batch`,
-    which uses a real KV cache (no O(n²) recompute).  Has no dependency
-    on any reward model; can be reused in isolation for offline
-    generation, qualitative sampling, or eval pipelines.
+    Delegates the prefill/decode loop to the injected
+    :class:`~astrai.trainer.backend.RolloutBackend` — colocated with the
+    training model or a replica on another device; the generator is
+    location-agnostic.  Has no dependency on any reward model; can be
+    reused in isolation for offline generation, qualitative sampling, or
+    eval pipelines.
     """
 
     def __init__(
         self,
-        scheduler: InferenceScheduler,
+        backend: RolloutBackend,
         tokenizer,
         params: SamplingParams,
+        output_device=None,
     ):
-        self.scheduler = scheduler
+        self.backend = backend
         self.tokenizer = tokenizer
         self.params = params
+        # Rollout tensors are handed to the training-side strategies on
+        # this device; defaults to the backend's own (a no-op for a
+        # colocated backend, a cross-device hop for a replica).
+        self._output_device = (
+            output_device
+            if output_device is not None
+            else getattr(backend, "device", None)
+        )
         self._weight_lock = threading.RLock()
 
     @property
     def policy_version(self) -> int:
-        return self.scheduler.policy_version
+        return self.backend.policy_version
 
     def update_weights(self, policy_version: int) -> int:
         """Acknowledge shared-model weights and invalidate older scheduler KV."""
         with self._weight_lock:
-            return self.scheduler.update_weights(policy_version)
+            return self.backend.update_weights(policy_version)
 
     def apply_weight_update(
         self, policy_version: Optional[int], update: Callable[[int], T]
@@ -201,14 +188,14 @@ class RolloutGenerator:
         still inside the lock.
         """
         with self._weight_lock:
-            return self.scheduler.apply_weight_update(policy_version, update)
+            return self.backend.apply_weight_update(policy_version, update)
 
     def with_policy_snapshot(self, inspect: Callable[[int], T]) -> T:
         """Inspect a version stable against generator and scheduler updates."""
         if not callable(inspect):
             raise TypeError("inspect must be callable")
         with self._weight_lock:
-            return self.scheduler.with_policy_snapshot(inspect)
+            return self.backend.with_policy_snapshot(inspect)
 
     @torch.no_grad()
     def generate(
@@ -234,20 +221,11 @@ class RolloutGenerator:
         """
         effective = self.params if params is None else params
         with self._weight_lock:
-
-            def generate_snapshot(generation_version: int) -> RawRollout:
-                model = self.scheduler._executor.model
-                was_training = model.training
-                model.eval()
-                try:
-                    return self._generate_eval(batch, generation_version, effective)
-                finally:
-                    model.train(was_training)
-
-            # Capture the version under the scheduler lock as well as the
-            # generator lock. This also serializes callers that update the
-            # scheduler directly instead of going through this wrapper.
-            return self.scheduler.with_policy_snapshot(generate_snapshot)
+            return self.backend.with_policy_snapshot(
+                lambda generation_version: self._generate_eval(
+                    batch, generation_version, effective
+                )
+            )
 
     def _generate_eval(
         self, batch: Dict, generation_version: int, params: SamplingParams
@@ -260,7 +238,7 @@ class RolloutGenerator:
         for ids in flat_prompt_ids:
             expanded_prompt_ids.extend([list(ids)] * G)
 
-        results = self.scheduler.run_batch(
+        results = self.backend.generate(
             expanded_prompt_ids,
             max_tokens=params.max_tokens,
             temperature=params.temperature,
@@ -302,7 +280,7 @@ class RolloutGenerator:
         max_len = max((len(result.token_ids) for result in results), default=0)
         max_len = max(max_len, 1)
 
-        device = self.scheduler.device
+        device = self._output_device
         P_len = max(len(ids) for ids in flat_prompt_ids)
         prompts_tensor = torch.zeros(B, P_len, dtype=torch.long, device=device)
         prompt_mask = torch.zeros(B, P_len, dtype=torch.bool, device=device)

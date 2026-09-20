@@ -12,6 +12,7 @@ from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.model.value import ValueModel
 from astrai.serialization import Checkpoint
+from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
 from astrai.trainer.rollout import BaseRewardModel, RolloutEvaluator
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.train_callback import CheckpointCallback
@@ -221,6 +222,35 @@ def test_builder_wires_val_evaluator_with_inherited_params(
     # The evaluator shares the training generator (same scheduler) until
     # a dedicated val backend is configured.
     assert context.val_evaluator.generator is runner.generator
+
+
+def test_builder_wires_val_replica_and_publisher(device, temp_dir, monkeypatch):
+    """rollout_val_device builds a dedicated replica backend for the val
+    evaluator and registers a P2PCopyPublisher on the strategy."""
+    monkeypatch.setenv("LOCAL_DEVICE", device)
+    build_test_tokenizer(vocab_size=200).save_pretrained(temp_dir)
+
+    cfg = _ppo_config(
+        device,
+        model_fn=lambda: AutoRegressiveLM(make_rollout_config()),
+        ckpt_dir=os.path.join(temp_dir, "ckpt"),
+        rollout_val_device=device,
+    )
+    context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
+
+    train_generator = context.strategy._rollout_runner.generator
+    assert isinstance(train_generator.backend, ColocatedBackend)
+    assert isinstance(context.val_evaluator.generator.backend, ReplicaBackend)
+    assert context.val_evaluator.generator is not train_generator
+
+    publishers = context.strategy._weight_publishers
+    assert len(publishers) == 1
+    assert isinstance(publishers[0], P2PCopyPublisher)
+    # The val replica started at the trainer's live policy version.
+    assert (
+        context.val_evaluator.generator.backend.policy_version
+        == train_generator.backend.policy_version
+    )
 
 
 def test_save_extra_persists_critic_state(device):
