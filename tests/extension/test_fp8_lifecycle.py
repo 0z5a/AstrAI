@@ -209,13 +209,13 @@ def test_recipe_change_rebuilds_rings():
     with fp8_autocast(enabled=True, recipe=FP8Recipe(history_len=4)):
         lin(x)
     meta = _meta(lin.weight, history_len=4)
-    assert meta["x"]["state"].numel() == 4 + 4 + K_FOLD_SLOTS
+    assert meta["x"]["state"].numel() == 4 + 6 + K_FOLD_SLOTS
     assert meta["x"]["idx"] == 1
 
     with fp8_autocast(enabled=True, recipe=FP8Recipe(history_len=8)):
         lin(x)
     meta = _meta(lin.weight, history_len=8)
-    assert meta["x"]["state"].numel() == 8 + 4 + K_FOLD_SLOTS
+    assert meta["x"]["state"].numel() == 8 + 6 + K_FOLD_SLOTS
     # Rebuilt fresh inside the forward above: seeded, folded, advanced once.
     assert meta["x"]["idx"] == 1 and meta["x"]["initialized"]
 

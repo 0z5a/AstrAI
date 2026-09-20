@@ -70,14 +70,23 @@ struct RingView {
     bool bound = false;
 };
 
-inline RingView ring_view(const torch::Tensor& st, int64_t hist_idx) {
+inline RingView ring_view(const torch::Tensor& st, int64_t hist_idx,
+                          c10::optional<int64_t> hist_len = c10::nullopt) {
     RingView r;
     TORCH_CHECK(st.is_cuda() && st.dim() == 1 &&
                     st.scalar_type() == torch::kFloat32,
                 "ring state must be a 1D float32 CUDA tensor");
-    const int64_t n = st.numel() - 4 - kFoldSlots;
+    // Raw-buffer callers derive the history length from numel; the composed
+    // fp8-linear ring passes it explicitly (its state carries a trailing
+    // double-buffered scale pair the fold never touches).
+    const int64_t n = hist_len.has_value()
+                          ? *hist_len
+                          : st.numel() - 4 - kFoldSlots;
     TORCH_CHECK(n > 0 && hist_idx >= 0 && hist_idx < n,
                 "ring state too small or hist_idx out of range");
+    TORCH_CHECK(!hist_len.has_value() ||
+                    st.numel() >= n + 4 + kFoldSlots,
+                "ring state smaller than the explicit history length");
     float* base = st.data_ptr<float>();
     r.hist = base;
     r.scale_out = base + n;
@@ -119,13 +128,23 @@ struct QuantizeOutputs {
 // to two single-format passes. A ring switches on the in-kernel
 // delayed-scaling fold (amax history + the published scale and its
 // reciprocal); without one the kernel runs a pure scale+cast.
+// ``pub_scale``/``pub_recip`` redirect where the fold publishes (default:
+// the ring's own slots) — the double-buffered ring's "next" pair, so the
+// consumer keeps reading the untouched current pair and needs no snapshot
+// clone.
 inline QuantizeOutputs run_quantize(torch::Tensor x, torch::Tensor scale,
                                     QuantLayout layout,
                                     at::ScalarType dtype_a,
                                     c10::optional<at::ScalarType> dtype_b,
                                     c10::optional<torch::Tensor> ring,
                                     int64_t hist_idx, double fp8_max,
-                                    double pow2_margin) {
+                                    double pow2_margin,
+                                    c10::optional<torch::Tensor> pub_scale =
+                                        c10::nullopt,
+                                    c10::optional<torch::Tensor> pub_recip =
+                                        c10::nullopt,
+                                    c10::optional<int64_t> hist_len =
+                                        c10::nullopt) {
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 ||
                     x.scalar_type() == torch::kHalf ||
@@ -155,10 +174,19 @@ inline QuantizeOutputs run_quantize(torch::Tensor x, torch::Tensor scale,
     p.scale = scale.data_ptr<float>();
     QuantizeOutputs outs;
     if (ring.has_value() && ring->defined()) {
-        const RingView r = ring_view(*ring, hist_idx);
+        const RingView r = ring_view(*ring, hist_idx, hist_len);
         outs.amax = r.amax;
         p.amax = r.amax.data_ptr<float>();
         bind_ring(p, r, hist_idx, fp8_max, pow2_margin);
+        if (pub_scale.has_value() && pub_recip.has_value()) {
+            TORCH_CHECK(pub_scale->is_cuda() && pub_recip->is_cuda() &&
+                            pub_scale->scalar_type() == torch::kFloat32 &&
+                            pub_recip->scalar_type() == torch::kFloat32 &&
+                            pub_scale->numel() == 1 && pub_recip->numel() == 1,
+                        "publish override slots must be CUDA float32 scalars");
+            p.scale_out = pub_scale->data_ptr<float>();
+            p.scale_recip_out = pub_recip->data_ptr<float>();
+        }
     }
     // The merged kernel views the whole buffer as one flat [rows][cols]
     // tile grid: leading dims fold into rows so 1D and 3D inputs are fully

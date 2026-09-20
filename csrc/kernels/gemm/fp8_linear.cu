@@ -87,15 +87,20 @@ inline Tensor amax_of(const Tensor& t) {
 // Delayed-scaling rings
 // ---------------------------------------------------------------------------
 
-// One operand's ring: [hist n | scale | scale_recip | amax | done | scratch].
-// The layout offsets are owned by quant::ring_view; this struct keeps the
-// buffer plus the views the policy reads, so no per-call view is created.
+// One operand's ring, with a double-buffered scale pair: state layout
+// [hist n | scale0 | recip0 | amax | done | scratch | scale1 | recip1].
+// The fold reads recip[cur] and publishes the next scale into pair[1-cur],
+// so this step's GEMMs keep reading pair[cur] — untouched by the fold —
+// and the host needs no snapshot clone. ``cur`` flips exactly once per
+// fold (inside advance()); pair 0 sits at the legacy offsets so the seed
+// path stays where it was.
 struct ScaleRing {
     Tensor state;
     Tensor hist;
-    Tensor scale;
-    Tensor scale_recip;
+    Tensor pscale[2];
+    Tensor precip[2];
     int64_t idx = 0;
+    int cur = 0;  // the pair this step reads; the fold publishes 1-cur
     bool initialized = false;
 
     ScaleRing() = default;
@@ -103,22 +108,34 @@ struct ScaleRing {
     ScaleRing(const torch::TensorOptions& opts, int64_t history_len) {
         const int64_t n = history_len;
         TORCH_CHECK(n > 0, "fp8 linear: history_len must be positive");
-        state = torch::zeros({n + 4 + quant::kFoldSlots}, opts);
+        state = torch::zeros({n + 6 + quant::kFoldSlots}, opts);
         hist = state.narrow(0, 0, n);
-        scale = state.narrow(0, n, 1);
-        scale_recip = state.narrow(0, n + 1, 1);
+        pscale[0] = state.narrow(0, n, 1);
+        precip[0] = state.narrow(0, n + 1, 1);
+        const int64_t tail = n + 4 + quant::kFoldSlots;
+        pscale[1] = state.narrow(0, tail, 1);
+        precip[1] = state.narrow(0, tail + 1, 1);
     }
 
-    void advance() { idx = (idx + 1) % hist.numel(); }
+    const Tensor& scale() const { return pscale[cur]; }
+    const Tensor& scale_recip() const { return precip[cur]; }
+    const Tensor& pub_scale() const { return pscale[cur ^ 1]; }
+    const Tensor& pub_recip() const { return precip[cur ^ 1]; }
+
+    void advance() {
+        idx = (idx + 1) % hist.numel();
+        cur ^= 1;  // the just-published pair becomes the next step's current
+    }
 
     // Mirrors the scale's reciprocal into its slot — seed / restore only; the
     // fold republishes both slots in-kernel every step.
-    void publish_recip() { at::reciprocal_out(scale_recip, scale); }
+    void publish_recip() { at::reciprocal_out(precip[cur], pscale[cur]); }
 
     void seed(const Tensor& t, at::ScalarType fmt, int64_t margin) {
         const Tensor amax = amax_of(t);
         hist.fill_(amax);
-        scale.copy_(scale_from_amax(hist, fmt, margin));
+        cur = 0;
+        pscale[0].copy_(scale_from_amax(hist, fmt, margin));
         publish_recip();
         initialized = true;
     }
@@ -249,6 +266,7 @@ void restore_ring(ScaleRing& ring, const py::object& sd, bool& geometry_ok) {
         return;
     }
     ring.state.copy_(saved.to(ring.state.device()));
+    ring.cur = d.contains("cur") ? py::cast<int>(d["cur"]) : 0;
     ring.publish_recip();  // snapshots older than the recip slot restore 0
     ring.idx = py::cast<int64_t>(d["idx"]);
     ring.initialized = py::cast<bool>(d["initialized"]);
@@ -336,17 +354,25 @@ struct Fp8Cfg {
 };
 
 // One quantize pass through the shared launcher, with the counters kept for
-// tests/benches.
+// tests/benches. ``pub_scale``/``pub_recip`` (double-buffered rings) redirect
+// where the fold publishes; undefined with no ring.
 quant::QuantizeOutputs run_quant(const Tensor& t, const Tensor& scale,
                                  quant::QuantLayout layout,
                                  at::ScalarType fmt_a,
                                  c10::optional<at::ScalarType> fmt_b,
                                  const c10::optional<Tensor>& ring, int64_t idx,
-                                 const Fp8Cfg& cfg) {
+                                 const Fp8Cfg& cfg,
+                                 const Tensor& pub_scale = Tensor(),
+                                 const Tensor& pub_recip = Tensor()) {
     state().n_quantize.fetch_add(1, std::memory_order_relaxed);
-    return quant::run_quantize(t, scale, layout, fmt_a, fmt_b, ring, idx,
-                               fp8_max_of(fmt_a),
-                               std::pow(2.0, static_cast<double>(cfg.margin)));
+    return quant::run_quantize(
+        t, scale, layout, fmt_a, fmt_b, ring, idx, fp8_max_of(fmt_a),
+        std::pow(2.0, static_cast<double>(cfg.margin)),
+        pub_scale.defined() ? c10::optional<Tensor>(pub_scale) : c10::nullopt,
+        pub_recip.defined() ? c10::optional<Tensor>(pub_recip) : c10::nullopt,
+        // The composed ring's state trails a double-buffered scale pair, so
+        // the history length is stated, never derived from numel.
+        cfg.history_len);
 }
 
 Tensor run_gemm(const Tensor& a, const Tensor& b,
@@ -397,10 +423,12 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x, const Tensor& w,
     if (!meta->x.initialized) meta->x.seed(x, fmt_a, margin);
     const bool w_pre = is_fp8(w.scalar_type());
 
-    // The scale snapshot feeds this call's GEMMs (stream-ordered before the
-    // in-kernel fold overwrites the ring slot); the kernels read the ring's
-    // published reciprocal themselves, so no host reciprocal is needed.
-    res.sx = meta->x.scale.clone();
+    // The dequant scale is the ring's current pair, read as a view: the
+    // fold publishes into the OTHER pair, so this slot still holds the
+    // scale the quantize used when the GEMM reads it — no clone. (The view
+    // is valid until this ring's second next fold; standard training's
+    // backward lands long before that.)
+    res.sx = meta->x.scale();
     Tensor w8;
     if (!w_pre && meta->cast.valid(w, fmt_a, fmt_b, st.generation)) {
         st.n_cast_hit.fetch_add(1, std::memory_order_relaxed);
@@ -409,22 +437,26 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x, const Tensor& w,
         res.w8T = meta->cast.w8T;
     } else {
         st.n_cast_miss.fetch_add(1, std::memory_order_relaxed);
-        res.sw = meta->w.scale.clone();
+        res.sw = meta->w.scale();
         if (w_pre) {
             w8 = w;
         } else if (update_rings) {
-            const auto qw = run_quant(w, meta->w.scale_recip,
+            const auto qw = run_quant(w, meta->w.scale_recip(),
                                       quant::QuantLayout::Dual, fmt_a, fmt_b,
-                                      meta->w.state, meta->w.idx, cfg);
+                                      meta->w.state, meta->w.idx, cfg,
+                                      meta->w.pub_scale(),
+                                      meta->w.pub_recip());
             w8 = qw.out;
             res.w8T = qw.out_t;
             meta->w.advance();
+            // The cache entry must outlive the ring pair it came from: store
+            // an immutable copy (once per optimizer step).
             meta->cast.fill(w, fmt_a, fmt_b, st.generation, w8, res.w8T,
-                            res.sw);
+                            res.sw.clone());
         } else {
             // Ring-free cast (no-grad passes): folding here would advance the
             // window a second time per step and desynchronize the recompute.
-            w8 = run_quant(w, meta->w.scale_recip,
+            w8 = run_quant(w, meta->w.scale_recip(),
                            quant::QuantLayout::RowMajor, fmt_a, c10::nullopt,
                            c10::nullopt, 0, cfg)
                      .out;
@@ -432,16 +464,17 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x, const Tensor& w,
     }
 
     if (update_rings) {
-        const auto qx = run_quant(x, meta->x.scale_recip,
+        const auto qx = run_quant(x, meta->x.scale_recip(),
                                   quant::QuantLayout::Dual, fmt_a, fmt_b,
-                                  meta->x.state, meta->x.idx, cfg);
+                                  meta->x.state, meta->x.idx, cfg,
+                                  meta->x.pub_scale(), meta->x.pub_recip());
         res.x8T = qx.out_t;
         meta->x.advance();
         res.out = run_gemm(qx.out.reshape({-1, qx.out.size(-1)}), w8, res.sx,
                            res.sw, bias, true)
                       .reshape(out_shape);
     } else {
-        const auto qx = run_quant(x, meta->x.scale_recip,
+        const auto qx = run_quant(x, meta->x.scale_recip(),
                                   quant::QuantLayout::RowMajor, fmt_a,
                                   c10::nullopt, c10::nullopt, 0, cfg);
         res.out = run_gemm(qx.out.reshape({-1, qx.out.size(-1)}), w8, res.sx,
@@ -477,7 +510,7 @@ tensor_list fp8_backward_impl(const Tensor& g, const Fp8BwdIn& in) {
     } else {
         meta = get_meta(in.w, in.history_len, in.margin, false);
         if (!meta->g.initialized) meta->g.seed(g2, in.fmt_b, in.margin);
-        sg = meta->g.scale.clone();
+        sg = meta->g.scale();  // ring view: g's fold publishes the other pair
         g_ring = meta->g.state;
         g_idx = meta->g.idx;
     }
@@ -486,10 +519,13 @@ tensor_list fp8_backward_impl(const Tensor& g, const Fp8BwdIn& in) {
     // gives grad_w. g is consumed in both orientations, so one dual pass
     // feeds both; x8T/w8T came from the forward (or the weight cast cache),
     // so the backward re-reads neither x nor w.
-    const auto qg = run_quant(g2, in.dynamic ? sg.reciprocal()
-                                             : meta->g.scale_recip,
+    const bool delayed = !in.dynamic;
+    const auto qg = run_quant(g2, delayed ? meta->g.scale_recip()
+                                          : sg.reciprocal(),
                               quant::QuantLayout::Dual, in.fmt_b, c10::nullopt,
-                              g_ring, g_idx, cfg);
+                              g_ring, g_idx, cfg,
+                              delayed ? meta->g.pub_scale() : Tensor(),
+                              delayed ? meta->g.pub_recip() : Tensor());
     Tensor x8T = in.x8T;
     if (!x8T.defined()) {
         x8T = run_quant(in.x.reshape({-1, in.x.size(-1)}), sx.reciprocal(),
@@ -613,6 +649,7 @@ py::dict ring_state_dict(const ScaleRing& r) {
     py::dict d;
     d["state"] = r.state.detach().clone();
     d["idx"] = r.idx;
+    d["cur"] = r.cur;  // which scale pair is current (double-buffered)
     d["initialized"] = r.initialized;
     return d;
 }
@@ -664,9 +701,10 @@ py::dict fp8_debug_meta(const Tensor& w, int64_t history_len, int64_t margin) {
         py::dict d;
         d["state"] = r.state;
         d["hist"] = r.hist;
-        d["scale"] = r.scale;
-        d["scale_recip"] = r.scale_recip;
+        d["scale"] = r.scale();
+        d["scale_recip"] = r.scale_recip();
         d["idx"] = r.idx;
+        d["cur"] = r.cur;
         d["initialized"] = r.initialized;
         return d;
     };
