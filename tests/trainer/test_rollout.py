@@ -198,13 +198,30 @@ def test_rollout_generator_serializes_generation_and_policy_update(device):
 
     _assert_interleaved(
         lambda: gen.generate(_make_instruction_batch(n=1)),
-        lambda: gen.apply_weight_update(1, update_finished.set),
+        lambda: gen.apply_weight_update(1, lambda _version: update_finished.set()),
         started=generation_started,
         release=allow_generation_to_finish,
         finished=update_finished,
     )
 
     assert update_finished.is_set()
+    assert gen.policy_version == 1
+
+
+def test_apply_weight_update_hands_derived_version_inside_lock(device):
+    gen, _ = _make_generator(device, group_size=1, max_tokens=2)
+    seen = {}
+
+    def record(policy_version):
+        # The target version is derived under the lock and passed in; the
+        # live version has not moved yet because the commit follows the
+        # update — weight publishers rely on exactly this ordering.
+        seen["arg"] = policy_version
+        seen["live_during"] = gen.scheduler.policy_version
+
+    gen.apply_weight_update(None, record)
+
+    assert seen == {"arg": 1, "live_during": 0}
     assert gen.policy_version == 1
 
 
@@ -475,7 +492,7 @@ def test_rollout_runner_publishes_cache_before_concurrent_policy_update(device):
 
     _assert_interleaved(
         produce_rollout,
-        lambda: runner.apply_weight_update(1, update_finished.set),
+        lambda: runner.apply_weight_update(1, lambda _version: update_finished.set()),
         started=final_validation_started,
         release=allow_final_validation_to_finish,
         finished=update_finished,

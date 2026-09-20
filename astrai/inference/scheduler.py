@@ -158,13 +158,14 @@ class InferenceScheduler:
         return self._policy_guard.update_weights(policy_version)
 
     def apply_weight_update(
-        self, policy_version: Optional[int], update: Callable[[], T]
+        self, policy_version: Optional[int], update: Callable[[int], T]
     ) -> T:
         """Mutate shared weights and publish their version without generation.
 
         ``policy_version=None`` derives ``live + 1`` under the same lock, for
         callers that only need "advance by one" (e.g. ``optimizer.step()``)
-        without a read-compute-write race on the current version.
+        without a read-compute-write race on the current version.  The
+        derived target version is handed to ``update``.
         """
         return self._policy_guard.apply_weight_update(policy_version, update)
 

@@ -26,7 +26,7 @@ from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
 from astrai.parallel.cp import LossReduction, TokenLoss
 from astrai.parallel.executor import broadcast_state_dict
-from astrai.trainer.rollout import RolloutResult
+from astrai.trainer.rollout import RolloutResult, WeightPublisher
 
 
 class LossOutput(TypedDict):
@@ -386,6 +386,7 @@ class BaseStrategy(ABC):
         self._moe_metrics: Dict[str, float] = {}
         self.strategy_kwargs = kwargs
         self._rollout_runner = None
+        self._weight_publishers: Tuple[WeightPublisher, ...] = ()
 
     # ---------- token-mean two-phase protocol ----------
     # CP composes between the phases: astrai.parallel.cp.CPStrategy shards
@@ -559,11 +560,29 @@ class BaseStrategy(ABC):
         if self._rollout_runner is None:
             return optimizer.step()
 
+        def commit(policy_version: int):
+            result = optimizer.step()
+            # Publishers run inside the version lock so a backend can
+            # never observe new-version weights that are still stale.
+            for publisher in self._weight_publishers:
+                publisher.publish(policy_version, self.model)
+            return result
+
         # None lets the scheduler derive live+1 under the policy lock,
         # avoiding a read-compute-write race on policy_version.
-        result = self._rollout_runner.apply_weight_update(None, optimizer.step)
+        result = self._rollout_runner.apply_weight_update(None, commit)
         self._rollout_runner.step()
         return result
+
+    def set_weight_publishers(self, publishers) -> None:
+        """Inject :class:`~astrai.trainer.rollout.WeightPublisher` instances.
+
+        Each publisher is invoked inside the policy-version lock on every
+        online optimizer step, after ``optimizer.step()`` and before the
+        version commit — the seam where rollout-backend replicas receive
+        fresh weights atomically with the trainer's own publication.
+        """
+        self._weight_publishers = tuple(publishers)
 
     def __call__(self, batch: Dict[str, Tensor]) -> LossOutput:
         """Run offline or online forward depending on runner injection."""

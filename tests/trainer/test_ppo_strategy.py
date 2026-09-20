@@ -458,7 +458,9 @@ def test_online_call_returns_finite_loss(ppo_strategy):
             pass
 
         def apply_weight_update(self, policy_version, update):
-            return update()
+            if policy_version is None:
+                policy_version = self.policy_version + 1
+            return update(policy_version)
 
     strategy.set_rollout_runner(_RecordingRunner())
     out = strategy({"instruction": ["x"]})

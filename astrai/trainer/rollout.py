@@ -16,10 +16,10 @@ Provides:
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, TypeVar
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.task import GenerationResult
@@ -104,6 +104,29 @@ class BaseRewardModel(ABC):
         ...
 
 
+class WeightPublisher(Protocol):
+    """Fan out the training model's new weights to a rollout backend.
+
+    Implementations run inside the policy-version lock as part of the
+    atomic commit (see
+    :meth:`BaseStrategy.optimizer_step
+    <astrai.trainer.strategy.BaseStrategy.optimizer_step>`): copying the
+    weights and advancing the receiving backend's version must be
+    indivisible from the trainer's own version publication, otherwise a
+    generation could observe new-version weights that are actually stale.
+    """
+
+    def publish(self, policy_version: int, source: nn.Module) -> None:
+        """Copy ``source`` weights and acknowledge ``policy_version``.
+
+        Args:
+            policy_version: The version the receiving backend must expose
+                after this call; monotonically increasing.
+            source: The (unwrapped) training model to copy from.
+        """
+        ...
+
+
 _PAD = 0
 T = TypeVar("T")
 
@@ -155,13 +178,15 @@ class RolloutGenerator:
             return self.scheduler.update_weights(policy_version)
 
     def apply_weight_update(
-        self, policy_version: Optional[int], update: Callable[[], T]
+        self, policy_version: Optional[int], update: Callable[[int], T]
     ) -> T:
         """Apply a shared-model mutation at an atomic generation boundary.
 
         ``policy_version=None`` lets the scheduler derive ``live + 1`` under
         the policy lock, closing the read-compute-write race for callers
-        that only need to advance by one.
+        that only need to advance by one.  The derived target version is
+        handed to ``update`` so weight publishers can fan it out while
+        still inside the lock.
         """
         with self._weight_lock:
             return self.scheduler.apply_weight_update(policy_version, update)
@@ -439,7 +464,7 @@ class RolloutRunner:
         return self.generator.update_weights(policy_version)
 
     def apply_weight_update(
-        self, policy_version: Optional[int], update: Callable[[], T]
+        self, policy_version: Optional[int], update: Callable[[int], T]
     ) -> T:
         """Apply a model update and publish its version as one operation."""
         return self.generator.apply_weight_update(policy_version, update)
