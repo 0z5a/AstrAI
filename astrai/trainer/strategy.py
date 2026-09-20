@@ -60,6 +60,71 @@ def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
+#: Model-dtype byte budget for one row-chunk of the deferred lm_head matmul
+#: in :func:`_chunked_token_logprobs`.  64 MB of bf16 logits per chunk keeps
+#: the fp32 upcast + logsumexp workspace well under a quarter gigabyte while
+#: amortizing the GEMM over hundreds of rows.
+_CHUNK_LOGIT_BYTES = 64 * 1024 * 1024
+
+
+def _chunked_token_logprobs(hidden_states: Tensor, weight: Tensor, targets: Tensor):
+    """Per-token log-probs without materializing the full ``[N, S, V]`` tensor.
+
+    The model forward is taken with ``skip_lm_head=True`` so only the
+    post-norm hidden states ``[N, S, H]`` exist; rows are then pushed
+    through ``lm_head`` in chunks sized by :data:`_CHUNK_LOGIT_BYTES`.
+    Each chunk computes the same expression as the full-tensor path —
+    ``gather(log_softmax(logits.float()))[target] == logits[target].float()
+    - logsumexp(logits.float())`` — so results agree up to bf16 GEMM
+    tiling noise.  No-grad callers only (autograd would retain every
+    chunk's logits, defeating the point).
+    """
+    n, s, hidden = hidden_states.shape
+    flat_hidden = hidden_states.reshape(n * s, hidden)
+    flat_targets = targets.reshape(n * s)
+    vocab, dtype_bytes = weight.shape[0], weight.element_size()
+    rows_per_chunk = max(1, _CHUNK_LOGIT_BYTES // (vocab * dtype_bytes))
+    weight_t = weight.t()
+    out = torch.empty(n * s, dtype=torch.float32, device=hidden_states.device)
+    for start in range(0, n * s, rows_per_chunk):
+        end = min(start + rows_per_chunk, n * s)
+        logits = flat_hidden[start:end] @ weight_t
+        logits = logits.float()
+        picked = logits.gather(-1, flat_targets[start:end].unsqueeze(-1)).squeeze(-1)
+        out[start:end] = picked - torch.logsumexp(logits, dim=-1)
+    return out.view(n, s)
+
+
+def _importance_ratio_metrics(
+    ratio: Tensor, token_masks: Tensor, clip_low: float, clip_high: float
+) -> Dict[str, Tensor]:
+    """Drift observability for the importance ratio ``exp(logπ - logπ_old)``.
+
+    Reports the ratio distribution over valid tokens plus the fraction
+    touching the clip band — a cheap canary for replayed rollouts going
+    stale (``max_policy_lag`` too loose) or behaviour log-probs that no
+    longer match the sampling policy.
+    """
+    with torch.no_grad():
+        valid = token_masks.bool()
+        zero = ratio.sum() * 0.0
+        if not bool(valid.any()):
+            return {
+                "ratio_mean": zero,
+                "ratio_min": zero,
+                "ratio_max": zero,
+                "clip_fraction": zero,
+            }
+        ratios = ratio[valid]
+        clipped = ((ratios < 1 - clip_low) | (ratios > 1 + clip_high)).float().mean()
+        return {
+            "ratio_mean": ratios.mean(),
+            "ratio_min": ratios.min(),
+            "ratio_max": ratios.max(),
+            "clip_fraction": clipped,
+        }
+
+
 def get_logprobs(
     model: nn.Module,
     input_ids: Tensor,
@@ -78,6 +143,13 @@ def get_logprobs(
 
     Returns:
         Log probabilities with reduction applied over sequence dimension
+
+    Under ``torch.no_grad`` the forward runs with ``skip_lm_head=True`` and
+    log-probs are computed in row chunks from the hidden states (see
+    :func:`_chunked_token_logprobs`) — the reference/old-policy passes never
+    materialize the full ``[N, S, V]`` fp32 log-softmax.  With gradients
+    enabled, or when the model cannot skip its lm_head, the original
+    full-tensor path runs unchanged.
     """
     allowed_reductions = ["mean", "sum", "none"]
     if reduction not in allowed_reductions:
@@ -88,16 +160,38 @@ def get_logprobs(
     shifted_input_ids = input_ids[:, 1:]
     shifted_loss_mask = loss_mask[:, 1:]
 
-    outputs = model(
-        input_ids[:, :-1],
-        attn_mask[:, :, :-1, :-1] if attn_mask.dim() == 4 else attn_mask[:, :-1],
+    sliced_mask = (
+        attn_mask[:, :, :-1, :-1] if attn_mask.dim() == 4 else attn_mask[:, :-1]
     )
-    logits = outputs["logits"]
-    log_probs = torch.log_softmax(logits.float(), dim=-1)
+    use_chunked = (
+        not torch.is_grad_enabled()
+        and isinstance(model, nn.Module)
+        and getattr(model, "lm_head", None) is not None
+    )
+    if use_chunked:
+        try:
+            outputs = model(input_ids[:, :-1], sliced_mask, skip_lm_head=True)
+        except TypeError:
+            # Model or wrapper does not accept the kwarg; full path below.
+            outputs = None
+        if outputs is not None and outputs.get("logits") is not None:
+            # A wrapper silently ignored the flag; the chunked contract
+            # (logits is None) did not hold.
+            outputs = None
+    else:
+        outputs = None
+    if outputs is None:
+        outputs = model(input_ids[:, :-1], sliced_mask)
 
-    token_logprobs = torch.gather(
-        log_probs, dim=-1, index=shifted_input_ids.unsqueeze(-1)
-    ).squeeze(-1)
+    if outputs["logits"] is None:
+        token_logprobs = _chunked_token_logprobs(
+            outputs["hidden_states"], model.lm_head.weight, shifted_input_ids
+        )
+    else:
+        log_probs = torch.log_softmax(outputs["logits"].float(), dim=-1)
+        token_logprobs = torch.gather(
+            log_probs, dim=-1, index=shifted_input_ids.unsqueeze(-1)
+        ).squeeze(-1)
 
     if reduction == "mean":
         logprobs = (token_logprobs * shifted_loss_mask).sum(
@@ -1114,6 +1208,11 @@ class GRPOStrategy(BaseStrategy):
             "policy_loss": policy_loss,
             "kl_loss": kl_penalty,
         }
+        metrics.update(
+            _importance_ratio_metrics(
+                ratio, token_masks, self.clip_eps_low, self.clip_eps_high
+            )
+        )
         if overlong_penalty is not None:
             metrics["overlong_penalty_mean"] = overlong_penalty.mean()
             metrics["overlong_fraction"] = (overlong_penalty < 0).float().mean()
@@ -1351,6 +1450,9 @@ class PPOStrategy(BaseStrategy):
                 "policy_loss": policy_loss,
                 "value_loss": value_loss,
                 "explained_variance": explained_variance,
+                **_importance_ratio_metrics(
+                    ratio, token_masks, self.clip_eps, self.clip_eps
+                ),
             },
             policy_output["aux_loss"],
             policy_output.get("router_stats"),

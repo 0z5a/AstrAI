@@ -563,6 +563,16 @@ class TrainContextBuilder:
             else context.optimizer_step
         )
         max_seq_len = getattr(context.model.config, "max_position_embeddings", None)
+        if cfg.rollout_pool_seq_len is not None:
+            # Right-size the KV pool: the default is the model's full
+            # context window, but a rollout never needs more than prompt +
+            # rollout_max_tokens — the difference is GBs of idle pool
+            # (see TrainConfig.rollout_pool_seq_len for the formula).
+            max_seq_len = (
+                min(max_seq_len, cfg.rollout_pool_seq_len)
+                if max_seq_len is not None
+                else cfg.rollout_pool_seq_len
+            )
         train_device = next(context.model.parameters()).device
 
         def _resolve_device(name: str, value: str | None) -> str | None:

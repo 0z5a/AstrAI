@@ -79,6 +79,7 @@ class TrainConfig(BaseConfig):
         rollout_val_top_k (Optional[int]): Validation top-k override. None inherits ``rollout_top_k``. Defaults to None.
         rollout_val_max_tokens (Optional[int]): Validation max generated tokens override. None inherits ``rollout_max_tokens``. Defaults to None.
         rollout_val_group_size (Optional[int]): Validation responses per prompt override. None inherits the strategy's ``group_size``. Defaults to None.
+        rollout_pool_seq_len (Optional[int]): Sequence budget per rollout request when sizing the rollout scheduler's KV pool. None uses the model's ``max_position_embeddings``. Must cover the longest prompt plus ``rollout_max_tokens`` or ``run_batch`` rejects the request. Right-sizing pays off: the pool holds ``2 × layers × (batch_capacity × seq) × kv_heads × head_dim`` bytes — for the 1B policy (24 layers, 4 KV heads, head_dim 64, bf16) the default 32768 context allocates ~3.2 GB against ~400 MB at 4096. Defaults to None.
         rollout_device (Optional[str]): Device for the training rollout backend, e.g. ``"cuda:1"``. None keeps the in-process colocated backend (generation shares the training model object; weight updates are free). Setting it builds a frozen replica whose weights are copied to inside the policy-version lock every optimizer step — the copy is a full state transfer (e.g. ~2GB/step for 1B bf16), so pay it only when backend isolation is worth it. Defaults to None.
         rollout_val_device (Optional[str]): Device for a dedicated validation rollout backend. None shares the training backend; setting it builds a separate replica so validation generation never touches the training scheduler's KV pool. Defaults to None.
         reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
@@ -145,6 +146,7 @@ class TrainConfig(BaseConfig):
     rollout_val_top_k: Optional[int] = None
     rollout_val_max_tokens: Optional[int] = None
     rollout_val_group_size: Optional[int] = None
+    rollout_pool_seq_len: Optional[int] = None
     rollout_device: Optional[str] = None
     rollout_val_device: Optional[str] = None
     reward_model_fn: Optional[Callable] = None
@@ -289,6 +291,12 @@ class TrainConfig(BaseConfig):
     def _validate_rollout_val_group_size(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v < 1:
             raise ValueError(f"rollout_val_group_size must be >= 1, got {v}")
+        return v
+
+    @field_validator("rollout_pool_seq_len")
+    def _validate_rollout_pool_seq_len(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError(f"rollout_pool_seq_len must be positive, got {v}")
         return v
 
     @field_validator("rollout_device", "rollout_val_device")

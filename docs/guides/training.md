@@ -225,6 +225,13 @@ optimizer step, so the replica's generations stay version-attributable. The
 copy is a full state transfer (~2GB/step for a 1B bf16 policy) — pay it only
 when backend isolation is worth it.
 
+The scheduler's KV pool is sized from the model's full
+`max_position_embeddings` by default; `--rollout_pool_seq_len` right-sizes it
+to the true rollout horizon (it must cover the longest prompt plus
+`rollout_max_tokens`). For the 1B policy the default 32768 window allocates
+~3.2 GB of KV against ~400 MB at 4096 — requests beyond the budget are
+rejected (`prompt_too_long`) rather than silently truncated.
+
 `--rollout_val_device` gives *validation* its own replica, so evaluation
 generation never disturbs the training scheduler's KV pool. Validation
 sampling is decoupled from training via the `rollout_val_*` overrides

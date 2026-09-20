@@ -151,10 +151,20 @@ def test_grpo_dapo_clip_higher_changes_positive_advantage_bound(
             }
 
         monkeypatch.setattr(strategy_module, "get_logprobs", fake_get_logprobs)
-        return strategy.compute_loss_output(batch)["metrics"]["policy_loss"]
+        metrics = strategy.compute_loss_output(batch)["metrics"]
+        return metrics["policy_loss"], metrics
 
-    assert policy_loss(0.2) == pytest.approx(-0.2, abs=1e-6)
-    assert policy_loss(0.28) == pytest.approx(-0.225, abs=1e-6)
+    loss_two, metrics_two = policy_loss(0.2)
+    assert loss_two == pytest.approx(-0.2, abs=1e-6)
+    loss_high, _ = policy_loss(0.28)
+    assert loss_high == pytest.approx(-0.225, abs=1e-6)
+
+    # Importance-ratio drift observability: the fake policy logprobs make
+    # ratio = exp(log(1.25)) and exp(log(0.75)) on the single valid token.
+    assert metrics_two["ratio_mean"] == pytest.approx(1.0, abs=1e-6)
+    assert metrics_two["ratio_min"] == pytest.approx(0.75, abs=1e-6)
+    assert metrics_two["ratio_max"] == pytest.approx(1.25, abs=1e-6)
+    assert metrics_two["clip_fraction"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(

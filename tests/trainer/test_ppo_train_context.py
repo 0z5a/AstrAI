@@ -253,6 +253,32 @@ def test_builder_wires_val_replica_and_publisher(device, temp_dir, monkeypatch):
     )
 
 
+def test_builder_right_sizes_rollout_pool(device, temp_dir, monkeypatch):
+    """rollout_pool_seq_len clamps the scheduler's KV budget below the
+    model's context window (min semantics; None keeps the default)."""
+    monkeypatch.setenv("LOCAL_DEVICE", device)
+    build_test_tokenizer(vocab_size=200).save_pretrained(temp_dir)
+
+    cfg = _ppo_config(
+        device,
+        model_fn=lambda: AutoRegressiveLM(make_rollout_config()),
+        ckpt_dir=os.path.join(temp_dir, "ckpt"),
+        rollout_pool_seq_len=32,
+    )
+    context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
+    scheduler = context.strategy._rollout_runner.generator.backend.scheduler
+    assert scheduler.max_seq_len == 32
+
+    cfg = _ppo_config(
+        device,
+        model_fn=lambda: AutoRegressiveLM(make_rollout_config()),
+        ckpt_dir=os.path.join(temp_dir, "ckpt2"),
+    )
+    context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
+    scheduler = context.strategy._rollout_runner.generator.backend.scheduler
+    assert scheduler.max_seq_len == make_rollout_config().max_position_embeddings
+
+
 def test_save_extra_persists_critic_state(device):
     model, _ = make_model(device)
     critic = ValueModel(make_rollout_config()).to(device)
