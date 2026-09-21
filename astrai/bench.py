@@ -179,6 +179,62 @@ def load_score_model(
     return model, tokenizer
 
 
+def causal_sequence_logits(
+    model,
+    rows: List[List[int]],
+    device: str,
+    position_ids: Optional[List[List[int]]] = None,
+    group_ids: Optional[List[List[int]]] = None,
+):
+    """Causally masked forward over a batch of token rows.
+
+    The single owner of the causal mask for every log-likelihood metric.
+    Callers must not build masks themselves: a 2-D ``input_mask`` is read as
+    key-padding only and switches causality off in
+    ``astrai/model/transformer.py``, which lets a scored position attend to
+    the very token it is scoring (see ``loglikelihood_batched``).
+    Per query/key pair the mask is ``real key & same document & key index
+    <= query index``.
+
+    Args:
+        rows: token ids of each row; ragged rows are right-padded here.
+        position_ids: optional per-row positions, ragged like ``rows``.
+        group_ids: optional per-token document id per row, so that packed
+            documents cannot attend to each other.  None means every row is
+            a single document.
+
+    Returns:
+        ``(logits, valid)`` with shapes ``[B, S, V]`` and ``[B, S]``;
+        ``logits[i, p]`` predicts ``rows[i][p + 1]``, and ``valid`` marks the
+        real (non-padding) tokens.
+    """
+    n = len(rows)
+    max_len = max(len(r) for r in rows)
+    ids = torch.zeros(n, max_len, dtype=torch.long, device=device)
+    key_pad = torch.zeros(n, 1, 1, max_len, dtype=torch.bool, device=device)
+    for i, r in enumerate(rows):
+        ids[i, : len(r)] = torch.tensor(r, dtype=torch.long, device=device)
+        key_pad[i, 0, 0, : len(r)] = True
+
+    pos = None
+    if position_ids is not None:
+        pos = torch.zeros(n, max_len, dtype=torch.long, device=device)
+        for i, p in enumerate(position_ids):
+            pos[i, : len(p)] = torch.tensor(p, dtype=torch.long, device=device)
+
+    causal = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool, device=device))
+    mask = key_pad & causal
+    if group_ids is not None:
+        doc = torch.full((n, max_len), -1, dtype=torch.long, device=device)
+        for i, g in enumerate(group_ids):
+            doc[i, : len(g)] = torch.tensor(g, dtype=torch.long, device=device)
+        mask = mask & (doc[:, None, :, None] == doc[:, None, None, :])
+
+    with torch.inference_mode():
+        logits = model(ids, position_ids=pos, input_mask=mask)["logits"]
+    return logits, key_pad.squeeze(1).squeeze(1)
+
+
 def loglikelihood_batched(
     model,
     tokenizer,
@@ -192,43 +248,28 @@ def loglikelihood_batched(
     ``ctx_ids + cont_ids`` — callers must ensure the tokenization matches how
     the model saw such text in training (see lm-eval's _encode_pair caveat).
     """
-    all_inputs = []
-    for i, (ctx_ids, cont_ids) in enumerate(requests):
+    rows: List[List[int]] = []
+    starts: List[int] = []
+    for ctx_ids, cont_ids in requests:
         input_ids = ctx_ids + cont_ids
         if len(input_ids) > max_model_len:
-            overflow = len(input_ids) - max_model_len
-            input_ids = input_ids[overflow:]
-            ctx_len = len(input_ids) - len(cont_ids)
-        else:
-            ctx_len = len(ctx_ids)
-        all_inputs.append((i, input_ids, ctx_len, cont_ids))
+            input_ids = input_ids[len(input_ids) - max_model_len :]
+        rows.append(input_ids)
+        starts.append(len(input_ids) - len(cont_ids))
 
-    n = len(all_inputs)
-    max_len = max(len(x[1]) for x in all_inputs)
-    padded = torch.zeros(n, max_len, dtype=torch.long, device=device)
-    key_pad = torch.zeros(n, 1, 1, max_len, dtype=torch.bool, device=device)
-    for i, (_, ids, _, _) in enumerate(all_inputs):
-        padded[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-        key_pad[i, 0, 0, : len(ids)] = True
-
-    # Causality must ride the mask: a 2-D input_mask is read as key-padding
-    # only and flips use_sdpa_causal_mask to False in transformer.py, which
-    # lets the scored position attend to the continuation it is scoring.
-    causal = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool, device=device))
-    with torch.inference_mode():
-        logits = model(padded, input_mask=key_pad & causal)["logits"]
+    logits, _ = causal_sequence_logits(model, rows, device)
 
     scores = [0.0] * len(requests)
-    for i, (ri, _, ctx_len, cont_ids) in enumerate(all_inputs):
+    for i, (ids, start) in enumerate(zip(rows, starts)):
         score = 0.0
-        for j, tid in enumerate(cont_ids):
-            pos = ctx_len - 1 + j
-            if pos >= logits.size(1):
+        for j in range(len(ids) - start):
+            pos = start - 1 + j
+            if pos < 0 or pos >= logits.size(1):
                 break
             score += torch.nn.functional.log_softmax(logits[i, pos].float(), dim=-1)[
-                tid
+                ids[start + j]
             ].item()
-        scores[ri] = score
+        scores[i] = score
     return scores
 
 
