@@ -199,16 +199,27 @@ inline bool tma_encode(const TmaMapSpec& s, CUtensorMap* map) {
                                    rank3 ? s.batch_stride : (cuuint64_t)16};
     const cuuint32_t box[3] = {s.box0, s.box1, 1};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
-    const CUtensorMapSwizzle swz =
-        s.swizzle_bits == 3
-            ? CU_TENSOR_MAP_SWIZZLE_128B
-            : s.swizzle_bits == 2 ? CU_TENSOR_MAP_SWIZZLE_64B
-                                  : CU_TENSOR_MAP_SWIZZLE_NONE;
-    // Box inner extent must equal the swizzle span (128B/64B): the staging
-    // layouts are full-line swizzled.
-    if ((swz == CU_TENSOR_MAP_SWIZZLE_128B && s.box0 != 128) ||
-        (swz == CU_TENSOR_MAP_SWIZZLE_64B && s.box0 != 64))
-        return false;
+    // Hardware swizzle modes exist at 128B and 64B only. A staging layout
+    // narrower than that has no map to encode: one byte per element halves a
+    // line's chunk count, so kK=32 gives Swizzle<1, 3>. Degrading such a tile
+    // to SWIZZLE_NONE used to encode *successfully* while every fragment
+    // reader kept applying the layout's XOR — the two 16-element k-chunks of
+    // each row came out exchanged, silently (measured 2026-09-21: the W8A16
+    // and symmetric-fp8 kK=32 congruous tiles, max abs error ~0.7 on outputs
+    // of sigma ~0.1, while the cp.async twin of the same recipe was exact).
+    // Refuse the map instead, so the caller stages through that twin: it
+    // writes through the layout, and an absent [gemm-plan] tma=true line says
+    // so.
+    if (s.swizzle_bits != 3 && s.swizzle_bits != 2) return false;
+    const CUtensorMapSwizzle swz = s.swizzle_bits == 3
+                                       ? CU_TENSOR_MAP_SWIZZLE_128B
+                                       : CU_TENSOR_MAP_SWIZZLE_64B;
+    // The box's inner extent IS the swizzle span (16B << bits): these staging
+    // layouts are full-line swizzled. Redundant with the trait today — it
+    // derives both from one kBits — but the hand-built specs this layer once
+    // accepted could drift from what the fragments read, so the invariant
+    // stays stated (and cheap) at the encode boundary.
+    if (s.box0 != (16u << s.swizzle_bits)) return false;
     const CUresult r = fn(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank3 ? 3 : 2,
                           const_cast<void*>(s.ptr), dims, strides, box,
                           elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swz,

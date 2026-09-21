@@ -87,7 +87,7 @@ struct quant_in_traits<float> {
 namespace detail {
 
 // Shared pair body — only the converter's interpretation constant differs
-// per format (mirrors dequant.cuh's Fp8WidenPair).
+// per format.
 template <__nv_fp8_interpretation_t Fmt>
 struct Fp8PackPair {
     static __device__ __forceinline__ unsigned pack(float a, float b) {

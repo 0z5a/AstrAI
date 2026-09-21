@@ -52,8 +52,6 @@ def cli() -> None:
 COMBOS: dict[str, tuple[torch.dtype, torch.dtype]] = {
     "w16a16": (torch.bfloat16, torch.bfloat16),
     "w8a16": (torch.bfloat16, torch.int8),
-    "w8a16_f8e4m3": (torch.bfloat16, torch.float8_e4m3fn),
-    "w8a16_f8e5m2": (torch.bfloat16, torch.float8_e5m2),
     "w8a8": (torch.int8, torch.int8),
     "f8a8_e4m3": (torch.float8_e4m3fn, torch.float8_e4m3fn),
     "f8a8_e5m2": (torch.float8_e5m2, torch.float8_e5m2),
@@ -63,8 +61,6 @@ COMBOS: dict[str, tuple[torch.dtype, torch.dtype]] = {
 PERF_CLASS: dict[str, int] = {
     "w16a16": 0,
     "w8a16": 1,
-    "w8a16_f8e4m3": 1,
-    "w8a16_f8e5m2": 1,
     "w8a8": 2,
     "f8a8_e4m3": 3,
     "f8a8_e5m2": 3,

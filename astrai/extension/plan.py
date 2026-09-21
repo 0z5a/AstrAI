@@ -35,13 +35,11 @@ logger = logging.getLogger(__name__)
 
 # The staging width pair per dtype pair (the vocabulary keys on it); the
 # perf class itself always comes back from the probe. Keys are the torch
-# dtype pair spellings the wrapper sees; the fp8 pairs ride the 1-byte
-# ladders (bf16 x fp8 shares the 2B x 1B one).
+# dtype pair spellings the wrapper sees; the symmetric fp8 pairs ride the
+# 1-byte ladders.
 _WIDTHS_OF = {
     ("torch.bfloat16", "torch.bfloat16"): (2, 2),
     ("torch.bfloat16", "torch.int8"): (2, 1),
-    ("torch.bfloat16", "torch.float8_e4m3fn"): (2, 1),
-    ("torch.bfloat16", "torch.float8_e5m2"): (2, 1),
     ("torch.int8", "torch.int8"): (1, 1),
     ("torch.float8_e4m3fn", "torch.float8_e4m3fn"): (1, 1),
     ("torch.float8_e5m2", "torch.float8_e5m2"): (1, 1),

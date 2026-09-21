@@ -527,44 +527,6 @@ static bool test_dtype_combos() {
                                                         rscale);
     }
 
-    // W-F8A16 weight-only: bf16 activation x per-channel-scaled e4m3
-    // weight. The weight dequantizes in-register through the hardware
-    // fp8->fp16 widen + exact bf16 rounding; row 0 is seeded with exact
-    // zeros and subnormal-magnitude values (0.001 < 2^-6) so those paths
-    // are exercised, and the mirrored pair follows. Pinned big CTA at
-    // k=320 covers the Tile_128x128x64_W64x32_S2 instantiation the planner would not
-    // route 256x256 to.
-    {
-        using F8Big = GemmPolicy<__nv_bfloat16, __nv_fp8_e4m3, RowMajor,
-                                 ColMajor, Tile_128x128x64_W64x32_S2, RowMajor,
-                                 __nv_bfloat16>;
-        printf("W-F8A16 (bf16 act x e4m3 weight, all layouts):\n");
-        for (int k : {64, 320}) {
-            std::vector<float> ha, hb;
-            prep(ha, hb, 256, 256, k, 222 + k);
-            const std::vector<float> scale = div_row_scales(hb, 256, k, 448.f);
-            for (int j = 0; j < 16; ++j)
-                hb[j] = j < 8 ? 0.f : 0.001f;  // +0 and e4m3 subnormals
-            printf(" 256x256x%d:\n", k);
-            all &= check_all_layouts<__nv_bfloat16, __nv_fp8_e4m3>(
-                ha, hb, 256, 256, k, "w-f8a16", 0.02f, scale);
-            if (k == 320) {
-                all &= check_pinned<__nv_bfloat16, __nv_fp8_e4m3, F8Big>(
-                    ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-                    "w-f8a16 big 128x128", 0.02f, scale);
-            }
-        }
-        printf("A-F8W16 (e4m3 act x bf16 weight, all layouts):\n");
-        for (int k : {64, 320}) {
-            std::vector<float> ha, hb;
-            prep(ha, hb, 256, 256, k, 333 + k);
-            const std::vector<float> rscale = div_row_scales(ha, 256, k, 448.f);
-            printf(" 256x256x%d:\n", k);
-            all &= check_all_layouts<__nv_fp8_e4m3, __nv_bfloat16>(
-                ha, hb, 256, 256, k, "a-f8w16", 0.02f, {}, rscale);
-        }
-    }
-
     // fp32 output (OutT = float): one fixed narrow-CTA policy and one
     // production-planned route through the dtype-generic dispatch. The
     // narrow tile's 32KB output fits the 36KB reclaimed operand rings
@@ -682,7 +644,6 @@ static void bench_dtype_combos() {
         bench_combo<bf16_, bf16_>(s.m, s.n, s.k, "W16A16", 0, 0);
         bench_combo<bf16_, int8_t>(s.m, s.n, s.k, "W8A16", 0, 127.f);
         bench_combo<int8_t, int8_t>(s.m, s.n, s.k, "W8A8", 127.f, 127.f);
-        bench_combo<bf16_, __nv_fp8_e4m3>(s.m, s.n, s.k, "W-F8A16", 0, 448.f);
         bench_combo<__nv_fp8_e4m3, __nv_fp8_e4m3>(s.m, s.n, s.k, "F8A8 e4m3", 0, 0);
         bench_combo<__nv_fp8_e5m2, __nv_fp8_e5m2>(s.m, s.n, s.k, "F8A8 e5m2", 0, 0);
     }

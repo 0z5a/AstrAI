@@ -115,8 +115,6 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
     X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)      \
     X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                 \
     X(torch::kChar, int8_t, torch::kChar, int8_t)                            \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kFloat8_e4m3fn, __nv_fp8_e4m3) \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kFloat8_e5m2, __nv_fp8_e5m2)   \
     X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn,           \
       __nv_fp8_e4m3)                                                         \
     X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
@@ -125,12 +123,11 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
 // switch's own default carries it, so the non-void lookups cannot fall off
 // their end. The message names the operand dtypes it actually got instead of
 // a hardcoded list that can drift.
-#define ASTRAI_GEMM_UNSUPPORTED_PAIR(SA, SB)                               \
-    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(SA),    \
-                " x ", toString(SB),                                       \
-                ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "     \
-                "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or matching " \
-                "fp8 x fp8")
+#define ASTRAI_GEMM_UNSUPPORTED_PAIR(SA, SB)                            \
+    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(SA), \
+                " x ", toString(SB),                                    \
+                ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "  \
+                "bf16 x bf16 (W16A16), or matching fp8 x fp8")
 
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
 #define GEMM_CASE(SA, TA, SB, TB) \
@@ -270,7 +267,7 @@ GemmConfigState configure(const GemmConfigPatch& patch) {
 // Tile_<bm>x<bn>x<kk>_W<wm>x<wn>_S<stages> — the bench's own spelling —
 // which is how the Python tooling joins rows with dataset recipe strings
 // without keeping a second copy of the vocabulary. (2,1) covers the mixed
-// W8A16 / W-F8A16 classes, whose congruent staging runs the conservative
+// W8A16 class, whose congruent staging runs the conservative
 // ladder too (manifest_kind's fallback); (1,2) matches no supported pair.
 std::vector<std::vector<int>> tile_vocabulary() {
     const std::pair<int, int> widths[] = {{2, 2}, {2, 1}, {1, 1}};
@@ -302,8 +299,6 @@ std::vector<const char*> tile_class_names() {
 //   bf16 x bf16 (W16A16)        — no scales
 //   bf16 x int8 (W8A16)         — b_scale required
 //   int8 x int8 (W8A8)          — both scales required
-//   bf16 x fp8 (W-F8A16)        — b_scale optional (in-register hardware
-//                                  widen to the bf16 mma)
 //   fp8 x fp8, matching formats — both scales optional
 // Scale arity is validated per side: int8 requires its dequant scale, fp8
 // takes one optionally (per-tensor scalar or the operand's extent), bf16
