@@ -9,10 +9,13 @@ Public API:
       ``FlashAttnBackend`` — attention backend strategies
     - ``resolve`` / ``explain`` / ``op_backend`` / ``set_op`` — the shared
       operator dispatcher (see ``astrai.extension.dispatch``)
-    - ``set_table`` / ``set_planner`` / ``set_log`` / ``set_staging`` /
-      ``state`` / ``probe`` / ``facts`` / ``tile_vocabulary`` — the runtime
-      GEMM plan API (see ``astrai.extension.ops.gemm``); the deprecated
-      ``ASTR_*`` variables are one-time startup seeds
+    - ``plan`` — the runtime GEMM plan (`plan.config` / `plan.configure` /
+      ``plan.override`` / ``plan.probe`` / ``plan.facts`` / ``plan.tiles``);
+      the flat ``set_table`` / ``set_planner`` / ``set_log`` / ``set_staging``
+      / ``state`` / ``probe`` / ``facts`` / ``tile_vocabulary`` names are the
+      same bindings in their raw dict/list shapes (see
+      ``astrai.extension.ops.gemm``); the deprecated ``ASTR_*`` variables are
+      one-time startup seeds
 
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 (blhd). Scale is always ``1/sqrt(head_dim)``. Wrapper functions call their
@@ -60,7 +63,6 @@ from astrai.extension.ops import (
     attn_prefill,
 )
 from astrai.extension.ops.gemm import (
-    PLANNER_MODES,
     facts,
     inject_rows,
     probe,
@@ -71,6 +73,7 @@ from astrai.extension.ops.gemm import (
     state,
     tile_vocabulary,
 )
+from astrai.extension.plan import PLANNER_MODES
 
 __all__ = [
     "ATTN_BACKEND",
@@ -106,8 +109,10 @@ __all__ = [
     "resolve_plan",
     "tensor_axes",
     "PLANNER_MODES",
+    "plan",
     "facts",
     "inject_rows",
+    "plan",
     "probe",
     "set_log",
     "set_planner",

@@ -72,10 +72,13 @@ py::dict probe_dict(const PlanProbe& r) {
 py::dict config_dict(const GemmConfigState& s) {
     py::dict d, table, staging;
     d["planner"] = s.planner;
+    d["planner_mode"] = s.planner_mode;
     d["log"] = s.log;
-    table["mode"] = s.table_mode;
+    table["off"] = s.table_off;
     table["override_rows"] = s.override_rows;
+    table["override_source"] = s.override_source;
     table["injected_rows"] = s.injected_rows;
+    table["injected_source"] = s.injected_source;
     d["table"] = table;
     staging["tma"] = s.staging_tma;
     staging["mx"] = s.staging_mx;
@@ -96,9 +99,11 @@ py::dict facts_dict() {
 }
 
 // py::None -> "absent"; a str planner is the binding's spelling of the mode
-// (int accepted too, with the range check left to configure()).
-GemmConfigPatch patch_from(py::object table, py::object planner, py::object log,
-                           py::object staging) {
+// ("" = back to unset, int accepted too, with the range check left to
+// configure()); a str tier names the row tier `rows` addresses.
+GemmConfigPatch patch_from(py::object planner, py::object log, py::object tma,
+                           py::object mx, py::object table_off,
+                           py::object rows, py::object tier) {
     GemmConfigPatch patch;
     if (!planner.is_none()) {
         if (py::isinstance<py::str>(planner)) {
@@ -121,12 +126,20 @@ GemmConfigPatch patch_from(py::object table, py::object planner, py::object log,
         }
     }
     if (!log.is_none()) patch.log = log.cast<bool>();
-    if (!staging.is_none()) {
-        py::dict s = staging.cast<py::dict>();
-        if (s.contains("tma")) patch.staging_tma = s["tma"].cast<bool>();
-        if (s.contains("mx")) patch.staging_mx = s["mx"].cast<bool>();
+    if (!tma.is_none()) patch.staging_tma = tma.cast<bool>();
+    if (!mx.is_none()) patch.staging_mx = mx.cast<bool>();
+    if (!table_off.is_none()) patch.table_off = table_off.cast<bool>();
+    if (!rows.is_none()) patch.rows = rows.cast<std::string>();
+    if (!tier.is_none()) {
+        const std::string name = tier.cast<std::string>();
+        if (name == "override")
+            patch.tier = RowTier::Override;
+        else if (name == "injected")
+            patch.tier = RowTier::Injected;
+        else
+            throw std::invalid_argument(
+                "tier must be 'override' or 'injected', got '" + name + "'");
     }
-    if (!table.is_none()) patch.table = table.cast<std::string>();
     return patch;
 }
 
@@ -136,9 +149,11 @@ py::dict probe_binding(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
     return probe_dict(plan_probe(m, n, k, dt_a, dt_b, trans_a, trans_b, batch));
 }
 
-py::dict configure_binding(py::object table, py::object planner, py::object log,
-                           py::object staging) {
-    return config_dict(configure(patch_from(table, planner, log, staging)));
+py::dict configure_binding(py::object planner, py::object log, py::object tma,
+                           py::object mx, py::object table_off,
+                           py::object rows, py::object tier) {
+    return config_dict(
+        configure(patch_from(planner, log, tma, mx, table_off, rows, tier)));
 }
 
 py::dict config_state_binding() { return config_dict(config_state()); }
@@ -163,8 +178,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("inject_plan_rows", &astrai::gemm::inject_plan_rows,
           py::arg("source"));
     m.def("configure", &astrai::gemm::configure_binding,
-          py::arg("table") = py::none(), py::arg("planner") = py::none(),
-          py::arg("log") = py::none(), py::arg("staging") = py::none());
+          py::arg("planner") = py::none(), py::arg("log") = py::none(),
+          py::arg("tma") = py::none(), py::arg("mx") = py::none(),
+          py::arg("table_off") = py::none(), py::arg("rows") = py::none(),
+          py::arg("tier") = py::none());
     m.def("config_state", &astrai::gemm::config_state_binding);
     m.def("tile_class_names", &astrai::gemm::tile_class_names);
     m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary);

@@ -10,7 +10,7 @@ growth, and the per-device persistence roundtrip.
 import pytest
 import torch
 
-from astrai.extension.ops.gemm import (
+from astrai.extension.plan import (
     GemmAutotuner,
     Row,
     _problem_key,
@@ -82,11 +82,14 @@ class FakeGemm:
     def config_state(self):
         return {
             "planner": "table",
+            "planner_mode": 0,
             "log": False,
             "table": {
-                "mode": "rows",
+                "off": False,
                 "override_rows": self.override_rows,
+                "override_source": "",
                 "injected_rows": 0,
+                "injected_source": "",
             },
             "staging": {"tma": True, "mx": True},
         }

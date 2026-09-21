@@ -21,8 +21,8 @@ layered directory:
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
-| `gemm/plan_table.h` | The row vocabulary and its chain: `TableRow` (band + recipe + optional gates), the `RowSource` containers, the `GemmConfig` runtime state, the empty-by-default per-class tables (`kBuiltinPlanW16A16`/`W8A16`/`W8A8`/`F8A8` — a device-specific build pastes rows in) and the degraded ladder that ends every chain. The planners themselves (`RowSetPlanner`, `ModelPlanner`) live in `gemm.cuh` |
-| `gemm/api.h` | The family's C++ surface — declarations only, and template-free so including it instantiates no dtype-pair kernel: `quant_gemm_impl` (the one GEMM entry), the planner face (`PlanProbe` + `plan_probe`, `inject_plan_rows`, `GemmConfigPatch` / `GemmConfigState` + `configure` / `config_state`) and the vocabulary (`tile_vocabulary` / `tile_class_names`). No Python type in a signature — the composed fp8 linear and the bindings TU call the same functions |
+| `gemm/plan_table.h` | The row vocabulary and its chain: `TableRow` (band + recipe + optional gates), the `RowSource` containers (each remembering the spec it was installed from — what makes the config state re-installable), the `GemmConfig` runtime state, the empty-by-default per-class tables (`kBuiltinPlanW16A16`/`W8A16`/`W8A8`/`F8A8` — a device-specific build pastes rows in) and the degraded ladder that ends every chain. The planners themselves (`RowSetPlanner`, `ModelPlanner`) live in `gemm.cuh` |
+| `gemm/api.h` | The family's C++ surface — declarations only, and template-free so including it instantiates no dtype-pair kernel: `quant_gemm_impl` (the one GEMM entry), the planner face (`PlanProbe` + `plan_probe`, `inject_plan_rows`, `GemmConfigPatch` — `rows` + `tier` (`RowTier`) + `table_off` + the mode/log/staging knobs — with the re-installable `GemmConfigState`, through `configure` / `config_state`) and the vocabulary (`tile_vocabulary` / `tile_class_names`). No Python type in a signature — the composed fp8 linear and the bindings TU call the same functions |
 | `gemm/gemm.cu` | The typed host layer: the dtype-pair registry (`ASTRAI_GEMM_PAIRS`, one entry feeding both the `gemm_dispatch` and the `plan_probe_for` lookup; one extern-template declaration per pair, which is what keeps this TU from re-instantiating them) plus the `api.h` implementations. Holds no `py::` type |
 | `gemm/fp8_linear.cu` | The composed fp8 training linear (forward *and* backward) in one C++ `autograd::Function`, so only one entry call stays in Python; its per-call state machine (rings, weight cast cache, checkpoint snapshot) is `fp8_state.cuh` |
 | `gemm/bindings.cu` | The pybind surface of the module: None-tolerant argument marshalling, the dict shapes the Python tooling reads (one key list per struct — that contract lives here, spelled once) and `PYBIND11_MODULE` → module `gemm` |
@@ -427,37 +427,56 @@ output.
 ## Runtime plan autotuning (ops.gemm)
 
 The planner the launch path uses is configured at runtime from Python —
-**no rebuild, no environment variable**. Everything lives in
-`astrai.extension.ops.gemm` (the gemm adapter) and is re-exported from
-`astrai.extension`:
+**no rebuild, no environment variable**. The surface is
+`astrai.extension.plan` (the gemm family's policy module) and it is
+re-exported from `astrai.extension`; the flat `set_*` / `state` / `probe` /
+`facts` / `tile_vocabulary` views over the same bindings stay in
+`astrai.extension.ops.gemm` (their raw dict/list shapes are what the
+`csrc/bench` tools parse). It is one value, one writer and one scope:
 
 ```python
-from astrai.extension import ops
-ops.gemm.set_planner("hybrid")        # "table" | "hybrid" | "model" (default: hybrid)
-ops.gemm.set_table("rows.txt")         # a row file, inline text, or "-"
-ops.gemm.set_log(True)                 # the [gemm-plan] decision log
-ops.gemm.set_staging(tma=False)        # the A/B staging switches
-ops.gemm.probe(512, 11008, 4096)       # the decision + who made it
-ops.gemm.state()                       # the effective configuration
-ops.gemm.tile_vocabulary()             # the recipe vocabulary (with geometry)
-ops.gemm.facts()                       # the DeviceFacts geometry
+from astrai.extension import plan
+
+plan.config                            # the whole configuration, as a value
+plan.configure(planner="hybrid")       # "table" | "hybrid" | "model" | "" (unset)
+plan.configure(rows="rows.txt", tier="override")   # a row file or inline text
+plan.configure(rows="", tier="injected")           # clear that tier
+plan.configure(table_off=True)         # every row tier off at once
+plan.configure(log=True, tma=False)    # the decision log; the A/B staging switches
+plan.probe(512, 11008, 4096)           # the decision + who made it
+plan.facts                             # the DeviceFacts geometry
+plan.tiles()                           # the recipe vocabulary, with class names
+
+with plan.override(planner="model", rows="", tier="override"):
+    ...                                # restored on exit — knobs *and* rows
 ```
 
-`probe` returns the decision `gemm_dispatch` would make, with the planner
-that made it: `"override"` (rows from `set_table`), `"injected"` (rows from
-`inject_rows`, ranked below override and above the compiled-in table),
-`"builtin"`, `"model"` (the analytical planner), or `"degraded"` (the
-band ladder).
+`configure` leaves every argument it is not given alone and returns the
+resulting value, so a saved `config` is re-installable: feeding its fields
+back restores exactly that state (each row tier carries the source spec it
+was installed from, and a plain `override(...)` block does this for you —
+including when the block raises). The records answer to the old idioms too
+(`cfg["staging"]["tma"]`, `tile[3]`, 12-tuple unpacking), and the flat
+`set_table` / `set_planner` / `set_log` / `set_staging` / `state` / `probe` /
+`facts` / `tile_vocabulary` names remain as the same bindings in their raw
+dict/list shapes — the four `csrc/bench` tools parse those keys, so those
+spellings are contract.
+
+`plan.probe` returns the decision `gemm_dispatch` would make, with the
+planner that made it: `"override"` (rows from the override tier),
+`"injected"` (rows from the injected tier, ranked below override and above
+the compiled-in table), `"builtin"`, `"model"` (the analytical planner), or
+`"degraded"` (the band ladder).
 
 The planners compose as a chain — override rows, injected rows, the
 compiled-in table, the analytical model, the degraded bands — and the mode
-above only picks which chain runs; `set_table("-")` disables every row tier
-at once. The shipped default is **hybrid with the compiled-in tables
+above only picks which chain runs; `configure(table_off=True)` disables every
+row tier at once. The shipped default is **hybrid with the compiled-in tables
 empty**, so a fresh process answers with the analytical model and takes
-measured recipes from `set_table` or the autotuner cache; a measured row is
+measured recipes from the override tier or the autotuner cache; a measured row is
 only shipped when a device-specific build pastes one in (measured 2026-09-14
 on sm_120: the previous W16A16 rows were +4.3% behind the degraded ladder
-across a holdout, six shapes past +2%). `set_planner("")` restores the
+across a holdout, six shapes past +2%). `configure(planner="")` restores the
 default instead of pinning a mode. The retired `ASTR_GEMM_*` environment
 variables are still read once per process as a migration seed; explicit
 API calls win.

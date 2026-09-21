@@ -73,10 +73,25 @@ int inject_plan_rows(const std::string& source);
 // tri-state: absent leaves the knob unchanged, an explicit value wins over the
 // one-time env seed. The pybind layer maps None to "absent".
 // ---------------------------------------------------------------------------
+
+// Which row tier a `rows` patch addresses. The tiers rank in this order at
+// lookup — override (the experimenter's) beats injected (the autotuner's)
+// beats the compiled-in tables — so a user table always wins over a tuned
+// winner.
+enum class RowTier : int {
+    Override = 0,
+    Injected = 1,
+};
+
 struct GemmConfigPatch {
-    // "" clears the override rows (every tier back on), "-" turns every row
-    // tier off, anything else is a row-file path or inline row text.
-    c10::optional<std::string> table;
+    // Row spec: a row-file path, or inline row text (one row per line:
+    // m_min m_max n_min n_max perf_class crosswise cta stages raster [kk]).
+    // The empty string clears that tier; absent leaves both tiers alone.
+    c10::optional<std::string> rows;
+    c10::optional<RowTier> tier;  // which tier `rows` addresses
+    // Every row tier off: the rows are skipped entirely and the planner chain
+    // falls through to its model/degraded end.
+    c10::optional<bool> table_off;
     // 0/1/2 = table / hybrid / model; -1 restores the unset state, where the
     // env seed decides (hybrid is what an unseeded process resolves to).
     c10::optional<int> planner_mode;
@@ -87,12 +102,19 @@ struct GemmConfigPatch {
     c10::optional<bool> staging_mx;
 };
 
+// The whole configuration as a value: configure(patch) returns it, and feeding
+// its fields back re-installs exactly this state — each row tier rides the
+// source spec it was installed from, so save/restore round-trips in one call.
 struct GemmConfigState {
-    std::string planner;     // planner mode name
-    bool log = false;
-    std::string table_mode;  // "rows" | "off"
+    std::string planner;    // the resolved planner mode name
+    int planner_mode = -1;  // the raw knob: -1 = unset (the env seed decides)
     int override_rows = 0;
     int injected_rows = 0;
+    std::string override_source;  // what that tier was last installed from
+    std::string injected_source;
+
+    bool log = false;
+    bool table_off = false;
     bool staging_tma = true;
     bool staging_mx = true;
 };

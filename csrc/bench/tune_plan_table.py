@@ -37,7 +37,8 @@ import torch
 
 from astrai.extension import is_available, ops
 from astrai.extension.loader import get_module
-from astrai.extension.ops.gemm import device_signature, quant_gemm
+from astrai.extension.ops.gemm import quant_gemm
+from astrai.extension.plan import Tile, device_signature
 
 
 @click.group(help=__doc__)
@@ -79,9 +80,10 @@ PERF_CLASS: dict[str, int] = {
 # the extension returns, per staging pair, every dispatch key the ladders
 # carry in dispatch (manifest) order, deduped by its own first-match rule —
 # the same rule dispatch_tile applies — so this file cannot disagree with
-# policy.cuh's manifests. Names are reconstructed from a row's own numbers
-# (Tile_<bm>x<bn>x<kk>_W<wm>x<wn>_S<stages>, the bench's spelling), which is
-# how dataset recipe strings join without a second mapping.
+# policy.cuh's manifests. Names come from the vocabulary record itself
+# (``Tile.name``, whose spelling the bench emits on the C++ side), which is
+# how dataset recipe strings join without a second mapping — and without a
+# second spelling of the format.
 # ---------------------------------------------------------------------------
 
 # Operand widths per GemmPerfClass id: W16A16 / W8A16 / W8A8 / F8A8.
@@ -127,8 +129,9 @@ def _binding_vocabulary():
     }
     class_of: dict[tuple[int, int], int] = {}
     for row in ops.gemm.tile_vocabulary():
-        cw, ba, bb, cta, stages, kk, bm, bn, wm, wn, _threads, _smem = row
-        name = f"Tile_{bm}x{bn}x{kk}_W{wm}x{wn}_S{stages}"
+        tile = Tile(*row)  # a record that still unpacks like its row
+        cw, ba, bb, cta, _stages, _kk, bm, bn, _wm, _wn, _threads, _smem = tile
+        name = tile.name
         ladder = (
             "TileManifestCross"
             if cw

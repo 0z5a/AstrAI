@@ -368,17 +368,28 @@ inline int parse_plan_table_text(const std::string& text, const char* label,
 // lookups copy the row out under the mutex — a concurrent install therefore
 // cannot dangle a pointer a launched plan still holds (installs happen
 // during serving warmups). Two mutable instances exist: the override source
-// (the plan.set_table / configure channel, which outranks everything) and
-// the injected source (the autotuner's measured winners, via the
-// inject_plan_rows binding); the builtin and degraded tiers read static
-// rows and need no container.
+// (the configure rows channel, which outranks everything) and the injected
+// source (the autotuner's measured winners, via the inject_plan_rows
+// binding); the builtin and degraded tiers read static rows and need no
+// container.
+//
+// `source` is the spec the rows were last installed from (a row-file path or
+// inline row text) — kept so the config state can hand back a value that
+// re-installs them exactly. TableRow carries gates (k bands, occupancy
+// floors) the text format cannot express, so re-emitting parsed rows would
+// be lossy.
 class RowSource {
 public:
-    void set(std::vector<TableRow> rows) {
+    void set_from(std::string source, std::vector<TableRow> rows) {
         std::lock_guard<std::mutex> g(mutex_);
         rows_ = std::move(rows);
+        source_ = std::move(source);
     }
-    void clear() { set({}); }
+    void clear() { set_from({}, {}); }
+    std::string source() const {
+        std::lock_guard<std::mutex> g(mutex_);
+        return source_;
+    }
     std::optional<TableRow> lookup(const PlanQuery& q) const {
         std::lock_guard<std::mutex> g(mutex_);
         const TableRow* row =
@@ -394,6 +405,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::vector<TableRow> rows_;
+    std::string source_;
 };
 
 inline RowSource& plan_table_override_source() {
@@ -465,7 +477,7 @@ inline void gemm_config_seed_once() {
             } else {
                 std::vector<TableRow> rows;
                 if (parse_plan_table_file(v, rows))
-                    plan_table_override_source().set(std::move(rows));
+                    plan_table_override_source().set_from(v, std::move(rows));
             }
         }
         return true;

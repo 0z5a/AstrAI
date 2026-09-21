@@ -187,31 +187,50 @@ PlanProbe plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
     return r;
 }
 
-int inject_plan_rows(const std::string& source) {
+namespace {
+
+// Install one row tier from a spec (a row-file path when one opens, else
+// inline row text) and remember the spec, so the config state can hand back a
+// value that re-installs it. `label` is what a parse error reports.
+int install_rows(RowSource& tier, const char* label, const std::string& source) {
     std::vector<TableRow> rows;
     if (!parse_plan_table_file(source, rows))
-        parse_plan_table_text(source, "injected rows", rows);
+        parse_plan_table_text(source, label, rows);
     const int installed = (int)rows.size();
-    plan_table_injected_source().set(std::move(rows));
+    tier.set_from(source, std::move(rows));
     return installed;
 }
 
+RowSource& row_tier(RowTier tier) {
+    return tier == RowTier::Injected ? plan_table_injected_source()
+                                     : plan_table_override_source();
+}
+
+}  // namespace
+
+int inject_plan_rows(const std::string& source) {
+    return install_rows(plan_table_injected_source(), "injected rows", source);
+}
+
 // ---------------------------------------------------------------------------
-// Runtime configuration: the backing of astrai.extension.plan. Every knob
-// is tri-state — an absent patch field leaves it unchanged, an explicit value
-// wins over the one-time env seed. `table` accepts a row-file path, inline row
-// text, "-" (every row tier off) or "" (clear the override rows, tiers back
-// on). `staging` keys are positive enables: tma=false forces cp.async staging,
-// mx=false knocks the sm_120a block-scale cell out (the A/B knobs).
+// Runtime configuration: the backing of astrai.extension.plan. Every knob is
+// tri-state — an absent patch field leaves it unchanged, an explicit value wins
+// over the one-time env seed. Rows are addressed by tier (`rows` + `tier`), the
+// all-tiers-off switch is its own field, and the staging keys are positive
+// enables: tma=false forces cp.async staging, mx=false knocks the sm_120a
+// block-scale cell out (the A/B knobs).
 // ---------------------------------------------------------------------------
 
 GemmConfigState config_state() {
     GemmConfigState s;
-    s.planner = kPlannerModeNames[gemm_planner_mode()];
+    s.planner = kPlannerModeNames[gemm_planner_mode()];  // resolves unset
+    s.planner_mode = gemm_config().planner.load(std::memory_order_relaxed);
     s.log = gemm_plan_log_enabled();
-    s.table_mode = gemm_table_off() ? "off" : "rows";
+    s.table_off = gemm_table_off();
     s.override_rows = (int)plan_table_override_source().size();
+    s.override_source = plan_table_override_source().source();
     s.injected_rows = (int)plan_table_injected_source().size();
+    s.injected_source = plan_table_injected_source().source();
     s.staging_tma = !gemm_tma_staging_disabled();
     s.staging_mx = !gemm_mx_cell_disabled();
     return s;
@@ -222,15 +241,7 @@ GemmConfigState configure(const GemmConfigPatch& patch) {
     if (patch.planner_mode.has_value()) {
         const int mode = *patch.planner_mode;
         if (mode < -1 || mode >= kPlannerModeCount)
-            throw std::invalid_argument("planner mode must be 0..2");
-        if (mode == -1) {
-            // "" from the binding: back to "unset", where the env seed decides
-            // (hybrid is what an unseeded process resolves to). This returns
-            // early and skips the rest of the patch — the binding's
-            // long-standing one-knob reset, kept verbatim.
-            gemm_config().planner = -1;
-            return config_state();
-        }
+            throw std::invalid_argument("planner mode must be -1..2");
         gemm_config().planner = mode;
     }
     if (patch.log.has_value())
@@ -239,19 +250,17 @@ GemmConfigState configure(const GemmConfigPatch& patch) {
         gemm_config().tma_disabled = *patch.staging_tma ? 0 : 1;
     if (patch.staging_mx.has_value())
         gemm_config().mx_disabled = *patch.staging_mx ? 0 : 1;
-    if (patch.table.has_value()) {
-        const std::string& source = *patch.table;
-        if (source == "-") {
-            gemm_config().table_off = 1;
-        } else if (source.empty()) {
-            gemm_config().table_off = 0;
-            plan_table_override_source().clear();
+    if (patch.table_off.has_value())
+        gemm_config().table_off = *patch.table_off ? 1 : 0;
+    if (patch.rows.has_value()) {
+        const RowTier which = patch.tier.value_or(RowTier::Override);
+        if (patch.rows->empty()) {
+            row_tier(which).clear();
         } else {
-            gemm_config().table_off = 0;
-            std::vector<TableRow> rows;
-            if (!parse_plan_table_file(source, rows))
-                parse_plan_table_text(source, "override rows", rows);
-            plan_table_override_source().set(std::move(rows));
+            install_rows(row_tier(which),
+                         which == RowTier::Injected ? "injected rows"
+                                                    : "override rows",
+                         *patch.rows);
         }
     }
     return config_state();

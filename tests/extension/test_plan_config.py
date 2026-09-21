@@ -7,10 +7,12 @@ first classes cover; the analytical planner's own selection RULE is
 covered by TestModelRule below.
 """
 
+import re
+
 import pytest
 import torch
 
-from astrai.extension import ops
+from astrai.extension import ops, plan
 from astrai.extension.loader import is_available
 
 pytestmark = [
@@ -276,3 +278,143 @@ class TestModelRule:
                 f"{shape}: picked {picked} with cost {by_recipe[picked]}, "
                 f"the best is {min(by_recipe.values())}"
             )
+
+
+class TestPlanFacade:
+    """The ``plan`` value API over the same bindings the flat names call."""
+
+    def test_config_agrees_with_the_wire(self):
+        cfg = plan.config
+        wire = ops.gemm.state()
+        assert cfg.planner == wire["planner"]
+        assert cfg.planner_mode == wire["planner_mode"]
+        assert cfg.log == wire["log"]
+        assert cfg.table_off == wire["table"]["off"]
+        assert cfg.override_rows == wire["table"]["override_rows"]
+        assert cfg.override_source == wire["table"]["override_source"]
+        assert cfg.staging.tma == wire["staging"]["tma"]  # the sub-record
+        assert cfg["staging"]["mx"] == wire["staging"]["mx"]  # still a mapping
+
+    def test_configure_returns_the_new_value(self):
+        after = plan.configure(planner="model", log=True)
+        assert after.planner == "model" and after.log is True
+        assert plan.config.planner == "model"
+
+    def test_configure_rejects_unknown_spellings(self):
+        with pytest.raises(ValueError):
+            plan.configure(planner="nope")
+        with pytest.raises(ValueError):
+            plan.configure(rows=ROW, tier="middle")
+
+    def test_planner_reset_does_not_skip_the_rest_of_the_patch(self):
+        # A planner reset ("" -> unset) applies the rest of the patch too:
+        # the early return the old binding had is gone, which is what makes
+        # a saved config fully re-installable in one call.
+        plan.configure(planner="model", log=True)
+        after = plan.configure(planner="", log=False)
+        assert after.planner_mode == -1 and after.log is False
+        assert after.planner == "hybrid"  # unset resolves to the shipped default
+
+    def test_override_restores_knobs_and_rows(self):
+        ops.gemm.set_table(ROW)  # a tier the block must bring back
+        plan.configure(planner="model", tma=False)
+        before = plan.config
+        with plan.override(
+            planner="table", tma=True, rows="", tier="override"
+        ) as inside:
+            assert inside.planner == "table" and inside.staging.tma is True
+            assert inside.override_rows == 0
+        after = plan.config
+        assert after == before, "the block must restore the exact prior state"
+
+    def test_override_restores_on_exception(self):
+        before = plan.config
+        with pytest.raises(RuntimeError):
+            with plan.override(planner="table", mx=False):
+                raise RuntimeError("boom")
+        assert plan.config == before
+
+    def test_saved_config_reinstalls_in_one_call(self):
+        ops.gemm.set_table(ROW)
+        plan.configure(planner="table", log=True, tma=False)
+        saved = plan.config
+        plan.configure(planner="model", log=False, tma=True, rows="", tier="override")
+        restored = plan.configure(
+            planner=saved.planner_mode,
+            log=saved.log,
+            tma=saved.staging.tma,
+            mx=saved.staging.mx,
+            table_off=saved.table_off,
+            rows=saved.override_source,
+            tier="override",
+        )
+        assert restored == saved
+
+    def test_rows_address_the_tier(self):
+        # The injected tier sits below the override one, so the same row
+        # reports a different source depending on which is installed.
+        plan.configure(rows=ROW, tier="injected")
+        assert plan.config.injected_rows == 1
+        assert plan.config.override_rows == 0
+        assert ops.gemm.probe(*SHAPE)["source"] == "injected"
+        plan.configure(rows=ROW, tier="override")
+        assert ops.gemm.probe(*SHAPE)["source"] == "override"
+
+    def test_probe_facts_tiles_are_records(self):
+        info = plan.probe(*SHAPE)
+        assert info.source == info["source"]
+        assert isinstance(info.cta, int)
+        assert plan.facts.cc == ops.gemm.facts()["cc"]
+        tiles = plan.tiles()
+        raw = ops.gemm.tile_vocabulary()
+        assert len(tiles) == len(raw)
+        first = tiles[0]
+        assert first[3] == first.cta  # row[3] still the CTA class
+        crosswise, ba, bb, cta, stages, kk, bm, bn, wm, wn, threads, smem = first
+        assert (crosswise, ba, bb, cta) == tuple(raw[0][:4])
+        assert first.cta_name and first.name.startswith("Tile_")
+        assert first.name.endswith(f"_S{stages}")
+
+
+class TestCrossLanguageSpellings:
+    """The two formats Python writes and C++ reads: the bench's ``Tile_...``
+    names and the plan-row text. Both are pinned here, so a drift fails in
+    the suite instead of surfacing as a bad join in a sweep."""
+
+    # The reader the tools run over the bench's names (tune_plan_table).
+    _NAME_RE = re.compile(r"Tile_(\d+)x(\d+)x(\d+)_W(\d+)x(\d+)_S(\d+)")
+
+    def test_tile_name_spells_the_record(self):
+        for tile in plan.tiles():
+            assert tile.name == (
+                f"Tile_{tile.bm}x{tile.bn}x{tile.kk}"
+                f"_W{tile.wm}x{tile.wn}_S{tile.stages}"
+            ), tile
+
+    def test_tile_name_reads_back_as_its_recipe(self):
+        for tile in plan.tiles():
+            m = self._NAME_RE.fullmatch(tile.name)
+            assert m, tile.name
+            assert tuple(int(part) for part in m.groups()) == (
+                tile.bm,
+                tile.bn,
+                tile.kk,
+                tile.wm,
+                tile.wn,
+                tile.stages,
+            ), tile
+
+    def test_row_text_means_the_same_to_the_planner(self):
+        # A row spelled in Python must make the C++ planner pick exactly that
+        # recipe: install it, ask who serves the band, and check the answer
+        # echoes the numbers the text carried (the record keeps the spelling
+        # in step with the vocabulary, so the row is legal by construction).
+        tile = next(t for t in plan.tiles() if (t.crosswise, t.ba, t.bb) == (0, 2, 2))
+        ops.gemm.set_table(f"511 513 8191 0 0 0 {tile.cta} {tile.stages} 0 {tile.kk}")
+        picked = plan.probe(*SHAPE)
+        assert picked.source == "override"
+        assert (picked.cta, picked.stages, picked.kk) == (
+            tile.cta,
+            tile.stages,
+            tile.kk,
+        )

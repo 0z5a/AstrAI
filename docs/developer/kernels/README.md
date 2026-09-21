@@ -133,13 +133,15 @@ policy:
 astrai/extension/
 ├── __init__.py             # Stable public API
 ├── loader.py               # Optional compiled-module discovery and loading
-├── ops/
+├── dispatch.py             # The shared operator dispatcher (resolve/explain/set_op)
+├── plan.py                 # The GEMM plan: config / configure / override / probe / facts /
+│                           #   tiles + the runtime autotuner (policy, not marshalling)
+├── quantize.py             # FP8/int8 strategy layer (fp8_autocast, recipes, quantizers)
+├── ops/                    # Stateless kernel wrappers — one adapter per compiled module
 │   ├── attention.py        # Stateless attention kernel wrappers
-│   ├── rotary.py           # Stateless rotary kernel wrapper
-│   ├── fp8.py              # Stateless FP8 primitives (custom_op)
-│   └── gemm.py             # Stateless quantized-GEMM wrapper + autotune hook
-├── gemm_autotune.py        # Runtime plan-row autotuner (see below)
-├── fp8.py                  # FP8 strategy layer (fp8_autocast, recipes)
+│   ├── quantize.py         # Stateless FP8 primitive wrappers
+│   ├── gemm.py             # quant_gemm + the flat plan views (set_*/state/probe, raw shapes)
+│   └── rotary.py           # Stateless rotary kernel wrapper
 └── backend/
     ├── attention.py        # Backend selection, KV cache I/O, and fallback
     └── rotary.py           # Per-call CUDA/torch rotary dispatch
