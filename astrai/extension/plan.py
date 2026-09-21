@@ -262,6 +262,10 @@ def configure(
 ) -> PlanConfig:
     """Apply a patch; returns the resulting configuration.
 
+    Every argument defaults to "leave it alone", and only the ones given ride
+    the patch: the binding takes a dict keyed by these names, so an unset
+    argument is an absent key rather than a second spelling of "no change".
+
     ``planner`` is a mode name, an int, or ``""`` to restore the unset state
     (the env seed decides). ``rows`` is a row-file path or inline row text;
     the empty string clears the tier named by ``tier`` (``"override"``, the
@@ -271,14 +275,17 @@ def configure(
         raise ValueError(f"tier must be one of {ROW_TIERS}, got {tier!r}")
     if isinstance(planner, str) and planner and planner not in PLANNER_MODES:
         raise ValueError(f"planner must be one of {PLANNER_MODES}, got {planner!r}")
+    patch = {
+        "planner": planner,
+        "log": log,
+        "tma": tma,
+        "mx": mx,
+        "table_off": table_off,
+        "rows": str(rows) if isinstance(rows, Path) else rows,
+        "tier": tier,
+    }
     wire = get_module("gemm").configure(
-        planner=planner,
-        log=log,
-        tma=tma,
-        mx=mx,
-        table_off=table_off,
-        rows=str(rows) if isinstance(rows, Path) else rows,
-        tier=tier,
+        {key: value for key, value in patch.items() if value is not None}
     )
     return PlanConfig._of(wire)
 
@@ -370,6 +377,11 @@ DEFAULT_MAX_SHAPES = 32
 DEFAULT_TRIGGER = 3
 _MEASURE_TRIALS = 5
 _MEASURE_WARMUP = 3
+
+# The config-patch schema the binding must speak (its own CONFIG_API attr).
+# A stale .so is otherwise indistinguishable from a current one: its
+# ``configure`` exists, it just takes keywords instead of a patch dict.
+_CONFIG_API = 2
 
 
 @dataclass(frozen=True)
@@ -502,14 +514,18 @@ class GemmAutotuner:
         mod = self._gemm()
         needed = (
             "plan_probe",
-            "inject_plan_rows",
+            "configure",
+            "config_state",
             "tile_vocabulary",
             "device_facts_info",
         )
-        if not all(hasattr(mod, name) for name in needed):
+        if not all(hasattr(mod, name) for name in needed) or (
+            getattr(mod, "CONFIG_API", 1) < _CONFIG_API
+        ):
             logger.warning(
-                "gemm extension lacks the autotune bindings; "
-                "rebuild with CSRC_KERNELS=true to enable the autotuner"
+                "gemm extension lacks the autotune bindings (or predates the "
+                "plan's config patch schema); rebuild with CSRC_KERNELS=true "
+                "to enable the autotuner"
             )
             return False
         table = mod.config_state()["table"]
@@ -689,12 +705,16 @@ class GemmAutotuner:
         return out
 
     def _install(self) -> None:
-        text = "\n".join(r.text() for r in self._rows + self._base_rows)
-        self._gemm().inject_plan_rows(text)
+        self._install_rows("\n".join(r.text() for r in self._rows + self._base_rows))
 
     def _install_one(self, row: Row) -> None:
         """Force one candidate: it alone in front, nothing else to shadow it."""
-        self._gemm().inject_plan_rows(row.text())
+        self._install_rows(row.text())
+
+    def _install_rows(self, text: str) -> None:
+        """Install rows at the injected tier — below any user override, above
+        the compiled-in tables."""
+        self._gemm().configure({"rows": text, "tier": "injected"})
 
     def _tune(
         self,

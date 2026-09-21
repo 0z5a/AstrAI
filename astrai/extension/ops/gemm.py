@@ -65,20 +65,10 @@ def set_table(rows: Rows) -> int:
     of rows installed.
     """
     source = str(rows) if isinstance(rows, Path) else rows
-    if source == "-":
-        table_off = True
-    else:
-        table_off = False
-    wire = get_module("gemm").configure(
-        table_off=table_off, rows=None if source == "-" else source, tier="override"
-    )
-    return int(wire["table"]["override_rows"])
-
-
-def inject_rows(rows: Rows) -> int:
-    """Install rows at the autotuner tier (below ``set_table`` overrides)."""
-    source = str(rows) if isinstance(rows, Path) else rows
-    return int(get_module("gemm").inject_plan_rows(source))
+    patch = {"tier": "override", "table_off": source == "-"}
+    if source != "-":
+        patch["rows"] = source
+    return int(get_module("gemm").configure(patch)["table"]["override_rows"])
 
 
 def set_planner(mode: str) -> dict:
@@ -88,17 +78,22 @@ def set_planner(mode: str) -> dict:
     shipped default instead of pinning a mode."""
     if mode and mode not in PLANNER_MODES:
         raise ValueError(f"planner must be one of {PLANNER_MODES}, got {mode!r}")
-    return get_module("gemm").configure(planner=mode)
+    return get_module("gemm").configure({"planner": mode})
 
 
 def set_log(enabled: bool = True) -> dict:
     """Toggle the read-only ``[gemm-plan]`` launch log on stderr."""
-    return get_module("gemm").configure(log=enabled)
+    return get_module("gemm").configure({"log": enabled})
 
 
 def set_staging(tma: bool | None = None, mx: bool | None = None) -> dict:
     """Toggle the staging A/B switches (both default to enabled)."""
-    return get_module("gemm").configure(tma=tma, mx=mx)
+    patch = {}
+    if tma is not None:
+        patch["tma"] = tma
+    if mx is not None:
+        patch["mx"] = mx
+    return get_module("gemm").configure(patch)
 
 
 def state() -> dict:
@@ -140,7 +135,6 @@ __all__ = [
     "quant_gemm",
     "PLANNER_MODES",
     "set_table",
-    "inject_rows",
     "set_planner",
     "set_log",
     "set_staging",

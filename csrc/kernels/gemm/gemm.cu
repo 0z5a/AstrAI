@@ -165,10 +165,10 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Planner introspection + runtime row injection: the Python autotuner's C++
-// face. The planner is GPU-free by design, so the probe launches nothing.
-// Injected rows rank BELOW the override rows (plan_table.h), keeping the
-// plan.set_table channel authoritative.
+// Planner introspection: the Python tooling's C++ face. The planner is
+// GPU-free by design, so the probe launches nothing. Rows reach the planner
+// through configure()'s rows channel; injected rows rank BELOW the override
+// rows (plan_table.h), keeping the override tier authoritative.
 // ---------------------------------------------------------------------------
 
 PlanProbe plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
@@ -207,10 +207,6 @@ RowSource& row_tier(RowTier tier) {
 }
 
 }  // namespace
-
-int inject_plan_rows(const std::string& source) {
-    return install_rows(plan_table_injected_source(), "injected rows", source);
-}
 
 // ---------------------------------------------------------------------------
 // Runtime configuration: the backing of astrai.extension.plan. Every knob is

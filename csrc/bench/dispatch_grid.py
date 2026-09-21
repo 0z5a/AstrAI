@@ -29,7 +29,7 @@ from pathlib import Path
 import click
 import torch
 
-from astrai.extension import ops
+from astrai.extension import ops, plan
 
 COMBOS = {
     "w16a16": (torch.bfloat16, torch.bfloat16),
@@ -97,7 +97,7 @@ def main(
     # A clean logic map: the shipped builtin rows, no runtime override or
     # injected tier shadowing them (model_capture's --check does the same).
     ops.gemm.set_table("")
-    ops.gemm.inject_rows("")
+    plan.configure(rows="", tier="injected")
     ops.gemm.set_planner(planner)
     names = ops.gemm.get_module("gemm").tile_class_names()
 

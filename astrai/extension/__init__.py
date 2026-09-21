@@ -64,7 +64,6 @@ from astrai.extension.ops import (
 )
 from astrai.extension.ops.gemm import (
     facts,
-    inject_rows,
     probe,
     set_log,
     set_planner,
@@ -111,8 +110,6 @@ __all__ = [
     "PLANNER_MODES",
     "plan",
     "facts",
-    "inject_rows",
-    "plan",
     "probe",
     "set_log",
     "set_planner",

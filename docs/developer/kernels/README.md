@@ -362,7 +362,7 @@ csrc/
 │   │   └── quantize.cu               #   binding only (module quantize): validation, param packing, launch dispatch, pybind
 │   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
-│   │   ├── api.h                     #   the family's C++ surface (declarations only, template-free — including it instantiates no dtype-pair kernel): quant_gemm_impl, the planner face (PlanProbe / probe / inject_plan_rows / GemmConfigPatch+configure), the vocabulary — no Python type in a signature
+│   │   ├── api.h                     #   the family's C++ surface (declarations only, template-free — including it instantiates no dtype-pair kernel): quant_gemm_impl, the planner face (PlanProbe / probe / GemmConfigPatch+configure), the vocabulary — no Python type in a signature
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
 │   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy + TileManifest (+ kTileClassCta)
 │   │   ├── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded row sources
@@ -374,7 +374,7 @@ csrc/
 │   │   ├── fp8_state.cuh             #   what that function keeps between calls: the delayed-scaling rings (double-buffered scale pairs), the version-keyed weight cast cache, the meta registry + its checkpoint snapshot/restore
 │   │   ├── gemm_bf16_* / gemm_*.cu   #     per-pair explicit gemm_dispatch instantiation units (one nvcc job each)
 │   │   ├── gemm.cu                   #   typed host layer: dtype-pair registry + the api.h implementations (no py:: type)
-│   │   └── bindings.cu               #   pybind surface (module gemm): argument marshalling, the dict shapes the Python tooling reads (one key list per struct), PYBIND11_MODULE
+│   │   └── bindings.cu               #   pybind surface (module gemm): argument marshalling, the dict shapes of both directions (the state report's keys + the config patch's kPatchKeys table), PYBIND11_MODULE
 └── tests/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
     ├── attn_test.cu                  # Decode + prefill kernels

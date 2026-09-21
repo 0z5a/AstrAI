@@ -332,7 +332,7 @@ inline bool parse_plan_table_file(const std::string& path,
 }
 
 // The same parser over an in-memory row text (newline-separated), so the
-// runtime-injection binding and the file path accept identical row syntax.
+// runtime rows channel and the file path accept identical row syntax.
 // Returns the number of rows that survived.
 inline int parse_plan_table_text(const std::string& text, const char* label,
                                  std::vector<TableRow>& rows) {
@@ -369,8 +369,8 @@ inline int parse_plan_table_text(const std::string& text, const char* label,
 // cannot dangle a pointer a launched plan still holds (installs happen
 // during serving warmups). Two mutable instances exist: the override source
 // (the configure rows channel, which outranks everything) and the injected
-// source (the autotuner's measured winners, via the inject_plan_rows
-// binding); the builtin and degraded tiers read static rows and need no
+// source (the same channel with tier=injected, where the autotuner's measured
+// winners land); the builtin and degraded tiers read static rows and need no
 // container.
 //
 // `source` is the spec the rows were last installed from (a row-file path or

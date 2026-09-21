@@ -61,17 +61,10 @@ PlanProbe plan_probe(int64_t m, int64_t n, int64_t k,
                      bool trans_a, bool trans_b, 
                      int64_t batch);
 
-// Replace the runtime-injected row tier wholesale (below the user's override
-// rows, above the compiled-in ones). `source` is a row-file path when one
-// opens, else inline row text (same syntax as the file); the return value is
-// the row count installed, so a mistyped path that parses as zero rows is
-// visible to the caller rather than silent.
-int inject_plan_rows(const std::string& source);
-
 // ---------------------------------------------------------------------------
 // Runtime configuration (the backing of astrai.extension.plan). Every field is
 // tri-state: absent leaves the knob unchanged, an explicit value wins over the
-// one-time env seed. The pybind layer maps None to "absent".
+// one-time env seed. The pybind layer maps an absent dict key to "absent".
 // ---------------------------------------------------------------------------
 
 // Which row tier a `rows` patch addresses. The tiers rank in this order at
@@ -86,7 +79,8 @@ enum class RowTier : int {
 struct GemmConfigPatch {
     // Row spec: a row-file path, or inline row text (one row per line:
     // m_min m_max n_min n_max perf_class crosswise cta stages raster [kk]).
-    // The empty string clears that tier; absent leaves both tiers alone.
+    // The tier it addresses is replaced wholesale; the empty string clears
+    // that tier, absent leaves both tiers alone.
     c10::optional<std::string> rows;
     c10::optional<RowTier> tier;  // which tier `rows` addresses
     // Every row tier off: the rows are skipped entirely and the planner chain
@@ -108,6 +102,8 @@ struct GemmConfigPatch {
 struct GemmConfigState {
     std::string planner;    // the resolved planner mode name
     int planner_mode = -1;  // the raw knob: -1 = unset (the env seed decides)
+    // Installed row counts: a mistyped path that parses to no rows shows up
+    // here as 0 rather than staying silent.
     int override_rows = 0;
     int injected_rows = 0;
     std::string override_source;  // what that tier was last installed from

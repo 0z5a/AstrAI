@@ -30,13 +30,13 @@ def _clean_plan_state():
     # override rows only, so an injected row leaked from another test would
     # keep answering ahead of the planner under test.
     ops.gemm.set_table("")
-    ops.gemm.inject_rows("")
+    plan.configure(rows="", tier="injected")
     ops.gemm.set_planner("")  # back to the shipped default
     ops.gemm.set_staging()
     ops.gemm.set_log(False)
     yield
     ops.gemm.set_table("")
-    ops.gemm.inject_rows("")
+    plan.configure(rows="", tier="injected")
     ops.gemm.set_planner("")  # back to the shipped default
     ops.gemm.set_staging()
     ops.gemm.set_log(False)
@@ -99,7 +99,8 @@ class TestTable:
         assert ops.gemm.probe(*SHAPE)["source"] == "model"
 
     def test_injected_rows_rank_below_override(self):
-        ops.gemm.inject_rows(ROW)
+        plan.configure(rows=ROW, tier="injected")
+        assert ops.gemm.state()["table"]["injected_rows"] == 1
         assert ops.gemm.probe(*SHAPE)["source"] == "injected"
         ops.gemm.set_table("511 513 8191 0 0 0 2 2 0 64")
         assert ops.gemm.probe(*SHAPE)["source"] == "override"

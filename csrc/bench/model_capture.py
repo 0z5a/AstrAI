@@ -315,10 +315,10 @@ def main(results_json, rule, class_filter, check, staging):
         captures[("model(measured)", perf_class)].append(over.get("model", 0.0) / best)
 
     if check:
-        from astrai.extension import ops
+        from astrai.extension import ops, plan
 
         ops.gemm.set_table("")
-        ops.gemm.inject_rows("")
+        plan.configure(rows="", tier="injected")
         ops.gemm.set_planner("model")
         if staging == "cpasync":
             ops.gemm.set_staging(tma=False)  # price what this dataset ran

@@ -3,9 +3,11 @@
 // planner's introspection, and the module registration. The typed C++ face is
 // gemm/api.h; gemm.cu holds the implementations.
 //
-// The dict keys below ARE the contract the Python tooling reads (csrc/bench's
-// dispatch_grid / model_capture / diff_rows / tune_plan_table), so they are
-// spelled exactly once, here, next to the struct they mirror.
+// Dictionaries are the wire here, in both directions: the state report and the
+// config patch. Each key set is spelled exactly once — the report's keys below,
+// the patch's in `kPatchKeys` — next to the struct they mirror, because
+// csrc/bench's dispatch_grid / model_capture / diff_rows / tune_plan_table read
+// those keys and astrai.extension.plan writes them.
 
 #include <torch/extension.h>
 
@@ -98,49 +100,109 @@ py::dict facts_dict() {
     return d;
 }
 
-// py::None -> "absent"; a str planner is the binding's spelling of the mode
-// ("" = back to unset, int accepted too, with the range check left to
-// configure()); a str tier names the row tier `rows` addresses.
-GemmConfigPatch patch_from(py::object planner, py::object log, py::object tma,
-                           py::object mx, py::object table_off,
-                           py::object rows, py::object tier) {
-    GemmConfigPatch patch;
-    if (!planner.is_none()) {
-        if (py::isinstance<py::str>(planner)) {
-            const std::string name = planner.cast<std::string>();
-            if (name.empty()) {
-                // "" restores the shipped default (back to "unset": the env
-                // seed decides, and hybrid is what an unseeded process
-                // resolves to).
-                patch.planner_mode = -1;
-            } else {
-                int mode = -1;
-                if (!parse_planner_mode(name, mode))
-                    throw std::invalid_argument(
-                        "planner must be 'table', 'hybrid' or 'model', got '" +
-                        name + "'");
-                patch.planner_mode = mode;
-            }
-        } else {
-            patch.planner_mode = planner.cast<int>();
+// A patch arrives as one dict, and a key that is absent leaves its knob alone —
+// that is the whole contract. The dict is the point: with a positional parameter
+// list this file had to spell the same seven names three times (the converter's
+// parameters, its conversion bodies, and the registration's py::arg list) on top
+// of gemm/api.h's struct and astrai.extension.plan's ``configure`` signature.
+// The table below is the C++ half of that vocabulary; those other two are the
+// typed and the documented ends.
+
+// A str planner is the binding's spelling of the mode: "" restores the unset
+// state (the env seed decides, and hybrid is what an unseeded process resolves
+// to), a name selects a mode, an int passes straight through for configure() to
+// range-check.
+void patch_planner(GemmConfigPatch& patch, const py::object& value) {
+    if (py::isinstance<py::str>(value)) {
+        const std::string name = value.cast<std::string>();
+        if (name.empty()) {
+            patch.planner_mode = -1;
+            return;
         }
-    }
-    if (!log.is_none()) patch.log = log.cast<bool>();
-    if (!tma.is_none()) patch.staging_tma = tma.cast<bool>();
-    if (!mx.is_none()) patch.staging_mx = mx.cast<bool>();
-    if (!table_off.is_none()) patch.table_off = table_off.cast<bool>();
-    if (!rows.is_none()) patch.rows = rows.cast<std::string>();
-    if (!tier.is_none()) {
-        const std::string name = tier.cast<std::string>();
-        if (name == "override")
-            patch.tier = RowTier::Override;
-        else if (name == "injected")
-            patch.tier = RowTier::Injected;
-        else
+        int mode = -1;
+        if (!parse_planner_mode(name, mode))
             throw std::invalid_argument(
-                "tier must be 'override' or 'injected', got '" + name + "'");
+                "planner must be 'table', 'hybrid' or 'model', got '" + name +
+                "'");
+        patch.planner_mode = mode;
+        return;
     }
-    return patch;
+    patch.planner_mode = value.cast<int>();
+}
+
+// ``rows`` is a row-file path or inline row text; ``tier`` names which row
+// source it addresses ("override", the experimenter's, is the default).
+void patch_rows(GemmConfigPatch& patch, const py::object& value) {
+    patch.rows = value.cast<std::string>();
+}
+
+void patch_tier(GemmConfigPatch& patch, const py::object& value) {
+    const std::string name = value.cast<std::string>();
+    if (name == "override") {
+        patch.tier = RowTier::Override;
+        return;
+    }
+    if (name == "injected") {
+        patch.tier = RowTier::Injected;
+        return;
+    }
+    throw std::invalid_argument("tier must be 'override' or 'injected', got '" +
+                                name + "'");
+}
+
+struct PatchKey {
+    const char* key;
+    void (*apply)(GemmConfigPatch&, const py::object&);
+};
+
+const PatchKey kPatchKeys[] = {
+    {"planner", patch_planner},
+    {"log",
+     [](GemmConfigPatch& p, const py::object& v) { p.log = v.cast<bool>(); }},
+    {"tma",
+     [](GemmConfigPatch& p, const py::object& v) {
+         p.staging_tma = v.cast<bool>();
+     }},
+    {"mx",
+     [](GemmConfigPatch& p, const py::object& v) {
+         p.staging_mx = v.cast<bool>();
+     }},
+    {"table_off",
+     [](GemmConfigPatch& p, const py::object& v) {
+         p.table_off = v.cast<bool>();
+     }},
+    {"rows", patch_rows},
+    {"tier", patch_tier},
+};
+
+std::string patch_keys() {
+    std::string out;
+    for (const PatchKey& key : kPatchKeys) {
+        if (!out.empty()) out += ", ";
+        out += key.key;
+    }
+    return out;
+}
+
+GemmConfigPatch patch_from(const py::dict& patch) {
+    GemmConfigPatch out;
+    for (const auto& item : patch) {
+        const py::object key_object = py::reinterpret_borrow<py::object>(item.first);
+        TORCH_CHECK(py::isinstance<py::str>(key_object),
+                    "gemm config keys must be strings; the plan's knobs are ",
+                    patch_keys());
+        const std::string key = key_object.cast<std::string>();
+        bool known = false;
+        for (const PatchKey& candidate : kPatchKeys) {
+            if (key != candidate.key) continue;
+            candidate.apply(out, py::reinterpret_borrow<py::object>(item.second));
+            known = true;
+            break;
+        }
+        TORCH_CHECK(known, "unknown gemm config key '", key,
+                    "'; the plan's knobs are ", patch_keys());
+    }
+    return out;
 }
 
 py::dict probe_binding(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
@@ -149,11 +211,8 @@ py::dict probe_binding(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
     return probe_dict(plan_probe(m, n, k, dt_a, dt_b, trans_a, trans_b, batch));
 }
 
-py::dict configure_binding(py::object planner, py::object log, py::object tma,
-                           py::object mx, py::object table_off,
-                           py::object rows, py::object tier) {
-    return config_dict(
-        configure(patch_from(planner, log, tma, mx, table_off, rows, tier)));
+py::dict configure_binding(const py::dict& patch) {
+    return config_dict(configure(patch_from(patch)));
 }
 
 py::dict config_state_binding() { return config_dict(config_state()); }
@@ -175,13 +234,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("n"), py::arg("k"), py::arg("dt_a"), py::arg("dt_b"),
           py::arg("trans_a") = false, py::arg("trans_b") = true,
           py::arg("batch") = 1);
-    m.def("inject_plan_rows", &astrai::gemm::inject_plan_rows,
-          py::arg("source"));
-    m.def("configure", &astrai::gemm::configure_binding,
-          py::arg("planner") = py::none(), py::arg("log") = py::none(),
-          py::arg("tma") = py::none(), py::arg("mx") = py::none(),
-          py::arg("table_off") = py::none(), py::arg("rows") = py::none(),
-          py::arg("tier") = py::none());
+    m.def("configure", &astrai::gemm::configure_binding, py::arg("patch"),
+          "Apply a config patch (a dict of the plan's knobs) and return the "
+          "resulting state");
+    // The patch-dict schema, so a capability probe can tell a stale build from
+    // a current one: ``configure``'s old keyword signature is not
+    // distinguishable by hasattr, only by calling it.
+    m.attr("CONFIG_API") = 2;
     m.def("config_state", &astrai::gemm::config_state_binding);
     m.def("tile_class_names", &astrai::gemm::tile_class_names);
     m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary);

@@ -73,6 +73,10 @@ VOCAB = [
 class FakeGemm:
     """The planner bindings as call records."""
 
+    # The config-patch schema attribute the tuner's capability probe reads
+    # (a stale build has ``configure`` too, so the name alone proves nothing).
+    CONFIG_API = 2
+
     def __init__(self, source: str = "degraded", override_rows: int = 0):
         self.source = source
         self.override_rows = override_rows
@@ -116,9 +120,12 @@ class FakeGemm:
             "crosswise": 0,
         }
 
-    def inject_plan_rows(self, source):
-        self.installs.append(source)
-        return source.count("\n") + 1
+    def configure(self, patch):
+        # The tuner's only use of the config channel: rows at the injected
+        # tier (below any user override). Anything else would be a bug here.
+        assert patch["tier"] == "injected" and set(patch) == {"rows", "tier"}
+        self.installs.append(patch["rows"])
+        return self.config_state()
 
     def tile_vocabulary(self):
         return VOCAB
@@ -220,6 +227,17 @@ class TestTuneFlow:
         assert len(fake.installs) == 1
         pairs = len({(e[1], e[2]) for e in VOCAB})
         assert fake.installs[0].count("\n") == pairs * 2 * 3 - 1
+
+    def test_start_refuses_a_pre_patch_build(self):
+        # A stale .so still has ``configure`` — it just takes keyword
+        # arguments, which hasattr cannot see. The schema attr is the guard,
+        # and refusing beats crashing inside the first install.
+        fake = FakeGemm()
+        fake.CONFIG_API = 1
+        tuner = GemmAutotuner()
+        tuner._mod = fake
+        assert tuner.start(time_budget_s=0) is False
+        assert fake.installs == []
 
     def test_builtin_shapes_never_tune(self):
         fake = FakeGemm(source="builtin")
