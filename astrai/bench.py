@@ -206,13 +206,17 @@ def loglikelihood_batched(
     n = len(all_inputs)
     max_len = max(len(x[1]) for x in all_inputs)
     padded = torch.zeros(n, max_len, dtype=torch.long, device=device)
-    mask = torch.zeros(n, max_len, dtype=torch.bool, device=device)
+    key_pad = torch.zeros(n, 1, 1, max_len, dtype=torch.bool, device=device)
     for i, (_, ids, _, _) in enumerate(all_inputs):
         padded[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-        mask[i, : len(ids)] = True
+        key_pad[i, 0, 0, : len(ids)] = True
 
+    # Causality must ride the mask: a 2-D input_mask is read as key-padding
+    # only and flips use_sdpa_causal_mask to False in transformer.py, which
+    # lets the scored position attend to the continuation it is scoring.
+    causal = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool, device=device))
     with torch.inference_mode():
-        logits = model(padded, input_mask=mask)["logits"]
+        logits = model(padded, input_mask=key_pad & causal)["logits"]
 
     scores = [0.0] * len(requests)
     for i, (ri, _, ctx_len, cont_ids) in enumerate(all_inputs):
