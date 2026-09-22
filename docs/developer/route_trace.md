@@ -85,11 +85,7 @@ identity, but those integrations belong in follow-up changes.
 
 The repository includes a deterministic serialization-only benchmark:
 
-```bash
-python scripts/benchmark_route_trace_codec.py \
-  --tokens 8192 --layers 40 --top-k 22 --num-experts 512 \
-  --level ids --device cpu --warmups 5 --repeats 50
-```
+Validation scripts are maintained locally.
 
 The JSON output separates logical tensor bytes, wire bytes, and an int64-ID
 baseline, and reports serialize/deserialize latency. Construction happens
@@ -210,12 +206,7 @@ match.
 
 Measure a local MoE forward/backward against the existing checkpoint path with:
 
-```bash
-python scripts/benchmark_moe_recompute_validation.py \
-  --tokens 128 --dim 128 --dim-ffn 256 \
-  --num-experts 8 --top-k 2 --device cpu \
-  --warmups 3 --repeats 10
-```
+Validation scripts are maintained locally.
 
 The report includes route hashes, mismatch counters, output/gradient parity,
 and paired-path latency. It excludes route replay, optimizer work, distributed
