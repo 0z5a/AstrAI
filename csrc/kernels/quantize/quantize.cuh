@@ -115,12 +115,15 @@ struct fp8_cvt_traits<__nv_fp8_e5m2> : detail::Fp8PackPair<__NV_E5M2> {
     }
 };
 
-// Block-wide amax reduce -> one RMW per block: warp-reduce, park one
-// value per warp, thread 0 folds. With p.fold_ring, blocks RMW their amax
-// into amax_scratch[block id mod kFoldSlots] and the last-finishing block
-// (atomicAdd ticket) folds the scratch into the history window and
-// publishes the next scale (fences + re-zeroing for the next launch) —
-// the host-side delayed-scaling update chain disappears.
+// The kernel's warp count; the launcher's block is ``dim3(32, kQuantWarps)``
+// and publish_amax parks one partial per warp, indexed by ``tid >> 5``.
+inline constexpr int kQuantWarps = 8;
+
+// Block-wide amax reduce -> one RMW per block: warp-reduce, park one value per
+// warp, thread 0 folds. Blocks RMW their amax into amax_scratch[block id mod
+// kFoldSlots] and the last-finishing block (atomicAdd ticket) folds the scratch
+// into the history window, publishes the next scale and the round's amax, then
+// re-zeroes for the next launch.
 template <int kWarps>
 __device__ __forceinline__ void publish_amax(const QuantParams& p,
                                              float v) {
@@ -135,7 +138,6 @@ __device__ __forceinline__ void publish_amax(const QuantParams& p,
         const int slot =
             (blockIdx.y * gridDim.x + blockIdx.x) & (kFoldSlots - 1);
         atomic_max_float(p.amax_scratch + slot, v);
-        if (!p.fold_ring) return;
         __threadfence();
         const unsigned int ticket = atomicAdd(p.done, 1u);
         __threadfence();
@@ -157,6 +159,7 @@ __device__ __forceinline__ void publish_amax(const QuantParams& p,
         // the ATen 1/x the host used to materialize (never fast-math: the
         // intrinsic pins the rounding mode).
         if (p.scale_recip_out) *p.scale_recip_out = __frcp_rn(next);
+        if (p.amax) *p.amax = peak;
         for (int s = 0; s < kFoldSlots; ++s) p.amax_scratch[s] = 0.0f;
         *p.done = 0u;
     }
@@ -206,7 +209,8 @@ struct dual_cvt {
     static __device__ __forceinline__ uint8_t pick(const uint8_t (*q)[2],
                                                    const uint8_t (*q2)[2], int j,
                                                    int k) {
-        return kMixed ? q2[j][k] : q[j][k];
+        if constexpr (kMixed) return q2[j][k];
+        return q[j][k];
     }
 };
 
@@ -313,7 +317,7 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
                     tile[threadIdx.y * 8 + i][threadIdx.x];
         }
     }
-    if (p.amax) publish_amax<8>(p, local_amax);
+    if (p.fold_ring) publish_amax<kQuantWarps>(p, local_amax);
 }
 
 // Quantize launcher: the mode (which pointers are live, the stride pair)
@@ -327,7 +331,7 @@ void launch_fp8_quantize(const QuantParams& p, cudaStream_t stream) {
     const dim3 grid(std::max(1, (p.cols + 63) / 64),
                     std::max(1, (p.rows + 31) / 32));
     fp8_quantize_strided_kernel<Fp8T, InT, Fp8T2>
-        <<<grid, dim3(32, 8), 0, stream>>>(p);
+        <<<grid, dim3(32, kQuantWarps), 0, stream>>>(p);
     ASTRAI_LAUNCH_CHECK();
 }
 

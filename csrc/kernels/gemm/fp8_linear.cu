@@ -284,6 +284,11 @@ tensor_list fp8_backward_impl(const Tensor& g, const Fp8BwdIn& in) {
     return {grad_x, grad_w, grad_b};
 }
 
+// apply() demands one returned gradient per forward argument — undefined for
+// the non-tensor ones, which the engine filters out after counting.
+constexpr size_t kFp8TensorInputs = 3;  // x, w, bias
+constexpr size_t kFp8ScalarInputs = 7;  // update_rings .. fmt_b
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -336,10 +341,8 @@ class Fp8Linear : public torch::autograd::Function<Fp8Linear> {
         in.fmt_b =
             static_cast<at::ScalarType>(ctx->saved_data["fmt_b"].toInt());
         tensor_list g = fp8_backward_impl(grad_outputs[0], in);
-        // apply() demands one return per forward argument; the seven
-        // non-tensor trailing inputs must come back as undefined tensors
-        // (the engine filters them out after checking).
-        g.resize(10, Tensor());
+        // One gradient per forward argument (see the arity constants).
+        g.resize(kFp8TensorInputs + kFp8ScalarInputs, Tensor());
         return g;
     }
 };
@@ -395,6 +398,16 @@ py::dict ring_state_dict(const ScaleRing& r) {
 py::dict fp8_state_dict() {
     State& st = state();
     std::lock_guard<std::mutex> lock(st.mu);
+    // Save only what a resume can bind: an orphan (dead weight) can never be
+    // looked up again, and in ``order`` it would shift every later binding.
+    for (auto it = st.order.begin(); it != st.order.end();) {
+        if ((*it)->alive()) {
+            ++it;
+        } else {
+            st.by_key.erase((*it)->key);
+            it = st.order.erase(it);
+        }
+    }
     py::list entries;
     for (const auto& meta : st.order) {
         py::dict e;

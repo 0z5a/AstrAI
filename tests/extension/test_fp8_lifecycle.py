@@ -27,6 +27,8 @@ reset() before AND after, or the next test's "fresh" linear inherits a stale
 ring and quantizes with a scale from someone else's amax.
 """
 
+import gc
+
 import pytest
 import torch
 from torch import nn
@@ -225,6 +227,50 @@ def test_recipe_change_rebuilds_rings():
         lin(x)
         lin(x)
     assert _meta(lin.weight, history_len=8)["x"]["idx"] == 3
+
+
+@skip_no_fp8
+def test_registry_evicts_a_dead_weights_ring():
+    """A weight that goes away takes its registry entry with it: an orphan can
+    never be restored (the entry is keyed by its buffer), and left in the
+    registration order it would shift the FIFO snapshot binding of every entry
+    after it. The sweep is lazy — at save time — because an orphan is already
+    inert (its anchor is dead, so no lookup can match it) and scanning the
+    registry on the lookup path would cost a pass per linear."""
+    dev = torch.device("cuda")
+    gemm = get_module("gemm")
+    x = torch.randn(8, 64, device=dev, dtype=torch.bfloat16)
+
+    # A helper, not a loop over the two weights: `for w in (...)` leaves the
+    # loop variable bound to the last tensor, keeping `doomed` alive past its
+    # `del` and making this test pass for the wrong reason.
+    def run_once(weight):
+        gemm.fp8_linear(
+            x,
+            weight,
+            None,
+            False,
+            False,
+            False,
+            16,
+            0,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+        )
+
+    keep = torch.randn(32, 64, device=dev, dtype=torch.bfloat16)
+    doomed = torch.randn(96, 64, device=dev, dtype=torch.bfloat16)
+    run_once(keep)
+    run_once(doomed)
+    assert gemm.fp8_debug_stats()["metas"] == 2
+    assert len(fp8_state_dict()["entries"]) == 2
+
+    del doomed
+    gc.collect()
+    torch.cuda.empty_cache()
+    # The next snapshot prunes it, and reports only what a resume can bind.
+    assert len(fp8_state_dict()["entries"]) == 1
+    assert gemm.fp8_debug_stats()["metas"] == 1
 
 
 @skip_no_fp8

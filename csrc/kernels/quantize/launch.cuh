@@ -56,9 +56,10 @@ inline void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
                : launch_for_dtype<__nv_fp8_e4m3, __nv_fp8_e4m3>(x, p, stream);
 }
 
-// The delayed-scaling ring, parsed: state layout
-// [hist n | scale | scale_recip | amax | done | fold scratch kFoldSlots],
-// where n = numel - 4 - kFoldSlots. The offsets live here and nowhere else.
+// The delayed-scaling ring as raw device pointers. Offsets are RingLayout's;
+// ``hist_len`` is required (numel cannot recover it — the composed ring's
+// trailing pair overshoots). Pair 1 is that double buffer's, so it is not
+// bound here: its publisher passes its own slots.
 struct RingView {
     float* hist = nullptr;
     float* scale_out = nullptr;
@@ -66,36 +67,32 @@ struct RingView {
     float* scratch = nullptr;
     unsigned int* done = nullptr;
     int len = 0;
-    torch::Tensor amax;  // the (never-written) tail slot: its non-null
-                         // pointer is the kernel's "fold the ring" flag
+    torch::Tensor amax;  // the fold's raw-domain amax sink (RingLayout::amax)
     bool bound = false;
 };
 
 inline RingView ring_view(const torch::Tensor& st, int64_t hist_idx,
-                          c10::optional<int64_t> hist_len = c10::nullopt) {
+                          int64_t hist_len) {
     RingView r;
     TORCH_CHECK(st.is_cuda() && st.dim() == 1 &&
                     st.scalar_type() == torch::kFloat32,
                 "ring state must be a 1D float32 CUDA tensor");
-    // Raw-buffer callers derive the history length from numel; the composed
-    // fp8-linear ring passes it explicitly (its state carries a trailing
-    // double-buffered scale pair the fold never touches).
-    const int64_t n = hist_len.has_value()
-                          ? *hist_len
-                          : st.numel() - 4 - kFoldSlots;
+    const RingLayout layout{hist_len};
+    const int64_t n = hist_len;
     TORCH_CHECK(n > 0 && hist_idx >= 0 && hist_idx < n,
                 "ring state too small or hist_idx out of range");
-    TORCH_CHECK(!hist_len.has_value() ||
-                    st.numel() >= n + 4 + kFoldSlots,
-                "ring state smaller than the explicit history length");
+    TORCH_CHECK(st.numel() >= layout.size(/*pairs=*/1),
+                "ring state holds ", st.numel(),
+                " floats: a history of ", n, " needs at least ",
+                layout.size(1));
     float* base = st.data_ptr<float>();
     r.hist = base;
-    r.scale_out = base + n;
-    r.scale_recip_out = base + n + 1;
-    r.done = reinterpret_cast<unsigned int*>(base + n + 3);
-    r.scratch = base + n + 4;
+    r.scale_out = base + layout.scale(0);
+    r.scale_recip_out = base + layout.recip(0);
+    r.done = reinterpret_cast<unsigned int*>(base + layout.done());
+    r.scratch = base + layout.scratch();
     r.len = static_cast<int>(n);
-    r.amax = st.narrow(0, n + 2, 1);
+    r.amax = st.narrow(0, layout.amax(), 1);
     r.bound = true;
     return r;
 }
@@ -117,7 +114,8 @@ inline void bind_ring(QuantParams& p, const RingView& r, int64_t hist_idx,
 struct QuantizeOutputs {
     torch::Tensor out;    // row-major orientation (undefined if not asked)
     torch::Tensor out_t;  // [cols][rows] transpose (undefined if not asked)
-    torch::Tensor amax;   // ring's self-cleaned slot, or undefined
+    torch::Tensor amax;   // the fold's raw-domain amax of the round (undefined
+                          // without a ring — nothing measures one)
 };
 
 // One quantize pass, end to end: validation, output allocation, launch.
@@ -132,7 +130,8 @@ struct QuantizeOutputs {
 // ``pub_scale``/``pub_recip`` redirect where the fold publishes (default:
 // the ring's own slots) — the double-buffered ring's "next" pair, so the
 // consumer keeps reading the untouched current pair and needs no snapshot
-// clone.
+// clone. A ring also requires ``hist_len`` (see RingLayout); one without is
+// rejected rather than guessed.
 inline QuantizeOutputs run_quantize(torch::Tensor x, torch::Tensor scale,
                                     QuantLayout layout,
                                     at::ScalarType dtype_a,
@@ -175,7 +174,13 @@ inline QuantizeOutputs run_quantize(torch::Tensor x, torch::Tensor scale,
     p.scale = scale.data_ptr<float>();
     QuantizeOutputs outs;
     if (ring.has_value() && ring->defined()) {
-        const RingView r = ring_view(*ring, hist_idx, hist_len);
+        // A wrong window is silent (scale slots read as history), so a ring
+        // without its hist_len is an error, not a guess.
+        TORCH_CHECK(hist_len.has_value(),
+                    "quantize: ring_state needs hist_len (the history window "
+                    "length) — the buffer's trailing slots make it "
+                    "unrecoverable from numel");
+        const RingView r = ring_view(*ring, hist_idx, *hist_len);
         outs.amax = r.amax;
         p.amax = r.amax.data_ptr<float>();
         bind_ring(p, r, hist_idx, fp8_max, pow2_margin);

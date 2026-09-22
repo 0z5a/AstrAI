@@ -1,20 +1,19 @@
 #pragma once
-// The fp8 training state machine: the delayed-scaling rings (with their
-// double-buffered scale pairs), the version-keyed weight cast cache, the
-// per-weight meta registry and its checkpoint snapshot/restore — everything
-// the composed linear (fp8_linear.cu) keeps between calls. Split out of that
-// file for readability only: this header is included by exactly one
-// translation unit, all functions are inline, and the registry singleton is
-// still one per process.
+// The fp8 training state machine: the delayed-scaling rings (double-buffered
+// scale pairs), the version-keyed weight cast cache, the per-weight meta
+// registry and its checkpoint snapshot/restore — everything the composed
+// linear (fp8_linear.cu) keeps between calls. Split out for readability only;
+// every function is ``inline``, so a second includer would still share one
+// registry per module (an anonymous namespace would give a silent copy per TU).
 //
-// Keyed by (data_ptr, shape, dtype) with the same contract as the Python
-// registry it replaced: a live meta assumes no allocator reuse under it, and
-// snapshots bind in registration order (data_ptr is meaningless across
-// processes).
+// Snapshots bind in registration order (data_ptr is meaningless across
+// processes); the ring's slot offsets are RingLayout's (quantize/common.h).
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/core/TensorImpl.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Optional.h>
+#include <c10/util/intrusive_ptr.h>
 #include <torch/extension.h>
 
 #include <algorithm>
@@ -33,8 +32,6 @@ namespace astrai {
 namespace fp8 {
 
 using torch::Tensor;
-
-namespace {
 
 // ---------------------------------------------------------------------------
 // Recipe constants
@@ -72,13 +69,12 @@ inline Tensor amax_of(const Tensor& t) {
 // Delayed-scaling rings
 // ---------------------------------------------------------------------------
 
-// One operand's ring, with a double-buffered scale pair: state layout
-// [hist n | scale0 | recip0 | amax | done | scratch | scale1 | recip1].
-// The fold reads recip[cur] and publishes the next scale into pair[1-cur],
-// so this step's GEMMs keep reading pair[cur] — untouched by the fold —
-// and the host needs no snapshot clone. ``cur`` flips exactly once per
-// fold (inside advance()); pair 0 sits at the legacy offsets so the seed
-// path stays where it was.
+// One operand's ring, with a double-buffered scale pair. Offsets are
+// RingLayout's; layout [hist n | scale0 | recip0 | amax | done | scratch |
+// scale1 | recip1]. The fold reads recip[cur] and publishes into pair[1-cur],
+// so this step's GEMMs keep reading pair[cur] and the host needs no snapshot
+// clone. ``cur`` flips once per fold (advance()); pair 0 keeps the legacy
+// offsets so the seed path stays put.
 struct ScaleRing {
     Tensor state;
     Tensor hist;
@@ -93,13 +89,13 @@ struct ScaleRing {
     ScaleRing(const torch::TensorOptions& opts, int64_t history_len) {
         const int64_t n = history_len;
         TORCH_CHECK(n > 0, "fp8 linear: history_len must be positive");
-        state = torch::zeros({n + 6 + quant::kFoldSlots}, opts);
+        const quant::RingLayout layout{n};
+        state = torch::zeros({layout.size()}, opts);
         hist = state.narrow(0, 0, n);
-        pscale[0] = state.narrow(0, n, 1);
-        precip[0] = state.narrow(0, n + 1, 1);
-        const int64_t tail = n + 4 + quant::kFoldSlots;
-        pscale[1] = state.narrow(0, tail, 1);
-        precip[1] = state.narrow(0, tail + 1, 1);
+        pscale[0] = state.narrow(0, layout.scale(0), 1);
+        precip[0] = state.narrow(0, layout.recip(0), 1);
+        pscale[1] = state.narrow(0, layout.scale(1), 1);
+        precip[1] = state.narrow(0, layout.recip(1), 1);
     }
 
     const Tensor& scale() const { return pscale[cur]; }
@@ -167,18 +163,36 @@ struct WeightCast {
 struct Fp8Meta {
     ScaleRing w, x, g;
     WeightCast cast;
-    std::vector<int64_t> shape;  // the owning weight's (registry + snapshot key)
+    // The weight this meta is for. ``weight_ptr`` is the key's address;
+    // ``anchor`` is a *weak* handle that keeps a dead TensorImpl (and its
+    // Storage) from being freed, so while it locks the recorded address cannot
+    // have been recycled — which makes the address comparison an identity, and
+    // an unlocked anchor the sound eviction signal. A strong reference would
+    // pin the replaced weight instead of dropping the entry.
+    void* weight_ptr = nullptr;
+    c10::weak_intrusive_ptr<c10::TensorImpl> anchor;
+    std::string key;             // this meta's registry key (eviction path)
+    std::vector<int64_t> shape;  // the owning weight's (snapshot key)
     at::ScalarType dtype = at::kBFloat16;
     int64_t history_len = 0;
     int64_t margin = 0;
     bool dynamic = false;
+
+    // A weak pointer has no empty state (its null singleton is a real target),
+    // and a meta always belongs to a weight. ``owner`` must be live.
+    explicit Fp8Meta(const Tensor& owner)
+        : weight_ptr(owner.data_ptr()), anchor(owner.getIntrusivePtr()) {}
+
+    bool owns(const Tensor& w) const {
+        return anchor.lock().get() != nullptr && weight_ptr == w.data_ptr();
+    }
+    bool alive() const { return anchor.lock().get() != nullptr; }
 };
 
 // ---------------------------------------------------------------------------
 // Process-wide state: the meta registry, the generation counter and the
-// checkpoint snapshot. The registry key mirrors the Python one — (data_ptr,
-// shape, dtype) — with the same contract (a live meta assumes no allocator
-// reuse under it; tests reset between cases).
+// checkpoint snapshot. The key is the weight's (data_ptr, shape, dtype); the
+// lookup also requires the meta's anchor to own that buffer (Fp8Meta::owns).
 // ---------------------------------------------------------------------------
 
 struct State {
@@ -197,12 +211,12 @@ struct State {
     std::atomic<int64_t> n_cast_miss{0};
 };
 
-State& state() {
+inline State& state() {
     static State s;
     return s;
 }
 
-std::string meta_key(const Tensor& w) {
+inline std::string meta_key(const Tensor& w) {
     std::string key = std::to_string(reinterpret_cast<uintptr_t>(w.data_ptr()));
     key += '|';
     for (const auto s : w.sizes()) {
@@ -214,10 +228,18 @@ std::string meta_key(const Tensor& w) {
     return key;
 }
 
+// Drop one meta from both registry views; a leftover in ``order`` would shift
+// the snapshot's FIFO binding for every later linear.
+inline void drop_meta(State& st, const std::shared_ptr<Fp8Meta>& meta) {
+    st.by_key.erase(meta->key);
+    st.order.erase(std::remove(st.order.begin(), st.order.end(), meta),
+                   st.order.end());
+}
+
 // The snapshot's dtype field uses the Python ``str(torch.dtype)`` spelling —
 // the format the checkpoint bridge established before this op existed, so a
 // snapshot written by either side restores on the other.
-std::string torch_dtype_str(at::ScalarType t) {
+inline std::string torch_dtype_str(at::ScalarType t) {
     switch (t) {
         case at::kBFloat16: return "torch.bfloat16";
         case at::kHalf: return "torch.float16";
@@ -235,14 +257,15 @@ std::string torch_dtype_str(at::ScalarType t) {
     }
 }
 
-bool dtype_str_matches(const std::string& s, at::ScalarType t) {
+inline bool dtype_str_matches(const std::string& s, at::ScalarType t) {
     return s == torch_dtype_str(t) || s == std::string(c10::toString(t));
 }
 
 // Restore one ring from a snapshot entry. False geometry means the buffer
 // changed since the save (a recipe change across the checkpoint boundary):
 // the ring stays fresh and re-seeds on next use.
-void restore_ring(ScaleRing& ring, const py::object& sd, bool& geometry_ok) {
+inline void restore_ring(ScaleRing& ring, const py::object& sd,
+                         bool& geometry_ok) {
     if (sd.is_none()) return;
     py::dict d = sd.cast<py::dict>();
     Tensor saved = d["state"].cast<Tensor>();
@@ -261,7 +284,7 @@ void restore_ring(ScaleRing& ring, const py::object& sd, bool& geometry_ok) {
 // (shape, dtype) — data_ptr is meaningless across processes, and re-binding
 // relies on the same registration-order contract TE documents for amax
 // reduction.
-void restore_pending_locked(std::shared_ptr<Fp8Meta>& meta) {
+inline void restore_pending_locked(std::shared_ptr<Fp8Meta>& meta) {
     State& st = state();
     for (size_t i = 0; i < st.pending.size(); ++i) {
         const py::dict entry = st.pending[i];
@@ -281,13 +304,13 @@ void restore_pending_locked(std::shared_ptr<Fp8Meta>& meta) {
     }
 }
 
-// Look up (or create) the rings for a weight. A recipe change under the same
-// weight rebuilds them: their geometry (history_len) and fold constants
-// (margin) are stale, and TE clears its fp8 workspaces on a recipe change for
-// the same reason. The fresh rings re-seed on the next forward (one step of
-// transient), and the generation bump invalidates the cast cache.
-std::shared_ptr<Fp8Meta> get_meta(const Tensor& w, int64_t history_len,
-                                  int64_t margin, bool dynamic) {
+// Look up (or create) the rings for a weight. An entry is rebuilt — with a
+// generation bump that invalidates the cast cache — when the recipe changed
+// (stale geometry and fold constants) or when it does not own this buffer (the
+// address was recycled after its weight died). Fresh rings re-seed on the next
+// forward.
+inline std::shared_ptr<Fp8Meta> get_meta(const Tensor& w, int64_t history_len,
+                                         int64_t margin, bool dynamic) {
     const std::string key = meta_key(w);
     State& st = state();
     std::lock_guard<std::mutex> lock(st.mu);
@@ -295,17 +318,16 @@ std::shared_ptr<Fp8Meta> get_meta(const Tensor& w, int64_t history_len,
     if (it != st.by_key.end()) {
         auto meta = it->second;
         if (meta->history_len == history_len && meta->margin == margin &&
-            meta->dynamic == dynamic) {
+            meta->dynamic == dynamic && meta->owns(w)) {
             return meta;
         }
-        st.by_key.erase(it);
-        st.order.erase(std::remove(st.order.begin(), st.order.end(), meta),
-                       st.order.end());
+        drop_meta(st, meta);
         st.generation += 1;
     }
     const auto opts = torch::TensorOptions().dtype(at::kFloat).device(
         w.device());
-    auto meta = std::make_shared<Fp8Meta>();
+    auto meta = std::make_shared<Fp8Meta>(w);
+    meta->key = key;
     meta->w = ScaleRing(opts, history_len);
     meta->x = ScaleRing(opts, history_len);
     meta->g = ScaleRing(opts, history_len);
@@ -320,6 +342,5 @@ std::shared_ptr<Fp8Meta> get_meta(const Tensor& w, int64_t history_len,
     return meta;
 }
 
-}  // namespace
 }  // namespace fp8
 }  // namespace astrai

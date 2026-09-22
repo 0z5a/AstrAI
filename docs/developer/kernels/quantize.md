@@ -19,12 +19,16 @@ and is never persisted. `FP8_max` is 448 for e4m3, 57344 for e5m2.
 The kernel is handed the *multiplier* `s^-1` and saturates at the format's
 range. Delayed scaling derives `s` from the amax history window (max over
 the last `history_len` entries, default 16): the quantize kernel folds the
-current amax into the ring (`[hist | scale | scale_recip | amax | 32-slot
-scratch]`, fp32) and publishes the next step's scale *and its reciprocal*
-(`__frcp_rn`, bit-identical to the host's `1/x`) in its own last block — one
-tensor read per step, and the policy hands the published recip straight to
-the next call instead of materializing one. Dynamic scaling measures the
-current amax instead (two reads, no window, exact on the first step).
+current amax into the ring (`[hist n | scale | recip | amax | done | 32-slot
+scratch]`, fp32, plus the composed ring's trailing double-buffered
+`scale | recip` pair) and publishes the next step's scale *and its
+reciprocal* (`__frcp_rn`, bit-identical to the host's `1/x`) in its own last
+block — one tensor read per step, and the policy hands the published recip
+straight to the next call instead of materializing one. The same block
+reports that round's amax on the ring's `amax` slot, and the window length is
+an explicit argument (`hist_len`): it is not recoverable from the buffer's
+`numel`. Dynamic scaling measures the current amax instead (two reads, no
+window, exact on the first step).
 `quantize_dual(g)` yields `(g8, g8T)` in a single read: the training path
 consumes the gradient in both orientations (dgrad takes `g`, wgrad takes
 `g^T`). No-grad calls read the rings without folding or advancing

@@ -354,7 +354,7 @@ csrc/
 │   │   └── paged_prefill.cu          #   → module attn_paged_prefill
 │   ├── rotary_emb.cu                 # rotary embedding (kernel + binding in one file) → module rotary_emb
 │   ├── quantize/                     # quantize family (pure CUDA; checks.h is the torch-bound gate)
-│   │   ├── common.h                  #   sm_at_least + kMinSmForFp8 capability helpers, QuantLayout, QuantParams POD (raw __nv_fp8_* types)
+│   │   ├── common.h                  #   sm_at_least + kMinSmForFp8 capability helpers, QuantLayout, RingLayout (the ring's slot offsets), QuantParams POD (raw __nv_fp8_* types)
 │   │   ├── checks.h                  #   torch-bound entry validation (check_fp8_device over ATen-cached properties)
 │   │   ├── dequant.cuh               #   in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
 │   │   ├── quantize.cuh              #   quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)

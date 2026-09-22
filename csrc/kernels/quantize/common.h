@@ -43,6 +43,38 @@ enum class QuantLayout : int {
 // folds the slots, publishes the scale and re-zeroes them (self-cleaning,
 // same protocol as the old single slot).
 inline constexpr int kFoldSlots = 32;
+static_assert((kFoldSlots & (kFoldSlots - 1)) == 0,
+              "the scratch is addressed by a power-of-two mask");
+
+// The delayed-scaling ring's slot offsets — one source for the kernel's fold
+// and every host view:
+//
+//   [ hist n | scale0 | recip0 | amax | done | scratch kFoldSlots | scale1 | recip1 ]
+//
+// Pair 0/1 is the composed ring's double buffer; pair 0 keeps the legacy
+// offsets, so ``size(1)`` is the stateless extent. The history length is not
+// recoverable from numel (the trailing pair overshoots by two, which reads the
+// scale slots as history), so callers state it.
+struct RingLayout {
+    int64_t hist_len = 0;
+
+    static constexpr int64_t kAuxSlots = 4;  // scale0 | recip0 | amax | done
+
+    // 2 scale pairs for the composed ring, 1 for the stateless layout.
+    constexpr int64_t size(int pairs = 2) const {
+        return hist_len + kAuxSlots + kFoldSlots + 2 * (pairs - 1);
+    }
+    constexpr int64_t scale(int pair = 0) const {
+        return pair == 0 ? hist_len : hist_len + kAuxSlots + kFoldSlots;
+    }
+    constexpr int64_t recip(int pair = 0) const { return scale(pair) + 1; }
+    constexpr int64_t amax() const { return hist_len + 2; }
+    constexpr int64_t done() const { return hist_len + 3; }
+    constexpr int64_t scratch() const { return hist_len + 4; }
+};
+
+static_assert(RingLayout{0}.size(1) == 4 + kFoldSlots,
+              "size(1) must stay the pre-double-buffer layout");
 
 // Quantize-kernel parameter POD: float input -> FP8 with fused amax.
 struct QuantParams {
@@ -51,14 +83,15 @@ struct QuantParams {
     void* __restrict__ output_transposed_ptr = nullptr;  // [cols][rows]
 
     const float* __restrict__ scale = nullptr;  // device multiplier
-    float* __restrict__ amax = nullptr;         // raw-domain max out
+    // The fold's raw-domain amax of the round — the value it folded into
+    // hist[hist_idx]. Null skips the store.
+    float* __restrict__ amax = nullptr;
 
-    // Optional delayed-scaling ring fold: when fold_ring is set, the kernel's
-    // last-finishing block folds the final amax into hist[hist_idx], reduces
-    // the window and publishes the next scale — replacing the host-side
-    // update chain. Blocks RMW their block amax into amax_scratch[block id
-    // mod kFoldSlots] (one contended address serializes every completion);
-    // the last block folds the scratch, zeroes it and publishes.
+    // The delayed-scaling ring fold: when set, the kernel's last-finishing
+    // block folds the round's amax into hist[hist_idx], reduces the window and
+    // publishes the next scale — replacing the host-side update chain. Blocks
+    // RMW their block amax into amax_scratch[block id mod kFoldSlots]. Every
+    // ring pointer below is meaningful only when this is set (bind_ring).
     bool fold_ring = false;
     float* __restrict__ hist = nullptr;  // [hist_len] amax history window
     float* __restrict__ scale_out = nullptr;

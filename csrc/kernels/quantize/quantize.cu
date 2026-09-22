@@ -42,15 +42,17 @@ c10::optional<torch::Tensor> optional_tensor(const py::object& t,
 py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
                          at::ScalarType out_dtype, QuantLayout layout,
                          py::object transposed_dtype, py::object ring,
-                         int64_t hist_idx, double fp8_max,
+                         int64_t hist_idx, py::object hist_len, double fp8_max,
                          double pow2_margin) {
     c10::optional<at::ScalarType> t_dtype = c10::nullopt;
     if (!transposed_dtype.is_none())
         t_dtype = transposed_dtype.cast<at::ScalarType>();
+    c10::optional<int64_t> ring_hist_len = c10::nullopt;
+    if (!hist_len.is_none()) ring_hist_len = hist_len.cast<int64_t>();
     const QuantizeOutputs outs =
         run_quantize(x, scale, layout, out_dtype, t_dtype,
                      optional_tensor(ring, "ring_state"), hist_idx, fp8_max,
-                     pow2_margin);
+                     pow2_margin, c10::nullopt, c10::nullopt, ring_hist_len);
     if (layout == QuantLayout::Dual)
         return py::make_tuple(outs.out, outs.out_t, outs.amax);
     return py::make_tuple(layout == QuantLayout::Transposed ? outs.out_t
@@ -60,15 +62,16 @@ py::object quantize_impl(torch::Tensor x, torch::Tensor scale,
 
 // Single-orientation quantize binding: row-major x8, or its [cols][rows]
 // transpose when transposed is set — the K-contiguous operand orientation
-// NT GEMMs want. Returns (x8|x8T, amax); amax is the ring's self-cleaned
-// slot when ring_state is given, else None (pure scale+cast).
+// NT GEMMs want. Returns (x8|x8T, amax); amax is the fold's raw-domain amax
+// of the round when ring_state is given, else None (pure scale+cast).
 py::object quantize(torch::Tensor x, torch::Tensor scale,
                     at::ScalarType dtype, bool transposed, py::object ring,
-                    int64_t hist_idx, double fp8_max, double pow2_margin) {
+                    int64_t hist_idx, py::object hist_len, double fp8_max,
+                    double pow2_margin) {
     const QuantLayout layout =
         transposed ? QuantLayout::Transposed : QuantLayout::RowMajor;
     return quantize_impl(x, scale, dtype, layout, py::none(), ring, hist_idx,
-                         fp8_max, pow2_margin);
+                         hist_len, fp8_max, pow2_margin);
 }
 
 // Dual-orientation quantize binding: one read of x produces both the
@@ -79,24 +82,26 @@ py::object quantize(torch::Tensor x, torch::Tensor scale,
 // amax as above.
 py::object quantize_dual(torch::Tensor x, torch::Tensor scale,
                          at::ScalarType dtype, py::object transposed_dtype,
-                         py::object ring, int64_t hist_idx, double fp8_max,
-                         double pow2_margin) {
+                         py::object ring, int64_t hist_idx, py::object hist_len,
+                         double fp8_max, double pow2_margin) {
     return quantize_impl(x, scale, dtype, QuantLayout::Dual, transposed_dtype,
-                         ring, hist_idx, fp8_max, pow2_margin);
+                         ring, hist_idx, hist_len, fp8_max, pow2_margin);
 }
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // The ring layout constant, for policy/tests that size the buffer
-    // (``[hist n | scale | recip | amax | done | kFoldSlots scratch]``).
+    // The fold-scratch extent, for policy/tests that size the ring buffer
+    // (the full layout is RingLayout, quantize/common.h).
     m.attr("K_FOLD_SLOTS") = kFoldSlots;
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"),
           py::arg("dtype"), py::arg("transposed") = false,
           py::arg("ring") = py::none(), py::arg("hist_idx") = 0,
-          py::arg("fp8_max") = 448.0, py::arg("pow2_margin") = 1.0);
+          py::arg("hist_len") = py::none(), py::arg("fp8_max") = 448.0,
+          py::arg("pow2_margin") = 1.0);
     m.def("quantize_dual", &quantize_dual, py::arg("x"), py::arg("scale"),
           py::arg("dtype"), py::arg("transposed_dtype") = py::none(),
           py::arg("ring") = py::none(), py::arg("hist_idx") = 0,
-          py::arg("fp8_max") = 448.0, py::arg("pow2_margin") = 1.0);
+          py::arg("hist_len") = py::none(), py::arg("fp8_max") = 448.0,
+          py::arg("pow2_margin") = 1.0);
 }

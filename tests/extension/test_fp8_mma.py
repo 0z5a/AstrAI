@@ -567,19 +567,22 @@ def test_quantize_ring_fold_matches_host_update(fmt, fmax, margin):
     # Fused: same window, fold inside the quantize kernel's last block.
     ring = torch.zeros(n + 4 + K_FOLD_SLOTS, device=dev)
     ring[:n].fill_(1.0)
-    x8, _ = quantize(
+    x8, amax = quantize(
         x,
         mult,
         fmt,
         ring_state=ring,
         hist_idx=idx,
+        hist_len=n,
         fp8_max=fmax,
         pow2_margin=pow2m,
     )
     assert torch.equal(x8.view(torch.uint8), x8_ref.view(torch.uint8))
     torch.testing.assert_close(ring[:n], hist, rtol=0, atol=0)
     torch.testing.assert_close(ring[n : n + 1], scale, rtol=0, atol=0)
-    assert float(ring[n + 2]) == 0.0  # amax slot self-cleaned
+    # The reported amax is the round's peak (hist[idx] is host-computed above).
+    torch.testing.assert_close(amax.reshape(()), hist[idx], rtol=0, atol=0)
+    assert float(ring[n + 4 :].abs().sum()) == 0.0  # fold scratch self-cleaned
     assert int(ring[n + 3].view(torch.int32)) == 0  # done counter reset
 
 
@@ -606,13 +609,21 @@ def test_quantize_ring_fold_tall_dual_grid(fmt, fmax):
 
     ring = torch.zeros(n + 4 + K_FOLD_SLOTS, device=dev)
     ring[:n].fill_(1.0)
-    d8, d8T, _ = quantize_dual(
-        x, mult, fmt, ring_state=ring, hist_idx=idx, fp8_max=fmax, pow2_margin=1.0
+    d8, d8T, amax = quantize_dual(
+        x,
+        mult,
+        fmt,
+        ring_state=ring,
+        hist_idx=idx,
+        hist_len=n,
+        fp8_max=fmax,
+        pow2_margin=1.0,
     )
     assert torch.equal(d8.view(torch.uint8), x8_ref.view(torch.uint8))
     torch.testing.assert_close(ring[:n], hist, rtol=0, atol=0)
     torch.testing.assert_close(ring[n : n + 1], scale, rtol=0, atol=0)
-    assert float(ring[n + 2]) == 0.0
+    torch.testing.assert_close(amax.reshape(()), hist[idx], rtol=0, atol=0)
+    assert float(ring[n + 4 :].abs().sum()) == 0.0
     assert int(ring[n + 3].view(torch.int32)) == 0
 
 
@@ -637,7 +648,7 @@ def test_dynamic_recipe_backward():
 @skip_no_fp8
 def test_quantize_amax_presence():
     """No ring => pure scale+cast (amax None); ring => the delayed-scaling
-    fold fills a self-cleaned amax slot."""
+    fold reports the round's raw-domain amax on that output."""
     torch.manual_seed(9)
     x = torch.randn(64, 96, device="cuda", dtype=torch.bfloat16)
     mult = _scale(x).reciprocal()
@@ -647,7 +658,7 @@ def test_quantize_amax_presence():
     assert amax_dual is None
     assert torch.equal(d8.view(torch.uint8), x8.view(torch.uint8))
     assert torch.equal(d8T.view(torch.uint8), x8.t().contiguous().view(torch.uint8))
-    # ring: the in-kernel fold writes the amax scratch, then self-cleans it.
+    # ring: the fold reports the round's amax and self-cleans its scratch.
     ring = torch.zeros(8 + K_FOLD_SLOTS, device="cuda")
     ring[:4].fill_(1.0)
     x8r, amax_ring = quantize(
@@ -656,12 +667,17 @@ def test_quantize_amax_presence():
         torch.float8_e4m3fn,
         ring_state=ring,
         hist_idx=2,
+        hist_len=4,
         fp8_max=448.0,
         pow2_margin=1.0,
     )
     assert amax_ring is not None
     assert torch.equal(x8.view(torch.uint8), x8r.view(torch.uint8))
-    assert float(amax_ring) == 0.0  # amax slot self-cleaned by the fold
+    # The round's amax — the window holds only 1.0, so a stale slot would read 0.
+    torch.testing.assert_close(
+        amax_ring.reshape(()), x.float().abs().amax(), rtol=0, atol=0
+    )
+    assert float(ring[4 + 4 :].abs().sum()) == 0.0  # fold scratch self-cleaned
     assert int(ring[7].view(torch.int32)) == 0  # done counter reset
 
 
@@ -669,7 +685,7 @@ def test_quantize_amax_presence():
 def test_quantize_empty_input_ring_still_publishes():
     """An empty tensor still fires one block so the delayed-scaling fold
     publishes: hist records the round's amax 0, scale comes off the window,
-    and the amax slot / done counter / fold scratch all self-clean."""
+    the fold reports that 0 on the amax sink and self-cleans its scratch."""
     dev = torch.device("cuda")
     n, idx = 4, 1
     ring = torch.zeros(n + 4 + K_FOLD_SLOTS, device=dev)
@@ -682,17 +698,30 @@ def test_quantize_empty_input_ring_still_publishes():
         torch.float8_e4m3fn,
         ring_state=ring,
         hist_idx=idx,
+        hist_len=n,
         fp8_max=448.0,
         pow2_margin=1.0,
     )
     assert x8.shape == (0, 1536)
-    assert amax is not None and float(amax) == 0.0
-    assert float(ring[idx]) == 0.0  # the empty round's amax
+    assert amax is not None and float(amax) == 0.0  # the empty round's amax
+    assert float(ring[idx]) == 0.0
     expected_scale = (ring[:n].max() / 448.0).clamp_min(1e-12).reshape(1)
     torch.testing.assert_close(ring[n : n + 1], expected_scale, rtol=0, atol=0)
-    assert float(ring[n + 2]) == 0.0  # amax slot self-cleaned
-    assert int(ring[n + 3].view(torch.int32)) == 0  # done counter reset
     assert float(ring[n + 4 :].abs().sum()) == 0.0  # fold scratch self-cleaned
+    assert int(ring[n + 3].view(torch.int32)) == 0  # done counter reset
+
+
+@skip_no_fp8
+def test_quantize_ring_requires_hist_len():
+    """A ring without hist_len is refused, not guessed: the composed ring's
+    trailing scale pair makes the window unrecoverable from numel, and the
+    inference that used to run silently read the scale slots as history."""
+    dev = torch.device("cuda")
+    ring = torch.zeros(4 + 4 + K_FOLD_SLOTS, device=dev)
+    x = torch.randn(32, 64, dtype=torch.bfloat16, device=dev)
+    mult = _scale(x).reciprocal()
+    with pytest.raises(RuntimeError, match="hist_len"):
+        quantize(x, mult, torch.float8_e4m3fn, ring_state=ring, hist_idx=0)
 
 
 @skip_no_fp8
@@ -707,7 +736,7 @@ def test_quantize_ring_scratch_self_clean_across_reuse():
     big = torch.randn(64, 96, dtype=torch.bfloat16, device=dev) * 50
     small = torch.randn(64, 96, dtype=torch.bfloat16, device=dev) * 0.05
     mult = torch.tensor([1.0], device=dev)
-    kw = dict(ring_state=ring, hist_idx=idx, fp8_max=448.0, pow2_margin=1.0)
+    kw = dict(ring_state=ring, hist_idx=idx, hist_len=n, fp8_max=448.0, pow2_margin=1.0)
 
     quantize(big, mult, torch.float8_e4m3fn, **kw)
     assert float(ring[n + 4 :].abs().sum()) == 0.0
