@@ -975,6 +975,47 @@ inline void canonicalize_gemm(GemmParams& p, bool& trans_a, bool& trans_b) {
     }
 }
 
+// The (trans_a, trans_b) -> layout-tag ladder: ONE home for the branch both
+// the launch below and the planner probe walk, so a probe cannot answer for
+// a layout the launch then does not take. fn gets the three tags (operand A,
+// operand B, output); the probe ignores the output one, which never reaches
+// the planner. `swapped` marks the symmetric-NN rewrite's own TT — the only
+// arm whose OUTPUT tag is transposed, the rewrite having computed the
+// transposed problem into the caller's [M][N] buffer.
+//
+// A visitor rather than a tag-returning function because a tag's identity is
+// its TYPE: the value cannot vary per arm, the instantiations can. Every arm
+// calls fn, which keeps this total for a caller that returns fn's value.
+template <typename ElemA, typename ElemB, typename F>
+auto with_layout_tags(bool trans_a, bool trans_b, bool swapped, F&& fn) {
+    constexpr bool kSymmetric = std::is_same_v<ElemA, ElemB>;
+    if (trans_a && trans_b) {
+        if constexpr (kSymmetric) {
+            if (swapped) return fn(ColMajor{}, ColMajor{}, ColMajor{});
+            return fn(ColMajor{}, ColMajor{}, RowMajor{});
+        }
+        return fn(ColMajor{}, ColMajor{}, RowMajor{});
+    }
+    if (trans_b) {
+        // NT (the fused-linear shape), the production nn.Linear route.
+        return fn(RowMajor{}, ColMajor{}, RowMajor{});
+    }
+    if (trans_a) return fn(ColMajor{}, RowMajor{}, RowMajor{});
+    if constexpr (kSymmetric) {
+        // Unreachable: canonicalize_gemm turns a symmetric NN into the TT arm
+        // above, so both callers arrive here for a mixed pair only. The arm
+        // stays total anyway — the probe returns fn's value and needs no dead
+        // fallback — and names the instantiation the rewrite's own TT branch
+        // already takes.
+        return fn(ColMajor{}, ColMajor{}, RowMajor{});
+    } else {
+        // Dual row-major: mixed only — symmetric NN was rewritten above
+        // into the transposed TT kernel (if constexpr keeps this
+        // instantiation out of symmetric builds).
+        return fn(RowMajor{}, RowMajor{}, RowMajor{});
+    }
+}
+
 // Dtype-generic entry point: canonicalize the problem, plan the launch,
 // wire the layout tags through. ElemA / ElemB / OutT are independent
 // knobs; the fp8 pairs enter with their element types directly.
@@ -1003,31 +1044,7 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
                                  OutT>(p),
             stream);
     };
-    if (trans_a && trans_b) {
-        // The swap computes the transposed problem; its (rewritten TT)
-        // branch instantiates the column-major-output epilogue through
-        // LayoutOut. Mixed never swaps, so its output stays row-major (and
-        // if constexpr keeps the swapped instantiation out of mixed builds).
-        if constexpr (kSymmetric) {
-            if (swapped)
-                launch(ColMajor{}, ColMajor{}, ColMajor{});
-            else
-                launch(ColMajor{}, ColMajor{}, RowMajor{});
-        } else {
-            launch(ColMajor{}, ColMajor{}, RowMajor{});
-        }
-    } else if (trans_b) {
-        // NT (the fused-linear shape), the production nn.Linear route.
-        launch(RowMajor{}, ColMajor{}, RowMajor{});
-    } else if (trans_a) {
-        launch(ColMajor{}, RowMajor{}, RowMajor{});
-    } else {
-        // Dual row-major: mixed only — symmetric NN was rewritten above
-        // into the transposed TT kernel (if constexpr keeps this
-        // instantiation out of symmetric builds).
-        if constexpr (!kSymmetric)
-            launch(RowMajor{}, RowMajor{}, RowMajor{});
-    }
+    with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, launch);
 }
 
 // The explicit-instantiation spelling shared by the per-pair TUs (bare, the
@@ -1039,10 +1056,10 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
 
 // Host-only planner probe (the Python autotuner's coverage check): the
 // decision gemm_dispatch would make for this problem, without a launch —
-// the planner is GPU-free by design. The
-// tag selection mirrors gemm_dispatch branch-for-branch, symmetric-NN
-// rewrite included, so a probe cannot disagree with the branch the real
-// call takes; LayoutOut never reaches the planner, so it is absent here.
+// the planner is GPU-free by design. The tag selection is the shared ladder
+// (with_layout_tags), symmetric-NN rewrite included, so a probe cannot
+// disagree with the branch the real call takes; the output tag the ladder
+// hands over is ignored here, LayoutOut never reaching the planner.
 // The probe returns the decision plus the query it answered (the binding
 // reports perf_class/crosswise from the query, source/recipe from the
 // decision).
@@ -1055,18 +1072,17 @@ std::pair<PlanDecision, PlanQuery> plan_probe_for(
     p.n = static_cast<int>(n);
     p.k = static_cast<int>(k);
     p.batch = static_cast<int>(batch);
+    bool swapped = false;
     if constexpr (std::is_same_v<ElemA, ElemB>) {
+        swapped = !trans_a && !trans_b;
         canonicalize_gemm(p, trans_a, trans_b);  // symmetric NN -> transposed TT
     }
-    auto probe = [&](auto la, auto lb) {
-        PlanQuery q =
-            plan_query<ElemA, ElemB, decltype(la), decltype(lb)>(p, dev);
-        return std::make_pair(plan_dispatch(q), std::move(q));
-    };
-    if (trans_a && trans_b) return probe(ColMajor{}, ColMajor{});
-    if (trans_b) return probe(RowMajor{}, ColMajor{});
-    if (trans_a) return probe(ColMajor{}, RowMajor{});
-    return probe(RowMajor{}, RowMajor{});
+    return with_layout_tags<ElemA, ElemB>(
+        trans_a, trans_b, swapped, [&](auto la, auto lb, auto) {
+            PlanQuery q =
+                plan_query<ElemA, ElemB, decltype(la), decltype(lb)>(p, dev);
+            return std::make_pair(plan_dispatch(q), std::move(q));
+        });
 }
 
 }  // namespace gemm

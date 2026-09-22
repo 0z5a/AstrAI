@@ -28,19 +28,33 @@ using namespace astrai::quant;
 namespace astrai {
 namespace gemm {
 
+// The dtype-pair table: one line per supported pair — (torch ScalarType,
+// element type) per operand — and the single source this TU's consumers
+// stamp: the extern template declarations below and the dispatch / probe
+// lookups further down. A pair is added once here and cannot reach one
+// consumer without the other. (The extern block used to be hand-maintained
+// beside the switch, and had already grown two bf16 x fp8 entries with no
+// instantiation TU behind them.) The CMake gemm module entry carries one
+// instantiation TU per line — kept together by hand, and a line with no TU
+// behind it fails the link loudly.
+#define ASTRAI_GEMM_PAIRS(X)                                                 \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)      \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                 \
+    X(torch::kChar, int8_t, torch::kChar, int8_t)                            \
+    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn,           \
+      __nv_fp8_e4m3)                                                         \
+    X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
+
 // The per-pair specializations are explicitly instantiated in their own TUs
 // (gemm_bf16_bf16.cu etc.), one nvcc job per dtype pair. These extern
 // template declarations keep the dispatch switch below from re-instantiating:
 // the address-of forms are references to the externally defined symbols only.
 // (They must sit here, outside the anonymous namespace — nvcc rejects
 // extern template declarations in an anonymous namespace.)
-extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, __nv_bfloat16);
-extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, int8_t);
-extern ASTRAI_GEMM_INSTANTIATE(int8_t, int8_t);
-extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, __nv_fp8_e4m3);
-extern ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, __nv_fp8_e5m2);
-extern ASTRAI_GEMM_INSTANTIATE(__nv_fp8_e4m3, __nv_fp8_e4m3);
-extern ASTRAI_GEMM_INSTANTIATE(__nv_fp8_e5m2, __nv_fp8_e5m2);
+#define ASTRAI_GEMM_EXTERN(SA, TA, SB, TB) \
+    extern ASTRAI_GEMM_INSTANTIATE(TA, TB);
+ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_EXTERN)
+#undef ASTRAI_GEMM_EXTERN
 
 namespace {
 
@@ -98,26 +112,17 @@ QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent,
     return {s.data_ptr<float>(), s.numel() == 1 ? 0 : (int)extent};
 }
 
-// The one dtype-pair table (scalar-type key -> element type): the dispatch
-// and probe lookups below stamp it, so a pair added for one can never be
-// missed in the other — and an unsupported pair raises with the actual
-// operand dtypes in the message instead of a hardcoded list that can drift.
-// pack_dtypes is constexpr, so every case label is a compile-time constant
-// and the switch lowers to one indexed branch, no runtime-initialized state.
+// The lookup key both stamped switches below pack their case labels with:
+// one u16 per pair, so every label is a compile-time constant and the switch
+// lowers to one indexed branch with no runtime-initialized state. An
+// unsupported pair raises with the actual operand dtypes in the message
+// instead of a hardcoded list that can drift.
 using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
 
 constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
     return static_cast<uint16_t>(static_cast<uint8_t>(a)) << 8 |
            static_cast<uint8_t>(b);
 }
-
-#define ASTRAI_GEMM_PAIRS(X)                                                 \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)      \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                 \
-    X(torch::kChar, int8_t, torch::kChar, int8_t)                            \
-    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn,           \
-      __nv_fp8_e4m3)                                                         \
-    X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
 
 // The unsupported-pair arm, one spelling for the two lookups below: the
 // switch's own default carries it, so the non-void lookups cannot fall off
