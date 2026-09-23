@@ -95,6 +95,10 @@ def _rollout_config(*, compile_mode=None):
         rollout_top_p=1.0,
         rollout_interval=1,
         rollout_max_policy_lag=None,
+        rollout_pool_seq_len=None,
+        rollout_device=None,
+        rollout_val_device=None,
+        rollout_val_overrides=lambda: {},
         cp_size=1,
         tp_size=1,
         device_type="cpu",
@@ -149,7 +153,7 @@ def test_train_context_passes_ddp_inference_view_to_rollout(tmp_path, monkeypatc
         assert captured["model"] is model
         assert captured["max_seq_len"] == 32
         assert captured["max_batch_size"] == 2
-        assert context.strategy.runner.generator.scheduler.__class__ is _Scheduler
+        assert context.strategy.runner.generator.backend.scheduler.__class__ is _Scheduler
     finally:
         dist.destroy_process_group()
 

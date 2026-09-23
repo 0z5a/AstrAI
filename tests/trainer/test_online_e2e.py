@@ -260,3 +260,30 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
 
     expected_steps = (len(dataset) + _DDP_TEST_WORLD_SIZE - 1) // _DDP_TEST_WORLD_SIZE
     assert Path(test_dir, "ckpt", f"epoch_0_step_{expected_steps}").is_dir()
+
+def test_rollout_val_overrides_drop_unset_fields():
+    """Only explicitly set validation fields enter the replace() dict."""
+    config = _minimal_online_config(rollout_val_temperature=0.0)
+    assert config.rollout_val_overrides() == {"temperature": 0.0}
+
+    config = _minimal_online_config(
+        rollout_val_temperature=0.0,
+        rollout_val_top_p=0.95,
+        rollout_val_top_k=0,
+        rollout_val_max_tokens=256,
+        rollout_val_group_size=1,
+    )
+    assert config.rollout_val_overrides() == {
+        "temperature": 0.0,
+        "top_p": 0.95,
+        "top_k": 0,
+        "max_tokens": 256,
+        "group_size": 1,
+    }
+
+    # Unset fields stay legal (inherit) while out-of-range values are
+    # rejected at config time; temperature=0 (greedy) is val-only legal.
+    with pytest.raises(ValueError, match="rollout_val_top_p"):
+        _minimal_online_config(rollout_val_top_p=0.0)
+    with pytest.raises(ValueError, match="rollout_val_group_size"):
+        _minimal_online_config(rollout_val_group_size=0)
