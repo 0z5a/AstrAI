@@ -80,7 +80,7 @@ class GQA(nn.Module):
 
         sdqa_out = attention(
             q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
-        ).reshape(*x.shape[:-1], self.dim)
+        ).reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 
         if self.use_gated_attention:
             sdqa_out = sdqa_out * F.sigmoid(self.gate(x))
@@ -176,7 +176,7 @@ class MLA(nn.Module):
 
         attn_out = attention(
             q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
-        ).reshape(*x.shape[:-1], self.dim)
+        ).reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 
         if self.use_gated_attention:
             attn_out = attn_out * F.sigmoid(self.gate(x))

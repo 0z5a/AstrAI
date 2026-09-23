@@ -13,7 +13,7 @@ import torch.nn as nn
 from astrai.extension import ATTN_BACKEND, AttentionBackend, get_backend
 from astrai.inference.cache import PagePool
 from astrai.inference.scheduler import InferenceScheduler
-from astrai.inference.task import STOP
+from astrai.inference.task import STOP, BatchedStreamCallback
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 
@@ -33,15 +33,27 @@ class GenerateResult:
         self._total = count
 
     def append(self, token: str, idx: int = 0):
+        self.append_batch([(idx, token)])
+
+    def append_batch(self, items: List[Tuple[int, Any]]) -> None:
+        """Append multiple ``(idx, token)`` events under one lock/notify.
+
+        Batched counterpart to :meth:`append` for per-step delivery: state
+        updates for every event happen under a single condition hold and
+        waiters are woken once per batch instead of once per token.
+        """
+        if not items:
+            return
         with self._cond:
-            self.tokens.append((idx, token))
-            if token is not STOP:
-                self.results[idx] += token
-            else:
-                if not self._done[idx]:
-                    self._done[idx] = True
-                    self._completed += 1
-                    self._cond.notify_all()
+            for idx, token in items:
+                self.tokens.append((idx, token))
+                if token is STOP:
+                    if not self._done[idx]:
+                        self._done[idx] = True
+                        self._completed += 1
+                        self._cond.notify_all()
+                else:
+                    self.results[idx] += token
             self._event.set()
 
     def pop_all(self) -> List[Tuple[int, str]]:
@@ -67,6 +79,47 @@ class GenerateResult:
     def get_results(self) -> List[str]:
         with self._cond:
             return self.results.copy()
+
+
+class _ResultSink(BatchedStreamCallback):
+    """Batched stream channel from the scheduler into one GenerateResult.
+
+    Registered as the ``stream_callback`` for every task of a single
+    ``generate`` call, so the scheduler's one dispatch per decode step
+    maps to one ``append_batch`` (one lock, one waiter wake). A task can
+    start decoding the moment ``add_task`` returns — before the engine
+    learns its id — so events for ids not yet bound are buffered and
+    replayed on ``bind``.
+    """
+
+    def __init__(self, result: GenerateResult):
+        self._result = result
+        self._lock = threading.Lock()
+        self._index_of: Dict[str, int] = {}
+        self._pending: List[Tuple[str, Any]] = []
+
+    def bind(self, task_id: str, idx: int) -> None:
+        with self._lock:
+            self._index_of[task_id] = idx
+            replay = [(idx, token) for tid, token in self._pending if tid == task_id]
+            if replay:
+                self._pending = [
+                    (tid, token) for tid, token in self._pending if tid != task_id
+                ]
+        if replay:
+            self._result.append_batch(replay)
+
+    def __call__(self, events: List[Tuple[str, Any]]) -> None:
+        with self._lock:
+            items: List[Tuple[int, Any]] = []
+            for tid, token in events:
+                idx = self._index_of.get(tid)
+                if idx is None:
+                    self._pending.append((tid, token))
+                else:
+                    items.append((idx, token))
+        if items:
+            self._result.append_batch(items)
 
 
 class InferenceEngine:
@@ -135,6 +188,93 @@ class InferenceEngine:
             rep_window,
         )
 
+    def score(
+        self,
+        prompt: Union[str, List[int], List[Union[str, List[int]]]],
+        continuation: Union[str, List[int], List[Union[str, List[int]]]],
+        per_token: bool = False,
+    ) -> Union[float, None, List[Any]]:
+        """Teacher-forced log-probability of ``continuation`` given ``prompt``.
+
+        The engine's entry point for log-likelihood metrics.  Nothing is
+        sampled: the sequence is prefilled as ``prompt + continuation`` and
+        only the continuation's own tokens are scored, projected at exactly
+        the positions that predict them.  Callers therefore never build an
+        attention mask -- a 2-D one used to switch causality off here.
+
+        Strings are tokenized the way the eval scripts tokenize a scored pair:
+        the prompt keeps its special tokens, the continuation does not.  Pass
+        token ids to control the boundary exactly (tokenizing a pair jointly
+        can differ from tokenizing the two sides).
+
+        Args:
+            prompt: one context, or a list of contexts.
+            continuation: the matching continuation(s).
+            per_token: return per-token log-probabilities instead of the sum.
+
+        Returns:
+            A ``float`` for a single pair, or a list for a batch.  ``None``
+            marks a pair that cannot be scored (empty side, or the sequence
+            reaching the engine's ``max_seq_len``).
+
+        Note:
+            Synchronous and not re-entrant: like :meth:`InferenceScheduler.
+            generate` it drives the executor on the calling thread, so do not
+            overlap it with generation on the same engine.
+        """
+
+        # A list of ints is one prompt given as token ids; a list of strings or
+        # of id-lists is a batch.
+        def _is_batch(side) -> bool:
+            return isinstance(side, list) and (
+                not side or isinstance(side[0], (str, list))
+            )
+
+        is_batch = _is_batch(prompt)
+        if is_batch != _is_batch(continuation):
+            raise ValueError(
+                "prompt and continuation must both be single or both batches"
+            )
+        if is_batch and len(prompt) != len(continuation):
+            raise ValueError("prompt and continuation batches must have equal length")
+        if not is_batch:
+            prompt, continuation = [prompt], [continuation]
+
+        def _encode(side: str, **kwargs) -> List[int]:
+            out = self.tokenizer.encode(side, **kwargs)
+            # Tokenizers in this repo return a flat list for a bare string;
+            # accept the batched shape too rather than depending on that.
+            if out and isinstance(out[0], list):
+                out = out[0]
+            return list(out)
+
+        def _ids(side) -> List[int]:
+            return _encode(side) if isinstance(side, str) else list(side)
+
+        def _cont_ids(side) -> List[int]:
+            return (
+                _encode(side, add_special_tokens=False)
+                if isinstance(side, str)
+                else list(side)
+            )
+
+        prompts = [_ids(p) for p in prompt]
+        conts = [_cont_ids(c) for c in continuation]
+
+        # The executor holds max_batch_size worth of fixed-shape buffers, so
+        # split a long batch here rather than failing deep in the executor.
+        chunk = max(1, self.scheduler._task_mgr.max_batch_size)
+        results: List[Any] = []
+        for start in range(0, len(prompts), chunk):
+            results.extend(
+                self.scheduler.score_ids(
+                    prompts[start : start + chunk],
+                    conts[start : start + chunk],
+                    per_token=per_token,
+                )
+            )
+        return results if is_batch else results[0]
+
     def generate_async(
         self,
         prompt: str,
@@ -147,6 +287,7 @@ class InferenceEngine:
     ) -> AsyncGenerator[str, None]:
         request_backend = get_backend(use_default=False)
         result = GenerateResult()
+        sink = _ResultSink(result)
         task_id = self.scheduler.add_task(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -156,8 +297,9 @@ class InferenceEngine:
             frequency_penalty=frequency_penalty,
             rep_window=rep_window,
             backend=request_backend,
-            stream_callback=result.append,
+            stream_callback=sink,
         )
+        sink.bind(task_id, 0)
 
         async def _agen():
             finished = False
@@ -191,8 +333,10 @@ class InferenceEngine:
         n = len(prompts)
         request_backend = get_backend(use_default=False)
         result = GenerateResult(count=n)
-        task_ids = [
-            self.scheduler.add_task(
+        sink = _ResultSink(result)
+        task_ids = []
+        for i, p in enumerate(prompts):
+            task_id = self.scheduler.add_task(
                 prompt=p,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -201,10 +345,10 @@ class InferenceEngine:
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
                 backend=request_backend,
-                stream_callback=lambda token, idx=i: result.append(token, idx),
+                stream_callback=sink,
             )
-            for i, p in enumerate(prompts)
-        ]
+            sink.bind(task_id, i)
+            task_ids.append(task_id)
 
         if not stream:
             try:

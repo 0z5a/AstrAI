@@ -153,9 +153,24 @@ per-token `logprobs_old` captured by the rollout sampler, avoiding an
 a compatibility fallback. The KL term regularises $\pi_\theta$ towards a frozen
 reference model (`ref_model`, typically the SFT checkpoint).
 
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. Offline callers that
+Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. The optional
+`clip_eps_low` and `clip_eps_high` parameters replace the symmetric interval
+with $[1-\epsilon_{low}, 1+\epsilon_{high}]$. Leaving both unset preserves the
+existing symmetric objective. DAPO Clip-Higher can be selected explicitly, for
+example with `clip_eps_low=0.2` and `clip_eps_high=0.28`. Offline callers that
 do not provide `logprobs_old` must sync `old_model` weights via
 `sync_old_model()` between data-generation rounds.
+
+`loss_aggregation="token"` (the default) divides by the total number of valid
+response tokens, matching DAPO's token-level policy-gradient loss. Set it to
+`"sequence"` to first average each response and then weight responses equally,
+matching the original GRPO reduction for controlled ablations.
+
+DAPO soft overlong shaping is enabled by setting `overlong_max_len` and a
+positive `overlong_buffer_len`. If $L$ is the valid response length, the added
+reward is zero through $L_{max}-L_{buffer}$, falls linearly to -1 at $L_{max}$,
+and is multiplied by `overlong_penalty_scale`. It is disabled by default and
+does not alter the reward-model output in place.
 
 Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
 `logprobs_old` (required when `old_model` is not configured).
@@ -169,6 +184,19 @@ them with a `BaseRewardModel`. It refreshes cached rollouts every
 `rollout_interval` optimizer steps. `online_grpo` carries the sampler's aligned
 behaviour log-probabilities into the loss, so it does not allocate or synchronize
 a separate old-policy model.
+
+`online_ppo` is actor-critic PPO on the same rollout pipeline. A `ValueModel`
+critic (backbone warm-started from the policy, zero-initialized value head)
+scores the rollout states; advantages come from GAE(`--ppo_gamma`,
+`--ppo_gae_lambda`) with the terminal reward on each response's last token and
+the reference-KL penalty (k3 estimator, `--grpo_kl_coef`) folded into per-token
+rewards. Advantages and returns are computed once per rollout and pinned on the
+`RolloutResult`, so replayed steps optimize fixed targets. The critic has its
+own optimizer, stepped outside the policy-version lock, and persists as
+`value_model.pt`/`value_optimizer.pt` checkpoint extras — resume without them
+fails loudly, and `scripts/docker/lib/train-common.sh` (via
+`CHECKPOINT_EXTRA_FILES` in `scripts/train.sh`) treats a PPO checkpoint as
+incomplete when they are missing.
 
 Every successful optimizer step mutates the shared model and advances its
 monotonic `policy_version` under the same generation lock. The scheduler
@@ -184,6 +212,35 @@ concurrent update cannot land between validation and cache insertion.
 Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward
 model factory.
+
+### Rollout backends and validation sampling
+
+Where generation physically runs is a *backend* choice
+(`astrai/trainer/backend.py`): by default the scheduler wraps the training
+model object in-process (`ColocatedBackend`, weight updates are free).
+`--rollout_device cuda:1` instead builds a frozen replica on that device
+with its own scheduler and KV pool; a `P2PCopyPublisher` copies the
+training weights into the replica inside the policy-version lock on every
+optimizer step, so the replica's generations stay version-attributable. The
+copy is a full state transfer (~2GB/step for a 1B bf16 policy) — pay it only
+when backend isolation is worth it.
+
+The scheduler's KV pool is sized from the model's full
+`max_position_embeddings` by default; `--rollout_pool_seq_len` right-sizes it
+to the true rollout horizon (it must cover the longest prompt plus
+`rollout_max_tokens`). For the 1B policy the default 32768 window allocates
+~3.2 GB of KV against ~400 MB at 4096 — requests beyond the budget are
+rejected (`prompt_too_long`) rather than silently truncated.
+
+`--rollout_val_device` gives *validation* its own replica, so evaluation
+generation never disturbs the training scheduler's KV pool. Validation
+sampling is decoupled from training via the `rollout_val_*` overrides
+(`--rollout_val_temperature 0` decodes greedily; group size, top-p, top-k,
+and max tokens inherit the training rollout when unset). Online validation
+runs through a `RolloutEvaluator` that reports reward statistics
+(`reward_mean`/`reward_std`/`reward_max`/`response_len_mean`) in the
+`validation` metric events instead of the training RL loss, which is
+degenerate under greedy decoding or `group_size == 1`.
 
 ## LR Schedulers
 
@@ -236,7 +293,7 @@ context = TrainContextBuilder(config).with_param_path(param_path, resume=True).b
 ```
 
 - Loads checkpoint weights before the model is wrapped
-- Creates executor via `ExecutorFactory.create(cfg.parallel_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)`
+- Creates executor via `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)`
 - Calls `executor.prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap=...)`; the executor creates, wraps, then builds the optimizer and scheduler for the wrapped model
 - Creates `RDSampler` for shuffle+resume
 - Builds strategy via `StrategyFactory.create(train_type, model, device, **kwargs)`
@@ -247,8 +304,8 @@ context = TrainContextBuilder(config).with_param_path(param_path, resume=True).b
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 nohup python scripts/tools/train.py \
-    --nprocs=4 \
-    --parallel_mode=ddp \
+    --dp_size=4 \
+    --dp_mode=ddp \
     --train_type=seq \
     --data_root_path=/path/to/dataset \
     --param_path=/path/to/model \
@@ -268,4 +325,4 @@ nohup python scripts/tools/train.py \
 
 Full parameter reference at [params.md](params.md).
 
-> Document Update Time: 2026-08-02
+> Document Update Time: 2026-09-20

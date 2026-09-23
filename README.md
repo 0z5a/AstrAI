@@ -47,7 +47,7 @@ AstrAI is an end-to-end Transformer framework for building, training, evaluating
 | Area | Capabilities |
 |---|---|
 | **Models** | Autoregressive language models and embedding models with GQA, MLA, MoE, RoPE, and extensible attention/FFN components |
-| **Training** | Pre-training (`seq`), supervised fine-tuning (`sft`), DPO, and GRPO with gradient accumulation, checkpointing, DDP, and FSDP |
+| **Training** | Pre-training (`seq`), supervised fine-tuning (`sft`), DPO, and online RL (GRPO/PPO) with in-process or cross-GPU rollout backends, gradient accumulation, checkpointing, DDP, and FSDP |
 | **Data** | Declarative JSON preprocessing, configurable masking and packing, binary/JSONL storage, and streaming datasets |
 | **Inference** | Continuous batching, paged KV cache, radix prefix caching, streaming generation, and Torch/CUDA/FlashAttention backends |
 | **Serving** | FastAPI server with OpenAI and Anthropic chat completion protocols, including SSE streaming and tool calls |
@@ -100,8 +100,8 @@ python scripts/tools/preprocess.py data/*.jsonl -o output/ -c pretrain.json
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 nohup python scripts/tools/train.py \
-    --nprocs=4 \
-    --parallel_mode=ddp \
+    --dp_size=4 \
+    --dp_mode=ddp \
     --train_type=seq \
     --data_root_path=/path/to/dataset \
     --param_path=/path/to/model \

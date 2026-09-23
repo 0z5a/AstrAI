@@ -97,40 +97,6 @@ def broadcast_state_dict(
     return state_dict
 
 
-def create_ref_model(
-    model_fn: Callable[[], nn.Module],
-    executor: Optional["BaseExecutor"] = None,
-    model: Optional[nn.Module] = None,
-    state_dict: Optional[Dict[str, torch.Tensor]] = None,
-    device: Optional[str] = None,
-) -> Optional[nn.Module]:
-    """Create a frozen reference model from executor or state dict.
-
-    In distributed mode (FSDP), ``unwrap_model`` returns ``None`` on
-    non-rank-0.  The state_dict is broadcast from rank-0 to all ranks
-    so every rank gets a complete copy.
-    """
-    if state_dict is None and executor is not None and model is not None:
-        state_dict = executor.unwrap_model(model)
-
-    # FSDP's unwrap_model returns None on non-rank-0. Broadcast from
-    # rank-0 so every rank receives a complete state_dict.
-    if executor is not None and executor.use_distributed:
-        state_dict = broadcast_state_dict(state_dict)
-
-    if state_dict is None:
-        return None
-
-    state_dict = strip_compile_prefix(state_dict)
-    ref_model = model_fn()
-    ref_model.load_state_dict(state_dict)
-    ref_model.requires_grad_(False)
-    ref_model.eval()
-    if device is not None:
-        ref_model = ref_model.to(device=device)
-    return ref_model
-
-
 class GradientState:
     def __init__(self, grad_accum_steps: int = 1):
         self.num_steps = max(grad_accum_steps, 1)

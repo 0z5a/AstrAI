@@ -16,12 +16,12 @@ from astrai.config.cli import (
 )
 from astrai.config.train_config import (
     BACKENDS,
-    PARALLEL_MODES,
+    DP_MODES,
     START_METHODS,
     TRAIN_TYPES,
 )
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
-from astrai.model import AutoRegressiveLM
+from astrai.model import AutoRegressiveLM, ValueModel
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.optim import OptimizerFactory
 from astrai.trainer import SchedulerFactory, Trainer
@@ -31,7 +31,7 @@ from astrai.trainer.rollout import BaseRewardModel
 _merge_yaml_into_kwargs = merge_yaml_into_kwargs
 
 _TRAIN_TYPE = sorted(TRAIN_TYPES)
-_PARALLEL = sorted(PARALLEL_MODES)
+_DP = sorted(DP_MODES)
 _SCHEDULES = ["cosine", "sgdr", "wsd"]
 _OPTIMIZERS = OptimizerFactory.list_registered()
 _BACKENDS = sorted(BACKENDS)
@@ -206,11 +206,74 @@ _SPECS = [
         help="GRPO clip epsilon.",
     ),
     OptSpec(
+        "grpo_clip_eps_low",
+        "Algorithm",
+        type=float,
+        default=None,
+        help="Optional lower GRPO clip epsilon; defaults to --grpo_clip_eps.",
+    ),
+    OptSpec(
+        "grpo_clip_eps_high",
+        "Algorithm",
+        type=float,
+        default=None,
+        help="Optional upper GRPO clip epsilon for DAPO Clip-Higher.",
+    ),
+    OptSpec(
+        "grpo_loss_aggregation",
+        "Algorithm",
+        choices=["token", "sequence"],
+        default="token",
+        help="Aggregate GRPO loss by token (DAPO) or equally by sequence.",
+    ),
+    OptSpec(
+        "grpo_overlong_max_len",
+        "Algorithm",
+        type=int,
+        default=None,
+        help="Optional response length limit for DAPO soft overlong shaping.",
+    ),
+    OptSpec(
+        "grpo_overlong_buffer_len",
+        "Algorithm",
+        type=int,
+        default=0,
+        help="Length of the linear DAPO overlong penalty window.",
+    ),
+    OptSpec(
+        "grpo_overlong_penalty_scale",
+        "Algorithm",
+        type=float,
+        default=1.0,
+        help="Scale applied to the DAPO soft overlong penalty.",
+    ),
+    OptSpec(
         "grpo_kl_coef",
         "Algorithm",
         type=float,
         default=0.01,
         help="GRPO KL penalty coefficient.",
+    ),
+    OptSpec(
+        "ppo_gamma",
+        "Algorithm",
+        type=float,
+        default=1.0,
+        help="PPO reward discount factor.",
+    ),
+    OptSpec(
+        "ppo_gae_lambda",
+        "Algorithm",
+        type=float,
+        default=0.95,
+        help="PPO GAE bias/variance trade-off.",
+    ),
+    OptSpec(
+        "ppo_vf_coef",
+        "Algorithm",
+        type=float,
+        default=0.5,
+        help="PPO value-loss coefficient.",
     ),
     OptSpec(
         "moe_aux_loss_coef",
@@ -227,6 +290,46 @@ _SPECS = [
     OptSpec("rollout_top_k", "Algorithm", help="Rollout top-k (0=disable)."),
     OptSpec("rollout_top_p", "Algorithm", help="Rollout top-p."),
     OptSpec("rollout_max_tokens", "Algorithm", help="Max tokens per rollout response."),
+    OptSpec(
+        "rollout_val_temperature",
+        "Algorithm",
+        help="Validation rollout temperature (0=greedy; unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_top_p",
+        "Algorithm",
+        help="Validation rollout top-p (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_top_k",
+        "Algorithm",
+        help="Validation rollout top-k (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_max_tokens",
+        "Algorithm",
+        help="Validation rollout max tokens (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_group_size",
+        "Algorithm",
+        help="Validation responses per prompt (unset inherits training group).",
+    ),
+    OptSpec(
+        "rollout_device",
+        "Algorithm",
+        help="Device for the training rollout backend, e.g. cuda:1 (unset: in-process).",
+    ),
+    OptSpec(
+        "rollout_val_device",
+        "Algorithm",
+        help="Device for a dedicated validation rollout backend (unset: shared).",
+    ),
+    OptSpec(
+        "rollout_pool_seq_len",
+        "Algorithm",
+        help="KV pool seq budget per rollout request (unset: model context window).",
+    ),
     OptSpec("neftune_alpha", "Algorithm", help="NEFTune noise alpha."),
     OptSpec("val_split", "Validation", help="Validation split ratio."),
     OptSpec("val_step", "Validation", help="Steps between validation runs."),
@@ -246,30 +349,42 @@ _SPECS = [
     ),
     OptSpec("start_epoch", "Checkpoint", help="Start epoch."),
     OptSpec("start_samples", "Checkpoint", help="Start samples (per rank)."),
-    OptSpec("master_addr", "Distributed", help="Master node address."),
-    OptSpec("master_port", "Distributed", help="Master node port."),
-    OptSpec("backend", "Distributed", choices=_BACKENDS, help="Distributed backend."),
-    OptSpec("nprocs", "Distributed", help="Number of GPUs."),
     OptSpec(
-        "parallel_mode",
+        "dp_size",
         "Distributed",
-        choices=_PARALLEL,
-        default="fsdp",
-        help="Parallel strategy.",
+        help="Data-parallel replicas; total GPUs/processes = dp_size x cp_size.",
     ),
-    OptSpec("device_type", "Distributed", help="Device type."),
     OptSpec(
-        "start_method",
+        "cp_size",
         "Distributed",
-        choices=_START_METHODS,
-        help="Multiprocessing start method.",
+        type=int,
+        default=None,
+        help="Context parallelism: shard sequences across contiguous ranks (seq pretraining).",
     ),
     OptSpec(
         "tp_size",
         "Distributed",
         type=int,
         default=None,
-        help="Tensor parallelism (future).",
+        help="Tensor parallelism: shard Linear projections over features "
+        "(attention heads / ffn channels).",
+    ),
+    OptSpec(
+        "dp_mode",
+        "Distributed",
+        choices=_DP,
+        default="fsdp",
+        help="Data-parallel gradient-sync strategy (none/ddp/fsdp).",
+    ),
+    OptSpec("backend", "Distributed", choices=_BACKENDS, help="Distributed backend."),
+    OptSpec("master_addr", "Distributed", help="Master node address."),
+    OptSpec("master_port", "Distributed", help="Master node port."),
+    OptSpec("device_type", "Distributed", help="Device type."),
+    OptSpec(
+        "start_method",
+        "Distributed",
+        choices=_START_METHODS,
+        help="Multiprocessing start method.",
     ),
     OptSpec(
         "gradient_checkpointing",
@@ -367,8 +482,9 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
 
     # Convert tuple back to list
     kwargs["metrics"] = list(kwargs["metrics"])
-    # Remove tp_size (not yet wired)
-    kwargs.pop("tp_size", None)
+    kwargs["tp_size"] = kwargs.pop("tp_size") or 1
+    kwargs["cp_size"] = kwargs.pop("cp_size") or 1
+    kwargs["dp_size"] = kwargs.pop("dp_size") or 1
 
     if dry_run:
         _print_dry_run(kwargs)
@@ -379,12 +495,18 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
 
 def _print_dry_run(kwargs: dict) -> None:
     """Print training plan summary."""
+    dp_size = kwargs.get("dp_size", 1) or 1
+    cp_size = kwargs.get("cp_size", 1) or 1
+    tp_size = kwargs.get("tp_size", 1) or 1
     rows = [
         ("Train type", kwargs.get("train_type")),
         ("Model path", kwargs.get("param_path")),
         ("Data path", kwargs.get("data_root_path")),
-        ("Parallel mode", kwargs.get("parallel_mode", "none")),
-        ("GPUs", str(kwargs.get("nprocs", 1))),
+        ("DP mode", kwargs.get("dp_mode", "none")),
+        ("DP replicas", str(dp_size)),
+        ("CP size", str(cp_size)),
+        ("TP size", str(tp_size)),
+        ("GPUs", str(dp_size * cp_size * tp_size)),
         ("Epochs", str(kwargs.get("n_epoch", 1))),
         ("Batch/device", str(kwargs.get("batch_per_device", 1))),
         ("Grad accum", str(kwargs.get("grad_accum_steps", 1))),
@@ -408,6 +530,10 @@ def create_model(config):
     return AutoRegressiveLM(config).to(dtype=torch.bfloat16)
 
 
+def create_value_model(config):
+    return ValueModel(config).to(dtype=torch.bfloat16)
+
+
 def create_optimizer(
     model, optimizer_name: str = "muon_adamw", **kwargs
 ) -> optim.Optimizer:
@@ -425,14 +551,14 @@ def compute_total_steps(
     dataset_len: int,
     n_epoch: int,
     batch_per_device: int,
-    nprocs: int,
+    dp_size: int,
     grad_accum_steps: int,
 ) -> int:
 
     def ceil_div(a: int, b: int) -> int:
         return (a + b - 1) // b
 
-    samples_per_replica = ceil_div(dataset_len, nprocs)
+    samples_per_replica = ceil_div(dataset_len, dp_size)
     batches_per_replica = ceil_div(samples_per_replica, batch_per_device)
     total_steps = (batches_per_replica // grad_accum_steps) * n_epoch
     return total_steps
@@ -462,8 +588,10 @@ def train(
     gradient_checkpointing: bool,
     window_size: int,
     stride: int,
-    nprocs: int,
-    parallel_mode: str,
+    dp_size: int,
+    cp_size: int,
+    tp_size: int,
+    dp_mode: str,
     device_type: str,
     backend: str,
     master_addr: str,
@@ -485,8 +613,24 @@ def train(
         )
     if not os.path.exists(param_path):
         raise FileNotFoundError(f"Model directory not found: {param_path}")
-    if nprocs > 1 and parallel_mode == "none":
-        raise ValueError("--nprocs > 1 requires --parallel_mode to be 'ddp' or 'fsdp'")
+    if dp_size > 1 and dp_mode == "none":
+        raise ValueError("--dp_size > 1 requires --dp_mode to be 'ddp' or 'fsdp'")
+
+    if cp_size > 1:
+        if tp_size > 1:
+            raise ValueError(
+                "--cp_size > 1 combined with --tp_size > 1 is not verified "
+                "yet: the ring-attention patch and head-sharded projections "
+                "interact on the SDPA inputs"
+            )
+        if train_type not in ("seq", "sft"):
+            raise ValueError(
+                "--cp_size > 1 supports seq (pretrain) and sft only; RL "
+                "strategies need cross-shard logprob handling and a "
+                "context-parallel rollout path"
+            )
+        if dp_mode not in ("ddp", "fsdp"):
+            raise ValueError("--cp_size > 1 requires --dp_mode ddp or fsdp")
 
     # Load config
     config_path = os.path.join(param_path, "config.json")
@@ -500,8 +644,17 @@ def train(
         "beta": kwargs.pop("dpo_beta"),
         "label_smoothing": kwargs.pop("label_smoothing"),
         "clip_eps": kwargs.pop("grpo_clip_eps"),
+        "clip_eps_low": kwargs.pop("grpo_clip_eps_low"),
+        "clip_eps_high": kwargs.pop("grpo_clip_eps_high"),
+        "loss_aggregation": kwargs.pop("grpo_loss_aggregation"),
+        "overlong_max_len": kwargs.pop("grpo_overlong_max_len"),
+        "overlong_buffer_len": kwargs.pop("grpo_overlong_buffer_len"),
+        "overlong_penalty_scale": kwargs.pop("grpo_overlong_penalty_scale"),
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
+        "gamma": kwargs.pop("ppo_gamma"),
+        "gae_lambda": kwargs.pop("ppo_gae_lambda"),
+        "vf_coef": kwargs.pop("ppo_vf_coef"),
     }
 
     rollout_interval = kwargs.pop("rollout_interval", 512)
@@ -510,10 +663,23 @@ def train(
     rollout_top_k = kwargs.pop("rollout_top_k", 0)
     rollout_top_p = kwargs.pop("rollout_top_p", 0.9)
     rollout_max_tokens = kwargs.pop("rollout_max_tokens", 1024)
+    rollout_val_temperature = kwargs.pop("rollout_val_temperature", None)
+    rollout_val_top_k = kwargs.pop("rollout_val_top_k", None)
+    rollout_val_top_p = kwargs.pop("rollout_val_top_p", None)
+    rollout_val_max_tokens = kwargs.pop("rollout_val_max_tokens", None)
+    rollout_val_group_size = kwargs.pop("rollout_val_group_size", None)
+    rollout_device = kwargs.pop("rollout_device", None)
+    rollout_val_device = kwargs.pop("rollout_val_device", None)
+    rollout_pool_seq_len = kwargs.pop("rollout_pool_seq_len", None)
     reward_model_fn: Callable[[], BaseRewardModel] | None = None
+    critic_model_fn = None
+    if train_type == "online_ppo":
+        # The optimizer defaults to the policy's; critic_optimizer_fn can
+        # override it in the TrainConfig.
+        critic_model_fn = partial(create_value_model, config)
 
     executor_kwargs = {}
-    if parallel_mode == "ddp":
+    if dp_mode == "ddp":
         executor_kwargs.update(
             gradient_as_bucket_view=True,
             broadcast_buffers=False,
@@ -584,8 +750,10 @@ def train(
             )
         }
 
+    # The scheduler counts optimizer steps over data-parallel replicas; cp
+    # peers split each batch's sequence rather than consuming extra samples.
     total_steps = compute_total_steps(
-        len(dataset), n_epoch, batch_per_device, nprocs, grad_accum_steps
+        len(dataset), n_epoch, batch_per_device, dp_size, grad_accum_steps
     )
     warmup_steps = int(warmup_ratio * total_steps)
     warmup_steps = min(warmup_steps, total_steps)
@@ -622,7 +790,7 @@ def train(
         collate_fn = dpo_collate_fn
     elif train_type == "grpo":
         collate_fn = grpo_collate_fn
-    elif train_type in ("online_grpo", "online_dpo"):
+    elif train_type in ("online_grpo", "online_dpo", "online_ppo"):
         collate_fn = None
 
     train_config = TrainConfig(
@@ -645,11 +813,13 @@ def train(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        nprocs=nprocs,
+        dp_size=dp_size,
+        cp_size=cp_size,
+        tp_size=tp_size,
+        dp_mode=dp_mode,
         backend=backend,
         master_addr=master_addr,
         master_port=master_port,
-        parallel_mode=parallel_mode,
         device_type=device_type,
         start_method=start_method,
         val_split=val_split,
@@ -667,7 +837,16 @@ def train(
         rollout_top_k=rollout_top_k,
         rollout_top_p=rollout_top_p,
         rollout_max_tokens=rollout_max_tokens,
+        rollout_val_temperature=rollout_val_temperature,
+        rollout_val_top_k=rollout_val_top_k,
+        rollout_val_top_p=rollout_val_top_p,
+        rollout_val_max_tokens=rollout_val_max_tokens,
+        rollout_val_group_size=rollout_val_group_size,
+        rollout_device=rollout_device,
+        rollout_val_device=rollout_val_device,
+        rollout_pool_seq_len=rollout_pool_seq_len,
         reward_model_fn=reward_model_fn,
+        critic_model_fn=critic_model_fn,
         moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),
     )
 

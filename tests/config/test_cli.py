@@ -91,7 +91,7 @@ def test_spec_overrides_beat_config_defaults():
     @apply_specs(
         [
             OptSpec("num_workers", "G", default=4),
-            OptSpec("parallel_mode", "G", default="fsdp"),
+            OptSpec("dp_mode", "G", default="fsdp"),
         ],
         TrainConfig,
     )
@@ -100,7 +100,7 @@ def test_spec_overrides_beat_config_defaults():
 
     params = {p.name: p for p in cmd.params}
     assert params["num_workers"].default == 4
-    assert params["parallel_mode"].default == "fsdp"
+    assert params["dp_mode"].default == "fsdp"
 
 
 def test_cli_only_flag_pair_and_one_way_flag():

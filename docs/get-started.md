@@ -41,7 +41,8 @@ pip install -e .
 > them, or `CSRC_KERNELS=true` to force them (required when building in an
 > isolated environment with `--no-build-isolation`). Once built, `CudaBackend`
 > is the default attention backend on GPU (cuda > flash > torch priority).
-> Override via `ASTR_BACKEND` env var or `attn_backend()` context manager.
+> Override via `set_op("attention", ...)` / the `attn_backend()` context
+> manager (the `ASTR_BACKEND` env var is a deprecated seed).
 > Fused rotary embedding kernel is auto-dispatched when available. Skip for
 > CPU-only usage.
 
@@ -182,8 +183,8 @@ python scripts/tools/train.py \
     --max_lr=1e-4 \
     --window_size=2048 \
     --ckpt_dir=./checkpoint \
-    --nprocs=1 \
-    --parallel_mode=none
+    --dp_size=1 \
+    --dp_mode=none
 ```
 
 ### Multi-GPU (DDP)
@@ -198,8 +199,8 @@ python scripts/tools/train.py \
     --train_type=seq \
     --data_root_path=/path/to/dataset \
     --param_path=./params \
-    --parallel_mode=ddp \
-    --nprocs=4 \
+    --dp_mode=ddp \
+    --dp_size=4 \
     --batch_per_device=4 \
     --grad_accum_steps=8 \
     --max_lr=1e-4 \
