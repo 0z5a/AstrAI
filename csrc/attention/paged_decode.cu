@@ -6,7 +6,7 @@
 #include <kernel/attention_launch.cuh>
 #include <launcher/attention.h>
 #include <launcher/attention_dtypes.h>
-#include <launcher/attention_entry.h>
+#include "entry.h"
 
 namespace astrai {
 namespace attention {

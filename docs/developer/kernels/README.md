@@ -16,7 +16,7 @@ maps to one family of translation units under `csrc/` (headers live in the `csrc
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
-| `quantize` | `quantize.cu` | FP8 quantization kernels (sm_89+) |
+| `quantize` | `quantize/bindings.cu` + `quantize/entry.cu` | FP8 quantization kernels (sm_89+) |
 | `gemm` | `gemm/gemm.cu` + per-dtype-pair `gemm_*.cu` | dtype-generic tensor-core GEMM binding + one explicit `gemm_dispatch` instantiation per dtype pair (fp8 / W8A16 / W8A8 / W16A16, sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
@@ -30,7 +30,7 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 | Operator | Doc | Kernel module | Python entry |
 |---|---|---|---|
-| Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize.cu` (headers: `csrc/include/`) | `astrai/extension/ops/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
+| Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (bindings + entry; headers: `csrc/include/`) | `astrai/extension/ops/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
 | GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/ops/gemm.py` |
 | Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (headers: `csrc/include/`) | `astrai/extension/ops/attention.py`; dispatch `astrai/extension/backend/attention.py` |
 | Rotary embedding | [rotary.md](rotary.md) | `csrc/rotary_emb.cu` | `astrai/extension/ops/rotary.py`; dispatch `astrai/extension/backend/rotary.py` |
@@ -341,11 +341,11 @@ csrc/
 │       ├── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded sources + GemmConfig seed
 │       ├── attention.h               #     attention entry declarations (astrai::attention)
 │       ├── attention_dtypes.h        #     attention ASTRAI_ATTN_DTYPE_LIST + generated unsupported-dtype refusal
-│       ├── attention_entry.h         #     attention torch→POD marshalling (pack_*_params, split-partial allocation)
 │       ├── gated_deltanet.h          #     the family's two entry declarations (astrai::gdn)
-│       ├── quantize_entry.h          #     quantize launcher + composed one-call API + input-dtype list (torch-tensor level, no pybind)
+│       ├── quantize_entry.h          #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
 │       └── fp8_checks.h              #     fp8 capability gate (check_fp8_device; shared by quantize + gemm bindings)
 ├── attention/                        # family translation units only (one torch entry each; kernels/launchers/dispatch in the shared kernel/ headers)
+│   ├── entry.h                       #   attention torch→POD marshalling (pack_*_params, split-partial allocation) — TU-local impl header, quoted-include (fp8_state.h shape)
 │   ├── decode.cu                     #   → module attn_decode
 │   ├── prefill.cu                    #   → module attn_prefill
 │   ├── paged_decode.cu               #   → module attn_paged_decode
@@ -356,7 +356,9 @@ csrc/
 │   ├── fp8_linear.cu                 #   the fp8 training linear (fwd+bwd) as one C++ autograd::Function
 │   ├── fp8_state.h                   #   the fp8 training state machine (delayed-scaling rings, cast caches, meta registry) — a TU-local split of fp8_linear.cu, quoted-include
 │   └── gemm_bf16_* / gemm_*.cu       #   per-pair explicit gemm_dispatch instantiation units (one nvcc job each; plan_table-free)
-├── quantize.cu                       # FP8 quantize binding only (module quantize; kernels in include/kernel/quantize.cuh)
+├── quantize/                         # family translation units (→ module quantize; entry.cu also compiled into gemm to share the chain)
+│   ├── bindings.cu                   #   pybind surface only (quantize / quantize_dual)
+│   └── entry.cu                      #   the entry implementation: run_quantize + ring binding + dtype dispatch (ASTRAI_QUANT_IN_DTYPES lives here)
 ├── gated_deltanet/                   # chunked GDN fwd/bwd kernels written in-TU + bindings.cu (→ module gated_deltanet)
 ├── rotary_emb.cu                     # rotary embedding (kernel + binding in one file) → module rotary_emb
 ├── bench/                            # measurement + dispatch-analysis tooling, run from the repo root as `python csrc/bench/<tool>.py`
@@ -394,13 +396,22 @@ the toolchain's plus the harness-local `test_utils.cuh`. A quoted project
 path would resolve through the includer's own directory first and silently
 change meaning on a move — the three same-named `common.h` are now
 `utils/{gemm,attention,quantize}_common.h` precisely so a spelling names
-one file. `tests/extension/test_csrc_layout.py` pins all of this — the
-stage set is closed, stage headers never include `launcher/` (zero
-exceptions since the planning split), `launcher/planning.h` has exactly one
-includer per binary, every project include is root-qualified, unshadowed
-and resolvable, and the harnesses stay torch-free. A new stage directory is
-registered in that test's `STAGES` and in this section together.
+one file. (The layout test that once pinned this mechanically was retired
+when the stage tree landed; the discipline lives here and in review.)
+
+A fourth convention, the mirror of the header fan-in rule: **implementation
+code lives in the TU territory of its consumers**. An implementation header
+whose every includer sits in one family directory lives beside them
+(`attention/entry.h`, `gemm/fp8_state.h` — quoted same-directory include);
+an implementation shared across modules becomes a .cu listed in each
+module's CMake sources (`quantize/entry.cu`, compiled into both the
+quantize and gemm modules), with only its declaration in `launcher/`.
+`launcher/` is therefore the declaration surface plus the two deliberate
+impl-headers (`planning.h`, `plan_table.h` — the single-inclusion planner
+and the row table; splitting them would put `plan_table.h` back through
+nvcc per dtype pair). A family gains a directory when it gains a second
+file; single-file families (`rotary_emb.cu`) stay at the top level.
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-> Document Update Time: 2026-09-26
+> Document Update Time: 2026-09-27

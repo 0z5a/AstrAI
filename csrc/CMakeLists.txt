@@ -130,7 +130,8 @@ set(KERNEL_MODULES
 if(ASTRAI_CUDA_ARCH_LIST)
     if(ASTRAI_CUDA_ARCH_MAX GREATER_EQUAL 89)
         list(APPEND KERNEL_MODULES
-            "quantize|quantize.cu"
+            "quantize|quantize/bindings.cu
+                  quantize/entry.cu"
             "gemm|gemm/gemm.cu
                   gemm/bindings.cu
                   gemm/fp8_linear.cu
@@ -138,7 +139,8 @@ if(ASTRAI_CUDA_ARCH_LIST)
                   gemm/gemm_bf16_int8.cu
                   gemm/gemm_int8_int8.cu
                   gemm/gemm_fp8_e4m3_fp8_e4m3.cu
-                  gemm/gemm_fp8_e5m2_fp8_e5m2.cu")
+                  gemm/gemm_fp8_e5m2_fp8_e5m2.cu
+                  quantize/entry.cu")
     else()
         message(WARNING
             "FP8 operator disabled: max ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "

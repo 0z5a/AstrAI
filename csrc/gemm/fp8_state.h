@@ -28,7 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <launcher/quantize_entry.h>
+#include <utils/quantize_common.h>
 
 namespace astrai {
 namespace fp8 {

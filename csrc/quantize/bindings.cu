@@ -1,8 +1,9 @@
-// CUDA bindings for the stateless FP8 quantize primitives. The launcher, the
-// ring layout and the composed pass live in ``launch.cuh`` so the fp8-linear
-// composition (``gemm/fp8_linear.cu``, compiled into the gemm module
-// where the GEMM dispatch state lives) shares them instead of re-deriving
-// them; this TU is only the pybind surface.
+// CUDA bindings for the stateless FP8 quantize primitives. The launcher,
+// the ring binding and the composed pass live in ``entry.cu`` (beside this
+// file, declared in launcher/quantize_entry.h) so the fp8-linear composition
+// (``gemm/fp8_linear.cu``, compiled into the gemm module where the GEMM
+// dispatch state lives) shares them instead of re-deriving them; this TU is
+// only the pybind surface.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cstdint>

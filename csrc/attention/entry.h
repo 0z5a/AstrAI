@@ -2,7 +2,10 @@
 // Attention's torch-entry marshalling layer: micro-checks, split-partial
 // allocation and the three params packers, shared by the four attention
 // entry .cu files (gemm's equivalent lives in gemm.cu; quantize's in
-// quantize_entry.h).
+// quantize/entry.cu). Lives in the family's TU directory, not
+// include/launcher/: every includer is one of the four .cu files beside
+// it (quoted same-directory include, the gemm/fp8_state.h shape), and the
+// launcher directory keeps only declaration surfaces.
 #include <float.h>
 
 #include <torch/extension.h>
