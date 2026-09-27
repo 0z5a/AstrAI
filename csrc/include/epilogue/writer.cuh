@@ -6,7 +6,7 @@
 
 #include <policy.cuh>
 #include <utils/define.cuh>
-#include <utils/gemm_common.h>
+#include <api/gemm_common.h>
 #include <utils/swizzle.cuh>
 #include <utils/tensor.cuh>
 

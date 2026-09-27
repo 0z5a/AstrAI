@@ -11,7 +11,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
-#include <utils/attention_common.h>
+#include <api/attention_common.h>
 
 namespace astrai {
 namespace attention {

@@ -12,7 +12,7 @@
 
 #include <mma/mma.cuh>
 #include <utils/device.cuh>
-#include <utils/gemm_common.h>
+#include <api/gemm_common.h>
 #include <utils/tensor.cuh>
 
 namespace astrai {

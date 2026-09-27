@@ -1,8 +1,5 @@
-// Entry points of the GDN kernel module.
-//
-// `gated_deltanet_fwd` prepares the chunked forward's operands and
-// `gated_deltanet_bwd` is the first stage of the reverse pass. The chunked
-// kernels themselves are not in the tree yet.
+// GDN entry points: fwd prepares the chunked forward's operands, bwd is the
+// first stage of the reverse pass (the chunked kernels are not in the tree).
 
 #pragma once
 

@@ -1,9 +1,5 @@
-// Entry points of the attention kernel modules.
-//
-// One declaration per entry (the api.h / gated_deltanet.h shape): the .cu
-// files implement these and attach each module's own pybind surface; the
-// device-side vocabulary (kernels, launchers, dispatchers) stays in the
-// kernel/ headers — pure CUDA, no torch.
+// Attention entry points: implemented by the attention .cu files, which own
+// the pybind surface; the device vocabulary stays in kernel/ (torch-free).
 
 #pragma once
 

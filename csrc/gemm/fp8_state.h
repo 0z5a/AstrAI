@@ -9,7 +9,7 @@
 // astrai/extension/fp8_slots.py) or by the weight's (data_ptr, shape, dtype);
 // the slot survives a replaced parameter, the address does not. Snapshots bind
 // slotted entries by name, others by registration order. Ring offsets:
-// RingLayout (utils/quantize_common.h).
+// RingLayout (api/quantize_common.h).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/core/TensorImpl.h>
@@ -28,7 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <utils/quantize_common.h>
+#include <api/quantize_common.h>
 
 namespace astrai {
 namespace fp8 {

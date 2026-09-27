@@ -31,7 +31,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <utils/gemm_common.h>
+#include <api/gemm_common.h>
 
 #include <api/fp8_checks.h>
 #include <api/gemm.h>

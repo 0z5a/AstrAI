@@ -97,7 +97,7 @@ py::object quantize_dual(torch::Tensor x,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // The fold-scratch extent, for policy/tests that size the ring buffer
-    // (the full layout is RingLayout, utils/quantize_common.h).
+    // (the full layout is RingLayout, api/quantize_common.h).
     m.attr("K_FOLD_SLOTS") = kFoldSlots;
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"), py::arg("dtype"),
           py::arg("transposed") = false, py::arg("ring") = py::none(), py::arg("hist_idx") = 0,

@@ -375,7 +375,7 @@ PRMT; deferred until measurement justifies a repack pass.
 
 **Scales** — the contract (code home: `resolve_quant_scale` in
 `csrc/gemm/entry.h`, the field semantics in `GemmParams`,
-`csrc/include/utils/gemm_common.h`; the Python docstrings point here instead
+`csrc/include/api/gemm_common.h`; the Python docstrings point here instead
 of restating the rules). A scale is a contiguous CUDA float32 tensor with
 numel 1 (per-tensor device scalar) or the operand's extent (per-row
 activation `a_scale[m]`, per-channel weight `b_scale[n]`); per side int8

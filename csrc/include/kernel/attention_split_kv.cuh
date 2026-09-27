@@ -5,7 +5,7 @@
 
 #include <memory/layout_policies.cuh>
 #include <mma/utils.cuh>
-#include <utils/attention_common.h>
+#include <api/attention_common.h>
 
 namespace astrai {
 namespace attention {

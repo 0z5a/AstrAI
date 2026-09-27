@@ -1,18 +1,14 @@
 #pragma once
-// Quantize's declaration surface: the composed one-call pass shared by the
-// standalone quantize bindings (quantize/bindings.cu) and the fp8-linear
-// composition (gemm/fp8_linear.cu, compiled into the gemm module so the
-// GEMM dispatch state stays single-source). The implementation is
-// quantize/entry.cu, listed in both modules' CMake source lists — a caller
-// that needs the quantize chain from C++ links the body via its own module
-// instead of re-deriving it. Torch-tensor level, no pybind (the api.h
-// rules): declarations only, struct definitions included.
+// Quantize's caller contract: the composed one-call pass shared by
+// quantize/bindings.cu and gemm/fp8_linear.cu; the implementation,
+// quantize/entry.cu, is listed in both modules' source lists. Torch-tensor
+// level, no pybind (the gemm.h header rules).
 
 #include <c10/util/Optional.h>
 #include <cstdint>
 #include <torch/extension.h>
 
-#include <utils/quantize_common.h>
+#include <api/quantize_common.h>
 
 namespace astrai {
 namespace quant {
@@ -20,20 +16,15 @@ namespace quant {
 struct QuantizeOutputs {
     torch::Tensor out;   // row-major orientation (undefined if not asked)
     torch::Tensor out_t; // [cols][rows] transpose (undefined if not asked)
-    torch::Tensor amax;  // the fold's raw-domain amax of the round (undefined
-                         // without a ring — nothing measures one)
+    torch::Tensor amax;  // the round's raw-domain amax; undefined without a ring
 };
 
-// One quantize pass, end to end: validation, output allocation, launch.
-// ``layout`` picks which orientations are produced; ``transposed_dtype``
-// (default: the row-major dtype) casts the transposed orientation in a
-// different fp8 format — the hybrid training pair casts the forward format
-// on one side and the backward format on the other from a single read. A
-// ring switches on the in-kernel delayed-scaling fold; without one the
-// kernel runs a pure scale+cast. ``pub_scale``/``pub_recip`` redirect where
-// the fold publishes (default: the ring's own slots). A ring also requires
-// ``hist_len`` (see RingLayout in utils/quantize_common.h); one without is
-// rejected rather than guessed. Semantics are documented at the definition
+// One quantize pass end to end: validate, allocate, launch. ``layout`` picks
+// the orientations produced; ``dtype_b`` (default: ``dtype_a``) recasts the
+// transposed side (hybrid fwd/bwd pair from one read). ``ring`` switches on
+// the delayed-scaling fold and requires ``hist_len`` (RingLayout,
+// api/quantize_common.h); ``pub_scale``/``pub_recip`` redirect where the
+// fold publishes (default: the ring's own slots). Semantics at the definition
 // (quantize/entry.cu).
 QuantizeOutputs run_quantize(torch::Tensor x,
                              torch::Tensor scale,

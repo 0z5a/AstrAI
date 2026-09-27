@@ -22,7 +22,7 @@
 #include <api/quantize.h>
 #include <kernel/quantize.cuh>
 #include <utils/dtype.cuh>
-#include <utils/quantize_common.h>
+#include <api/quantize_common.h>
 
 namespace astrai {
 namespace quant {

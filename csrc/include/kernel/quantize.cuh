@@ -19,7 +19,7 @@
 #include <arith/reduce.cuh>
 #include <utils/define.cuh>
 #include <utils/launch.cuh>
-#include <utils/quantize_common.h>
+#include <api/quantize_common.h>
 
 namespace astrai {
 namespace quant {

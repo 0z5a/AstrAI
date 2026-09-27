@@ -2,7 +2,7 @@
 // GEMM umbrella (bf16 / int8 / fp8): the kernel orchestrator and the launch
 // machinery — pure CUDA, no torch; the planner lives in launcher/planning.h
 // (one TU per binary, reached through policy.cuh's declarations). Layout
-// tags: utils/gemm_common.h.
+// tags: api/gemm_common.h.
 
 #include <cstdio>
 #include <cuda_bf16.h>
@@ -18,7 +18,7 @@
 #include <policy.cuh>
 #include <scheduler.cuh>
 #include <utils/device.cuh>
-#include <utils/gemm_common.h>
+#include <api/gemm_common.h>
 #include <utils/launch.cuh>
 
 namespace astrai {

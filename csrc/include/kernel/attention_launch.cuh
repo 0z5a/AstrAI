@@ -16,7 +16,7 @@
 #include <kernel/attention_split_kv.cuh>
 #include <kernel/attention_split_q.cuh>
 #include <memory/layout_policies.cuh>
-#include <utils/attention_common.h>
+#include <api/attention_common.h>
 #include <utils/launch.cuh>
 
 namespace astrai {
