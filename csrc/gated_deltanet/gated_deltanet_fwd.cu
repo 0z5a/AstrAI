@@ -13,19 +13,19 @@
 // staged in shared memory, and read back transposed so the head-dim axis of the
 // store is coalesced too. The two operations collapse into two launches.
 
-#include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <torch/extension.h>
 
-#include <utils/launch.cuh>
 #include <api/gated_deltanet.h>
+#include <utils/launch.cuh>
 
 namespace {
 
 constexpr int kThreads = 256;
-constexpr int kHeadDim = 128;  // D: the Qwen3.5 linear-attention head shape
-constexpr int kTile = 64;      // tokens per block
-constexpr int kQuarters = 4;   // norm reduction is split kQuarters ways
+constexpr int kHeadDim = 128; // D: the Qwen3.5 linear-attention head shape
+constexpr int kTile = 64;     // tokens per block
+constexpr int kQuarters = 4;  // norm reduction is split kQuarters ways
 // Row pitch in shared memory. 66 bf16 is 33 words, so the transposed read (one
 // thread per head dim) walks consecutive banks instead of colliding; a 16-byte
 // multiple would be conflict-prone, which is why the vector stores below are
@@ -33,20 +33,18 @@ constexpr int kQuarters = 4;   // norm reduction is split kQuarters ways
 constexpr int kPitch = kTile + 2;
 
 // One block per (b, h, token tile).
-__global__ void gated_deltanet_fwd_qkv_kernel(
-    const __nv_bfloat16* __restrict__ q,
-    const __nv_bfloat16* __restrict__ k,
-    const __nv_bfloat16* __restrict__ v,
-    __nv_bfloat16* __restrict__ q_out,
-    __nv_bfloat16* __restrict__ k_out,
-    __nv_bfloat16* __restrict__ v_out,
-    int64_t stride_qb,
-    int64_t stride_kb,
-    int64_t stride_vb,
-    int seq,
-    int heads,
-    float eps
-) {
+__global__ void gated_deltanet_fwd_qkv_kernel(const __nv_bfloat16* __restrict__ q,
+                                              const __nv_bfloat16* __restrict__ k,
+                                              const __nv_bfloat16* __restrict__ v,
+                                              __nv_bfloat16* __restrict__ q_out,
+                                              __nv_bfloat16* __restrict__ k_out,
+                                              __nv_bfloat16* __restrict__ v_out,
+                                              int64_t stride_qb,
+                                              int64_t stride_kb,
+                                              int64_t stride_vb,
+                                              int seq,
+                                              int heads,
+                                              float eps) {
     __shared__ __nv_bfloat16 q_s[kHeadDim * kPitch];
     __shared__ __nv_bfloat16 k_s[kHeadDim * kPitch];
     __shared__ __nv_bfloat16 v_s[kHeadDim * kPitch];
@@ -127,17 +125,12 @@ __global__ void gated_deltanet_fwd_qkv_kernel(
 
     // Transposed store: consecutive threads write consecutive head dims.
     const int out_d = tid % kHeadDim;
-    const int64_t out =
-        (static_cast<int64_t>(b) * heads + h) * seq * kHeadDim + t0 * kHeadDim;
+    const int64_t out = (static_cast<int64_t>(b) * heads + h) * seq * kHeadDim + t0 * kHeadDim;
 #pragma unroll
     for (int j = tid / kHeadDim; j < kTile; j += kThreads / kHeadDim) {
         const int64_t off = out + static_cast<int64_t>(j) * kHeadDim + out_d;
-        q_out[off] = __float2bfloat16(
-            __bfloat162float(q_s[out_d * kPitch + j]) * scale_q[j]
-        );
-        k_out[off] = __float2bfloat16(
-            __bfloat162float(k_s[out_d * kPitch + j]) * scale_k[j]
-        );
+        q_out[off] = __float2bfloat16(__bfloat162float(q_s[out_d * kPitch + j]) * scale_q[j]);
+        k_out[off] = __float2bfloat16(__bfloat162float(k_s[out_d * kPitch + j]) * scale_k[j]);
         v_out[off] = v_s[out_d * kPitch + j];
     }
 }
@@ -145,15 +138,13 @@ __global__ void gated_deltanet_fwd_qkv_kernel(
 // One block per (b, h, chunk), with the block size equal to the chunk. The
 // source is [B, T, H] with H contiguous, so the gather is strided while the
 // scatter is contiguous.
-__global__ void gated_deltanet_fwd_gates_kernel(
-    const float* __restrict__ g,
-    const float* __restrict__ beta,
-    float* __restrict__ g_out,
-    float* __restrict__ beta_out,
-    int seq,
-    int heads,
-    int chunk
-) {
+__global__ void gated_deltanet_fwd_gates_kernel(const float* __restrict__ g,
+                                                const float* __restrict__ beta,
+                                                float* __restrict__ g_out,
+                                                float* __restrict__ beta_out,
+                                                int seq,
+                                                int heads,
+                                                int chunk) {
     extern __shared__ float scan[];
     const int i = threadIdx.x;
     const int chunks = (seq + chunk - 1) / chunk;
@@ -183,20 +174,18 @@ __global__ void gated_deltanet_fwd_gates_kernel(
     beta_out[out] = beta[(b * seq + index) * heads + h];
 }
 
-}  // namespace
+} // namespace
 
 namespace astrai {
 namespace gdn {
 
-std::vector<torch::Tensor> gated_deltanet_fwd(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor g,
-    torch::Tensor beta,
-    double eps,
-    int64_t chunk
-) {
+std::vector<torch::Tensor> gated_deltanet_fwd(torch::Tensor q,
+                                              torch::Tensor k,
+                                              torch::Tensor v,
+                                              torch::Tensor g,
+                                              torch::Tensor beta,
+                                              double eps,
+                                              int64_t chunk) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -206,14 +195,11 @@ std::vector<torch::Tensor> gated_deltanet_fwd(
     TORCH_CHECK(v.scalar_type() == torch::kBFloat16, "v must be bf16");
     TORCH_CHECK(g.scalar_type() == torch::kFloat32, "g must be fp32 (log decay)");
     TORCH_CHECK(beta.scalar_type() == torch::kFloat32, "beta must be fp32");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
-                "q/k/v must be [B, T, H, D]");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q/k/v must be [B, T, H, D]");
     TORCH_CHECK(g.dim() == 3 && beta.dim() == 3, "g/beta must be [B, T, H]");
     TORCH_CHECK(g.is_contiguous() && beta.is_contiguous(), "g/beta must be contiguous");
-    TORCH_CHECK(q.sizes() == k.sizes() && q.sizes() == v.sizes(),
-                "q/k/v must share a shape");
-    TORCH_CHECK(g.size(0) == q.size(0) && g.size(1) == q.size(1) &&
-                    g.size(2) == q.size(2),
+    TORCH_CHECK(q.sizes() == k.sizes() && q.sizes() == v.sizes(), "q/k/v must share a shape");
+    TORCH_CHECK(g.size(0) == q.size(0) && g.size(1) == q.size(1) && g.size(2) == q.size(2),
                 "g/beta must be [B, T, H] matching q");
 
     const int batch = q.size(0);
@@ -230,11 +216,9 @@ std::vector<torch::Tensor> gated_deltanet_fwd(
     // so the token axis is the contiguous one. Accepting any other layout would
     // silently read the wrong elements, so it is checked rather than assumed.
     for (const auto* named : {&q, &k, &v}) {
-        TORCH_CHECK(
-            named->stride(1) == 1 && named->stride(3) == seq &&
-                named->stride(2) == static_cast<int64_t>(seq) * dim,
-            "q/k/v must carry the projection layout ([B, H, D, T] in memory)"
-        );
+        TORCH_CHECK(named->stride(1) == 1 && named->stride(3) == seq &&
+                        named->stride(2) == static_cast<int64_t>(seq) * dim,
+                    "q/k/v must carry the projection layout ([B, H, D, T] in memory)");
     }
 
     auto head_major = [&](const torch::Tensor& t) {
@@ -253,25 +237,19 @@ std::vector<torch::Tensor> gated_deltanet_fwd(
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(k_out.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(v_out.data_ptr()),
-        q.stride(0), k.stride(0), v.stride(0),
-        seq, heads, static_cast<float>(eps)
-    );
+        reinterpret_cast<__nv_bfloat16*>(v_out.data_ptr()), q.stride(0), k.stride(0), v.stride(0),
+        seq, heads, static_cast<float>(eps));
     ASTRAI_LAUNCH_CHECK();
 
     const int chunks = (seq + chunk - 1) / chunk;
     gated_deltanet_fwd_gates_kernel<<<batch * heads * chunks, static_cast<int>(chunk),
-                            chunk * sizeof(float), stream>>>(
-        g.data_ptr<float>(),
-        beta.data_ptr<float>(),
-        g_out.data_ptr<float>(),
-        beta_out.data_ptr<float>(),
-        seq, heads, static_cast<int>(chunk)
-    );
+                                      chunk * sizeof(float), stream>>>(
+        g.data_ptr<float>(), beta.data_ptr<float>(), g_out.data_ptr<float>(),
+        beta_out.data_ptr<float>(), seq, heads, static_cast<int>(chunk));
     ASTRAI_LAUNCH_CHECK();
 
     return {q_out, k_out, v_out, g_out, beta_out};
 }
 
-}  // namespace gdn
-}  // namespace astrai
+} // namespace gdn
+} // namespace astrai

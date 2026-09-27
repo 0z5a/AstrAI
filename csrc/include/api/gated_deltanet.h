@@ -13,25 +13,21 @@
 namespace astrai {
 namespace gdn {
 
-std::vector<torch::Tensor> gated_deltanet_fwd(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor g,
-    torch::Tensor beta,
-    double eps,
-    int64_t chunk
-);
+std::vector<torch::Tensor> gated_deltanet_fwd(torch::Tensor q,
+                                              torch::Tensor k,
+                                              torch::Tensor v,
+                                              torch::Tensor g,
+                                              torch::Tensor beta,
+                                              double eps,
+                                              int64_t chunk);
 
-std::vector<torch::Tensor> gated_deltanet_bwd(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v_new,
-    torch::Tensor h,
-    torch::Tensor g,
-    torch::Tensor do_grad,
-    double scale
-);
+std::vector<torch::Tensor> gated_deltanet_bwd(torch::Tensor q,
+                                              torch::Tensor k,
+                                              torch::Tensor v_new,
+                                              torch::Tensor h,
+                                              torch::Tensor g,
+                                              torch::Tensor do_grad,
+                                              double scale);
 
-}  // namespace gdn
-}  // namespace astrai
+} // namespace gdn
+} // namespace astrai

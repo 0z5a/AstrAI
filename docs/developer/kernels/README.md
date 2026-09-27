@@ -340,7 +340,7 @@ csrc/
 │   │   ├── attention.h               #     attention entry declarations (astrai::attention)
 │   │   ├── attention_dtypes.h        #     attention ASTRAI_ATTN_DTYPE_LIST + generated unsupported-dtype refusal
 │   │   ├── gated_deltanet.h          #     the family's two entry declarations (astrai::gdn)
-│   │   ├── quantize_entry.h          #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
+│   │   ├── quantize.h          #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
 │   │   └── fp8_checks.h              #     fp8 capability gate (check_fp8_device; shared by quantize + gemm)
 │   └── launcher/                     # THE DISPATCH MACHINERY — the planner chain and the row table behind the api/ surface; both are deliberate impl-headers (they are why this directory still exists)
 │       ├── planning.h                #     the planner chain + recipe vocabulary + plan_raster; plan_dispatch defined non-inline — SINGLE-INCLUSION (one TU per binary: gemm.cu or a standalone harness)

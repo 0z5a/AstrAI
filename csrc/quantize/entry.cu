@@ -3,7 +3,7 @@
 // quantize chain — the quantize module itself and the fp8-linear composition
 // in the gemm module (which shares it instead of re-deriving it, so the
 // implementation is a plain .cu listed in both modules' CMake source lists).
-// The declaration surface is api/quantize_entry.h; this TU is the body.
+// The declaration surface is api/quantize.h; this TU is the body.
 //
 // The instantiation list lives HERE, not in the header: every expansion site
 // (the refusal message, the dispatch switch, the supported-input check) is
@@ -19,10 +19,10 @@
 #include <torch/extension.h>
 
 #include <api/fp8_checks.h>
-#include <api/quantize_entry.h>
+#include <api/quantize.h>
+#include <kernel/quantize.cuh>
 #include <utils/dtype.cuh>
 #include <utils/quantize_common.h>
-#include <kernel/quantize.cuh>
 
 namespace astrai {
 namespace quant {
@@ -31,9 +31,9 @@ namespace quant {
 // ScalarType names the input dtype at the boundary, the C++ element type is
 // what the kernel takes as a template parameter. The refusal below is
 // generated from the same rows, so the supported set cannot drift.
-#define ASTRAI_QUANT_IN_DTYPES(X) \
-    X(torch::kBFloat16, bf16)     \
-    X(torch::kHalf, fp16)         \
+#define ASTRAI_QUANT_IN_DTYPES(X)                                                                  \
+    X(torch::kBFloat16, bf16)                                                                      \
+    X(torch::kHalf, fp16)                                                                          \
     X(torch::kFloat32, float)
 
 namespace {
@@ -42,9 +42,8 @@ namespace {
 // read off the list above (the attention_dtypes.h pattern).
 [[noreturn]] void unsupported_quant_input(at::ScalarType st) {
     std::string instantiated;
-#define ASTRAI_QUANT_NAME_ROW(S, T)                                    \
-    instantiated += std::string(instantiated.empty() ? "" : ", ") +    \
-                    toString(S);
+#define ASTRAI_QUANT_NAME_ROW(S, T)                                                                \
+    instantiated += std::string(instantiated.empty() ? "" : ", ") + toString(S);
     ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_NAME_ROW)
 #undef ASTRAI_QUANT_NAME_ROW
     TORCH_CHECK(false, "quantize has no kernel for ", toString(st),
@@ -55,12 +54,11 @@ namespace {
 // for a (possibly mixed) fp8 output pair; the default is unreachable (the
 // entry gate above) but stays a hard error — never a silent re-route.
 template <typename Fp8TA, typename Fp8TB>
-void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
-                      cudaStream_t stream) {
+void launch_for_dtype(const torch::Tensor& x, const QuantParams& p, cudaStream_t stream) {
     switch (x.scalar_type()) {
-#define ASTRAI_QUANT_CASE(S, T) \
-    case S:                     \
-        launch_fp8_quantize<Fp8TA, T, Fp8TB>(p, stream); \
+#define ASTRAI_QUANT_CASE(S, T)                                                                    \
+    case S:                                                                                        \
+        launch_fp8_quantize<Fp8TA, T, Fp8TB>(p, stream);                                           \
         break;
         ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_CASE)
 #undef ASTRAI_QUANT_CASE
@@ -71,8 +69,8 @@ void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
 
 // Row-major format picks the A side, transposed format the B side (both the
 // same in every non-hybrid use).
-void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
-                         bool a_e5m2, bool b_e5m2, cudaStream_t stream) {
+void launch_quantize_for(
+    const torch::Tensor& x, const QuantParams& p, bool a_e5m2, bool b_e5m2, cudaStream_t stream) {
     if (a_e5m2)
         b_e5m2 ? launch_for_dtype<fp8_e5m2, fp8_e5m2>(x, p, stream)
                : launch_for_dtype<fp8_e5m2, fp8_e4m3>(x, p, stream);
@@ -81,7 +79,7 @@ void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
                : launch_for_dtype<fp8_e4m3, fp8_e4m3>(x, p, stream);
 }
 
-}  // namespace
+} // namespace
 
 // The delayed-scaling ring as raw device pointers. Offsets are RingLayout's;
 // ``hist_len`` is required (numel cannot recover it — the composed ring's
@@ -94,24 +92,20 @@ struct RingView {
     float* scratch = nullptr;
     unsigned int* done = nullptr;
     int len = 0;
-    torch::Tensor amax;  // the fold's raw-domain amax sink (RingLayout::amax)
+    torch::Tensor amax; // the fold's raw-domain amax sink (RingLayout::amax)
     bool bound = false;
 };
 
-static RingView ring_view(const torch::Tensor& st, int64_t hist_idx,
-                          int64_t hist_len) {
+static RingView ring_view(const torch::Tensor& st, int64_t hist_idx, int64_t hist_len) {
     RingView r;
-    TORCH_CHECK(st.is_cuda() && st.dim() == 1 &&
-                    st.scalar_type() == torch::kFloat32,
+    TORCH_CHECK(st.is_cuda() && st.dim() == 1 && st.scalar_type() == torch::kFloat32,
                 "ring state must be a 1D float32 CUDA tensor");
     const RingLayout layout{hist_len};
     const int64_t n = hist_len;
     TORCH_CHECK(n > 0 && hist_idx >= 0 && hist_idx < n,
                 "ring state too small or hist_idx out of range");
-    TORCH_CHECK(st.numel() >= layout.size(/*pairs=*/1),
-                "ring state holds ", st.numel(),
-                " floats: a history of ", n, " needs at least ",
-                layout.size(1));
+    TORCH_CHECK(st.numel() >= layout.size(/*pairs=*/1), "ring state holds ", st.numel(),
+                " floats: a history of ", n, " needs at least ", layout.size(1));
     float* base = st.data_ptr<float>();
     r.hist = base;
     r.scale_out = base + layout.scale(0);
@@ -124,8 +118,8 @@ static RingView ring_view(const torch::Tensor& st, int64_t hist_idx,
     return r;
 }
 
-static void bind_ring(QuantParams& p, const RingView& r, int64_t hist_idx,
-                      double fp8_max, double pow2_margin) {
+static void
+bind_ring(QuantParams& p, const RingView& r, int64_t hist_idx, double fp8_max, double pow2_margin) {
     p.fold_ring = true;
     p.hist = r.hist;
     p.scale_out = r.scale_out;
@@ -152,21 +146,26 @@ static void bind_ring(QuantParams& p, const RingView& r, int64_t hist_idx,
 // consumer keeps reading the untouched current pair and needs no snapshot
 // clone. A ring also requires ``hist_len`` (see RingLayout); one without is
 // rejected rather than guessed.
-QuantizeOutputs run_quantize(
-    torch::Tensor x, torch::Tensor scale, QuantLayout layout,
-    at::ScalarType dtype_a, c10::optional<at::ScalarType> dtype_b,
-    c10::optional<torch::Tensor> ring, int64_t hist_idx, double fp8_max,
-    double pow2_margin, c10::optional<torch::Tensor> pub_scale,
-    c10::optional<torch::Tensor> pub_recip,
-    c10::optional<int64_t> hist_len) {
+QuantizeOutputs run_quantize(torch::Tensor x,
+                             torch::Tensor scale,
+                             QuantLayout layout,
+                             at::ScalarType dtype_a,
+                             c10::optional<at::ScalarType> dtype_b,
+                             c10::optional<torch::Tensor> ring,
+                             int64_t hist_idx,
+                             double fp8_max,
+                             double pow2_margin,
+                             c10::optional<torch::Tensor> pub_scale,
+                             c10::optional<torch::Tensor> pub_recip,
+                             c10::optional<int64_t> hist_len) {
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
     {
         bool supported = false;
-#define ASTRAI_QUANT_SUPPORTED_ROW(S, T) \
-        supported = supported || x.scalar_type() == S;
+#define ASTRAI_QUANT_SUPPORTED_ROW(S, T) supported = supported || x.scalar_type() == S;
         ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_SUPPORTED_ROW)
 #undef ASTRAI_QUANT_SUPPORTED_ROW
-        if (!supported) unsupported_quant_input(x.scalar_type());
+        if (!supported)
+            unsupported_quant_input(x.scalar_type());
     }
     const at::ScalarType out_dtype = dtype_a;
     const at::ScalarType t_dtype = dtype_b.has_value() ? *dtype_b : dtype_a;
@@ -177,8 +176,7 @@ QuantizeOutputs run_quantize(
     TORCH_CHECK(layout == QuantLayout::RowMajor || x.dim() >= 2,
                 "transposed quantize layouts need a 2D+ tensor");
     TORCH_CHECK(scale.is_cuda() && scale.device() == x.device() &&
-                    scale.scalar_type() == torch::kFloat32 &&
-                    scale.numel() == 1,
+                    scale.scalar_type() == torch::kFloat32 && scale.numel() == 1,
                 "scale must be a CUDA float32 scalar on the input device");
     check_fp8_device(x.device().index());
     const at::cuda::OptionalCUDAGuard guard(x.device());
@@ -194,10 +192,9 @@ QuantizeOutputs run_quantize(
     if (ring.has_value() && ring->defined()) {
         // A wrong window is silent (scale slots read as history), so a ring
         // without its hist_len is an error, not a guess.
-        TORCH_CHECK(hist_len.has_value(),
-                    "quantize: ring_state needs hist_len (the history window "
-                    "length) — the buffer's trailing slots make it "
-                    "unrecoverable from numel");
+        TORCH_CHECK(hist_len.has_value(), "quantize: ring_state needs hist_len (the history window "
+                                          "length) — the buffer's trailing slots make it "
+                                          "unrecoverable from numel");
         const RingView r = ring_view(*ring, hist_idx, *hist_len);
         outs.amax = r.amax;
         p.amax = r.amax.data_ptr<float>();
@@ -231,20 +228,20 @@ QuantizeOutputs run_quantize(
     if (layout != QuantLayout::Transposed) {
         // Direct-to-allocator empty (no dispatcher round trip): the outputs
         // are fresh kernel destinations, never autograd-visible on their own.
-        outs.out = torch::Tensor(at::detail::empty_cuda(
-            input.sizes(), out_dtype, input.device(), std::nullopt));
+        outs.out = torch::Tensor(
+            at::detail::empty_cuda(input.sizes(), out_dtype, input.device(), std::nullopt));
         p.output_ptr = outs.out.data_ptr();
     }
     if (layout != QuantLayout::RowMajor) {
-        outs.out_t = torch::Tensor(at::detail::empty_cuda(
-            {cols, rows}, t_dtype, input.device(), std::nullopt));
+        outs.out_t = torch::Tensor(
+            at::detail::empty_cuda({cols, rows}, t_dtype, input.device(), std::nullopt));
         p.output_transposed_ptr = outs.out_t.data_ptr();
     }
-    launch_quantize_for(input, p, out_dtype == torch::kFloat8_e5m2,
-                        t_dtype == torch::kFloat8_e5m2, stream.stream());
+    launch_quantize_for(input, p, out_dtype == torch::kFloat8_e5m2, t_dtype == torch::kFloat8_e5m2,
+                        stream.stream());
     C10_CUDA_CHECK(cudaGetLastError());
     return outs;
 }
 
-}  // namespace quant
-}  // namespace astrai
+} // namespace quant
+} // namespace astrai

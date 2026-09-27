@@ -18,8 +18,8 @@
 #include <string>
 #include <vector>
 
-#include <utils/device.cuh>
 #include <policy.cuh>
+#include <utils/device.cuh>
 
 namespace astrai {
 namespace gemm {
@@ -95,14 +95,15 @@ inline constexpr void plan_row_geometry(TileClass cta, int& bm, int& bn) {
 // planner cannot make), so resident_model <= resident_true fires the wave
 // gate early, never late. Exact for the 512-thread tiles where the register
 // file binds (64 regs x 512 x 2 = 64K) — the only gated ring today.
-inline int plan_resident_ctas(TileClass cta, int stages, int kk,
-                              const PlanQuery& q) {
+inline int plan_resident_ctas(TileClass cta, int stages, int kk, const PlanQuery& q) {
     const DeviceFacts& dev = q.dev;
-    if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0) return 0;
+    if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0)
+        return 0;
     int bm = 0, bn = 0;
     plan_row_geometry(cta, bm, bn);
     const int ring = ring_smem_bytes(bm, bn, kk, stages, q.ba, q.bb);
-    if (ring > dev.smem_max) return 0;
+    if (ring > dev.smem_max)
+        return 0;
     return std::min(dev.smem_per_sm / ring, min_ctas_for_ring(ring));
 }
 
@@ -110,41 +111,48 @@ inline int plan_resident_ctas(TileClass cta, int stages, int kk,
 // is the open-K reading (degraded rows, no-depth callers); q.dev.sms <= 0
 // skips gated rows rather than guessing, and the lookup still ends at the
 // degraded rows — planning stays total.
-inline const TableRow* plan_row_for(const TableRow* rows, int count,
-                                    const PlanQuery& q) {
+inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQuery& q) {
     for (int i = 0; i < count; ++i) {
         const TableRow& r = rows[i];
-        if (q.m <= r.m_min) continue;
-        if (r.m_max != 0 && q.m > r.m_max) continue;
-        if (q.n <= r.n_min) continue;
-        if (r.n_max != 0 && q.n > r.n_max) continue;
-        if (r.perf_class != -1 && r.perf_class != q.perf_class) continue;
-        if (r.crosswise != -1 && r.crosswise != q.crosswise) continue;
+        if (q.m <= r.m_min)
+            continue;
+        if (r.m_max != 0 && q.m > r.m_max)
+            continue;
+        if (q.n <= r.n_min)
+            continue;
+        if (r.n_max != 0 && q.n > r.n_max)
+            continue;
+        if (r.perf_class != -1 && r.perf_class != q.perf_class)
+            continue;
+        if (r.crosswise != -1 && r.crosswise != q.crosswise)
+            continue;
         // An open row (both bounds 0) matches any K, including the k <= 0
         // callers; a bounded row only matches a real depth.
         if (r.k_min != 0 || r.k_max != 0) {
-            if (q.k <= 0) continue;
-            if (q.k <= r.k_min) continue;
-            if (r.k_max != 0 && q.k > r.k_max) continue;
+            if (q.k <= 0)
+                continue;
+            if (q.k <= r.k_min)
+                continue;
+            if (r.k_max != 0 && q.k > r.k_max)
+                continue;
         }
         // Wave gates: the row's own geometry prices the grid, so a row cannot
         // state a fill it could not itself satisfy. min_ctas_per_sm is the
         // bare CTAs-per-SM form; min_wave_permille the wave form, whose
         // resident term is priced from the row's ring on this device.
         if (r.min_ctas_per_sm > 0 || r.min_wave_permille > 0) {
-            if (q.dev.sms <= 0) continue;
+            if (q.dev.sms <= 0)
+                continue;
             int bm, bn;
             plan_row_geometry(r.cta, bm, bn);
-            const int64_t grid = ((q.m + bm - 1) / bm) * ((q.n + bn - 1) / bn) *
-                                 q.batch;
-            if (r.min_ctas_per_sm > 0 &&
-                grid < (int64_t)r.min_ctas_per_sm * q.dev.sms)
+            const int64_t grid = ((q.m + bm - 1) / bm) * ((q.n + bn - 1) / bn) * q.batch;
+            if (r.min_ctas_per_sm > 0 && grid < (int64_t)r.min_ctas_per_sm * q.dev.sms)
                 continue;
             if (r.min_wave_permille > 0) {
                 const int resident = plan_resident_ctas(r.cta, r.stages, r.kk, q);
-                if (resident <= 0) continue;
-                if (grid * 1000 <
-                    (int64_t)r.min_wave_permille * q.dev.sms * resident)
+                if (resident <= 0)
+                    continue;
+                if (grid * 1000 < (int64_t)r.min_wave_permille * q.dev.sms * resident)
                     continue;
             }
         }
@@ -168,50 +176,57 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count,
 // never block a launch the fallback would serve.
 
 // lo <= v <= hi, for the fields whose legal values are a contiguous interval.
-inline constexpr bool in_range(int v, int lo, int hi) {
-    return v >= lo && v <= hi;
-}
+inline constexpr bool in_range(int v, int lo, int hi) { return v >= lo && v <= hi; }
 
 // A band is (min, max]: min exclusive, 0 = unbounded, so the sentinel stays
 // out of the ordering test. max == min is an empty band — legal, and simply
 // never matched.
-inline constexpr bool row_band_ok(int64_t min, int64_t max) {
-    return max == 0 || max >= min;
-}
+inline constexpr bool row_band_ok(int64_t min, int64_t max) { return max == 0 || max >= min; }
 
 // First out-of-range field, or nullptr: one check per line so the warning
 // names the hand-edited column that is wrong.
 inline const char* plan_row_error(const TableRow& row, int fields) {
-    if (fields != kRowFields && fields != kRowFieldsLegacyK &&
-        fields != kRowFieldsKband && fields != kRowFieldsWave &&
-        fields != kRowFieldsWavePermille)
+    if (fields != kRowFields && fields != kRowFieldsLegacyK && fields != kRowFieldsKband &&
+        fields != kRowFieldsWave && fields != kRowFieldsWavePermille)
         return "field count";
-    if (row.m_min < 0 || row.n_min < 0) return "band min < 0";
-    if (!row_k_supported(row.kk)) return "k (want 32 or 64)";
-    if (!row_band_ok(row.m_min, row.m_max)) return "m band (max < min)";
-    if (!row_band_ok(row.n_min, row.n_max)) return "n band (max < min)";
-    if (!row_band_ok(row.k_min, row.k_max)) return "k band (max < min)";
-    if (row.k_min < 0 || row.k_max < 0) return "k band min < 0";
-    if (row.min_ctas_per_sm < 0) return "min_ctas_per_sm < 0";
-    if (row.min_wave_permille < 0) return "min_wave_permille < 0";
-    if (!in_range(row.perf_class, -1, kMaxPerfClass)) return "perf_class";
-    if (!in_range(row.crosswise, -1, 2)) return "crosswise (-1..2)";
-    if (!row_stages_supported(row.stages)) return "stages (want 2..5)";
+    if (row.m_min < 0 || row.n_min < 0)
+        return "band min < 0";
+    if (!row_k_supported(row.kk))
+        return "k (want 32 or 64)";
+    if (!row_band_ok(row.m_min, row.m_max))
+        return "m band (max < min)";
+    if (!row_band_ok(row.n_min, row.n_max))
+        return "n band (max < min)";
+    if (!row_band_ok(row.k_min, row.k_max))
+        return "k band (max < min)";
+    if (row.k_min < 0 || row.k_max < 0)
+        return "k band min < 0";
+    if (row.min_ctas_per_sm < 0)
+        return "min_ctas_per_sm < 0";
+    if (row.min_wave_permille < 0)
+        return "min_wave_permille < 0";
+    if (!in_range(row.perf_class, -1, kMaxPerfClass))
+        return "perf_class";
+    if (!in_range(row.crosswise, -1, 2))
+        return "crosswise (-1..2)";
+    if (!row_stages_supported(row.stages))
+        return "stages (want 2..5)";
     return nullptr;
 }
 
 // Warn-and-skip: a hand-edit typo costs one row, not the table.
 inline void warn_bad_row(const std::string& path, int lineno, const char* why) {
-    std::fprintf(stderr, "[gemm-plan-table] %s:%d: ignoring row: bad %s\n",
-                 path.c_str(), lineno, why);
+    std::fprintf(stderr, "[gemm-plan-table] %s:%d: ignoring row: bad %s\n", path.c_str(), lineno,
+                 why);
 }
 
 // One row-file line (label names the source in warnings). Mutated in place
 // (the '#' comment cut); both the file and runtime-injection readers go
 // through here so the two cannot drift.
-inline void parse_plan_table_line(char* line, const char* label, int lineno,
-                                  std::vector<TableRow>& rows) {
-    if (char* hash = std::strchr(line, '#'); hash != nullptr) *hash = '\0';
+inline void
+parse_plan_table_line(char* line, const char* label, int lineno, std::vector<TableRow>& rows) {
+    if (char* hash = std::strchr(line, '#'); hash != nullptr)
+        *hash = '\0';
     long long m_min, m_max, n_min, n_max;
     int perf_class, crosswise, cta, stages, raster;
     // sscanf leaves a variable alone when its conversion fails, so a row
@@ -222,23 +237,31 @@ inline void parse_plan_table_line(char* line, const char* label, int lineno,
     int min_ctas_per_sm = 0;
     int min_wave_permille = 0;
     const int got =
-        std::sscanf(line,
-                    " %lld %lld %lld %lld %d %d %d %d %d %d %lld %lld %d %d",
-                    &m_min, &m_max, &n_min, &n_max, &perf_class, &crosswise,
-                    &cta, &stages, &raster, &kk, &k_min, &k_max,
-                    &min_ctas_per_sm, &min_wave_permille);
-    if (got == EOF) return;  // blank or comment-only line
+        std::sscanf(line, " %lld %lld %lld %lld %d %d %d %d %d %d %lld %lld %d %d", &m_min, &m_max,
+                    &n_min, &n_max, &perf_class, &crosswise, &cta, &stages, &raster, &kk, &k_min,
+                    &k_max, &min_ctas_per_sm, &min_wave_permille);
+    if (got == EOF)
+        return; // blank or comment-only line
     // cta is read as the TileClass ordinal, so it is the one field checked
     // before there is a row to validate; plan_row_error takes the rest.
     if (!in_range(cta, 0, kTileClassCount - 1)) {
         warn_bad_row(label, lineno, "cta index");
         return;
     }
-    const TableRow row{
-        static_cast<TileClass>(cta), m_min, m_max, n_min, n_max,
-        perf_class, crosswise, stages, raster, kk, k_min, k_max,
-        min_ctas_per_sm, min_wave_permille
-    };
+    const TableRow row{static_cast<TileClass>(cta),
+                       m_min,
+                       m_max,
+                       n_min,
+                       n_max,
+                       perf_class,
+                       crosswise,
+                       stages,
+                       raster,
+                       kk,
+                       k_min,
+                       k_max,
+                       min_ctas_per_sm,
+                       min_wave_permille};
     if (const char* bad = plan_row_error(row, got); bad != nullptr) {
         warn_bad_row(label, lineno, bad);
         return;
@@ -246,10 +269,10 @@ inline void parse_plan_table_line(char* line, const char* label, int lineno,
     rows.push_back(row);
 }
 
-inline bool parse_plan_table_file(const std::string& path,
-                                  std::vector<TableRow>& rows) {
+inline bool parse_plan_table_file(const std::string& path, std::vector<TableRow>& rows) {
     FILE* f = std::fopen(path.c_str(), "r");
-    if (f == nullptr) return false;
+    if (f == nullptr)
+        return false;
     char line[256];
     int lineno = 0;
     while (std::fgets(line, sizeof line, f) != nullptr) {
@@ -262,8 +285,8 @@ inline bool parse_plan_table_file(const std::string& path,
 
 // The same parser over in-memory row text: the runtime channel and the file
 // path accept identical syntax. Returns the surviving row count.
-inline int parse_plan_table_text(const std::string& text, const char* label,
-                                 std::vector<TableRow>& rows) {
+inline int
+parse_plan_table_text(const std::string& text, const char* label, std::vector<TableRow>& rows) {
     const int before = (int)rows.size();
     std::string line;
     int lineno = 0;
@@ -293,7 +316,7 @@ inline int parse_plan_table_text(const std::string& text, const char* label,
 // state can re-install exactly (re-emitting parsed rows would lose the
 // gates the text format cannot express).
 class RowSource {
-public:
+  public:
     void set_from(std::string source, std::vector<TableRow> rows) {
         std::lock_guard<std::mutex> g(mutex_);
         rows_ = std::move(rows);
@@ -306,9 +329,9 @@ public:
     }
     std::optional<TableRow> lookup(const PlanQuery& q) const {
         std::lock_guard<std::mutex> g(mutex_);
-        const TableRow* row =
-            plan_row_for(rows_.data(), (int)rows_.size(), q);
-        if (row == nullptr) return std::nullopt;
+        const TableRow* row = plan_row_for(rows_.data(), (int)rows_.size(), q);
+        if (row == nullptr)
+            return std::nullopt;
         return *row;
     }
     size_t size() const {
@@ -316,7 +339,7 @@ public:
         return rows_.size();
     }
 
-private:
+  private:
     mutable std::mutex mutex_;
     std::vector<TableRow> rows_;
     std::string source_;
@@ -332,11 +355,9 @@ inline RowSource& plan_table_injected_source() {
     return source;
 }
 
-
 // The planner-rank vocabulary, one place: the strings configure() takes
 // and config_state() returns for GemmConfig::planner.
-inline constexpr const char* kPlannerModeNames[] = {"table", "hybrid",
-                                                    "model"};
+inline constexpr const char* kPlannerModeNames[] = {"table", "hybrid", "model"};
 inline constexpr int kPlannerModeCount = 3;
 inline bool parse_planner_mode(const std::string& name, int& out) {
     for (int i = 0; i < kPlannerModeCount; ++i)
@@ -360,8 +381,10 @@ inline void gemm_config_seed_once() {
             c.planner = std::atoi(v.c_str());
         if (const std::string v = env("ASTR_GEMM_PLAN"); !v.empty() && v != "0")
             c.log = 1;
-        if (env("ASTR_GEMM_NO_TMA") == "1") c.tma_disabled = 1;
-        if (env("ASTR_GEMM_NO_MX") == "1") c.mx_disabled = 1;
+        if (env("ASTR_GEMM_NO_TMA") == "1")
+            c.tma_disabled = 1;
+        if (env("ASTR_GEMM_NO_MX") == "1")
+            c.mx_disabled = 1;
         if (const std::string v = env("ASTR_GEMM_TABLE"); !v.empty()) {
             if (v == "-") {
                 c.table_off = 1;
@@ -381,13 +404,14 @@ inline void gemm_config_seed_once() {
 inline int gemm_planner_mode() {
     gemm_config_seed_once();
     const int v = gemm_config().planner.load(std::memory_order_relaxed);
-    return v < 0 ? 1 : v;  // default: hybrid (model fills what no row owns)
+    return v < 0 ? 1 : v; // default: hybrid (model fills what no row owns)
 }
 inline bool gemm_table_off() {
     gemm_config_seed_once();
     return gemm_config().table_off.load(std::memory_order_relaxed) > 0;
 }
 
+// clang-format off
 // BEGIN GENERATED
 // Rows are the measured DIFF of the model, not full coverage: emitted only
 // where a recipe beat the model's dispatch by >=2% in interleaved A/B
@@ -578,28 +602,28 @@ inline bool builtin_rows_match_device(const DeviceFacts& dev) {
 }
 
 // END GENERATED
-
+// clang-format on
 
 // Builtin table for one dtype class; count receives its row count. An empty
 // table (the shipped default) returns a valid pointer and a zero count, so
 // plan_row_for matches nothing and the chain falls through to the model.
 inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) {
     switch (perf_class) {
-        case 0:
-            count = (int)kBuiltinPlanW16A16.size();
-            return kBuiltinPlanW16A16.data();
-        case 1:
-            count = (int)kBuiltinPlanW8A16.size();
-            return kBuiltinPlanW8A16.data();
-        case 2:
-            count = (int)kBuiltinPlanW8A8.size();
-            return kBuiltinPlanW8A8.data();
-        case 3:
-            count = (int)kBuiltinPlanF8A8.size();
-            return kBuiltinPlanF8A8.data();
-        default:
-            count = 0;
-            return nullptr;
+    case 0:
+        count = (int)kBuiltinPlanW16A16.size();
+        return kBuiltinPlanW16A16.data();
+    case 1:
+        count = (int)kBuiltinPlanW8A16.size();
+        return kBuiltinPlanW8A16.data();
+    case 2:
+        count = (int)kBuiltinPlanW8A8.size();
+        return kBuiltinPlanW8A8.data();
+    case 3:
+        count = (int)kBuiltinPlanF8A8.size();
+        return kBuiltinPlanF8A8.data();
+    default:
+        count = 0;
+        return nullptr;
     }
 }
 
@@ -616,5 +640,5 @@ static constexpr TableRow kDegradedPlanRows[] = {
     {TileClass::kBig128, 3072, 0, 0, 0, -1, -1, 2, 0},
 };
 
-}  // namespace gemm
-}  // namespace astrai
+} // namespace gemm
+} // namespace astrai

@@ -20,10 +20,10 @@
 #include <string>
 #include <vector>
 
-#include <kernel/gemm.cuh>
-#include <api/gemm.h>
-#include <launcher/planning.h>
 #include "entry.h"
+#include <api/gemm.h>
+#include <kernel/gemm.cuh>
+#include <launcher/planning.h>
 
 using namespace astrai;
 using namespace astrai::quant;
@@ -40,12 +40,11 @@ namespace gemm {
 // instantiation TU behind them.) The CMake gemm module entry carries one
 // instantiation TU per line — kept together by hand, and a line with no TU
 // behind it fails the link loudly.
-#define ASTRAI_GEMM_PAIRS(X)                                                 \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)      \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                 \
-    X(torch::kChar, int8_t, torch::kChar, int8_t)                            \
-    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn,           \
-      __nv_fp8_e4m3)                                                         \
+#define ASTRAI_GEMM_PAIRS(X)                                                                       \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)                            \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                                       \
+    X(torch::kChar, int8_t, torch::kChar, int8_t)                                                  \
+    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn, __nv_fp8_e4m3)                  \
     X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
 
 // The per-pair specializations are explicitly instantiated in their own TUs
@@ -54,8 +53,7 @@ namespace gemm {
 // the address-of forms are references to the externally defined symbols only.
 // (They must sit here, outside the anonymous namespace — nvcc rejects
 // extern template declarations in an anonymous namespace.)
-#define ASTRAI_GEMM_EXTERN(SA, TA, SB, TB) \
-    extern ASTRAI_GEMM_INSTANTIATE(TA, TB);
+#define ASTRAI_GEMM_EXTERN(SA, TA, SB, TB) extern ASTRAI_GEMM_INSTANTIATE(TA, TB);
 ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_EXTERN)
 #undef ASTRAI_GEMM_EXTERN
 
@@ -69,8 +67,7 @@ namespace {
 using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
 
 constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
-    return static_cast<uint16_t>(static_cast<uint8_t>(a)) << 8 |
-           static_cast<uint8_t>(b);
+    return static_cast<uint16_t>(static_cast<uint8_t>(a)) << 8 | static_cast<uint8_t>(b);
 }
 
 // The unsupported-pair arm, one spelling for the two lookups below: the
@@ -79,18 +76,18 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
 // (the attention_dtypes.h pattern), so it cannot drift from the table.
 [[noreturn]] void unsupported_pair(c10::ScalarType a, c10::ScalarType b) {
     std::string instantiated;
-#define ASTRAI_GEMM_PAIR_ROW(SA, TA, SB, TB)                             \
-    instantiated += std::string(instantiated.empty() ? "" : ", ") +      \
-                    toString(SA) + " x " + toString(SB);
+#define ASTRAI_GEMM_PAIR_ROW(SA, TA, SB, TB)                                                       \
+    instantiated +=                                                                                \
+        std::string(instantiated.empty() ? "" : ", ") + toString(SA) + " x " + toString(SB);
     ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_PAIR_ROW)
 #undef ASTRAI_GEMM_PAIR_ROW
-    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(a), " x ",
-                toString(b), " (instantiated: ", instantiated, ")");
+    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(a), " x ", toString(b),
+                " (instantiated: ", instantiated, ")");
 }
 
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
-#define GEMM_CASE(SA, TA, SB, TB) \
-    case pack_dtypes(SA, SB):     \
+#define GEMM_CASE(SA, TA, SB, TB)                                                                  \
+    case pack_dtypes(SA, SB):                                                                      \
         return &gemm_dispatch<TA, TB>;
     switch (pack_dtypes(a, b)) {
         ASTRAI_GEMM_PAIRS(GEMM_CASE)
@@ -102,13 +99,12 @@ GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
 
 // Host-only functions that run the planner without a launch (the
 // autotuner's coverage check).
-using GemmProbeFn =
-    std::pair<PlanDecision, PlanQuery> (*)(int64_t, int64_t, int64_t, int64_t,
-                                           bool, bool, const DeviceFacts&);
+using GemmProbeFn = std::pair<PlanDecision, PlanQuery> (*)(
+    int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
 
 GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
-#define PROBE_CASE(SA, TA, SB, TB) \
-    case pack_dtypes(SA, SB):      \
+#define PROBE_CASE(SA, TA, SB, TB)                                                                 \
+    case pack_dtypes(SA, SB):                                                                      \
         return &plan_probe_for<TA, TB>;
     switch (pack_dtypes(a, b)) {
         ASTRAI_GEMM_PAIRS(PROBE_CASE)
@@ -118,7 +114,7 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
 #undef PROBE_CASE
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Planner introspection: the Python tooling's C++ face. The planner is
@@ -127,11 +123,16 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
 // rows (plan_table.h), keeping the override tier authoritative.
 // ---------------------------------------------------------------------------
 
-PlanProbe plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
-                     at::ScalarType dt_b, bool trans_a, bool trans_b,
+PlanProbe plan_probe(int64_t m,
+                     int64_t n,
+                     int64_t k,
+                     at::ScalarType dt_a,
+                     at::ScalarType dt_b,
+                     bool trans_a,
+                     bool trans_b,
                      int64_t batch) {
-    const auto [decision, query] = find_gemm_probe(dt_a, dt_b)(
-        m, n, k, batch, trans_a, trans_b, astrai::device_facts());
+    const auto [decision, query] =
+        find_gemm_probe(dt_a, dt_b)(m, n, k, batch, trans_a, trans_b, astrai::device_facts());
     PlanProbe r;
     r.source = decision.source;
     r.cta = decision.recipe.cta;
@@ -158,11 +159,10 @@ int install_rows(RowSource& tier, const char* label, const std::string& source) 
 }
 
 RowSource& row_tier(RowTier tier) {
-    return tier == RowTier::Injected ? plan_table_injected_source()
-                                     : plan_table_override_source();
+    return tier == RowTier::Injected ? plan_table_injected_source() : plan_table_override_source();
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Runtime configuration: the backing of astrai.extension.plan. Every knob is
@@ -175,7 +175,7 @@ RowSource& row_tier(RowTier tier) {
 
 GemmConfigState config_state() {
     GemmConfigState s;
-    s.planner = kPlannerModeNames[gemm_planner_mode()];  // resolves unset
+    s.planner = kPlannerModeNames[gemm_planner_mode()]; // resolves unset
     s.planner_mode = gemm_config().planner.load(std::memory_order_relaxed);
     s.log = gemm_plan_log_enabled();
     s.table_off = gemm_table_off();
@@ -210,8 +210,7 @@ GemmConfigState configure(const GemmConfigPatch& patch) {
             row_tier(which).clear();
         } else {
             install_rows(row_tier(which),
-                         which == RowTier::Injected ? "injected rows"
-                                                    : "override rows",
+                         which == RowTier::Injected ? "injected rows" : "override rows",
                          *patch.rows);
         }
     }
@@ -234,8 +233,8 @@ std::vector<std::vector<int>> tile_vocabulary() {
     for (int crosswise = 0; crosswise <= 1; ++crosswise)
         for (const auto& [ba, bb] : widths)
             for (const GemmRecipe& r : gemm_recipes_for(crosswise != 0, ba, bb))
-                out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk,
-                               r.bm, r.bn, r.wm, r.wn, r.threads, r.smem});
+                out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk, r.bm, r.bn, r.wm, r.wn,
+                               r.threads, r.smem});
     return out;
 }
 
@@ -243,11 +242,9 @@ std::vector<std::vector<int>> tile_vocabulary() {
 // to in the compiled-in tables (the GENERATED block's paste target). Owned
 // here so the sweep's C++ emitter needs no Python-side copy of the names.
 std::vector<const char*> tile_class_names() {
-    static constexpr const char* kNames[] = {
-        "kSmall64", "kNarrow128x64", "kBig128", "kWide128x256",
-        "kTall64x128"};
-    static_assert((int)TileClass::kTall64x128 ==
-                      (int)(sizeof(kNames) / sizeof(kNames[0])) - 1,
+    static constexpr const char* kNames[] = {"kSmall64", "kNarrow128x64", "kBig128", "kWide128x256",
+                                             "kTall64x128"};
+    static_assert((int)TileClass::kTall64x128 == (int)(sizeof(kNames) / sizeof(kNames[0])) - 1,
                   "kNames is indexed by TileClass: keep it in enum order");
     return std::vector<const char*>(kNames, kNames + sizeof(kNames) / sizeof(kNames[0]));
 }
@@ -267,10 +264,8 @@ torch::Tensor quant_gemm_impl(torch::Tensor a,
                               bool trans_a,
                               bool trans_b,
                               c10::optional<torch::Tensor> bias) {
-    return quant_gemm_ladder<&find_gemm_dispatch>(a, b, a_scale, b_scale,
-                                                  trans_a, trans_b, bias);
+    return quant_gemm_ladder<&find_gemm_dispatch>(a, b, a_scale, b_scale, trans_a, trans_b, bias);
 }
 
-}  // namespace gemm
-}  // namespace astrai
-
+} // namespace gemm
+} // namespace astrai

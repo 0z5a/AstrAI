@@ -58,36 +58,41 @@ namespace astrai {
 // transaction bytes. Coordinates are in the map's element units — the
 // host encodes byte-granular dims for operand tiles, so x is a byte
 // offset along K.
-DEVICE_FORCEINLINE void tma_load_2d(const void* map, uint64_t* bar,
-                                            void* smem_dst, int x, int y) {
+DEVICE_FORCEINLINE void tma_load_2d(const void* map, uint64_t* bar, void* smem_dst, int x, int y) {
 #if ASTRAI_TMA_ENABLED
     const unsigned dst = __cvta_generic_to_shared(smem_dst);
     const unsigned bar_addr = __cvta_generic_to_shared(bar);
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(map), "r"(x), "r"(y), "r"(bar_addr)
-        : "memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                 " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst),
+                 "l"(map), "r"(x), "r"(y), "r"(bar_addr)
+                 : "memory");
 #else
-    (void)map; (void)bar; (void)smem_dst; (void)x; (void)y;
+    (void)map;
+    (void)bar;
+    (void)smem_dst;
+    (void)x;
+    (void)y;
 #endif
 }
 
 // 3D form: the batch is the outer map dimension (stride-0 broadcast
 // operands encode as 2D and keep the 2D emitter).
-DEVICE_FORCEINLINE void tma_load_3d(const void* map, uint64_t* bar,
-                                            void* smem_dst, int x, int y,
-                                            int z) {
+DEVICE_FORCEINLINE void
+tma_load_3d(const void* map, uint64_t* bar, void* smem_dst, int x, int y, int z) {
 #if ASTRAI_TMA_ENABLED
     const unsigned dst = __cvta_generic_to_shared(smem_dst);
     const unsigned bar_addr = __cvta_generic_to_shared(bar);
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(map), "r"(x), "r"(y), "r"(z), "r"(bar_addr)
-        : "memory");
+    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes"
+                 " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
+                 "l"(map), "r"(x), "r"(y), "r"(z), "r"(bar_addr)
+                 : "memory");
 #else
-    (void)map; (void)bar; (void)smem_dst; (void)x; (void)y; (void)z;
+    (void)map;
+    (void)bar;
+    (void)smem_dst;
+    (void)x;
+    (void)y;
+    (void)z;
 #endif
 }
 
@@ -95,8 +100,8 @@ DEVICE_FORCEINLINE void tma_load_3d(const void* map, uint64_t* bar,
 // compile-time branch instead of a runtime flag. `z` is dead in the rank-2
 // form (broadcast operands share one 2D map's coordinates across grid.z).
 template <bool kRank3>
-DEVICE_FORCEINLINE void tma_load(const void* map, uint64_t* bar,
-                                         void* smem_dst, int x, int y, int z) {
+DEVICE_FORCEINLINE void
+tma_load(const void* map, uint64_t* bar, void* smem_dst, int x, int y, int z) {
     if constexpr (kRank3)
         tma_load_3d(map, bar, smem_dst, x, y, z);
     else
@@ -125,8 +130,7 @@ struct TmaMapSpec {
     int swizzle_bits = 0;      // 3 = SWIZZLE_128B (2B elems), 2 = SWIZZLE_64B (1B)
 
     bool aligned16() const {
-        return ((reinterpret_cast<uintptr_t>(ptr) | stride1 |
-                 (batch > 1 ? batch_stride : 0)) &
+        return ((reinterpret_cast<uintptr_t>(ptr) | stride1 | (batch > 1 ? batch_stride : 0)) &
                 15) == 0;
     }
 };
@@ -140,14 +144,12 @@ struct TmaMapSpec {
 // hand-built specs once did, which could drift from what the fragments
 // actually read.
 template <typename StagedT>
-struct TmaSwizzleOf;  // undefined: only swizzled congruous staging feeds TMA
+struct TmaSwizzleOf; // undefined: only swizzled congruous staging feeds TMA
 
-template <typename SwzT, typename LayT>
-struct TmaSwizzleOf<ComposedLayout<SwzT, LayT>> {
-    static_assert(SwzT::kTmaMode,
-                  "TMA staging needs a hardware swizzle mode (Swizzle<1-3, 3>)");
+template <typename SwzT, typename LayT> struct TmaSwizzleOf<ComposedLayout<SwzT, LayT>> {
+    static_assert(SwzT::kTmaMode, "TMA staging needs a hardware swizzle mode (Swizzle<1-3, 3>)");
     static constexpr int kBits = SwzT::kBits;
-    static constexpr uint32_t kBox0Bytes = 16u << kBits;  // the swizzle span
+    static constexpr uint32_t kBox0Bytes = 16u << kBits; // the swizzle span
 };
 
 // Host spec for one congruous staged operand: the compile-time facts (map
@@ -155,8 +157,8 @@ struct TmaSwizzleOf<ComposedLayout<SwzT, LayT>> {
 // ride the type; only the runtime geometry (extents / strides / batch)
 // fills the struct. `rows` is M for A, N for B.
 template <typename ElemT, typename StagedT, int kBoxRows>
-TmaMapSpec tma_spec(const void* ptr, int64_t rows, int64_t k, int64_t ld,
-                    int batch, int64_t batch_stride) {
+TmaMapSpec
+tma_spec(const void* ptr, int64_t rows, int64_t k, int64_t ld, int batch, int64_t batch_stride) {
     using Swz = TmaSwizzleOf<StagedT>;
     static_assert(kBoxRows % 8 == 0, "box rows must tile the MMA m/n extent");
     TmaMapSpec s;
@@ -172,18 +174,25 @@ TmaMapSpec tma_spec(const void* ptr, int64_t rows, int64_t k, int64_t ld,
     return s;
 }
 
-using TmaEncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t,
-                                 void*, const cuuint64_t*, const cuuint64_t*,
-                                 const cuuint32_t*, const cuuint32_t*,
-                                 CUtensorMapInterleave, CUtensorMapSwizzle,
-                                 CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+using TmaEncodeFn = CUresult (*)(CUtensorMap*,
+                                 CUtensorMapDataType,
+                                 cuuint32_t,
+                                 void*,
+                                 const cuuint64_t*,
+                                 const cuuint64_t*,
+                                 const cuuint32_t*,
+                                 const cuuint32_t*,
+                                 CUtensorMapInterleave,
+                                 CUtensorMapSwizzle,
+                                 CUtensorMapL2promotion,
+                                 CUtensorMapFloatOOBfill);
 
 inline TmaEncodeFn tma_encode_fn() {
     static TmaEncodeFn fn = [] {
         void* handle = dlopen("libcuda.so.1", RTLD_LAZY);
-        if (handle == nullptr) handle = dlopen("libcuda.so", RTLD_LAZY);
-        return handle ? reinterpret_cast<TmaEncodeFn>(
-                            dlsym(handle, "cuTensorMapEncodeTiled"))
+        if (handle == nullptr)
+            handle = dlopen("libcuda.so", RTLD_LAZY);
+        return handle ? reinterpret_cast<TmaEncodeFn>(dlsym(handle, "cuTensorMapEncodeTiled"))
                       : nullptr;
     }();
     return fn;
@@ -194,10 +203,8 @@ inline bool tma_encode(const TmaMapSpec& s, CUtensorMap* map) {
     if (fn == nullptr || !s.aligned16() || s.box1 == 0 || s.dim1 == 0)
         return false;
     const bool rank3 = s.batch > 1 && s.batch_stride > 0;
-    const cuuint64_t dims[3] = {s.dim0, s.dim1,
-                                rank3 ? (cuuint64_t)s.batch : 1};
-    const cuuint64_t strides[2] = {s.stride1,
-                                   rank3 ? s.batch_stride : (cuuint64_t)16};
+    const cuuint64_t dims[3] = {s.dim0, s.dim1, rank3 ? (cuuint64_t)s.batch : 1};
+    const cuuint64_t strides[2] = {s.stride1, rank3 ? s.batch_stride : (cuuint64_t)16};
     const cuuint32_t box[3] = {s.box0, s.box1, 1};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
     // Hardware swizzle modes exist at 128B and 64B only. A staging layout
@@ -211,21 +218,21 @@ inline bool tma_encode(const TmaMapSpec& s, CUtensorMap* map) {
     // Refuse the map instead, so the caller stages through that twin: it
     // writes through the layout, and an absent [gemm-plan] tma=true line says
     // so.
-    if (s.swizzle_bits != 3 && s.swizzle_bits != 2) return false;
-    const CUtensorMapSwizzle swz = s.swizzle_bits == 3
-                                       ? CU_TENSOR_MAP_SWIZZLE_128B
-                                       : CU_TENSOR_MAP_SWIZZLE_64B;
+    if (s.swizzle_bits != 3 && s.swizzle_bits != 2)
+        return false;
+    const CUtensorMapSwizzle swz =
+        s.swizzle_bits == 3 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
     // The box's inner extent IS the swizzle span (16B << bits): these staging
     // layouts are full-line swizzled. Redundant with the trait today — it
     // derives both from one kBits — but the hand-built specs this layer once
     // accepted could drift from what the fragments read, so the invariant
     // stays stated (and cheap) at the encode boundary.
-    if (s.box0 != (16u << s.swizzle_bits)) return false;
-    const CUresult r = fn(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank3 ? 3 : 2,
-                          const_cast<void*>(s.ptr), dims, strides, box,
-                          elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swz,
-                          CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-                          CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (s.box0 != (16u << s.swizzle_bits))
+        return false;
+    const CUresult r =
+        fn(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank3 ? 3 : 2, const_cast<void*>(s.ptr), dims,
+           strides, box, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swz,
+           CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     return r == CUDA_SUCCESS;
 }
 
@@ -251,9 +258,11 @@ class TmaMapCache {
     std::optional<CUtensorMap> lookup(const TmaMapSpec& s) {
         const std::lock_guard<std::mutex> lock(mu_);
         for (Entry& e : entries_)
-            if (e.used && matches(e, s)) return e.map;
+            if (e.used && matches(e, s))
+                return e.map;
         Entry& e = entries_[next_];
-        if (!tma_encode(s, &e.map)) return std::nullopt;
+        if (!tma_encode(s, &e.map))
+            return std::nullopt;
         e.used = true;
         e.spec = s;
         next_ = (next_ + 1) % kCap;
@@ -268,11 +277,9 @@ class TmaMapCache {
         bool used = false;
     };
     static bool matches(const Entry& e, const TmaMapSpec& s) {
-        return e.spec.ptr == s.ptr && e.spec.dim0 == s.dim0 &&
-               e.spec.dim1 == s.dim1 && e.spec.stride1 == s.stride1 &&
-               e.spec.box0 == s.box0 && e.spec.box1 == s.box1 &&
-               e.spec.batch == s.batch &&
-               e.spec.batch_stride == s.batch_stride &&
+        return e.spec.ptr == s.ptr && e.spec.dim0 == s.dim0 && e.spec.dim1 == s.dim1 &&
+               e.spec.stride1 == s.stride1 && e.spec.box0 == s.box0 && e.spec.box1 == s.box1 &&
+               e.spec.batch == s.batch && e.spec.batch_stride == s.batch_stride &&
                e.spec.swizzle_bits == s.swizzle_bits;
     }
     Entry entries_[kCap];
@@ -285,4 +292,4 @@ inline TmaMapCache& tma_map_cache() {
     return cache;
 }
 
-}  // namespace astrai
+} // namespace astrai

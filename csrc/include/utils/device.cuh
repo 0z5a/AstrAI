@@ -56,12 +56,10 @@ inline DeviceFacts device_facts() {
     if (!facts.sms) {
         int l2 = 0, major = 0, minor = 0;
         cudaDeviceGetAttribute(&facts.sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaDeviceGetAttribute(&facts.smem_max,
-                               cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-        cudaDeviceGetAttribute(&facts.smem_per_sm,
-                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
-        cudaDeviceGetAttribute(&facts.regs_per_sm,
-                               cudaDevAttrMaxRegistersPerMultiprocessor, dev);
+        cudaDeviceGetAttribute(&facts.smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        cudaDeviceGetAttribute(&facts.smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                               dev);
+        cudaDeviceGetAttribute(&facts.regs_per_sm, cudaDevAttrMaxRegistersPerMultiprocessor, dev);
         cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
@@ -71,9 +69,10 @@ inline DeviceFacts device_facts() {
         facts.regs_per_sm = facts.regs_per_sm > 0 ? facts.regs_per_sm : 65536;
         facts.l2_bytes = l2 > 0 ? l2 : (int64_t{4} << 20);
         facts.cc = major > 0 ? major * 10 + minor : 0;
-        if (cacheable) cached[dev] = facts;
+        if (cacheable)
+            cached[dev] = facts;
     }
     return facts;
 }
 
-}  // namespace astrai
+} // namespace astrai

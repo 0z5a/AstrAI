@@ -33,8 +33,8 @@
 
 #include <utils/gemm_common.h>
 
-#include <api/gemm.h>
 #include <api/fp8_checks.h>
+#include <api/gemm.h>
 
 namespace astrai {
 namespace gemm {
@@ -48,10 +48,10 @@ namespace {
 // LayoutA/LayoutB tags cover both storages. m/n/k derive from the user flag
 // only. Tensors whose inner dims are neither natural layout fall back to
 // .contiguous().
-bool resolve_operand(const torch::Tensor& t_in, 
-                     bool flag, 
+bool resolve_operand(const torch::Tensor& t_in,
+                     bool flag,
                      int64_t& ld,
-                     int64_t& batch_stride, 
+                     int64_t& batch_stride,
                      torch::Tensor& storage) {
     torch::Tensor t = t_in;
     bool col_major = false;
@@ -74,19 +74,16 @@ struct QuantScale {
     int n = 0;
 };
 
-QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent,
-                               const char* name) {
+QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent, const char* name) {
     TORCH_CHECK(s.defined(), name, " is required");
-    TORCH_CHECK(s.is_cuda() && s.scalar_type() == torch::kFloat32 &&
-                    s.is_contiguous(),
-                name, " must be a contiguous CUDA float32 tensor");
-    TORCH_CHECK(s.numel() == 1 || s.numel() == extent,
-                name, " must hold 1 element (per-tensor) or ", extent,
-                " (per-row/per-channel)");
+    TORCH_CHECK(s.is_cuda() && s.scalar_type() == torch::kFloat32 && s.is_contiguous(), name,
+                " must be a contiguous CUDA float32 tensor");
+    TORCH_CHECK(s.numel() == 1 || s.numel() == extent, name,
+                " must hold 1 element (per-tensor) or ", extent, " (per-row/per-channel)");
     return {s.data_ptr<float>(), s.numel() == 1 ? 0 : (int)extent};
 }
 
-}  // namespace
+} // namespace
 
 // The single quantized-GEMM entry body (one kernel for every cell, the only
 // kernel-facing export). The dtype pair picks the mma mode:
@@ -119,12 +116,10 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     }
     const int64_t m = trans_a ? a.size(-1) : a.size(-2);
     const int64_t n = trans_b ? b.size(-2) : b.size(-1);
-    auto opt_scale = [&](const c10::optional<torch::Tensor>& s, int64_t extent,
-                         const char* name, bool i8_side,
-                         bool bf16_side) -> QuantScale {
+    auto opt_scale = [&](const c10::optional<torch::Tensor>& s, int64_t extent, const char* name,
+                         bool i8_side, bool bf16_side) -> QuantScale {
         if (!s.has_value()) {
-            TORCH_CHECK(!i8_side, "quant_gemm: ", name,
-                        " is required for an int8 operand");
+            TORCH_CHECK(!i8_side, "quant_gemm: ", name, " is required for an int8 operand");
             return {nullptr, 0};
         }
         TORCH_CHECK(!bf16_side, "quant_gemm: ", name,
@@ -135,19 +130,19 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     const QuantScale sb = opt_scale(b_scale, n, "b_scale", i8b, b16b);
 
     TORCH_CHECK(a.is_cuda() && b.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK((a.dim() == 2 || a.dim() == 3) &&
-                    (b.dim() == 2 || b.dim() == 3),
+    TORCH_CHECK((a.dim() == 2 || a.dim() == 3) && (b.dim() == 2 || b.dim() == 3),
                 "a and b must be 2D or 3D (batched)");
     TORCH_CHECK(a.device() == b.device(), "a and b must share device");
     torch::Tensor bias_t;
-    if (bias.has_value()) bias_t = *bias;
+    if (bias.has_value())
+        bias_t = *bias;
     const at::cuda::OptionalCUDAGuard guard(a.device());
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const int64_t batch_a = a.dim() == 3 ? a.size(0) : 1;
     const int64_t batch_b = b.dim() == 3 ? b.size(0) : 1;
-    TORCH_CHECK(batch_a == batch_b || batch_a == 1 || batch_b == 1,
-                "batch dim mismatch (got ", batch_a, " and ", batch_b, ")");
+    TORCH_CHECK(batch_a == batch_b || batch_a == 1 || batch_b == 1, "batch dim mismatch (got ",
+                batch_a, " and ", batch_b, ")");
     const int64_t batch = std::max(batch_a, batch_b);
     TORCH_CHECK(batch <= 65535, "batch dim exceeds the grid.z launch limit");
 
@@ -157,16 +152,13 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     const bool tag_b = resolve_operand(b, trans_b, b_ld, b_bstride, b_st);
     const int64_t k = trans_a ? a.size(-2) : a.size(-1);
     TORCH_CHECK(k == (trans_b ? b.size(-1) : b.size(-2)), "inner dim mismatch");
-    TORCH_CHECK(sa.ptr == nullptr || sa.n == 0 || sa.n == m,
-                "a_scale extent must match m");
-    TORCH_CHECK(sb.ptr == nullptr || sb.n == 0 || sb.n == n,
-                "w_scale extent must match n");
+    TORCH_CHECK(sa.ptr == nullptr || sa.n == 0 || sa.n == m, "a_scale extent must match m");
+    TORCH_CHECK(sb.ptr == nullptr || sb.n == 0 || sb.n == n, "w_scale extent must match n");
 
     const bool batched_out = a.dim() == 3 || b.dim() == 3;
-    torch::Tensor output =
-        batched_out
-            ? torch::empty({batch, m, n}, a.options().dtype(torch::kBFloat16))
-            : torch::empty({m, n}, a.options().dtype(torch::kBFloat16));
+    torch::Tensor output = batched_out
+                               ? torch::empty({batch, m, n}, a.options().dtype(torch::kBFloat16))
+                               : torch::empty({m, n}, a.options().dtype(torch::kBFloat16));
     GemmParams p;
     p.a_ptr = a_st.data_ptr();
     p.b_ptr = b_st.data_ptr();
@@ -204,12 +196,13 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     // k == 0 needs no guard: the mainloop runs zero iterations and the
     // epilogue writes the empty sum — zero, plus bias
     // (tests/extension/test_w8.py pins both, and the empty-m/n shapes).
-    if (m == 0 || n == 0) return output;
+    if (m == 0 || n == 0)
+        return output;
 
     Lookup(dt_a, dt_b)(p, stream.stream(), tag_a, tag_b);
     C10_CUDA_CHECK(cudaGetLastError());
     return output;
 }
 
-}  // namespace gemm
-}  // namespace astrai
+} // namespace gemm
+} // namespace astrai

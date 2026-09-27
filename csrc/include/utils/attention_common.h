@@ -9,8 +9,8 @@ namespace attention {
 // Internally, kernels always operate on BHLD [batch, n_heads, seq_len, head_dim].
 // When the caller passes BLHD, dims 1 and 2 are transposed at entry.
 enum TensorLayout : int {
-    BHLD = 0,  // [batch, n_heads, seq_len, head_dim]
-    BLHD = 1,  // [batch, seq_len, n_heads, head_dim]
+    BHLD = 0, // [batch, n_heads, seq_len, head_dim]
+    BLHD = 1, // [batch, seq_len, n_heads, head_dim]
 };
 
 // Split-KV workspace cap: max decode splits per (batch, q_head).
@@ -20,7 +20,6 @@ constexpr int MAX_SPLITS = 32;
 // covers this many query rows of one request.  Must match Q_TILE_ROWS in
 // astrai/inference/workspace.py, which builds the device-side tile maps.
 constexpr int HOST_Q_TILE_ROWS = 64;
-
 
 // Unified attention params covering BOTH addressing modes:
 //   - Contiguous K/V: dense [batch, kv_head, kv_len, head_dim] tensors (k/v).
@@ -49,8 +48,8 @@ struct AttentionParams {
     int q_head;
     int kv_head;
     int head_dim;
-    int q_len;   // Per-request in contiguous mode; total_q in paged mode.
-    int kv_len;  // Contiguous mode; paged mode uses kv_indptr.
+    int q_len;  // Per-request in contiguous mode; total_q in paged mode.
+    int kv_len; // Contiguous mode; paged mode uses kv_indptr.
 
     // Attention behavior
     float scale;
@@ -87,12 +86,12 @@ struct AttentionParams {
     int mask_l_stride;
 
     // Paged K/V addressing
-    const int* __restrict__ req_to_token = nullptr;      // [num_reqs, max_context_len]
-    const int* __restrict__ req_pool_indices = nullptr;  // [batch]
-    const int* __restrict__ kv_indptr = nullptr;         // [batch + 1]
-    const int* __restrict__ qo_indptr = nullptr;         // [batch + 1] or nullptr for decode
-    const int* __restrict__ q_tile_to_batch = nullptr;   // [num_q_tiles], prefill only
-    const int* __restrict__ q_tile_to_index = nullptr;   // [num_q_tiles], prefill only
+    const int* __restrict__ req_to_token = nullptr;     // [num_reqs, max_context_len]
+    const int* __restrict__ req_pool_indices = nullptr; // [batch]
+    const int* __restrict__ kv_indptr = nullptr;        // [batch + 1]
+    const int* __restrict__ qo_indptr = nullptr;        // [batch + 1] or nullptr for decode
+    const int* __restrict__ q_tile_to_batch = nullptr;  // [num_q_tiles], prefill only
+    const int* __restrict__ q_tile_to_index = nullptr;  // [num_q_tiles], prefill only
     int num_q_tiles;
     int max_context_len; // req_to_token stride (dim 1)
 
@@ -102,5 +101,5 @@ struct AttentionParams {
     float* __restrict__ ml_part = nullptr;
 };
 
-}  // namespace attention
-}  // namespace astrai
+} // namespace attention
+} // namespace astrai

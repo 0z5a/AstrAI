@@ -3,17 +3,17 @@
 // the kernel takes, and the runtime planning vocabulary. Dtype-generic via
 // gemm_elem_traits.
 
-#include <cuda_fp8.h>
 #include <atomic>
 #include <cstdint>
+#include <cuda_fp8.h>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 
 #include <mma/mma.cuh>
 #include <utils/device.cuh>
-#include <utils/tensor.cuh>
 #include <utils/gemm_common.h>
+#include <utils/tensor.cuh>
 
 namespace astrai {
 namespace gemm {
@@ -24,8 +24,12 @@ namespace gemm {
 // their native mma (fp32/int32 accumulators), a lone 8-bit side against
 // bf16 dequantizes in-register (kDequantA/B mark those inserts per side).
 // UseMx swaps the symmetric-fp8 cell for the sm_120 block_scale cell.
-template <typename ElemA_, typename ElemB_, typename CtaShape_,
-          typename WarpShape_, int Stages, bool UseMx = false>
+template <typename ElemA_,
+          typename ElemB_,
+          typename CtaShape_,
+          typename WarpShape_,
+          int Stages,
+          bool UseMx = false>
 struct GemmTraits {
     using ElemA = ElemA_;
     using ElemB = ElemB_;
@@ -35,11 +39,11 @@ struct GemmTraits {
     // carries the instruction's K extent and accumulator type (fp32 for the
     // float families, s32 for the s8 pair).
     static constexpr bool kMxCell =
-        UseMx && (std::is_same_v<MmaT, __nv_fp8_e4m3> ||
-                  std::is_same_v<MmaT, __nv_fp8_e5m2>);
-    using MmaOp = std::conditional_t<
-        kMxCell, astrai::MxMmaOp<MmaT>,
-        astrai::MmaOp<MmaT, MmaT, typename astrai::MmaShapeFor<MmaT>::type>>;
+        UseMx && (std::is_same_v<MmaT, __nv_fp8_e4m3> || std::is_same_v<MmaT, __nv_fp8_e5m2>);
+    using MmaOp =
+        std::conditional_t<kMxCell,
+                           astrai::MxMmaOp<MmaT>,
+                           astrai::MmaOp<MmaT, MmaT, typename astrai::MmaShapeFor<MmaT>::type>>;
     using AccT = typename MmaOp::AccT;
     using ElemTraitsA = gemm_elem_traits<ElemA_>;
     using ElemTraitsB = gemm_elem_traits<ElemB_>;
@@ -74,16 +78,13 @@ struct GemmTraits {
     // m16n8 mma cells on the (kMt, kNt) warp tile grid.
     static constexpr int kMt = kWarpM / 16;
     static constexpr int kNt = kWarpN / 8;
-    using AccTensor =
-        Tensor<ArrayEngine<typename MmaOp::CFrag, kMt * kNt>,
-               CellLayout<kNt>>;
+    using AccTensor = Tensor<ArrayEngine<typename MmaOp::CFrag, kMt * kNt>, CellLayout<kNt>>;
 };
 
 // Ring-budget formula, one source for GemmSmem, launch_plan's epilogue
 // reclaim check and the host planner's recipe feasibility gate (gemm.cuh):
 // every operand ring holds kStages+1 buffers of k * (bm*ba + bn*bb) bytes.
-constexpr int ring_smem_bytes(int bm, int bn, int k, int stages,
-                              int ba, int bb) {
+constexpr int ring_smem_bytes(int bm, int bn, int k, int stages, int ba, int bb) {
     return (stages + 1) * k * (bm * ba + bn * bb);
 }
 
@@ -100,9 +101,7 @@ constexpr int ring_smem_bytes(int bm, int bn, int k, int stages,
 // therefore NOT the smem term of residency: that term is priced from
 // DeviceFacts::smem_per_sm, because a part with more smem per SM packs more
 // CTAs than a watermark fixed at one device's figure allows.
-constexpr int min_ctas_for_ring(int bytes) {
-    return bytes <= 48 * 1024 ? 2 : 1;
-}
+constexpr int min_ctas_for_ring(int bytes) { return bytes <= 48 * 1024 ? 2 : 1; }
 
 // Which storages take the DIRECT (crosswise) staging path. A stored [K][M]
 // (ColMajor) and B stored [K][N] (RowMajor) each keep the tile's rows along K,
@@ -112,31 +111,26 @@ constexpr int min_ctas_for_ring(int bytes) {
 // ColMajor means crosswise for A and congruous for B. Everything else in this
 // directory spells the predicate from these two — crosswise_of() sums them,
 // GemmSmem reads them per operand, the ladder picks its kind from them.
-template <typename Layout>
-constexpr bool direct_a() {
-    return std::is_same_v<Layout, ColMajor>;
-}
-template <typename Layout>
-constexpr bool direct_b() {
-    return std::is_same_v<Layout, RowMajor>;
-}
+template <typename Layout> constexpr bool direct_a() { return std::is_same_v<Layout, ColMajor>; }
+template <typename Layout> constexpr bool direct_b() { return std::is_same_v<Layout, RowMajor>; }
 
 // Layout-aware shared-memory budget and occupancy hint. Every operand ring
 // holds kStages+1 buffers: the load for tile i+kStages targets slot
 // (i-1)%(kStages+1) — already consumed — so neither load path needs a
 // post-compute barrier (one __syncthreads per k-tile). The register-budget
 // hint comes from min_ctas_for_ring below.
-template <typename Traits, typename LayoutA, typename LayoutB>
-struct GemmSmem {
+template <typename Traits, typename LayoutA, typename LayoutB> struct GemmSmem {
     // Crosswise (direct-load) operands: A ColMajor storage, B RowMajor
     // storage (B's tag is relative to the canonical [K][N]).
     static constexpr bool kDirectA = direct_a<LayoutA>();
     static constexpr bool kDirectB = direct_b<LayoutB>();
     static constexpr int kRingDepth = Traits::kStages + 1;
-    static constexpr int kBytes =
-        ring_smem_bytes(Traits::kBlockM, Traits::kBlockN, Traits::kK,
-                        Traits::kStages, Traits::kElemBytesA,
-                        Traits::kElemBytesB);
+    static constexpr int kBytes = ring_smem_bytes(Traits::kBlockM,
+                                                  Traits::kBlockN,
+                                                  Traits::kK,
+                                                  Traits::kStages,
+                                                  Traits::kElemBytesA,
+                                                  Traits::kElemBytesB);
     static constexpr int kMinCtas = min_ctas_for_ring(kBytes);
 };
 
@@ -154,8 +148,7 @@ struct GemmSmem {
 // predication-free copy 9-19% FASTER on both big kk twins, and the
 // downgrade was unreachable through the planner anyway (the model's
 // residency rule never picks big on the crosswise ladder).
-template <typename CtaShape_, typename WarpShape_, int Stages_>
-struct GemmTileConfig {
+template <typename CtaShape_, typename WarpShape_, int Stages_> struct GemmTileConfig {
     using CtaShape = CtaShape_;
     using WarpShape = WarpShape_;
     static constexpr int kStages = Stages_;
@@ -172,18 +165,12 @@ struct GemmTileConfig {
 // kTileLines*kChunks % kThreads == 0 with a power-of-two chunks-per-thread,
 // so a 1-byte line holds half as many 16B chunks as a 2-byte one and the
 // widest warp tilings do not instantiate for 1-byte operands.
-using Tile_128x128x64_W64x32_S2 =
-    GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2>;
-using Tile_128x128x64_W64x32_S3 =
-    GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3>;
-using Tile_128x64x64_W32x32_S2 =
-    GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 2>;
-using Tile_128x64x64_W32x32_S3 =
-    GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 3>;
-using Tile_64x64x64_W16x32_S2 =
-    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 2>;
-using Tile_64x64x64_W16x32_S3 =
-    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 3>;
+using Tile_128x128x64_W64x32_S2 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 2>;
+using Tile_128x128x64_W64x32_S3 = GemmTileConfig<Shape<128, 128, 64>, Shape<64, 32>, 3>;
+using Tile_128x64x64_W32x32_S2 = GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 2>;
+using Tile_128x64x64_W32x32_S3 = GemmTileConfig<Shape<128, 64, 64>, Shape<32, 32>, 3>;
+using Tile_64x64x64_W16x32_S2 = GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 2>;
+using Tile_64x64x64_W16x32_S3 = GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 3>;
 // Deep-ring s4/s5 twins of this geometry were removed: the sweep measured
 // them a wash against s2..s3 (within 1-2% at this tile) and no compiled-in
 // row reaches past s3. The planner rejects stages > 3 outright, so a stale
@@ -199,28 +186,21 @@ using Tile_64x64x64_W16x32_S3 =
 // predicated skip (load.cuh) and the dequant fragments each lane owes
 // halve with the 16-wide N partition.
 template <typename Tile>
-using small_16w_t = GemmTileConfig<typename Tile::CtaShape, Shape<16, 16>,
-                                   Tile::kStages>;
+using small_16w_t = GemmTileConfig<typename Tile::CtaShape, Shape<16, 16>, Tile::kStages>;
 
 // kK=32 twins: the measured k-tile-depth winner on most shapes, since a
 // 64-deep k-tile spends ring budget and issue slots the short K loop cannot
 // use.
-using Tile_64x64x32_W16x32_S2 =
-    GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 2>;
-using Tile_64x64x32_W16x32_S3 =
-    GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 3>;
+using Tile_64x64x32_W16x32_S2 = GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 2>;
+using Tile_64x64x32_W16x32_S3 = GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 3>;
 // The tall 64x128 CTA (N:M = 2:1): the tile sweep's champion at wide N and
 // at the parity square on the congruous ladder (up to 1.089x over the best
 // previously reachable recipe), so it joins the manifest rather than living
 // in the sweep grid only.
-using Tile_64x128x32_W32x32_S2 =
-    GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 2>;
-using Tile_64x128x32_W32x32_S3 =
-    GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 3>;
-using Tile_128x64x32_W32x32_S2 =
-    GemmTileConfig<Shape<128, 64, 32>, Shape<32, 32>, 2>;
-using Tile_128x128x32_W64x32_S3 =
-    GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 3>;
+using Tile_64x128x32_W32x32_S2 = GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 2>;
+using Tile_64x128x32_W32x32_S3 = GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 3>;
+using Tile_128x64x32_W32x32_S2 = GemmTileConfig<Shape<128, 64, 32>, Shape<32, 32>, 2>;
+using Tile_128x128x32_W64x32_S3 = GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 3>;
 // 16 warps per CTA on the 128x128x32 ring (32x32 warp tiles, 512 threads):
 // same CTA geometry, same 48KB ring, twice the warps. The 8-warp twin above
 // leaves the tensor pipe waiting at every fragment boundary; doubling the warps
@@ -229,20 +209,16 @@ using Tile_128x128x32_W64x32_S3 =
 // 1.2%, and that shape is served by the 64x64 rows). The residency budget
 // still holds: 512 threads x 2 CTAs needs <= 64 registers, which the smaller
 // 32x32 warp tile's accumulator (32 fp32 cells) leaves room for.
-using Tile_128x128x32_W32x32_S2 =
-    GemmTileConfig<Shape<128, 128, 32>, Shape<32, 32>, 2>;
+using Tile_128x128x32_W32x32_S2 = GemmTileConfig<Shape<128, 128, 32>, Shape<32, 32>, 2>;
 // 1-byte operands only: the ring is 147KB for a 2-byte pair (past the smem
 // opt-in ceiling) against 74KB for a 1-byte one.
-using Tile_128x256x64_W64x32_S2 =
-    GemmTileConfig<Shape<128, 256, 64>, Shape<64, 32>, 2>;
+using Tile_128x256x64_W64x32_S2 = GemmTileConfig<Shape<128, 256, 64>, Shape<64, 32>, 2>;
 
 // CTA class of a tile config, derived from its CTA geometry — one axis of
 // the dispatch key the launch ladders select on (GemmPlan in gemm.cuh).
-enum class TileClass { kSmall64, kNarrow128x64, kBig128, kWide128x256,
-                       kTall64x128 };
+enum class TileClass { kSmall64, kNarrow128x64, kBig128, kWide128x256, kTall64x128 };
 
-template <typename Tile>
-constexpr TileClass tile_class() {
+template <typename Tile> constexpr TileClass tile_class() {
     if constexpr (Tile::CtaShape::kM == 128 && Tile::CtaShape::kN == 256)
         return TileClass::kWide128x256;
     else if constexpr (Tile::CtaShape::kM == 128 && Tile::CtaShape::kN == 128)
@@ -266,23 +242,21 @@ constexpr TileClass tile_class() {
 template <typename ElemA, typename ElemB, typename Tile>
 using warp_widened_t =
     std::conditional_t<sizeof(ElemA) + sizeof(ElemB) >= 3 &&
-                           tile_class<Tile>() == TileClass::kSmall64 &&
-                           Tile::CtaShape::kK == 64,
-                       small_16w_t<Tile>, Tile>;
+                           tile_class<Tile>() == TileClass::kSmall64 && Tile::CtaShape::kK == 64,
+                       small_16w_t<Tile>,
+                       Tile>;
 // CTA geometry per dispatch class — the inverse of tile_class, and the one
 // home for the class -> (M, N) numbers the host plan table prices rows with
 // (plan_row_geometry in plan_table.h). Indexed by TileClass, enum order.
 inline constexpr int kTileClassCta[][2] = {
-    {64, 64},    // kSmall64
-    {128, 64},   // kNarrow128x64
-    {128, 128},  // kBig128
-    {128, 256},  // kWide128x256
-    {64, 128},   // kTall64x128
+    {64, 64},   // kSmall64
+    {128, 64},  // kNarrow128x64
+    {128, 128}, // kBig128
+    {128, 256}, // kWide128x256
+    {64, 128},  // kTall64x128
 };
-static_assert((int)TileClass::kSmall64 == 0 &&
-                  (int)TileClass::kNarrow128x64 == 1 &&
-                  (int)TileClass::kBig128 == 2 &&
-                  (int)TileClass::kWide128x256 == 3 &&
+static_assert((int)TileClass::kSmall64 == 0 && (int)TileClass::kNarrow128x64 == 1 &&
+                  (int)TileClass::kBig128 == 2 && (int)TileClass::kWide128x256 == 3 &&
                   (int)TileClass::kTall64x128 == 4,
               "kTileClassCta is indexed by TileClass: keep the enum in table order");
 
@@ -291,13 +265,11 @@ static_assert((int)TileClass::kSmall64 == 0 &&
 // row file's cta column (plan_table.h) is bounds-checked against this and then
 // read as the TileClass ordinal: the file's numbering and the enum's are one
 // fact, not two tables to keep in sync.
-inline constexpr int kTileClassCount =
-    (int)(sizeof(kTileClassCta) / sizeof(kTileClassCta[0]));
+inline constexpr int kTileClassCount = (int)(sizeof(kTileClassCta) / sizeof(kTileClassCta[0]));
 
 // A class is a function of its CTA shape alone, so one representative tile per
 // class pins the table to the tiles the ladders actually instantiate.
-template <typename Tile>
-constexpr bool cta_matches_class() {
+template <typename Tile> constexpr bool cta_matches_class() {
     return kTileClassCta[(int)tile_class<Tile>()][0] == Tile::CtaShape::kM &&
            kTileClassCta[(int)tile_class<Tile>()][1] == Tile::CtaShape::kN;
 }
@@ -311,8 +283,7 @@ static_assert(cta_matches_class<Tile_64x64x64_W16x32_S2>() &&
 // Tuple concatenation, so a manifest reads as "the shared ladder plus my own
 // additions" instead of re-listing the shared entries — the prefix relationship
 // between the ladders is then structural, not a copy that can drift.
-template <typename... Ts>
-using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
+template <typename... Ts> using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
 
 // The shared ladder: the geometries every staging path instantiates.
 // load_operand_tile stages a crosswise operand as kK lines of (M or N)*elem/16
@@ -322,10 +293,12 @@ using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
 // staging path wants; the wide CTA is 1-byte-only besides. The 16-warp
 // small is a resolver substitution, never a manifest entry, so the bus
 // never gated it either way. Every other manifest contains these.
-using TileManifestCross = std::tuple<
-    Tile_128x128x64_W64x32_S2, Tile_128x128x64_W64x32_S3,
-    Tile_128x64x64_W32x32_S2, Tile_128x64x64_W32x32_S3,
-    Tile_64x64x64_W16x32_S2, Tile_64x64x64_W16x32_S3>;
+using TileManifestCross = std::tuple<Tile_128x128x64_W64x32_S2,
+                                     Tile_128x128x64_W64x32_S3,
+                                     Tile_128x64x64_W32x32_S2,
+                                     Tile_128x64x64_W32x32_S3,
+                                     Tile_64x64x64_W16x32_S2,
+                                     Tile_64x64x64_W16x32_S3>;
 
 // The dispatch manifests (CUTLASS builder-table style): every recipe the
 // launch ladders select over, keyed by the plan's CTA class, ring depth and
@@ -344,12 +317,14 @@ using TileManifestCross = std::tuple<
 // first entry whose (class, stages, kK) matches. The small CTA's 16-warp
 // widening is not an entry here: it is a resolver substitution (small_16w_t)
 // so the same key stays legal on 1-byte operands.
-using TileManifest = tuple_cat_t<
-    TileManifestCross,
-    std::tuple<Tile_64x64x32_W16x32_S2, Tile_64x64x32_W16x32_S3,
-               Tile_128x64x32_W32x32_S2, Tile_128x128x32_W32x32_S2,
-               Tile_128x128x32_W64x32_S3, Tile_64x128x32_W32x32_S2,
-               Tile_64x128x32_W32x32_S3>>;
+using TileManifest = tuple_cat_t<TileManifestCross,
+                                 std::tuple<Tile_64x64x32_W16x32_S2,
+                                            Tile_64x64x32_W16x32_S3,
+                                            Tile_128x64x32_W32x32_S2,
+                                            Tile_128x128x32_W32x32_S2,
+                                            Tile_128x128x32_W64x32_S3,
+                                            Tile_64x128x32_W32x32_S2,
+                                            Tile_64x128x32_W32x32_S3>>;
 
 // The 1-byte ladder: the shared six plus the wide CTA at kK 64, and the
 // 32-deep-ring kK=32 big CTA. The kK=32 crosswise feed runs its packed grid
@@ -363,14 +338,12 @@ using TileManifest = tuple_cat_t<
 // warp_widened_t).
 using TileManifestByte =
     tuple_cat_t<TileManifestCross,
-                std::tuple<Tile_128x256x64_W64x32_S2,
-                           Tile_128x128x32_W64x32_S3>>;
+                std::tuple<Tile_128x256x64_W64x32_S2, Tile_128x128x32_W64x32_S3>>;
 
 // How many operands take that direct path (0 = dual-congruous NT). The
 // planner's crosswise field and the launcher's ladder selection are this one
 // number, asked of the layout tags rather than re-derived from trans flags.
-template <typename LayoutA, typename LayoutB>
-constexpr int crosswise_of() {
+template <typename LayoutA, typename LayoutB> constexpr int crosswise_of() {
     return (direct_a<LayoutA>() ? 1 : 0) + (direct_b<LayoutB>() ? 1 : 0);
 }
 
@@ -391,41 +364,52 @@ constexpr int crosswise_of() {
 enum class ManifestKind { kCrosswise, kTwoByte, kMixed, kByte };
 
 constexpr ManifestKind manifest_kind(bool crosswise_staging, int ba, int bb) {
-    if (ba == 1 && bb == 1) return ManifestKind::kByte;
-    if (crosswise_staging) return ManifestKind::kCrosswise;
-    if (ba == 2 && bb == 2) return ManifestKind::kTwoByte;
-    if (ba + bb == 3) return ManifestKind::kMixed;
+    if (ba == 1 && bb == 1)
+        return ManifestKind::kByte;
+    if (crosswise_staging)
+        return ManifestKind::kCrosswise;
+    if (ba == 2 && bb == 2)
+        return ManifestKind::kTwoByte;
+    if (ba + bb == 3)
+        return ManifestKind::kMixed;
     return ManifestKind::kCrosswise;
 }
 
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
 constexpr ManifestKind manifest_kind_of() {
-    return manifest_kind(crosswise_of<LayoutA, LayoutB>() != 0,
-                         (int)sizeof(ElemA), (int)sizeof(ElemB));
+    return manifest_kind(crosswise_of<LayoutA, LayoutB>() != 0, (int)sizeof(ElemA),
+                         (int)sizeof(ElemB));
 }
 
 // The manifest a given operand pair and staging selects over: the kind above,
 // mapped to its ladder (kCrosswise is the fallback, so it needs no arm).
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
 using manifest_for = std::conditional_t<
-    manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() ==
-            ManifestKind::kTwoByte ||
-        manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() ==
-            ManifestKind::kMixed,
+    manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kTwoByte ||
+        manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kMixed,
     TileManifest,
-    std::conditional_t<
-        manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kByte,
-        TileManifestByte, TileManifestCross>>;
+    std::conditional_t<manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kByte,
+                       TileManifestByte,
+                       TileManifestCross>>;
 
-template <typename ElemA_, typename ElemB_, typename LayoutA_, typename LayoutB_,
-          typename Tile_, typename LayoutOut_ = RowMajor,
-          typename OutT_ = __nv_bfloat16, bool StreamOut_ = false,
-          bool UseTma_ = false, bool UseMxMma_ = false,
+template <typename ElemA_,
+          typename ElemB_,
+          typename LayoutA_,
+          typename LayoutB_,
+          typename Tile_,
+          typename LayoutOut_ = RowMajor,
+          typename OutT_ = __nv_bfloat16,
+          bool StreamOut_ = false,
+          bool UseTma_ = false,
+          bool UseMxMma_ = false,
           bool StoreWriteThrough_ = false>
 struct GemmPolicy {
     using Tile = Tile_;
-    using Traits = GemmTraits<ElemA_, ElemB_, typename Tile_::CtaShape,
-                              typename Tile_::WarpShape, Tile_::kStages,
+    using Traits = GemmTraits<ElemA_,
+                              ElemB_,
+                              typename Tile_::CtaShape,
+                              typename Tile_::WarpShape,
+                              Tile_::kStages,
                               UseMxMma_>;
     using LayoutTagA = LayoutA_;
     using LayoutTagB = LayoutB_;
@@ -451,8 +435,7 @@ struct GemmPolicy {
     // TMA budgets the 1024B ring-base alignment pad plus the full/empty
     // mbarrier pair per ring slot (tma.cuh); the residency hint stays
     // ring-based.
-    static constexpr int kTmaExtra =
-        UseTma_ ? 1024 + 2 * (Tile_::kStages + 1) * 8 : 0;
+    static constexpr int kTmaExtra = UseTma_ ? 1024 + 2 * (Tile_::kStages + 1) * 8 : 0;
     // Flattened for __launch_bounds__, which takes no dependent type names.
     static constexpr int kCtaThreads = Traits::kCtaThreads;
     static constexpr int kMinCtas = Smem::kMinCtas;
@@ -474,7 +457,7 @@ struct GemmPolicy {
 struct GemmConfig {
     std::atomic<int> planner{-1};      // 0 table-only, 1 hybrid (table -> model), 2 model-only
     std::atomic<int> log{-1};          // [gemm-plan] stderr log on/off
-    std::atomic<int> tma_disabled{-1};  // cp.async staging forced everywhere
+    std::atomic<int> tma_disabled{-1}; // cp.async staging forced everywhere
     std::atomic<int> mx_disabled{-1};  // sm_120a block-scale cell knocked out
     std::atomic<int> table_off{-1};    // 1 = "-" (no override, no injected, no builtin rows)
 };
@@ -484,7 +467,7 @@ inline GemmConfig& gemm_config() {
     return cfg;
 }
 
-void gemm_config_seed_once();  // plan_table.h (env seed)
+void gemm_config_seed_once(); // plan_table.h (env seed)
 
 // Dtype-class ids the plan-table rows key on.
 enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
@@ -492,13 +475,13 @@ enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
 // One launchable tile configuration, runtime form; every consumer names
 // tiles through this.
 struct GemmRecipe {
-    int cta;      // TileClass ordinal — the row-file serialization key
-    int stages;   // ring depth
-    int kk;       // k-tile depth (the kK twins are separate recipes)
-    int bm, bn;   // CTA geometry
-    int wm, wn;   // warp tiling (the recipe name's W<x>x<y>)
-    int threads;  // the manifest entry's warp tiling (first match wins)
-    int smem;     // ring bytes at this staging pair's operand widths
+    int cta;     // TileClass ordinal — the row-file serialization key
+    int stages;  // ring depth
+    int kk;      // k-tile depth (the kK twins are separate recipes)
+    int bm, bn;  // CTA geometry
+    int wm, wn;  // warp tiling (the recipe name's W<x>x<y>)
+    int threads; // the manifest entry's warp tiling (first match wins)
+    int smem;    // ring bytes at this staging pair's operand widths
 };
 
 // Everything a plan decision is priced against, assembled once per launch
@@ -508,19 +491,19 @@ struct PlanQuery {
     int64_t n = 0;
     int64_t k = 0;
     int64_t batch = 1;
-    int perf_class = -1;  // GemmPerfClass id; -1 matches any
-    int crosswise = 0;    // direct-load operand count, see gemm_dispatch
-    int ba = 2;           // operand element bytes
+    int perf_class = -1; // GemmPerfClass id; -1 matches any
+    int crosswise = 0;   // direct-load operand count, see gemm_dispatch
+    int ba = 2;          // operand element bytes
     int bb = 2;
-    int out_elem_bytes = 2;  // output element bytes the model cost's output
-                             // term prices; 2 = the bf16 fused-linear
-                             // default (plan_query's OutT parameter — an
-                             // fp32-out caller is priced at 4, not 2)
-    bool tma = true;  // the staging this launch will take (plan_query fills
-                      // it from launch_plan_impl's predicate): the planner
-                      // prices residency per variant — the sign flips with
-                      // staging (TMA shares bandwidth, cp.async's software
-                      // ring IS the latency hiding)
+    int out_elem_bytes = 2; // output element bytes the model cost's output
+                            // term prices; 2 = the bf16 fused-linear
+                            // default (plan_query's OutT parameter — an
+                            // fp32-out caller is priced at 4, not 2)
+    bool tma = true;        // the staging this launch will take (plan_query fills
+                            // it from launch_plan_impl's predicate): the planner
+                            // prices residency per variant — the sign flips with
+                            // staging (TMA shares bandwidth, cp.async's software
+                            // ring IS the latency hiding)
     DeviceFacts dev{};
 };
 
@@ -548,5 +531,5 @@ inline bool gemm_mx_cell_disabled() {
     return gemm_config().mx_disabled.load(std::memory_order_relaxed) > 0;
 }
 
-}  // namespace gemm
-}  // namespace astrai
+} // namespace gemm
+} // namespace astrai

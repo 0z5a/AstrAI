@@ -1,8 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-#include <cstdint>
 
 // Pure POD/traits header — no .cuh/CUDA-kernel includes; raw __nv_* spellings
 // only. Quantize-side declarations only: GEMM's dtype-neutral tags/POD live in
@@ -14,10 +14,8 @@
 namespace astrai {
 namespace quant {
 
-inline bool sm_at_least(int device_major, int device_minor, int major,
-                        int minor) {
-    return device_major > major ||
-           (device_major == major && device_minor >= minor);
+inline bool sm_at_least(int device_major, int device_minor, int major, int minor) {
+    return device_major > major || (device_major == major && device_minor >= minor);
 }
 
 // FP8 tensor-core MMA (`mma.sync.aligned.m16n8k32`) needs Ada (sm_89) or newer;
@@ -54,7 +52,7 @@ static_assert((kFoldSlots & (kFoldSlots - 1)) == 0,
 struct RingLayout {
     int64_t hist_len = 0;
 
-    static constexpr int64_t kAuxSlots = 4;  // scale0 | recip0 | amax | done
+    static constexpr int64_t kAuxSlots = 4; // scale0 | recip0 | amax | done
 
     // 2 scale pairs for the composed ring, 1 for the stateless layout.
     constexpr int64_t size(int pairs = 2) const {
@@ -76,9 +74,9 @@ static_assert(RingLayout{0}.size(1) == 4 + kFoldSlots,
 struct QuantParams {
     const void* __restrict__ input_ptr = nullptr;
     void* __restrict__ output_ptr = nullptr;
-    void* __restrict__ output_transposed_ptr = nullptr;  // [cols][rows]
+    void* __restrict__ output_transposed_ptr = nullptr; // [cols][rows]
 
-    const float* __restrict__ scale = nullptr;  // device multiplier
+    const float* __restrict__ scale = nullptr; // device multiplier
     // The round's raw-domain amax, as folded into hist[hist_idx]. Null skips it.
     float* __restrict__ amax = nullptr;
 
@@ -88,17 +86,17 @@ struct QuantParams {
     // amax_scratch[block id mod kFoldSlots]. Every ring pointer below is
     // meaningful only when this is set (bind_ring).
     bool fold_ring = false;
-    float* __restrict__ hist = nullptr;  // [hist_len] amax history window
+    float* __restrict__ hist = nullptr; // [hist_len] amax history window
     float* __restrict__ scale_out = nullptr;
     // The published scale's correctly rounded reciprocal (__frcp_rn), in the
     // slot the next quantize reads as its multiplier — publishing both here keeps
     // the host out of the per-step scale chain.
     float* __restrict__ scale_recip_out = nullptr;
-    float* __restrict__ amax_scratch = nullptr;  // [kFoldSlots] RMW lines
-    unsigned int* __restrict__ done = nullptr;   // block-completion counter
+    float* __restrict__ amax_scratch = nullptr; // [kFoldSlots] RMW lines
+    unsigned int* __restrict__ done = nullptr;  // block-completion counter
     int hist_len = 0;
     int hist_idx = 0;
-    float fp8_max = 448.0f;   // scale = max(hist) / fp8_max / pow2_margin
+    float fp8_max = 448.0f; // scale = max(hist) / fp8_max / pow2_margin
     float pow2_margin = 1.0f;
 
     // The tiled kernel views the buffer as [rows][cols] row-major.
@@ -113,5 +111,5 @@ struct QuantParams {
     int out_col_stride = 0;
 };
 
-}  // namespace quant
-}  // namespace astrai
+} // namespace quant
+} // namespace astrai

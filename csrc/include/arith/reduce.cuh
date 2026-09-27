@@ -18,23 +18,20 @@ namespace astrai {
 // maximum with an fmaxf specialization for float. maximum is the
 // NaN-suppressing IEEE max (fmaxf drops a NaN operand); no max.NaN.f32
 // variant because no caller wants NaN propagation.
-template <typename T>
-struct plus {
+template <typename T> struct plus {
     DEVICE_FORCEINLINE T operator()(T lhs, const T& rhs) const {
         lhs += rhs;
         return lhs;
     }
 };
 
-template <typename T>
-struct maximum {
+template <typename T> struct maximum {
     DEVICE_FORCEINLINE T operator()(const T& lhs, const T& rhs) const {
         return lhs < rhs ? rhs : lhs;
     }
 };
 
-template <>
-struct maximum<float> {
+template <> struct maximum<float> {
     DEVICE_FORCEINLINE float operator()(const float& lhs, const float& rhs) const {
         return fmaxf(lhs, rhs);
     }
@@ -43,8 +40,7 @@ struct maximum<float> {
 // Full-warp butterfly reduction over a binary op (32 lanes). The op rides
 // on the template parameter list with a default, so the sum call sites read
 // plain warp_reduce(v) and the max ones warp_reduce<maximum<float>>(v).
-template <typename Op = plus<float>>
-DEVICE_FORCEINLINE float warp_reduce(float v) {
+template <typename Op = plus<float>> DEVICE_FORCEINLINE float warp_reduce(float v) {
     Op op;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -68,8 +64,7 @@ DEVICE_FORCEINLINE float group_reduce(float v, unsigned mask) {
 // destination disables the update (kernels with optional amax slots).
 DEVICE_FORCEINLINE void atomic_max_float(float* destination, float value) {
     if (destination)
-        atomicMax(reinterpret_cast<unsigned*>(destination),
-                  __float_as_uint(value));
+        atomicMax(reinterpret_cast<unsigned*>(destination), __float_as_uint(value));
 }
 
-}  // namespace astrai
+} // namespace astrai

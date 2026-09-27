@@ -17,20 +17,19 @@ namespace astrai {
 namespace gemm {
 
 struct GemmTileScheduler {
-    __device__ static int2 tile(const uint3& block, const dim3& blocks,
-                                int raster) {
+    __device__ static int2 tile(const uint3& block, const dim3& blocks, int raster) {
         const int bid = int(block.y) * int(blocks.x) + int(block.x);
         if (raster > 0) {
             const int group_first_m = (bid / (raster * int(blocks.x))) * raster;
             const int group_rows =
-                min(int(blocks.y) - group_first_m, raster);  // M-tail group is short
+                min(int(blocks.y) - group_first_m, raster); // M-tail group is short
             return int2{group_first_m + bid % group_rows,
                         (bid % (raster * int(blocks.x))) / group_rows};
         } else if (raster < 0) {
             const int width = -raster;
             const int group_first_n = (bid / (width * int(blocks.y))) * width;
             const int group_cols =
-                min(int(blocks.x) - group_first_n, width);  // N-tail group is short
+                min(int(blocks.x) - group_first_n, width); // N-tail group is short
             return int2{(bid % (width * int(blocks.y))) / group_cols,
                         group_first_n + bid % group_cols};
         } else {
@@ -39,5 +38,5 @@ struct GemmTileScheduler {
     }
 };
 
-}  // namespace gemm
-}  // namespace astrai
+} // namespace gemm
+} // namespace astrai

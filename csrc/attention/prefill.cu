@@ -3,23 +3,21 @@
 // shape). Device-side code (kernels, launchers, dispatchers) is in
 // kernel/attention_launch.cuh + kernel/attention_split_q.cuh.
 
-#include <kernel/attention_launch.cuh>
+#include "entry.h"
 #include <api/attention.h>
 #include <api/attention_dtypes.h>
-#include "entry.h"
+#include <kernel/attention_launch.cuh>
 
 namespace astrai {
 namespace attention {
 
-torch::Tensor attn_prefill(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    c10::optional<torch::Tensor> mask,
-    int64_t causal_offset,
-    double scale,
-    int64_t layout
-) {
+torch::Tensor attn_prefill(torch::Tensor q,
+                           torch::Tensor k,
+                           torch::Tensor v,
+                           c10::optional<torch::Tensor> mask,
+                           int64_t causal_offset,
+                           double scale,
+                           int64_t layout) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -32,27 +30,25 @@ torch::Tensor attn_prefill(
     p.o_ptr = O_view.data_ptr();
 
     switch (q.scalar_type()) {
-#define ASTRAI_ATTN_DTYPE_ROW(tag, type) \
-        case tag: dispatch_prefill<type>(p, stream); break;
+#define ASTRAI_ATTN_DTYPE_ROW(tag, type)                                                           \
+    case tag:                                                                                      \
+        dispatch_prefill<type>(p, stream);                                                         \
+        break;
         ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
 #undef ASTRAI_ATTN_DTYPE_ROW
-        default: attn_dtype_unsupported(q.scalar_type());
+    default:
+        attn_dtype_unsupported(q.scalar_type());
     }
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }
 
-}  // namespace attention
-}  // namespace astrai
+} // namespace attention
+} // namespace astrai
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_prefill", &astrai::attention::attn_prefill,
-        py::arg("q"),
-        py::arg("k"),
-        py::arg("v"),
-        py::arg("mask") = py::none(),
-        py::arg("causal_offset") = -1,
-        py::arg("scale") = 0.0,
-        py::arg("layout") = (int64_t)astrai::attention::BHLD,
-        "GQA prefill (tensor-core mma on sm_80+)");
+    m.def("attn_prefill", &astrai::attention::attn_prefill, py::arg("q"), py::arg("k"),
+          py::arg("v"), py::arg("mask") = py::none(), py::arg("causal_offset") = -1,
+          py::arg("scale") = 0.0, py::arg("layout") = (int64_t)astrai::attention::BHLD,
+          "GQA prefill (tensor-core mma on sm_80+)");
 }

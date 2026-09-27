@@ -28,8 +28,7 @@ namespace astrai {
 
 // Shared/global-memory storage: the engine knows the element, the layout
 // knows the address map.
-template <typename T>
-struct PtrEngine {
+template <typename T> struct PtrEngine {
     using Elem = T;
     T* ptr;
     DEVICE_FORCEINLINE T* base() const { return ptr; }
@@ -38,14 +37,11 @@ struct PtrEngine {
 // Register-array storage (cute's Array role — an mma fragment cell IS an
 // array). Passed BY REFERENCE to the mma/ldmatrix emitters so the
 // registers stay in place — no address arithmetic can appear at the seams.
-template <typename T, int N>
-struct ArrayEngine {
+template <typename T, int N> struct ArrayEngine {
     using Elem = T;
     T storage[N];
     DEVICE_FORCEINLINE T& operator[](int i) { return storage[i]; }
-    DEVICE_FORCEINLINE const T& operator[](int i) const {
-        return storage[i];
-    }
+    DEVICE_FORCEINLINE const T& operator[](int i) const { return storage[i]; }
     DEVICE_FORCEINLINE T* base() { return storage; }
     DEVICE_FORCEINLINE const T* base() const { return storage; }
 };
@@ -55,28 +51,23 @@ struct ArrayEngine {
 // Ring layout: slot rotation over a per-stage chunk grid — the staged
 // ring expressed as one (slot, row, chunk) map instead of a bespoke ring
 // object. Chunk units are 16B, so the byte budget is dtype-independent.
-template <typename StageLay_, int kSlots_>
-struct RingLayout {
+template <typename StageLay_, int kSlots_> struct RingLayout {
     using Stage = StageLay_;
     static constexpr bool kChunkUnit = true;
     static constexpr int kSlots = kSlots_;
     static constexpr int kStageChunks = StageLay_::kRows * StageLay_::kChunks;
     static constexpr int kStageBytes = kStageChunks * 16;
     static constexpr int kTotalBytes = kSlots * kStageBytes;
-    DEVICE_FORCEINLINE uint32_t operator()(uint32_t slot, uint32_t row,
-                                                   uint32_t chunk) const {
-        return slot * (uint32_t)kStageChunks +
-               StageLay_{}(row, chunk);
+    DEVICE_FORCEINLINE uint32_t operator()(uint32_t slot, uint32_t row, uint32_t chunk) const {
+        return slot * (uint32_t)kStageChunks + StageLay_{}(row, chunk);
     }
 };
 
 // Cell layout: an element-unit row-major (m, n) grid — the accumulator's
 // (mt, nt) mma-cell coordinates.
-template <int kCols>
-struct CellLayout {
+template <int kCols> struct CellLayout {
     static constexpr bool kChunkUnit = false;
-    DEVICE_FORCEINLINE uint32_t operator()(uint32_t m,
-                                                   uint32_t n) const {
+    DEVICE_FORCEINLINE uint32_t operator()(uint32_t m, uint32_t n) const {
         return m * (uint32_t)kCols + n;
     }
 };
@@ -91,12 +82,10 @@ struct CellLayout {
 // Addresses come back as pointers (the smem seams feed cp.async /
 // ldmatrix byte math); element-unit layouts (CellLayout) address whole
 // engine cells.
-template <typename EngineT, typename LayoutT>
-struct Tensor {
+template <typename EngineT, typename LayoutT> struct Tensor {
     using Elem = typename EngineT::Elem;
     using Layout = LayoutT;
-    static constexpr int kChunkElems =
-        LayoutT::kChunkUnit ? 16 / (int)sizeof(Elem) : 1;
+    static constexpr int kChunkElems = LayoutT::kChunkUnit ? 16 / (int)sizeof(Elem) : 1;
 
     EngineT engine;
     LayoutT layout;
@@ -108,38 +97,28 @@ struct Tensor {
     // derives from the row ALONE (ComposedLayout's closed form) — it must
     // not serialize behind the row*stride IMAD (a linearized form
     // regressed W8A8 up to +29%; see docs/developer/cuda_kernels.md).
-    template <bool kChunk = LayoutT::kChunkUnit,
-              std::enable_if_t<kChunk, int> = 0>
+    template <bool kChunk = LayoutT::kChunkUnit, std::enable_if_t<kChunk, int> = 0>
     DEVICE_FORCEINLINE Elem* operator()(int row, int col) const {
         constexpr int kShift = log2_const<kChunkElems>::value;
-        const uint32_t off =
-            (uint32_t)row * (uint32_t)(LayoutT::kChunks * kChunkElems) +
-            (layout.chunk_of((uint32_t)row, (uint32_t)(col >> kShift))
-             << kShift) +
-            (uint32_t)(col & (kChunkElems - 1));
+        const uint32_t off = (uint32_t)row * (uint32_t)(LayoutT::kChunks * kChunkElems) +
+                             (layout.chunk_of((uint32_t)row, (uint32_t)(col >> kShift)) << kShift) +
+                             (uint32_t)(col & (kChunkElems - 1));
         return engine.base() + (ptrdiff_t)off;
     }
     // Chunk-unit 3-coordinate ring view: layout(slot, row, chunk).
-    template <bool kChunk = LayoutT::kChunkUnit,
-              std::enable_if_t<kChunk, int> = 0>
-    DEVICE_FORCEINLINE Elem* operator()(int slot, int row,
-                                                int col) const {
+    template <bool kChunk = LayoutT::kChunkUnit, std::enable_if_t<kChunk, int> = 0>
+    DEVICE_FORCEINLINE Elem* operator()(int slot, int row, int col) const {
         constexpr int kShift = log2_const<kChunkElems>::value;
         const typename LayoutT::Stage stage{};
-        const uint32_t off =
-            (uint32_t)slot *
-                (uint32_t)(LayoutT::kStageChunks * kChunkElems) +
-            (uint32_t)row *
-                (uint32_t)(LayoutT::Stage::kChunks * kChunkElems) +
-            (stage.chunk_of((uint32_t)row, (uint32_t)(col >> kShift))
-             << kShift) +
-            (uint32_t)(col & (kChunkElems - 1));
+        const uint32_t off = (uint32_t)slot * (uint32_t)(LayoutT::kStageChunks * kChunkElems) +
+                             (uint32_t)row * (uint32_t)(LayoutT::Stage::kChunks * kChunkElems) +
+                             (stage.chunk_of((uint32_t)row, (uint32_t)(col >> kShift)) << kShift) +
+                             (uint32_t)(col & (kChunkElems - 1));
         return engine.base() + (ptrdiff_t)off;
     }
     // Element-unit cell view: layout(m, n) -> &engine cell. Non-const: the
     // accumulator rides non-const references through the mainloop/epilogue.
-    template <bool kChunk = LayoutT::kChunkUnit,
-              std::enable_if_t<!kChunk, int> = 0>
+    template <bool kChunk = LayoutT::kChunkUnit, std::enable_if_t<!kChunk, int> = 0>
     DEVICE_FORCEINLINE Elem* operator()(int m, int n) {
         return engine.base() + (size_t)layout((uint32_t)m, (uint32_t)n);
     }
@@ -149,9 +128,7 @@ struct Tensor {
 
 // Construct the staged ring tensor over a raw shared-memory carve.
 template <typename ElemT, typename StageLay, int kSlots>
-DEVICE_FORCEINLINE Tensor<PtrEngine<ElemT>,
-                                 RingLayout<StageLay, kSlots>>
-make_ring(char* smem) {
+DEVICE_FORCEINLINE Tensor<PtrEngine<ElemT>, RingLayout<StageLay, kSlots>> make_ring(char* smem) {
     return {PtrEngine<ElemT>{reinterpret_cast<ElemT*>(smem)}, {}};
 }
 
@@ -162,14 +139,11 @@ make_ring(char* smem) {
 // facts.
 template <typename ElemT, typename StageLay, int kSlots>
 DEVICE_FORCEINLINE Tensor<PtrEngine<ElemT>, StageLay>
-stage_of(const Tensor<PtrEngine<ElemT>, RingLayout<StageLay, kSlots>>& ring,
-         int64_t tile) {
-    return {PtrEngine<ElemT>{
-                ring.engine.ptr +
-                (size_t)(tile % kSlots) *
-                    RingLayout<StageLay, kSlots>::kStageChunks *
-                    (16 / (int)sizeof(ElemT))},
+stage_of(const Tensor<PtrEngine<ElemT>, RingLayout<StageLay, kSlots>>& ring, int64_t tile) {
+    return {PtrEngine<ElemT>{ring.engine.ptr + (size_t)(tile % kSlots) *
+                                                   RingLayout<StageLay, kSlots>::kStageChunks *
+                                                   (16 / (int)sizeof(ElemT))},
             {}};
 }
 
-}  // namespace astrai
+} // namespace astrai

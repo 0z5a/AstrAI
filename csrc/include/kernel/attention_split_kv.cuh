@@ -53,11 +53,11 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(q_gmem + q_base, p.q_h_stride, p.q_d_stride,
-                                  qra, qrb, va, vb, tid4, Qa);
+    load_q_mma_frags<Traits::KD>(q_gmem + q_base, p.q_h_stride, p.q_d_stride, qra, qrb, va, vb,
+                                 tid4, Qa);
 
     float Oacc[Traits::DN8][4];
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < Traits::DN8; j++)
         Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
@@ -70,11 +70,10 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     // ---- Load tile lambda: predicated cp.async (addressing via KV policy;
     // only the first GQA pass persists new K/V to the pool) ----
     auto load_tile = [&](int ti, int buf) {
-        load_kv_tile<Traits>(sK, sV, ti, buf, seq_len,
-            [&](int kc, int d, bool valid) {
-                return KV::template decode_addr<Traits::VEC>(
-                    p, kctx, batch, kv_head, kc, d, valid, pass == 0);
-            });
+        load_kv_tile<Traits>(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
+            return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, kc, d, valid,
+                                                         pass == 0);
+        });
     };
 
     // ---- Multi-stage cp.async pipeline: wait only for the oldest group
@@ -94,20 +93,15 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         // Decode: q_len=1 so qrow0=qrow1=0. Paged treats [0, seq_len) as
         // the causal range; contig clips to the causal_offset bound.
         int maxc = IsCausal ? KV::decode_attend_len(p, batch) : seq_len;
-        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc,
-                                          0, 0,
-                                          p.mask_b_stride, p.mask_h_stride,
-                                          p.mask_l_stride,
-                                          batch, q_head0 + gid, q_head0 + gid + 8,
-                                          p.mask,
-                                          va, vb,
-                                          Sacc, Oacc, m0, m1, l0, l1, lane);
+        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc, 0, 0, p.mask_b_stride, p.mask_h_stride,
+                                          p.mask_l_stride, batch, q_head0 + gid, q_head0 + gid + 8,
+                                          p.mask, va, vb, Sacc, Oacc, m0, m1, l0, l1, lane);
 
         mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
     };
 
     if (ntiles >= STAGES) {
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < STAGES; i++)
             load_tile(ti_begin + i, i);
 
@@ -137,7 +131,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         size_t bh = (size_t)batch * p.q_head + h;
         return bh * MAX_SPLITS + split;
     };
-    #pragma unroll
+#pragma unroll
     for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
         int r0 = gid, r1 = gid + 8;
@@ -159,25 +153,27 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         if (r0 < G) {
             int h = q_head0 + r0;
             float* mp = p.ml_part + split_slot(h) * 2;
-            mp[0] = m0; mp[1] = l0;
+            mp[0] = m0;
+            mp[1] = l0;
         }
         if (r1 < G) {
             int h = q_head0 + r1;
             float* mp = p.ml_part + split_slot(h) * 2;
-            mp[0] = m1; mp[1] = l1;
+            mp[0] = m1;
+            mp[1] = l1;
         }
     }
 }
 
 // Split-combine: merges the per-split partials (o_part/ml_part) into the
 // final normalised O (KV selects the O addressing and element type).
-template <typename KV>
-__global__ void attn_decode_combine_kernel(AttentionParams p) {
+template <typename KV> __global__ void attn_decode_combine_kernel(AttentionParams p) {
     using T = typename KV::Elem;
 
     int bh = blockIdx.x;
     int d = threadIdx.x;
-    if (d >= p.head_dim) return;
+    if (d >= p.head_dim)
+        return;
 
     int batch = bh / p.q_head;
     int q_head = bh % p.q_head;
@@ -190,7 +186,8 @@ __global__ void attn_decode_combine_kernel(AttentionParams p) {
     float acc = 0.0f;
     for (int s = 0; s < p.num_splits; s++) {
         float mi = mlp[s * 2];
-        if (mi <= -FLT_MAX) continue;
+        if (mi <= -FLT_MAX)
+            continue;
         float li = mlp[s * 2 + 1];
         float corr, e;
         softmax_step(st, mi, li, corr, e);
@@ -202,5 +199,5 @@ __global__ void attn_decode_combine_kernel(AttentionParams p) {
     static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
 }
 
-}  // namespace attention
-}  // namespace astrai
+} // namespace attention
+} // namespace astrai

@@ -30,12 +30,12 @@
 // rather than staged — the accesses within a warp hit the same address and
 // broadcast.
 
-#include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <torch/extension.h>
 
-#include <utils/launch.cuh>
 #include <api/gated_deltanet.h>
+#include <utils/launch.cuh>
 
 namespace {
 
@@ -43,33 +43,31 @@ constexpr int kThreads = 256;
 constexpr int kChunk = 64;
 constexpr int kHeadDim = 128;
 
-constexpr int kQElem = kChunk * kChunk;          // 4096
-constexpr int kDElem = kChunk * kHeadDim;        // 8192 per (token, dim) tensor
-constexpr int kHElem = kHeadDim * kHeadDim;      // 16384
+constexpr int kQElem = kChunk * kChunk;     // 4096
+constexpr int kDElem = kChunk * kHeadDim;   // 8192 per (token, dim) tensor
+constexpr int kHElem = kHeadDim * kHeadDim; // 16384
 
 // 64 x 64 outputs over 256 threads.
-constexpr int kAPerThread = kQElem / kThreads;   // 16
+constexpr int kAPerThread = kQElem / kThreads; // 16
 // 64 x 128 outputs over 256 threads.
-constexpr int kDPerThread = kDElem / kThreads;   // 32
+constexpr int kDPerThread = kDElem / kThreads; // 32
 // 128 x 128 outputs over 256 threads: dh is twice as large as the rest.
-constexpr int kHPerThread = kHElem / kThreads;   // 64
+constexpr int kHPerThread = kHElem / kThreads; // 64
 
-__global__ void gated_deltanet_bwd_o_kernel(
-    const __nv_bfloat16* __restrict__ q,
-    const __nv_bfloat16* __restrict__ k,
-    const __nv_bfloat16* __restrict__ v_new,
-    const __nv_bfloat16* __restrict__ h,
-    const float* __restrict__ g,
-    const __nv_bfloat16* __restrict__ do_ptr,
-    __nv_bfloat16* __restrict__ dq,
-    __nv_bfloat16* __restrict__ dk,
-    float* __restrict__ dv_new,
-    float* __restrict__ dh,
-    float* __restrict__ dg,
-    int seq,
-    int heads,
-    float scale
-) {
+__global__ void gated_deltanet_bwd_o_kernel(const __nv_bfloat16* __restrict__ q,
+                                            const __nv_bfloat16* __restrict__ k,
+                                            const __nv_bfloat16* __restrict__ v_new,
+                                            const __nv_bfloat16* __restrict__ h,
+                                            const float* __restrict__ g,
+                                            const __nv_bfloat16* __restrict__ do_ptr,
+                                            __nv_bfloat16* __restrict__ dq,
+                                            __nv_bfloat16* __restrict__ dk,
+                                            float* __restrict__ dv_new,
+                                            float* __restrict__ dh,
+                                            float* __restrict__ dg,
+                                            int seq,
+                                            int heads,
+                                            float scale) {
     extern __shared__ char smem[];
     __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem);
     __nv_bfloat16* k_s = q_s + kDElem;
@@ -97,12 +95,10 @@ __global__ void gated_deltanet_bwd_o_kernel(
     const __nv_bfloat16* k_base = k + base * kHeadDim;
     const __nv_bfloat16* vn_base = v_new + base * kHeadDim;
     const __nv_bfloat16* do_base = do_ptr + base * kHeadDim;
-    const __nv_bfloat16* h_base = h + (static_cast<int64_t>(bh) * chunks + ic)
-        * kHElem;
+    const __nv_bfloat16* h_base = h + (static_cast<int64_t>(bh) * chunks + ic) * kHElem;
     __nv_bfloat16* dq_base = dq + base * kHeadDim;
     __nv_bfloat16* dk_base = dk + base * kHeadDim;
-    float* dvn_base =
-        dv_new + (static_cast<int64_t>(bh) * seq + t0) * kHeadDim;
+    float* dvn_base = dv_new + (static_cast<int64_t>(bh) * seq + t0) * kHeadDim;
     float* dh_base = dh + static_cast<int64_t>(bh) * kHElem;
 
     for (int i = tid; i < kDElem; i += kThreads) {
@@ -130,11 +126,8 @@ __global__ void gated_deltanet_bwd_o_kernel(
         float acc = 0.0f;
         if (j >= l) {
             for (int d = 0; d < kHeadDim; ++d) {
-                acc = fmaf(
-                    __bfloat162float(q_s[j * kHeadDim + d]),
-                    __bfloat162float(k_s[l * kHeadDim + d]),
-                    acc
-                );
+                acc = fmaf(__bfloat162float(q_s[j * kHeadDim + d]),
+                           __bfloat162float(k_s[l * kHeadDim + d]), acc);
             }
             acc *= egh_s[j] / egh_s[l];
         }
@@ -153,11 +146,8 @@ __global__ void gated_deltanet_bwd_o_kernel(
         const int l = idx % kChunk;
         float acc = 0.0f;
         for (int v = 0; v < kHeadDim; ++v) {
-            acc = fmaf(
-                __bfloat162float(do_base[j * kHeadDim + v]),
-                __bfloat162float(vn_s[l * kHeadDim + v]),
-                acc
-            );
+            acc = fmaf(__bfloat162float(do_base[j * kHeadDim + v]),
+                       __bfloat162float(vn_s[l * kHeadDim + v]), acc);
         }
         da_reg[i] = acc * inv_scale;
     }
@@ -172,11 +162,8 @@ __global__ void gated_deltanet_bwd_o_kernel(
         // the thing to re-check if dq ever drifts.
         float acc = 0.0f;
         for (int v = 0; v < kHeadDim; ++v) {
-            acc = fmaf(
-                __bfloat162float(do_base[j * kHeadDim + v]),
-                __bfloat162float(h_s[d * kHeadDim + v]),
-                acc
-            );
+            acc = fmaf(__bfloat162float(do_base[j * kHeadDim + v]),
+                       __bfloat162float(h_s[d * kHeadDim + v]), acc);
         }
         dqe_reg[i] = acc * inv_scale;
     }
@@ -188,11 +175,7 @@ __global__ void gated_deltanet_bwd_o_kernel(
         const int v = idx % kHeadDim;
         float acc = 0.0f;
         for (int l = 0; l < kChunk; ++l) {
-            acc = fmaf(
-                a_s[l * kChunk + j],
-                __bfloat162float(do_base[l * kHeadDim + v]),
-                acc
-            );
+            acc = fmaf(a_s[l * kChunk + j], __bfloat162float(do_base[l * kHeadDim + v]), acc);
         }
         if (acc != 0.0f) {
             atomicAdd(&dvn_base[j * kHeadDim + v], acc * inv_scale);
@@ -206,11 +189,8 @@ __global__ void gated_deltanet_bwd_o_kernel(
         const int v = idx % kHeadDim;
         float acc = 0.0f;
         for (int j = 0; j < kChunk; ++j) {
-            acc = fmaf(
-                __bfloat162float(q_s[j * kHeadDim + d]) * egh_s[j],
-                __bfloat162float(do_base[j * kHeadDim + v]),
-                acc
-            );
+            acc = fmaf(__bfloat162float(q_s[j * kHeadDim + d]) * egh_s[j],
+                       __bfloat162float(do_base[j * kHeadDim + v]), acc);
         }
         if (acc != 0.0f) {
             atomicAdd(&dh_base[d * kHeadDim + v], acc * inv_scale);
@@ -242,11 +222,7 @@ __global__ void gated_deltanet_bwd_o_kernel(
         float acc = dqe_reg[i] * egh_s[j];
         for (int l = 0; l < kChunk; ++l) {
             const float disc = j >= l ? egh_s[j] / egh_s[l] : 0.0f;
-            acc = fmaf(
-                a_s[j * kChunk + l] * disc,
-                __bfloat162float(k_s[l * kHeadDim + d]),
-                acc
-            );
+            acc = fmaf(a_s[j * kChunk + l] * disc, __bfloat162float(k_s[l * kHeadDim + d]), acc);
         }
         dq_base[j * kHeadDim + d] = __float2bfloat16(acc);
         const float qe = __bfloat162float(q_s[j * kHeadDim + d]) * egh_s[j];
@@ -264,11 +240,7 @@ __global__ void gated_deltanet_bwd_o_kernel(
         float acc = 0.0f;
         for (int j = 0; j < kChunk; ++j) {
             const float disc = j >= l ? egh_s[j] / egh_s[l] : 0.0f;
-            acc = fmaf(
-                a_s[j * kChunk + l] * disc,
-                __bfloat162float(q_s[j * kHeadDim + d]),
-                acc
-            );
+            acc = fmaf(a_s[j * kChunk + l] * disc, __bfloat162float(q_s[j * kHeadDim + d]), acc);
         }
         dk_base[l * kHeadDim + d] = __float2bfloat16(acc);
     }
@@ -279,20 +251,18 @@ __global__ void gated_deltanet_bwd_o_kernel(
     }
 }
 
-}  // namespace
+} // namespace
 
 namespace astrai {
 namespace gdn {
 
-std::vector<torch::Tensor> gated_deltanet_bwd(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v_new,
-    torch::Tensor h,
-    torch::Tensor g,
-    torch::Tensor do_grad,
-    double scale
-) {
+std::vector<torch::Tensor> gated_deltanet_bwd(torch::Tensor q,
+                                              torch::Tensor k,
+                                              torch::Tensor v_new,
+                                              torch::Tensor h,
+                                              torch::Tensor g,
+                                              torch::Tensor do_grad,
+                                              double scale) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -326,38 +296,29 @@ std::vector<torch::Tensor> gated_deltanet_bwd(
     auto dh = torch::zeros({batch, heads, kHeadDim, kHeadDim}, q.options().dtype(torch::kFloat32));
     auto dg = torch::empty({batch, heads, seq}, g.options());
 
-    const size_t smem_bytes = kDElem * 3 * sizeof(__nv_bfloat16)
-        + kHElem * sizeof(__nv_bfloat16) + kQElem * sizeof(float)
-        + 3 * kChunk * sizeof(float);
+    const size_t smem_bytes = kDElem * 3 * sizeof(__nv_bfloat16) + kHElem * sizeof(__nv_bfloat16) +
+                              kQElem * sizeof(float) + 3 * kChunk * sizeof(float);
     static bool configured = false;
     if (!configured) {
-        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(
-            gated_deltanet_bwd_o_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem_bytes)
-        ));
+        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(gated_deltanet_bwd_o_kernel,
+                                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               static_cast<int>(smem_bytes)));
         configured = true;
     }
 
-    gated_deltanet_bwd_o_kernel<<<dim3(chunks, batch * heads), kThreads,
-                                          smem_bytes, stream>>>(
+    gated_deltanet_bwd_o_kernel<<<dim3(chunks, batch * heads), kThreads, smem_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v_new.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
-        g.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()), g.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(do_grad.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(dq.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(dk.data_ptr()),
-        dv_new.data_ptr<float>(),
-        dh.data_ptr<float>(),
-        dg.data_ptr<float>(),
-        seq, heads, static_cast<float>(scale)
-    );
+        reinterpret_cast<__nv_bfloat16*>(dk.data_ptr()), dv_new.data_ptr<float>(),
+        dh.data_ptr<float>(), dg.data_ptr<float>(), seq, heads, static_cast<float>(scale));
     ASTRAI_LAUNCH_CHECK();
 
     return {dq, dk, dv_new, dh, dg};
 }
 
-}  // namespace gdn
-}  // namespace astrai
+} // namespace gdn
+} // namespace astrai

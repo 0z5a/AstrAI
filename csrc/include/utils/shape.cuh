@@ -11,17 +11,14 @@
 namespace astrai {
 
 // log2 of a compile-time power of two.
-template <int N, int Acc = 0>
-struct log2_const : log2_const<(N >> 1), Acc + 1> {};
-template <int Acc>
-struct log2_const<1, Acc> {
+template <int N, int Acc = 0> struct log2_const : log2_const<(N >> 1), Acc + 1> {};
+template <int Acc> struct log2_const<1, Acc> {
     static constexpr int value = Acc;
 };
 
 // Static integer shape: kM/kN/kK read the leading extents (missing ones
 // read 0), so tile recipes and instruction shapes share one spelling.
-template <int... Ns>
-struct Shape {
+template <int... Ns> struct Shape {
     static constexpr int kRank = sizeof...(Ns);
     static constexpr int kVals[kRank ? kRank : 1] = {Ns...};
     static constexpr int kM = kRank > 0 ? kVals[0] : 0;
@@ -29,4 +26,4 @@ struct Shape {
     static constexpr int kK = kRank > 2 ? kVals[2] : 0;
 };
 
-}  // namespace astrai
+} // namespace astrai

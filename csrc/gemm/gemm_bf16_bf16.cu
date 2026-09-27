@@ -9,5 +9,5 @@ namespace gemm {
 
 ASTRAI_GEMM_INSTANTIATE(__nv_bfloat16, __nv_bfloat16);
 
-}  // namespace gemm
-}  // namespace astrai
+} // namespace gemm
+} // namespace astrai

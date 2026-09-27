@@ -16,10 +16,9 @@ namespace quant {
 // getDeviceProperties is ATen-cached, so this stays cheap per call.
 inline void check_fp8_device(int device_index) {
     const auto* prop = at::cuda::getDeviceProperties(device_index);
-    TORCH_CHECK(sm_at_least(prop->major, prop->minor, kMinSmForFp8Major,
-                            kMinSmForFp8Minor),
+    TORCH_CHECK(sm_at_least(prop->major, prop->minor, kMinSmForFp8Major, kMinSmForFp8Minor),
                 "FP8 MMA requires compute capability 8.9+");
 }
 
-}  // namespace quant
-}  // namespace astrai
+} // namespace quant
+} // namespace astrai

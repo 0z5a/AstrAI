@@ -34,14 +34,17 @@ namespace gemm {
 inline int plan_raster(const PlanQuery& q, int bm, int bn) {
     const int64_t m_tiles = (q.m + bm - 1) / bm;
     const int64_t n_tiles = (q.n + bn - 1) / bn;
-    if (m_tiles < n_tiles) return -8;
-    if (q.n * q.k * (int64_t)q.bb <= q.dev.l2_bytes * 7 / 10) return 1;
+    if (m_tiles < n_tiles)
+        return -8;
+    if (q.n * q.k * (int64_t)q.bb <= q.dev.l2_bytes * 7 / 10)
+        return 1;
     const double reserve = 0.12 + 0.28 * (double)q.bb / (double)q.ba;
     const double budget = (1.0 - std::min(reserve, 0.5)) * (double)q.dev.l2_bytes;
     const int64_t ub = (int64_t)(budget / ((double)bm * (double)q.k * q.ba));
     const int64_t lb = (q.dev.sms + n_tiles - 1) / n_tiles;
     int64_t g = std::min(ub, m_tiles);
-    if (ub >= lb) g = std::min(std::max(g, lb), m_tiles);
+    if (ub >= lb)
+        g = std::min(std::max(g, lb), m_tiles);
     return (int)std::max(g, (int64_t)1);
 }
 
@@ -53,22 +56,23 @@ inline int plan_raster(const PlanQuery& q, int bm, int bn) {
 // One manifest tile -> its recipe row, priced at the caller's operand
 // widths (smem is pair-specific); the vector and scan forms share this and
 // must never disagree.
-template <typename Tile>
-inline GemmRecipe recipe_for_tile(int ba, int bb) {
-    return GemmRecipe{
-        (int)tile_class<Tile>(), Tile::kStages, (int)Tile::CtaShape::kK,
-        Tile::CtaShape::kM, Tile::CtaShape::kN,
-        Tile::WarpShape::kM, Tile::WarpShape::kN,
-        (Tile::CtaShape::kM / Tile::WarpShape::kM) *
-            (Tile::CtaShape::kN / Tile::WarpShape::kN) * 32,
-        ring_smem_bytes(Tile::CtaShape::kM, Tile::CtaShape::kN,
-                        Tile::CtaShape::kK, Tile::kStages, ba, bb)};
+template <typename Tile> inline GemmRecipe recipe_for_tile(int ba, int bb) {
+    return GemmRecipe{(int)tile_class<Tile>(),
+                      Tile::kStages,
+                      (int)Tile::CtaShape::kK,
+                      Tile::CtaShape::kM,
+                      Tile::CtaShape::kN,
+                      Tile::WarpShape::kM,
+                      Tile::WarpShape::kN,
+                      (Tile::CtaShape::kM / Tile::WarpShape::kM) *
+                          (Tile::CtaShape::kN / Tile::WarpShape::kN) * 32,
+                      ring_smem_bytes(Tile::CtaShape::kM, Tile::CtaShape::kN, Tile::CtaShape::kK,
+                                      Tile::kStages, ba, bb)};
 }
 
 // Deduped on (class, stages, kK): dispatch_tile takes the first manifest
 // match, so the 16-warp small CTA behind its 32-warp twin is one candidate.
-template <typename Tile>
-inline void append_recipe(std::vector<GemmRecipe>& out, int ba, int bb) {
+template <typename Tile> inline void append_recipe(std::vector<GemmRecipe>& out, int ba, int bb) {
     const GemmRecipe r = recipe_for_tile<Tile>(ba, bb);
     for (const GemmRecipe& have : out)
         if (have.cta == r.cta && have.stages == r.stages && have.kk == r.kk)
@@ -79,35 +83,30 @@ inline void append_recipe(std::vector<GemmRecipe>& out, int ba, int bb) {
 template <typename Manifest>
 inline void collect_recipes(std::vector<GemmRecipe>& out, int ba, int bb) {
     std::apply(
-        [&out, ba, bb](auto... tiles) {
-            (append_recipe<decltype(tiles)>(out, ba, bb), ...);
-        },
+        [&out, ba, bb](auto... tiles) { (append_recipe<decltype(tiles)>(out, ba, bb), ...); },
         Manifest{});
 }
 
 // manifest_kind -> THE one manifest type list that ladder instantiates;
 // the vocabulary builder and the scan oracle both dispatch through it.
-template <typename F>
-inline auto with_manifest(bool crosswise_staging, int ba, int bb, F&& fn) {
+template <typename F> inline auto with_manifest(bool crosswise_staging, int ba, int bb, F&& fn) {
     switch (manifest_kind(crosswise_staging, ba, bb)) {
-        case ManifestKind::kTwoByte:
-        case ManifestKind::kMixed:  // the congruous ladder carries the
-                                    // mixed bus on the predicated skip
-            return fn(TileManifest{});
-        case ManifestKind::kByte:
-            return fn(TileManifestByte{});
-        default:  // kCrosswise is the fallback kind, manifest_for included
-            return fn(TileManifestCross{});
+    case ManifestKind::kTwoByte:
+    case ManifestKind::kMixed: // the congruous ladder carries the
+                               // mixed bus on the predicated skip
+        return fn(TileManifest{});
+    case ManifestKind::kByte:
+        return fn(TileManifestByte{});
+    default: // kCrosswise is the fallback kind, manifest_for included
+        return fn(TileManifestCross{});
     }
 }
 
 // Every recipe the ladders instantiate for one staging pair.
-inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging,
-                                                int ba, int bb) {
+inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging, int ba, int bb) {
     std::vector<GemmRecipe> out;
-    with_manifest(crosswise_staging, ba, bb, [&](auto manifest) {
-        collect_recipes<decltype(manifest)>(out, ba, bb);
-    });
+    with_manifest(crosswise_staging, ba, bb,
+                  [&](auto manifest) { collect_recipes<decltype(manifest)>(out, ba, bb); });
     return out;
 }
 
@@ -117,14 +116,13 @@ inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging,
 // Scans the manifest list directly (no vector): the vector build cost
 // ~2.5us of the ~2.9us a dispatch took, the scan ~100ns (measured).
 template <typename Manifest>
-inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb,
-                        GemmRecipe& out) {
+inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb, GemmRecipe& out) {
     bool found = false;
     auto consider = [&](auto tile) {
         using T = decltype(tile);
-        if (found) return;
-        if ((int)tile_class<T>() != cta || (int)T::kStages != stages ||
-            (int)T::CtaShape::kK != kk)
+        if (found)
+            return;
+        if ((int)tile_class<T>() != cta || (int)T::kStages != stages || (int)T::CtaShape::kK != kk)
             return;
         out = recipe_for_tile<T>(ba, bb);
         found = true;
@@ -133,24 +131,26 @@ inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb,
     return found;
 }
 
-inline std::optional<GemmRecipe> recipe_of(int cta, int stages, int kk,
-                                           bool crosswise, int ba, int bb) {
+inline std::optional<GemmRecipe>
+recipe_of(int cta, int stages, int kk, bool crosswise, int ba, int bb) {
     GemmRecipe out{};
     const bool found = with_manifest(crosswise, ba, bb, [&](auto manifest) {
         return recipe_scan<decltype(manifest)>(cta, stages, kk, ba, bb, out);
     });
-    if (!found) return std::nullopt;
+    if (!found)
+        return std::nullopt;
     return out;
 }
 
 // The [gemm-plan] decision line (gen_plan_table's tag regex reads it).
 inline void log_dispatch(const PlanQuery& q, const PlanDecision& d) {
-    if (!gemm_plan_log_enabled()) return;
+    if (!gemm_plan_log_enabled())
+        return;
     std::fprintf(stderr,
                  "[gemm-plan] %s m%lld n%lld k%lld b=%d -> cta%d s%d "
                  "raster %d\n",
-                 d.source, (long long)q.m, (long long)q.n, (long long)q.k,
-                 (int)q.batch, d.recipe.cta, d.recipe.stages, d.raster);
+                 d.source, (long long)q.m, (long long)q.n, (long long)q.k, (int)q.batch,
+                 d.recipe.cta, d.recipe.stages, d.raster);
 }
 
 // ---------------------------------------------------------------------------
@@ -169,29 +169,27 @@ struct GemmPlanner {
 // never fails a launch. Raster 0 resolves through plan_raster at the
 // recipe's geometry (a bare 0 is PLAIN raster, ~14% off on M<<N).
 class RowSetPlanner final : public GemmPlanner {
-public:
-    using RowFn =
-        std::function<std::optional<TableRow>(const PlanQuery&)>;
+  public:
+    using RowFn = std::function<std::optional<TableRow>(const PlanQuery&)>;
     RowSetPlanner(const char* source, RowFn rows, bool respects_table_off)
-        : source_(source), rows_(std::move(rows)),
-          respects_table_off_(respects_table_off) {}
+        : source_(source), rows_(std::move(rows)), respects_table_off_(respects_table_off) {}
     const char* name() const override { return source_; }
     std::optional<PlanDecision> plan(const PlanQuery& q) const override {
-        if (respects_table_off_ && gemm_table_off()) return std::nullopt;
+        if (respects_table_off_ && gemm_table_off())
+            return std::nullopt;
         const std::optional<TableRow> row = rows_(q);
-        if (!row) return std::nullopt;
+        if (!row)
+            return std::nullopt;
         const std::optional<GemmRecipe> recipe =
-            recipe_of((int)row->cta, row->stages, row->kk, q.crosswise > 0,
-                      q.ba, q.bb);
-        if (!recipe || recipe->smem > q.dev.smem_max) return std::nullopt;
-        return PlanDecision{
-            *recipe,
-            row->raster != 0 ? row->raster
-                             : plan_raster(q, recipe->bm, recipe->bn),
-            source_};
+            recipe_of((int)row->cta, row->stages, row->kk, q.crosswise > 0, q.ba, q.bb);
+        if (!recipe || recipe->smem > q.dev.smem_max)
+            return std::nullopt;
+        return PlanDecision{*recipe,
+                            row->raster != 0 ? row->raster : plan_raster(q, recipe->bm, recipe->bn),
+                            source_};
     }
 
-private:
+  private:
     const char* source_;
     RowFn rows_;
     bool respects_table_off_;
@@ -223,19 +221,19 @@ private:
 // rule: the kK=32 twin's 48KB ring holds two CTAs where kK=64's 96KB
 // holds one.
 class ModelPlanner final : public GemmPlanner {
-public:
+  public:
     const char* name() const override { return "model"; }
 
     std::optional<PlanDecision> plan(const PlanQuery& q) const override {
         if (q.dev.sms <= 0 || q.m <= 0 || q.n <= 0 || q.k <= 0)
             return std::nullopt;
-        const std::vector<GemmRecipe> recipes =
-            gemm_recipes_for(q.crosswise > 0, q.ba, q.bb);
+        const std::vector<GemmRecipe> recipes = gemm_recipes_for(q.crosswise > 0, q.ba, q.bb);
         const GemmRecipe* best = nullptr;
         std::int64_t best_cost = 0;
         for (const GemmRecipe& r : recipes) {
             const int resident = resident_of(r, q);
-            if (resident <= 0) continue;  // ring cannot be resident
+            if (resident <= 0)
+                continue; // ring cannot be resident
             const std::int64_t cost = cost_of(r, q, resident);
             // every width pair ranks on the cost alone; a tie keeps the
             // candidate seen first, the manifest's own order
@@ -244,12 +242,12 @@ public:
                 best_cost = cost;
             }
         }
-        if (!best) return std::nullopt;
-        return PlanDecision{*best, plan_raster(q, best->bm, best->bn),
-                            name()};
+        if (!best)
+            return std::nullopt;
+        return PlanDecision{*best, plan_raster(q, best->bm, best->bn), name()};
     }
 
-private:
+  private:
     // 2026-09-16 RTX 5090 grid fits — re-fit per box. kKTileIssueBytes
     // prices the per-k-tile overhead (barrier, mma issue, load scheduling)
     // as output-cell-bytes per k-iteration — the term that makes kK a
@@ -260,9 +258,9 @@ private:
     static constexpr std::int64_t kMmaArmBytesPerInstr = 64;
 
     static int resident_of(const GemmRecipe& r, const PlanQuery& q) {
-        if (q.dev.smem_per_sm <= 0 || q.dev.regs_per_sm <= 0) return 0;
-        return std::min(q.dev.smem_per_sm / r.smem,
-                        min_ctas_for_ring(r.smem));
+        if (q.dev.smem_per_sm <= 0 || q.dev.regs_per_sm <= 0)
+            return 0;
+        return std::min(q.dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
     }
 
     // cost = max(memory bytes, mma arm) * W_eff per CTA on TMA: the arms
@@ -273,45 +271,34 @@ private:
     // cp.async prices differently: the software ring is the only latency
     // hiding, so residency DIVIDES the makespan instead of sharing
     // bandwidth — the axis flips with staging.
-    static std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q,
-                                int resident) {
-        const std::int64_t blocks =
-            q.batch * ((std::int64_t)((q.m + r.bm - 1) / r.bm) *
-                       (std::int64_t)((q.n + r.bn - 1) / r.bn));
+    static std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
+        const std::int64_t blocks = q.batch * ((std::int64_t)((q.m + r.bm - 1) / r.bm) *
+                                               (std::int64_t)((q.n + r.bn - 1) / r.bn));
         if (!q.tma) {
             // cp.async (zero-constant L20 form, 2026-09-16): raw-floor
             // residency in the denominator, k-tail priced whole. Measures
             // 0.9552 vs the TMA form's 0.8445 on the cp.async grid, the
             // reverse on every TMA grid.
             const std::int64_t operand =
-                ((q.k + r.kk - 1) / r.kk) * (std::int64_t)r.kk *
-                (r.bm * q.ba + r.bn * q.bb);
+                ((q.k + r.kk - 1) / r.kk) * (std::int64_t)r.kk * (r.bm * q.ba + r.bn * q.bb);
             const std::int64_t mu = q.dev.smem_per_sm / r.smem;
             const std::int64_t slots = (std::int64_t)q.dev.sms * mu;
-            const std::int64_t waves =
-                slots > 0 ? (blocks + slots - 1) / slots : 1;
-            return (operand +
-                    (std::int64_t)q.out_elem_bytes * r.bm * r.bn) * waves;
+            const std::int64_t waves = slots > 0 ? (blocks + slots - 1) / slots : 1;
+            return (operand + (std::int64_t)q.out_elem_bytes * r.bm * r.bn) * waves;
         }
         const bool byte_pair = q.ba == 1 && q.bb == 1;
-        const std::int64_t operand =
-            (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
-        const std::int64_t output =
-            (std::int64_t)q.out_elem_bytes * r.bm * r.bn;
-        const std::int64_t issue = byte_pair
-            ? 0
-            : kKTileIssueBytes * (std::int64_t)r.bm * r.bn *
-                  ((q.k + r.kk - 1) / r.kk);
-        const std::int64_t mma_arm = kMmaArmBytesPerInstr *
-            (std::int64_t)r.bm * r.bn * q.k / (128 * (byte_pair ? 32 : 16));
-        const std::int64_t per_cta =
-            std::max(operand + output + issue, mma_arm);
+        const std::int64_t operand = (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
+        const std::int64_t output = (std::int64_t)q.out_elem_bytes * r.bm * r.bn;
+        const std::int64_t issue =
+            byte_pair ? 0
+                      : kKTileIssueBytes * (std::int64_t)r.bm * r.bn * ((q.k + r.kk - 1) / r.kk);
+        const std::int64_t mma_arm =
+            kMmaArmBytesPerInstr * (std::int64_t)r.bm * r.bn * q.k / (128 * (byte_pair ? 32 : 16));
+        const std::int64_t per_cta = std::max(operand + output + issue, mma_arm);
         const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
-        const std::int64_t waves =
-            slots > 0 ? (blocks + slots - 1) / slots : 1;
-        const std::int64_t w_eff = q.ba == 2 && q.bb == 2
-            ? waves * resident
-            : (blocks + q.dev.sms - 1) / q.dev.sms;
+        const std::int64_t waves = slots > 0 ? (blocks + slots - 1) / slots : 1;
+        const std::int64_t w_eff =
+            q.ba == 2 && q.bb == 2 ? waves * resident : (blocks + q.dev.sms - 1) / q.dev.sms;
         return per_cta * w_eff;
     }
 };
@@ -324,15 +311,11 @@ private:
 PlanDecision plan_dispatch(const PlanQuery& q) {
     static const RowSetPlanner override_planner(
         "override",
-        [](const PlanQuery& query) {
-            return plan_table_override_source().lookup(query);
-        },
+        [](const PlanQuery& query) { return plan_table_override_source().lookup(query); },
         /*respects_table_off=*/true);
     static const RowSetPlanner injected_planner(
         "injected",
-        [](const PlanQuery& query) {
-            return plan_table_injected_source().lookup(query);
-        },
+        [](const PlanQuery& query) { return plan_table_injected_source().lookup(query); },
         /*respects_table_off=*/true);
     static const RowSetPlanner builtin_planner(
         "builtin",
@@ -343,11 +326,12 @@ PlanDecision plan_dispatch(const PlanQuery& q) {
             if (!builtin_rows_match_device(query.dev))
                 return std::optional<TableRow>{};
             int count = 0;
-            const TableRow* rows =
-                builtin_plan_table(query.perf_class, count);
-            if (rows == nullptr) return std::optional<TableRow>{};
+            const TableRow* rows = builtin_plan_table(query.perf_class, count);
+            if (rows == nullptr)
+                return std::optional<TableRow>{};
             const TableRow* row = plan_row_for(rows, count, query);
-            if (row == nullptr) return std::optional<TableRow>{};
+            if (row == nullptr)
+                return std::optional<TableRow>{};
             return std::optional<TableRow>{*row};
         },
         /*respects_table_off=*/true);
@@ -361,8 +345,7 @@ PlanDecision plan_dispatch(const PlanQuery& q) {
             PlanQuery m_only;
             m_only.m = query.m;
             m_only.n = 1;
-            const TableRow* row =
-                plan_row_for(kDegradedPlanRows, 3, m_only);
+            const TableRow* row = plan_row_for(kDegradedPlanRows, 3, m_only);
             if (row == nullptr)
                 return std::optional<TableRow>{kDegradedPlanRows[0]};
             return std::optional<TableRow>{*row};
@@ -370,18 +353,16 @@ PlanDecision plan_dispatch(const PlanQuery& q) {
         /*respects_table_off=*/false);
     static const ModelPlanner model_planner;
 
-    static constexpr const GemmPlanner* kChainTable[] = {
-        &override_planner, &injected_planner, &builtin_planner,
-        &degraded_planner};
+    static constexpr const GemmPlanner* kChainTable[] = {&override_planner, &injected_planner,
+                                                         &builtin_planner, &degraded_planner};
     static constexpr const GemmPlanner* kChainHybrid[] = {
-        &override_planner, &injected_planner, &builtin_planner,
-        &model_planner, &degraded_planner};
-    static constexpr const GemmPlanner* kChainModel[] = {&model_planner,
-                                                         &degraded_planner};
+        &override_planner, &injected_planner, &builtin_planner, &model_planner, &degraded_planner};
+    static constexpr const GemmPlanner* kChainModel[] = {&model_planner, &degraded_planner};
 
     const int mode = gemm_planner_mode();
-    const GemmPlanner* const* chain =
-        mode == 2 ? kChainModel : mode == 1 ? kChainHybrid : kChainTable;
+    const GemmPlanner* const* chain = mode == 2   ? kChainModel
+                                      : mode == 1 ? kChainHybrid
+                                                  : kChainTable;
     const int chain_len = mode == 2 ? 2 : mode == 1 ? 5 : 4;
     for (int i = 0; i < chain_len; ++i)
         if (std::optional<PlanDecision> d = chain[i]->plan(q)) {
@@ -395,11 +376,10 @@ PlanDecision plan_dispatch(const PlanQuery& q) {
     // dim, so this tail is the no-facts answer: the first degraded row,
     // the historical choice for degenerate shapes.
     const TableRow& row = kDegradedPlanRows[0];
-    PlanDecision d{*recipe_of((int)row.cta, row.stages, row.kk, false, 2, 2),
-                   0, "degraded"};
+    PlanDecision d{*recipe_of((int)row.cta, row.stages, row.kk, false, 2, 2), 0, "degraded"};
     log_dispatch(q, d);
     return d;
 }
 
-}  // namespace gemm
-}  // namespace astrai
+} // namespace gemm
+} // namespace astrai

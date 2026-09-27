@@ -9,5 +9,5 @@ namespace gemm {
 
 ASTRAI_GEMM_INSTANTIATE(__nv_fp8_e5m2, __nv_fp8_e5m2);
 
-}  // namespace gemm
-}  // namespace astrai
+} // namespace gemm
+} // namespace astrai

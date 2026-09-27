@@ -15,14 +15,14 @@
 #include <string>
 #include <vector>
 
-#include <utils/device.cuh>
 #include <api/gemm.h>
 #include <launcher/plan_table.h>
+#include <utils/device.cuh>
 
 namespace astrai {
 namespace fp8 {
 void bind_fp8(py::module& m);
-}  // namespace fp8
+} // namespace fp8
 
 namespace gemm {
 namespace {
@@ -41,16 +41,19 @@ torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
 // pybind surface: None-tolerant operand scales and bias (``cast_tensor_arg``
 // keeps the "must be a torch.Tensor or None" message), then the shared
 // implementation the composed fp8 linear also calls (see api/gemm.h).
-torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
-                         py::object b_scale, bool trans_a, bool trans_b,
+torch::Tensor quant_gemm(torch::Tensor a,
+                         torch::Tensor b,
+                         py::object a_scale,
+                         py::object b_scale,
+                         bool trans_a,
+                         bool trans_b,
                          py::object bias) {
-    auto opt = [](const py::object& o,
-                  const char* name) -> c10::optional<torch::Tensor> {
-        if (o.is_none()) return c10::nullopt;
+    auto opt = [](const py::object& o, const char* name) -> c10::optional<torch::Tensor> {
+        if (o.is_none())
+            return c10::nullopt;
         return cast_tensor_arg(o, name);
     };
-    return quant_gemm_impl(a, b, opt(a_scale, "a_scale"),
-                           opt(b_scale, "b_scale"), trans_a, trans_b,
+    return quant_gemm_impl(a, b, opt(a_scale, "a_scale"), opt(b_scale, "b_scale"), trans_a, trans_b,
                            opt(bias, "bias"));
 }
 
@@ -121,9 +124,8 @@ void patch_planner(GemmConfigPatch& patch, const py::object& value) {
         }
         int mode = -1;
         if (!parse_planner_mode(name, mode))
-            throw std::invalid_argument(
-                "planner must be 'table', 'hybrid' or 'model', got '" + name +
-                "'");
+            throw std::invalid_argument("planner must be 'table', 'hybrid' or 'model', got '" +
+                                        name + "'");
         patch.planner_mode = mode;
         return;
     }
@@ -146,8 +148,7 @@ void patch_tier(GemmConfigPatch& patch, const py::object& value) {
         patch.tier = RowTier::Injected;
         return;
     }
-    throw std::invalid_argument("tier must be 'override' or 'injected', got '" +
-                                name + "'");
+    throw std::invalid_argument("tier must be 'override' or 'injected', got '" + name + "'");
 }
 
 struct PatchKey {
@@ -157,20 +158,10 @@ struct PatchKey {
 
 const PatchKey kPatchKeys[] = {
     {"planner", patch_planner},
-    {"log",
-     [](GemmConfigPatch& p, const py::object& v) { p.log = v.cast<bool>(); }},
-    {"tma",
-     [](GemmConfigPatch& p, const py::object& v) {
-         p.staging_tma = v.cast<bool>();
-     }},
-    {"mx",
-     [](GemmConfigPatch& p, const py::object& v) {
-         p.staging_mx = v.cast<bool>();
-     }},
-    {"table_off",
-     [](GemmConfigPatch& p, const py::object& v) {
-         p.table_off = v.cast<bool>();
-     }},
+    {"log", [](GemmConfigPatch& p, const py::object& v) { p.log = v.cast<bool>(); }},
+    {"tma", [](GemmConfigPatch& p, const py::object& v) { p.staging_tma = v.cast<bool>(); }},
+    {"mx", [](GemmConfigPatch& p, const py::object& v) { p.staging_mx = v.cast<bool>(); }},
+    {"table_off", [](GemmConfigPatch& p, const py::object& v) { p.table_off = v.cast<bool>(); }},
     {"rows", patch_rows},
     {"tier", patch_tier},
 };
@@ -178,7 +169,8 @@ const PatchKey kPatchKeys[] = {
 std::string patch_keys() {
     std::string out;
     for (const PatchKey& key : kPatchKeys) {
-        if (!out.empty()) out += ", ";
+        if (!out.empty())
+            out += ", ";
         out += key.key;
     }
     return out;
@@ -189,24 +181,29 @@ GemmConfigPatch patch_from(const py::dict& patch) {
     for (const auto& item : patch) {
         const py::object key_object = py::reinterpret_borrow<py::object>(item.first);
         TORCH_CHECK(py::isinstance<py::str>(key_object),
-                    "gemm config keys must be strings; the plan's knobs are ",
-                    patch_keys());
+                    "gemm config keys must be strings; the plan's knobs are ", patch_keys());
         const std::string key = key_object.cast<std::string>();
         bool known = false;
         for (const PatchKey& candidate : kPatchKeys) {
-            if (key != candidate.key) continue;
+            if (key != candidate.key)
+                continue;
             candidate.apply(out, py::reinterpret_borrow<py::object>(item.second));
             known = true;
             break;
         }
-        TORCH_CHECK(known, "unknown gemm config key '", key,
-                    "'; the plan's knobs are ", patch_keys());
+        TORCH_CHECK(known, "unknown gemm config key '", key, "'; the plan's knobs are ",
+                    patch_keys());
     }
     return out;
 }
 
-py::dict probe_binding(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
-                       at::ScalarType dt_b, bool trans_a, bool trans_b,
+py::dict probe_binding(int64_t m,
+                       int64_t n,
+                       int64_t k,
+                       at::ScalarType dt_a,
+                       at::ScalarType dt_b,
+                       bool trans_a,
+                       bool trans_b,
                        int64_t batch) {
     return probe_dict(plan_probe(m, n, k, dt_a, dt_b, trans_a, trans_b, batch));
 }
@@ -217,9 +214,9 @@ py::dict configure_binding(const py::dict& patch) {
 
 py::dict config_state_binding() { return config_dict(config_state()); }
 
-}  // namespace
-}  // namespace gemm
-}  // namespace astrai
+} // namespace
+} // namespace gemm
+} // namespace astrai
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // The fp8 training linear (forward + backward) lives in this module:
@@ -228,11 +225,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     astrai::fp8::bind_fp8(m);
     m.def("quant_gemm", &astrai::gemm::quant_gemm, py::arg("a"), py::arg("b"),
           py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
-          py::arg("trans_a") = false, py::arg("trans_b") = true,
-          py::arg("bias") = py::none());
-    m.def("plan_probe", &astrai::gemm::probe_binding, py::arg("m"),
-          py::arg("n"), py::arg("k"), py::arg("dt_a"), py::arg("dt_b"),
-          py::arg("trans_a") = false, py::arg("trans_b") = true,
+          py::arg("trans_a") = false, py::arg("trans_b") = true, py::arg("bias") = py::none());
+    m.def("plan_probe", &astrai::gemm::probe_binding, py::arg("m"), py::arg("n"), py::arg("k"),
+          py::arg("dt_a"), py::arg("dt_b"), py::arg("trans_a") = false, py::arg("trans_b") = true,
           py::arg("batch") = 1);
     m.def("configure", &astrai::gemm::configure_binding, py::arg("patch"),
           "Apply a config patch (a dict of the plan's knobs) and return the "

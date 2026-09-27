@@ -29,13 +29,13 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int gid = lane >> 2;   // 0..7
-    const int tid4 = lane & 3;   // 0..3
+    const int gid = lane >> 2; // 0..7
+    const int tid4 = lane & 3; // 0..3
 
     const int G = p.q_head / p.kv_head;
-    const int HB = min(G, Traits::WARPS);   // q heads packed per block
-    const int WPH = Traits::WARPS / HB;     // 16-row chunks per head
-    const int BPG = (G + HB - 1) / HB;      // blocks per GQA group
+    const int HB = min(G, Traits::WARPS); // q heads packed per block
+    const int WPH = Traits::WARPS / HB;   // 16-row chunks per head
+    const int BPG = (G + HB - 1) / HB;    // blocks per GQA group
     const int chunk = warp % WPH;
 
     int batch, row_base;
@@ -51,8 +51,8 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     const int qrow0 = row_base + chunk * Traits::BR;
 
     // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
-    const int seq_len    = KV::kv_len(p, batch);
-    const int q_len      = QSchedule::q_len(p, batch);
+    const int seq_len = KV::kv_len(p, batch);
+    const int q_len = QSchedule::q_len(p, batch);
     const int causal_off = KV::causal_offset(p, batch, q_len);
     const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
 
@@ -68,11 +68,11 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     const int qrb = qrow0 + gid + 8;
     const bool va = qra < q_len, vb = qrb < q_len;
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(q_gmem + q_base, p.q_l_stride, p.q_d_stride,
-                                  qra, qrb, va, vb, tid4, Qa);
+    load_q_mma_frags<Traits::KD>(q_gmem + q_base, p.q_l_stride, p.q_d_stride, qra, qrb, va, vb,
+                                 tid4, Qa);
 
     float Oacc[Traits::DN8][4];
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < Traits::DN8; j++)
         Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
@@ -89,16 +89,16 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     int t_end = tiles - 1;
     if constexpr (IsCausal) {
         int bt = block_max_kv / Traits::BC;
-        if (bt < t_end) t_end = bt;
+        if (bt < t_end)
+            t_end = bt;
     }
 
     // ---- Load tile lambda: predicated cp.async (addressing via KV policy) ----
     auto load_tile = [&](int ti, int buf) {
-        load_kv_tile<Traits>(sK, sV, ti, buf, seq_len,
-            [&](int kc, int d, bool valid) {
-                int token = KV::resolve_token(p, kctx, kc, valid);
-                return KV::kv_addr_from_token(p, kctx, token, d);
-            });
+        load_kv_tile<Traits>(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
+            int token = KV::resolve_token(p, kctx, kc, valid);
+            return KV::kv_addr_from_token(p, kctx, token, d);
+        });
     };
 
     // ---- Prologue: issue first tile load ----
@@ -110,7 +110,8 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
         // Wait for current tile, then publish cross-warp + guard buffer reuse.
         astrai::cp_async_wait_group<0>();
         __syncthreads();
-        if (ti < t_end) load_tile(ti + 1, (ti + 1) & 1);
+        if (ti < t_end)
+            load_tile(ti + 1, (ti + 1) & 1);
 
         const T* bK = sK + buf * Traits::BC * Traits::LD;
         const T* bV = sV + buf * Traits::BC * Traits::LD;
@@ -122,18 +123,11 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
             float Sacc[Traits::NC8][4];
             mma_compute_scores<Traits>(Qa, bK, p.scale, lane, Sacc);
 
-            int maxc0 = IsCausal ? min(seq_len, causal_off + qr0 + 1)
-                                 : seq_len;
-            int maxc1 = IsCausal ? min(seq_len, causal_off + qr1 + 1)
-                                 : seq_len;
-            mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1,
-                                              qr0, qr1,
-                                              p.mask_b_stride, p.mask_h_stride,
-                                              p.mask_l_stride,
-                                              batch, q_head, q_head,
-                                              p.mask,
-                                              va, vb,
-                                              Sacc, Oacc, m0, m1, l0, l1, lane);
+            int maxc0 = IsCausal ? min(seq_len, causal_off + qr0 + 1) : seq_len;
+            int maxc1 = IsCausal ? min(seq_len, causal_off + qr1 + 1) : seq_len;
+            mma_softmax_tile<Traits, HasMask>(
+                kv0, maxc0, maxc1, qr0, qr1, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
+                batch, q_head, q_head, p.mask, va, vb, Sacc, Oacc, m0, m1, l0, l1, lane);
 
             mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
         }
@@ -144,19 +138,19 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     float rl1 = (l1 > 1e-20f) ? (1.0f / l1) : 0.0f;
     T* __restrict__ o_gmem = static_cast<T*>(p.o_ptr);
     const int o_base = QSchedule::q_base(p, batch, q_head);
-    #pragma unroll
+#pragma unroll
     for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
         if (active && qr0 < q_len) {
             astrai::store2<T>(o_gmem + o_base + qr0 * p.q_l_stride + d * p.q_d_stride,
-                      Oacc[dn8][0] * rl0, Oacc[dn8][1] * rl0);
+                              Oacc[dn8][0] * rl0, Oacc[dn8][1] * rl0);
         }
         if (active && qr1 < q_len) {
             astrai::store2<T>(o_gmem + o_base + qr1 * p.q_l_stride + d * p.q_d_stride,
-                      Oacc[dn8][2] * rl1, Oacc[dn8][3] * rl1);
+                              Oacc[dn8][2] * rl1, Oacc[dn8][3] * rl1);
         }
     }
 }
 
-}  // namespace attention
-}  // namespace astrai
+} // namespace attention
+} // namespace astrai

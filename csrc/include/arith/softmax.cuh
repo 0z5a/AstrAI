@@ -25,8 +25,8 @@ struct SoftmaxState {
 // w = 1; the split-KV combine merges a (mi, li) partial with w = li.
 // `alpha` rescales the caller's accumulator carrying the OLD max, `beta`
 // weights the new term:  acc = acc * alpha + x * beta;  l likewise.
-DEVICE_FORCEINLINE void softmax_step(
-    SoftmaxState& s, float score, float w, float& alpha, float& beta) {
+DEVICE_FORCEINLINE void
+softmax_step(SoftmaxState& s, float score, float w, float& alpha, float& beta) {
     float nm = fmaxf(s.m, score);
     alpha = __expf(s.m - nm);
     beta = (nm == -FLT_MAX) ? 0.0f : __expf(score - nm);
@@ -37,8 +37,7 @@ DEVICE_FORCEINLINE void softmax_step(
 // Running-max advance for consumers that reduce a whole tile before taking
 // the exp (the MMA path): returns the new max, writes the old-state rescale
 // factor and the 0/1 gate that zeroes the exp() terms of an all-masked row.
-DEVICE_FORCEINLINE float softmax_remax(
-    float& m, float cand, float& corr, float& pn) {
+DEVICE_FORCEINLINE float softmax_remax(float& m, float cand, float& corr, float& pn) {
     float nm = fmaxf(m, cand);
     corr = __expf(m - nm);
     pn = (nm == -FLT_MAX) ? 0.0f : 1.0f;
@@ -46,5 +45,5 @@ DEVICE_FORCEINLINE float softmax_remax(
     return nm;
 }
 
-}  // namespace attention
-}  // namespace astrai
+} // namespace attention
+} // namespace astrai

@@ -18,10 +18,10 @@ namespace astrai {
 namespace quant {
 
 struct QuantizeOutputs {
-    torch::Tensor out;    // row-major orientation (undefined if not asked)
-    torch::Tensor out_t;  // [cols][rows] transpose (undefined if not asked)
-    torch::Tensor amax;   // the fold's raw-domain amax of the round (undefined
-                          // without a ring — nothing measures one)
+    torch::Tensor out;   // row-major orientation (undefined if not asked)
+    torch::Tensor out_t; // [cols][rows] transpose (undefined if not asked)
+    torch::Tensor amax;  // the fold's raw-domain amax of the round (undefined
+                         // without a ring — nothing measures one)
 };
 
 // One quantize pass, end to end: validation, output allocation, launch.
@@ -35,19 +35,18 @@ struct QuantizeOutputs {
 // ``hist_len`` (see RingLayout in utils/quantize_common.h); one without is
 // rejected rather than guessed. Semantics are documented at the definition
 // (quantize/entry.cu).
-QuantizeOutputs run_quantize(
-    torch::Tensor x, 
-    torch::Tensor scale, 
-    QuantLayout layout,
-    at::ScalarType dtype_a, 
-    c10::optional<at::ScalarType> dtype_b,
-    c10::optional<torch::Tensor> ring, 
-    int64_t hist_idx, 
-    double fp8_max,
-    double pow2_margin, 
-    c10::optional<torch::Tensor> pub_scale = c10::nullopt,
-    c10::optional<torch::Tensor> pub_recip = c10::nullopt,
-    c10::optional<int64_t> hist_len = c10::nullopt);
+QuantizeOutputs run_quantize(torch::Tensor x,
+                             torch::Tensor scale,
+                             QuantLayout layout,
+                             at::ScalarType dtype_a,
+                             c10::optional<at::ScalarType> dtype_b,
+                             c10::optional<torch::Tensor> ring,
+                             int64_t hist_idx,
+                             double fp8_max,
+                             double pow2_margin,
+                             c10::optional<torch::Tensor> pub_scale = c10::nullopt,
+                             c10::optional<torch::Tensor> pub_recip = c10::nullopt,
+                             c10::optional<int64_t> hist_len = c10::nullopt);
 
-}  // namespace quant
-}  // namespace astrai
+} // namespace quant
+} // namespace astrai

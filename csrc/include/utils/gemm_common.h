@@ -1,8 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include <cstdint>
 #include <type_traits>
 
 #include <utils/dtype.cuh>
@@ -34,16 +34,14 @@ using astrai::Shape;
 // cell's (16); dequant insertion factors ride gemm_mma_traits. An element type
 // the vocabulary does not know is a compile error at the use site, never a
 // silent fallback.
-template <typename T>
-using gemm_elem_traits = astrai::ElemTrait<T>;
+template <typename T> using gemm_elem_traits = astrai::ElemTrait<T>;
 
 // MMA compute type per operand pair — the tensor-core input type both
 // operands are brought to before mma.sync. Promotes to bf16 m16n8k16 when
 // int8 rides exactly one side (W8A16, A8W16, the only supported mixed
 // pair); symmetric pairs keep their native mma (bf16 pass-through, fp8 mma,
 // s8 mma with int32 accumulators).
-template <typename ElemA, typename ElemB>
-struct gemm_mma_traits {
+template <typename ElemA, typename ElemB> struct gemm_mma_traits {
     static constexpr bool kI8A = std::is_same_v<ElemA, int8_t>;
     static constexpr bool kI8B = std::is_same_v<ElemB, int8_t>;
     static constexpr bool kPromote = (kI8A != kI8B);
@@ -92,5 +90,5 @@ struct GemmParams {
     int raster = 8;
 };
 
-}  // namespace gemm
-}  // namespace astrai
+} // namespace gemm
+} // namespace astrai

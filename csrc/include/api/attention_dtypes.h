@@ -28,21 +28,19 @@ namespace attention {
 
 // The element types are spelled namespace-qualified: a row is expanded at the
 // entries' file scope, where only `astrai::attention` is open.
-#define ASTRAI_ATTN_DTYPE_LIST(X) \
-    X(at::kBFloat16, astrai::bf16)
+#define ASTRAI_ATTN_DTYPE_LIST(X) X(at::kBFloat16, astrai::bf16)
 
 // A scalar type attention has no kernel for: say which ones it does have, read
 // off the list above.
 inline void attn_dtype_unsupported(at::ScalarType st) {
     std::string instantiated;
-#define ASTRAI_ATTN_DTYPE_NAME_ROW(tag, type)                                  \
-    instantiated += std::string(instantiated.empty() ? "" : ", ") +            \
-                    c10::toString(tag);
+#define ASTRAI_ATTN_DTYPE_NAME_ROW(tag, type)                                                      \
+    instantiated += std::string(instantiated.empty() ? "" : ", ") + c10::toString(tag);
     ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_NAME_ROW)
 #undef ASTRAI_ATTN_DTYPE_NAME_ROW
     TORCH_CHECK(false, "attention has no kernel for ", c10::toString(st),
                 " (instantiated: ", instantiated, ")");
 }
 
-}  // namespace attention
-}  // namespace astrai
+} // namespace attention
+} // namespace astrai
