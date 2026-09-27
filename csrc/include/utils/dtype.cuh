@@ -10,7 +10,7 @@
 // The primary template is UNDEFINED and specializes per element type: an
 // element type the vocabulary does not know is a compile error at the use
 // site, never a silent fallback (the same discipline as MmaShapeFor in
-// common/mma.cuh and gemm's storage traits, which alias this one).
+// mma/mma.cuh and gemm's storage traits, which alias this one).
 //
 // The pair-cell operations exist only for the 16-bit types — one 32-bit
 // register holding two elements, the tensor-core operand and packed-store

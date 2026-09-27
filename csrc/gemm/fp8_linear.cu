@@ -15,7 +15,7 @@
 // Not here by design: the autocast region and recipe/format policy
 // (astrai/extension/quantize.py), the module slot table
 // (astrai/extension/fp8_slots.py), and the rings / cast caches / snapshot
-// (fp8_state.cuh, same translation unit).
+// (fp8_state.h, same translation unit).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

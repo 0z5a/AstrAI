@@ -4,7 +4,7 @@
 // type). The entries switch on q.scalar_type() over this list and the refusal
 // below is generated from the same rows, so the supported set cannot drift.
 // Adding a precision = a row here + its ElemTrait (utils/dtype.cuh) and, for
-// tensor-core dtypes, the MmaShapeFor/MmaOp cell (common/mma.cuh).
+// tensor-core dtypes, the MmaShapeFor/MmaOp cell (mma/mma.cuh).
 
 #include <string>
 

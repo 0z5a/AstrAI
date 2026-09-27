@@ -5,7 +5,7 @@
 //
 //   engines:  PtrEngine<T> (shared/global pointer), ArrayEngine<T, N>
 //             (registers — cute's Array role: mma fragments are arrays)
-//   layouts:  the ComposedLayout instances of common/swizzle.cuh (16B chunk
+//   layouts:  the ComposedLayout instances of utils/swizzle.cuh (16B chunk
 //             grids, dtype-agnostic) + RingLayout / CellLayout here
 //   ops:      make_ring (construct over a raw carve), stage_of (slice one
 //             ring slot's tile — cute's tensor slicing)
@@ -96,7 +96,7 @@ template <typename EngineT, typename LayoutT> struct Tensor {
     // regressed the crosswise-direct readers' register budget. The XOR
     // derives from the row ALONE (ComposedLayout's closed form) — it must
     // not serialize behind the row*stride IMAD (a linearized form
-    // regressed W8A8 up to +29%; see docs/developer/cuda_kernels.md).
+    // regressed W8A8 up to +29%; see docs/developer/kernels/gemm.md).
     template <bool kChunk = LayoutT::kChunkUnit, std::enable_if_t<kChunk, int> = 0>
     DEVICE_FORCEINLINE Elem* operator()(int row, int col) const {
         constexpr int kShift = log2_const<kChunkElems>::value;

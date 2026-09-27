@@ -11,7 +11,7 @@
 // GEMM-family POD/traits header — dtype-neutral: layout tags, element traits
 // and the unified parameter POD shared by every element-type specialization.
 // The element types themselves (and their storage facts) come from the shared
-// vocabulary in common/dtype.cuh, so a precision is named once for the whole
+// vocabulary in utils/dtype.cuh, so a precision is named once for the whole
 // kernel tree. Torch-free: these headers are what a host or device pass sees
 // before any binding does.
 
@@ -27,9 +27,9 @@ struct ColMajor {};
 using astrai::Shape;
 
 // Element-type traits: the family-local spelling of the shared vocabulary's
-// ElemTrait (common/dtype.cuh), which carries the per-dtype storage facts the
+// ElemTrait (utils/dtype.cuh), which carries the per-dtype storage facts the
 // smem layers price rings from (kBytes). The MMA K extent rides
-// MmaShapeFor<MmaT> (common/mma.cuh) — it keys on the COMPUTE type, so a
+// MmaShapeFor<MmaT> (mma/mma.cuh) — it keys on the COMPUTE type, so a
 // dequantized operand's storage K (32) is never conflated with the promoted
 // cell's (16); dequant insertion factors ride gemm_mma_traits. An element type
 // the vocabulary does not know is a compile error at the use site, never a

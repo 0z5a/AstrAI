@@ -33,11 +33,12 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 | Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (bindings + entry; headers: `csrc/include/`) | `astrai/extension/ops/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
 | GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/ops/gemm.py` |
 | Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (headers: `csrc/include/`) | `astrai/extension/ops/attention.py`; dispatch `astrai/extension/backend/attention.py` |
+| Gated DeltaNet (chunked fwd prep / bwd output stage) | [attention.md](attention.md) (§GDN) | `csrc/gated_deltanet/` (headers: `csrc/include/`) | `astrai/extension/ops/gdn.py` |
 | Rotary embedding | [rotary.md](rotary.md) | `csrc/rotary_emb.cu` | `astrai/extension/ops/rotary.py`; dispatch `astrai/extension/backend/rotary.py` |
 
 One entry the table does not spell out: `gemm/` also carries the **fp8
 training** linear — `fp8_linear.cu` (the composed forward *and* backward in
-one C++ `autograd::Function`) with its state machine `fp8_state.cuh` (rings,
+one C++ `autograd::Function`) with its state machine `gemm/fp8_state.h` (rings,
 weight cast cache, checkpoint snapshot). Its Python entry is the strategy
 layer `astrai/extension/quantize.py` (`fp8_autocast`, recipe/format policy),
 and it ships inside the `gemm` module so the dispatch state — plan table,
@@ -326,22 +327,22 @@ csrc/
 │   │   └── reduce.cuh                #     plus/maximum functors, warp_reduce/group_reduce, atomic_max_float
 │   ├── datatype/                     # dtype traits and dequant primitives (stage-agnostic)
 │   │   └── dequant.cuh               #     in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
-│   ├── utils/                        # stage-agnostic vocabulary — the sink of the include graph
+│   ├── utils/                        # stage-agnostic tools — the sink of the include graph
 │   │   ├── define.cuh                #     HOST/DEVICE_FORCEINLINE — the shared function-qualifier macros
 │   │   ├── device.cuh                #     DeviceFacts geometry query (sms / smem opt-in / L2)
 │   │   ├── dtype.cuh                 #     element-type words (aliases + ElemTrait, torch at::ScalarType naming)
 │   │   ├── launch.cuh                #     launch-and-check macros, pure C
-│   │   ├── shape.cuh / swizzle.cuh / tensor.cuh   # static geometry / staging swizzle / Tensor<Engine, Layout>
-│   │   ├── gemm_common.h             #     layout tags, gemm_elem_traits, gemm_mma_traits, GemmParams POD
-│   │   ├── attention_common.h        #     AttentionParams POD, TensorLayout enum
-│   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
-│   ├── api/                          # THE CALLER CONTRACT — declarations, the supported-set lists and the capability gates; the only directory whose headers may touch torch/ATen/c10/Python (files named BY FAMILY: <family>*.h = that family's surface)
-│   │   ├── gemm.h                     #     gemm C++ surface (declarations only, no py:: type)
+│   │   └── shape.cuh / swizzle.cuh / tensor.cuh   # static geometry / staging swizzle / Tensor<Engine, Layout>
+│   ├── api/                          # THE CALLER CONTRACT — declarations, the supported-set lists, the capability gates and the cross-layer family PODs; the only directory whose headers may touch torch/ATen/c10/Python (files named BY FAMILY: <family>*.h = that family's surface)
+│   │   ├── gemm.h                    #     gemm C++ surface (declarations only, no py:: type)
 │   │   ├── attention.h               #     attention entry declarations (astrai::attention)
 │   │   ├── attention_dtypes.h        #     attention ASTRAI_ATTN_DTYPE_LIST + generated unsupported-dtype refusal
 │   │   ├── gated_deltanet.h          #     the family's two entry declarations (astrai::gdn)
-│   │   ├── quantize.h          #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
-│   │   └── fp8_checks.h              #     fp8 capability gate (check_fp8_device; shared by quantize + gemm)
+│   │   ├── quantize.h                #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
+│   │   ├── fp8_checks.h              #     fp8 capability gate (check_fp8_device; shared by quantize + gemm)
+│   │   ├── gemm_common.h             #     layout tags, gemm_elem_traits, gemm_mma_traits, GemmParams POD
+│   │   ├── attention_common.h        #     AttentionParams POD (cross-layer: stage headers include it)
+│   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
 │   └── launcher/                     # THE DISPATCH MACHINERY — the planner chain and the row table behind the api/ surface; both are deliberate impl-headers (they are why this directory still exists)
 │       ├── planning.h                #     the planner chain + recipe vocabulary + plan_raster; plan_dispatch defined non-inline — SINGLE-INCLUSION (one TU per binary: gemm.cu or a standalone harness)
 │       └── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded sources + GemmConfig seed
@@ -398,7 +399,7 @@ root-qualified** (`<kernel/gemm.cuh>`, `<policy.cuh>`); quoted includes are
 the toolchain's plus the harness-local `test_utils.cuh`. A quoted project
 path would resolve through the includer's own directory first and silently
 change meaning on a move — the three same-named `common.h` are now
-`utils/{gemm,attention,quantize}_common.h` precisely so a spelling names
+`api/{gemm,attention,quantize}_common.h` precisely so a spelling names
 one file. (The layout test that once pinned this mechanically was retired
 when the stage tree landed; the discipline lives here and in review.)
 

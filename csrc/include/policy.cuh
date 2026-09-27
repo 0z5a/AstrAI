@@ -35,7 +35,7 @@ struct GemmTraits {
     using ElemB = ElemB_;
     using MmaPair = gemm_mma_traits<ElemA_, ElemB_>;
     using MmaT = typename MmaPair::MmaT;
-    // The exact mma cell <MmaT, MmaT, shape> (common/mma.cuh): one type
+    // The exact mma cell <MmaT, MmaT, shape> (mma/mma.cuh): one type
     // carries the instruction's K extent and accumulator type (fp32 for the
     // float families, s32 for the s8 pair).
     static constexpr bool kMxCell =

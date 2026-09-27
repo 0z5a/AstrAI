@@ -61,7 +61,7 @@ template <> struct DequantPair<int8_t, __nv_bfloat16> {
     // both LOP3s and the HSUB2 then run on the pair at once:
     // 4 SASS instructions. (A future humming-style offline byte interleave
     // could fold the spread into storage and drop the PRMT; the layout
-    // derivation lives in docs/developer/cuda_kernels.md.)
+    // derivation lives in docs/developer/kernels/gemm.md.)
     static DEVICE_FORCEINLINE unsigned pair(unsigned short v) {
         const unsigned spread = __byte_perm((unsigned)v, 0, 0x4140u); // (e0, 0, e1, 0)
         return expand(spread, spread);

@@ -2,7 +2,7 @@
 // Collective mainloop: smem stage rings, stage loads (congruous cp.async /
 // crosswise LDG+PRMT), per-lane ldmatrix addressing, software-pipelined
 // mma.sync. Addressing scheme + fast-loop peel rationale:
-// docs/developer/cuda_kernels.md.
+// docs/developer/kernels/gemm.md.
 
 #include <type_traits>
 
@@ -87,7 +87,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
     static constexpr int kBRing = Smem::kRingDepth;
 
     // Staging layouts, cute-style: composition(Swizzle, Layout<Shape,
-    // Stride>) over the row-major 16B-chunk grid (common/swizzle.cuh), one
+    // Stride>) over the row-major 16B-chunk grid (utils/swizzle.cuh), one
     // instance shared by loaders, fragment reads and the lane-offset mirrors
     // below. Canonical [rows][kK] serves congruous + 8-bit crosswise (TMA
     // SWIZZLE_128B / SWIZZLE_64B); trans [kK][rows] the 16-bit crosswise
@@ -136,7 +136,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
     static constexpr bool kPackA = kDirectA && !kDequantA && kPackOkA;
     static constexpr bool kPackB = kDirectB && !kDequantB && kPackOkB;
 
-    // One ring type per operand (common/tensor.cuh): the staged-layout
+    // One ring type per operand (utils/tensor.cuh): the staged-layout
     // instance each path addresses — trans when 16-bit crosswise staging is
     // active, canonical otherwise (congruous, 8-bit crosswise and dequant
     // readers all use it). Both stagings hold the same element count, so one

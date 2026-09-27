@@ -58,15 +58,15 @@ template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> s
 
 // ---- PTX wrappers ----
 // Tensor-core mma.sync lives in the shared astrai::mma_sync template
-// (common/mma.cuh); the element operations (pack2/unpack2/...) in
-// common/dtype.cuh.
+// (mma/mma.cuh); the element operations (pack2/unpack2/...) in
+// utils/dtype.cuh.
 
 // pack two floats into one 16-bit-pair register as .b32 (mma A/B operand cell)
 template <typename T> DEVICE_FORCEINLINE unsigned pk2(float a, float b) {
     return ElemTrait<T>::pack2(a, b);
 }
 
-// ldmatrix lives in the shared template (common/mma.cuh):
+// ldmatrix lives in the shared template (mma/mma.cuh):
 // `astrai::ldmatrix_x2<Traits::Elem>` / `<Traits::Elem, /*Trans=*/true>` load
 // the K/V fragments with the exact register layout mma expects.
 

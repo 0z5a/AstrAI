@@ -5,7 +5,7 @@
 // The congruous operand staging this feeds is layout-identical to the
 // cp.async rings it replaces: the staging swizzles are already the TMA
 // hardware modes (Swizzle<3,3> = SWIZZLE_128B for 2-byte elements,
-// Swizzle<2,3> = SWIZZLE_64B for 1-byte — see common/swizzle.cuh), so
+// Swizzle<2,3> = SWIZZLE_64B for 1-byte — see utils/swizzle.cuh), so
 // fragment addressing, the ring slots and the epilogue reclaim are all
 // unchanged. Two TMA-specific facts the rest of the family respects:
 //

@@ -2,7 +2,7 @@
 // Collective epilogue: fused bias, the bf16 scatter of the fp32
 // accumulators through the reclaimed operand shared memory, and the
 // coalesced copy-out. The staging swizzle is one instance of the unified
-// family (common/swizzle.cuh) shared with the operand staging in load.cuh.
+// family (utils/swizzle.cuh) shared with the operand staging in load.cuh.
 
 #include <policy.cuh>
 #include <utils/define.cuh>
@@ -71,7 +71,7 @@ template <typename Policy> struct GemmCollectiveEpilogue {
     using OutLayout =
         decltype(composition(Swizzle<kRowBits, kRowBits>{},
                              Layout<Shape<kRowRows, kRowChunks>, Stride<kRowChunks, 1>>{}));
-    // The staged output tile, typed by OutLayout (common/tensor.cuh):
+    // The staged output tile, typed by OutLayout (utils/tensor.cuh):
     // operator()(row, elem) is the swizzled address.
     const Tensor<PtrEngine<OutT>, OutLayout> out_tile;
     const int row_elems, row_chunks;

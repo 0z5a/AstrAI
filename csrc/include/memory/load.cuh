@@ -3,7 +3,7 @@
 // (cp.async, predicated and interior variants, plus the loop-carried
 // prefetch state) and the direct LDG+PRMT path for crosswise operands.
 // The staging invariants and the swizzle derivation live in
-// docs/developer/cuda_kernels.md.
+// docs/developer/kernels/gemm.md.
 
 #include <memory/pipeline.cuh>
 #include <utils/define.cuh>

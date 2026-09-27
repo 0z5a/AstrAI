@@ -88,7 +88,7 @@ template <> struct MmaShapeFor<__nv_fp8_e5m2> {
 // Primary template undefined: only the instantiated cells below exist.
 //
 // Each cell names its register cells as types (humming's ARegisters /
-// BRegisters / CRegisters role): AFrag/BFrag/CFrag over common/tensor.cuh's
+// BRegisters / CRegisters role): AFrag/BFrag/CFrag over utils/tensor.cuh's
 // ArrayEngine (cute's Array). The typed fma overload takes fragments BY
 // REFERENCE, so
 // fragment tensors index by semantic coordinates and no pointer arithmetic
