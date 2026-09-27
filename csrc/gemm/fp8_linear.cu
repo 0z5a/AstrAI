@@ -5,8 +5,8 @@
 // It lives in the gemm module because that module owns the GEMM dispatch state
 // (plan table, planner mode, staging switches) — a second copy in another .so
 // would let `set_planner` configure one and the training path launch through the
-// other. Quantize comes in through quantize/launch.cuh, GEMM through gemm/api.h:
-// the same code the standalone bindings run.
+// other. Quantize comes in through api/quantize_entry.h, GEMM through
+// api/gemm.h: the same code the standalone bindings run.
 //
 // The composition is C++ because a ``torch::autograd::Function`` runs both
 // directions inside the engine's call — only the dispatcher entry stays in
@@ -32,9 +32,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include <launcher/api.h>
+#include <api/gemm.h>
 #include "fp8_state.h"
-#include <launcher/quantize_entry.h>
+#include <api/quantize_entry.h>
 
 namespace astrai {
 namespace fp8 {

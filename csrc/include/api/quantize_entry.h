@@ -36,10 +36,16 @@ struct QuantizeOutputs {
 // rejected rather than guessed. Semantics are documented at the definition
 // (quantize/entry.cu).
 QuantizeOutputs run_quantize(
-    torch::Tensor x, torch::Tensor scale, QuantLayout layout,
-    at::ScalarType dtype_a, c10::optional<at::ScalarType> dtype_b,
-    c10::optional<torch::Tensor> ring, int64_t hist_idx, double fp8_max,
-    double pow2_margin, c10::optional<torch::Tensor> pub_scale = c10::nullopt,
+    torch::Tensor x, 
+    torch::Tensor scale, 
+    QuantLayout layout,
+    at::ScalarType dtype_a, 
+    c10::optional<at::ScalarType> dtype_b,
+    c10::optional<torch::Tensor> ring, 
+    int64_t hist_idx, 
+    double fp8_max,
+    double pow2_margin, 
+    c10::optional<torch::Tensor> pub_scale = c10::nullopt,
     c10::optional<torch::Tensor> pub_recip = c10::nullopt,
     c10::optional<int64_t> hist_len = c10::nullopt);
 

@@ -88,8 +88,8 @@ def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric per-row dynamic int8 quantization of activations.
 
     ``x`` is ``[..., K]``; returns ``(q int8 with x's shape, scale f32
-    [prod(leading dims)])`` — the scale layout ``quant_gemm``'s per-row a_scale expects once the
-    leading dims flatten.
+    [prod(leading dims)])`` — upstream of ``quant_gemm``'s per-row a_scale
+    (the scale contract: ``docs/developer/kernels/gemm.md``, "Scales").
     """
     xf = x.detach().to(torch.float32)
     x2 = xf.reshape(-1, xf.shape[-1])

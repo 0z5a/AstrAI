@@ -1,11 +1,11 @@
 // GQA decode (split-KV FlashDecoding), contiguous K/V — the implementation
-// of the entry declared in launcher/attention.h (the gated_deltanet_fwd.cu
+// of the entry declared in api/attention.h (the gated_deltanet_fwd.cu
 // shape). Device-side code (kernels, launchers, dispatchers) is in
 // kernel/attention_launch.cuh + kernel/attention_split_kv.cuh.
 
 #include <kernel/attention_launch.cuh>
-#include <launcher/attention.h>
-#include <launcher/attention_dtypes.h>
+#include <api/attention.h>
+#include <api/attention_dtypes.h>
 #include "entry.h"
 
 namespace astrai {

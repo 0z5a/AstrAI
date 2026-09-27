@@ -216,3 +216,12 @@ foreach(entry IN LISTS KERNEL_MODULES)
             "rate on sm_120")
     endif()
 endforeach()
+
+# No IDE-indexing target here, deliberately: every device header under
+# include/ is already included by a real TU (kernel/gemm.cuh,
+# kernel/attention_launch.cuh, policy.cuh, quantize/entry.cu, ...), so any
+# language server that reads this build's compile commands already resolves
+# the whole stage tree. The DeepGEMM pattern (csrc/indexing/main.cu) exists
+# for a JIT library whose device code no CMake target instantiates; copied
+# here it would only add a decorative target. Don't re-add it without a
+# device header that no TU includes.

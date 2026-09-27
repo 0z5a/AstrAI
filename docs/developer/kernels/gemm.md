@@ -22,7 +22,7 @@ layered directory:
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
 | `gemm/plan_table.h` | The row vocabulary and its chain: `TableRow` (band + recipe + optional gates), the `RowSource` containers (each remembering the spec it was installed from — what makes the config state re-installable), the `GemmConfig` runtime state, the empty-by-default per-class tables (`kBuiltinPlanW16A16`/`W8A16`/`W8A8`/`F8A8` — a device-specific build pastes rows in) and the degraded ladder that ends every chain. The planners themselves (`RowSetPlanner`, `ModelPlanner`) live in `gemm.cuh` |
-| `gemm/api.h` | The family's C++ surface — declarations only, and template-free so including it instantiates no dtype-pair kernel: `quant_gemm_impl` (the one GEMM entry), the planner face (`PlanProbe` + `plan_probe`, `GemmConfigPatch` — `rows` + `tier` (`RowTier`) + `table_off` + the mode/log/staging knobs — with the re-installable `GemmConfigState`, through `configure` / `config_state`) and the vocabulary (`tile_vocabulary` / `tile_class_names`). No Python type in a signature — the composed fp8 linear and the bindings TU call the same functions |
+| `api/gemm.h` | The family's C++ surface — declarations only, and template-free so including it instantiates no dtype-pair kernel: `quant_gemm_impl` (the one GEMM entry), the planner face (`PlanProbe` + `plan_probe`, `GemmConfigPatch` — `rows` + `tier` (`RowTier`) + `table_off` + the mode/log/staging knobs — with the re-installable `GemmConfigState`, through `configure` / `config_state`) and the vocabulary (`tile_vocabulary` / `tile_class_names`). No Python type in a signature — the composed fp8 linear and the bindings TU call the same functions |
 | `gemm/gemm.cu` | The typed host layer: the dtype-pair registry (`ASTRAI_GEMM_PAIRS`, one entry feeding both the `gemm_dispatch` and the `plan_probe_for` lookup; one extern-template declaration per pair, which is what keeps this TU from re-instantiating them) plus the `api.h` implementations. Holds no `py::` type |
 | `gemm/fp8_linear.cu` | The composed fp8 training linear (forward *and* backward) in one C++ `autograd::Function`, so only one entry call stays in Python; its per-call state machine (rings, weight cast cache, checkpoint snapshot) is `fp8_state.cuh` |
 | `gemm/bindings.cu` | The pybind surface of the module: None-tolerant argument marshalling, the dict shapes of both directions (the state report's keys and the config patch's `kPatchKeys` table — each key set spelled once, here, as the contract the Python tooling reads) and `PYBIND11_MODULE` → module `gemm`. `configure` takes one patch dict, so a knob's name has two homes total: this table and the Python signature |
@@ -373,16 +373,31 @@ interleave (per k16 slice, u32 word c holding `(k₂c, k₂c₊₈, k₂c₊₁,
 would let one `LDS.32` feed both registers of a pair and drop the spread
 PRMT; deferred until measurement justifies a repack pass.
 
-**Scales.** `GemmParams` carries per-operand dequant scales folded
-multiplicatively into the epilogue (the mma accumulates the raw quantized
-product): per-tensor device scalar, per-row activation `a_scale[m]`, or
-per-channel weight `b_scale[n]`. The epilogue applies them after the
-accumulator's int→float conversion, so the s32 path shares one scatter
-code. Grouped-along-K scales belong in the mainloop and are not
-implemented. The transposed-output epilogue branch applies
-`b_scale`/bias per kernel row — including the +8 accumulator half
-(its own row factor), a pre-existing mixup the first scale-carrying
-NN-swap test exposed.
+**Scales** — the contract (code home: `resolve_quant_scale` in
+`csrc/gemm/entry.h`, the field semantics in `GemmParams`,
+`csrc/include/utils/gemm_common.h`; the Python docstrings point here instead
+of restating the rules). A scale is a contiguous CUDA float32 tensor with
+numel 1 (per-tensor device scalar) or the operand's extent (per-row
+activation `a_scale[m]`, per-channel weight `b_scale[n]`); per side int8
+requires its scale, fp8 takes one optionally, bf16 rejects one. Both fold
+multiplicatively into the epilogue — `D = (A_q B_q) ⊙ a_scale ⊗ b_scale` —
+which is exactly the class of scale indexed by output coordinates. The
+epilogue applies them after the accumulator's int→float conversion, so the
+s32 path shares one scatter code. A scale indexed along K is NOT
+representable here — it would apply inside the accumulation,
+`D[m,n] = Σ_k (A_q[m,k]·sa[m,k/g])·(B_q[k,n]·sb[k/g,n])` — and `GemmParams`
+carries no field for it (grouped-along-K scales are unimplemented; the
+hardware leg, the `mxf8f6f4.block_scale` cell, runs identity scales today).
+The transposed-output epilogue branch applies `b_scale`/bias per kernel row —
+including the +8 accumulator half (its own row factor), a pre-existing mixup
+the first scale-carrying NN-swap test exposed.
+
+Degenerate geometry: `k == 0` is the empty sum — zero mainloop iterations,
+so the epilogue writes zero, plus bias when given. `m == 0` / `n == 0` return
+an empty result without launching (the grid would have a zero extent, an
+illegal launch); the guard sits at the end of the entry ladder, so an empty
+call still validates its configuration. Both are pinned in
+`tests/extension/test_w8.py` (`TestQuantGemmDegenerate`).
 
 **Python surface (two layers).** `astrai/extension/ops/gemm.py` is the
 compiled `gemm` module's adapter — the single `quant_gemm` entry (the

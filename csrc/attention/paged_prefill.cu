@@ -1,11 +1,11 @@
 // SGLang-style paged GQA prefill (flat KV pool, ragged batch via
 // qo_indptr/kv_indptr) — the implementation of the entry declared in
-// launcher/attention.h. Device-side code is in kernel/attention_launch.cuh
+// api/attention.h. Device-side code is in kernel/attention_launch.cuh
 // + kernel/attention_split_q.cuh.
 
 #include <kernel/attention_launch.cuh>
-#include <launcher/attention.h>
-#include <launcher/attention_dtypes.h>
+#include <api/attention.h>
+#include <api/attention_dtypes.h>
 #include "entry.h"
 
 namespace astrai {

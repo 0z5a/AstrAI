@@ -183,3 +183,49 @@ class TestQuantizers:
         assert q.dtype == torch.int8 and q.shape == x.shape
         assert s.dtype == torch.float32 and s.shape == (15,)
         assert q.int().abs().max().item() <= 127
+
+
+@skip_no_kernel
+class TestQuantGemmDegenerate:
+    """Empty problems extend/contract nothing: the result is returned empty
+    instead of launching — a zero-extent grid is an illegal launch, which the
+    launch check turns into a process exit. k == 0 is the empty sum (zeros,
+    plus bias when given); both are pinned here."""
+
+    def test_empty_m(self):
+        x = torch.empty((0, 32), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((32, 64), device="cuda", dtype=torch.bfloat16)
+        out = quant_gemm(x, w, trans_b=False)
+        assert out.shape == (0, 64) and out.dtype == torch.bfloat16
+
+    def test_empty_n(self):
+        x = torch.empty((8, 32), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((0, 32), device="cuda", dtype=torch.bfloat16)
+        out = quant_gemm(x, w, trans_b=True)
+        assert out.shape == (8, 0)
+
+    def test_empty_m_still_validates_the_scale(self):
+        x = torch.empty((0, 32), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((64, 32), device="cuda", dtype=torch.int8)
+        s = torch.ones(1, device="cuda", dtype=torch.float32)
+        out = quant_gemm(x, w, b_scale=s, trans_b=True)
+        assert out.shape == (0, 64)
+
+    def test_k_zero_is_the_empty_sum(self):
+        x = torch.empty((8, 0), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((0, 64), device="cuda", dtype=torch.bfloat16)
+        out = quant_gemm(x, w, trans_b=False)
+        assert bool((out == 0).all())
+
+    def test_k_zero_keeps_bias(self):
+        x = torch.empty((4, 0), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((0, 5), device="cuda", dtype=torch.bfloat16)
+        bias = torch.arange(5, device="cuda", dtype=torch.bfloat16)
+        out = quant_gemm(x, w, bias=bias, trans_b=False)
+        assert torch.equal(out, bias.expand(4, 5))
+
+    def test_empty_batched(self):
+        x = torch.empty((3, 0, 32), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((32, 64), device="cuda", dtype=torch.bfloat16)
+        out = quant_gemm(x, w, trans_b=False)
+        assert out.shape == (3, 0, 64)

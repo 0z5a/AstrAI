@@ -3,7 +3,7 @@
 // quantize chain — the quantize module itself and the fp8-linear composition
 // in the gemm module (which shares it instead of re-deriving it, so the
 // implementation is a plain .cu listed in both modules' CMake source lists).
-// The declaration surface is launcher/quantize_entry.h; this TU is the body.
+// The declaration surface is api/quantize_entry.h; this TU is the body.
 //
 // The instantiation list lives HERE, not in the header: every expansion site
 // (the refusal message, the dispatch switch, the supported-input check) is
@@ -18,8 +18,8 @@
 #include <string>
 #include <torch/extension.h>
 
-#include <launcher/fp8_checks.h>
-#include <launcher/quantize_entry.h>
+#include <api/fp8_checks.h>
+#include <api/quantize_entry.h>
 #include <utils/dtype.cuh>
 #include <utils/quantize_common.h>
 #include <kernel/quantize.cuh>

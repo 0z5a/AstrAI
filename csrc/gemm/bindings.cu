@@ -1,7 +1,7 @@
 // pybind surface of the gemm module: every py:: spelling in the family lives
 // here — the None-tolerant argument marshalling, the dict shapes of the
 // planner's introspection, and the module registration. The typed C++ face is
-// gemm/api.h; gemm.cu holds the implementations.
+// api/gemm.h; gemm.cu holds the implementations.
 //
 // Dictionaries are the wire here, in both directions: the state report and the
 // config patch. Each key set is spelled exactly once — the report's keys below,
@@ -16,7 +16,7 @@
 #include <vector>
 
 #include <utils/device.cuh>
-#include <launcher/api.h>
+#include <api/gemm.h>
 #include <launcher/plan_table.h>
 
 namespace astrai {
@@ -40,7 +40,7 @@ torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
 
 // pybind surface: None-tolerant operand scales and bias (``cast_tensor_arg``
 // keeps the "must be a torch.Tensor or None" message), then the shared
-// implementation the composed fp8 linear also calls (see gemm/api.h).
+// implementation the composed fp8 linear also calls (see api/gemm.h).
 torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
                          py::object b_scale, bool trans_a, bool trans_b,
                          py::object bias) {
@@ -104,7 +104,7 @@ py::dict facts_dict() {
 // that is the whole contract. The dict is the point: with a positional parameter
 // list this file had to spell the same seven names three times (the converter's
 // parameters, its conversion bodies, and the registration's py::arg list) on top
-// of gemm/api.h's struct and astrai.extension.plan's ``configure`` signature.
+// of api/gemm.h's struct and astrai.extension.plan's ``configure`` signature.
 // The table below is the C++ half of that vocabulary; those other two are the
 // typed and the documented ends.
 

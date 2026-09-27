@@ -335,15 +335,16 @@ csrc/
 │   │   ├── gemm_common.h             #     layout tags, gemm_elem_traits, gemm_mma_traits, GemmParams POD
 │   │   ├── attention_common.h        #     AttentionParams POD, TensorLayout enum
 │   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
-│   └── launcher/                     # THE HOST SURFACE — the only directory whose headers may touch torch/ATen/c10/Python (files named BY FAMILY: <family>*.h = that family's surface)
-│       ├── api.h                     #     gemm C++ surface (declarations only, no py:: type)
+│   ├── api/                          # THE CALLER CONTRACT — declarations, the supported-set lists and the capability gates; the only directory whose headers may touch torch/ATen/c10/Python (files named BY FAMILY: <family>*.h = that family's surface)
+│   │   ├── gemm.h                     #     gemm C++ surface (declarations only, no py:: type)
+│   │   ├── attention.h               #     attention entry declarations (astrai::attention)
+│   │   ├── attention_dtypes.h        #     attention ASTRAI_ATTN_DTYPE_LIST + generated unsupported-dtype refusal
+│   │   ├── gated_deltanet.h          #     the family's two entry declarations (astrai::gdn)
+│   │   ├── quantize_entry.h          #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
+│   │   └── fp8_checks.h              #     fp8 capability gate (check_fp8_device; shared by quantize + gemm)
+│   └── launcher/                     # THE DISPATCH MACHINERY — the planner chain and the row table behind the api/ surface; both are deliberate impl-headers (they are why this directory still exists)
 │       ├── planning.h                #     the planner chain + recipe vocabulary + plan_raster; plan_dispatch defined non-inline — SINGLE-INCLUSION (one TU per binary: gemm.cu or a standalone harness)
-│       ├── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded sources + GemmConfig seed
-│       ├── attention.h               #     attention entry declarations (astrai::attention)
-│       ├── attention_dtypes.h        #     attention ASTRAI_ATTN_DTYPE_LIST + generated unsupported-dtype refusal
-│       ├── gated_deltanet.h          #     the family's two entry declarations (astrai::gdn)
-│       ├── quantize_entry.h          #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
-│       └── fp8_checks.h              #     fp8 capability gate (check_fp8_device; shared by quantize + gemm bindings)
+│       └── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded sources + GemmConfig seed
 ├── attention/                        # family translation units only (one torch entry each; kernels/launchers/dispatch in the shared kernel/ headers)
 │   ├── entry.h                       #   attention torch→POD marshalling (pack_*_params, split-partial allocation) — TU-local impl header, quoted-include (fp8_state.h shape)
 │   ├── decode.cu                     #   → module attn_decode
@@ -351,7 +352,8 @@ csrc/
 │   ├── paged_decode.cu               #   → module attn_paged_decode
 │   └── paged_prefill.cu              #   → module attn_paged_prefill
 ├── gemm/                             # family translation units only (→ module gemm)
-│   ├── gemm.cu                       #   typed host layer: dtype-pair registry + api.h implementations + the ONE planning.h includer
+│   ├── gemm.cu                       #   typed host layer: dtype-pair registry + its two lookups + the planner's C++ face + the ONE planning.h includer
+│   ├── entry.h                       #   quant_gemm's op-entry ladder (dtype classify → device gate → scale contract → layout/shape validation → GemmParams pack → dispatch) + the empty-problem guard — TU-local impl header, quoted-include, included at the bottom of gemm.cu (the lookups it calls live there)
 │   ├── bindings.cu                   #   pybind surface: marshalling, dict shapes, PYBIND11_MODULE
 │   ├── fp8_linear.cu                 #   the fp8 training linear (fwd+bwd) as one C++ autograd::Function
 │   ├── fp8_state.h                   #   the fp8 training state machine (delayed-scaling rings, cast caches, meta registry) — a TU-local split of fp8_linear.cu, quoted-include
@@ -381,11 +383,12 @@ Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python
 Three conventions the tree encodes. (1) **Stages, not families**: headers
 live under `csrc/include/<stage>/` by what they do (kernel / memory / mma /
 epilogue / arith / datatype / utils), the family directories hold only
-translation units, and `launcher/` is the host surface — the only directory
+translation units, and `api/` is the caller contract — declarations, the
+supported-set lists and the capability gates; it is the only directory
 whose headers may touch torch, which is what keeps the standalone
 `csrc/tests/*.cu` harnesses torch-free. The gemm→quantize include edges
 that forced a family-qualified tree before (`mainloop → dequant`,
-`fp8_linear → quantize launch`) are plain kernel→datatype and TU→launcher
+`fp8_linear → quantize launch`) are plain kernel→datatype and TU→api
 edges now. (2) The standalone harnesses stay out of the CMake registry on
 purpose: each carries its own `nvcc` line so a correctness test runs
 without torch; the `bench/` python tools are the reproduce path for the
@@ -405,12 +408,13 @@ whose every includer sits in one family directory lives beside them
 (`attention/entry.h`, `gemm/fp8_state.h` — quoted same-directory include);
 an implementation shared across modules becomes a .cu listed in each
 module's CMake sources (`quantize/entry.cu`, compiled into both the
-quantize and gemm modules), with only its declaration in `launcher/`.
-`launcher/` is therefore the declaration surface plus the two deliberate
-impl-headers (`planning.h`, `plan_table.h` — the single-inclusion planner
+quantize and gemm modules), with only its declaration in `api/`.
+`launcher/` is therefore the dispatch machinery alone — the two deliberate
+impl-headers (`planning.h`, `plan_table.h`: the single-inclusion planner
 and the row table; splitting them would put `plan_table.h` back through
-nvcc per dtype pair). A family gains a directory when it gains a second
-file; single-file families (`rotary_emb.cu`) stay at the top level.
+nvcc per dtype pair) that the `api/` declarations sit in front of. A family
+gains a directory when it gains a second file; single-file families
+(`rotary_emb.cu`) stay at the top level.
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 

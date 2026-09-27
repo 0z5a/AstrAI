@@ -12,9 +12,10 @@ fp8 mma for symmetric fp8 pairs); int8 and fp8 operands dequantize in-register
 between the smem read and the mma — never a separate F2F pass — and
 per-operand scales fold multiplicatively into the epilogue.
 
-Scales are contiguous float32 CUDA tensors: one element (per-tensor
-scalar) or the operand's extent — per-row activations ``a_scale[m]`` /
-per-channel weights ``b_scale[n]``. The ``trans_a``/``trans_b`` flags name
+The scale contract — what a scale tensor may be and per which operand side —
+is stated once in ``docs/developer/kernels/gemm.md`` ("Scales") and in the
+kernel's ``GemmParams``: this layer validates to it, it does not restate it.
+The ``trans_a``/``trans_b`` flags name
 the math (``True`` = operand laid out ``[contract][rows]``);
 inner-transposed views fold into the kernel layout at zero copy. ``bias``
 (CUDA bf16 1D of length n) fuses into the epilogue.
