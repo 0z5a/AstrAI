@@ -14,12 +14,12 @@ import torch
 import torch.nn.functional as F
 
 import astrai.extension.quantize as f8mod
+from astrai.extension.kernel.gemm import quant_gemm
+from astrai.extension.kernel.quantize import quantize, quantize_dual
 from astrai.extension.loader import get_module
-from astrai.extension.ops.gemm import quant_gemm
-from astrai.extension.ops.quantize import quantize, quantize_dual
 
 try:
-    from astrai.extension.ops.quantize import K_FOLD_SLOTS
+    from astrai.extension.kernel.quantize import K_FOLD_SLOTS
 except RuntimeError:
     # The binding must stay import-safe on boxes without the extension;
     # every K_FOLD_SLOTS use sits inside kernel-level tests that skip

@@ -251,7 +251,7 @@ def rules() -> dict:
     "--check",
     is_flag=True,
     default=False,
-    help="Fidelity: compare each rule's pick with ops.gemm.probe on "
+    help="Fidelity: compare each rule's pick with kernel.gemm.probe on "
     "the measured points (the model rule must match 100%).",
 )
 @click.option(
@@ -315,13 +315,13 @@ def main(results_json, rule, class_filter, check, staging):
         captures[("model(measured)", perf_class)].append(over.get("model", 0.0) / best)
 
     if check:
-        from astrai.extension import ops, plan
+        from astrai.extension import kernel, plan
 
-        ops.gemm.set_table("")
+        kernel.gemm.set_table("")
         plan.configure(rows="", tier="injected")
-        ops.gemm.set_planner("model")
+        kernel.gemm.set_planner("model")
         if staging == "cpasync":
-            ops.gemm.set_staging(tma=False)  # price what this dataset ran
+            kernel.gemm.set_staging(tma=False)  # price what this dataset ran
         seen: set[tuple] = set()
         for combo, n, k, m in sorted(by_point):
             perf_class = tpt.PERF_CLASS[combo]
@@ -331,7 +331,7 @@ def main(results_json, rule, class_filter, check, staging):
                 continue
             seen.add((combo, n, k, m))
             act, weight = tpt.COMBOS[combo]
-            info = ops.gemm.probe(m, n, k, act, weight)
+            info = kernel.gemm.probe(m, n, k, act, weight)
             real = (info["cta"], info["stages"], info["kk"])
             ba, bb = tpt.BYTES[combo]
             ctx = {"m": m, "n": n, "k": k, "ba": ba, "bb": bb, "tma": use_tma}
@@ -358,9 +358,9 @@ def main(results_json, rule, class_filter, check, staging):
                     check_seen[name].append(
                         f"combo={combo} m{m} n{n} k{k}: harness {got} vs binding {real}"
                     )
-        ops.gemm.set_planner("")
+        kernel.gemm.set_planner("")
         if staging == "cpasync":
-            ops.gemm.set_staging(tma=True)
+            kernel.gemm.set_staging(tma=True)
         click.echo("fidelity vs the binding (mismatches, first 5 per rule):")
         for name in names + ["model(measured)"]:
             bad = check_seen.get(name, [])

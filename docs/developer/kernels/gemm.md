@@ -37,8 +37,8 @@ only by the delayed-scaling ring fold (the in-kernel fused reduction) or
 measured by the caller — the plain no-ring quantize runs a pure scale+cast
 and returns `amax=None`.
 
-Python layer (two levels): `astrai/extension/ops/quantize.py` and
-`ops/gemm.py` are the stateless kernel adapters (plain `quantize` /
+Python layer (two levels): `astrai/extension/kernel/quantize.py` and
+`kernel/gemm.py` are the stateless kernel adapters (plain `quantize` /
 `quantize_dual` / `quant_gemm` wrappers, one adapter file per compiled kernel
 module), and `astrai/extension/quantize.py` is the strategy layer (fp8
 recipes, delayed / dynamic scaling, `fp8_autocast`, plus the int8
@@ -385,7 +385,7 @@ spellings are contract.
 planner that made it: `"override"`, `"injected"`, `"builtin"`, `"model"`,
 or `"degraded"`.
 
-**Autotuning.** `ops.gemm.enable()` installs the runtime autotuner: shapes
+**Autotuning.** `kernel.gemm.enable()` installs the runtime autotuner: shapes
 no row serves tune once (candidates from `tile_vocabulary` filtered to the
 staging pair and smem ceiling, forced as one-row tables, interleaved
 CUDA-event medians over the caller's own tensors; the winner persists under

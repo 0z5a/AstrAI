@@ -12,7 +12,7 @@ failure mode that matters, since a void* carries no type of its own.
 import pytest
 import torch
 
-from astrai.extension.ops.attention import (
+from astrai.extension.kernel.attention import (
     attn_decode,
     attn_paged_decode,
     attn_paged_prefill,

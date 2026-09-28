@@ -18,7 +18,7 @@ import argparse
 
 import torch
 
-from astrai.extension.ops.quantize import quantize, quantize_dual
+from astrai.extension.kernel.quantize import quantize, quantize_dual
 from astrai.extension.quantize import fp8_autocast
 
 # astrai_1b pretrain projections: x is the m=16384 activation against

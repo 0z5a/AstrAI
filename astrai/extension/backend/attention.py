@@ -72,11 +72,11 @@ from astrai.extension.dispatch import (
 from astrai.extension.dispatch import (
     resolve as _dispatch_resolve,
 )
-from astrai.extension.loader import is_available
-from astrai.extension.ops.attention import (
+from astrai.extension.kernel.attention import (
     attn_paged_decode,
     attn_paged_prefill,
 )
+from astrai.extension.loader import is_available
 from astrai.factory import BaseFactory
 
 try:

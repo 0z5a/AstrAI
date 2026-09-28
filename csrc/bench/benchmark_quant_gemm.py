@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from astrai.extension import is_available
-from astrai.extension.ops.gemm import quant_gemm
+from astrai.extension.kernel.gemm import quant_gemm
 from astrai.extension.quantize import quantize_act_int8, quantize_weight_int8
 
 # GEMM shapes as (N, K) weight mats; M comes from --m-values.

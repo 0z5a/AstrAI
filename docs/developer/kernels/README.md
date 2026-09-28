@@ -30,11 +30,11 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 | Operator | Doc | Kernel module | Python entry |
 |---|---|---|---|
-| Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (bindings + entry; headers: `csrc/include/`) | `astrai/extension/ops/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
-| GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/ops/gemm.py` |
-| Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (headers: `csrc/include/`) | `astrai/extension/ops/attention.py`; dispatch `astrai/extension/backend/attention.py` |
-| Gated DeltaNet (chunked fwd prep / bwd output stage) | [attention.md](attention.md) (§GDN) | `csrc/gated_deltanet/` (headers: `csrc/include/`) | `astrai/extension/ops/gdn.py` |
-| Rotary embedding | [rotary.md](rotary.md) | `csrc/rotary_emb.cu` | `astrai/extension/ops/rotary.py`; dispatch `astrai/extension/backend/rotary.py` |
+| Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (bindings + entry; headers: `csrc/include/`) | `astrai/extension/kernel/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
+| GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/kernel/gemm.py` |
+| Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (headers: `csrc/include/`) | `astrai/extension/kernel/attention.py`; dispatch `astrai/extension/backend/attention.py` |
+| Gated DeltaNet (chunked fwd prep / bwd output stage) | [attention.md](attention.md) (§GDN) | `csrc/gated_deltanet/` (headers: `csrc/include/`) | `astrai/extension/kernel/gdn.py` |
+| Rotary embedding | [rotary.md](rotary.md) | `csrc/rotary_emb.cu` | `astrai/extension/kernel/rotary.py`; dispatch `astrai/extension/backend/rotary.py` |
 
 One entry the table does not spell out: `gemm/` also carries the **fp8
 training** linear — `fp8_linear.cu` (the composed forward *and* backward in
@@ -136,7 +136,7 @@ astrai/extension/
 ├── plan.py                 # The GEMM plan: config / configure / override / probe / facts /
 │                           #   tiles + the runtime autotuner (policy, not marshalling)
 ├── quantize.py             # FP8/int8 strategy layer (fp8_autocast, recipes, quantizers)
-├── ops/                    # Stateless kernel wrappers — one adapter per compiled module
+├── kernel/                 # Stateless kernel wrappers — one adapter per compiled module
 │   ├── attention.py        # Stateless attention kernel wrappers
 │   ├── quantize.py         # Stateless FP8 primitive wrappers
 │   ├── gemm.py             # quant_gemm + the flat plan views (set_*/state/probe, raw shapes)
@@ -155,17 +155,17 @@ model / inference
 extension public API
        |
        v
-backend policy  --->  ops wrappers  --->  loader  --->  compiled .so
+backend policy  --->  kernel wrappers  --->  loader  --->  compiled .so
        |
        +----------->  torch / flash-attn fallback
 ```
 
-`ops` must not import `backend`. This keeps direct kernel bindings independent
+`kernel` must not import `backend`. This keeps direct kernel bindings independent
 of model, cache, fallback, and backend-selection policy.
 
 ### Ops Layer
 
-`astrai.extension.ops` is the low-level boundary around compiled extensions:
+`astrai.extension.kernel` is the low-level boundary around compiled extensions:
 
 - Wrappers are stateless and map Python arguments to pybind or
   `torch.library.custom_op` calls.
@@ -174,13 +174,13 @@ of model, cache, fallback, and backend-selection policy.
 - Wrappers do not choose another implementation, gather KV cache entries, or
   decide whether an input is supported by a backend.
 - Tests that specifically exercise a compiled kernel may import from
-  `astrai.extension.ops`.
+  `astrai.extension.kernel`.
 
 For example, `attn_prefill(...)` means "run this CUDA kernel" rather than "run
 attention using the best available implementation":
 
 ```python
-from astrai.extension.ops import attn_prefill
+from astrai.extension.kernel import attn_prefill
 
 output = attn_prefill(q, k, v, mask=mask, is_causal=True)
 ```
@@ -216,7 +216,7 @@ with attn_backend(ATTN_BACKEND.TORCH_NATIVE):
 
 The package root re-exports the supported high-level API and selected direct
 kernel wrappers. Internal code should use `astrai.extension.backend` only when
-it needs a backend type or policy implementation, and `astrai.extension.ops`
+it needs a backend type or policy implementation, and `astrai.extension.kernel`
 only when it deliberately requires one exact kernel.
 
 ### Placement Rules
@@ -225,8 +225,8 @@ When extending this package:
 
 | Change | Location |
 |--------|----------|
-| Add a pybind call for a compiled kernel | `astrai/extension/ops/` |
-| Add argument translation required by the compiled ABI | `astrai/extension/ops/` |
+| Add a pybind call for a compiled kernel | `astrai/extension/kernel/` |
+| Add argument translation required by the compiled ABI | `astrai/extension/kernel/` |
 | Add capability checks or implementation selection | `astrai/extension/backend/` |
 | Add a torch or third-party fallback | `astrai/extension/backend/` |
 | Add attention KV cache behavior | `astrai/extension/backend/attention.py` |

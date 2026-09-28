@@ -14,7 +14,7 @@ Public API:
       the flat ``set_table`` / ``set_planner`` / ``set_log`` / ``set_staging``
       / ``state`` / ``probe`` / ``facts`` / ``tile_vocabulary`` names are the
       same bindings in their raw dict/list shapes (see
-      ``astrai.extension.ops.gemm``); the deprecated ``ASTR_*`` variables are
+      ``astrai.extension.kernel.gemm``); the deprecated ``ASTR_*`` variables are
       one-time startup seeds
 
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
@@ -54,15 +54,14 @@ from astrai.extension.dispatch import (
     set_op,
     tensor_axes,
 )
-from astrai.extension.loader import KERNEL_NAMES, is_available
-from astrai.extension.ops import (
+from astrai.extension.kernel import (
     TensorLayout,
     attn_decode,
     attn_paged_decode,
     attn_paged_prefill,
     attn_prefill,
 )
-from astrai.extension.ops.gemm import (
+from astrai.extension.kernel.gemm import (
     facts,
     probe,
     set_log,
@@ -72,6 +71,7 @@ from astrai.extension.ops.gemm import (
     state,
     tile_vocabulary,
 )
+from astrai.extension.loader import KERNEL_NAMES, is_available
 from astrai.extension.plan import PLANNER_MODES
 
 __all__ = [

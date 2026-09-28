@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from astrai.extension import is_available
-from astrai.extension.ops import rotary_emb
+from astrai.extension.kernel import rotary_emb
 
 
 @dataclass(frozen=True)

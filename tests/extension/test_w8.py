@@ -1,6 +1,6 @@
 """Quantized-GEMM primitives: W8A16 / W8A8 / W16A16 kernel-level tests plus
 the int8 policy layer (quantizers). Kernel tests exercise the stateless
-wrappers in ``astrai.extension.ops.gemm`` against torch references built
+wrappers in ``astrai.extension.kernel.gemm`` against torch references built
 from the same quantized values; policy tests check the quantizers'
 contracts.
 """
@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from astrai.extension.ops.gemm import quant_gemm
+from astrai.extension.kernel.gemm import quant_gemm
 from astrai.extension.quantize import quantize_act_int8, quantize_weight_int8
 from tests.conftest import skip_no_kernel
 

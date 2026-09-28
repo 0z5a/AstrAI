@@ -206,7 +206,7 @@ def test_recipe_change_rebuilds_rings():
     dev = torch.device("cuda")
     x = torch.randn(8, 64, device=dev, dtype=torch.bfloat16)
     lin = _linear(6)
-    from astrai.extension.ops.quantize import K_FOLD_SLOTS
+    from astrai.extension.kernel.quantize import K_FOLD_SLOTS
 
     with fp8_autocast(enabled=True, recipe=FP8Recipe(history_len=4)):
         lin(x)

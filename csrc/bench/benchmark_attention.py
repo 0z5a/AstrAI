@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from astrai.extension import is_available
-from astrai.extension.ops import (
+from astrai.extension.kernel import (
     attn_decode,
     attn_paged_decode,
     attn_paged_prefill,

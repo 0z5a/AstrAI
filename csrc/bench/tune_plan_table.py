@@ -12,7 +12,7 @@ Stages run as separate processes (``run`` re-invokes this file), so each
 stage gets its own GPU clock/thermal state — the isolation the three
 standalone scripts had.
 
-Row tables are served at runtime through ``ops.gemm.set_table`` (no
+Row tables are served at runtime through ``kernel.gemm.set_table`` (no
 rebuild, no environment variable); an emitted row file can also be pasted
 into csrc/include/launcher/plan_table.h's GENERATED block, which does require a
 rebuild. The special ``model`` candidate measures every row tier off (the
@@ -35,9 +35,9 @@ from pathlib import Path
 import click
 import torch
 
-from astrai.extension import is_available, ops
+from astrai.extension import is_available, kernel
+from astrai.extension.kernel.gemm import quant_gemm
 from astrai.extension.loader import get_module
-from astrai.extension.ops.gemm import quant_gemm
 from astrai.extension.plan import Tile, device_signature
 
 
@@ -72,7 +72,7 @@ PERF_CLASS: dict[str, int] = {
 # A recipe is one tile: its CTA class, its ring depth and its k-tile depth,
 # written as a row file's (cta, stages, kK) — which is exactly the dispatch
 # key dispatch_tile matches on. The vocabulary is single-sourced from the
-# compiled binding (ops.gemm.tile_vocabulary -> gemm.cuh gemm_recipes_for):
+# compiled binding (kernel.gemm.tile_vocabulary -> gemm.cuh gemm_recipes_for):
 # the extension returns, per staging pair, every dispatch key the ladders
 # carry in dispatch (manifest) order, deduped by its own first-match rule —
 # the same rule dispatch_tile applies — so this file cannot disagree with
@@ -116,7 +116,7 @@ def _binding_vocabulary():
     """(ladders in dispatch order, geometry -> TileClass ordinal) from the
     extension binding — the same rows the extension's own planner ranks,
     so the vocabulary cannot drift from the compiled manifests."""
-    from astrai.extension import ops  # host-only: no kernel, no device
+    from astrai.extension import kernel  # host-only: no kernel, no device
 
     ladders: dict[str, list[str]] = {
         "TileManifestCross": [],
@@ -124,7 +124,7 @@ def _binding_vocabulary():
         "TileManifestByte": [],
     }
     class_of: dict[tuple[int, int], int] = {}
-    for row in ops.gemm.tile_vocabulary():
+    for row in kernel.gemm.tile_vocabulary():
         tile = Tile(*row)  # a record that still unpacks like its row
         cw, ba, bb, cta, _stages, _kk, bm, bn, _wm, _wn, _threads, _smem = tile
         name = tile.name
@@ -254,18 +254,18 @@ def _last_tag(text: str) -> str:
 
 def _planned_tag(run) -> str:
     """The decision source of one launch, with the plan log on for that
-    launch only (ops.gemm.set_log toggles the C-side flag around it, so its
+    launch only (kernel.gemm.set_log toggles the C-side flag around it, so its
     fprintf stays out of the timed loop). The tag is read from fd 2 — the
     log is C-level fprintf, not Python's stderr."""
     log = tempfile.TemporaryFile()
     saved = os.dup(2)
-    ops.gemm.set_log(True)
+    kernel.gemm.set_log(True)
     os.dup2(log.fileno(), 2)
     try:
         run()
         torch.cuda.synchronize()
     finally:
-        ops.gemm.set_log(False)
+        kernel.gemm.set_log(False)
         os.dup2(saved, 2)
         os.close(saved)
     # fd 2 shares this file's offset, so the write above left it at the end.
@@ -374,7 +374,7 @@ def sweep(
         )
 
     # Candidates are one-row tables toggled per launch through the plan API
-    # (ops.gemm.set_table), so all candidates at a shape share its GPU
+    # (kernel.gemm.set_table), so all candidates at a shape share its GPU
     # clock/thermal state. The "model" candidate measures the degraded
     # rows: it is the "this band has no table row" reference of the
     # min-gain mode, not a planner.
@@ -387,7 +387,7 @@ def sweep(
     # default answers with the analytical model; a table-pinned process
     # with the degraded ladder).
     no_row_source = (
-        "degraded (no table)" if ops.gemm.state()["planner"] == "table" else "model"
+        "degraded (no table)" if kernel.gemm.state()["planner"] == "table" else "model"
     )
     torch.manual_seed(0)
     results = []
@@ -410,9 +410,9 @@ def sweep(
                     if recipe == "model":
                         # "-" = every row tier off: the no-row reference
                         # (the model under the shipped default).
-                        ops.gemm.set_table("-")
+                        kernel.gemm.set_table("-")
                     else:
-                        ops.gemm.set_table(candidate_rows[recipe])
+                        kernel.gemm.set_table(candidate_rows[recipe])
                     expected = no_row_source if recipe == "model" else "override"
                     if (combo, recipe) not in tags:
                         tags[(combo, recipe)] = _planned_tag(run)
@@ -452,7 +452,7 @@ def sweep(
                         f"TFLOPS",
                         flush=True,
                     )
-    ops.gemm.set_table("")
+    kernel.gemm.set_table("")
     return results
 
 
@@ -864,15 +864,15 @@ def apply_table(name: str, path: str | None, hybrid: bool = False) -> None:
     # table-only mode a miss falls to the degraded ladder, which is a
     # different deployment, not this one.
     if name == "model":
-        ops.gemm.set_planner("")
-        ops.gemm.set_table("-" if hybrid else "")
+        kernel.gemm.set_planner("")
+        kernel.gemm.set_table("-" if hybrid else "")
         return
-    ops.gemm.set_planner("" if hybrid else "table")
+    kernel.gemm.set_planner("" if hybrid else "table")
     if name == "none":
         # Every row tier off: the degraded-bands reference.
-        ops.gemm.set_table("-")
+        kernel.gemm.set_table("-")
     else:
-        ops.gemm.set_table(path or "")
+        kernel.gemm.set_table(path or "")
 
 
 def validate(
@@ -1141,7 +1141,7 @@ def _device_facts() -> dict:
     binding (the cache key cannot drift from the autotuner's)."""
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA is required")
-    from astrai.extension.ops.gemm import facts
+    from astrai.extension.kernel.gemm import facts
 
     return facts()
 
@@ -1339,7 +1339,7 @@ def main(
         dest = _install(candidate, out_dir, sig, sys.argv[1:])
     click.echo(f"installed: {dest}")
     click.echo(
-        f'serve without rebuild: ops.gemm.set_table("{dest}")\n'
+        f'serve without rebuild: kernel.gemm.set_table("{dest}")\n'
         "(the runtime autotuner picks it up as its cache automatically)"
     )
 

@@ -3,10 +3,10 @@
 The policy layer over the kernel side's single quantize family
 (``csrc/quantize/`` — the fp8 quantize entry plus the int8
 dequant the GEMM family consumes). Stateless kernel adapters live one
-layer down (``ops/quantize.py`` / ``ops/gemm.py`` — the only modules
+layer down (``kernel/quantize.py`` / ``kernel/gemm.py`` — the only modules
 touching the pybind).
 
-INT8 (inference, stateless strategies consumed with ``ops.gemm``'s
+INT8 (inference, stateless strategies consumed with ``kernel.gemm``'s
 ``mm_w8*`` primitives):
 
 - ``quantize_weight_int8`` — symmetric per-channel weight quantization

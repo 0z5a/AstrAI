@@ -1,7 +1,7 @@
 # Rotary Embedding
 
 > Kernel `csrc/rotary_emb.cu`; python adapter
-> `astrai/extension/ops/rotary.py`, dispatch in
+> `astrai/extension/kernel/rotary.py`, dispatch in
 > `astrai/extension/backend/rotary.py`.
 
 ## Kernel
@@ -25,6 +25,6 @@ No context-manager switching needed — the dispatch is automatic per call.
 
 ## Wrapper
 
-`astrai/extension/ops/rotary.py` provides the wrapper for the rotary
+`astrai/extension/kernel/rotary.py` provides the wrapper for the rotary
 embedding kernel. Fallback to torch complex multiply is handled by
 `backend/rotary.py`.

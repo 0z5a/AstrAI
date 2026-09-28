@@ -59,7 +59,7 @@ def make_prep_layer(device):
 @pytest.mark.skipif(not prep_available(), reason="gated deltanet kernel not built")
 def test_prep_kernel_matches_the_torch_preparation(device):
     """Normalization and the gate scan, checked against the torch steps directly."""
-    from astrai.extension.ops.gdn import gdn_fwd
+    from astrai.extension.kernel.gdn import gdn_fwd
 
     layer = make_prep_layer(device)
     x = torch.randn(1, 128, 256, device=device, dtype=torch.bfloat16)
@@ -84,7 +84,7 @@ def test_prep_kernel_matches_the_torch_preparation(device):
 @pytest.mark.skipif(not prep_available(), reason="gated deltanet kernel not built")
 def test_prep_rejects_tensors_that_do_not_carry_the_projection_layout(device):
     """A contiguous [B, T, H, D] tensor would be read as the wrong elements."""
-    from astrai.extension.ops.gdn import gdn_fwd
+    from astrai.extension.kernel.gdn import gdn_fwd
 
     layer = make_prep_layer(device)
     x = torch.randn(1, 64, 256, device=device, dtype=torch.bfloat16)

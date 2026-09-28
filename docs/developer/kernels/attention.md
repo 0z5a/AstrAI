@@ -1,7 +1,7 @@
 # Attention
 
 > Kernel modules `csrc/attention/` (module list in the [family overview](README.md#overview)); 
-> python adapters in `astrai/extension/ops/attention.py`, dispatch policy in `astrai/extension/backend/attention.py`.
+> python adapters in `astrai/extension/kernel/attention.py`, dispatch policy in `astrai/extension/backend/attention.py`.
 
 ## Attention Backend
 
@@ -37,7 +37,7 @@ only) and finally to torch SDPA.
 
 ## Python Wrappers
 
-`astrai/extension/ops/attention.py` provides Python wrappers for each compiled attention kernel. Each wrapper calls its CUDA kernel directly and raises `RuntimeError` if the `.so` is not available. Fallback to torch SDPA is handled by the attention backend, not the wrapper functions.
+`astrai/extension/kernel/attention.py` provides Python wrappers for each compiled attention kernel. Each wrapper calls its CUDA kernel directly and raises `RuntimeError` if the `.so` is not available. Fallback to torch SDPA is handled by the attention backend, not the wrapper functions.
 
 
 Interface (all functions):
@@ -179,7 +179,7 @@ decode bandwidth reduction.
 
 `csrc/gated_deltanet/` holds the kernels that had to be CUDA. The module
 is `gated_deltanet` and exposes `gated_deltanet_fwd` and `gated_deltanet_bwd`; the
-Python wrappers live in `astrai/extension/ops/gdn.py`, where `gdn_fwd` mirrors the
+Python wrappers live in `astrai/extension/kernel/gdn.py`, where `gdn_fwd` mirrors the
 entry point it calls.
 
 ### `gated_deltanet_fwd`: preparation

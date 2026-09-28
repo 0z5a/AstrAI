@@ -193,7 +193,7 @@ Three-layer separation (SGLang-inspired):
 The extension package separates mechanism from policy:
 
 - `astrai/extension/loader.py` discovers and lazily loads the compiled kernel modules (`.so` name = module name = pybind name).
-- `astrai/extension/ops/` contains stateless adapters — one file per compiled kernel module — that call their kernel directly and fail when it is unavailable.
+- `astrai/extension/kernel/` contains stateless adapters — one file per compiled kernel module — that call their kernel directly and fail when it is unavailable.
 - `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O (`dispatch.py` is the family-agnostic selection core it registers into).
 - `astrai/extension/quantize.py` holds every quantization scheme (int8 strategies, fp8 recipes and autocast); its `aten::linear` override installs lazily on the first fp8 activation, so plain imports stay dispatcher-neutral.
 - Model and inference code use the stable `astrai.extension` API instead of selecting ops directly.
@@ -219,7 +219,7 @@ with attn_backend(ATTN_BACKEND.CUDA):
 
 Layout convention: all q/k/v are `[batch, seq_len, n_heads, head_dim]` (blhd). Scale is always `1/sqrt(head_dim)`.
 
-Direct imports from `astrai.extension.ops` are reserved for low-level kernel tests and code that intentionally requires a specific compiled implementation. They do not provide fallback.
+Direct imports from `astrai.extension.kernel` are reserved for low-level kernel tests and code that intentionally requires a specific compiled implementation. They do not provide fallback.
 
 ## Mask Algorithm Internals
 
