@@ -334,21 +334,22 @@ class InferenceEngine:
         request_backend = get_backend(use_default=False)
         result = GenerateResult(count=n)
         sink = _ResultSink(result)
-        task_ids = []
-        for i, p in enumerate(prompts):
-            task_id = self.scheduler.add_task(
-                prompt=p,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                frequency_penalty=frequency_penalty,
-                rep_window=rep_window,
-                backend=request_backend,
-                stream_callback=sink,
-            )
+        # One batched add: a single encode_batch call tokenizes every prompt
+        # (per-prompt add_task serializes the tokenizer and delays the first
+        # prefill launch behind the whole batch's host work).
+        task_ids = self.scheduler.add_tasks(
+            prompts=prompts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            rep_window=rep_window,
+            backend=request_backend,
+            stream_callbacks=[sink] * n,
+        )
+        for i, task_id in enumerate(task_ids):
             sink.bind(task_id, i)
-            task_ids.append(task_id)
 
         if not stream:
             try:

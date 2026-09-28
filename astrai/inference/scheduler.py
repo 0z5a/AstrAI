@@ -176,6 +176,10 @@ class InferenceScheduler:
     def add_task(self, prompt: str, **kwargs) -> str:
         return self._task_mgr.add_task(prompt, **kwargs)
 
+    def add_tasks(self, prompts: List[str], **kwargs) -> List[str]:
+        """Batch add with one tokenizer ``encode_batch``; see TaskManager."""
+        return self._task_mgr.add_tasks(prompts, **kwargs)
+
     def cancel_task(self, task_id: str) -> bool:
         """Cancel a waiting or active task without freeing in-use KV state."""
         immediate, cancelled = self._task_mgr.cancel_task(task_id)

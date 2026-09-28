@@ -149,12 +149,12 @@ def test_engine_generate_non_streaming_single():
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
 
-        def fake_add(prompt, **kw):
-            cb = kw["stream_callback"]
+        def fake_add_tasks(prompts, **kw):
+            cb = kw["stream_callbacks"][0]
             cb([("task-1", "response"), ("task-1", STOP)])
-            return "task-1"
+            return ["task-1"]
 
-        instance.add_task.side_effect = fake_add
+        instance.add_tasks.side_effect = fake_add_tasks
         instance.remove_task.return_value = []
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
@@ -167,19 +167,19 @@ def test_engine_generate_streaming_yields_tokens():
 
     callbacks_saved = []
 
-    def capture_cb(prompt, **kw):
-        callbacks_saved.append(kw.get("stream_callback"))
-        return "task-0"
+    def capture_cbs(prompts, **kw):
+        callbacks_saved.append(kw.get("stream_callbacks"))
+        return ["task-0"]
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
-        instance.add_task.side_effect = capture_cb
+        instance.add_tasks.side_effect = capture_cbs
         instance.remove_task.return_value = []
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         gen = eng.generate("hello", stream=True)
 
-        cb = callbacks_saved[0]
+        cb = callbacks_saved[0][0]
         cb([("task-0", "t1")])
         cb([("task-0", "t2")])
         cb([("task-0", STOP)])
@@ -192,18 +192,18 @@ def test_engine_stream_close_cancels_unfinished_task():
     mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
     callbacks_saved = []
 
-    def capture_cb(prompt, **kwargs):
-        callbacks_saved.append(kwargs["stream_callback"])
-        return "task-1"
+    def capture_cbs(prompts, **kwargs):
+        callbacks_saved.append(kwargs["stream_callbacks"])
+        return ["task-1"]
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
-        instance.add_task.side_effect = capture_cb
+        instance.add_tasks.side_effect = capture_cbs
 
         engine = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         stream = engine.generate("hello", stream=True)
 
-        callbacks_saved[0]([("task-1", "t1")])
+        callbacks_saved[0][0]([("task-1", "t1")])
         assert next(stream) == "t1"
         stream.close()
 
@@ -271,16 +271,19 @@ def test_engine_generate_non_streaming_batch():
     counter = itertools.count()
     task_ids = []
 
-    def fake_add(prompt, **kw):
-        cb = kw["stream_callback"]
-        tid = f"task-{next(counter)}"
-        task_ids.append(tid)
-        cb([(tid, "r"), (tid, STOP)])
-        return tid
+    def fake_add_tasks(prompts, **kw):
+        cbs = kw["stream_callbacks"]
+        ids = []
+        for _ in prompts:
+            tid = f"task-{next(counter)}"
+            task_ids.append(tid)
+            cbs[0]([(tid, "r"), (tid, STOP)])
+            ids.append(tid)
+        return ids
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
-        instance.add_task.side_effect = fake_add
+        instance.add_tasks.side_effect = fake_add_tasks
         instance.remove_task.return_value = []
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=2)
@@ -298,7 +301,7 @@ def test_engine_generate_zero_max_tokens_returns_empty():
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=2)
         assert eng.generate(["hello", "world"], max_tokens=0) == ["", ""]
-        instance.add_task.assert_not_called()
+        instance.add_tasks.assert_not_called()
 
 
 def test_engine_generate_zero_max_tokens_stream_is_empty():
@@ -308,7 +311,7 @@ def test_engine_generate_zero_max_tokens_stream_is_empty():
         instance = MockSched.return_value
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         assert list(eng.generate("hello", stream=True, max_tokens=0)) == []
-        instance.add_task.assert_not_called()
+        instance.add_tasks.assert_not_called()
 
 
 def test_engine_passes_backend_to_scheduler():
@@ -332,12 +335,12 @@ def test_generate_captures_calling_backend_context():
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
 
-        def fake_add(prompt, **kwargs):
+        def fake_add_tasks(prompts, **kwargs):
             captured.append(kwargs["backend"])
-            kwargs["stream_callback"]([("task", STOP)])
-            return "task"
+            kwargs["stream_callbacks"][0]([("task", STOP)])
+            return ["task"]
 
-        instance.add_task.side_effect = fake_add
+        instance.add_tasks.side_effect = fake_add_tasks
         engine = InferenceEngine(mock_model, mock_tokenizer)
         with attn_backend("torch_native"):
             assert engine.generate("hello") == ""
@@ -369,11 +372,11 @@ def test_build_engine_passes_engine_kwargs_through():
     backend = TorchNativeBackend()
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
 
-        def fake_add(*args, **k):
-            k["stream_callback"]([("task", STOP)])
-            return "task"
+        def fake_add_tasks(*args, **k):
+            k["stream_callbacks"][0]([("task", STOP)])
+            return ["task"]
 
-        MockSched.return_value.add_task.side_effect = fake_add
+        MockSched.return_value.add_tasks.side_effect = fake_add_tasks
         engine = build_engine(
             model=model,
             tokenizer=FakeTokenizer(),

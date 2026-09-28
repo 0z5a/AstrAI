@@ -82,9 +82,10 @@ class DecodeSteadyState:
 
 def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
     pin = str(device).startswith("cuda")
-    freq_penalties = torch.tensor(
-        [t.frequency_penalty for t in tasks], dtype=torch.float32, pin_memory=pin
-    ).to(device, non_blocking=True)
+    freq_list = [t.frequency_penalty for t in tasks]
+    freq_penalties = torch.tensor(freq_list, dtype=torch.float32, pin_memory=pin).to(
+        device, non_blocking=True
+    )
     return SamplingBatchInfo(
         temperatures=torch.tensor(
             [t.temperature for t in tasks], dtype=torch.float32, pin_memory=pin
@@ -96,7 +97,11 @@ def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
             [t.top_p for t in tasks], dtype=torch.float32, pin_memory=pin
         ).to(device, non_blocking=True),
         freq_penalties=freq_penalties,
-        has_freq=bool((freq_penalties != 0).any()),
+        # Host-side any(): the values came from the task list, so checking
+        # them on device would force a synchronize right after the
+        # non-blocking H2D copies — draining whatever prefill work is still
+        # queued (measured 0.6 s stall at batch 128).
+        has_freq=any(f != 0.0 for f in freq_list),
     )
 
 
