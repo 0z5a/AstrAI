@@ -266,7 +266,9 @@ The loss is divided by `grad_accum_steps` before `backward()`, so gradients sum 
 
 ### Effective batch size
 
-$$ \text{Effective batch} = \text{dp\_size} \times \text{batch\_per\_device} \times \text{grad\_accum\_steps} $$
+```
+effective_batch = dp_size × batch_per_device × grad_accum_steps
+```
 
 ### Total optimizer steps
 

@@ -362,7 +362,7 @@ csrc/
 ├── quantize/                         # family translation units (→ module quantize; entry.cu also compiled into gemm to share the chain)
 │   ├── bindings.cu                   #   pybind surface only (quantize / quantize_dual)
 │   └── entry.cu                      #   the entry implementation: run_quantize + ring binding + dtype dispatch (ASTRAI_QUANT_IN_DTYPES lives here)
-├── gated_deltanet/                   # chunked GDN fwd/bwd kernels written in-TU + bindings.cu (→ module gated_deltanet)
+├── gated_deltanet/                   # chunked GDN fwd/bwd kernels in-TU, one module, both defs in the fwd TU tail (→ module gated_deltanet)
 ├── rotary_emb.cu                     # rotary embedding (kernel + binding in one file) → module rotary_emb
 ├── bench/                            # measurement + dispatch-analysis tooling, run from the repo root as `python csrc/bench/<tool>.py`
 │   ├── bench_tile_sweep.cu           #   cell-level tile/warp/kK sweep; standalone nvcc line in its header (no CMake target)

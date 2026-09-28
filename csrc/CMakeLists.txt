@@ -123,8 +123,7 @@ set(KERNEL_MODULES
     "attn_paged_prefill|attention/paged_prefill.cu"
     "rotary_emb|rotary_emb.cu"
     "gated_deltanet|gated_deltanet/gated_deltanet_fwd.cu
-         gated_deltanet/gated_deltanet_bwd.cu
-         gated_deltanet/bindings.cu"
+         gated_deltanet/gated_deltanet_bwd.cu"
 )
 
 if(ASTRAI_CUDA_ARCH_LIST)
