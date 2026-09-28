@@ -458,3 +458,27 @@ def test_page_pool_paged_ps64_bind_roundtrip():
     indices = kv.req_to_token[kv.req_pool_indices, :128]
     gathered_k = kv.k_buffer[0, indices]
     assert torch.allclose(gathered_k, k)
+
+
+def test_page_pool_paged_steady_decode_slots_reach_device():
+    """The extend fast path stages slot ids on the host; every bind (the
+    steady incremental decode path included) gathers req_to_token rows
+    on-device, so the staged tails must land there before the gather."""
+    pool = _make_paged_pool(n_tokens=64, max_seq_len=16)
+    task_cache = _make_task_cache(pool)
+    ws = _ws(pool)
+    prompt = list(range(4))
+    assert task_cache.task_alloc("t1", prompt)
+
+    # Prefill bind flushes the whole staged prefix.
+    task_cache.bind(["t1"], ws, start_pos=0)
+    state = task_cache._states["t1"]
+
+    # Decode steps: extend stages one slot per token, bind (incremental or
+    # not) must push it to the device row.
+    for pos in range(4, 10):
+        assert task_cache.task_extend("t1", pos)
+        task_cache.bind(["t1"], ws)
+        device_row = pool.req_pool.req_to_token[state.req_idx, : pos + 1].tolist()
+        expected = [p * pool.page_size for p in state.pages[: pos + 1]]
+        assert device_row == expected

@@ -16,6 +16,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, OrderedDict
 
+import torch
+
 from astrai.model.kv_cache import ReqToTokenPool
 
 # ---- data contract: per-task slot state ----
@@ -28,12 +30,19 @@ class TaskCacheState:
     Co-locates all task-owned cache metadata so the alloc/free/extend
     lifecycle is atomic.  Owned by ``TaskCacheManager``, consumed by
     every ``AllocationStrategy`` method.
+
+    ``slots`` mirrors the page-size-1 tail of ``req_to_token[req_idx]`` on
+    the host: ``extend`` appends to it instead of issuing one tiny H2D copy
+    per decoded token, and ``write_indices`` flushes the prefix it did not
+    already cover in one bulk write.
     """
 
     req_idx: int
     length: int = 0
     cached: int = 0
     pages: List[int] = field(default_factory=list)
+    _slots: List[int] = field(default_factory=list)
+    _flushed: int = 0
 
 
 # ---- allocation primitives ----
@@ -66,6 +75,40 @@ class Allocator:
                 return idx
             return -1
 
+    def alloc_many(self, n: int) -> Optional[List[int]]:
+        """Allocate up to ``n`` pages, or ``None`` if fewer are free.
+
+        A whole prompt's pages in one lock acquisition and one mask scan:
+        per-page ``alloc`` costs a lock round-trip and a bit extraction per
+        token, which dominated host time at serving batch sizes (575 calls
+        per 512-token prompt). Falls back to LRU eviction page-by-page when
+        the free mask alone cannot satisfy the request.
+        """
+        if n <= 0:
+            return []
+        with self._lock:
+            free = bin(self._free_mask).count("1")
+            if free < n:
+                promoted = 0
+                while free + promoted < n and self._lru:
+                    idx, _ = self._lru.popitem(last=False)
+                    if self.on_evict:
+                        self.on_evict(idx)
+                    self._free_mask |= 1 << idx
+                    promoted += 1
+                if free + promoted < n:
+                    return None
+            out: List[int] = []
+            mask = self._free_mask
+            while len(out) < n:
+                lsb = mask & -mask
+                idx = lsb.bit_length() - 1
+                out.append(idx)
+                mask ^= lsb
+                self._refs[idx] = 1
+            self._free_mask = mask
+            return out
+
     def free(self, idx: int, keep_cached: bool = False):
         with self._lock:
             self._refs[idx] -= 1
@@ -74,6 +117,25 @@ class Allocator:
                     self._lru[idx] = None
                 else:
                     self._free_mask |= 1 << idx
+
+    def free_many(self, idxs: List[int], keep_cached_for=None):
+        """Release many pages under one lock acquisition.
+
+        ``keep_cached_for`` is a predicate over the page index: pages it
+        accepts stay in the LRU (prefix-cache hits), the rest return to the
+        free mask.
+        """
+        if not idxs:
+            return
+        keep = keep_cached_for or (lambda idx: False)
+        with self._lock:
+            for idx in idxs:
+                self._refs[idx] -= 1
+                if self._refs[idx] == 0:
+                    if keep(idx):
+                        self._lru[idx] = None
+                    else:
+                        self._free_mask |= 1 << idx
 
     def inc_ref(self, idx: int):
         with self._lock:
@@ -213,6 +275,14 @@ class AllocationStrategy(ABC):
         start: int,
     ) -> None: ...
 
+    def flush_slots(self, states: List[TaskCacheState], device) -> None:
+        """Push host-staged slot maps to the device row.
+
+        Only the paged strategy stages slots on the host; the default is a
+        no-op for strategies whose req_to_token rows are already current
+        (contiguous rows are pre-filled and never rewritten).
+        """
+
     def invalidate_cache(self) -> int:
         """Drop reusable KV entries after an inference weight update."""
         return 0
@@ -281,23 +351,20 @@ class PagedStrategy(AllocationStrategy):
         if remaining <= 0:
             return True
         n_new = (remaining + self._page_size - 1) // self._page_size
-        for _ in range(n_new):
-            p = self._alloc.alloc()
-            if p < 0:
-                return False
-            state.pages.append(p)
+        new_pages = self._alloc.alloc_many(n_new)
+        if new_pages is None:
+            return False
+        state.pages.extend(new_pages)
         return True
 
     def free(self, state: TaskCacheState) -> None:
         if self._prefix is not None:
+            self._alloc.free_many(state.pages, keep_cached_for=self._prefix.has_page)
             for p in state.pages:
-                keep = self._prefix.has_page(p)
-                self._alloc.free(p, keep_cached=keep)
-                if not keep:
+                if not self._prefix.has_page(p):
                     self._prefix.evict(p)
         else:
-            for p in state.pages:
-                self._alloc.free(p)
+            self._alloc.free_many(state.pages)
 
     def extend(self, state: TaskCacheState, pos: int) -> bool:
         page_idx = pos // self._page_size
@@ -306,21 +373,61 @@ class PagedStrategy(AllocationStrategy):
             if p < 0:
                 return False
             state.pages.append(p)
-        offset = pos % self._page_size
-        self._req_pool.req_to_token[state.req_idx, pos] = (
-            state.pages[page_idx] * self._page_size + offset
-        )
+        slot = state.pages[page_idx] * self._page_size + pos % self._page_size
+        if self._page_size == 1 and pos == len(state._slots):
+            # page_size=1 fast path: positions arrive in order, so the slot
+            # list extends by one element instead of each call issuing a
+            # single-element H2D copy to req_to_token (128 such copies per
+            # decode step at serving batch sizes). _slots is flushed to the
+            # device in bulk by write_indices/bind.
+            state._slots.append(slot)
+            return True
+        self._req_pool.req_to_token[state.req_idx, pos] = slot
         return True
 
     def write_indices(self, state: TaskCacheState, prompt_ids: List[int]) -> None:
-        total = len(prompt_ids)
-        for pos in range(total):
-            page_idx = pos // self._page_size
-            offset = pos % self._page_size
-            if page_idx < len(state.pages):
-                self._req_pool.req_to_token[state.req_idx, pos] = (
-                    state.pages[page_idx] * self._page_size + offset
-                )
+        total = min(len(prompt_ids), len(state.pages) * self._page_size)
+        if total <= 0:
+            return
+        # One H2D write per row: every per-position assignment is a separate
+        # tiny copy (~15us of driver overhead each), so a 512-token prompt
+        # spends ~8ms in the loop while the same row written once as a tensor
+        # costs ~60us. The position -> slot map is an affine function of the
+        # page ids, built on the host in bulk either way.
+        page_size = self._page_size
+        pages = state.pages
+        if page_size == 1:
+            vals = pages[:total]
+        else:
+            vals = []
+            for page_idx, p in enumerate(pages[: (total + page_size - 1) // page_size]):
+                base = p * page_size
+                n = min(page_size, total - page_idx * page_size)
+                vals.extend(range(base, base + n))
+        self._req_pool.req_to_token[state.req_idx, :total] = torch.tensor(
+            vals, dtype=torch.int32, device=self._device
+        )
+        state._slots = list(vals)
+        state._flushed = total
+
+    def flush_slots(self, states: List[TaskCacheState], device) -> None:
+        # One tiny H2D copy per dirty TAIL per step, all appended after the
+        # bind's device-side work is enqueued in stream order — steady-state
+        # decode also gathers req_to_token rows on-device (out_cache_loc), so
+        # the new positions must land there even on the incremental path.
+        # Writing only the unflushed tail keeps the per-step volume at one
+        # int per decoded token instead of re-sending the whole row.
+        for state in states:
+            slots = state._slots
+            n = len(slots)
+            if n <= state._flushed:
+                continue
+            start = state._flushed
+            state._flushed = n
+            row = self._req_pool.req_to_token[state.req_idx]
+            row[start:n] = torch.tensor(
+                slots[start:], dtype=torch.int32, device=self._device
+            )
 
     def record_hashes(
         self,

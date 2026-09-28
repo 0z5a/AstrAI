@@ -392,6 +392,11 @@ class TaskCacheManager:
         self._bind_state = _BindState(sig, list(seq_lens))
         self._bind_was_steady = incremental
 
+        # req_to_token rows are read on-device by every decode bind
+        # (out_cache_loc gather), incremental or not — push any host-staged
+        # slot tails so the device rows are current before the gather runs.
+        self._strategy.flush_slots(states, device or workspace.device)
+
         return self._pool.bind_tasks(
             req_indices,
             seq_lens,
