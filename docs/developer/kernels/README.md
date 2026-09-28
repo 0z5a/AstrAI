@@ -32,7 +32,7 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 |---|---|---|---|
 | Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (bindings + entry; headers: `csrc/include/`) | `astrai/extension/kernel/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
 | GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/kernel/gemm.py` |
-| Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (headers: `csrc/include/`) | `astrai/extension/kernel/attention.py`; dispatch `astrai/extension/backend/attention.py` |
+| Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (module `attention`; headers: `csrc/include/`) | `astrai/extension/kernel/attention.py`; dispatch `astrai/extension/backend/attention.py` |
 | Gated DeltaNet (chunked fwd prep / bwd output stage) | [attention.md](attention.md) (§GDN) | `csrc/gated_deltanet/` (headers: `csrc/include/`) | `astrai/extension/kernel/gdn.py` |
 | Rotary embedding | [rotary.md](rotary.md) | `csrc/rotary_emb.cu` | `astrai/extension/kernel/rotary.py`; dispatch `astrai/extension/backend/rotary.py` |
 
@@ -310,7 +310,7 @@ csrc/
 │   │   ├── gemm_mainloop.cuh         #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
 │   │   ├── attention_launch.cuh      #     pure-CUDA launch vocabulary: launchers + tile-config maps + dispatch_decode/prefill(_paged) funnels, split-K math
 │   │   ├── attention_split_kv.cuh    #     decode kernel (split-KV FlashDecoding, GQA head packing) + split-combine
-│   │   ├── attention_split_q.cuh     #     prefill kernel (split-Q, GQA head packing)
+│   │   ├── attention_split_q.cuh     #     prefill kernel (split-Q, PackGQA head folding: h = idx % G over the global packed row index)
 │   │   └── quantize.cuh              #     quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
 │   ├── memory/                       # data movement with stage semantics
 │   │   ├── load.cuh                  #     gemm operand loaders (typed staged tiles, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
@@ -346,7 +346,7 @@ csrc/
 │   └── launcher/                     # THE DISPATCH MACHINERY — the planner chain and the row table behind the api/ surface; both are deliberate impl-headers (they are why this directory still exists)
 │       ├── planning.h                #     the planner chain + recipe vocabulary + plan_raster; plan_dispatch defined non-inline — SINGLE-INCLUSION (one TU per binary: gemm.cu or a standalone harness)
 │       └── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded sources + GemmConfig seed
-├── attention/                        # family translation units only (one torch entry each; kernels/launchers/dispatch in the shared kernel/ headers)
+├── attention/                        # family translation units + one bindings.cu (→ module attention; kernels/launchers/dispatch in the shared kernel/ headers)
 │   ├── entry.h                       #   attention torch→POD marshalling (pack_*_params, split-partial allocation) — TU-local impl header, quoted-include (fp8_state.h shape)
 │   ├── decode.cu                     #   → module attn_decode
 │   ├── prefill.cu                    #   → module attn_prefill
@@ -362,7 +362,7 @@ csrc/
 ├── quantize/                         # family translation units (→ module quantize; entry.cu also compiled into gemm to share the chain)
 │   ├── bindings.cu                   #   pybind surface only (quantize / quantize_dual)
 │   └── entry.cu                      #   the entry implementation: run_quantize + ring binding + dtype dispatch (ASTRAI_QUANT_IN_DTYPES lives here)
-├── gated_deltanet/                   # chunked GDN fwd/bwd kernels in-TU, one module, both defs in the fwd TU tail (→ module gated_deltanet)
+├── gated_deltanet/                   # chunked GDN fwd/bwd kernels written in-TU + bindings.cu (→ module gated_deltanet)
 ├── rotary_emb.cu                     # rotary embedding (kernel + binding in one file) → module rotary_emb
 ├── bench/                            # measurement + dispatch-analysis tooling, run from the repo root as `python csrc/bench/<tool>.py`
 │   ├── bench_tile_sweep.cu           #   cell-level tile/warp/kK sweep; standalone nvcc line in its header (no CMake target)

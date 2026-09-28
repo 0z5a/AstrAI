@@ -117,13 +117,15 @@ set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
 # that cannot compile. The remaining kernels are still useful on sm_80+
 # (including sm_86).
 set(KERNEL_MODULES
-    "attn_decode|attention/decode.cu"
-    "attn_prefill|attention/prefill.cu"
-    "attn_paged_decode|attention/paged_decode.cu"
-    "attn_paged_prefill|attention/paged_prefill.cu"
+    "attention|attention/decode.cu
+         attention/prefill.cu
+         attention/paged_decode.cu
+         attention/paged_prefill.cu
+         attention/bindings.cu"
     "rotary_emb|rotary_emb.cu"
     "gated_deltanet|gated_deltanet/gated_deltanet_fwd.cu
-         gated_deltanet/gated_deltanet_bwd.cu"
+         gated_deltanet/gated_deltanet_bwd.cu
+         gated_deltanet/bindings.cu"
 )
 
 if(ASTRAI_CUDA_ARCH_LIST)

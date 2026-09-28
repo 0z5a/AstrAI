@@ -49,7 +49,7 @@ def attn_decode(
     Returns:
         [batch, 1, n_heads, head_dim] (blhd, bf16)
     """
-    mod = get_module("attn_decode")
+    mod = get_module("attention")
     causal_offset = (k.size(1) - 1) if is_causal else -1
     return mod.attn_decode(
         q, k, v, mask=mask, causal_offset=causal_offset, layout=TensorLayout.BLHD
@@ -75,7 +75,7 @@ def attn_prefill(
     Returns:
         [batch, q_len, n_heads, head_dim] (blhd, bf16)
     """
-    mod = get_module("attn_prefill")
+    mod = get_module("attention")
     causal_offset = (k.size(1) - q.size(1)) if is_causal else -1
     return mod.attn_prefill(
         q, k, v, mask=mask, causal_offset=causal_offset, layout=TensorLayout.BLHD
@@ -121,7 +121,7 @@ def attn_paged_decode(
     Returns:
         [batch, n_heads, head_dim] (bf16, 3D)
     """
-    mod = get_module("attn_paged_decode")
+    mod = get_module("attention")
     causal_offset = 0 if is_causal else -1
     return mod.attn_paged_decode(
         q,
@@ -175,7 +175,7 @@ def attn_paged_prefill(
     Returns:
         [total_q, n_heads, head_dim] (bf16, 3D)
     """
-    mod = get_module("attn_paged_prefill")
+    mod = get_module("attention")
     causal_offset = 0 if is_causal else -1
     return mod.attn_paged_prefill(
         q,

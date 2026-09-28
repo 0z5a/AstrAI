@@ -29,26 +29,10 @@ torch::Tensor attn_prefill(torch::Tensor q,
     auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
     p.o_ptr = O_view.data_ptr();
 
-    switch (q.scalar_type()) {
-#define ASTRAI_ATTN_DTYPE_ROW(tag, type)                                                           \
-    case tag:                                                                                      \
-        dispatch_prefill<type>(p, stream);                                                         \
-        break;
-        ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
-#undef ASTRAI_ATTN_DTYPE_ROW
-    default:
-        attn_dtype_unsupported(q.scalar_type());
-    }
+    attn_dtype_dispatch<AttnDispatchPrefill>(q.scalar_type(), p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }
 
 } // namespace attention
 } // namespace astrai
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_prefill", &astrai::attention::attn_prefill, py::arg("q"), py::arg("k"),
-          py::arg("v"), py::arg("mask") = py::none(), py::arg("causal_offset") = -1,
-          py::arg("scale") = 0.0, py::arg("layout") = (int64_t)astrai::attention::BHLD,
-          "GQA prefill (tensor-core mma on sm_80+)");
-}

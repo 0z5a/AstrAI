@@ -100,15 +100,11 @@ template <typename QSchedule, typename KV> struct PrefillLauncher {
         using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
         using Traits =
             KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES, typename KV::Elem>;
-        // GQA head packing: HB = min(G, WARPS) q-heads share each block's
-        // K/V stream (~HB× less traffic); G=1 (MHA) reproduces the
-        // historical grid exactly. See the prefill kernel header for the
-        // full warp-to-head/chunk mapping.
-        const int G = p.q_head / p.kv_head;
-        const int HB = std::min(G, Config::WARPS);
-        const int WPH = Config::WARPS / HB;
-        constexpr int BR = Traits::BR;
-        dim3 grid(QSchedule::packed_grid_x(p, BR * WPH), p.kv_head * ((G + HB - 1) / HB),
+        // PackGQA-folded grid: each block owns BLOCK_M packed (head,row) rows
+        // of the request's packed space; grid.y is the kv head (see the
+        // prefill kernel header for the fold math).
+        constexpr int BLOCK_M = Traits::BR * Config::WARPS;
+        dim3 grid(QSchedule::packed_grid_x(p, BLOCK_M, BLOCK_M), p.kv_head,
                   QSchedule::host_grid_batch(p));
         dim3 block(Traits::NUM_THREADS);
         attn_prefill_split_q_mma_kernel<Traits, QSchedule, KV, IsCausal, HasMask>
@@ -231,6 +227,26 @@ template <typename T>
 static inline void dispatch_paged_decode(AttentionParams& p, cudaStream_t stream) {
     dispatch_head_dim<DispatchPagedDecode<T>>(p, stream);
 }
+
+// Per-family wrappers: a class template per entry (function templates
+// cannot be template-template arguments), each forwarding to the free
+// dispatch function above.
+template <typename T> struct AttnDispatchDecode {
+    static void run(AttentionParams& p, cudaStream_t stream) { dispatch_decode<T>(p, stream); }
+};
+template <typename T> struct AttnDispatchPrefill {
+    static void run(AttentionParams& p, cudaStream_t stream) { dispatch_prefill<T>(p, stream); }
+};
+template <typename T> struct AttnDispatchPagedDecode {
+    static void run(AttentionParams& p, cudaStream_t stream) {
+        dispatch_paged_decode<T>(p, stream);
+    }
+};
+template <typename T> struct AttnDispatchPagedPrefill {
+    static void run(AttentionParams& p, cudaStream_t stream) {
+        dispatch_paged_prefill<T>(p, stream);
+    }
+};
 
 } // namespace attention
 } // namespace astrai

@@ -43,10 +43,6 @@ namespace attention {
 // ============================================================================
 
 struct DenseQSchedule {
-    static HOST_FORCEINLINE int host_q_blocks(const AttentionParams& p, int rows) {
-        return (p.q_len + rows - 1) / rows;
-    }
-
     static HOST_FORCEINLINE int host_grid_batch(const AttentionParams& p) { return p.batch; }
 
     static DEVICE_FORCEINLINE void map_block(const AttentionParams&, int& batch, int& q_tile) {
@@ -54,17 +50,21 @@ struct DenseQSchedule {
         q_tile = blockIdx.x;
     }
 
-    // GQA-packed prefill mapping: HB q-heads of one kv-head group share a
-    // block's K/V stream, each head owning `rows` = BR*WPH consecutive q rows
-    // per block.  Dense tensors tile q_len directly, one block per range.
-    static HOST_FORCEINLINE int packed_grid_x(const AttentionParams& p, int rows) {
-        return (p.q_len + rows - 1) / rows;
+    // PackGQA-folded prefill mapping: the block's row space is the packed
+    // (head, row) space of the request — G heads folded, h = idx % G,
+    // m = idx / G over the GLOBAL packed index (a per-block offset would
+    // shift the head phase when block_m % G != 0). Dense tensors tile the
+    // packed space G*q_len directly.
+    static HOST_FORCEINLINE int
+    packed_grid_x(const AttentionParams& p, int, int block_m) {
+        const int G = p.q_head / p.kv_head;
+        return (p.q_len * G + block_m - 1) / block_m;
     }
 
     static DEVICE_FORCEINLINE void
-    map_packed_block(const AttentionParams&, int rows, int& batch, int& row_base) {
+    map_packed_block(const AttentionParams&, int block_m, int& batch, int& packed0) {
         batch = blockIdx.z;
-        row_base = blockIdx.x * rows;
+        packed0 = blockIdx.x * block_m;
     }
 
     static DEVICE_FORCEINLINE int q_len(const AttentionParams& p, int) { return p.q_len; }
@@ -86,20 +86,27 @@ struct PackedQSchedule {
         q_tile = p.q_tile_to_index[blockIdx.x];
     }
 
-    // GQA-packed prefill mapping: the host tile maps are built in
-    // HOST_Q_TILE_ROWS granularity, so each host tile splits into
-    // HOST_Q_TILE_ROWS / rows packed blocks along blockIdx.x.
-    static HOST_FORCEINLINE int packed_grid_x(const AttentionParams& p, int rows) {
-        return p.num_q_tiles * (HOST_Q_TILE_ROWS / rows);
+    // PackGQA-folded prefill mapping: the host tile maps are built in
+    // HOST_Q_TILE_ROWS granularity and stay head-agnostic; host tile t covers
+    // rows [t*HQR, (t+1)*HQR) of every head, i.e. packed idx
+    // [t*HQR*G, ...+HQR*G). Blocks carve that space in block_m steps; the
+    // kernel decodes h = idx % G over the request-local packed index.
+    // qo_indptr is a device pointer — the host grid derives from the tile
+    // count alone (a request's last tile is padded up by the host builder).
+    static HOST_FORCEINLINE int
+    packed_grid_x(const AttentionParams& p, int, int block_m) {
+        const int blocks_per_host_tile = (p.q_head / p.kv_head) * HOST_Q_TILE_ROWS / block_m;
+        return p.num_q_tiles * blocks_per_host_tile;
     }
 
     static DEVICE_FORCEINLINE void
-    map_packed_block(const AttentionParams& p, int rows, int& batch, int& row_base) {
-        const int hb = HOST_Q_TILE_ROWS / rows;
-        const int host_tile = blockIdx.x / hb;
+    map_packed_block(const AttentionParams& p, int block_m, int& batch, int& packed0) {
+        const int G = p.q_head / p.kv_head;
+        const int blocks_per_host_tile = G * HOST_Q_TILE_ROWS / block_m;
+        const int host_tile = blockIdx.x / blocks_per_host_tile;
         batch = p.q_tile_to_batch[host_tile];
-        row_base =
-            p.q_tile_to_index[host_tile] * HOST_Q_TILE_ROWS + (blockIdx.x - host_tile * hb) * rows;
+        const int in_tile = blockIdx.x - host_tile * blocks_per_host_tile;
+        packed0 = p.q_tile_to_index[host_tile] * HOST_Q_TILE_ROWS * G + in_tile * block_m;
     }
 
     static DEVICE_FORCEINLINE int q_len(const AttentionParams& p, int batch) {

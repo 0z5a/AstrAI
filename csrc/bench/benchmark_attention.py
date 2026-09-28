@@ -564,10 +564,10 @@ def benchmark_command(
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA is required")
     kernel_for_suite = {
-        "decode": "attn_decode",
-        "prefill": "attn_prefill",
-        "paged_decode": "attn_paged_decode",
-        "paged_prefill": "attn_paged_prefill",
+        "decode": "attention",
+        "prefill": "attention",
+        "paged_decode": "attention",
+        "paged_prefill": "attention",
     }
     selected = (
         tuple(kernel_for_suite) if "all" in suites else tuple(dict.fromkeys(suites))

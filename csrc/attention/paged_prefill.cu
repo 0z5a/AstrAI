@@ -34,28 +34,10 @@ torch::Tensor attn_paged_prefill(torch::Tensor q,
     auto O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
     p.o_ptr = O.data_ptr();
 
-    switch (q.scalar_type()) {
-#define ASTRAI_ATTN_DTYPE_ROW(tag, type)                                                           \
-    case tag:                                                                                      \
-        dispatch_paged_prefill<type>(p, stream);                                                   \
-        break;
-        ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
-#undef ASTRAI_ATTN_DTYPE_ROW
-    default:
-        attn_dtype_unsupported(q.scalar_type());
-    }
+    attn_dtype_dispatch<AttnDispatchPagedPrefill>(q.scalar_type(), p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }
 
 } // namespace attention
 } // namespace astrai
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_paged_prefill", &astrai::attention::attn_paged_prefill, py::arg("q"),
-          py::arg("k_cache"), py::arg("v_cache"), py::arg("req_to_token"),
-          py::arg("req_pool_indices"), py::arg("kv_indptr"), py::arg("qo_indptr"),
-          py::arg("q_tile_to_batch"), py::arg("q_tile_to_index"), py::arg("mask") = py::none(),
-          py::arg("causal_offset") = -1, py::arg("scale") = 0.0,
-          "SGLang-style paged prefill: flat KV pool + ragged batch.");
-}

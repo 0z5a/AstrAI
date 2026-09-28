@@ -46,15 +46,23 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     __shared__ __align__(16) T sK[Traits::STAGES * Traits::BC * Traits::LD];
     __shared__ __align__(16) T sV[Traits::STAGES * Traits::BC * Traits::LD];
 
-    // Load Q directly from global into mma A-operand registers.
+    // Load Q directly from global into mma A-operand registers. The decode
+    // "rows" are GQA heads (q_len=1): off = head index * q_h_stride.
     const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
     const int q_base = KV::q_decode_base(p, batch, q_head0);
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(q_gmem + q_base, p.q_h_stride, p.q_d_stride, qra, qrb, va, vb,
-                                 tid4, Qa);
+    load_q_mma_frags<Traits::KD>(q_gmem + q_base,
+                                 q_gmem + q_base,
+                                 p.q_d_stride,
+                                 qra * p.q_h_stride,
+                                 qrb * p.q_h_stride,
+                                 va,
+                                 vb,
+                                 tid4,
+                                 Qa);
 
     float Oacc[Traits::DN8][4];
 #pragma unroll

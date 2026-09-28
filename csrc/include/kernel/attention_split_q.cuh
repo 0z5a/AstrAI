@@ -12,13 +12,15 @@ namespace attention {
 
 // Tensor-core prefill flash attention, unified across contiguous and paged
 // K/V via the KV template parameter; S = Q@K^T and O = P@V run on
-// mma.sync.m16n8k16 (f32 accumulate), one warp owning BR=16 query rows.
+// mma.sync.m16n8k16 (f32 accumulate), one warp owning 16 packed rows.
 //
-// GQA head packing (FA2/FA3-style): HB = min(G, WARPS) query heads of one
-// kv-head group share a block's K/V tiles (~HB× less K/V traffic).
-// WARPS = WPH × HB: warp w handles head slot w/WPH, chunk w%WPH; all warps
-// of a block cover the same token range, keeping the causal sweep end
-// block-uniform. G=1 (MHA) degenerates to the unpadded layout.
+// PackGQA head folding (FA3-style): the block's row space is the packed
+// (head, row) space of one kv-head group — packed idx in [0, G*rows) with
+// h = idx % G, m = idx / G. Every block covers BLOCK_M = BR*WARPS packed
+// rows of one host tile, K/V tiles loaded once per block and shared by all
+// G heads' rows; any G packs with zero idle warps (G=6 no longer wastes 25%
+// of every block). Rows past a head's q_len tail are masked per-row; G=1
+// (MHA) degenerates to the unfolded layout.
 //
 // KV = ContigKV<T> or PagedKV<T> (T = Traits::Elem); IsCausal/HasMask are
 // compile-time bools — dead branches eliminated in the compute loop.
@@ -32,23 +34,24 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     const int gid = lane >> 2; // 0..7
     const int tid4 = lane & 3; // 0..3
 
-    const int G = p.q_head / p.kv_head;
-    const int HB = min(G, Traits::WARPS); // q heads packed per block
-    const int WPH = Traits::WARPS / HB;   // 16-row chunks per head
-    const int BPG = (G + HB - 1) / HB;    // blocks per GQA group
-    const int chunk = warp % WPH;
+    constexpr int BLOCK_M = Traits::BR * Traits::WARPS; // packed rows per block
 
-    int batch, row_base;
-    QSchedule::map_packed_block(p, Traits::BR * WPH, batch, row_base);
-    const int kv_head = blockIdx.y / BPG;
-    const int slot = blockIdx.y - kv_head * BPG;
-    const int head_idx = slot * HB + warp / WPH;
-    // G % HB tail blocks: clamp idle head slots to the last head so
-    // cp.async + __syncthreads stay block-uniform; skip the O store via
-    // `active`.
-    const bool active = head_idx < G;
-    const int q_head = kv_head * G + min(head_idx, G - 1);
-    const int qrow0 = row_base + chunk * Traits::BR;
+    const int G = p.q_head / p.kv_head;
+    const int kv_head = blockIdx.y;
+
+    int batch, packed0;
+    QSchedule::map_packed_block(p, BLOCK_M, batch, packed0);
+
+    // Warp w folds packed rows [warp*BR, (warp+1)*BR) of the block; each mma
+    // row maps to (head, row-within-head) = (idx % G, idx / G) over the
+    // GLOBAL packed index (a block-local decode would shift the head phase
+    // when BLOCK_M % G != 0).
+    const int ia = packed0 + warp * Traits::BR + gid;
+    const int ib = ia + 8;
+    const int h0 = ia % G;
+    const int h1 = ib % G;
+    const int mra = ia / G; // row within the head
+    const int mrb = ib / G;
 
     // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
     const int seq_len = KV::kv_len(p, batch);
@@ -62,14 +65,23 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     __shared__ __align__(16) T sV[Traits::STAGES * Traits::BC * Traits::LD];
 
     // Load Q fragments straight from global into mma A-operand layout.
+    // Row b loads through row a's base when both rows sit in the same head
+    // (always true when 8 | G); a BR straddling a head boundary (G not a
+    // multiple of 8) loads row b through its own base instead.
     const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
-    const int q_base = QSchedule::q_base(p, batch, q_head);
-    const int qra = qrow0 + gid;
-    const int qrb = qrow0 + gid + 8;
-    const bool va = qra < q_len, vb = qrb < q_len;
+    const bool va = mra < q_len, vb = mrb < q_len;
+    const T* qb = (h1 == h0) ? q_gmem + QSchedule::q_base(p, batch, kv_head * G + h0)
+                             : q_gmem + QSchedule::q_base(p, batch, kv_head * G + h1);
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(q_gmem + q_base, p.q_l_stride, p.q_d_stride, qra, qrb, va, vb,
-                                 tid4, Qa);
+    load_q_mma_frags<Traits::KD>(q_gmem + QSchedule::q_base(p, batch, kv_head * G + h0),
+                                 qb,
+                                 p.q_d_stride,
+                                 mra * p.q_l_stride,
+                                 mrb * p.q_l_stride,
+                                 va,
+                                 vb,
+                                 tid4,
+                                 Qa);
 
     float Oacc[Traits::DN8][4];
 #pragma unroll
@@ -78,17 +90,16 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
 
     const int tiles = (seq_len + Traits::BC - 1) / Traits::BC;
-    const int qr0 = qrow0 + gid;
-    const int qr1 = qrow0 + gid + 8;
 
-    // Causal tile-skip bounds (dead code when IsCausal == false): max_kv is
-    // per-warp; block_max_kv must be uniform for the shared sweep loop.
-    const int max_kv = qrow0 + Traits::BR - 1 + causal_off;
-    const int block_max_kv = row_base + WPH * Traits::BR - 1 + causal_off;
+    // Causal tile-skip bounds (dead code when IsCausal == false): the
+    // warp-uniform sweep end covers the warp's deepest in-head row; the
+    // block bound covers the whole block's packed space for the shared loop.
+    const int warp_max_m = (packed0 + (warp + 1) * Traits::BR - 1) / G;
+    const int block_max_m = (packed0 + BLOCK_M - 1) / G;
 
     int t_end = tiles - 1;
     if constexpr (IsCausal) {
-        int bt = block_max_kv / Traits::BC;
+        int bt = (block_max_m + causal_off) / Traits::BC;
         if (bt < t_end)
             t_end = bt;
     }
@@ -118,16 +129,22 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
         int kv0 = ti * Traits::BC;
 
         // Warp-level causal skip (dead branch eliminated when IsCausal == false)
-        if (!IsCausal || kv0 <= max_kv) {
+        if (!IsCausal || kv0 <= warp_max_m + causal_off) {
 
             float Sacc[Traits::NC8][4];
             mma_compute_scores<Traits>(Qa, bK, p.scale, lane, Sacc);
 
-            int maxc0 = IsCausal ? min(seq_len, causal_off + qr0 + 1) : seq_len;
-            int maxc1 = IsCausal ? min(seq_len, causal_off + qr1 + 1) : seq_len;
-            MaskView mv{p.mask, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
-                        batch,  q_head,          q_head,          qr0,
-                        qr1};
+            int maxc0 = IsCausal ? min(seq_len, causal_off + mra + 1) : seq_len;
+            int maxc1 = IsCausal ? min(seq_len, causal_off + mrb + 1) : seq_len;
+            MaskView mv{p.mask,
+                        p.mask_b_stride,
+                        p.mask_h_stride,
+                        p.mask_l_stride,
+                        batch,
+                        kv_head * G + h0,
+                        kv_head * G + h1,
+                        mra,
+                        mrb};
             mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1, mv, va, vb, Sacc, Oacc, m0, m1, l0,
                                               l1, lane);
 
@@ -139,16 +156,17 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     float rl0 = (l0 > 1e-20f) ? (1.0f / l0) : 0.0f;
     float rl1 = (l1 > 1e-20f) ? (1.0f / l1) : 0.0f;
     T* __restrict__ o_gmem = static_cast<T*>(p.o_ptr);
-    const int o_base = QSchedule::q_base(p, batch, q_head);
+    const int o_base0 = QSchedule::q_base(p, batch, kv_head * G + h0);
+    const int o_base1 = (h1 == h0) ? o_base0 : QSchedule::q_base(p, batch, kv_head * G + h1);
 #pragma unroll
     for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
-        if (active && qr0 < q_len) {
-            astrai::store2<T>(o_gmem + o_base + qr0 * p.q_l_stride + d * p.q_d_stride,
+        if (va) {
+            astrai::store2<T>(o_gmem + o_base0 + mra * p.q_l_stride + d * p.q_d_stride,
                               Oacc[dn8][0] * rl0, Oacc[dn8][1] * rl0);
         }
-        if (active && qr1 < q_len) {
-            astrai::store2<T>(o_gmem + o_base + qr1 * p.q_l_stride + d * p.q_d_stride,
+        if (vb) {
+            astrai::store2<T>(o_gmem + o_base1 + mrb * p.q_l_stride + d * p.q_d_stride,
                               Oacc[dn8][2] * rl1, Oacc[dn8][3] * rl1);
         }
     }

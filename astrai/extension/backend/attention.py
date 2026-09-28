@@ -579,11 +579,7 @@ class CudaBackend(AttentionBackend):
 
     @classmethod
     def available(cls) -> bool:
-        return (
-            torch.cuda.is_available()
-            and is_available("attn_paged_decode")
-            and is_available("attn_paged_prefill")
-        )
+        return torch.cuda.is_available() and is_available("attention")
 
     def supports_call(
         self,
@@ -604,7 +600,7 @@ class CudaBackend(AttentionBackend):
             and q.ndim == 3
             and q.dtype == torch.bfloat16
             and q.size(-1) in self.HEAD_DIMS
-            and is_available(f"attn_paged_{fwd}")
+            and is_available("attention")
         )
 
     @staticmethod
@@ -823,9 +819,7 @@ _SPEC_CUDA = (
     & axis("ndim").eq(3)
     & axis("dtype").in_(torch.bfloat16)
     & axis("head_dim").in_(*CudaBackend.HEAD_DIMS)
-    & Spec.of(
-        lambda ax: is_available(f"attn_paged_{ax.get('fwd')}"), "paged kernels loaded"
-    )
+    & Spec.of(lambda ax: is_available("attention"), "attention module loaded")
 )
 
 _SPEC_FLASH = (

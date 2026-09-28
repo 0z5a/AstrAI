@@ -48,29 +48,10 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
     p.o_ptr = O.data_ptr();
 
     resolve_split_buffers(o_part_buf, ml_part_buf, p);
-    switch (q.scalar_type()) {
-#define ASTRAI_ATTN_DTYPE_ROW(tag, type)                                                           \
-    case tag:                                                                                      \
-        dispatch_paged_decode<type>(p, stream);                                                    \
-        break;
-        ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
-#undef ASTRAI_ATTN_DTYPE_ROW
-    default:
-        attn_dtype_unsupported(q.scalar_type());
-    }
+    attn_dtype_dispatch<AttnDispatchPagedDecode>(q.scalar_type(), p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }
 
 } // namespace attention
 } // namespace astrai
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_paged_decode", &astrai::attention::attn_paged_decode, py::arg("q"),
-          py::arg("k_cache"), py::arg("v_cache"), py::arg("req_to_token"),
-          py::arg("req_pool_indices"), py::arg("kv_indptr"), py::arg("new_k") = py::none(),
-          py::arg("new_v") = py::none(), py::arg("mask") = py::none(),
-          py::arg("causal_offset") = -1, py::arg("scale") = 0.0, py::arg("o_part_buf") = py::none(),
-          py::arg("ml_part_buf") = py::none(), py::arg("out_buf") = py::none(),
-          "SGLang-style paged decode: flat KV pool + req_to_token + kv_indptr.");
-}

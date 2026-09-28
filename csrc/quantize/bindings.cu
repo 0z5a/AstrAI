@@ -102,9 +102,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"), py::arg("dtype"),
           py::arg("transposed") = false, py::arg("ring") = py::none(), py::arg("hist_idx") = 0,
           py::arg("hist_len") = py::none(), py::arg("fp8_max") = 448.0,
-          py::arg("pow2_margin") = 1.0);
+          py::arg("pow2_margin") = 1.0,
+          "Scaled cast to fp8/int8; returns (x8|x8T, amax) — amax None without a ring");
     m.def("quantize_dual", &quantize_dual, py::arg("x"), py::arg("scale"), py::arg("dtype"),
           py::arg("transposed_dtype") = py::none(), py::arg("ring") = py::none(),
           py::arg("hist_idx") = 0, py::arg("hist_len") = py::none(), py::arg("fp8_max") = 448.0,
-          py::arg("pow2_margin") = 1.0);
+          py::arg("pow2_margin") = 1.0,
+          "One read produces both orientations: returns (x8, x8T, amax)");
 }

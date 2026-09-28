@@ -33,26 +33,10 @@ torch::Tensor attn_decode(torch::Tensor q,
     p.o_ptr = O_view.data_ptr();
 
     resolve_split_buffers(o_part_buf, ml_part_buf, p);
-    switch (q.scalar_type()) {
-#define ASTRAI_ATTN_DTYPE_ROW(tag, type)                                                           \
-    case tag:                                                                                      \
-        dispatch_decode<type>(p, stream);                                                          \
-        break;
-        ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
-#undef ASTRAI_ATTN_DTYPE_ROW
-    default:
-        attn_dtype_unsupported(q.scalar_type());
-    }
+    attn_dtype_dispatch<AttnDispatchDecode>(q.scalar_type(), p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }
 
 } // namespace attention
 } // namespace astrai
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_decode", &astrai::attention::attn_decode, py::arg("q"), py::arg("k"), py::arg("v"),
-          py::arg("mask") = py::none(), py::arg("causal_offset") = -1, py::arg("scale") = 0.0,
-          py::arg("layout") = (int64_t)astrai::attention::BHLD, py::arg("o_part_buf") = py::none(),
-          py::arg("ml_part_buf") = py::none(), "GQA decode (tensor-core head-packing on sm_80+)");
-}

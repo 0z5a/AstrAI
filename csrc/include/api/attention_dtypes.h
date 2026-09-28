@@ -6,6 +6,7 @@
 // Adding a precision = a row here + its ElemTrait (utils/dtype.cuh) and, for
 // tensor-core dtypes, the MmaShapeFor/MmaOp cell (mma/mma.cuh).
 
+#include <cuda_runtime.h>
 #include <string>
 
 #include <c10/core/ScalarType.h>
@@ -29,6 +30,21 @@ inline void attn_dtype_unsupported(at::ScalarType st) {
 #undef ASTRAI_ATTN_DTYPE_NAME_ROW
     TORCH_CHECK(false, "attention has no kernel for ", c10::toString(st),
                 " (instantiated: ", instantiated, ")");
+}
+
+// Dtype dispatch over the list; wrappers live in kernel/attention_launch.cuh (fn templates cannot be template-template args).
+template <template <typename> class DispatchFn, typename ParamsT>
+inline void attn_dtype_dispatch(at::ScalarType st, ParamsT& p, cudaStream_t stream) {
+    switch (st) {
+#define ASTRAI_ATTN_DTYPE_ROW(tag, type)                                                           \
+    case tag:                                                                                      \
+        DispatchFn<type>::run(p, stream);                                                          \
+        break;
+        ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
+#undef ASTRAI_ATTN_DTYPE_ROW
+    default:
+        attn_dtype_unsupported(st);
+    }
 }
 
 } // namespace attention

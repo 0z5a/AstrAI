@@ -225,10 +225,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     astrai::fp8::bind_fp8(m);
     m.def("quant_gemm", &astrai::gemm::quant_gemm, py::arg("a"), py::arg("b"),
           py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
-          py::arg("trans_a") = false, py::arg("trans_b") = true, py::arg("bias") = py::none());
+          py::arg("trans_a") = false, py::arg("trans_b") = true, py::arg("bias") = py::none(),
+          "Quantized GEMM: (a @ b) * a_scale * b_scale (+ bias), bf16 out");
     m.def("plan_probe", &astrai::gemm::probe_binding, py::arg("m"), py::arg("n"), py::arg("k"),
           py::arg("dt_a"), py::arg("dt_b"), py::arg("trans_a") = false, py::arg("trans_b") = true,
-          py::arg("batch") = 1);
+          py::arg("batch") = 1,
+          "The dispatch decision for one shape, with the planner that made it");
     m.def("configure", &astrai::gemm::configure_binding, py::arg("patch"),
           "Apply a config patch (a dict of the plan's knobs) and return the "
           "resulting state");
@@ -236,8 +238,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // a current one: ``configure``'s old keyword signature is not
     // distinguishable by hasattr, only by calling it.
     m.attr("CONFIG_API") = 2;
-    m.def("config_state", &astrai::gemm::config_state_binding);
-    m.def("tile_class_names", &astrai::gemm::tile_class_names);
-    m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary);
-    m.def("device_facts_info", &astrai::gemm::facts_dict);
+    m.def("config_state", &astrai::gemm::config_state_binding,
+          "The whole plan configuration, as a re-installable value");
+    m.def("tile_class_names", &astrai::gemm::tile_class_names,
+          "The TileClass spellings, in enum order");
+    m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary,
+          "Every ladder's recipes as rows, in dispatch order");
+    m.def("device_facts_info", &astrai::gemm::facts_dict, "The DeviceFacts geometry, as a dict");
 }

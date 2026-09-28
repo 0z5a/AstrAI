@@ -82,15 +82,16 @@ DEVICE_FORCEINLINE int swiz_col(int d, int r, int mask = 7) {
 // ---------------------------------------------------------------------------
 // Q-load: load query rows directly from global memory into mma A-operand
 // register layout. One call replaces ~15 duplicated lines in each MMA kernel.
-// stride_row is p.q_h_stride for decode (q_len=1, G heads) or
-//              p.q_l_stride for prefill (multi-q rows).
+// off_a/off_b are the two mma rows' element offsets (row-within-head times
+// q row stride); the bases differ when the PackGQA fold puts the two rows in
+// different heads. Decode passes the same base twice (rows are heads).
 // ---------------------------------------------------------------------------
 template <int KD, typename T>
-__device__ inline void load_q_mma_frags(const T* __restrict__ q,
-                                        int stride_row,
+__device__ inline void load_q_mma_frags(const T* __restrict__ qa,
+                                        const T* __restrict__ qb,
                                         int stride_d,
-                                        int qra,
-                                        int qrb,
+                                        int off_a,
+                                        int off_b,
                                         bool va,
                                         bool vb,
                                         int tid4,
@@ -98,10 +99,8 @@ __device__ inline void load_q_mma_frags(const T* __restrict__ q,
 #pragma unroll
     for (int kt = 0; kt < KD; kt++) {
         int c = kt * 16 + tid4 * 2;
-        const unsigned* pau =
-            reinterpret_cast<const unsigned*>(&q[qra * stride_row + c * stride_d]);
-        const unsigned* pbu =
-            reinterpret_cast<const unsigned*>(&q[qrb * stride_row + c * stride_d]);
+        const unsigned* pau = reinterpret_cast<const unsigned*>(&qa[off_a + c * stride_d]);
+        const unsigned* pbu = reinterpret_cast<const unsigned*>(&qb[off_b + c * stride_d]);
         Qa[kt][0] = va ? pau[0] : 0u;
         Qa[kt][1] = vb ? pbu[0] : 0u;
         Qa[kt][2] = va ? pau[4] : 0u;
@@ -252,12 +251,21 @@ __device__ inline void mma_softmax_tile(int kv0,
     l0 = l0 * corr0 + rsum0;
     l1 = l1 * corr1 + rsum1;
 
+    // Skip the O rescale when the max did not move: corr == exp(0) == 1.0f
+    // exactly, and x * 1.0f is bit-identical to x.
+    if (corr0 != 1.0f) {
 #pragma unroll
-    for (int j = 0; j < Traits::DN8; j++) {
-        Oacc[j][0] *= corr0;
-        Oacc[j][1] *= corr0;
-        Oacc[j][2] *= corr1;
-        Oacc[j][3] *= corr1;
+        for (int j = 0; j < Traits::DN8; j++) {
+            Oacc[j][0] *= corr0;
+            Oacc[j][1] *= corr0;
+        }
+    }
+    if (corr1 != 1.0f) {
+#pragma unroll
+        for (int j = 0; j < Traits::DN8; j++) {
+            Oacc[j][2] *= corr1;
+            Oacc[j][3] *= corr1;
+        }
     }
 }
 
