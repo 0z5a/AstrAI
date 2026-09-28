@@ -1,5 +1,7 @@
 """Unit tests for inference cache components."""
 
+import random
+
 import pytest
 import torch
 
@@ -482,3 +484,44 @@ def test_page_pool_paged_steady_decode_slots_reach_device():
         device_row = pool.req_pool.req_to_token[state.req_idx, : pos + 1].tolist()
         expected = [p * pool.page_size for p in state.pages[: pos + 1]]
         assert device_row == expected
+
+
+def test_allocator_alloc_many_matches_free_set_exactly():
+    """Bulk allocation must yield exactly the pages the free set held.
+
+    The word-window harvest once re-issued already-harvested pages (stale
+    mask read across windows) and once left cleared pages marked free
+    (mixed absolute/shifted bit coordinates); this randomized
+    reference-model check pins the mask == free-set invariant.
+    """
+    rng = random.Random(7)
+    alloc = Allocator(300)
+    free = set(range(300))
+    held = []
+    for _ in range(400):
+        if free and rng.random() < 0.55:
+            n = rng.randint(1, 25)
+            got = alloc.alloc_many(n)
+            if got is None:
+                assert len(free) < n
+                continue
+            assert len(got) == n
+            assert len(set(got)) == n
+            for p in got:
+                assert p in free
+                free.remove(p)
+            held.append(got)
+        elif held:
+            g = held.pop(rng.randrange(len(held)))
+            alloc.free_many(g)
+            free.update(g)
+        mask = alloc._free_mask
+        for p in range(300):
+            assert bool(mask >> p & 1) == (p in free)
+
+
+def test_allocator_alloc_many_fragmentation_roundtrip():
+    alloc = Allocator(10000)
+    first = alloc.alloc_many(100)
+    alloc.free_many(first[0::2])
+    assert alloc.alloc_many(50) == sorted(first[0::2])

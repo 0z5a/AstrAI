@@ -49,14 +49,58 @@ class TaskCacheState:
 
 
 class Allocator:
-    """Bitmask-based page allocator with ref-counting and LRU eviction."""
+    """Bitmask-based page allocator with ref-counting and LRU eviction.
+
+    The free set is a Python big-int bitmask. On serving-scale pools the
+    mask is tens of thousands of bits wide, so the classic
+    ``lsb = mask & -mask`` extraction walks the whole big-int per page —
+    fine for one page, quadratic for a 512-page prompt. The bulk paths
+    below therefore harvest a run of low bits at once: the mask is a set
+    of machine-word limbs, and the lowest set bits almost always live in
+    the first few limbs.
+    """
+
+    _WORD_BITS = 64
 
     def __init__(self, n_pages: int):
         self._free_mask = (1 << n_pages) - 1
+        self._n_pages = n_pages
         self._refs: List[int] = [0] * n_pages
         self._lru: OrderedDict[int, None] = OrderedDict()
         self.on_evict: Optional[Callable[[int], None]] = None
         self._lock = threading.Lock()
+
+    def _harvest_low(self, mask: int, n: int) -> List[int]:
+        """Pop the ``n`` lowest set bits off ``mask`` in word-sized bites.
+
+        Returns ``(page indices, cleared-mask)``; the caller holds the lock
+        and updates ``_refs``. Only the bit extraction works a 64-bit
+        window at a time; the cleared bits are accumulated into one
+        single-bit-mask sum and removed with one big-int subtraction at
+        the end (clearing them one ``xor`` at a time on a wide mask costs
+        a full big-int walk per page).
+        """
+        out: List[int] = []
+        clear = 0
+        base = 0
+        word_mask = (1 << self._WORD_BITS) - 1
+        while len(out) < n:
+            word = (mask >> base) & word_mask
+            if word == 0:
+                base += self._WORD_BITS
+                if base >= self._n_pages or base >= mask.bit_length():
+                    break
+                continue
+            take = min(n - len(out), word.bit_count())
+            for _ in range(take):
+                lsb = word & -word
+                out.append(base + lsb.bit_length() - 1)
+                clear |= lsb << base
+                word ^= lsb
+            # Reflect the harvest before reading the next window, or the
+            # loop would re-harvest the same low word from the stale mask.
+            mask &= ~clear
+        return out, mask
 
     def alloc(self) -> int:
         with self._lock:
@@ -76,18 +120,17 @@ class Allocator:
             return -1
 
     def alloc_many(self, n: int) -> Optional[List[int]]:
-        """Allocate up to ``n`` pages, or ``None`` if fewer are free.
+        """Allocate exactly ``n`` pages, or ``None`` if fewer are free.
 
-        A whole prompt's pages in one lock acquisition and one mask scan:
-        per-page ``alloc`` costs a lock round-trip and a bit extraction per
-        token, which dominated host time at serving batch sizes (575 calls
-        per 512-token prompt). Falls back to LRU eviction page-by-page when
-        the free mask alone cannot satisfy the request.
+        One lock acquisition per prompt. Free pages come from the low
+        words of the mask in bulk; only when the free set cannot satisfy
+        the request does it promote LRU pages (page-by-page, evicting as
+        it goes).
         """
         if n <= 0:
             return []
         with self._lock:
-            free = bin(self._free_mask).count("1")
+            free = self._free_mask.bit_count()
             if free < n:
                 promoted = 0
                 while free + promoted < n and self._lru:
@@ -98,15 +141,17 @@ class Allocator:
                     promoted += 1
                 if free + promoted < n:
                     return None
-            out: List[int] = []
-            mask = self._free_mask
-            while len(out) < n:
-                lsb = mask & -mask
-                idx = lsb.bit_length() - 1
-                out.append(idx)
-                mask ^= lsb
-                self._refs[idx] = 1
+            out, mask = self._harvest_low(self._free_mask, n)
+            if len(out) < n:
+                # Depleted the low words mid-request (fragmented free set):
+                # fall back to whole-mask extraction for the remainder.
+                while len(out) < n:
+                    lsb = mask & -mask
+                    out.append(lsb.bit_length() - 1)
+                    mask ^= lsb
             self._free_mask = mask
+            for idx in out:
+                self._refs[idx] = 1
             return out
 
     def free(self, idx: int, keep_cached: bool = False):
@@ -411,12 +456,16 @@ class PagedStrategy(AllocationStrategy):
         state._flushed = total
 
     def flush_slots(self, states: List[TaskCacheState], device) -> None:
-        # One tiny H2D copy per dirty TAIL per step, all appended after the
-        # bind's device-side work is enqueued in stream order — steady-state
-        # decode also gathers req_to_token rows on-device (out_cache_loc), so
-        # the new positions must land there even on the incremental path.
-        # Writing only the unflushed tail keeps the per-step volume at one
-        # int per decoded token instead of re-sending the whole row.
+        # req_to_token rows are gathered on-device by every decode bind
+        # (out_cache_loc), so staged tails must land there before the
+        # gather runs — steady incremental steps included. The staged tails
+        # of the whole batch are concatenated into ONE tensor write (one
+        # H2D per step instead of one per task; 128 per-task copies cost
+        # ~5ms/step at serving batch sizes) using a built-once scatter
+        # index (task row, in-row offset) pairs.
+        flat_vals: List[int] = []
+        row_idx: List[int] = []
+        col_idx: List[int] = []
         for state in states:
             slots = state._slots
             n = len(slots)
@@ -424,10 +473,16 @@ class PagedStrategy(AllocationStrategy):
                 continue
             start = state._flushed
             state._flushed = n
-            row = self._req_pool.req_to_token[state.req_idx]
-            row[start:n] = torch.tensor(
-                slots[start:], dtype=torch.int32, device=self._device
-            )
+            flat_vals.extend(slots[start:])
+            req = state.req_idx
+            row_idx.extend([req] * (n - start))
+            col_idx.extend(range(start, n))
+        if not flat_vals:
+            return
+        rows = torch.tensor(row_idx, dtype=torch.long, device=self._device)
+        cols = torch.tensor(col_idx, dtype=torch.long, device=self._device)
+        vals = torch.tensor(flat_vals, dtype=torch.int32, device=self._device)
+        self._req_pool.req_to_token[rows, cols] = vals
 
     def record_hashes(
         self,
