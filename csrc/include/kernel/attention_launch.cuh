@@ -39,16 +39,49 @@ namespace attention {
     std::exit(EXIT_FAILURE);
 }
 
-// Split-KV: fill all SMs for small-batch decode, targeting total grid
-// blocks rather than scaling by SM count (measured: bandwidth saturates
-// near 256-512 blocks; 512 minimizes worst-case latency over the B×kv
-// grid). Caps splits so each processes at least `min_tiles_per_split`
-// tiles — more is pure oversplit overhead.
-constexpr int DECODE_TARGET_BLOCKS = 512;
-inline int compute_num_splits(int base_blocks, int tiles_total, int min_tiles_per_split = 1) {
-    int n = (DECODE_TARGET_BLOCKS + base_blocks - 1) / base_blocks;
-    int max_by_work = tiles_total / min_tiles_per_split;
-    return std::max(1, std::min(n, std::min(max_by_work, MAX_SPLITS)));
+// Split-KV count: fill exactly one wave of blocks.
+//
+// The GPU runs blocks in waves of (SM count x resident blocks per SM). A
+// grid smaller than a wave leaves SMs idle; a grid that crosses into a
+// second wave pays a full extra wave of latency for the few straggler
+// blocks. So the split count is chosen to bring the grid as close to one
+// full wave as possible without crossing it:
+//   grid = base_blocks * splits <= wave_capacity
+//   =>   splits = floor(wave_capacity / base_blocks)
+// The work caps still apply: never more splits than the tile count allows
+// (each split needs at least min_tiles_per_split tiles to not be pure
+// combine overhead) and never more than MAX_SPLITS.
+inline int compute_num_splits(int base_blocks,
+                              int tiles_total,
+                              int wave_capacity,
+                              int min_tiles_per_split = 1) {
+    int cap = std::min(tiles_total / std::max(min_tiles_per_split, 1), MAX_SPLITS);
+    if (cap <= 1)
+        return 1;
+    return std::max(1, std::min(wave_capacity / std::max(base_blocks, 1), cap));
+}
+
+// Wave capacity = SM count x blocks resident per SM, for one decode kernel
+// instantiation. Residency depends on the kernel's shared memory and
+// register footprint, so it is queried from the occupancy API rather than
+// assumed. The query and the device-property reads are not free and decode
+// launches per token, so the answer is memoized per instantiation (the
+// lambda runs once).
+template <typename Kernel>
+inline int decode_wave_capacity(Kernel kernel, int threads) {
+    static int capacity = [kernel, threads] {
+        int per_sm = 0, device = 0;
+        cudaGetDevice(&device);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, device);
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, 0) !=
+                cudaSuccess ||
+            per_sm < 1)
+            per_sm = 1;
+        int c = prop.multiProcessorCount * per_sm;
+        return c > 0 ? c : 1;
+    }();
+    return capacity;
 }
 
 // Dispatch IsCausal × HasMask. FN is a function template
@@ -125,9 +158,12 @@ template <typename KV> struct DecodeLauncher {
         constexpr int BC = 16;
         int kv_len = KV::host_kv_len(p);
         int tiles_total = (kv_len + BC - 1) / BC;
-        p.num_splits = compute_num_splits(p.batch * p.kv_head * num_passes, tiles_total, 2);
-        constexpr int STAGES = 2;
-        using Traits = KernelTraits<HEAD_DIM, BC, 1, STAGES, typename KV::Elem>;
+        using Traits = KernelTraits<HEAD_DIM, BC, 1, 2, typename KV::Elem>;
+        p.num_splits = compute_num_splits(
+            p.batch * p.kv_head * num_passes, tiles_total,
+            decode_wave_capacity(attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask>,
+                                 32),
+            2);
         dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
         attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask><<<grid, 32, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
