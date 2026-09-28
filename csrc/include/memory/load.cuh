@@ -19,30 +19,22 @@ template <typename ElemT> DEVICE_FORCEINLINE unsigned raw_byte(const ElemT& e) {
     return *reinterpret_cast<const unsigned char*>(&e);
 }
 
-// Stage-load one operand tile from global memory into its swizzled ring
-// slot. Two geometries are the role-swapped mirror of the SAME loop, so one
-// template bit composes the whole function instead of a parallel copy:
-//
-//   kTransposed = false — CONGRUOUS operand (contract-contiguous storage,
-//     the only cp.async-able shape) into the canonical [rows][kK] tile;
-//   kTransposed = true  — CROSSWISE 16-bit operand (row-contiguous 16B
-//     runs) into the transposed [kK][rows] tile, where ldmatrix.trans does
-//     the matrix turn at fragment-extraction time (b16-only — 8-bit
-//     crosswise operands keep the LDG+PRMT staging).
-//
-// Under transposed staging the tile's line axis is the contract dim, so the
-// predication axes trade places with a canonical run's. The staged tile is
-// the TRANS layout instance: chunks swizzled by the k-row bits (custom XOR,
-// source is the row field) so the 8 k-rows one ldmatrix.trans matrix
-// addresses at a fixed column window land on distinct chunks (conflict-
-// free); only the low 3 row bits can join the XOR (LDSM gives 8 rows per
-// matrix), so tiles wider than 8 chunks leave the upper bits unswizzled.
-//
-// The tile arrives as a Tensor over the staged layout: the swizzled address
-// is the tensor's operator(), dispatching to the layout op. kInterior drops
-// all predication — valid only for a fully interior CTA (whole lines,
-// 16B-aligned base|ld, k_base + kK <= contract); the address math then folds
-// to one immediate XOR per chunk (see the design notes).
+// Stage-load one operand tile into its swizzled ring slot; the two
+// geometries are role-swapped mirrors of the SAME loop, so one template
+// bit composes both: kTransposed false = congruous operand
+// (contract-contiguous, the only cp.async-able shape) into the canonical
+// [rows][kK] tile; true = crosswise 16-bit operand (row-contiguous 16B
+// runs) into the transposed [kK][rows] tile that ldmatrix.trans turns at
+// fragment time (b16-only; 8-bit crosswise keeps the LDG+PRMT staging).
+// Under trans staging the line axis is the contract dim, so the
+// predication axes trade places. The staged tile is the TRANS layout:
+// chunks swizzled by the k-row bits so the 8 k-rows of one ldmatrix.trans
+// matrix land on distinct chunks; only the low 3 row bits join the XOR
+// (LDSM gives 8 rows per matrix), so tiles wider than 8 chunks leave the
+// upper bits unswizzled. The tile arrives as a Tensor over the staged
+// layout (the swizzled address is its operator()). kInterior drops all
+// predication — valid only for a fully interior CTA (whole lines,
+// 16B-aligned base|ld, k_base + kK <= contract).
 template <typename SmemLayout,
           typename ElemT,
           int kThreads,
@@ -61,28 +53,22 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
     constexpr int kTileLines = SmemLayout::kRows; // lines staged per tile
     constexpr int kChunks = SmemLayout::kChunks;  // chunks per line
     constexpr int kTotalChunks = kTileLines * kChunks;
-    // The bus may be under-subscribed: a 1-byte operand halves the chunks a
-    // line carries, so a narrow tile can hold fewer chunks than there are
-    // threads (a 16-warp small CTA against a 1-byte B, or any kK=32 1-byte
-    // side). Threads then take one chunk each and the rest stage nothing —
-    // the same true-skip shape load_crosswise_direct's grid-stride loop has
-    // always had. What cannot relax is the aligned run: the XOR chunk
-    // stepping below (dst ^ (j << 4)) is the swizzle of c0c + j only
-    // because a thread's chunks are one aligned power-of-two run inside
-    // the line — j's bits never reach c0c's.
+    // The bus may be under-subscribed (a 1-byte operand halves the chunks
+    // per line; a 16-warp small CTA against a 1-byte B, or any kK=32
+    // 1-byte side): threads take one chunk each, the rest stage nothing.
+    // What cannot relax is the aligned run: the XOR chunk stepping
+    // (dst ^ (j << 4)) is the swizzle of c0c + j only because a thread's
+    // chunks are one aligned power-of-two run inside the line.
     static_assert(kTotalChunks % kThreads == 0 || kTotalChunks < kThreads,
                   "tile chunks must divide the threads or under-subscribe the bus");
     constexpr int kCpt = // chunks per thread
         kTotalChunks < kThreads ? 1 : kTotalChunks / kThreads;
     static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
                   "XOR chunk stepping needs a power-of-two chunks-per-thread");
-    // A thread's run must stay inside ONE line: the r/c0 decomposition
-    // (kCpr below) divides kChunks BY kCpt, and a run wider than the line
-    // sends kCpr to zero — tid/0 garbage addresses and a wedged cp.async
-    // (observed 2026-09-16 on 128x256x32 with 4 warps: kernel hangs at
-    // 100% GPU on the first launch). Fully subscribed this says the staged
-    // extent (bm, bn) must not exceed the thread count; the under-subscribed
-    // arm keeps kCpt 1 and cannot violate it.
+    // A thread's run must stay inside ONE line: a run wider than the line
+    // sends kCpr to zero — tid/0 garbage and a wedged cp.async. Fully
+    // subscribed this says the staged extent must not exceed the thread
+    // count; the under-subscribed arm keeps kCpt 1 and cannot violate it.
     static_assert(kCpt <= kChunks, "a thread's 16B run must fit one staged line: the staged "
                                    "extent cannot exceed the thread count");
     constexpr int kCpr = kChunks / kCpt; // chunks per line slice
@@ -139,25 +125,18 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
     }
 }
 
-// Loop-carried prefetch state for one congruous-or-trans operand ring:
-// per-thread (r, c0) mapping with the swizzled stage destination and global
-// source pointer carried across k-tiles, so each prefetch chunk is one
-// LDGSTS issued straight from registers. The geometry rides the operand's
-// Ring tensor (slots, stage stride, staged layout). kTrans selects the
-// crosswise 16-bit geometry on the SOURCE side: the tile's rows are k
-// lines, so the per-tile source advance is kK * ld instead of kK.
-// kAsync=false (synchronous 8-bit crosswise operand) is an empty no-op.
-template <bool kAsync, typename RingT, int kThreads, bool kTrans = false> struct PrefetchCarry;
-
-template <typename RingT, int kThreads, bool kTrans>
-struct PrefetchCarry<true, RingT, kThreads, kTrans> {
+// Loop-carried prefetch state for one congruous-or-trans operand ring: the
+// per-thread (r, c0) swizzled stage destination and global source pointer
+// carried across k-tiles, so each prefetch chunk is one LDGSTS straight
+// from registers; geometry rides the operand's Ring tensor. kTrans selects
+// the crosswise 16-bit source geometry (rows are k lines: per-tile advance
+// kK*ld). kAsync false (synchronous 8-bit crosswise) collapses to no-ops.
+template <bool kAsync, typename RingT, int kThreads, bool kTrans = false> struct PrefetchCarry {
     using ElemT = typename RingT::Elem;               // Ring = Tensor<PtrEngine, RingLayout>
     using SmemLayout = typename RingT::Layout::Stage; // per-stage layout
     static constexpr int kChunkElems = 16 / sizeof(ElemT);
-    // The layout carries the tile geometry (rows x chunks per row),
-    // whichever way round the staging runs. Same bus rule as
-    // load_operand_tile: an under-subscribed bus (fewer chunks than
-    // threads) leaves the surplus threads inactive rather than illegal.
+    // Same bus rule as load_operand_tile: an under-subscribed bus leaves
+    // the surplus threads inactive rather than illegal.
     static constexpr int kTotalChunks = SmemLayout::kRows * SmemLayout::kChunks;
     static_assert(kTotalChunks % kThreads == 0 || kTotalChunks < kThreads,
                   "tile chunks must divide the threads or under-subscribe the bus");
@@ -165,8 +144,7 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
     static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
                   "XOR chunk stepping needs a power-of-two chunks-per-thread");
     static constexpr int kCpr = SmemLayout::kChunks / kCpt;
-    // All carried state is in BYTES: the smem write ring and the global
-    // source pointer both advance by the byte-sized stage stride.
+    // Carried state is in BYTES: both pointers advance by the stage stride.
     static constexpr int kK = kTrans ? SmemLayout::kRows : SmemLayout::kChunks * kChunkElems;
     static constexpr unsigned kKBytes = (unsigned)kK * sizeof(ElemT);
     unsigned wr = 0;           // current stage's swizzled destination offset
@@ -182,28 +160,30 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
                                      int64_t blockRow,
                                      int tid,
                                      int firstTile) {
-        const int rRaw = tid / kCpr;
-        active = rRaw < SmemLayout::kRows;
-        // An inactive thread's (r, c0) maps to no staged chunk; the carried
-        // offsets are computed at a clamped r and never dereferenced.
-        const int r = active ? rRaw : 0;
-        const int c0 = (tid % kCpr) * kCpt * kChunkElems;
-        const ElemT* slot0 = astrai::stage_of(ring, firstTile).engine.ptr;
-        const unsigned laneOff = static_cast<unsigned>(
-            (const char*)astrai::stage_of(ring, firstTile)(r, c0) - (const char*)slot0);
-        const unsigned base = __cvta_generic_to_shared(ring.engine.ptr) + laneOff;
-        wr = base +
-             (unsigned)((int64_t)(firstTile % RingT::Layout::kSlots) * RingT::Layout::kStageBytes);
-        wr0 = base;
-        wrEnd = base + (unsigned)RingT::Layout::kTotalBytes;
-        if constexpr (kTrans) {
-            src = reinterpret_cast<const char*>(operand + ((int64_t)firstTile * kK + r) * ld +
-                                                blockRow + c0);
-            srcStep = (int64_t)kK * ld * sizeof(ElemT); // k advances rows
-        } else {
-            src = reinterpret_cast<const char*>(operand + (blockRow + r) * ld + c0) +
-                  (int64_t)firstTile * kKBytes;
-            srcStep = kKBytes; // k advances the contiguous columns
+        if constexpr (kAsync) {
+            const int rRaw = tid / kCpr;
+            active = rRaw < SmemLayout::kRows;
+            // An inactive thread's (r, c0) maps to no staged chunk; the carried
+            // offsets are computed at a clamped r and never dereferenced.
+            const int r = active ? rRaw : 0;
+            const int c0 = (tid % kCpr) * kCpt * kChunkElems;
+            const ElemT* slot0 = astrai::stage_of(ring, firstTile).engine.ptr;
+            const unsigned laneOff = static_cast<unsigned>(
+                (const char*)astrai::stage_of(ring, firstTile)(r, c0) - (const char*)slot0);
+            const unsigned base = __cvta_generic_to_shared(ring.engine.ptr) + laneOff;
+            wr = base + (unsigned)((int64_t)(firstTile % RingT::Layout::kSlots) *
+                                   RingT::Layout::kStageBytes);
+            wr0 = base;
+            wrEnd = base + (unsigned)RingT::Layout::kTotalBytes;
+            if constexpr (kTrans) {
+                src = reinterpret_cast<const char*>(operand + ((int64_t)firstTile * kK + r) * ld +
+                                                    blockRow + c0);
+                srcStep = (int64_t)kK * ld * sizeof(ElemT); // k advances rows
+            } else {
+                src = reinterpret_cast<const char*>(operand + (blockRow + r) * ld + c0) +
+                      (int64_t)firstTile * kKBytes;
+                srcStep = kKBytes; // k advances the contiguous columns
+            }
         }
     }
 
@@ -211,38 +191,31 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
     // zero-fills into the slot compute(i-1) already released. An inactive
     // thread owns no chunks, so it emits nothing at all.
     DEVICE_FORCEINLINE void emit(bool pf) const {
-        if (!active)
-            return;
+        if constexpr (kAsync) {
+            if (!active)
+                return;
 #pragma unroll
-        for (int j = 0; j < kCpt; ++j)
-            astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);
+            for (int j = 0; j < kCpt; ++j)
+                astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);
+        }
     }
 
     DEVICE_FORCEINLINE void advance() {
-        wr += (unsigned)RingT::Layout::kStageBytes;
-        if (wr == wrEnd)
-            wr = wr0;
-        src += srcStep;
+        if constexpr (kAsync) {
+            wr += (unsigned)RingT::Layout::kStageBytes;
+            if (wr == wrEnd)
+                wr = wr0;
+            src += srcStep;
+        }
     }
 };
 
-template <typename RingT, int kThreads, bool kTrans>
-struct PrefetchCarry<false, RingT, kThreads, kTrans> {
-    DEVICE_FORCEINLINE
-    PrefetchCarry(const RingT&, const typename RingT::Elem*, int64_t, int64_t, int, int) {}
-    DEVICE_FORCEINLINE void emit(bool) const {}
-    DEVICE_FORCEINLINE void advance() {}
-};
-
 // The two arms one 16-row crosswise chunk can take, shared by the general
-// grid-stride loader and the register carry below — the pair must never
-// diverge on the perm sequence or the predication, or the same operand
-// would stage differently depending on bus width.
-//
-// Fast arm: four contract runs (uint4 each, already fetched into the
-// register file) -> one PRMT pass -> 16 packed span words in the staging
-// tile. Slow arm (row tail / misaligned base): element-granular gather
-// with per-row predication; contract-tail columns zero-fill.
+// loader and the register carry — the pair must never diverge on the perm
+// sequence or the predication, or the same operand would stage differently
+// depending on bus width. Fast arm: four contract runs (uint4, already in
+// the register file) -> one PRMT pass. Slow arm (row tail / misaligned
+// base): element-granular gather, contract-tail columns zero-fill.
 template <typename TileT>
 DEVICE_FORCEINLINE void crosswise_perm_span(TileT tile, int rg, int span, const uint4* v) {
     const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
@@ -287,20 +260,14 @@ DEVICE_FORCEINLINE void crosswise_gather_span(TileT tile,
 
 // Direct (synchronous) crosswise load into a canonical rotating stage:
 // LDG.128 runs (4 x 16B of the non-contract dim) + in-register transpose
-// (PRMT) + 16 STS.32. Crosswise operands cannot cp.async into the
+// (PRMT) + 16 STS.32 — crosswise operands cannot cp.async into the
 // canonical tile (a 16B global run holds contract positions for a run of
-// the other dim), so they take the register route; a staged smem->smem
-// variant measured 15-20% slower and was removed (see git history).
-//
-// One chunk = 64B of global memory staging one 16-row group: 4 runs of
-// 16 rows x 4 contract positions; the PRMT byte-perm gathers one 32-bit
-// word per row across the four runs.
-//
-// This is the GENERAL form: a grid-stride loop over the tile's chunks, so
-// any tile geometry stages correctly however few threads it has. The path
-// the ladders actually instantiate has a two-phase sibling (CrosswiseCarry,
-// below) which load_crosswise_direct selects; this one covers the bus
-// under-subscription case.
+// the other dim). One chunk = 64B staging one 16-row group (4 runs of 16
+// rows x 4 contract positions); the PRMT gathers one 32-bit word per row
+// across the four runs. The GENERAL grid-stride form: any geometry stages
+// correctly however few threads; the instantiated path's two-phase sibling
+// (CrosswiseCarry) is selected by load_crosswise_direct, this one covers
+// the under-subscribed bus.
 template <typename SmemLayout, typename ElemT, int kThreads>
 DEVICE_FORCEINLINE void load_crosswise_direct_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                                                       const ElemT* __restrict__ operand,
@@ -346,58 +313,29 @@ DEVICE_FORCEINLINE void load_crosswise_direct_general(Tensor<PtrEngine<ElemT>, S
     }
 }
 
-// ---------------------------------------------------------------------------
-// Two-phase register staging for the 8-bit crosswise operand.
-//
-// The general loader is a synchronous round trip in front of the k-tile's MMA
-// phase, so its global latency sits on the critical path of every iteration.
-// At the 64x64 CTA that costs 243 TF against 350 TF for the same tile staged
-// congruously (interleaved A/B 2026-09-18, qkv fp8) — the sync staging's
-// whole share, and the kernel's top stall.
-//
-// The carry splits it across the phase boundary: issue() fires the global runs
-// one phase ahead of the transpose, commit() does PRMT + STS after the MMA
-// phase, so the latency hides behind tensor-pipe work (ncu long-scoreboard
-// 1.18 -> 0.42, barrier 5.35 -> 3.53, the 64x64 kernel 1.54 -> 1.34 ms).
-// One thread owns the whole 64B chunk: the four contract runs have to meet in
-// one register file for the byte-perm, which is also why the 1-byte operand
-// cannot ride the cp.async trans staging the 2-byte side uses.
-//
-// Spreading that chunk over more threads was tried TWICE and lost both times,
-// which is what pins this path as instruction-throughput bound rather than
-// latency or parallelism bound (profile: issue 39%, not_selected 0.63, i.e.
-// the scheduler is not saturated and the CTA waits on its two loader warps):
-//
-//   * 8-row chunks (32B, LDG.64, 2x the loader threads): qkv fp8 TT -1.7%,
-//     NN -6.2%, TN -7.6% — the LDG count doubles and the loads narrow.
-//   * lane pair per chunk (2 runs each + one shfl_xor per row, LDG.128 kept,
-//     identical LDG/PRMT/STS totals): qkv fp8 TT -7.6%, NN -13%, TN -15%,
-//     square -13..-18% — the exchange costs more than the balance buys.
-//
-// The ladder's tiles all keep the chunk count at or below the thread count,
-// so one chunk per thread is the whole carried state. A thinner bus (more
-// chunks than threads), 2-byte elements and the predicated boundary chunks
-// fall back to load_crosswise_direct_general; the carry owns the interior,
-// aligned chunks.
-template <typename SmemLayout, typename ElemT, int kThreads, bool kOn> struct CrosswiseCarry;
-
-template <typename SmemLayout, typename ElemT, int kThreads>
-struct CrosswiseCarry<SmemLayout, ElemT, kThreads, false> {
-    DEVICE_FORCEINLINE void issue(const ElemT*, int64_t, int64_t, int64_t, int, int64_t, int64_t) {}
-    template <typename TileT>
-    DEVICE_FORCEINLINE void
-    commit(TileT, const ElemT*, int64_t, int64_t, int64_t, int, int64_t, int64_t) const {}
-};
-
-template <typename SmemLayout, typename ElemT, int kThreads>
-struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
-    static_assert(sizeof(ElemT) == 1, "the register carry stages the 8-bit crosswise path");
+// Two-phase register staging for the 8-bit crosswise operand: the general
+// loader's synchronous round trip sits on the MMA phase's critical path, so
+// the carry splits it across the phase boundary — issue() fires the global
+// runs one phase ahead, commit() does PRMT + STS after the MMA phase, the
+// latency hiding behind tensor-pipe work. One thread owns the whole 64B
+// chunk: the four contract runs must meet in one register file for the
+// byte-perm (also why the 1-byte operand cannot ride the cp.async trans
+// staging the 2-byte side uses; the path is instruction-throughput bound —
+// spreading the chunk over more threads lost both times it was tried, so
+// do not retry). The ladder's tiles keep the chunk count at or below the
+// thread count, so one chunk per thread is the whole carried state. A
+// thinner bus, 2-byte elements and the predicated boundary chunks fall
+// back to load_crosswise_direct_general; the carry owns the interior,
+// aligned chunks. kOn false (a non-8-bit-crosswise operand) collapses
+// every method to a no-op through the same constexpr guards.
+template <typename SmemLayout, typename ElemT, int kThreads, bool kOn> struct CrosswiseCarry {
+    static_assert(!kOn || sizeof(ElemT) == 1, "the register carry stages the 8-bit crosswise path");
     static constexpr int kCw = 4;         // contract elems per chunk
     static constexpr int kRowsChunk = 16; // rows per chunk (4 contract runs)
-    static constexpr int kK = SmemLayout::kChunks * 16;
-    static constexpr int kGroups = SmemLayout::kRows / kRowsChunk;
-    static constexpr int kTChunks = (kK / kCw) * kGroups;
-    static constexpr bool kFits = kTChunks <= kThreads;
+    static constexpr int kK = kOn ? SmemLayout::kChunks * 16 : 0;
+    static constexpr int kGroups = kOn ? SmemLayout::kRows / kRowsChunk : 0;
+    static constexpr int kTChunks = kOn ? (kK / kCw) * kGroups : 0;
+    static constexpr bool kFits = kOn && kTChunks <= kThreads;
 
     uint4 v[4];   // the chunk's four 16-row contract runs
     int span = 0; // contract span this thread owns
@@ -455,10 +393,12 @@ struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
                                    int64_t k_base,
                                    int64_t block_row) const {
         if constexpr (!kFits) {
-            // Thin bus: issue() staged nothing, so the whole round trip stays
-            // synchronous here.
-            load_crosswise_direct_general<SmemLayout, ElemT, kThreads>(
-                tile, operand, rows, contract, ld, tid, k_base, block_row);
+            // Off (kOn false): nothing to stage. Thin bus (kOn true but not
+            // kFits): issue() staged nothing, the round trip stays synchronous
+            // here.
+            if constexpr (kOn)
+                load_crosswise_direct_general<SmemLayout, ElemT, kThreads>(
+                    tile, operand, rows, contract, ld, tid, k_base, block_row);
             return;
         }
         if (!active)
@@ -472,24 +412,16 @@ struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
     }
 };
 
-// ---------------------------------------------------------------------------
-// k-pair packed staging for the 8-bit crosswise operand.
-//
-// The canonical-tile carry above has to gather FOUR contract runs into one
-// register file before its byte-perm; a packed unit is a 16-bit (row, k-pair)
-// cell instead, so the two ADJACENT runs (2j, 2j+1) suffice and one thread
-// owns its unit outright — no lane pairing, no shfl_xor, one PRMT per output
-// word. The tile it stages is the transposed [kK/2][rows] grid the 16-bit
-// crosswise path already reads: ldmatrix.trans turns 16 packed rows (one mma
-// k-segment = 32 contract bytes) into m16n8k32 fragments, so that reader's
-// lane offsets and per-segment steps carry over unchanged.
-//
-// Per 32B unit: 2 LDG.128 + 8 PRMT + 2 STS.128 — against the canonical
-// carry's 4 LDG + 48 PRMT + 16 STS + 16 shfl per 64B staged.
-//
+// k-pair packed staging for the 8-bit crosswise operand: a packed unit is a
+// 16-bit (row, k-pair) cell, so the two ADJACENT runs (2j, 2j+1) suffice
+// and one thread owns its unit outright — no lane pairing, no shfl_xor, one
+// PRMT per output word (against the canonical carry's 4 LDG + 48 PRMT +
+// 16 STS + 16 shfl per 64B). The staged tile is the transposed [kK/2][rows]
+// grid the 16-bit crosswise path already reads: ldmatrix.trans turns 16
+// packed rows (one mma k-segment = 32 contract bytes) into m16n8k32
+// fragments, so that reader's lane offsets and steps carry over unchanged.
 // The element-granular sibling covers the row tail, a misaligned base and a
-// bus thinner than the unit count: any geometry, at element resolution, so
-// the fast carry itself stays predication-free.
+// thinner bus, so the fast carry stays predication-free.
 template <typename SmemLayout, typename ElemT, int kThreads>
 DEVICE_FORCEINLINE void pack_crosswise_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                                                const ElemT* __restrict__ operand,
@@ -518,23 +450,12 @@ DEVICE_FORCEINLINE void pack_crosswise_general(Tensor<PtrEngine<ElemT>, SmemLayo
     }
 }
 
-template <typename SmemLayout, typename ElemT, int kThreads, bool kOn> struct PairPackCarry;
-
-template <typename SmemLayout, typename ElemT, int kThreads>
-struct PairPackCarry<SmemLayout, ElemT, kThreads, false> {
-    DEVICE_FORCEINLINE void issue(const ElemT*, int64_t, int64_t, int64_t, int, int64_t, int64_t) {}
-    template <typename TileT>
-    DEVICE_FORCEINLINE void
-    commit(TileT, const ElemT*, int64_t, int64_t, int64_t, int, int64_t, int64_t) const {}
-};
-
-template <typename SmemLayout, typename ElemT, int kThreads>
-struct PairPackCarry<SmemLayout, ElemT, kThreads, true> {
-    static_assert(sizeof(ElemT) == 1, "the packed carry stages the 8-bit crosswise path");
-    static constexpr int kRowsTile = SmemLayout::kChunks * 8;  // 8 units/chunk
-    static constexpr int kGroups = kRowsTile / 16;             // 16-row groups per tile
-    static constexpr int kUnits = SmemLayout::kRows * kGroups; // 32B units
-    static constexpr bool kFits = kUnits <= kThreads;
+template <typename SmemLayout, typename ElemT, int kThreads, bool kOn> struct PairPackCarry {
+    static_assert(!kOn || sizeof(ElemT) == 1, "the packed carry stages the 8-bit crosswise path");
+    static constexpr int kRowsTile = kOn ? SmemLayout::kChunks * 8 : 0;  // 8 units/chunk
+    static constexpr int kGroups = kOn ? kRowsTile / 16 : 0;             // 16-row groups per tile
+    static constexpr int kUnits = kOn ? SmemLayout::kRows * kGroups : 0; // 32B units
+    static constexpr bool kFits = kOn && kUnits <= kThreads;
 
     uint4 v[2];   // this unit's two runs: k = 2j and 2j+1, 16 rows each
     int jrow = 0; // the packed row this thread owns
@@ -591,10 +512,12 @@ struct PairPackCarry<SmemLayout, ElemT, kThreads, true> {
                                    int64_t k_base,
                                    int64_t block_row) const {
         if constexpr (!kFits) {
-            // Thin bus: issue() staged nothing, so the whole round trip stays
-            // synchronous here (the packed grid, still one thread per unit).
-            pack_crosswise_general<SmemLayout, ElemT, kThreads>(tile, operand, rows, contract, ld,
-                                                                tid, k_base, block_row);
+            // Off (kOn false): nothing to stage. Thin bus (kOn true but not
+            // kFits): issue() staged nothing, the round trip stays synchronous
+            // here (the packed grid, still one thread per unit).
+            if constexpr (kOn)
+                pack_crosswise_general<SmemLayout, ElemT, kThreads>(tile, operand, rows, contract,
+                                                                    ld, tid, k_base, block_row);
             return;
         }
         if (!active)

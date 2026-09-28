@@ -96,71 +96,91 @@ template <> struct MmaShapeFor<__nv_fp8_e5m2> {
 // attention kernels' mma_sync and the C tests build on it).
 template <typename A, typename B, typename ShapeT> struct MmaOp;
 
-template <> struct MmaOp<__nv_bfloat16, __nv_bfloat16, Shape<16, 8, 16>> {
-    using AccT = float;              // the accumulator type is derived, too
-    static constexpr int kARegs = 4; // A fragment: 4x b32
-    static constexpr int kBRegs = 2; // B fragment: 2x b32
-    static constexpr int kCRegs = 4; // C/D fragment: 4x f32
-    using AFrag = ArrayEngine<unsigned, kARegs>;
-    using BFrag = ArrayEngine<unsigned, kBRegs>;
-    using CFrag = ArrayEngine<AccT, kCRegs>;
-    static DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {
-        fma(d.storage, a.storage, b.storage, c.storage);
-    }
-    static DEVICE_FORCEINLINE void
-    fma(float d[4], const unsigned a[4], const unsigned b[2], const float c[4]) {
-        static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 800,
-                      "bf16 mma.sync requires sm_80+");
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
-                     : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]),
-                       "f"(c[1]), "f"(c[2]), "f"(c[3]));
-    }
-};
-
-// The fp8 cells are sm_89+ instructions. fma is a template keyed on the
-// pass arch so the kMinArch static_assert fires only when the cell is
+// Every cell shares one register contract (4x b32 A, 2x b32 B, 4-acc C/D)
+// and one operand list, so the CELL is one template skeleton whose typed
+// facts (accumulator, arch floor) derive from traits — the single source —
+// and whose only free variable is the asm statement itself, injected as a
+// macro-stamped tag type (asm operands and constraints must be literals
+// inside the asm expression, so they cannot ride a template parameter;
+// everything else can and does). The tag's asm_fma carries the constraint
+// list that differs per cell: float families feed C as "f" inputs, the s8
+// cell accumulates in place ("+r" outputs, no C input). fma is a template
+// keyed on the pass arch so the static_assert fires only when the cell is
 // CALLED: member bodies of full specializations are checked in every
-// including TU, and a bare assert would trip uncalled on the sm_80 passes
+// including TU, and a bare assert would trip uncalled on older passes
 // (attention includes this header for the bf16 cell and ldmatrix).
-// One cell per fp8 format: identical register contract, operand lists and
-// instruction shape — only the format token differs, so each cell is
-// stamped from one macro. (The asm template must be a string literal,
-// which is why this is a file-local macro rather than a template over an
-// opcode trait.)
-#define ASTRAI_MMA_OP_FP8(FP8T, FMT)                                                               \
-    template <> struct MmaOp<FP8T, FP8T, Shape<16, 8, 32>> {                                       \
-        using AccT = float;                                                                        \
-        static constexpr int kARegs = 4;                                                           \
-        static constexpr int kBRegs = 2;                                                           \
-        static constexpr int kCRegs = 4;                                                           \
-        using AFrag = ArrayEngine<unsigned, kARegs>;                                               \
-        using BFrag = ArrayEngine<unsigned, kBRegs>;                                               \
-        using CFrag = ArrayEngine<AccT, kCRegs>;                                                   \
-        template <int Arch = ASTRAI_DEVICE_ARCH>                                                   \
+#define ASTRAI_MMA_ASM(TAG, ACC, ASM, OUT_C, ...)                                                  \
+    struct TAG {                                                                                   \
         static DEVICE_FORCEINLINE void                                                             \
-        fma(CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {                            \
-            fma<Arch>(d.storage, a.storage, b.storage, c.storage);                                 \
-        }                                                                                          \
-        template <int Arch = ASTRAI_DEVICE_ARCH>                                                   \
-        static DEVICE_FORCEINLINE void                                                             \
-        fma(float d[4], const unsigned a[4], const unsigned b[2], const float c[4]) {              \
-            static_assert(Arch == 0 || Arch >= 890, "fp8 mma.sync requires sm_89+");               \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32." FMT "." FMT                      \
-                         ".f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "                            \
-                         "{%10,%11,%12,%13};"                                                      \
-                         : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])                          \
-                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),       \
-                           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));                            \
+        asm_fma(ACC d[4], const unsigned a[4], const unsigned b[2], const ACC c[4]) {              \
+            asm volatile(ASM                                                                       \
+                         : OUT_C(d[0]), OUT_C(d[1]), OUT_C(d[2]), OUT_C(d[3])                      \
+                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]),                  \
+                           "r"(b[1])__VA_ARGS__);                                                  \
         }                                                                                          \
     };
 
-ASTRAI_MMA_OP_FP8(__nv_fp8_e4m3, "e4m3")
-ASTRAI_MMA_OP_FP8(__nv_fp8_e5m2, "e5m2")
+ASTRAI_MMA_ASM(MmaAsmBf16,
+               float,
+               "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};",
+               "=f",
+               ,
+               "f"(c[0]),
+               "f"(c[1]),
+               "f"(c[2]),
+               "f"(c[3]))
+ASTRAI_MMA_ASM(MmaAsmE4m3,
+               float,
+               "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};",
+               "=f",
+               ,
+               "f"(c[0]),
+               "f"(c[1]),
+               "f"(c[2]),
+               "f"(c[3]))
+ASTRAI_MMA_ASM(MmaAsmE5m2,
+               float,
+               "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
+               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};",
+               "=f",
+               ,
+               "f"(c[0]),
+               "f"(c[1]),
+               "f"(c[2]),
+               "f"(c[3]))
+ASTRAI_MMA_ASM(MmaAsmS8,
+               int32_t,
+               "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "
+               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};",
+               "+r", )
 
-template <> struct MmaOp<int8_t, int8_t, Shape<16, 8, 32>> {
-    using AccT = int32_t;
+#undef ASTRAI_MMA_ASM
+
+// The accumulator the cell's C/D registers carry: float for the float
+// families, the int32 the s8 pair accumulates into.
+template <typename DT> struct MmaAccFor;
+template <> struct MmaAccFor<__nv_bfloat16> {
+    using type = float;
+};
+template <> struct MmaAccFor<__nv_fp8_e4m3> {
+    using type = float;
+};
+template <> struct MmaAccFor<__nv_fp8_e5m2> {
+    using type = float;
+};
+template <> struct MmaAccFor<int8_t> {
+    using type = int32_t;
+};
+
+// The cell skeleton: accumulator from MmaAccFor, arch floor from
+// MmaShapeFor, asm from the tag. Mixed dtype pairs never reach the tensor
+// core (the gemm promotes both sides to MmaT first), so every cell is
+// symmetric; the MmaOp<A, B, Shape> specializations below keep the pairing
+// explicit.
+template <typename DT, typename AsmT> struct MmaOpImpl {
+    using AccT = typename MmaAccFor<DT>::type;
     static constexpr int kARegs = 4;
     static constexpr int kBRegs = 2;
     static constexpr int kCRegs = 4;
@@ -168,18 +188,27 @@ template <> struct MmaOp<int8_t, int8_t, Shape<16, 8, 32>> {
     using BFrag = ArrayEngine<unsigned, kBRegs>;
     using CFrag = ArrayEngine<AccT, kCRegs>;
     static DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {
-        fma(d.storage, a.storage, b.storage, c.storage);
+        fma<ASTRAI_DEVICE_ARCH>(d.storage, a.storage, b.storage, c.storage);
     }
+    template <int Arch = ASTRAI_DEVICE_ARCH>
     static DEVICE_FORCEINLINE void
-    fma(int32_t d[4], const unsigned a[4], const unsigned b[2], const int32_t c[4]) {
-        static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 800,
-                      "s8 mma.sync requires sm_80+");
-        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "
-                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                     : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
-                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    fma(AccT d[4], const unsigned a[4], const unsigned b[2], const AccT c[4]) {
+        static_assert(Arch == 0 || Arch >= MmaShapeFor<DT>::kMinArch,
+                      "mma.sync requires the cell's kMinArch");
+        AsmT::asm_fma(d, a, b, c);
     }
 };
+
+template <>
+struct MmaOp<__nv_bfloat16, __nv_bfloat16, Shape<16, 8, 16>>
+    : MmaOpImpl<__nv_bfloat16, MmaAsmBf16> {};
+template <>
+struct MmaOp<__nv_fp8_e4m3, __nv_fp8_e4m3, Shape<16, 8, 32>>
+    : MmaOpImpl<__nv_fp8_e4m3, MmaAsmE4m3> {};
+template <>
+struct MmaOp<__nv_fp8_e5m2, __nv_fp8_e5m2, Shape<16, 8, 32>>
+    : MmaOpImpl<__nv_fp8_e5m2, MmaAsmE5m2> {};
+template <> struct MmaOp<int8_t, int8_t, Shape<16, 8, 32>> : MmaOpImpl<int8_t, MmaAsmS8> {};
 
 // --- full-rate fp8 via block_scale (sm_120 family) -------------------------
 // The plain fp8 mma.sync decodes at half rate on sm_120 (measured issue
@@ -335,6 +364,3 @@ static DEVICE_FORCEINLINE void ldmatrix_x2(unsigned r[2], const T* p) {
 }
 
 } // namespace astrai
-
-#undef ASTRAI_MMA_OP_FP8
-#undef ASTRAI_MX_MMA_OP
