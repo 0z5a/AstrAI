@@ -3,9 +3,9 @@
 #include <cfloat>
 #include <cuda_bf16.h>
 
+#include <api/attention_common.h>
 #include <memory/layout_policies.cuh>
 #include <mma/utils.cuh>
-#include <api/attention_common.h>
 
 namespace astrai {
 namespace attention {
@@ -125,9 +125,11 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
 
             int maxc0 = IsCausal ? min(seq_len, causal_off + qr0 + 1) : seq_len;
             int maxc1 = IsCausal ? min(seq_len, causal_off + qr1 + 1) : seq_len;
-            mma_softmax_tile<Traits, HasMask>(
-                kv0, maxc0, maxc1, qr0, qr1, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
-                batch, q_head, q_head, p.mask, va, vb, Sacc, Oacc, m0, m1, l0, l1, lane);
+            MaskView mv{p.mask, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
+                        batch,  q_head,          q_head,          qr0,
+                        qr1};
+            mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1, mv, va, vb, Sacc, Oacc, m0, m1, l0,
+                                              l1, lane);
 
             mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
         }

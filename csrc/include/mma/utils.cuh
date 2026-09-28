@@ -171,25 +171,24 @@ __device__ inline void mma_compute_scores(const unsigned Qa[Traits::KD][4],
     }
 }
 
-// ---------------------------------------------------------------------------
-// Online softmax + Oacc rescale for one K/V tile.
-//
+// Online softmax + Oacc rescale for one K/V tile. The mask addressing and
+// the two rows' causal/valid predicates ride the MaskView struct: nine
+// positional parameters became typed fields, so a call site cannot transpose
+// a stride and an offset.
 // HasMask is a compile-time template bool: when false, the mask branch is
 // entirely dead-code-eliminated from the inner unrolled loop.
-// ---------------------------------------------------------------------------
+struct MaskView {
+    const bool* __restrict__ mask;
+    int b_stride, h_stride, l_stride;
+    int batch, head0, head1;
+    int qrow0, qrow1;
+};
+
 template <typename Traits, bool HasMask>
 __device__ inline void mma_softmax_tile(int kv0,
                                         int maxc0,
                                         int maxc1,
-                                        int qrow0,
-                                        int qrow1,
-                                        int mask_b_stride,
-                                        int mask_h_stride,
-                                        int mask_l_stride,
-                                        int mask_batch,
-                                        int mask_head0,
-                                        int mask_head1,
-                                        const bool* __restrict__ mask,
+                                        MaskView mv,
                                         bool valid0,
                                         bool valid1,
                                         float Sacc[Traits::NC8][4],
@@ -202,18 +201,16 @@ __device__ inline void mma_softmax_tile(int kv0,
     int tid4 = lane & 3;
 
     float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
-    int mask_base0 =
-        mask_batch * mask_b_stride + mask_head0 * mask_h_stride + qrow0 * mask_l_stride;
-    int mask_base1 =
-        mask_batch * mask_b_stride + mask_head1 * mask_h_stride + qrow1 * mask_l_stride;
+    int mask_base0 = mv.batch * mv.b_stride + mv.head0 * mv.h_stride + mv.qrow0 * mv.l_stride;
+    int mask_base1 = mv.batch * mv.b_stride + mv.head1 * mv.h_stride + mv.qrow1 * mv.l_stride;
 #pragma unroll
     for (int n8 = 0; n8 < Traits::NC8; n8++) {
         int cc = kv0 + n8 * 8 + 2 * tid4;
         int c1 = cc + 1;
-        bool b0 = !valid0 || (cc >= maxc0) || (HasMask && !mask[mask_base0 + cc]);
-        bool b1 = !valid0 || (c1 >= maxc0) || (HasMask && !mask[mask_base0 + c1]);
-        bool b2 = !valid1 || (cc >= maxc1) || (HasMask && !mask[mask_base1 + cc]);
-        bool b3 = !valid1 || (c1 >= maxc1) || (HasMask && !mask[mask_base1 + c1]);
+        bool b0 = !valid0 || (cc >= maxc0) || (HasMask && !mv.mask[mask_base0 + cc]);
+        bool b1 = !valid0 || (c1 >= maxc0) || (HasMask && !mv.mask[mask_base0 + c1]);
+        bool b2 = !valid1 || (cc >= maxc1) || (HasMask && !mv.mask[mask_base1 + cc]);
+        bool b3 = !valid1 || (c1 >= maxc1) || (HasMask && !mv.mask[mask_base1 + c1]);
         float s0 = b0 ? -FLT_MAX : Sacc[n8][0];
         float s1 = b1 ? -FLT_MAX : Sacc[n8][1];
         float s2 = b2 ? -FLT_MAX : Sacc[n8][2];

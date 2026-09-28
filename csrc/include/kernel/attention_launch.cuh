@@ -13,23 +13,29 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 
+#include <api/attention_common.h>
 #include <kernel/attention_split_kv.cuh>
 #include <kernel/attention_split_q.cuh>
 #include <memory/layout_policies.cuh>
-#include <api/attention_common.h>
 #include <utils/launch.cuh>
 
 namespace astrai {
 namespace attention {
 
+// The one list of instantiated head dims — the dispatch switch, the fatal
+// message and (drift-asserted) the Python backend's HEAD_DIMS all read it.
+#define ASTRAI_ATTN_HEAD_DIMS(X) X(32) X(64) X(128) X(256)
+
 // A head dim no kernel was instantiated for — the launch discipline: never
-// run a kernel that was not built for the shape (the Python backend gates
-// the same set, drift-asserted against HEAD_DIMS).
+// run a kernel that was not built for the shape.
 [[noreturn]] inline void head_dim_fatal(int head_dim) {
-    std::fprintf(stderr,
-                 "ASTRAI: attention: head_dim %d has no kernel instantiation "
-                 "(instantiated: 32, 64, 128, 256)\n",
-                 head_dim);
+    std::fprintf(
+        stderr,
+        "ASTRAI: attention: head_dim %d has no kernel instantiation (instantiated:", head_dim);
+#define ASTRAI_HEAD_DIM_ROW(D) std::fprintf(stderr, " %d", D);
+    ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_ROW)
+#undef ASTRAI_HEAD_DIM_ROW
+    std::fprintf(stderr, ")\n");
     std::exit(EXIT_FAILURE);
 }
 
@@ -148,25 +154,6 @@ static inline void dispatch_prefill_impl(AttentionParams& p, cudaStream_t stream
     DISPATCH_CAUSAL_MASK(is_causal, has_mask, Launcher::template launch, HEAD_DIM, p, stream);
 }
 
-template <typename T> static inline void dispatch_prefill(AttentionParams& p, cudaStream_t stream) {
-    switch (p.head_dim) {
-    case 32:
-        dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, 32>(p, stream);
-        break;
-    case 64:
-        dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, 64>(p, stream);
-        break;
-    case 128:
-        dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, 128>(p, stream);
-        break;
-    case 256:
-        dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, 256>(p, stream);
-        break;
-    default:
-        head_dim_fatal(p.head_dim);
-    }
-}
-
 template <typename QSchedule, typename KV, int HEAD_DIM>
 static inline void dispatch_paged_prefill_impl(AttentionParams& p, cudaStream_t stream) {
     bool is_causal = (p.causal_offset >= 0);
@@ -174,26 +161,6 @@ static inline void dispatch_paged_prefill_impl(AttentionParams& p, cudaStream_t 
 
     using Launcher = PrefillLauncher<QSchedule, KV>;
     DISPATCH_CAUSAL_MASK(is_causal, has_mask, Launcher::template launch, HEAD_DIM, p, stream);
-}
-
-template <typename T>
-static inline void dispatch_paged_prefill(AttentionParams& p, cudaStream_t stream) {
-    switch (p.head_dim) {
-    case 32:
-        dispatch_paged_prefill_impl<PackedQSchedule, PagedKV<T>, 32>(p, stream);
-        break;
-    case 64:
-        dispatch_paged_prefill_impl<PackedQSchedule, PagedKV<T>, 64>(p, stream);
-        break;
-    case 128:
-        dispatch_paged_prefill_impl<PackedQSchedule, PagedKV<T>, 128>(p, stream);
-        break;
-    case 256:
-        dispatch_paged_prefill_impl<PackedQSchedule, PagedKV<T>, 256>(p, stream);
-        break;
-    default:
-        head_dim_fatal(p.head_dim);
-    }
 }
 
 // Decode funnel: the causal/mask ladder plus the combine pass reducing the
@@ -210,43 +177,59 @@ static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream)
     ASTRAI_LAUNCH_CHECK();
 }
 
-template <typename T> static inline void dispatch_decode(AttentionParams& p, cudaStream_t stream) {
+// One table-driven head-dim dispatch per family: the caller passes a
+// Fn object exposing template <int HEAD_DIM> operator()(AttentionParams&,
+// cudaStream_t); the switch stamps one call per list row. The four family
+// entries below differ only in the policy pair they bind.
+template <typename Fn>
+static inline void dispatch_head_dim(AttentionParams& p, cudaStream_t stream) {
     switch (p.head_dim) {
-    case 32:
-        dispatch_decode_impl<ContigKV<T>, 32>(p, stream);
+#define ASTRAI_HEAD_DIM_CASE(D)                                                                    \
+    case D:                                                                                        \
+        Fn::template run<D>(p, stream);                                                            \
         break;
-    case 64:
-        dispatch_decode_impl<ContigKV<T>, 64>(p, stream);
-        break;
-    case 128:
-        dispatch_decode_impl<ContigKV<T>, 128>(p, stream);
-        break;
-    case 256:
-        dispatch_decode_impl<ContigKV<T>, 256>(p, stream);
-        break;
+        ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
+#undef ASTRAI_HEAD_DIM_CASE
     default:
         head_dim_fatal(p.head_dim);
     }
 }
 
+// Family bindings: one thin Fn per entry, naming its policy pair.
+template <typename T> struct DispatchPrefill {
+    template <int HEAD_DIM> static void run(AttentionParams& p, cudaStream_t stream) {
+        dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, HEAD_DIM>(p, stream);
+    }
+};
+template <typename T> struct DispatchPagedPrefill {
+    template <int HEAD_DIM> static void run(AttentionParams& p, cudaStream_t stream) {
+        dispatch_prefill_impl<PackedQSchedule, PagedKV<T>, HEAD_DIM>(p, stream);
+    }
+};
+template <typename T> struct DispatchDecode {
+    template <int HEAD_DIM> static void run(AttentionParams& p, cudaStream_t stream) {
+        dispatch_decode_impl<ContigKV<T>, HEAD_DIM>(p, stream);
+    }
+};
+template <typename T> struct DispatchPagedDecode {
+    template <int HEAD_DIM> static void run(AttentionParams& p, cudaStream_t stream) {
+        dispatch_decode_impl<PagedKV<T>, HEAD_DIM>(p, stream);
+    }
+};
+
+template <typename T> static inline void dispatch_prefill(AttentionParams& p, cudaStream_t stream) {
+    dispatch_head_dim<DispatchPrefill<T>>(p, stream);
+}
+template <typename T>
+static inline void dispatch_paged_prefill(AttentionParams& p, cudaStream_t stream) {
+    dispatch_head_dim<DispatchPagedPrefill<T>>(p, stream);
+}
+template <typename T> static inline void dispatch_decode(AttentionParams& p, cudaStream_t stream) {
+    dispatch_head_dim<DispatchDecode<T>>(p, stream);
+}
 template <typename T>
 static inline void dispatch_paged_decode(AttentionParams& p, cudaStream_t stream) {
-    switch (p.head_dim) {
-    case 32:
-        dispatch_decode_impl<PagedKV<T>, 32>(p, stream);
-        break;
-    case 64:
-        dispatch_decode_impl<PagedKV<T>, 64>(p, stream);
-        break;
-    case 128:
-        dispatch_decode_impl<PagedKV<T>, 128>(p, stream);
-        break;
-    case 256:
-        dispatch_decode_impl<PagedKV<T>, 256>(p, stream);
-        break;
-    default:
-        head_dim_fatal(p.head_dim);
-    }
+    dispatch_head_dim<DispatchPagedDecode<T>>(p, stream);
 }
 
 } // namespace attention

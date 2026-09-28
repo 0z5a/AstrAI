@@ -3,9 +3,9 @@
 #include <cfloat>
 #include <cuda_bf16.h>
 
+#include <api/attention_common.h>
 #include <memory/layout_policies.cuh>
 #include <mma/utils.cuh>
-#include <api/attention_common.h>
 
 namespace astrai {
 namespace attention {
@@ -93,9 +93,11 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         // Decode: q_len=1 so qrow0=qrow1=0. Paged treats [0, seq_len) as
         // the causal range; contig clips to the causal_offset bound.
         int maxc = IsCausal ? KV::decode_attend_len(p, batch) : seq_len;
-        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc, 0, 0, p.mask_b_stride, p.mask_h_stride,
-                                          p.mask_l_stride, batch, q_head0 + gid, q_head0 + gid + 8,
-                                          p.mask, va, vb, Sacc, Oacc, m0, m1, l0, l1, lane);
+        MaskView mv{p.mask, p.mask_b_stride, p.mask_h_stride,   p.mask_l_stride,
+                    batch,  q_head0 + gid,   q_head0 + gid + 8, 0,
+                    0};
+        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc, mv, va, vb, Sacc, Oacc, m0, m1, l0, l1,
+                                          lane);
 
         mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
     };
