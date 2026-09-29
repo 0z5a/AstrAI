@@ -874,7 +874,7 @@ classDiagram
             +shutdown()
         }
 
-        class Executor {
+        class GPUModelRunner {
             +AutoModel model
             +PagePool kv_cache
             +TaskCacheManager task_cache
@@ -906,7 +906,7 @@ classDiagram
         class InferenceScheduler {
             +PagePool _cache
             +TaskCacheManager _task_cache
-            +Executor _executor
+            +GPUModelRunner _executor
             +TaskManager _task_mgr
             +Event _stop_event
             +Thread _loop_thread
@@ -1456,8 +1456,8 @@ classDiagram
     InferenceEngine *-- InferenceScheduler
     InferenceScheduler *-- PagePool
     InferenceScheduler *-- TaskCacheManager
-    InferenceScheduler *-- Executor
-    Executor *-- InferenceWorkspace
+    InferenceScheduler *-- GPUModelRunner
+    GPUModelRunner *-- InferenceWorkspace
     InferenceScheduler *-- TaskManager
     AutoRegressiveLM *-- DecoderBlock
     AutoRegressiveLM *-- RotaryEmbedding
@@ -1553,8 +1553,8 @@ classDiagram
     InferenceScheduler --> TaskStatus
     Task --> TaskStatus
     InferenceEngine --> AutoModel
-    Executor --> AutoModel
-    Executor --> TaskCacheManager
+    GPUModelRunner --> AutoModel
+    GPUModelRunner --> TaskCacheManager
     TaskManager --> AutoTokenizer
 
 ```
@@ -1571,7 +1571,7 @@ classDiagram
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator, RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher | Training workflow (online RL rollout via injectable backends) |
-| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, InferenceWorkspace, PagePool, TaskCacheManager, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, AllocationStrategy, ContiguousStrategy, PagedStrategy, Task, TaskManager, TaskStatus, StreamDecoder, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
+| **astrai.inference** | InferenceEngine, InferenceScheduler, GPUModelRunner, InferenceWorkspace, PagePool, TaskCacheManager, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, AllocationStrategy, ContiguousStrategy, PagedStrategy, Task, TaskManager, TaskStatus, StreamDecoder, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
 | **astrai.extension** | `backend` policy package, `kernel` kernel-wrapper package, `fp8.py` FP8 strategy layer, AttentionBackend, TorchNativeBackend, CudaBackend, FlashAttnBackend, attention, attn_backend, ATTN_BACKEND, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optim** | OptimizerFactory, MuonAdamW, NoraNadamW, ManoAdamW, composite_step/composite_zero_grad/composite_state_dict, partition_optimizer_parameters | Built-in optimizers (`muon_adamw` / `nora_nadamw` / `mano_adamw`) with shared composite-optimizer helpers |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch, executors & gradient accumulation |

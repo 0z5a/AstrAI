@@ -51,13 +51,15 @@ class TaskCacheState:
 class Allocator:
     """Bitmask-based page allocator with ref-counting and LRU eviction.
 
-    The free set is a Python big-int bitmask. On serving-scale pools the
-    mask is tens of thousands of bits wide, so the classic
-    ``lsb = mask & -mask`` extraction walks the whole big-int per page —
-    fine for one page, quadratic for a 512-page prompt. The bulk paths
-    below therefore harvest a run of low bits at once: the mask is a set
-    of machine-word limbs, and the lowest set bits almost always live in
-    the first few limbs.
+    The free set is a Python big-int bitmask (kept as the source of truth:
+    ``_free_mask`` is read by tests and debug tooling). Scanning it
+    directly costs a full limb-chain walk per extracted page on
+    serving-scale pools, so the fast paths go through a shadow index of
+    per-64-page words (``_words``) plus a cursor to the lowest non-empty
+    word. Allocation only touches the handful of words it consumes;
+    freeing sets one bit and pulls the cursor back. The two structures
+    are updated together under the same lock, and ``_words`` can be
+    rebuilt from the mask at any time (see ``_sync_words``).
     """
 
     _WORD_BITS = 64
@@ -69,45 +71,54 @@ class Allocator:
         self._lru: OrderedDict[int, None] = OrderedDict()
         self.on_evict: Optional[Callable[[int], None]] = None
         self._lock = threading.Lock()
+        self._sync_words()
 
-    def _harvest_low(self, mask: int, n: int) -> List[int]:
-        """Pop the ``n`` lowest set bits off ``mask`` in word-sized bites.
+    def _sync_words(self):
+        """Rebuild the word index from ``_free_mask`` (caller holds or
+        owns exclusive access, e.g. at init or after mask surgery)."""
+        n_words = (self._n_pages + self._WORD_BITS - 1) // self._WORD_BITS
+        self._words: List[int] = [0] * n_words
+        m = self._free_mask
+        w = 0
+        while m:
+            self._words[w] = m & 0xFFFFFFFFFFFFFFFF
+            m >>= self._WORD_BITS
+            w += 1
+        self._first_nonempty = 0
+        while self._first_nonempty < n_words and self._words[self._first_nonempty] == 0:
+            self._first_nonempty += 1
 
-        Returns ``(page indices, cleared-mask)``; the caller holds the lock
-        and updates ``_refs``. Only the bit extraction works a 64-bit
-        window at a time; the cleared bits are accumulated into one
-        single-bit-mask sum and removed with one big-int subtraction at
-        the end (clearing them one ``xor`` at a time on a wide mask costs
-        a full big-int walk per page).
-        """
-        out: List[int] = []
+    def _mask_alloc_bits(self, pages: List[int]):
+        # One aggregated mask subtraction for the whole batch: per-page
+        # big-int clears cost a limb walk each, which is what the word
+        # index exists to avoid.
         clear = 0
-        base = 0
-        word_mask = (1 << self._WORD_BITS) - 1
-        while len(out) < n:
-            word = (mask >> base) & word_mask
-            if word == 0:
-                base += self._WORD_BITS
-                if base >= self._n_pages or base >= mask.bit_length():
-                    break
-                continue
-            take = min(n - len(out), word.bit_count())
-            for _ in range(take):
-                lsb = word & -word
-                out.append(base + lsb.bit_length() - 1)
-                clear |= lsb << base
-                word ^= lsb
-            # Reflect the harvest before reading the next window, or the
-            # loop would re-harvest the same low word from the stale mask.
-            mask &= ~clear
-        return out, mask
+        for idx in pages:
+            clear |= 1 << idx
+            w = idx >> 6
+            self._words[w] &= ~(1 << (idx & 63))
+        self._free_mask &= ~clear
+        # Advance the cursor past every word the batch emptied, in order.
+        for w in range(self._first_nonempty, len(self._words)):
+            if self._words[w] == 0:
+                self._first_nonempty = w + 1
+            else:
+                break
+
+    def _mask_free_bit(self, idx: int):
+        bit = 1 << idx
+        self._free_mask |= bit
+        w = idx >> 6
+        self._words[w] |= 1 << (idx & 63)
+        if w < self._first_nonempty:
+            self._first_nonempty = w
 
     def alloc(self) -> int:
         with self._lock:
             if self._free_mask:
                 lsb = self._free_mask & -self._free_mask
                 idx = lsb.bit_length() - 1
-                self._free_mask ^= lsb
+                self._mask_alloc_bits([idx])
                 self._refs[idx] = 1
                 return idx
             if self._lru:
@@ -115,7 +126,11 @@ class Allocator:
                 if self.on_evict:
                     self.on_evict(idx)
                 self._refs[idx] = 1
+                # LRU promotion: the bit was set by the caller before or
+                # during eviction; clear it in both structures now.
                 self._free_mask &= ~(1 << idx)
+                w = idx >> 6
+                self._words[w] &= ~(1 << (idx & 63))
                 return idx
             return -1
 
@@ -137,19 +152,29 @@ class Allocator:
                     idx, _ = self._lru.popitem(last=False)
                     if self.on_evict:
                         self.on_evict(idx)
-                    self._free_mask |= 1 << idx
+                    self._mask_free_bit(idx)
                     promoted += 1
                 if free + promoted < n:
                     return None
-            out, mask = self._harvest_low(self._free_mask, n)
-            if len(out) < n:
-                # Depleted the low words mid-request (fragmented free set):
-                # fall back to whole-mask extraction for the remainder.
-                while len(out) < n:
-                    lsb = mask & -mask
-                    out.append(lsb.bit_length() - 1)
-                    mask ^= lsb
-            self._free_mask = mask
+            # Word-index harvest: only the words actually consumed are
+            # touched, so a fragmented pool costs the skipped empty words
+            # (cursor advance) instead of a big-int limb walk per page.
+            out: List[int] = []
+            w = self._first_nonempty
+            words = self._words
+            while len(out) < n and w < len(words):
+                word = words[w]
+                if word == 0:
+                    w += 1
+                    continue
+                base = w * self._WORD_BITS
+                while word and len(out) < n:
+                    lsb = word & -word
+                    out.append(base + lsb.bit_length() - 1)
+                    word ^= lsb
+                words[w] = word
+                w += 1
+            self._mask_alloc_bits(out)
             for idx in out:
                 self._refs[idx] = 1
             return out
@@ -161,7 +186,7 @@ class Allocator:
                 if keep_cached:
                     self._lru[idx] = None
                 else:
-                    self._free_mask |= 1 << idx
+                    self._mask_free_bit(idx)
 
     def free_many(self, idxs: List[int], keep_cached_for=None):
         """Release many pages under one lock acquisition.
@@ -174,13 +199,27 @@ class Allocator:
             return
         keep = keep_cached_for or (lambda idx: False)
         with self._lock:
+            # Set-latch pass first (refs may drop to zero multiple times in
+            # one batch; the freed bits are aggregated into ONE big-int
+            # insertion and the word index updated per page — the index is
+            # what the fast paths read, the mask follows in bulk).
+            freed_bits = 0
+            lowest_word = len(self._words)
             for idx in idxs:
                 self._refs[idx] -= 1
                 if self._refs[idx] == 0:
                     if keep(idx):
                         self._lru[idx] = None
                     else:
-                        self._free_mask |= 1 << idx
+                        freed_bits |= 1 << idx
+                        w = idx >> 6
+                        self._words[w] |= 1 << (idx & 63)
+                        if w < lowest_word:
+                            lowest_word = w
+            if freed_bits:
+                self._free_mask |= freed_bits
+                if lowest_word < self._first_nonempty:
+                    self._first_nonempty = lowest_word
 
     def inc_ref(self, idx: int):
         with self._lock:
@@ -206,7 +245,7 @@ class Allocator:
                     raise RuntimeError("Cannot invalidate a referenced cache page")
                 if self.on_evict:
                     self.on_evict(idx)
-                self._free_mask |= 1 << idx
+                self._mask_free_bit(idx)
             return len(cached)
 
 
@@ -383,6 +422,26 @@ class PagedStrategy(AllocationStrategy):
         self._page_size = page_size
         self._req_pool = req_pool
         self._device = device
+        # Pinned staging for the per-step flush of host-staged slot tails:
+        # synchronous ``torch.tensor(..., device=)`` construction costs a
+        # blocking H2D per tensor per decode step; staging into pre-pinned
+        # buffers keeps those transfers asynchronous.  The ring depth of 2
+        # lets step t+1 write its staging while step t's transfer may still
+        # be in flight (same stream, so ordering is preserved either way).
+        # Pinned allocation needs a CUDA driver — CPU-only environments
+        # (CI) stage through pageable memory instead (the flush then just
+        # keeps its old blocking-copy behaviour).
+        max_batch = req_pool.req_to_token.shape[0]
+        pin = torch.cuda.is_available() and torch.device(device).type == "cuda"
+        self._flush_pin = [
+            (
+                torch.empty(max_batch, dtype=torch.int64, pin_memory=pin),
+                torch.empty(max_batch, dtype=torch.int64, pin_memory=pin),
+                torch.empty(max_batch, dtype=torch.int32, pin_memory=pin),
+            )
+            for _ in range(2)
+        ]
+        self._flush_ring = 0
 
     def alloc(self, state: TaskCacheState, prompt_ids: List[int]) -> bool:
         if self._prefix is not None:
@@ -479,9 +538,22 @@ class PagedStrategy(AllocationStrategy):
             col_idx.extend(range(start, n))
         if not flat_vals:
             return
-        rows = torch.tensor(row_idx, dtype=torch.long, device=self._device)
-        cols = torch.tensor(col_idx, dtype=torch.long, device=self._device)
-        vals = torch.tensor(flat_vals, dtype=torch.int32, device=self._device)
+        # Depth-2 pinned staging: writes go into the free ring slot, then
+        # a single non_blocking H2D per tensor replaces three blocking
+        # ``torch.tensor(..., device=)`` constructions.  Depth 2 (vs a
+        # single buffer) keeps the host writable while the previous
+        # transfer may still be queued — the caller (bind) runs strictly
+        # step-serial, but the same stream executes the copies in order
+        # regardless.
+        pin_rows, pin_cols, pin_vals = self._flush_pin[self._flush_ring]
+        self._flush_ring ^= 1
+        n = len(flat_vals)
+        pin_rows[:n] = torch.as_tensor(row_idx, dtype=torch.int64)
+        pin_cols[:n] = torch.as_tensor(col_idx, dtype=torch.int64)
+        pin_vals[:n] = torch.as_tensor(flat_vals, dtype=torch.int32)
+        rows = pin_rows[:n].to(self._device, non_blocking=True)
+        cols = pin_cols[:n].to(self._device, non_blocking=True)
+        vals = pin_vals[:n].to(self._device, non_blocking=True)
         self._req_pool.req_to_token[rows, cols] = vals
 
     def record_hashes(

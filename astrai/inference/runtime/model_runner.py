@@ -14,7 +14,17 @@ from astrai.extension.backend.attention import (
 )
 from astrai.inference.cache import PagePool, TaskCacheManager
 from astrai.inference.runtime.graph import CudaGraphContext
-from astrai.inference.runtime.sample import sample
+from astrai.inference.runtime.pending import (
+    BatchSnapshot,
+    PendingStep,
+    ResultRing,
+)
+from astrai.inference.runtime.sample import (
+    SamplingMeta,
+    SamplingPipeline,
+    build_sampling_pipeline,
+    sample,
+)
 from astrai.inference.task import Task
 from astrai.inference.workspace import InferenceWorkspace
 from astrai.model.automodel import AutoModel
@@ -54,6 +64,12 @@ class SamplingBatchInfo:
     Sampling params are constant for a given ordered task set, so they are
     built once (pinned-memory async H2D) and reused until the task set
     changes.  ``top_ks`` is int32 to match the native consumers.
+
+    ``meta`` holds the host-resolved facts (greedy, active filters) derived
+    from the same task attributes, and ``pipeline`` the strategy chain
+    built from them — both constant for the same ordered task set, so the
+    steady-state decode path reuses the whole bundle instead of rebuilding
+    strategy objects and re-probing device tensors every step.
     """
 
     temperatures: Tensor  # float32 [B]
@@ -61,6 +77,8 @@ class SamplingBatchInfo:
     top_ps: Tensor  # float32 [B]
     freq_penalties: Tensor  # float32 [B]
     has_freq: bool  # any frequency_penalty != 0 (avoids per-step GPU .any())
+    meta: Optional[SamplingMeta] = None
+    pipeline: Optional[SamplingPipeline] = None
 
 
 @dataclass
@@ -83,26 +101,49 @@ class DecodeSteadyState:
 def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
     pin = str(device).startswith("cuda")
     freq_list = [t.frequency_penalty for t in tasks]
+    temps = [t.temperature for t in tasks]
+    top_ks = [t.top_k for t in tasks]
+    top_ps = [t.top_p for t in tasks]
     freq_penalties = torch.tensor(freq_list, dtype=torch.float32, pin_memory=pin).to(
         device, non_blocking=True
     )
-    return SamplingBatchInfo(
-        temperatures=torch.tensor(
-            [t.temperature for t in tasks], dtype=torch.float32, pin_memory=pin
-        ).to(device, non_blocking=True),
-        top_ks=torch.tensor(
-            [t.top_k for t in tasks], dtype=torch.int32, pin_memory=pin
-        ).to(device, non_blocking=True),
-        top_ps=torch.tensor(
-            [t.top_p for t in tasks], dtype=torch.float32, pin_memory=pin
-        ).to(device, non_blocking=True),
-        freq_penalties=freq_penalties,
-        # Host-side any(): the values came from the task list, so checking
-        # them on device would force a synchronize right after the
-        # non-blocking H2D copies — draining whatever prefill work is still
-        # queued (measured 0.6 s stall at batch 128).
-        has_freq=any(f != 0.0 for f in freq_list),
+    # Host-side any()/all(): the values came from the task list, so checking
+    # them on device would force a synchronize right after the non-blocking
+    # H2D copies — draining whatever prefill work is still queued
+    # (measured 0.6 s stall at batch 128).
+    has_freq = any(f != 0.0 for f in freq_list)
+    meta = SamplingMeta(
+        greedy=all(t == 0.0 for t in temps),
+        any_temp_not_one=any(t != 1.0 for t in temps),
+        max_top_k=max(top_ks, default=0),
+        any_topp_lt1=any(tp < 1.0 for tp in top_ps),
+        has_freq=has_freq,
     )
+    temperatures = torch.tensor(temps, dtype=torch.float32, pin_memory=pin).to(
+        device, non_blocking=True
+    )
+    top_ks_t = torch.tensor(top_ks, dtype=torch.int32, pin_memory=pin).to(
+        device, non_blocking=True
+    )
+    top_ps_t = torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin).to(
+        device, non_blocking=True
+    )
+    info = SamplingBatchInfo(
+        temperatures=temperatures,
+        top_ks=top_ks_t,
+        top_ps=top_ps_t,
+        freq_penalties=freq_penalties,
+        has_freq=has_freq,
+        meta=meta,
+    )
+    info.pipeline = build_sampling_pipeline(
+        temperatures,
+        top_ks_t,
+        top_ps_t,
+        freq_penalties,
+        meta=meta,
+    )
+    return info
 
 
 def _warmup_cuda_graphs(
@@ -188,8 +229,8 @@ def _warmup_cuda_graphs(
         torch.cuda.synchronize()
 
 
-class Executor:
-    """Model forward passes for prefill and decode phases."""
+class GPUModelRunner:
+    """Model forward passes for prefill and decode phases (vLLM GPUModelRunner counterpart)."""
 
     def __init__(
         self,
@@ -210,6 +251,18 @@ class Executor:
         # task set decodes one token per step).  Sampling params stay
         # constant; only positions advance.
         self._decode_cache: Optional[DecodeSteadyState] = None
+
+        # The most recent submitted-but-not-necessarily-committed decode
+        # step.  ``submit_decode`` consults it to refuse the one unsafe
+        # overlap (frequency penalty reading stale host histories); the
+        # Stepper's commit phase clears it.  Synchronous callers commit
+        # immediately, so it is usually already consumed.
+        self._pending: Optional[PendingStep] = None
+
+        # Async result relay: pinned depth-2 slots on a dedicated copy
+        # stream.  A submitted step's tokens land here without a blocking
+        # tolist; commit waits on the posted event instead.  Inert on CPU.
+        self._result_ring = ResultRing(kv_cache.max_batch_size, self.device)
 
         # Pre-allocated fixed-shape buffers for the decode hot path
         # (input_ids, decode mask, KV bind metadata).  Eagerly sized at init
@@ -256,63 +309,6 @@ class Executor:
     @property
     def cuda_graph_enabled(self) -> bool:
         return self._graph_ctx.enabled and self._graph_supported
-
-    def _sample_logits(
-        self,
-        logits: Tensor,
-        tasks: List[Task],
-        return_logprobs: bool = False,
-        info: Optional[SamplingBatchInfo] = None,
-    ):
-        """Sample from ``logits`` and return ``(host_payload, tokens)``.
-
-        ``host_payload`` is the scheduler-facing list (token ids, or
-        ``(token_id, logprob)`` tuples with ``return_logprobs``);
-        ``tokens`` is the ``[B]`` device tensor that produced it, kept
-        for the steady-state decode fast path.
-        """
-        info = info or _build_sampling_batch_info(tasks, self.device)
-        if info.has_freq:
-            history_lists = [
-                t.prompt_ids[-t.rep_window :] + t.output_ids for t in tasks
-            ]
-            history_lens = [len(ids) for ids in history_lists]
-            max_len = max(history_lens, default=0)
-            padded_ids = torch.zeros(
-                len(tasks), max_len, dtype=torch.long, device=self.device
-            )
-            padded_mask = torch.zeros(
-                len(tasks), max_len, dtype=torch.bool, device=self.device
-            )
-            for i, ids in enumerate(history_lists):
-                length = len(ids)
-                padded_ids[i, :length] = torch.as_tensor(
-                    ids, dtype=torch.long, device=self.device
-                )
-                padded_mask[i, :length] = True
-        else:
-            padded_ids = None
-            padded_mask = None
-
-        result = sample(
-            logits,
-            temperature=info.temperatures,
-            top_k=info.top_ks,
-            top_p=info.top_ps,
-            frequency_penalty=info.freq_penalties,
-            input_ids=padded_ids,
-            input_mask=padded_mask,
-            return_logprobs=return_logprobs,
-        )
-        if not return_logprobs:
-            return result.tolist(), result
-
-        tokens, logprobs = result
-        tokens_list = tokens.tolist()
-        logprobs_list = logprobs.tolist()
-        for task, logprob in zip(tasks, logprobs_list):
-            task.output_logprobs.append(float(logprob))
-        return list(zip(tokens_list, logprobs_list)), tokens
 
     def execute_prefill(
         self,
@@ -380,8 +376,8 @@ class Executor:
             )
             logits = outputs["logits"]
 
-        step_out, _ = self._sample_logits(logits, tasks, return_logprobs)
-        return tasks, step_out
+        pending = self._submit_sample(logits, tasks, return_logprobs)
+        return tasks, pending
 
     def execute_score(
         self,
@@ -469,25 +465,26 @@ class Executor:
             out.append(chunk if per_token else sum(chunk))
         return out
 
-    def execute_decode(
+    def submit_decode(
         self, tasks: List[Task], return_logprobs: bool = False
-    ) -> List[int]:
-        """Decode next token for each task.
+    ) -> Optional[PendingStep]:
+        """Launch one decode step without resolving any value on host.
 
-        Args:
-            return_logprobs: When ``True``, also record (and return)
-                the log-probability of each sampled token under the
-                post-strategy sampling distribution.  The logprob is
-                appended to ``task.output_logprobs`` and the return
-                list becomes ``List[Tuple[int, float]]``.
+        The submit half of the decode contract: fills input buffers, binds
+        KV, replays the forward and launches sampling, then hands back a
+        :class:`PendingStep` carrying the device-resident tokens (and
+        optional logprobs).  Nothing here touches host copies of the
+        sampled values or mutates task output state — that is exclusively
+        :meth:`PendingStep.commit`'s job, invoked by the Stepper's commit
+        phase.
 
-        Returns:
-            ``List[int]`` of sampled token IDs, or
-            ``List[Tuple[int, float]]`` of ``(token_id, logprob)`` when
-            ``return_logprobs`` is ``True``.
+        Frequency penalty needs each task's host-side output history at
+        submit time, so a pending (not yet committed) previous step for the
+        same batch would be read stale; that combination is rejected here
+        (``None``) and the caller falls back to commit-then-submit.
         """
         if not tasks:
-            return []
+            return None
 
         b = len(tasks)
 
@@ -519,6 +516,11 @@ class Executor:
         # let a fresh batch replay a previous generation's tokens.
         cached = self._decode_cache
         cache_valid = cached is not None and cached.task_sig == task_sig
+        pending_same_batch = (
+            self._pending is not None
+            and not self._pending.committed
+            and self._pending.snapshot.task_ids == task_sig
+        )
         if cache_valid and cached.last_tokens is not None:
             with torch.inference_mode():
                 input_ids = ws.fill_input_ids_from_device(cached.last_tokens)
@@ -541,6 +543,12 @@ class Executor:
             ws.position_ids[:b].copy_(
                 torch.tensor(cur_positions, dtype=torch.long, device=self.device)
             )
+        if info.has_freq and pending_same_batch:
+            # Frequency penalty subtracts per-token counts computed from the
+            # host history (prompt tail + full output). With a pending step
+            # in flight the histories are one step behind the device relay,
+            # so the penalty would be computed against the wrong prefix.
+            return None
         self._decode_cache = DecodeSteadyState(task_sig, cur_positions, info)
 
         # ---- forward (graph replay or live run + capture) ----
@@ -573,8 +581,155 @@ class Executor:
                 )
             logits = outputs["logits"]
 
-        step_out, tokens_dev = self._sample_logits(
-            logits, tasks, return_logprobs, info=info
+        pending = self._submit_sample(logits, tasks, return_logprobs, info=info)
+        self._result_ring.post(pending)
+        self._decode_cache.last_tokens = pending.tokens
+        self._pending = pending
+        return pending
+
+    def _submit_sample(
+        self,
+        logits: Tensor,
+        tasks: List[Task],
+        return_logprobs: bool = False,
+        info: Optional[SamplingBatchInfo] = None,
+    ) -> PendingStep:
+        """Sample from ``logits`` into a :class:`PendingStep`.
+
+        Same strategy pipeline and frequency-penalty history assembly as
+        the pre-split host path, but the result stays on device inside a
+        pending step instead of being resolved to host lists.
+        """
+        info = info or _build_sampling_batch_info(tasks, self.device)
+        if info.has_freq:
+            history_lists = [
+                t.prompt_ids[-t.rep_window :] + t.output_ids for t in tasks
+            ]
+            history_lens = [len(ids) for ids in history_lists]
+            max_len = max(history_lens, default=0)
+            padded_ids = torch.zeros(
+                len(tasks), max_len, dtype=torch.long, device=self.device
+            )
+            padded_mask = torch.zeros(
+                len(tasks), max_len, dtype=torch.bool, device=self.device
+            )
+            for i, ids in enumerate(history_lists):
+                length = len(ids)
+                padded_ids[i, :length] = torch.as_tensor(
+                    ids, dtype=torch.long, device=self.device
+                )
+                padded_mask[i, :length] = True
+        else:
+            padded_ids = None
+            padded_mask = None
+
+        result = (
+            info.pipeline.sample(
+                logits,
+                input_ids=padded_ids,
+                input_mask=padded_mask,
+                return_logprobs=return_logprobs,
+            )
+            if info.pipeline is not None
+            else sample(
+                logits,
+                temperature=info.temperatures,
+                top_k=info.top_ks,
+                top_p=info.top_ps,
+                frequency_penalty=info.freq_penalties,
+                input_ids=padded_ids,
+                input_mask=padded_mask,
+                return_logprobs=return_logprobs,
+                meta=info.meta,
+            )
         )
-        self._decode_cache.last_tokens = tokens_dev
-        return step_out
+        if return_logprobs:
+            tokens, logprobs = result
+        else:
+            tokens, logprobs = result, None
+
+        snapshot = BatchSnapshot(
+            task_ids=tuple(t.task_id for t in tasks),
+            kv_positions=tuple(t.next_pos for t in tasks),
+            policy_version=0,
+        )
+        return PendingStep(
+            snapshot=snapshot,
+            tasks=list(tasks),
+            tokens=tokens,
+            logprobs=logprobs,
+        )
+
+    def peek_pending(self) -> Optional[PendingStep]:
+        """The in-flight submitted step, if any (not committed)."""
+        return self._pending
+
+    def clear_pending(self) -> Optional[PendingStep]:
+        """Detach the in-flight step without committing it.
+
+        The overlap scheduler's commit phase takes ownership this way: the
+        executor's ``_pending`` slot frees up for the *next* submit while
+        the scheduler still holds (and commits) the returned step.
+        """
+        pending = self._pending
+        self._pending = None
+        return pending
+
+    def can_overlap_submit(self) -> bool:
+        """Whether the next submit may overlap the in-flight step.
+
+        Frequency penalty is the one refusal: its per-step history rebuild
+        reads host-side ``output_ids``, which a pending step has not yet
+        produced — the overlap would penalise against a stale prefix.
+        """
+        pending = self._pending
+        if pending is None or pending.committed:
+            return True
+        cached = self._decode_cache
+        return cached is None or not getattr(cached.sampling_info, "has_freq", False)
+
+    def flush_pending(self, stepper=None) -> Optional[PendingStep]:
+        """Commit and clear any in-flight submitted step.
+
+        The drain point for every state transition that must not race an
+        outstanding step: weight updates, KV invalidation, shutdown, and
+        the frequency-penalty fallback inside :meth:`submit_decode`
+        (via the Stepper).  Returns the drained step, or ``None``.
+        """
+        pending = self._pending
+        if pending is None:
+            return None
+        self._pending = None
+        if pending.committed:
+            return pending
+        if stepper is not None:
+            stepper.step_commit(pending)
+        else:
+            pending.commit()
+        return pending
+
+    def execute_decode(
+        self, tasks: List[Task], return_logprobs: bool = False
+    ) -> List[int]:
+        """Decode next token for each task (submit + immediate commit).
+
+        Compatibility shell over :meth:`submit_decode`: same ordering
+        guarantees and same return contract as before the split, for the
+        synchronous callers (``run_batch``, RL rollout).  The Stepper's
+        overlapping path uses ``submit_decode`` + deferred commit instead.
+
+        Returns:
+            ``List[int]`` of sampled token IDs, or
+            ``List[Tuple[int, float]]`` of ``(token_id, logprob)`` when
+            ``return_logprobs`` is ``True``.
+        """
+        pending = self.submit_decode(tasks, return_logprobs)
+        if pending is None:
+            # submit_decode refuses only the freq-penalty-with-pending
+            # combination; with no pending step in flight it cannot happen,
+            # so reaching here means the caller bypassed the contract.
+            raise RuntimeError("execute_decode: submit refused an empty batch")
+        payload = pending.commit()
+        if return_logprobs:
+            return [(tid, lp) for tid, lp in payload]
+        return [tid for tid, _ in payload]

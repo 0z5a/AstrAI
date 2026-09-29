@@ -49,21 +49,9 @@ __all__ = [
     "PagePool",
     "TaskCacheManager",
     "TaskCacheState",
-    "page_hash",
 ]
 
 # ---- helpers ----
-
-
-def page_hash(
-    token_ids: List[int], page_idx: int, page_size: int, parent_hash: int = 0
-) -> int:
-    start = page_idx * page_size
-    end = min(start + page_size, len(token_ids))
-    h = parent_hash
-    for i in range(start, end):
-        h = (h * 31 + token_ids[i]) & 0xFFFFFFFFFFFFFFFF
-    return h
 
 
 def _is_steady_increment(

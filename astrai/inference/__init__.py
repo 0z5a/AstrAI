@@ -14,7 +14,7 @@ Modules:
 
 from astrai.inference.engine import InferenceEngine, build_engine
 from astrai.inference.network import get_app, run_server
-from astrai.inference.runtime.executor import Executor
+from astrai.inference.runtime.model_runner import GPUModelRunner
 from astrai.inference.runtime.sample import sample
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.task import (
@@ -32,7 +32,7 @@ __all__ = [
     "InferenceScheduler",
     "BatchedStreamCallback",
     "GenerationResult",
-    "Executor",
+    "GPUModelRunner",
     "STOP",
     "Task",
     "TaskManager",

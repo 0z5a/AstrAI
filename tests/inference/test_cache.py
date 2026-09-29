@@ -12,7 +12,6 @@ from astrai.inference.cache import (
     RadixCache,
     ReqToTokenPool,
     TaskCacheManager,
-    page_hash,
 )
 from astrai.inference.workspace import InferenceWorkspace
 
@@ -31,14 +30,6 @@ def _ws(pool: PagePool) -> InferenceWorkspace:
 
 def _make_task_cache(pool: PagePool) -> TaskCacheManager:
     return TaskCacheManager(pool)
-
-
-# ---- page_hash ----
-
-
-def test_page_hash_different_page_differs():
-    token_ids = list(range(256))
-    assert page_hash(token_ids, 0, 64) != page_hash(token_ids, 1, 64)
 
 
 # ---- Allocator ----

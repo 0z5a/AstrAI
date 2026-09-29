@@ -142,7 +142,8 @@ class Task:
         """True when all prompt KV entries are materialized."""
         return self._kv_len >= self.input_tokens > 0
 
-    def is_finished(self, stop_ids: List[int]) -> bool:
+    def is_finished(self, stop_ids) -> bool:
+        """Terminal check; ``stop_ids`` may be a set (O(1) membership)."""
         if self.max_tokens is not None and self.output_tokens >= self.max_tokens:
             return True
         if self.output_ids and self.output_ids[-1] in stop_ids:
