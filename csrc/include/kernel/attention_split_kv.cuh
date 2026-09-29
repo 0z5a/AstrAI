@@ -41,6 +41,11 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     // Per-request seq_len (paged reads kv_indptr; contig uses p.kv_len).
     const int seq_len = KV::kv_len(p, batch);
     const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
+    // scale * log2(e): the exp2 base-change factor folded into every
+    // softmax exponent (see arith/softmax.cuh). The partials this kernel
+    // writes (m raw-space, l, Oacc un-normalised) are consumed by the
+    // combine kernel, which uses the same factor.
+    const float scale_log2 = p.scale * LOG2E;
 
     // Double-buffered shared memory for K/V (no sQ needed)
     __shared__ __align__(16) T sK[Traits::STAGES * Traits::BC * Traits::LD];
@@ -96,7 +101,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         int kv0 = (ti_begin + it) * Traits::BC;
 
         float Sacc[Traits::NC8][4];
-        mma_compute_scores<Traits>(Qa, bK, p.scale, lane, Sacc);
+        mma_compute_scores<Traits>(Qa, bK, lane, Sacc);
 
         // Decode: q_len=1 so qrow0=qrow1=0. Paged treats [0, seq_len) as
         // the causal range; contig clips to the causal_offset bound.
@@ -104,8 +109,8 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         MaskView mv{p.mask, p.mask_b_stride, p.mask_h_stride,   p.mask_l_stride,
                     batch,  q_head0 + gid,   q_head0 + gid + 8, 0,
                     0};
-        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc, mv, va, vb, Sacc, Oacc, m0, m1, l0, l1,
-                                          lane);
+        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc, mv, va, vb, scale_log2, Sacc, Oacc, m0,
+                                          m1, l0, l1, lane);
 
         mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
     };
@@ -194,13 +199,14 @@ template <typename KV> __global__ void attn_decode_combine_kernel(AttentionParam
 
     SoftmaxState st;
     float acc = 0.0f;
+    const float scale_log2 = p.scale * LOG2E;
     for (int s = 0; s < p.num_splits; s++) {
         float mi = mlp[s * 2];
         if (mi <= -FLT_MAX)
             continue;
         float li = mlp[s * 2 + 1];
         float corr, e;
-        softmax_step(st, mi, li, corr, e);
+        softmax_step(st, mi, li, corr, e, scale_log2);
         acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
     }
 

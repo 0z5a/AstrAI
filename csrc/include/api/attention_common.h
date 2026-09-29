@@ -21,6 +21,11 @@ constexpr int MAX_SPLITS = 32;
 // astrai/inference/workspace.py, which builds the device-side tile maps.
 constexpr int HOST_Q_TILE_ROWS = 64;
 
+// log2(e), the exp2 base-change constant the softmax kernels fold into
+// every exp2 exponent (one FFMA feeding MUFU.EX2 per weight; design in
+// arith/softmax.cuh). Kernels compute scale_log2 = p.scale * LOG2E at entry.
+constexpr float LOG2E = 1.44269504088896340736f;
+
 // Unified attention params covering BOTH addressing modes:
 //   - Contiguous K/V: dense [batch, kv_head, kv_len, head_dim] tensors (k/v).
 //   - Paged (SGLang-style): flat pool [size, kv_head, head_dim] + req_to_token.

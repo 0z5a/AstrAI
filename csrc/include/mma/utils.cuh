@@ -140,14 +140,15 @@ __device__ inline void load_kv_tile(typename Traits::Elem* sK, // ring bases (ST
 }
 
 // ---------------------------------------------------------------------------
-// S = Q @ K^T  (Qa pre-loaded by the caller; `scale` applied post-mma in
-// float to avoid 16-bit precision loss).
+// S = Q @ K^T  (Qa pre-loaded by the caller). Scores are RAW (unscaled): the
+// softmax consumes them in the raw space and folds scale * log2(e) into the
+// exp2 argument (FlashAttention's base change — one FFMA per element feeding
+// MUFU.EX2, and the post-mma per-element scale multiply disappears).
 // Traits provides Elem, KD, NC8, LD, and SWIZ_MASK.
 // ---------------------------------------------------------------------------
 template <typename Traits>
 __device__ inline void mma_compute_scores(const unsigned Qa[Traits::KD][4],
                                           const typename Traits::Elem* __restrict__ sK,
-                                          float scale,
                                           int lane,
                                           float Sacc[Traits::NC8][4]) {
 #pragma unroll
@@ -163,10 +164,6 @@ __device__ inline void mma_compute_scores(const unsigned Qa[Traits::KD][4],
                 &sK[krow_l * Traits::LD + swiz_col(kt * 16 + kcol_h, krow_l, Traits::SWIZ_MASK)]);
             astrai::mma_sync<typename Traits::Elem>(Sacc[n8], Qa[kt], b, Sacc[n8]);
         }
-        Sacc[n8][0] *= scale;
-        Sacc[n8][1] *= scale;
-        Sacc[n8][2] *= scale;
-        Sacc[n8][3] *= scale;
     }
 }
 
@@ -190,6 +187,7 @@ __device__ inline void mma_softmax_tile(int kv0,
                                         MaskView mv,
                                         bool valid0,
                                         bool valid1,
+                                        float scale_log2,
                                         float Sacc[Traits::NC8][4],
                                         float Oacc[Traits::DN8][4],
                                         float& m0,
@@ -226,21 +224,31 @@ __device__ inline void mma_softmax_tile(int kv0,
     rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
     rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
 
-    float corr0, corr1, pn0, pn1;
-    float nm0 = softmax_remax(m0, rmax0, corr0, pn0);
-    float nm1 = softmax_remax(m1, rmax1, corr1, pn1);
+    float corr0, corr1;
+    float nm0 = softmax_remax(m0, rmax0, corr0, scale_log2);
+    float nm1 = softmax_remax(m1, rmax1, corr1, scale_log2);
+
+    // The exp2 anchor: the new max's scaled value, with the still-empty
+    // state clamped to 0 so masked-out (-FLT_MAX) scores weigh 0 instead of
+    // exp2(0) == 1 (softmax.cuh's sentinel). One subtract feeds every
+    // element's FFMA below.
+    float nm2_0 = softmax_scaled_max(nm0, scale_log2);
+    float nm2_1 = softmax_scaled_max(nm1, scale_log2);
 
     float rsum0 = 0.0f, rsum1 = 0.0f;
 #pragma unroll
     for (int n8 = 0; n8 < Traits::NC8; n8++) {
-        float p0 = pn0 * __expf(Sacc[n8][0] - nm0);
-        float p1 = pn0 * __expf(Sacc[n8][1] - nm0);
-        float p2 = pn1 * __expf(Sacc[n8][2] - nm1);
-        float p3 = pn1 * __expf(Sacc[n8][3] - nm1);
+        // exp2f(x*s2 - nm2): the compiler contracts the product and subtract
+        // into one FFMA feeding MUFU.EX2 — the instruction saving this base
+        // change exists for (2 flops per element vs 3 before).
+        float p0 = exp2f(Sacc[n8][0] * scale_log2 - nm2_0);
+        float p1 = exp2f(Sacc[n8][1] * scale_log2 - nm2_0);
+        float p2 = exp2f(Sacc[n8][2] * scale_log2 - nm2_1);
+        float p3 = exp2f(Sacc[n8][3] * scale_log2 - nm2_1);
         Sacc[n8][0] = p0;
         Sacc[n8][1] = p1;
-        Sacc[n8][2] = p2;
-        Sacc[n8][3] = p3;
+        Sacc[n8][0+2] = p2;
+        Sacc[n8][0+3] = p3;
         rsum0 += p0 + p1;
         rsum1 += p2 + p3;
     }
@@ -251,7 +259,7 @@ __device__ inline void mma_softmax_tile(int kv0,
     l0 = l0 * corr0 + rsum0;
     l1 = l1 * corr1 + rsum1;
 
-    // Skip the O rescale when the max did not move: corr == exp(0) == 1.0f
+    // Skip the O rescale when the max did not move: corr == exp2(0) == 1.0f
     // exactly, and x * 1.0f is bit-identical to x.
     if (corr0 != 1.0f) {
 #pragma unroll

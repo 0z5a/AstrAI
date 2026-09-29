@@ -38,6 +38,9 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
 
     const int G = p.q_head / p.kv_head;
     const int kv_head = blockIdx.y;
+    // scale * log2(e): the exp2 base-change factor folded into every
+    // softmax exponent (see arith/softmax.cuh).
+    const float scale_log2 = p.scale * LOG2E;
 
     int batch, packed0;
     QSchedule::map_packed_block(p, BLOCK_M, batch, packed0);
@@ -132,7 +135,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
         if (!IsCausal || kv0 <= warp_max_m + causal_off) {
 
             float Sacc[Traits::NC8][4];
-            mma_compute_scores<Traits>(Qa, bK, p.scale, lane, Sacc);
+            mma_compute_scores<Traits>(Qa, bK, lane, Sacc);
 
             int maxc0 = IsCausal ? min(seq_len, causal_off + mra + 1) : seq_len;
             int maxc1 = IsCausal ? min(seq_len, causal_off + mrb + 1) : seq_len;
@@ -145,8 +148,8 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
                         kv_head * G + h1,
                         mra,
                         mrb};
-            mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1, mv, va, vb, Sacc, Oacc, m0, m1, l0,
-                                              l1, lane);
+            mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1, mv, va, vb, scale_log2, Sacc,
+                                              Oacc, m0, m1, l0, l1, lane);
 
             mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
         }
