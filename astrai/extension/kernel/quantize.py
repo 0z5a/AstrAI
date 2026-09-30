@@ -17,8 +17,9 @@ output dtype (``torch.float8_e4m3fn`` / ``torch.float8_e5m2``) — the binding
 validates and dispatches on it. ``amax`` is the delayed-scaling fold's
 raw-domain amax of the round, or ``None`` with no ``ring_state``.
 
-Policy (scales, amax history, delayed scaling, autocast) lives in
-``astrai.extension.quantize``; this module is stateless.
+FP8 policy — scales, amax history, delayed scaling, the autocast region —
+lives in ``astrai.extension.autocast``; the INT8 inference strategies are
+defined in the ``astrai.extension`` package root. This module is stateless.
 """
 
 from typing import Optional, Tuple

@@ -65,13 +65,8 @@ class InferenceScheduler:
         ):
             raise ValueError("policy_version must be a non-negative integer")
         # Depth-2 submit/commit overlap for steady online decode batches.
-        # Off by default: on this box the online loop is host-bound at
-        # serving batch sizes (~15ms host vs ~4ms GPU per step at B=128),
-        # so re-ordering host work buys nothing until the host path is
-        # shortened further — measured 22.5 vs 19.9 ms/step with it on.
-        # The contract (submit/commit split, deferred KV retirement) is
-        # exercised regardless; run_batch and the synchronous loop ride
-        # the same stepper.
+        # Keep opt-in because its benefit depends on serving workload; the
+        # contract is exercised regardless, while run_batch stays synchronous.
         self._enable_overlap = enable_overlap
         config = model.config
 
@@ -236,11 +231,6 @@ class InferenceScheduler:
         """Advance every active task by one token; see :class:`Stepper`."""
         return self._stepper.step(tasks, return_logprobs=return_logprobs)
 
-    def _commit_step(self, pending) -> List[Task]:
-        """Commit a submitted step and detach it from the executor."""
-        self._executor.clear_pending()
-        return self._stepper.step_commit(pending)
-
     def _run_generation_loop(self):
         # Set membership is O(1); the tokenizer rebuilds the list on every
         # attribute access, and both the finished-task scan and the
@@ -360,8 +350,15 @@ class InferenceScheduler:
                         and self._executor.can_overlap_submit()
                     )
                     if steady:
+                        # step_submit owns the executor's pending slot: the
+                        # step it launches replaces the in-flight one, so the
+                        # slot must NOT be cleared again here — clearing it
+                        # would drop the just-submitted step (its tokens then
+                        # never commit; every other steady iteration lost a
+                        # token and tasks aborted at the KV cap instead of
+                        # max_tokens).
                         produced, new_pending = self._stepper.step_submit(active)
-                        committed = self._commit_step(pending)
+                        committed = self._stepper.step_commit(pending)
                     else:
                         self._executor.flush_pending(self._stepper)
                         produced, aborted = self._stepper.step(active)

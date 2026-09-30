@@ -7,7 +7,7 @@ the planner's bindings in their raw wire shapes (the four ``csrc/bench`` tools
 parse those keys, so those spellings are contract). The plan's records, the
 ``plan`` facade and the runtime autotuner are policy and live next door in
 ``astrai.extension.plan``; the fp8/int8 quantization policy in
-``astrai.extension.quantize``. The mma consumes bf16 fragments (or the native
+``astrai.extension.autocast``. The mma consumes bf16 fragments (or the native
 fp8 mma for symmetric fp8 pairs); int8 and fp8 operands dequantize in-register
 between the smem read and the mma — never a separate F2F pass — and
 per-operand scales fold multiplicatively into the epilogue.

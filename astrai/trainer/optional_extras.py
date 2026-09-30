@@ -32,16 +32,16 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def _quantize_mod():
+def _fp8_mod():
     try:
-        from astrai.extension import quantize
+        from astrai.extension import autocast
     except ImportError:  # extension not built: fp8 was never in use either
         return None
-    return quantize
+    return autocast
 
 
 def _fp8_extra() -> dict | None:
-    mod = _quantize_mod()
+    mod = _fp8_mod()
     if mod is None:
         return None
     sd = mod.fp8_state_dict()
@@ -49,7 +49,7 @@ def _fp8_extra() -> dict | None:
 
 
 def _fp8_restore(sd: dict) -> None:
-    mod = _quantize_mod()
+    mod = _fp8_mod()
     if mod is not None:
         mod.fp8_load_state_dict(sd)
 

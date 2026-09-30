@@ -105,14 +105,17 @@ class Stepper:
 
         decoded: List[Task] = []
         aborted: List[Task] = []
-        for t in tasks:
-            if t.task_id in prefilled_ids:
-                continue
-            if self._task_cache.task_extend(t.task_id, t.next_pos):
-                decoded.append(t)
-            else:
-                t.status = TaskStatus.ABORTED
-                aborted.append(t)
+        if prefilled_ids:
+            for t in tasks:
+                if t.task_id in prefilled_ids:
+                    continue
+                if self._task_cache.task_extend(t.task_id, t.next_pos):
+                    decoded.append(t)
+                else:
+                    t.status = TaskStatus.ABORTED
+                    aborted.append(t)
+        else:
+            decoded, aborted = self._extend_and_partition(tasks)
 
         pending, produced_decoded, aborted_decoded = self._submit_decoded(
             decoded, return_logprobs, abort_on_refusal=True
@@ -123,6 +126,28 @@ class Stepper:
         produced.extend(produced_decoded)
 
         return produced, aborted
+
+    def _extend_and_partition(self, tasks: List[Task]) -> Tuple[List[Task], List[Task]]:
+        """Extend a step's tasks with ONE batched cache call.
+
+        The steady decode step (no prefills in the batch) is the hot
+        path: per-task ``task_extend`` costs one allocator round-trip
+        each (~13us per task on serving-scale pools), the batched call
+        harvests all new pages in one word-indexed pass.  Failure marks
+        the task ABORTED exactly like the per-task loop.
+        """
+        ok = self._task_cache.task_extend_batch(
+            [t.task_id for t in tasks], [t.next_pos for t in tasks]
+        )
+        decoded: List[Task] = []
+        aborted: List[Task] = []
+        for t, extended in zip(tasks, ok):
+            if extended:
+                decoded.append(t)
+            else:
+                t.status = TaskStatus.ABORTED
+                aborted.append(t)
+        return decoded, aborted
 
     def _submit_decoded(
         self, decoded: List[Task], return_logprobs: bool, abort_on_refusal: bool
@@ -226,11 +251,14 @@ class Stepper:
                     )
 
         decoded: List[Task] = []
-        for t in tasks:
-            if t.task_id in prefilled_ids:
-                continue
-            if self._task_cache.task_extend(t.task_id, t.next_pos):
-                decoded.append(t)
+        if prefilled_ids:
+            for t in tasks:
+                if t.task_id in prefilled_ids:
+                    continue
+                if self._task_cache.task_extend(t.task_id, t.next_pos):
+                    decoded.append(t)
+        else:
+            decoded, _aborted = self._extend_and_partition(tasks)
 
         if decoded:
             pending, produced_decoded, _ = self._submit_decoded(

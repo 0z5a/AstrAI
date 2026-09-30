@@ -1,7 +1,7 @@
 """FP8 lifecycle: ring checkpointing, recompute safety, recipe invalidation.
 
 The TE-pattern adaptations (2026-09-20, see
-notes/fp8-framework-survey-2026-09-20.md):
+notes/astrai-fp8.md):
 
 - A1 checkpointing — the delayed-scaling rings (scale / amax history / index)
   survive save/resume, the way TE persists fp8_meta with the checkpoint.
@@ -33,14 +33,14 @@ import pytest
 import torch
 from torch import nn
 
-import astrai.extension.quantize as f8mod
-from astrai.extension.loader import get_module
-from astrai.extension.quantize import (
+import astrai.extension.autocast as f8mod
+from astrai.extension.autocast import (
     FP8Recipe,
     fp8_autocast,
     fp8_load_state_dict,
     fp8_state_dict,
 )
+from astrai.extension.loader import get_module
 from tests.conftest import skip_no_fp8
 
 

@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from astrai.extension.fp8_slots import (
+from astrai.extension.autocast import (
     Fp8Slot,
     assign_slots,
     clear_slots,
@@ -176,7 +176,7 @@ def test_rebind_follows_a_replaced_weight():
 
 
 def test_stale_counts_swapped_weights_and_refresh_repairs_them():
-    from astrai.extension.fp8_slots import refresh_slots
+    from astrai.extension.autocast import refresh_slots
 
     model = _Model(layers=1)
     table = assign_slots(model)
@@ -194,7 +194,7 @@ def test_stale_counts_swapped_weights_and_refresh_repairs_them():
 
 
 def test_refresh_is_a_noop_once_the_model_is_gone():
-    from astrai.extension.fp8_slots import refresh_slots
+    from astrai.extension.autocast import refresh_slots
 
     model = _Model(layers=1)
     table = assign_slots(model)

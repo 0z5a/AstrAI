@@ -136,6 +136,7 @@ def test_step_splits_decode_batch_by_request_backend():
     scheduler._cache = SimpleNamespace(page_size=1)
     scheduler._task_cache = MagicMock()
     scheduler._task_cache.task_extend.return_value = True
+    scheduler._task_cache.task_extend_batch.return_value = [True, True]
     scheduler._metrics = MetricsCollector()
     scheduler._executor = MagicMock()
     scheduler._stepper = Stepper(
@@ -1081,9 +1082,111 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
             assert done["second"].wait(timeout=10)
             assert all(t is not STOP for t in events["first"][:-1])
             assert all(t is not STOP for t in events["second"][:-1])
-            assert scheduler._executor.peek_pending() is None
+            # STOP callbacks fire at commit, but the overlap loop may still
+            # hold the FINAL submitted step in the executor slot (the step
+            # launched past the terminal one) for one more iteration. Wait
+            # for the drain instead of racing it.
+            deadline = time.time() + 5
+            while scheduler._executor.peek_pending() is not None:
+                if time.time() > deadline:
+                    pytest.fail("overlap loop left a step pending after finish")
+                time.sleep(0.01)
             stats = scheduler.get_stats()
             assert stats["in_flight_tasks"] == 0
             assert stats["kv_cache_tasks"] == 0
+    finally:
+        scheduler.stop()
+
+
+def test_overlap_loop_matches_synchronous_tokens(device):
+    """Overlap decode commits every step: token stream identical to sync.
+
+    Regression gate for the clear_pending bug: the steady overlap branch
+    used to detach the JUST-SUBMITTED pending step (the executor slot
+    already held the new step, not the one being committed), so every
+    other steady iteration's tokens never committed -- tasks finished at
+    the KV cap with half their tokens and interleaved-token detext.
+    Token-count gates cannot see this on small configs (the tasks still
+    finish); only the full sequence comparison against the synchronous
+    run_batch reference catches it.
+    """
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
+    tokenizer = FakeTokenizer()
+    scheduler = InferenceScheduler(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=8,
+        max_seq_len=64,
+        enable_overlap=True,
+    )
+
+    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_task's
+    # contract is the flat single-string shape, so unwrap here (same
+    # workaround as the overlap e2e test).
+    class _UnwrappingTokenizer:
+        def __init__(self, inner):
+            object.__setattr__(self, "_inner", inner)
+            object.__setattr__(self, "stop_ids", inner.stop_ids)
+
+        def encode(self, prompt, **kw):
+            out = self._inner.encode(prompt, **kw)
+            return out[0] if isinstance(out[0], list) else out
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    scheduler._task_mgr.tokenizer = _UnwrappingTokenizer(tokenizer)
+
+    # StreamDecoder needs the Rust handle FakeTokenizer lacks; emit the
+    # token id itself as the "text" so the sink sees every token.
+    class _IdDecoder:
+        def __init__(self, tokenizer):
+            pass
+
+        def push(self, token_id):
+            return str(token_id)
+
+    class _TokenSink(BatchedStreamCallback):
+        def __init__(self):
+            self.events: list = []
+
+        def __call__(self, batch):
+            self.events.extend(batch)
+
+    prompts = ["a" * 8, "b" * 8, "c" * 8]
+    sink = _TokenSink()
+    scheduler.start()
+    try:
+        # Synchronous reference: same model, same prompts, greedy.
+        reference = scheduler.run_batch(
+            [[ord(c) for c in p] for p in prompts], max_tokens=12, temperature=0
+        )
+        assert all(len(ids) == 12 for ids in reference)
+
+        with patch("astrai.inference.task.StreamDecoder", _IdDecoder):
+            task_ids = [
+                scheduler.add_task(
+                    p, max_tokens=12, stream_callback=sink, temperature=0
+                )
+                for p in prompts
+            ]
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                stops = sum(1 for _tid, tok in sink.events if tok is STOP)
+                if stops == 3:
+                    break
+                time.sleep(0.01)
+
+        by_task = {tid: [] for tid in task_ids}
+        for tid, token in sink.events:
+            if token is not STOP:
+                by_task[tid].append(int(token))
+        for i, tid in enumerate(task_ids):
+            assert by_task[tid] == list(reference[i]), (
+                f"task {i} overlap stream {by_task[tid]} != reference "
+                f"{list(reference[i])}"
+            )
+        assert scheduler._executor.peek_pending() is None
     finally:
         scheduler.stop()

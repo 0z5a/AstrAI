@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from astrai.extension.autocast import fp8_autocast
 from astrai.extension.loader import get_module
-from astrai.extension.quantize import fp8_autocast
 from tests.conftest import skip_no_fp8
 
 FMT_A = torch.float8_e4m3fn

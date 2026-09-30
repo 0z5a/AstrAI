@@ -516,3 +516,99 @@ def test_allocator_alloc_many_fragmentation_roundtrip():
     first = alloc.alloc_many(100)
     alloc.free_many(first[0::2])
     assert alloc.alloc_many(50) == sorted(first[0::2])
+
+
+def test_extend_batch_matches_per_task_extend():
+    """Batched decode-step extension is observably identical to per-task.
+
+    Steady decode extends every task by exactly one position; the batch
+    must produce the same pages, the same slot staging and the same
+    length bookkeeping as the historical per-task loop, including the
+    page ORDER (both harvest lowest-first).
+    """
+
+    def make_pool():
+        return PagePool(
+            n_layers=2,
+            n_kv_heads=1,
+            head_dim=4,
+            max_batch_size=8,
+            max_seq_len=64,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            page_size=1,
+            n_tokens=8 * 64,
+        )
+
+    pool_a, pool_b = make_pool(), make_pool()
+    mgr_a = _make_task_cache(pool_a)
+    mgr_b = _make_task_cache(pool_b)
+    ws = _ws(pool_a)
+
+    ids = [f"t{i}" for i in range(4)]
+    for tid in ids:
+        assert mgr_a.task_alloc(tid, [10, 20, 30])
+        assert mgr_b.task_alloc(tid, [10, 20, 30])
+
+    # Per-task reference: four extends at position 3.
+    for tid in ids:
+        assert mgr_a.task_extend(tid, 3)
+    # Batched: same positions through one strategy call.
+    assert mgr_b.task_extend_batch(list(ids), [3] * 4) == [True] * 4
+
+    for tid in ids:
+        sa = mgr_a._states[tid]
+        sb = mgr_b._states[tid]
+        assert sa.pages == sb.pages
+        assert sa._slots == sb._slots
+        assert sa.length == sb.length == 4
+
+    # Next positions stay in lockstep, and bind flushes both equally.
+    assert mgr_b.task_extend_batch(list(ids), [4] * 4) == [True] * 4
+    for tid in ids:
+        assert mgr_a.task_extend(tid, 4)
+    mgr_a.bind(ids, ws)
+    mgr_b.bind(ids, _ws(pool_b))
+    for tid in ids:
+        sa = mgr_a._states[tid]
+        sb = mgr_b._states[tid]
+        assert sa._slots == sb._slots
+        assert sa.length == sb.length == 5
+
+    # A missing task fails alone; the rest still extend.
+    assert mgr_b.task_extend_batch(["ghost"] + ids[1:], [5] * 4) == [
+        False,
+        True,
+        True,
+        True,
+    ]
+
+
+def test_extend_batch_falls_back_when_pool_runs_dry():
+    """Pool exhaustion keeps per-task success ORDER via the fallback.
+
+    The batch harvest cannot satisfy every state when the pool is
+    nearly empty; the strategy then re-runs per-task extend so failure
+    lands on the same tasks the historical loop would have failed.
+    """
+    # 6 pages total: 4 consumed by prompts, 2 free.
+    pool = PagePool(
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=4,
+        max_batch_size=4,
+        max_seq_len=8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        page_size=1,
+        n_tokens=6,
+    )
+    mgr = _make_task_cache(pool)
+    ids = [f"dry{i}" for i in range(4)]
+    for tid in ids:
+        # One page each leaves 2 free for decode extension.
+        assert mgr.task_alloc(tid, [7])
+    results = mgr.task_extend_batch(list(ids), [1] * 4)
+    assert results == [True, True, False, False]
+    for tid, ok in zip(ids, results):
+        assert (mgr._states[tid].length == 2) == ok

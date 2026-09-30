@@ -134,6 +134,7 @@ class InferenceEngine:
         cache: Optional[PagePool] = None,
         enable_cuda_graph: bool = True,
         backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
+        enable_overlap: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -145,6 +146,7 @@ class InferenceEngine:
             cache=cache,
             enable_cuda_graph=enable_cuda_graph,
             backend=backend,
+            enable_overlap=enable_overlap,
         )
 
         self.scheduler.start()
@@ -418,8 +420,8 @@ def build_engine(
 
     Loads model and tokenizer from *param_path*, or accepts preloaded
     objects, places the model, and returns a started InferenceEngine.
-    Extra *engine_kwargs* (cache, enable_cuda_graph, backend) pass
-    through to InferenceEngine. Placement parts left as None are skipped.
+    Extra *engine_kwargs* (cache, enable_cuda_graph, backend, enable_overlap)
+    pass through to InferenceEngine. Placement parts left as None are skipped.
     """
     if param_path is not None:
         if model is not None or tokenizer is not None:

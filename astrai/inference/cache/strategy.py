@@ -348,6 +348,16 @@ class AllocationStrategy(ABC):
     @abstractmethod
     def extend(self, state: TaskCacheState, pos: int) -> bool: ...
 
+    def extend_batch(
+        self, states: List[TaskCacheState], positions: List[int]
+    ) -> List[bool]:
+        """Extend many tasks by one position each; per-item success flags.
+
+        Default: loop ``extend``.  Strategies with a per-extension
+        allocation cost override this with a batched harvest.
+        """
+        return [self.extend(s, p) for s, p in zip(states, positions)]
+
     @abstractmethod
     def write_indices(self, state: TaskCacheState, prompt_ids: List[int]) -> None: ...
 
@@ -488,6 +498,44 @@ class PagedStrategy(AllocationStrategy):
             return True
         self._req_pool.req_to_token[state.req_idx, pos] = slot
         return True
+
+    def extend_batch(
+        self, states: List[TaskCacheState], positions: List[int]
+    ) -> List[bool]:
+        """Extend a decode step's tasks with ONE word-indexed harvest.
+
+        ``extend`` allocates at most one page per call through the
+        big-int-masked ``Allocator.alloc`` (~13us on serving-scale pools;
+        128 per decode step = ~1.7ms of host time).  In the steady decode
+        loop every state needs exactly one new page, so the batch asks
+        the allocator once and hands the pages out lowest-first — the
+        same order the per-task lsb scans would have produced, making
+        the harvest unobservable in slot numbering.  When the batch
+        harvest cannot satisfy every state (a mixed batch or pool
+        pressure), the call falls back to per-task ``extend`` so the
+        success/failure ORDER matches the historical per-task path.
+        """
+        page_size = self._page_size
+        need: List[int] = []
+        for i, (state, pos) in enumerate(zip(states, positions)):
+            if pos // page_size >= len(state.pages):
+                need.append(i)
+        if not need:
+            return [True] * len(states)
+        pages = self._alloc.alloc_many(len(need))
+        if pages is None or len(pages) < len(need):
+            return [self.extend(s, p) for s, p in zip(states, positions)]
+        for i, p in zip(need, pages):
+            states[i].pages.append(p)
+        results = [True] * len(states)
+        for state, pos in zip(states, positions):
+            page_idx = pos // page_size
+            slot = state.pages[page_idx] * page_size + pos % page_size
+            if page_size == 1 and pos == len(state._slots):
+                state._slots.append(slot)
+            else:
+                self._req_pool.req_to_token[state.req_idx, pos] = slot
+        return results
 
     def write_indices(self, state: TaskCacheState, prompt_ids: List[int]) -> None:
         total = min(len(prompt_ids), len(state.pages) * self._page_size)

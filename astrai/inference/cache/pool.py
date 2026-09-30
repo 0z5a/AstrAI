@@ -328,6 +328,37 @@ class TaskCacheManager:
         state.length = pos + 1
         return True
 
+    def task_extend_batch(
+        self, task_ids: List[str], positions: List[int]
+    ) -> List[bool]:
+        """``task_extend`` for a whole decode step, one strategy call.
+
+        The decode-steady hot path extends every active task by exactly
+        one position; a single batched strategy call replaces one
+        allocation round-trip per task (see
+        ``PagedStrategy.extend_batch``).  Per-task semantics are
+        unchanged: a missing state or an out-of-cap position fails that
+        task alone.
+        """
+        results = [False] * len(task_ids)
+        live_idx: List[int] = []
+        live_states: List[TaskCacheState] = []
+        live_pos: List[int] = []
+        for i, tid in enumerate(task_ids):
+            state = self._states.get(tid)
+            if state is not None and positions[i] < self._max_seq_len:
+                live_idx.append(i)
+                live_states.append(state)
+                live_pos.append(positions[i])
+        if not live_idx:
+            return results
+        extended = self._strategy.extend_batch(live_states, live_pos)
+        for i, state, pos, ok in zip(live_idx, live_states, live_pos, extended):
+            if ok:
+                state.length = pos + 1
+                results[i] = True
+        return results
+
     @property
     def task_count(self) -> int:
         """Number of tasks currently holding KV request state."""

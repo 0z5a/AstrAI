@@ -6,7 +6,7 @@
 // share one registry (an anonymous namespace would give a copy per TU).
 //
 // A meta is addressed by its module's *slot* (a path, published by
-// astrai/extension/fp8_slots.py) or by the weight's (data_ptr, shape, dtype);
+// astrai/extension/autocast.py) or by the weight's (data_ptr, shape, dtype);
 // the slot survives a replaced parameter, the address does not. Snapshots bind
 // slotted entries by name, others by registration order. Ring offsets:
 // RingLayout (api/quantize_common.h).
@@ -205,7 +205,7 @@ struct Fp8Meta {
     int64_t margin = 0;
     bool dynamic = false;
 
-    // Slot addressing (fp8_slots.py): the state belongs to the *module*, so a
+    // Slot addressing (slot addressing in autocast.py): the state belongs to the *module*, so a
     // replaced weight parameter re-points the identity and keeps the rings.
     // ``slot_name`` is the snapshot key, ``role`` the Python-side policy glob;
     // all three stay empty for an unslotted meta (bare call, bench).
@@ -332,7 +332,7 @@ struct State {
     std::mutex mu;
     std::unordered_map<std::string, std::shared_ptr<Fp8Meta>> by_key;
     std::unordered_map<int64_t, std::shared_ptr<Fp8Meta>> by_slot;
-    // Slot id -> (module path, role), published once by fp8_slots.py. Metadata,
+    // Slot id -> (module path, role), published once by the Python slot
     // not training state: fp8_reset leaves it alone, a later fp8_set_slots
     // replaces the lot.
     std::unordered_map<int64_t, SlotInfo> slots;

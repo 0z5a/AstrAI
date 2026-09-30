@@ -9,8 +9,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from astrai.extension import quantize_act_int8, quantize_weight_int8
 from astrai.extension.kernel.gemm import quant_gemm
-from astrai.extension.quantize import quantize_act_int8, quantize_weight_int8
 from tests.conftest import skip_no_kernel
 
 # bf16-output comparisons: the kernel's dequant and fp32 accumulation are

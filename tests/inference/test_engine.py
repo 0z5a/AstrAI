@@ -328,6 +328,21 @@ def test_engine_passes_backend_to_scheduler():
     assert MockSched.call_args.kwargs["backend"] == "torch_native"
 
 
+@pytest.mark.parametrize("enable_overlap", [False, True])
+def test_engine_passes_overlap_to_scheduler(enable_overlap):
+    mock_model, mock_tokenizer = _make_engine_mocks()
+
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        InferenceEngine(
+            mock_model,
+            mock_tokenizer,
+            max_batch_size=1,
+            enable_overlap=enable_overlap,
+        )
+
+    assert MockSched.call_args.kwargs["enable_overlap"] is enable_overlap
+
+
 def test_generate_captures_calling_backend_context():
     mock_model, mock_tokenizer = _make_engine_mocks()
     captured = []
@@ -385,6 +400,7 @@ def test_build_engine_passes_engine_kwargs_through():
             cache=object(),
             enable_cuda_graph=False,
             backend=backend,
+            enable_overlap=True,
         )
         engine.generate("hi")
 
@@ -392,6 +408,7 @@ def test_build_engine_passes_engine_kwargs_through():
     assert kwargs["cache"] is not None
     assert kwargs["enable_cuda_graph"] is False
     assert kwargs["backend"] is backend
+    assert kwargs["enable_overlap"] is True
 
 
 @pytest.mark.parametrize(
