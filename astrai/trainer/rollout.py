@@ -56,6 +56,12 @@ class RawRollout:
             (for reward models).
         route_trace_batch: Optional immutable MoE route artifacts bound to the
             exact policy version and prompt/response token tensors.
+        finish_reasons: Scheduler termination reason per response
+            (``"stop"`` or ``"length"``), shape ``[B][G]``.  Truncated
+            responses must not be mistaken for finished episodes: PPO
+            treats the last valid token as terminal either way, but the
+            truncation rate is the observable that says the max-token
+            budget — not the policy — ended the episode.
     """
 
     prompts: Tensor
@@ -67,6 +73,7 @@ class RawRollout:
     prompt_texts: List[str] = field(default_factory=list)
     response_texts: List[List[str]] = field(default_factory=list)
     route_trace_batch: Optional[RolloutRouteTraceBatchV0] = None
+    finish_reasons: List[List[str]] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
@@ -302,6 +309,7 @@ class RolloutGenerator:
 
         flat_idx = 0
         response_texts: List[List[str]] = [[] for _ in range(B)]
+        finish_reasons: List[List[str]] = [[] for _ in range(B)]
         for i in range(B):
             for g in range(G):
                 result = results[flat_idx]
@@ -319,6 +327,7 @@ class RolloutGenerator:
                 response_texts[i].append(
                     self.tokenizer.decode(token_ids, skip_special_tokens=True)
                 )
+                finish_reasons[i].append(result.finish_reason)
 
         return RawRollout(
             prompts=prompts_tensor,
@@ -329,6 +338,7 @@ class RolloutGenerator:
             policy_version=generation_version,
             prompt_texts=prompt_texts,
             response_texts=response_texts,
+            finish_reasons=finish_reasons,
         )
 
     def _prepare_prompts(self, batch: Dict) -> Tuple[List[str], List[List[int]]]:
@@ -513,6 +523,7 @@ class RolloutRunner:
             prompt_texts=raw.prompt_texts,
             response_texts=raw.response_texts,
             route_trace_batch=raw.route_trace_batch,
+            finish_reasons=raw.finish_reasons,
         )
 
     def _validate_policy_version(
@@ -639,13 +650,19 @@ class RolloutEvaluator:
         rewards = _score_rewards(self.reward_model, raw)
         lengths = raw.response_mask.sum(dim=-1).to(torch.float32)
         std = rewards.std(unbiased=False).item() if rewards.numel() > 1 else 0.0
-        return {
+        metrics = {
             "reward_mean": rewards.mean().item(),
             "reward_std": std,
             "reward_max": rewards.max().item(),
             "response_len_mean": lengths.mean().item(),
             "num_responses": float(rewards.numel()),
         }
+        flat_reasons = [reason for group in raw.finish_reasons for reason in group]
+        if flat_reasons:
+            metrics["truncation_rate"] = sum(
+                1 for reason in flat_reasons if reason == "length"
+            ) / len(flat_reasons)
+        return metrics
 
 
 def _score_rewards(reward_model: BaseRewardModel, raw: RawRollout) -> Tensor:

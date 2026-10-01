@@ -13,19 +13,19 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import astrai.extension.quantize as f8mod
+import astrai.extension.autocast as f8mod
+from astrai.extension.kernel.gemm import quant_gemm
+from astrai.extension.kernel.quantize import quantize, quantize_dual
 from astrai.extension.loader import get_module
-from astrai.extension.ops.gemm import quant_gemm
-from astrai.extension.ops.quantize import quantize, quantize_dual
 
 try:
-    from astrai.extension.ops.quantize import K_FOLD_SLOTS
+    from astrai.extension.kernel.quantize import K_FOLD_SLOTS
 except RuntimeError:
     # The binding must stay import-safe on boxes without the extension;
     # every K_FOLD_SLOTS use sits inside kernel-level tests that skip
     # via skip_no_fp8/skip_no_kernel when the kernel is not built.
     K_FOLD_SLOTS = None
-from astrai.extension.quantize import (
+from astrai.extension.autocast import (
     FP8Recipe,
     fp8_autocast,
     fp8_format_pair,
@@ -924,6 +924,7 @@ def test_weight_cast_cache_reuses_and_invalidates():
     dev = torch.device("cuda")
     gemm = _gemm()
     gemm.fp8_reset()
+    gemm.fp8_set_act_cache(False)
     x = torch.randn(8, 64, device=dev, dtype=torch.bfloat16)
     w = torch.randn(32, 64, device=dev, dtype=torch.bfloat16)
     bias = torch.zeros(32, device=dev, dtype=torch.bfloat16)
@@ -980,6 +981,7 @@ def test_weight_cast_cache_reuses_and_invalidates():
         assert stats["quantize"] == 2  # a restore re-publishes scales
     finally:
         gemm.fp8_reset()
+        gemm.fp8_set_act_cache(True)
 
 
 @skip_no_fp8

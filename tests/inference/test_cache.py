@@ -1,5 +1,7 @@
 """Unit tests for inference cache components."""
 
+import random
+
 import pytest
 import torch
 
@@ -10,7 +12,6 @@ from astrai.inference.cache import (
     RadixCache,
     ReqToTokenPool,
     TaskCacheManager,
-    page_hash,
 )
 from astrai.inference.workspace import InferenceWorkspace
 
@@ -29,14 +30,6 @@ def _ws(pool: PagePool) -> InferenceWorkspace:
 
 def _make_task_cache(pool: PagePool) -> TaskCacheManager:
     return TaskCacheManager(pool)
-
-
-# ---- page_hash ----
-
-
-def test_page_hash_different_page_differs():
-    token_ids = list(range(256))
-    assert page_hash(token_ids, 0, 64) != page_hash(token_ids, 1, 64)
 
 
 # ---- Allocator ----
@@ -458,3 +451,164 @@ def test_page_pool_paged_ps64_bind_roundtrip():
     indices = kv.req_to_token[kv.req_pool_indices, :128]
     gathered_k = kv.k_buffer[0, indices]
     assert torch.allclose(gathered_k, k)
+
+
+def test_page_pool_paged_steady_decode_slots_reach_device():
+    """The extend fast path stages slot ids on the host; every bind (the
+    steady incremental decode path included) gathers req_to_token rows
+    on-device, so the staged tails must land there before the gather."""
+    pool = _make_paged_pool(n_tokens=64, max_seq_len=16)
+    task_cache = _make_task_cache(pool)
+    ws = _ws(pool)
+    prompt = list(range(4))
+    assert task_cache.task_alloc("t1", prompt)
+
+    # Prefill bind flushes the whole staged prefix.
+    task_cache.bind(["t1"], ws, start_pos=0)
+    state = task_cache._states["t1"]
+
+    # Decode steps: extend stages one slot per token, bind (incremental or
+    # not) must push it to the device row.
+    for pos in range(4, 10):
+        assert task_cache.task_extend("t1", pos)
+        task_cache.bind(["t1"], ws)
+        device_row = pool.req_pool.req_to_token[state.req_idx, : pos + 1].tolist()
+        expected = [p * pool.page_size for p in state.pages[: pos + 1]]
+        assert device_row == expected
+
+
+def test_allocator_alloc_many_matches_free_set_exactly():
+    """Bulk allocation must yield exactly the pages the free set held.
+
+    The word-window harvest once re-issued already-harvested pages (stale
+    mask read across windows) and once left cleared pages marked free
+    (mixed absolute/shifted bit coordinates); this randomized
+    reference-model check pins the mask == free-set invariant.
+    """
+    rng = random.Random(7)
+    alloc = Allocator(300)
+    free = set(range(300))
+    held = []
+    for _ in range(400):
+        if free and rng.random() < 0.55:
+            n = rng.randint(1, 25)
+            got = alloc.alloc_many(n)
+            if got is None:
+                assert len(free) < n
+                continue
+            assert len(got) == n
+            assert len(set(got)) == n
+            for p in got:
+                assert p in free
+                free.remove(p)
+            held.append(got)
+        elif held:
+            g = held.pop(rng.randrange(len(held)))
+            alloc.free_many(g)
+            free.update(g)
+        mask = alloc._free_mask
+        for p in range(300):
+            assert bool(mask >> p & 1) == (p in free)
+
+
+def test_allocator_alloc_many_fragmentation_roundtrip():
+    alloc = Allocator(10000)
+    first = alloc.alloc_many(100)
+    alloc.free_many(first[0::2])
+    assert alloc.alloc_many(50) == sorted(first[0::2])
+
+
+def test_extend_batch_matches_per_task_extend():
+    """Batched decode-step extension is observably identical to per-task.
+
+    Steady decode extends every task by exactly one position; the batch
+    must produce the same pages, the same slot staging and the same
+    length bookkeeping as the historical per-task loop, including the
+    page ORDER (both harvest lowest-first).
+    """
+
+    def make_pool():
+        return PagePool(
+            n_layers=2,
+            n_kv_heads=1,
+            head_dim=4,
+            max_batch_size=8,
+            max_seq_len=64,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            page_size=1,
+            n_tokens=8 * 64,
+        )
+
+    pool_a, pool_b = make_pool(), make_pool()
+    mgr_a = _make_task_cache(pool_a)
+    mgr_b = _make_task_cache(pool_b)
+    ws = _ws(pool_a)
+
+    ids = [f"t{i}" for i in range(4)]
+    for tid in ids:
+        assert mgr_a.task_alloc(tid, [10, 20, 30])
+        assert mgr_b.task_alloc(tid, [10, 20, 30])
+
+    # Per-task reference: four extends at position 3.
+    for tid in ids:
+        assert mgr_a.task_extend(tid, 3)
+    # Batched: same positions through one strategy call.
+    assert mgr_b.task_extend_batch(list(ids), [3] * 4) == [True] * 4
+
+    for tid in ids:
+        sa = mgr_a._states[tid]
+        sb = mgr_b._states[tid]
+        assert sa.pages == sb.pages
+        assert sa._slots == sb._slots
+        assert sa.length == sb.length == 4
+
+    # Next positions stay in lockstep, and bind flushes both equally.
+    assert mgr_b.task_extend_batch(list(ids), [4] * 4) == [True] * 4
+    for tid in ids:
+        assert mgr_a.task_extend(tid, 4)
+    mgr_a.bind(ids, ws)
+    mgr_b.bind(ids, _ws(pool_b))
+    for tid in ids:
+        sa = mgr_a._states[tid]
+        sb = mgr_b._states[tid]
+        assert sa._slots == sb._slots
+        assert sa.length == sb.length == 5
+
+    # A missing task fails alone; the rest still extend.
+    assert mgr_b.task_extend_batch(["ghost"] + ids[1:], [5] * 4) == [
+        False,
+        True,
+        True,
+        True,
+    ]
+
+
+def test_extend_batch_falls_back_when_pool_runs_dry():
+    """Pool exhaustion keeps per-task success ORDER via the fallback.
+
+    The batch harvest cannot satisfy every state when the pool is
+    nearly empty; the strategy then re-runs per-task extend so failure
+    lands on the same tasks the historical loop would have failed.
+    """
+    # 6 pages total: 4 consumed by prompts, 2 free.
+    pool = PagePool(
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=4,
+        max_batch_size=4,
+        max_seq_len=8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        page_size=1,
+        n_tokens=6,
+    )
+    mgr = _make_task_cache(pool)
+    ids = [f"dry{i}" for i in range(4)]
+    for tid in ids:
+        # One page each leaves 2 free for decode extension.
+        assert mgr.task_alloc(tid, [7])
+    results = mgr.task_extend_batch(list(ids), [1] * 4)
+    assert results == [True, True, False, False]
+    for tid, ok in zip(ids, results):
+        assert (mgr._states[tid].length == 2) == ok

@@ -2,7 +2,7 @@
 
 Emits the three production modes at the canonical shapes so ncu can judge
 them under the only trustworthy metric on this box (see
-notes/quantize-kernel-ncu-2026-09-19.md): cold-cache duration with pinned
+notes/astrai-fp8.md): cold-cache duration with pinned
 clocks. Round 1 warms; ncu profiles round 2 via --launch-skip.
 
     CUDA_VISIBLE_DEVICES=0 ncu --clock-control base --cache-control all \
@@ -18,8 +18,8 @@ import argparse
 
 import torch
 
-from astrai.extension.ops.quantize import quantize, quantize_dual
-from astrai.extension.quantize import fp8_autocast
+from astrai.extension.autocast import fp8_autocast
+from astrai.extension.kernel.quantize import quantize, quantize_dual
 
 # astrai_1b pretrain projections: x is the m=16384 activation against
 # hidden=1536; g is the backward gradient against qkv's 6144 outputs.

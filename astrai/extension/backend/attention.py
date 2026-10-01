@@ -72,11 +72,11 @@ from astrai.extension.dispatch import (
 from astrai.extension.dispatch import (
     resolve as _dispatch_resolve,
 )
-from astrai.extension.loader import is_available
-from astrai.extension.ops.attention import (
+from astrai.extension.kernel.attention import (
     attn_paged_decode,
     attn_paged_prefill,
 )
+from astrai.extension.loader import is_available
 from astrai.factory import BaseFactory
 
 try:
@@ -85,7 +85,7 @@ except Exception:
     _flash_attn = None
 
 if TYPE_CHECKING:
-    from astrai.inference.cache import KVCache
+    from astrai.model.kv_cache import KVCache
 
 logger = logging.getLogger(__name__)
 
@@ -579,11 +579,7 @@ class CudaBackend(AttentionBackend):
 
     @classmethod
     def available(cls) -> bool:
-        return (
-            torch.cuda.is_available()
-            and is_available("attn_paged_decode")
-            and is_available("attn_paged_prefill")
-        )
+        return torch.cuda.is_available() and is_available("attention")
 
     def supports_call(
         self,
@@ -593,16 +589,18 @@ class CudaBackend(AttentionBackend):
         is_causal: bool,
         fwd: Optional[str],
     ) -> bool:
-        # The CUDA kernels are bf16-only, support head_dim in
-        # HEAD_DIMS, and need a KV cache (decode/prefill); everything
-        # else falls back down the priority list to torch.
+        # The CUDA kernels take one precision per build — bf16 today, and the
+        # instantiated set lives in csrc/include/api/attention_dtypes.h
+        # (ASTRAI_ATTN_DTYPE_LIST) — support head_dim in HEAD_DIMS, and need a
+        # KV cache (decode/prefill); everything else falls back down the
+        # priority list to torch.
         return (
             fwd in ("prefill", "decode")
             and kv_cache is not None
             and q.ndim == 3
             and q.dtype == torch.bfloat16
             and q.size(-1) in self.HEAD_DIMS
-            and is_available(f"attn_paged_{fwd}")
+            and is_available("attention")
         )
 
     @staticmethod
@@ -821,9 +819,7 @@ _SPEC_CUDA = (
     & axis("ndim").eq(3)
     & axis("dtype").in_(torch.bfloat16)
     & axis("head_dim").in_(*CudaBackend.HEAD_DIMS)
-    & Spec.of(
-        lambda ax: is_available(f"attn_paged_{ax.get('fwd')}"), "paged kernels loaded"
-    )
+    & Spec.of(lambda ax: is_available("attention"), "attention module loaded")
 )
 
 _SPEC_FLASH = (

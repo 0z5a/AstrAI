@@ -9,7 +9,7 @@ read the planner's own answers. Records answer to both idioms — attribute
 access and the old ``d["key"]`` / ``row[3]`` / tuple unpacking.
 
 The raw-dict views of the same bindings stay in
-``astrai.extension.ops.gemm`` (``set_table`` / ``set_planner`` / ``set_log`` /
+``astrai.extension.kernel.gemm`` (``set_table`` / ``set_planner`` / ``set_log`` /
 ``set_staging`` / ``state`` / ``probe`` / ``facts`` / ``tile_vocabulary``):
 the four ``csrc/bench`` tools parse those shapes, so those spellings are
 contract. The autotuner at the bottom — and the per-launch hook the adapter
