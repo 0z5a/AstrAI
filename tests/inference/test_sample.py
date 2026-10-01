@@ -2,7 +2,7 @@
 
 import torch
 
-from astrai.inference.runtime.sample import (
+from astrai.inference.worker.sample import (
     BaseSamplingStrategy,
     FrequencyPenaltyStrategy,
     SamplingPipeline,

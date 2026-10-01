@@ -12,7 +12,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from astrai.inference.engine import InferenceEngine
+from astrai.inference.frontend.engine import InferenceEngine
 
 
 def sse_event(data: Dict[str, Any], event: Optional[str] = None) -> str:
@@ -121,13 +121,14 @@ class ProtocolHandler:
         prompt, ctx, stop_sequences = self.builder.prepare(self.request, self.engine)
         ctx.prompt_tokens = len(self.engine.tokenizer.encode(prompt))
 
-        agen = self.engine.generate_async(
-            prompt=prompt,
+        agen = self.engine.generate_events(
+            prompt,
             max_tokens=self.request.max_tokens,
             temperature=self.request.temperature,
             top_p=self.request.top_p,
             top_k=self.request.top_k,
             frequency_penalty=getattr(self.request, "frequency_penalty", 0.0),
+            stop_sequences=stop_sequences,
         )
 
         if self.request.stream:
@@ -138,40 +139,42 @@ class ProtocolHandler:
     def _handle_stream(
         self, agen: AsyncGenerator, ctx: GenContext, stop_sequences: List[str]
     ) -> StreamingResponse:
-        checker = StopChecker(stop_sequences)
-
         async def event_stream():
             for event in self.builder.format_stream_start(ctx):
                 yield event
 
             body = ""
             yielded = ""
-            matched = None
-            token_ids: List[int] = []
+            final = None
             try:
-                async for token in agen:
-                    body += token
-
-                    new_ids = self.engine.tokenizer.encode(token)
-                    token_ids.extend(new_ids)
-
-                    matched = checker.check(body)
-                    if matched:
+                async for chunk in agen:
+                    body += chunk.text
+                    ctx.completion_tokens += len(chunk.delta_token_ids)
+                    if chunk.stopped or chunk.is_final:
+                        final = chunk
                         break
-
-                    ctx.completion_tokens += 1
                     for event in self.builder.format_chunk(
-                        token,
+                        chunk.text,
                         body=body,
-                        current_token_ids=token_ids,
-                        delta_token_ids=new_ids,
+                        current_token_ids=chunk.current_token_ids,
+                        delta_token_ids=chunk.delta_token_ids,
                     ):
                         yield event
-                    yielded += token
+                    yielded += chunk.text
             finally:
                 await agen.aclose()
 
-            stop = StopInfo(matched=matched, body=body, yielded=yielded)
+            # Terminal facts come from the chunk's folded state (usage was
+            # counted from token ids, stop was matched incrementally).
+            if final is not None:
+                stop = StopInfo(
+                    matched=final.stop_sequence,
+                    body=body,
+                    yielded=yielded,
+                )
+                ctx.completion_tokens = final.completion_tokens
+            else:
+                stop = StopInfo(matched=None, body=body, yielded=yielded)
             for event in self.builder.format_stream_end(ctx, stop):
                 yield event
             yield sse_done()
@@ -185,21 +188,25 @@ class ProtocolHandler:
     async def _handle_non_stream(
         self, agen: AsyncGenerator, ctx: GenContext, stop_sequences: List[str]
     ) -> Dict[str, Any]:
-        checker = StopChecker(stop_sequences)
         body = ""
-        matched = None
+        final = None
 
         try:
-            async for token in agen:
-                body += token
-
-                matched = checker.check(body)
-                if matched:
+            async for chunk in agen:
+                body += chunk.text
+                ctx.completion_tokens += len(chunk.delta_token_ids)
+                if chunk.stopped or chunk.is_final:
+                    final = chunk
                     break
-
-                ctx.completion_tokens += 1
         finally:
             await agen.aclose()
 
-        stop = StopInfo(matched=matched, body=body)
+        stop = (
+            StopInfo(matched=final.stop_sequence, body=body)
+            if final is not None
+            else StopInfo(matched=None, body=body)
+        )
+        if final is not None:
+            ctx.prompt_tokens = final.prompt_tokens
+            ctx.completion_tokens = final.completion_tokens
         return self.builder.format_response(ctx, body, stop)

@@ -30,7 +30,7 @@ class InferenceWorkspace:
       device buffer (fixed address for CUDA-graph capture).
     - KV-cache bind metadata (``req_pool_indices``, ``seq_lens``,
       ``kv_indptr``, ``inc``, ``out_cache_loc``), written by
-      ``PagePool.bind_tasks`` when the model runner passes this workspace.
+      ``BlockPool.bind_tasks`` when the model runner passes this workspace.
     - ``decode_o_part`` / ``decode_ml_part``: split-KV partial result buffers
       (mirrors FlashInfer's workspace).  One global alloc, reused by every
       decode step across all layers.  Sliced views are passed to the CUDA
@@ -87,7 +87,7 @@ class InferenceWorkspace:
             )
 
             # KV-cache bind metadata (fixed shape, written by
-            # ``PagePool.bind_tasks`` when the model runner passes this
+            # ``BlockPool.bind_tasks`` when the model runner passes this
             # workspace).  Stable addresses make the decode forward
             # CUDA-graph capturable.
             self.req_pool_indices = torch.empty(

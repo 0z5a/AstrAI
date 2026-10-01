@@ -2,7 +2,7 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 from torch import Tensor
@@ -12,21 +12,25 @@ from astrai.extension.backend.attention import (
     CudaBackend,
     get_backend,
 )
-from astrai.inference.cache import PagePool, TaskCacheManager
-from astrai.inference.runtime.graph import CudaGraphContext
-from astrai.inference.runtime.pending import (
+
+if TYPE_CHECKING:
+    # Type-only dependency: the worker consumes the KV manager's ``bind``
+    # interface; importing it at runtime would create a core↔worker cycle.
+    from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
+from astrai.inference.core.request import Request
+from astrai.inference.worker.graph import CUDAGraphRunner
+from astrai.inference.worker.pending import (
     BatchSnapshot,
-    PendingStep,
+    PendingExecution,
     ResultRing,
 )
-from astrai.inference.runtime.sample import (
+from astrai.inference.worker.sample import (
     SamplingMeta,
     SamplingPipeline,
     build_sampling_pipeline,
     sample,
 )
-from astrai.inference.task import Task
-from astrai.inference.workspace import InferenceWorkspace
+from astrai.inference.worker.workspace import InferenceWorkspace
 from astrai.model.automodel import AutoModel
 
 logger = logging.getLogger(__name__)
@@ -61,13 +65,13 @@ def timed(label: str, log: Optional[logging.Logger] = None):
 class SamplingBatchInfo:
     """Per-batch sampling parameters, cached across decode steps.
 
-    Sampling params are constant for a given ordered task set, so they are
-    built once (pinned-memory async H2D) and reused until the task set
+    Sampling params are constant for a given ordered request set, so they are
+    built once (pinned-memory async H2D) and reused until the request set
     changes.  ``top_ks`` is int32 to match the native consumers.
 
     ``meta`` holds the host-resolved facts (greedy, active filters) derived
-    from the same task attributes, and ``pipeline`` the strategy chain
-    built from them — both constant for the same ordered task set, so the
+    from the same request attributes, and ``pipeline`` the strategy chain
+    built from them — both constant for the same ordered request set, so the
     steady-state decode path reuses the whole bundle instead of rebuilding
     strategy objects and re-probing device tensors every step.
     """
@@ -85,8 +89,8 @@ class SamplingBatchInfo:
 class DecodeSteadyState:
     """Cached decode metadata for the steady-state case.
 
-    When the same ordered task set decodes one token per step, sampling
-    params and task signature are reused; only positions advance by 1.
+    When the same ordered request set decodes one token per step, sampling
+    params and request signature are reused; only positions advance by 1.
     ``last_tokens`` keeps that step's sampled ids on-device so the next
     step with an unchanged signature can fill ``input_ids`` via a
     device-to-device copy.
@@ -98,16 +102,16 @@ class DecodeSteadyState:
     last_tokens: Optional[Tensor] = None
 
 
-def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
+def _build_sampling_batch_info(requests: List[Request], device) -> SamplingBatchInfo:
     pin = str(device).startswith("cuda")
-    freq_list = [t.frequency_penalty for t in tasks]
-    temps = [t.temperature for t in tasks]
-    top_ks = [t.top_k for t in tasks]
-    top_ps = [t.top_p for t in tasks]
+    freq_list = [t.frequency_penalty for t in requests]
+    temps = [t.temperature for t in requests]
+    top_ks = [t.top_k for t in requests]
+    top_ps = [t.top_p for t in requests]
     freq_penalties = torch.tensor(freq_list, dtype=torch.float32, pin_memory=pin).to(
         device, non_blocking=True
     )
-    # Host-side any()/all(): the values came from the task list, so checking
+    # Host-side any()/all(): the values came from the request list, so checking
     # them on device would force a synchronize right after the non-blocking
     # H2D copies — draining whatever prefill work is still queued
     # (measured 0.6 s stall at batch 128).
@@ -148,10 +152,10 @@ def _build_sampling_batch_info(tasks: List[Task], device) -> SamplingBatchInfo:
 
 def _warmup_cuda_graphs(
     model: AutoModel,
-    pool: PagePool,
-    task_cache: TaskCacheManager,
+    pool: "BlockPool",
+    cache_mgr: "KVCacheManager",
     ws: InferenceWorkspace,
-    gctx: CudaGraphContext,
+    gctx: CUDAGraphRunner,
     max_batch_size: int,
     prompt_len: int = 1,
     device: Optional[str] = None,
@@ -164,12 +168,12 @@ def _warmup_cuda_graphs(
     # that follows.  Custom .so kernels do NOT need this — they are pre-built.
     warmup_len = _config.prefill_warmup_len
     tid = "_warmup_prefill"
-    if task_cache.task_alloc(tid, list(range(warmup_len))):
+    if cache_mgr.alloc_slots(tid, list(range(warmup_len))):
         with (
             torch.inference_mode(),
             timed("warmup prefill", logger),
         ):
-            kv = task_cache.bind([tid], ws, start_pos=0)
+            kv = cache_mgr.bind([tid], ws, start_pos=0)
             ids_in = torch.arange(warmup_len, device=dev)
             pos_in = ids_in
             model(
@@ -181,7 +185,7 @@ def _warmup_cuda_graphs(
                     [warmup_len - 1], dtype=torch.long, device=dev
                 ),
             )
-        task_cache.task_free(tid)
+        cache_mgr.free_slots(tid)
 
     batch_sizes = [1]
     n = 2
@@ -192,16 +196,16 @@ def _warmup_cuda_graphs(
         batch_sizes.append(max_batch_size)
 
     for b in batch_sizes:
-        task_ids = [f"_warmup_decode_{b}_{i}" for i in range(b)]
+        request_ids = [f"_warmup_decode_{b}_{i}" for i in range(b)]
         prompt_tokens = [list(range(prompt_len)) for _ in range(b)]
         alloc_ok = True
-        for tid, pt in zip(task_ids, prompt_tokens):
-            if not task_cache.task_alloc(tid, pt):
+        for tid, pt in zip(request_ids, prompt_tokens):
+            if not cache_mgr.alloc_slots(tid, pt):
                 alloc_ok = False
                 break
         if not alloc_ok:
-            for tid in task_ids:
-                task_cache.task_free(tid)
+            for tid in request_ids:
+                cache_mgr.free_slots(tid)
             continue
 
         with (
@@ -211,9 +215,9 @@ def _warmup_cuda_graphs(
             for step in range(2):
                 seq_pos = step
                 ws.position_ids[:b] = seq_pos
-                for tid in task_ids:
-                    task_cache.task_extend(tid, seq_pos)
-                kv = task_cache.bind(task_ids, ws)
+                for tid in request_ids:
+                    cache_mgr.extend_slots(tid, seq_pos)
+                kv = cache_mgr.bind(request_ids, ws)
                 ids_buf = ws.fill_input_ids([step] * b)
                 gctx.forward(
                     model,
@@ -224,8 +228,8 @@ def _warmup_cuda_graphs(
                     fwd="decode",
                 )
 
-        for tid in task_ids:
-            task_cache.task_free(tid)
+        for tid in request_ids:
+            cache_mgr.free_slots(tid)
         torch.cuda.synchronize()
 
 
@@ -235,29 +239,29 @@ class GPUModelRunner:
     def __init__(
         self,
         model: AutoModel,
-        kv_cache: PagePool,
-        task_cache: TaskCacheManager,
+        kv_cache: "BlockPool",
+        cache_mgr: "KVCacheManager",
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         enable_cuda_graph: bool = True,
     ):
         self.model = model
         self.kv_cache = kv_cache
-        self.task_cache = task_cache
+        self.kv_manager = cache_mgr
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
 
         # Per-step decode cache for the steady-state case (same ordered
-        # task set decodes one token per step).  Sampling params stay
+        # request set decodes one token per step).  Sampling params stay
         # constant; only positions advance.
         self._decode_cache: Optional[DecodeSteadyState] = None
 
         # The most recent submitted-but-not-necessarily-committed decode
         # step.  ``submit_decode`` consults it to refuse the one unsafe
         # overlap (frequency penalty reading stale host histories); the
-        # Stepper's commit phase clears it.  Synchronous callers commit
+        # SchedulerStep's commit phase clears it.  Synchronous callers commit
         # immediately, so it is usually already consumed.
-        self._pending: Optional[PendingStep] = None
+        self._pending: Optional[PendingExecution] = None
 
         # Async result relay: pinned depth-2 slots on a dedicated copy
         # stream.  A submitted step's tokens land here without a blocking
@@ -287,7 +291,7 @@ class GPUModelRunner:
         # CUDA-graph capture: one graph per (batch_size,) key.
         # Enabled at init-time via _warmup_cuda_graphs for CudaBackend
         # on supported head_dims; left disabled otherwise.
-        self._graph_ctx = CudaGraphContext()
+        self._graph_ctx = CUDAGraphRunner()
         if enable_cuda_graph:
             self._try_enable_cuda_graph()
 
@@ -299,7 +303,7 @@ class GPUModelRunner:
         _warmup_cuda_graphs(
             self.model,
             self.kv_cache,
-            self.task_cache,
+            self.kv_manager,
             self._workspace,
             self._graph_ctx,
             max_batch_size=self.kv_cache.max_batch_size,
@@ -312,12 +316,12 @@ class GPUModelRunner:
 
     def execute_prefill(
         self,
-        tasks: List[Task],
+        requests: List[Request],
         start_pos: int = 0,
         return_logprobs: bool = False,
     ):
-        tasks = sorted(tasks, key=lambda t: t.task_id)
-        batch_sz = len(tasks)
+        requests = sorted(requests, key=lambda t: t.request_id)
+        batch_sz = len(requests)
 
         # Validate batch size bounds
         if batch_sz > self._workspace.max_batch_size:
@@ -326,7 +330,7 @@ class GPUModelRunner:
                 f"{self._workspace.max_batch_size}"
             )
 
-        prompt_lens = [len(t.prompt_ids) for t in tasks]
+        prompt_lens = [len(t.prompt_ids) for t in requests]
 
         # Validate inputs before any resource allocation
         if any(start_pos >= prompt_len for prompt_len in prompt_lens):
@@ -335,12 +339,12 @@ class GPUModelRunner:
         q_lens = [prompt_len - start_pos for prompt_len in prompt_lens]
 
         input_ids = torch.tensor(
-            [token for t in tasks for token in t.prompt_ids[start_pos:]],
+            [token for t in requests for token in t.prompt_ids[start_pos:]],
             dtype=torch.long,
             device=self.device,
         )
 
-        task_ids = [t.task_id for t in tasks]
+        request_ids = [t.request_id for t in requests]
         position_ids = torch.cat(
             [
                 torch.arange(
@@ -366,8 +370,8 @@ class GPUModelRunner:
             outputs = self.model(
                 input_ids,
                 position_ids=position_ids,
-                kv_cache=self.task_cache.bind(
-                    task_ids,
+                kv_cache=self.kv_manager.bind(
+                    request_ids,
                     self._workspace,
                     start_pos=start_pos,
                 ),
@@ -376,39 +380,39 @@ class GPUModelRunner:
             )
             logits = outputs["logits"]
 
-        pending = self._submit_sample(logits, tasks, return_logprobs)
-        return tasks, pending
+        pending = self._submit_sample(logits, requests, return_logprobs)
+        return requests, pending
 
     def execute_score(
         self,
-        tasks: List[Task],
+        requests: List[Request],
         per_token: bool = False,
     ) -> List[Any]:
         """Teacher-forced log-probabilities for a batch of prompts.
 
-        Each task's ``prompt_ids`` is the *whole* scored sequence
-        (context + continuation); ``task.cont_len`` says how many trailing
+        Each request's ``prompt_ids`` is the *whole* scored sequence
+        (context + continuation); ``request.cont_len`` says how many trailing
         tokens of it are the continuation to score.  The model is projected
         only at the positions that predict those tokens (``logits_positions``),
         so nothing is sampled and the softmax runs over ``sum(cont_len)`` rows
         rather than over the whole batch.
 
-        Returns per task either the summed log-probability of its continuation
+        Returns per request either the summed log-probability of its continuation
         or, with ``per_token=True``, the list of per-token log-probabilities.
         """
-        if not tasks:
+        if not requests:
             return []
-        batch_sz = len(tasks)
+        batch_sz = len(requests)
         if batch_sz > self._workspace.max_batch_size:
             raise ValueError(
                 f"Batch size {batch_sz} exceeds max_batch_size "
                 f"{self._workspace.max_batch_size}"
             )
 
-        prompt_lens = [len(t.prompt_ids) for t in tasks]
-        cont_lens = [t.cont_len for t in tasks]
+        prompt_lens = [len(t.prompt_ids) for t in requests]
+        cont_lens = [t.cont_len for t in requests]
         if any(c <= 0 for c in cont_lens):
-            raise ValueError("every scored task needs a non-empty continuation")
+            raise ValueError("every scored request needs a non-empty continuation")
         if any(c >= p for c, p in zip(cont_lens, prompt_lens)):
             raise ValueError("continuation must be shorter than the scored sequence")
 
@@ -419,16 +423,16 @@ class GPUModelRunner:
         # logical positions [P-C, P) is read from logits at [P-C-1, P-1).
         positions: List[int] = []
         flat_targets: List[int] = []
-        for offset, prompt_len, cont_len, task in zip(
-            offsets.tolist(), prompt_lens, cont_lens, tasks
+        for offset, prompt_len, cont_len, request in zip(
+            offsets.tolist(), prompt_lens, cont_lens, requests
         ):
             start = offset + prompt_len - cont_len - 1
             positions.extend(range(start, start + cont_len))
-            flat_targets.extend(task.prompt_ids[-cont_len:])
+            flat_targets.extend(request.prompt_ids[-cont_len:])
 
         logits_positions = torch.tensor(positions, dtype=torch.long, device=self.device)
         input_ids = torch.tensor(
-            [token for t in tasks for token in t.prompt_ids],
+            [token for t in requests for token in t.prompt_ids],
             dtype=torch.long,
             device=self.device,
         )
@@ -438,13 +442,15 @@ class GPUModelRunner:
                 for prompt_len in prompt_lens
             ]
         )
-        task_ids = [t.task_id for t in tasks]
+        request_ids = [t.request_id for t in requests]
 
         with torch.inference_mode():
             outputs = self.model(
                 input_ids,
                 position_ids=position_ids,
-                kv_cache=self.task_cache.bind(task_ids, self._workspace, start_pos=0),
+                kv_cache=self.kv_manager.bind(
+                    request_ids, self._workspace, start_pos=0
+                ),
                 fwd="prefill",
                 logits_positions=logits_positions,
             )
@@ -466,27 +472,27 @@ class GPUModelRunner:
         return out
 
     def submit_decode(
-        self, tasks: List[Task], return_logprobs: bool = False
-    ) -> Optional[PendingStep]:
+        self, requests: List[Request], return_logprobs: bool = False
+    ) -> Optional[PendingExecution]:
         """Launch one decode step without resolving any value on host.
 
         The submit half of the decode contract: fills input buffers, binds
         KV, replays the forward and launches sampling, then hands back a
-        :class:`PendingStep` carrying the device-resident tokens (and
+        :class:`PendingExecution` carrying the device-resident tokens (and
         optional logprobs).  Nothing here touches host copies of the
-        sampled values or mutates task output state — that is exclusively
-        :meth:`PendingStep.commit`'s job, invoked by the Stepper's commit
+        sampled values or mutates request output state — that is exclusively
+        :meth:`PendingExecution.commit`'s job, invoked by the SchedulerStep's commit
         phase.
 
-        Frequency penalty needs each task's host-side output history at
+        Frequency penalty needs each request's host-side output history at
         submit time, so a pending (not yet committed) previous step for the
         same batch would be read stale; that combination is rejected here
         (``None``) and the caller falls back to commit-then-submit.
         """
-        if not tasks:
+        if not requests:
             return None
 
-        b = len(tasks)
+        b = len(requests)
 
         # Validate batch size bounds
         if b > self._workspace.max_batch_size:
@@ -496,20 +502,20 @@ class GPUModelRunner:
             )
 
         ws = self._workspace
-        task_ids = [t.task_id for t in tasks]
-        task_sig = tuple(task_ids)
-        cur_positions = [t.next_pos for t in tasks]
+        request_ids = [t.request_id for t in requests]
+        task_sig = tuple(request_ids)
+        cur_positions = [t.next_pos for t in requests]
 
         # ---- pre-replay: update input buffers in-place ----
 
-        # When the previous decode step ran this same ordered task set, its
+        # When the previous decode step ran this same ordered request set, its
         # sampled tokens are still on-device and map 1:1 onto the current
         # slots — fill input ids device-to-device.  inference_mode guards
         # the read because the source was produced under sampling's
         # inference-mode context.
         #
-        # ``cache_valid`` checks the decode cache's own task signature:
-        # task ids are globally unique, so equality alone proves the cached
+        # ``cache_valid`` checks the decode cache's own request signature:
+        # request ids are globally unique, so equality alone proves the cached
         # tokens were sampled for exactly this ordered batch.  Req-index
         # signatures in the cache manager are deliberately NOT consulted —
         # they are recycled when freed slots are reallocated, which once
@@ -519,27 +525,30 @@ class GPUModelRunner:
         pending_same_batch = (
             self._pending is not None
             and not self._pending.committed
-            and self._pending.snapshot.task_ids == task_sig
+            and self._pending.snapshot.request_ids == task_sig
         )
         if cache_valid and cached.last_tokens is not None:
             with torch.inference_mode():
                 input_ids = ws.fill_input_ids_from_device(cached.last_tokens)
         else:
             input_ids = ws.fill_input_ids(
-                [t.output_ids[-1] if t.output_ids else t.prompt_ids[-1] for t in tasks]
+                [
+                    t.output_ids[-1] if t.output_ids else t.prompt_ids[-1]
+                    for t in requests
+                ]
             )
 
-        kv_cache = self.task_cache.bind(task_ids, ws)
+        kv_cache = self.kv_manager.bind(request_ids, ws)
 
         # Reuse sampling state only if all conditions hold:
-        # 1. The cached decode state belongs to THIS task set (task_sig)
+        # 1. The cached decode state belongs to THIS request set (task_sig)
         # 2. KV bind detected steady increment (same req_indices, seq_lens +1)
-        reuse_decode_state = cache_valid and self.task_cache.bind_was_steady
+        reuse_decode_state = cache_valid and self.kv_manager.bind_was_steady
         if reuse_decode_state:
             info = cached.sampling_info
             ws.position_ids[:b] += 1
         else:
-            info = _build_sampling_batch_info(tasks, self.device)
+            info = _build_sampling_batch_info(requests, self.device)
             ws.position_ids[:b].copy_(
                 torch.tensor(cur_positions, dtype=torch.long, device=self.device)
             )
@@ -581,7 +590,7 @@ class GPUModelRunner:
                 )
             logits = outputs["logits"]
 
-        pending = self._submit_sample(logits, tasks, return_logprobs, info=info)
+        pending = self._submit_sample(logits, requests, return_logprobs, info=info)
         self._result_ring.post(pending)
         self._decode_cache.last_tokens = pending.tokens
         self._pending = pending
@@ -590,28 +599,28 @@ class GPUModelRunner:
     def _submit_sample(
         self,
         logits: Tensor,
-        tasks: List[Task],
+        requests: List[Request],
         return_logprobs: bool = False,
         info: Optional[SamplingBatchInfo] = None,
-    ) -> PendingStep:
-        """Sample from ``logits`` into a :class:`PendingStep`.
+    ) -> PendingExecution:
+        """Sample from ``logits`` into a :class:`PendingExecution`.
 
         Same strategy pipeline and frequency-penalty history assembly as
         the pre-split host path, but the result stays on device inside a
         pending step instead of being resolved to host lists.
         """
-        info = info or _build_sampling_batch_info(tasks, self.device)
+        info = info or _build_sampling_batch_info(requests, self.device)
         if info.has_freq:
             history_lists = [
-                t.prompt_ids[-t.rep_window :] + t.output_ids for t in tasks
+                t.prompt_ids[-t.rep_window :] + t.output_ids for t in requests
             ]
             history_lens = [len(ids) for ids in history_lists]
             max_len = max(history_lens, default=0)
             padded_ids = torch.zeros(
-                len(tasks), max_len, dtype=torch.long, device=self.device
+                len(requests), max_len, dtype=torch.long, device=self.device
             )
             padded_mask = torch.zeros(
-                len(tasks), max_len, dtype=torch.bool, device=self.device
+                len(requests), max_len, dtype=torch.bool, device=self.device
             )
             for i, ids in enumerate(history_lists):
                 length = len(ids)
@@ -649,22 +658,22 @@ class GPUModelRunner:
             tokens, logprobs = result, None
 
         snapshot = BatchSnapshot(
-            task_ids=tuple(t.task_id for t in tasks),
-            kv_positions=tuple(t.next_pos for t in tasks),
+            request_ids=tuple(t.request_id for t in requests),
+            kv_positions=tuple(t.next_pos for t in requests),
             policy_version=0,
         )
-        return PendingStep(
+        return PendingExecution(
             snapshot=snapshot,
-            tasks=list(tasks),
+            requests=list(requests),
             tokens=tokens,
             logprobs=logprobs,
         )
 
-    def peek_pending(self) -> Optional[PendingStep]:
+    def peek_pending(self) -> Optional[PendingExecution]:
         """The in-flight submitted step, if any (not committed)."""
         return self._pending
 
-    def clear_pending(self) -> Optional[PendingStep]:
+    def clear_pending(self) -> Optional[PendingExecution]:
         """Detach the in-flight step without committing it.
 
         The overlap scheduler's commit phase takes ownership this way: the
@@ -688,13 +697,13 @@ class GPUModelRunner:
         cached = self._decode_cache
         return cached is None or not getattr(cached.sampling_info, "has_freq", False)
 
-    def flush_pending(self, stepper=None) -> Optional[PendingStep]:
+    def flush_pending(self, stepper=None) -> Optional[PendingExecution]:
         """Commit and clear any in-flight submitted step.
 
         The drain point for every state transition that must not race an
         outstanding step: weight updates, KV invalidation, shutdown, and
         the frequency-penalty fallback inside :meth:`submit_decode`
-        (via the Stepper).  Returns the drained step, or ``None``.
+        (via the SchedulerStep).  Returns the drained step, or ``None``.
         """
         pending = self._pending
         if pending is None:
@@ -709,13 +718,13 @@ class GPUModelRunner:
         return pending
 
     def execute_decode(
-        self, tasks: List[Task], return_logprobs: bool = False
+        self, requests: List[Request], return_logprobs: bool = False
     ) -> List[int]:
-        """Decode next token for each task (submit + immediate commit).
+        """Decode next token for each request (submit + immediate commit).
 
         Compatibility shell over :meth:`submit_decode`: same ordering
         guarantees and same return contract as before the split, for the
-        synchronous callers (``run_batch``, RL rollout).  The Stepper's
+        synchronous callers (``run_batch``, RL rollout).  The SchedulerStep's
         overlapping path uses ``submit_decode`` + deferred commit instead.
 
         Returns:
@@ -723,7 +732,7 @@ class GPUModelRunner:
             ``List[Tuple[int, float]]`` of ``(token_id, logprob)`` when
             ``return_logprobs`` is ``True``.
         """
-        pending = self.submit_decode(tasks, return_logprobs)
+        pending = self.submit_decode(requests, return_logprobs)
         if pending is None:
             # submit_decode refuses only the freq-penalty-with-pending
             # combination; with no pending step in flight it cannot happen,

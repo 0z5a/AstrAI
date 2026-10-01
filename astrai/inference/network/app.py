@@ -18,7 +18,7 @@ import uvicorn
 from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from astrai.inference.engine import InferenceEngine, build_engine
+from astrai.inference.frontend.engine import InferenceEngine, build_engine
 from astrai.inference.network.anthropic import AnthropicResponseBuilder
 from astrai.inference.network.openai import OpenAIResponseBuilder
 from astrai.inference.network.protocol import ProtocolHandler

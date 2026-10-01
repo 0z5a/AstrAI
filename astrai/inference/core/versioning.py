@@ -3,7 +3,7 @@
 The guard owns the monotonic version counter, the RLock that serializes
 weight publication against generation (``run_batch`` acquires the same
 lock), and the validation/commit rules around both.  Scheduler-specific
-preconditions (no in-flight generation, no queued tasks) and side effects
+preconditions (no in-flight generation, no queued requests) and side effects
 (dropping stale KV entries) are injected as callables so the guard stays
 free of inference-subsystem knowledge.
 """

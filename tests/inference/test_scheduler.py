@@ -10,19 +10,19 @@ import pytest
 import torch
 
 from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
-from astrai.inference import GenerationResult, InferenceScheduler
-from astrai.inference.metrics import MetricsCollector
-from astrai.inference.runtime.model_runner import (
+from astrai.inference import GenerationResult, Scheduler
+from astrai.inference.core.metrics import MetricsCollector
+from astrai.inference.core.request import STOP, BatchedStreamCallback, Request
+from astrai.inference.core.stepper import SchedulerStep
+from astrai.inference.worker.model_runner import (
     DecodeSteadyState,
     GPUModelRunner,
 )
-from astrai.inference.runtime.pending import (
+from astrai.inference.worker.pending import (
     BatchSnapshot,
-    PendingStep,
+    PendingExecution,
     ResultRing,
 )
-from astrai.inference.runtime.stepper import Stepper
-from astrai.inference.task import STOP, BatchedStreamCallback, Task
 from astrai.model.transformer import AutoRegressiveLM
 from tests.helpers import FakeTokenizer, make_rollout_config
 
@@ -54,10 +54,10 @@ def _make_mock_scheduler(mock_model_and_tokenizer):
     """Build a CPU scheduler over mocks, patching scheduler-internal imports."""
     mock_model, mock_tokenizer = mock_model_and_tokenizer
     with (
-        patch("astrai.inference.scheduler.AutoModel"),
-        patch("astrai.inference.scheduler.AutoTokenizer"),
+        patch("astrai.inference.core.scheduler.AutoModel"),
+        patch("astrai.inference.core.scheduler.AutoTokenizer"),
     ):
-        return InferenceScheduler(
+        return Scheduler(
             model=mock_model,
             tokenizer=mock_tokenizer,
             max_batch_size=4,
@@ -74,18 +74,20 @@ def _run_threads(*workers, timeout=10.0):
 
 
 def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
-    """Test concurrent add_task operations."""
+    """Test concurrent add_request operations."""
     scheduler = _make_mock_scheduler(mock_model_and_tokenizer)
 
-    results = {"task_ids": [], "errors": []}
+    results = {"request_ids": [], "errors": []}
     lock = threading.Lock()
 
     def add_task_worker(worker_id):
         try:
             for i in range(10):
-                task_id = scheduler.add_task(f"prompt from worker {worker_id}-{i}")
+                request_id = scheduler.add_request(
+                    f"prompt from worker {worker_id}-{i}"
+                )
                 with lock:
-                    results["task_ids"].append(task_id)
+                    results["request_ids"].append(request_id)
         except Exception as e:
             results["errors"].append(str(e))
 
@@ -94,14 +96,14 @@ def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
     scheduler.stop()
 
     assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
-    assert len(results["task_ids"]) == 50
+    assert len(results["request_ids"]) == 50
 
 
 def test_generation_loop_activates_backend_in_worker_thread():
-    scheduler = object.__new__(InferenceScheduler)
+    scheduler = object.__new__(Scheduler)
     scheduler._backend = TorchNativeBackend()
     scheduler._stop_event = threading.Event()
-    scheduler._task_cache = MagicMock()
+    scheduler._kv_manager = MagicMock()
     scheduler._retired = []
     scheduler._executor = MagicMock()
     scheduler._executor.peek_pending.return_value = None
@@ -110,20 +112,20 @@ def test_generation_loop_activates_backend_in_worker_thread():
     observed = []
     task_mgr = MagicMock()
     task_mgr.tokenizer.stop_ids = [0]
-    task_mgr.remove_finished_tasks.return_value = []
-    task_mgr.get_active_tasks.return_value = []
+    task_mgr.remove_finished_requests.return_value = []
+    task_mgr.get_running_requests.return_value = []
     task_mgr.max_batch_size = 1
-    task_mgr.pull_candidates.return_value = []
-    task_mgr.has_work.return_value = False
+    task_mgr.pull_waiting.return_value = []
+    task_mgr.has_requests.return_value = False
 
     def observe_backend(*args, **kwargs):
         observed.append(type(get_backend()))
         scheduler._stop_event.set()
 
-    task_mgr.wait_for_tasks.side_effect = observe_backend
-    scheduler._task_mgr = task_mgr
+    task_mgr.wait_for_requests.side_effect = observe_backend
+    scheduler._requests = task_mgr
 
-    thread = threading.Thread(target=scheduler._run_generation_loop)
+    thread = threading.Thread(target=scheduler.run_busy_loop)
     thread.start()
     thread.join(timeout=5)
 
@@ -132,41 +134,43 @@ def test_generation_loop_activates_backend_in_worker_thread():
 
 
 def test_step_splits_decode_batch_by_request_backend():
-    scheduler = object.__new__(InferenceScheduler)
+    scheduler = object.__new__(Scheduler)
     scheduler._cache = SimpleNamespace(page_size=1)
-    scheduler._task_cache = MagicMock()
-    scheduler._task_cache.task_extend.return_value = True
-    scheduler._task_cache.task_extend_batch.return_value = [True, True]
+    scheduler._kv_manager = MagicMock()
+    scheduler._kv_manager.extend_slots.return_value = True
+    scheduler._kv_manager.extend_slots_batch.return_value = [True, True]
     scheduler._metrics = MetricsCollector()
     scheduler._executor = MagicMock()
-    scheduler._stepper = Stepper(
-        scheduler._cache, scheduler._task_cache, scheduler._executor, scheduler._metrics
+    scheduler._stepper = SchedulerStep(
+        scheduler._cache, scheduler._kv_manager, scheduler._executor, scheduler._metrics
     )
 
     observed = []
 
     def submit(*args, **kwargs):
-        tasks = args[0]
-        observed.append((type(get_backend()), [task.task_id for task in tasks]))
-        return PendingStep(
+        requests = args[0]
+        observed.append(
+            (type(get_backend()), [request.request_id for request in requests])
+        )
+        return PendingExecution(
             snapshot=BatchSnapshot(
-                task_ids=tuple(t.task_id for t in tasks),
+                request_ids=tuple(t.request_id for t in requests),
                 kv_positions=(0,),
                 policy_version=0,
             ),
-            tasks=list(tasks),
-            tokens=torch.tensor([1] * len(tasks), dtype=torch.long),
+            requests=list(requests),
+            tokens=torch.tensor([1] * len(requests), dtype=torch.long),
         )
 
     scheduler._executor.submit_decode.side_effect = submit
 
-    torch_task = Task("torch", [1], backend=TorchNativeBackend())
-    cuda_task = Task("cuda", [1], backend=CudaBackend())
-    for task in (torch_task, cuda_task):
-        task.input_tokens = 1
-        task.output_ids = [1]
-        task.mark_prefill_done()
-        scheduler._metrics.register(task.task_id)
+    torch_task = Request("torch", [1], backend=TorchNativeBackend())
+    cuda_task = Request("cuda", [1], backend=CudaBackend())
+    for request in (torch_task, cuda_task):
+        request.input_tokens = 1
+        request.output_ids = [1]
+        request.mark_prefill_complete()
+        scheduler._metrics.register(request.request_id)
 
     produced, aborted = scheduler._step([torch_task, cuda_task])
 
@@ -179,26 +183,26 @@ def test_step_splits_decode_batch_by_request_backend():
 
 
 def test_step_batches_ragged_prefill_with_shared_cache_start():
-    scheduler = object.__new__(InferenceScheduler)
+    scheduler = object.__new__(Scheduler)
     scheduler._cache = SimpleNamespace(page_size=64)
-    scheduler._task_cache = MagicMock()
-    scheduler._task_cache.task_cached.return_value = 0
+    scheduler._kv_manager = MagicMock()
+    scheduler._kv_manager.cached_tokens.return_value = 0
     scheduler._metrics = MetricsCollector()
     scheduler._executor = MagicMock()
-    scheduler._stepper = Stepper(
-        scheduler._cache, scheduler._task_cache, scheduler._executor, scheduler._metrics
+    scheduler._stepper = SchedulerStep(
+        scheduler._cache, scheduler._kv_manager, scheduler._executor, scheduler._metrics
     )
 
-    short = Task("short", [1, 2, 3])
-    long = Task("long", [4, 5, 6, 7, 8])
-    for task in (short, long):
-        scheduler._metrics.register(task.task_id)
+    short = Request("short", [1, 2, 3])
+    long = Request("long", [4, 5, 6, 7, 8])
+    for request in (short, long):
+        scheduler._metrics.register(request.request_id)
 
     scheduler._executor.execute_prefill.return_value = (
         [long, short],
-        PendingStep(
+        PendingExecution(
             snapshot=BatchSnapshot(("long", "short"), (0,), 0),
-            tasks=[long, short],
+            requests=[long, short],
             tokens=torch.tensor([11, 12], dtype=torch.long),
         ),
     )
@@ -217,8 +221,8 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
 def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
-    executor.task_cache = MagicMock()
-    executor.task_cache.bind.return_value = MagicMock()
+    executor.kv_manager = MagicMock()
+    executor.kv_manager.bind.return_value = MagicMock()
     executor._workspace = MagicMock()
     executor._workspace.max_batch_size = 16  # Add max_batch_size for validation
     all_logits = torch.arange(42, dtype=torch.float32).reshape(6, 7)
@@ -228,25 +232,25 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
 
     executor.model = MagicMock(side_effect=fake_model)
     executor._submit_sample = MagicMock(
-        return_value=PendingStep(
+        return_value=PendingExecution(
             snapshot=BatchSnapshot(("a", "b"), (0,), 0),
-            tasks=[],
+            requests=[],
             tokens=torch.tensor([101, 102]),
         )
     )
 
-    task_b = Task("b", [20, 21, 22, 23, 24])
-    task_a = Task("a", [10, 11, 12])
+    task_b = Request("b", [20, 21, 22, 23, 24])
+    task_a = Request("a", [10, 11, 12])
 
-    tasks, pending = executor.execute_prefill([task_b, task_a], start_pos=1)
+    requests, pending = executor.execute_prefill([task_b, task_a], start_pos=1)
 
-    assert tasks == [task_a, task_b]
+    assert requests == [task_a, task_b]
     assert pending.commit() == [(101, None), (102, None)]
     model_args, model_kwargs = executor.model.call_args
     assert model_args[0].tolist() == [11, 12, 21, 22, 23, 24]
     assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
     assert model_kwargs["logits_positions"].tolist() == [1, 5]
-    executor.task_cache.bind.assert_called_once_with(
+    executor.kv_manager.bind.assert_called_once_with(
         ["a", "b"], executor._workspace, start_pos=1
     )
     sample_args, sample_kwargs = executor._submit_sample.call_args
@@ -257,7 +261,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
 
 
 def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
-    """Test concurrent add and remove task operations."""
+    """Test concurrent add and remove request operations."""
     scheduler = _make_mock_scheduler(mock_model_and_tokenizer)
 
     results = {"added": [], "removed": [], "errors": []}
@@ -266,8 +270,8 @@ def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
     def add_worker():
         try:
             for i in range(20):
-                task_id = scheduler.add_task(f"prompt {i}")
-                results["added"].append(task_id)
+                request_id = scheduler.add_request(f"prompt {i}")
+                results["added"].append(request_id)
                 if len(results["added"]) >= 10:
                     add_ready.set()
         except Exception as e:
@@ -276,9 +280,9 @@ def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
     def remove_worker():
         try:
             add_ready.wait(timeout=5.0)
-            for task_id in results["added"][:10]:
-                scheduler.remove_task(task_id)
-                results["removed"].append(task_id)
+            for request_id in results["added"][:10]:
+                scheduler.remove_request(request_id)
+                results["removed"].append(request_id)
         except Exception as e:
             results["errors"].append(f"Remove: {str(e)}")
 
@@ -297,10 +301,10 @@ def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
     started = threading.Event()
     stats_done = threading.Event()
 
-    def add_tasks():
+    def add_requests():
         try:
             for i in range(20):
-                scheduler.add_task(f"prompt {i}")
+                scheduler.add_request(f"prompt {i}")
                 started.set()
         except Exception as e:
             results["errors"].append(f"Add: {str(e)}")
@@ -315,7 +319,7 @@ def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
         except Exception as e:
             results["errors"].append(f"Get stats: {str(e)}")
 
-    _run_threads(add_tasks, get_stats)
+    _run_threads(add_requests, get_stats)
     scheduler.stop()
     stats_done.wait(timeout=5.0)
 
@@ -332,7 +336,7 @@ def _make_real_scheduler(device):
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     tokenizer = FakeTokenizer()
-    scheduler = InferenceScheduler(
+    scheduler = Scheduler(
         model=model,
         tokenizer=tokenizer,
         max_batch_size=8,
@@ -344,17 +348,18 @@ def _make_real_scheduler(device):
 def test_cancel_waiting_task_storm_returns_to_baseline(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
-        task_ids = [
-            scheduler.add_task(f"waiting-{index}", max_tokens=32) for index in range(32)
+        request_ids = [
+            scheduler.add_request(f"waiting-{index}", max_tokens=32)
+            for index in range(32)
         ]
 
-        assert all(scheduler.cancel_task(task_id) for task_id in task_ids)
+        assert all(scheduler.cancel_request(request_id) for request_id in request_ids)
         stats = scheduler.get_stats()
-        assert stats["active_tasks"] == 0
+        assert stats["running"] == 0
         assert stats["waiting_tasks"] == 0
         assert stats["in_flight_tasks"] == 0
         assert stats["kv_cache_tasks"] == 0
-        assert stats["cancelled_total"] == len(task_ids)
+        assert stats["cancelled_total"] == len(request_ids)
     finally:
         scheduler.stop()
 
@@ -362,30 +367,30 @@ def test_cancel_waiting_task_storm_returns_to_baseline(device):
 def test_cancel_active_task_releases_metrics_and_kv(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
-        task_id = scheduler.add_task("active", max_tokens=32)
-        task = scheduler._task_mgr.pull_candidates(1)[0]
-        assert scheduler._task_cache.task_alloc(task.task_id, task.prompt_ids)
-        assert scheduler._task_mgr.activate(task)
+        request_id = scheduler.add_request("active", max_tokens=32)
+        request = scheduler._requests.pull_waiting(1)[0]
+        assert scheduler._kv_manager.alloc_slots(request.request_id, request.prompt_ids)
+        assert scheduler._requests.activate(request)
 
         before = scheduler.get_stats()
-        assert before["active_tasks"] == 1
+        assert before["running"] == 1
         assert before["in_flight_tasks"] == 1
         assert before["kv_cache_tasks"] == 1
 
-        assert scheduler.cancel_task(task_id)
+        assert scheduler.cancel_request(request_id)
         scheduler.start()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             after = scheduler.get_stats()
             if (
-                after["active_tasks"] == 0
+                after["running"] == 0
                 and after["in_flight_tasks"] == 0
                 and after["kv_cache_tasks"] == 0
             ):
                 break
             time.sleep(0.01)
 
-        assert after["active_tasks"] == 0
+        assert after["running"] == 0
         assert after["waiting_tasks"] == 0
         assert after["in_flight_tasks"] == 0
         assert after["kv_cache_tasks"] == 0
@@ -398,7 +403,7 @@ def test_cancel_during_kv_allocation_releases_metrics_and_kv(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     allocation_started = threading.Event()
     continue_allocation = threading.Event()
-    original_alloc = scheduler._task_cache.task_alloc
+    original_alloc = scheduler._kv_manager.alloc_slots
 
     def blocking_alloc(*args, **kwargs):
         allocation_started.set()
@@ -407,21 +412,21 @@ def test_cancel_during_kv_allocation_releases_metrics_and_kv(device):
 
     try:
         with patch.object(
-            scheduler._task_cache,
-            "task_alloc",
+            scheduler._kv_manager,
+            "alloc_slots",
             side_effect=blocking_alloc,
         ):
             scheduler.start()
-            task_id = scheduler.add_task("allocation-race", max_tokens=32)
+            request_id = scheduler.add_request("allocation-race", max_tokens=32)
             assert allocation_started.wait(timeout=5)
-            assert scheduler.cancel_task(task_id)
+            assert scheduler.cancel_request(request_id)
             continue_allocation.set()
 
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 stats = scheduler.get_stats()
                 if (
-                    stats["active_tasks"] == 0
+                    stats["running"] == 0
                     and stats["waiting_tasks"] == 0
                     and stats["in_flight_tasks"] == 0
                     and stats["kv_cache_tasks"] == 0
@@ -429,7 +434,7 @@ def test_cancel_during_kv_allocation_releases_metrics_and_kv(device):
                     break
                 time.sleep(0.01)
 
-        assert stats["active_tasks"] == 0
+        assert stats["running"] == 0
         assert stats["waiting_tasks"] == 0
         assert stats["in_flight_tasks"] == 0
         assert stats["kv_cache_tasks"] == 0
@@ -538,7 +543,7 @@ def test_run_batch_stop_id_terminates(device):
     try:
         # Make every token a stop id: generation must end after exactly
         # one token (the stop token itself) instead of running to max_tokens.
-        scheduler._task_mgr.tokenizer.stop_ids = list(range(200))
+        scheduler._requests.tokenizer.stop_ids = list(range(200))
         prompts = [[10, 20, 30]]
         results = scheduler.run_batch(prompts, max_tokens=32, temperature=1.0)
         assert len(results[0]) == 1
@@ -679,11 +684,11 @@ def test_scheduler_serializes_policy_snapshot_and_direct_update(device):
 
 def test_scheduler_rejects_weight_update_with_queued_tasks(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
-    task_id = scheduler.add_task("queued")
+    request_id = scheduler.add_request("queued")
     try:
-        with pytest.raises(RuntimeError, match="while tasks are queued"):
+        with pytest.raises(RuntimeError, match="while requests are queued"):
             scheduler.update_weights(1)
-        scheduler.remove_task(task_id)
+        scheduler.remove_request(request_id)
         assert scheduler.update_weights(1) == 1
     finally:
         scheduler.stop()
@@ -739,7 +744,7 @@ def test_run_batch_details_report_non_positive_max_tokens(device):
 def test_run_batch_details_report_allocation_failure(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
-        with patch.object(scheduler._task_cache, "task_alloc", return_value=False):
+        with patch.object(scheduler._kv_manager, "alloc_slots", return_value=False):
             result = scheduler.run_batch([[10, 20]], max_tokens=2, return_details=True)[
                 0
             ]
@@ -755,7 +760,7 @@ def test_run_batch_details_report_extension_failure_and_cleanup(device):
         with patch.object(
             scheduler._stepper,
             "step",
-            side_effect=lambda tasks, **_kwargs: ([], list(tasks)),
+            side_effect=lambda requests, **_kwargs: ([], list(requests)),
         ):
             result = scheduler.run_batch([[10, 20]], max_tokens=2, return_details=True)[
                 0
@@ -763,7 +768,7 @@ def test_run_batch_details_report_extension_failure_and_cleanup(device):
 
         assert result.finish_reason == "rejected"
         assert result.error_reason == "kv_cache_extension_failed"
-        assert scheduler._task_cache._states == {}
+        assert scheduler._kv_manager._states == {}
         assert scheduler._metrics._timings == {}
     finally:
         scheduler.stop()
@@ -772,9 +777,9 @@ def test_run_batch_details_report_extension_failure_and_cleanup(device):
 def test_decode_does_not_reuse_previous_batch_state():
     executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
-    executor.task_cache = MagicMock()
-    executor.task_cache.bind_was_steady = True
-    executor.task_cache.bind.return_value = MagicMock()
+    executor.kv_manager = MagicMock()
+    executor.kv_manager.bind_was_steady = True
+    executor.kv_manager.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
     executor._pending = None
@@ -793,29 +798,29 @@ def test_decode_does_not_reuse_previous_batch_state():
     old_info = object()
     new_info = SimpleNamespace(has_freq=False)
     executor._decode_cache = DecodeSteadyState(("old",), [2], old_info)
-    pending_result = PendingStep(
+    pending_result = PendingExecution(
         snapshot=BatchSnapshot(("new",), (8,), 0),
-        tasks=[],
+        requests=[],
         tokens=torch.tensor([3], dtype=torch.long),
     )
     executor._submit_sample = MagicMock(return_value=pending_result)
 
-    task = Task("new", list(range(8)), temperature=0)
-    task.input_tokens = 8
-    task.output_ids = [7]
-    task.mark_prefill_done()
+    request = Request("new", list(range(8)), temperature=0)
+    request.input_tokens = 8
+    request.output_ids = [7]
+    request.mark_prefill_complete()
 
     with patch(
-        "astrai.inference.runtime.model_runner._build_sampling_batch_info",
+        "astrai.inference.worker.model_runner._build_sampling_batch_info",
         return_value=new_info,
     ):
-        assert executor.execute_decode([task]) == [3]
+        assert executor.execute_decode([request]) == [3]
 
     assert workspace.position_ids.tolist() == [8]
     assert executor._decode_cache.task_sig == ("new",)
     executor._submit_sample.assert_called_once()
     args, kwargs = executor._submit_sample.call_args
-    assert args[1:] == ([task], False)
+    assert args[1:] == ([request], False)
     assert kwargs["info"] is new_info
 
 
@@ -823,9 +828,9 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     """Steady-state decode copies cached device tokens, skipping the host."""
     executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
-    executor.task_cache = MagicMock()
-    executor.task_cache.bind_was_steady = True
-    executor.task_cache.bind.return_value = MagicMock()
+    executor.kv_manager = MagicMock()
+    executor.kv_manager.bind_was_steady = True
+    executor.kv_manager.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
 
@@ -846,21 +851,21 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     executor._pending = None
     executor._result_ring = ResultRing(16, executor.device)
     executor._submit_sample = MagicMock(
-        return_value=PendingStep(
-            snapshot=BatchSnapshot(("t1",), (3,), 0), tasks=[], tokens=tokens
+        return_value=PendingExecution(
+            snapshot=BatchSnapshot(("t1",), (3,), 0), requests=[], tokens=tokens
         )
     )
 
-    task = Task("t1", list(range(8)), temperature=0)
-    task.input_tokens = 8
-    task.output_ids = [7]
-    task.mark_prefill_done()
+    request = Request("t1", list(range(8)), temperature=0)
+    request.input_tokens = 8
+    request.output_ids = [7]
+    request.mark_prefill_complete()
 
     with patch(
-        "astrai.inference.runtime.model_runner._build_sampling_batch_info",
+        "astrai.inference.worker.model_runner._build_sampling_batch_info",
         return_value=info,
     ):
-        assert executor.execute_decode([task]) == [3]
+        assert executor.execute_decode([request]) == [3]
 
     workspace.fill_input_ids.assert_not_called()
     workspace.fill_input_ids_from_device.assert_called_once_with(tokens)
@@ -951,12 +956,12 @@ def test_run_batch_greedy_reproducible_across_calls(device):
 
 
 def test_pending_step_commit_is_idempotent(device):
-    """A committed step cannot double-append tokens to its tasks."""
+    """A committed step cannot double-append tokens to its requests."""
     tokens = torch.tensor([5, 6], dtype=torch.long)
     logprobs = torch.tensor([-1.5, -2.5], dtype=torch.float32)
-    pending = PendingStep(
+    pending = PendingExecution(
         snapshot=BatchSnapshot(("a", "b"), (0, 0), 0),
-        tasks=[object(), object()],
+        requests=[object(), object()],
         tokens=tokens,
         logprobs=logprobs,
     )
@@ -968,43 +973,45 @@ def test_pending_step_commit_is_idempotent(device):
 
 
 def test_submit_decode_returns_pending_without_touching_tasks(device):
-    """The submit half leaves task output state untouched.
+    """The submit half leaves request output state untouched.
 
     Core of the B1 contract: after submit, no token is appended — the
     scheduler may still roll the batch back.  (The KV write cursor is a
-    submit-side property — see Stepper._submit_decoded — because the
+    submit-side property — see SchedulerStep._submit_decoded — because the
     launched work owns its write slot; commit only materialises results.)
     """
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30, 40]]
         scheduler.run_batch(prompts, max_tokens=2, temperature=0.7)
-        tasks = [
-            Task(
-                task_id=f"probe_{uuid.uuid4().hex[:8]}",
+        requests = [
+            Request(
+                request_id=f"probe_{uuid.uuid4().hex[:8]}",
                 prompt_ids=[10, 20, 30, 40],
                 max_tokens=4,
                 temperature=0.7,
             )
         ]
-        task = tasks[0]
-        if not scheduler._task_cache.task_alloc(task.task_id, task.prompt_ids):
+        request = requests[0]
+        if not scheduler._kv_manager.alloc_slots(
+            request.request_id, request.prompt_ids
+        ):
             pytest.skip("KV allocation failed")
-        task.input_tokens = len(task.prompt_ids)
+        request.input_tokens = len(request.prompt_ids)
         # Prefill through the real stepper path so KV state is complete.
         with scheduler._backend_context():
-            scheduler._stepper.step([task])
-            assert task.prefill_done
-            pending = scheduler._executor.submit_decode([task])
+            scheduler._stepper.step([request])
+            assert request.prefill_complete
+            pending = scheduler._executor.submit_decode([request])
         assert pending is not None
         try:
-            n_prefilled = len(task.output_ids)
-            assert task.output_tokens == n_prefilled
+            n_prefilled = len(request.output_ids)
+            assert request.output_tokens == n_prefilled
             scheduler._stepper.step_commit(pending)
-            assert len(task.output_ids) == n_prefilled + 1
-            assert task.output_tokens == n_prefilled + 1
+            assert len(request.output_ids) == n_prefilled + 1
+            assert request.output_tokens == n_prefilled + 1
         finally:
-            scheduler._task_cache.task_free(task.task_id)
+            scheduler._kv_manager.free_slots(request.request_id)
     finally:
         scheduler.stop()
 
@@ -1021,7 +1028,7 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     tok = FakeTokenizer()
-    scheduler = InferenceScheduler(
+    scheduler = Scheduler(
         model=model,
         tokenizer=tok,
         max_batch_size=8,
@@ -1029,7 +1036,7 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
         enable_overlap=True,
     )
 
-    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_task's
+    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_request's
     # contract is the flat single-string shape, so unwrap it here.
     class _UnwrappingTokenizer:
         def __init__(self, inner):
@@ -1043,7 +1050,7 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
         def __getattr__(self, name):
             return getattr(self._inner, name)
 
-    scheduler._task_mgr.tokenizer = _UnwrappingTokenizer(tok)
+    scheduler._requests.tokenizer = _UnwrappingTokenizer(tok)
 
     # StreamDecoder requires the Rust tokenizer's ``_tokenizer`` handle,
     # which FakeTokenizer does not provide; the online e2e only needs
@@ -1061,7 +1068,7 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
     def make_sink(tag):
         class _Sink(BatchedStreamCallback):
             def __call__(self, batch):
-                for task_id, token in batch:
+                for request_id, token in batch:
                     events[tag].append(token)
                     if token is STOP:
                         done[tag].set()
@@ -1069,13 +1076,13 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
         return _Sink()
 
     try:
-        with patch("astrai.inference.task.StreamDecoder", _FakeStreamDecoder):
+        with patch("astrai.inference.core.request.StreamDecoder", _FakeStreamDecoder):
             scheduler.start()
-            scheduler.add_task(
+            scheduler.add_request(
                 "a" * 8, max_tokens=12, stream_callback=make_sink("first")
             )
             time.sleep(0.2)  # let the first request enter steady decode
-            scheduler.add_task(
+            scheduler.add_request(
                 "b" * 8, max_tokens=12, stream_callback=make_sink("second")
             )
             assert done["first"].wait(timeout=10)
@@ -1104,16 +1111,16 @@ def test_overlap_loop_matches_synchronous_tokens(device):
     Regression gate for the clear_pending bug: the steady overlap branch
     used to detach the JUST-SUBMITTED pending step (the executor slot
     already held the new step, not the one being committed), so every
-    other steady iteration's tokens never committed -- tasks finished at
+    other steady iteration's tokens never committed -- requests finished at
     the KV cap with half their tokens and interleaved-token detext.
-    Token-count gates cannot see this on small configs (the tasks still
+    Token-count gates cannot see this on small configs (the requests still
     finish); only the full sequence comparison against the synchronous
     run_batch reference catches it.
     """
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     tokenizer = FakeTokenizer()
-    scheduler = InferenceScheduler(
+    scheduler = Scheduler(
         model=model,
         tokenizer=tokenizer,
         max_batch_size=8,
@@ -1121,7 +1128,7 @@ def test_overlap_loop_matches_synchronous_tokens(device):
         enable_overlap=True,
     )
 
-    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_task's
+    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_request's
     # contract is the flat single-string shape, so unwrap here (same
     # workaround as the overlap e2e test).
     class _UnwrappingTokenizer:
@@ -1136,7 +1143,7 @@ def test_overlap_loop_matches_synchronous_tokens(device):
         def __getattr__(self, name):
             return getattr(self._inner, name)
 
-    scheduler._task_mgr.tokenizer = _UnwrappingTokenizer(tokenizer)
+    scheduler._requests.tokenizer = _UnwrappingTokenizer(tokenizer)
 
     # StreamDecoder needs the Rust handle FakeTokenizer lacks; emit the
     # token id itself as the "text" so the sink sees every token.
@@ -1164,9 +1171,9 @@ def test_overlap_loop_matches_synchronous_tokens(device):
         )
         assert all(len(ids) == 12 for ids in reference)
 
-        with patch("astrai.inference.task.StreamDecoder", _IdDecoder):
-            task_ids = [
-                scheduler.add_task(
+        with patch("astrai.inference.core.request.StreamDecoder", _IdDecoder):
+            request_ids = [
+                scheduler.add_request(
                     p, max_tokens=12, stream_callback=sink, temperature=0
                 )
                 for p in prompts
@@ -1178,13 +1185,13 @@ def test_overlap_loop_matches_synchronous_tokens(device):
                     break
                 time.sleep(0.01)
 
-        by_task = {tid: [] for tid in task_ids}
+        by_task = {tid: [] for tid in request_ids}
         for tid, token in sink.events:
             if token is not STOP:
                 by_task[tid].append(int(token))
-        for i, tid in enumerate(task_ids):
+        for i, tid in enumerate(request_ids):
             assert by_task[tid] == list(reference[i]), (
-                f"task {i} overlap stream {by_task[tid]} != reference "
+                f"request {i} overlap stream {by_task[tid]} != reference "
                 f"{list(reference[i])}"
             )
         assert scheduler._executor.peek_pending() is None

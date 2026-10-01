@@ -31,7 +31,7 @@ from astrai.extension.kernel import (
     attn_paged_prefill,
     attn_prefill,
 )
-from astrai.inference.workspace import MAX_SPLITS, Q_TILE_ROWS
+from astrai.inference.worker.workspace import MAX_SPLITS, Q_TILE_ROWS
 
 
 @dataclass(frozen=True)

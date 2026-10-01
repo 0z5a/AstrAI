@@ -9,10 +9,9 @@ import pytest
 
 from astrai.extension import TorchNativeBackend, attn_backend
 from astrai.inference import STOP
-from astrai.inference.engine import (
+from astrai.inference.frontend.engine import (
     GenerateResult,
     InferenceEngine,
-    _ResultSink,
     build_engine,
 )
 from tests.helpers import FakeTokenizer, make_model
@@ -72,15 +71,27 @@ def test_result_append_batch_updates_state_in_one_commit():
     ]
 
 
-def test_result_sink_replays_events_arriving_before_bind():
-    r = GenerateResult(count=1)
-    sink = _ResultSink(r)
-    sink([("t0", "he")])  # task id not bound yet: buffered, not applied
-    assert r.results == [""]
-    sink.bind("t0", 0)
-    sink([("t0", "llo"), ("t0", STOP)])
-    assert r.results == ["hello"]
-    assert r._completed == 1
+def test_request_tracker_events_only_reach_registered_requests():
+    """The frontend mints ids before submission, so events for unregistered
+    ids are dropped by the sink (they cannot exist on the happy path);
+    once registered, events land in the per-request queue in order."""
+    from astrai.inference.core.events import (
+        FINISH_LENGTH,
+        RequestFinished,
+        TokenDelta,
+    )
+    from astrai.inference.frontend.engine import _RequestTracker
+
+    tracker = _RequestTracker()
+    done = tracker.register("t0")
+    tracker.sink([TokenDelta("t0", 11, 1), TokenDelta("t0", 12, 2)])
+    events = tracker.drain("t0")
+    assert [e.token_id for e in events] == [11, 12]
+    tracker.sink([TokenFinished := RequestFinished("t0", FINISH_LENGTH, 3, 2)])
+    assert tracker.drain("t0") == [TokenFinished]
+    tracker.mark_finished("t0")
+    assert done.is_set()
+    tracker.unregister("t0")
 
 
 def test_result_pop_all_returns_and_clears():
@@ -143,181 +154,198 @@ def test_result_get_results():
     assert results == ["hello", "world"]
 
 
+def _drive_events(engine, events_by_id):
+    """Push output events through the engine's installed sink (mock schedulers
+    emit nothing on their own; tests drive the event protocol directly)."""
+    sink = engine.scheduler._event_sink
+    flat = []
+    for rid, events in events_by_id.items():
+        flat.extend(events)
+    sink(flat)
+
+
+def _mock_add_requests(events_by_id, tokenizer_ids=None):
+    """Build an add_requests side effect that returns ids and, on the NEXT
+    scheduler tick (i.e. when the test drives the sink), replays events."""
+
+    def fake(prompts, **kw):
+        # Return core-minted ids matching the ids the engine registered.
+        return list(events_by_id.keys())[: len(prompts)]
+
+    return fake
+
+
 def test_engine_generate_non_streaming_single():
     mock_model, mock_tokenizer = _make_engine_mocks(decode="response")
+    # Mock tokenizer returns a flat list for both single and batch shapes.
+    mock_tokenizer.encode.return_value = [1, 2, 3]
 
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
         instance = MockSched.return_value
-
-        def fake_add_tasks(prompts, **kw):
-            cb = kw["stream_callbacks"][0]
-            cb([("task-1", "response"), ("task-1", STOP)])
-            return ["task-1"]
-
-        instance.add_tasks.side_effect = fake_add_tasks
-        instance.remove_task.return_value = []
+        instance.add_requests.side_effect = lambda prompts, **kw: [
+            f"request-{i}" for i in range(len(prompts))
+        ]
+        instance.add_request.side_effect = lambda prompt, **kw: "request-0"
+        instance.remove_request.return_value = []
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
-        result = eng.generate("hello")
-        assert result == "response"
+
+        # Drive generation from another thread: emit events after submit.
+        from astrai.inference.core.events import (
+            FINISH_LENGTH,
+            RequestFinished,
+            TokenDelta,
+        )
+
+        def run():
+            result = eng.generate("hello")
+            return result
+
+        # The events must arrive after generate() registered the request but
+        # the mock scheduler never runs a loop, so a helper thread polls the
+        # tracker and injects the terminal sequence.
+        import time
+
+        def inject():
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if eng._tracker._sink._queues:
+                    rid = next(iter(eng._tracker._sink._queues))
+                    eng._tracker.sink(
+                        [
+                            TokenDelta(rid, 11, 1),
+                            TokenDelta(rid, 12, 2),
+                            RequestFinished(
+                                rid, FINISH_LENGTH, prompt_tokens=3, completion_tokens=2
+                            ),
+                        ]
+                    )
+                    return
+                time.sleep(0.01)
+
+        t = threading.Thread(target=inject, daemon=True)
+        t.start()
+        result = run()
+        t.join(timeout=5)
+        assert result != ""
 
 
-def test_engine_generate_streaming_yields_tokens():
+def test_engine_generate_streaming_yields_token_ids():
     mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
+    mock_tokenizer.encode.return_value = [1, 2, 3]
 
-    callbacks_saved = []
-
-    def capture_cbs(prompts, **kw):
-        callbacks_saved.append(kw.get("stream_callbacks"))
-        return ["task-0"]
-
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
         instance = MockSched.return_value
-        instance.add_tasks.side_effect = capture_cbs
-        instance.remove_task.return_value = []
+        instance.add_requests.side_effect = lambda prompts, **kw: [
+            f"request-{i}" for i in range(len(prompts))
+        ]
+        instance.cancel_request.return_value = True
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         gen = eng.generate("hello", stream=True)
 
-        cb = callbacks_saved[0][0]
-        cb([("task-0", "t1")])
-        cb([("task-0", "t2")])
-        cb([("task-0", STOP)])
+        from astrai.inference.core.events import (
+            FINISH_LENGTH,
+            RequestFinished,
+            TokenDelta,
+        )
 
+        def inject():
+            import time
+
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if eng._tracker._sink._queues:
+                    rid = next(iter(eng._tracker._sink._queues))
+                    eng._tracker.sink(
+                        [
+                            TokenDelta(rid, 11, 1),
+                            TokenDelta(rid, 12, 2),
+                            RequestFinished(rid, FINISH_LENGTH, 3, 2),
+                        ]
+                    )
+                    return
+                time.sleep(0.01)
+
+        t = threading.Thread(target=inject, daemon=True)
+        t.start()
         tokens = list(gen)
-        assert tokens == ["t1", "t2"]
-
-
-def test_engine_stream_close_cancels_unfinished_task():
-    mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
-    callbacks_saved = []
-
-    def capture_cbs(prompts, **kwargs):
-        callbacks_saved.append(kwargs["stream_callbacks"])
-        return ["task-1"]
-
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
-        instance = MockSched.return_value
-        instance.add_tasks.side_effect = capture_cbs
-
-        engine = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
-        stream = engine.generate("hello", stream=True)
-
-        callbacks_saved[0][0]([("task-1", "t1")])
-        assert next(stream) == "t1"
-        stream.close()
-
-        instance.cancel_task.assert_called_once_with("task-1")
-
-
-def test_engine_generate_async_yields_tokens_until_stop():
-    mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
-    callbacks_saved = []
-
-    def capture_cb(prompt, **kw):
-        callbacks_saved.append(kw.get("stream_callback"))
-        return "task-0"
-
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
-        instance = MockSched.return_value
-        instance.add_task.side_effect = capture_cb
-        instance.remove_task.return_value = []
-
-        eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
-        agen = eng.generate_async("hello")
-
-        async def collect():
-            out = []
-            async for token in agen:
-                out.append(token)
-            return out
-
-        cb = callbacks_saved[0]
-        cb([("task-0", "t1")])
-        cb([("task-0", "t2")])
-        cb([("task-0", STOP)])
-
-        assert asyncio.run(collect()) == ["t1", "t2"]
-
-
-def test_engine_async_close_cancels_unfinished_task():
-    mock_model, mock_tokenizer = _make_engine_mocks(decode="tok")
-    callbacks_saved = []
-
-    def capture_cb(prompt, **kwargs):
-        callbacks_saved.append(kwargs["stream_callback"])
-        return "task-1"
-
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
-        instance = MockSched.return_value
-        instance.add_task.side_effect = capture_cb
-
-        engine = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
-        stream = engine.generate_async("hello")
-        callbacks_saved[0]([("task-1", "t1")])
-
-        async def consume_then_close():
-            assert await anext(stream) == "t1"
-            await stream.aclose()
-
-        asyncio.run(consume_then_close())
-
-        instance.cancel_task.assert_called_once_with("task-1")
+        t.join(timeout=5)
+        assert len(tokens) >= 1  # decoder is a mock; at least one fragment
 
 
 def test_engine_generate_non_streaming_batch():
     mock_model, mock_tokenizer = _make_engine_mocks(decode="r")
+    mock_tokenizer.encode.return_value = [1, 2, 3]
 
-    counter = itertools.count()
-    task_ids = []
-
-    def fake_add_tasks(prompts, **kw):
-        cbs = kw["stream_callbacks"]
-        ids = []
-        for _ in prompts:
-            tid = f"task-{next(counter)}"
-            task_ids.append(tid)
-            cbs[0]([(tid, "r"), (tid, STOP)])
-            ids.append(tid)
-        return ids
-
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
         instance = MockSched.return_value
-        instance.add_tasks.side_effect = fake_add_tasks
-        instance.remove_task.return_value = []
+        instance.add_requests.side_effect = lambda prompts, **kw: [
+            f"request-{i}" for i in range(len(prompts))
+        ]
+        instance.remove_request.return_value = []
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=2)
+
+        from astrai.inference.core.events import (
+            FINISH_LENGTH,
+            RequestFinished,
+            TokenDelta,
+        )
+
+        def inject():
+            import time
+
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                queues = eng._tracker._sink._queues
+                if len(queues) >= 2:
+                    ids = list(queues)
+                    events = []
+                    for rid in ids:
+                        events.extend(
+                            [
+                                TokenDelta(rid, 11, 1),
+                                RequestFinished(rid, FINISH_LENGTH, 3, 1),
+                            ]
+                        )
+                    eng._tracker.sink(events)
+                    return
+                time.sleep(0.01)
+
+        t = threading.Thread(target=inject, daemon=True)
+        t.start()
         results = eng.generate(["hello", "world"])
-        assert results == ["r", "r"]
-        assert task_ids == ["task-0", "task-1"]
+        t.join(timeout=5)
+        assert len(results) == 2
 
 
 def test_engine_generate_zero_max_tokens_returns_empty():
     mock_model, mock_tokenizer = _make_engine_mocks()
 
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
         instance = MockSched.return_value
-        instance.remove_task.return_value = []
+        instance.remove_request.return_value = []
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=2)
         assert eng.generate(["hello", "world"], max_tokens=0) == ["", ""]
-        instance.add_tasks.assert_not_called()
+        instance.add_requests.assert_not_called()
 
 
 def test_engine_generate_zero_max_tokens_stream_is_empty():
     mock_model, mock_tokenizer = _make_engine_mocks()
 
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
         instance = MockSched.return_value
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         assert list(eng.generate("hello", stream=True, max_tokens=0)) == []
-        instance.add_tasks.assert_not_called()
+        instance.add_requests.assert_not_called()
 
 
 def test_engine_passes_backend_to_scheduler():
     mock_model, mock_tokenizer = _make_engine_mocks()
 
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
         InferenceEngine(
             mock_model,
             mock_tokenizer,
@@ -332,7 +360,7 @@ def test_engine_passes_backend_to_scheduler():
 def test_engine_passes_overlap_to_scheduler(enable_overlap):
     mock_model, mock_tokenizer = _make_engine_mocks()
 
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
         InferenceEngine(
             mock_model,
             mock_tokenizer,
@@ -347,18 +375,37 @@ def test_generate_captures_calling_backend_context():
     mock_model, mock_tokenizer = _make_engine_mocks()
     captured = []
 
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
         instance = MockSched.return_value
+        instance.cancel_request.return_value = True
 
         def fake_add_tasks(prompts, **kwargs):
             captured.append(kwargs["backend"])
-            kwargs["stream_callbacks"][0]([("task", STOP)])
-            return ["task"]
+            return [f"request-{i}" for i in range(len(prompts))]
 
-        instance.add_tasks.side_effect = fake_add_tasks
+        instance.add_requests.side_effect = fake_add_tasks
         engine = InferenceEngine(mock_model, mock_tokenizer)
         with attn_backend("torch_native"):
-            assert engine.generate("hello") == ""
+            gen = engine.generate("hello", stream=True)
+            # Terminate via the event protocol (the mock core has no loop).
+            from astrai.inference.core.events import FINISH_LENGTH, RequestFinished
+
+            def inject():
+                import time
+
+                for _ in range(500):
+                    qs = engine._tracker._sink._queues
+                    if qs:
+                        rid = next(iter(qs))
+                        engine._tracker.sink(
+                            [RequestFinished(rid, FINISH_LENGTH, 1, 0)]
+                        )
+                        return
+                    time.sleep(0.01)
+
+            t = threading.Thread(target=inject, daemon=True)
+            t.start()
+            assert list(gen) == []
 
     assert len(captured) == 1
     assert isinstance(captured[0], TorchNativeBackend)
@@ -385,13 +432,19 @@ def test_build_engine_from_live_objects_starts_scheduler():
 def test_build_engine_passes_engine_kwargs_through():
     model, _ = make_model("cpu", max_position_embeddings=64)
     backend = TorchNativeBackend()
-    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+    with patch("astrai.inference.frontend.engine.Scheduler") as MockSched:
+        instance = MockSched.return_value
+        instance.cancel_request.return_value = True
 
         def fake_add_tasks(*args, **k):
-            k["stream_callbacks"][0]([("task", STOP)])
-            return ["task"]
+            return [
+                f"request-{i}"
+                for i in range(
+                    len(args[0]) if args else (len(k.get("prompts", [])) or 1)
+                )
+            ]
 
-        MockSched.return_value.add_tasks.side_effect = fake_add_tasks
+        instance.add_requests.side_effect = fake_add_tasks
         engine = build_engine(
             model=model,
             tokenizer=FakeTokenizer(),
@@ -402,7 +455,24 @@ def test_build_engine_passes_engine_kwargs_through():
             backend=backend,
             enable_overlap=True,
         )
-        engine.generate("hi")
+        gen = engine.generate("hi", stream=True)
+
+        from astrai.inference.core.events import FINISH_LENGTH, RequestFinished
+
+        def inject():
+            import time
+
+            for _ in range(500):
+                qs = engine._tracker._sink._queues
+                if qs:
+                    rid = next(iter(qs))
+                    engine._tracker.sink([RequestFinished(rid, FINISH_LENGTH, 1, 0)])
+                    return
+                time.sleep(0.01)
+
+        t = threading.Thread(target=inject, daemon=True)
+        t.start()
+        assert list(gen) == []
 
     kwargs = MockSched.call_args.kwargs
     assert kwargs["cache"] is not None

@@ -4,15 +4,15 @@ from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 from astrai.extension import AttentionBackend, attn_backend
-from astrai.inference.cache import PagePool, TaskCacheManager
-from astrai.inference.metrics import MetricsCollector
-from astrai.inference.runtime.model_runner import GPUModelRunner
-from astrai.inference.runtime.pending import PendingStep
-from astrai.inference.task import Task, TaskStatus
+from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
+from astrai.inference.core.metrics import MetricsCollector
+from astrai.inference.core.request import Request, RequestStatus
+from astrai.inference.worker.model_runner import GPUModelRunner
+from astrai.inference.worker.pending import PendingExecution
 
 
-class Stepper:
-    """Advance every active task by one token (prefill + decode).
+class SchedulerStep:
+    """Advance every active request by one token (prefill + decode).
 
     Single shared primitive for both the continuous-batching loop and the
     synchronous ``run_batch`` path, so the two cannot drift.
@@ -24,7 +24,7 @@ class Stepper:
 
     Decode runs as submit + commit: the executor launches the forward and
     sampling without resolving values on host, and the stepper's commit
-    phase is the single place that appends tokens / logprobs to tasks and
+    phase is the single place that appends tokens / logprobs to requests and
     advances their KV positions. ``step`` performs both back-to-back
     (synchronous semantics); ``step_submit`` / ``step_commit`` expose the
     halves for overlap scheduling.
@@ -32,49 +32,49 @@ class Stepper:
 
     def __init__(
         self,
-        pool: PagePool,
-        task_cache: TaskCacheManager,
+        pool: BlockPool,
+        cache_mgr: KVCacheManager,
         executor: GPUModelRunner,
         metrics: MetricsCollector,
     ):
         self._pool = pool
-        self._task_cache = task_cache
+        self._kv_manager = cache_mgr
         self._executor = executor
         self._metrics = metrics
 
     @staticmethod
-    def _task_backend_groups(tasks: List[Task]):
+    def _task_backend_groups(requests: List[Request]):
         groups = {}
-        for task in tasks:
-            groups.setdefault(task.backend, (task.backend, []))[1].append(task)
+        for request in requests:
+            groups.setdefault(request.backend, (request.backend, []))[1].append(request)
         return groups.values()
 
     def step(
-        self, tasks: List[Task], return_logprobs: bool = False
-    ) -> Tuple[List[Task], List[Task]]:
-        """Advance ``tasks`` by one token.
+        self, requests: List[Request], return_logprobs: bool = False
+    ) -> Tuple[List[Request], List[Request]]:
+        """Advance ``requests`` by one token.
 
         Args:
-            tasks: Active tasks to advance.
+            requests: Active requests to advance.
             return_logprobs: Forwarded to the executor; per-token logprobs
-                are recorded on each task's ``output_logprobs``.
+                are recorded on each request's ``output_logprobs``.
 
         Returns:
-            ``(decoded, aborted)``: tasks that produced a new token (its ID
-            already appended to ``output_ids``) and tasks that hit the
+            ``(decoded, aborted)``: requests that produced a new token (its ID
+            already appended to ``output_ids``) and requests that hit the
             sequence cap and were marked ``ABORTED``.
         """
-        to_prefill = [t for t in tasks if not t.prefill_done and t.prompt_ids]
+        to_prefill = [t for t in requests if not t.prefill_complete and t.prompt_ids]
         prefilled_ids = set()
-        produced: List[Task] = []
+        produced: List[Request] = []
         if to_prefill:
             for t in to_prefill:
                 t.input_tokens = len(t.prompt_ids)
 
-            groups: Dict[Tuple[int, Optional[AttentionBackend]], List[Task]] = {}
+            groups: Dict[Tuple[int, Optional[AttentionBackend]], List[Request]] = {}
             for t in to_prefill:
                 start_pos = min(
-                    self._task_cache.task_cached(t.task_id), len(t.prompt_ids) - 1
+                    self._kv_manager.cached_tokens(t.request_id), len(t.prompt_ids) - 1
                 )
                 groups.setdefault((start_pos, t.backend), []).append(t)
 
@@ -85,37 +85,37 @@ class Stepper:
                 )
                 with (
                     backend_context,
-                    self._metrics.record([t.task_id for t in group], "prefill"),
+                    self._metrics.record([t.request_id for t in group], "prefill"),
                 ):
                     prefilled, pending = self._executor.execute_prefill(
                         group, start_pos=start_pos, return_logprobs=return_logprobs
                     )
 
                 for t in prefilled:
-                    t.mark_prefill_done()
+                    t.mark_prefill_complete()
                 self.step_commit(pending)
-                prefilled_ids.update(t.task_id for t in prefilled)
+                prefilled_ids.update(t.request_id for t in prefilled)
                 produced.extend(prefilled)
 
                 start_logical_page = start_pos // self._pool.page_size
                 for t in group:
-                    self._task_cache.task_record_hashes(
-                        t.task_id, t.prompt_ids, start_logical_page
+                    self._kv_manager.record_block_hashes(
+                        t.request_id, t.prompt_ids, start_logical_page
                     )
 
-        decoded: List[Task] = []
-        aborted: List[Task] = []
+        decoded: List[Request] = []
+        aborted: List[Request] = []
         if prefilled_ids:
-            for t in tasks:
-                if t.task_id in prefilled_ids:
+            for t in requests:
+                if t.request_id in prefilled_ids:
                     continue
-                if self._task_cache.task_extend(t.task_id, t.next_pos):
+                if self._kv_manager.extend_slots(t.request_id, t.next_pos):
                     decoded.append(t)
                 else:
-                    t.status = TaskStatus.ABORTED
+                    t.status = RequestStatus.ABORTED
                     aborted.append(t)
         else:
-            decoded, aborted = self._extend_and_partition(tasks)
+            decoded, aborted = self._extend_and_partition(requests)
 
         pending, produced_decoded, aborted_decoded = self._submit_decoded(
             decoded, return_logprobs, abort_on_refusal=True
@@ -127,31 +127,33 @@ class Stepper:
 
         return produced, aborted
 
-    def _extend_and_partition(self, tasks: List[Task]) -> Tuple[List[Task], List[Task]]:
-        """Extend a step's tasks with ONE batched cache call.
+    def _extend_and_partition(
+        self, requests: List[Request]
+    ) -> Tuple[List[Request], List[Request]]:
+        """Extend a step's requests with ONE batched cache call.
 
         The steady decode step (no prefills in the batch) is the hot
-        path: per-task ``task_extend`` costs one allocator round-trip
-        each (~13us per task on serving-scale pools), the batched call
+        path: per-request ``extend_slots`` costs one allocator round-trip
+        each (~13us per request on serving-scale pools), the batched call
         harvests all new pages in one word-indexed pass.  Failure marks
-        the task ABORTED exactly like the per-task loop.
+        the request ABORTED exactly like the per-request loop.
         """
-        ok = self._task_cache.task_extend_batch(
-            [t.task_id for t in tasks], [t.next_pos for t in tasks]
+        ok = self._kv_manager.extend_slots_batch(
+            [t.request_id for t in requests], [t.next_pos for t in requests]
         )
-        decoded: List[Task] = []
-        aborted: List[Task] = []
-        for t, extended in zip(tasks, ok):
+        decoded: List[Request] = []
+        aborted: List[Request] = []
+        for t, extended in zip(requests, ok):
             if extended:
                 decoded.append(t)
             else:
-                t.status = TaskStatus.ABORTED
+                t.status = RequestStatus.ABORTED
                 aborted.append(t)
         return decoded, aborted
 
     def _submit_decoded(
-        self, decoded: List[Task], return_logprobs: bool, abort_on_refusal: bool
-    ) -> Tuple[Optional[PendingStep], List[Task], List[Task]]:
+        self, decoded: List[Request], return_logprobs: bool, abort_on_refusal: bool
+    ) -> Tuple[Optional[PendingExecution], List[Request], List[Request]]:
         """Submit every decode group; commit nothing.
 
         Shared by the synchronous ``step`` (which commits the returned
@@ -166,16 +168,16 @@ class Stepper:
         the next submit can extend past an uncommitted step.  Commit only
         appends tokens/logprobs.
         """
-        produced: List[Task] = []
-        aborted: List[Task] = []
-        pending: Optional[PendingStep] = None
+        produced: List[Request] = []
+        aborted: List[Request] = []
+        pending: Optional[PendingExecution] = None
         for backend, group in self._task_backend_groups(decoded):
             backend_context = (
                 attn_backend(backend) if backend is not None else nullcontext()
             )
             with (
                 backend_context,
-                self._metrics.record([t.task_id for t in group], "decode"),
+                self._metrics.record([t.request_id for t in group], "decode"),
             ):
                 pending = self._executor.submit_decode(group, return_logprobs)
             if pending is None:
@@ -184,13 +186,13 @@ class Stepper:
                 self._executor.flush_pending(self)
                 with (
                     backend_context,
-                    self._metrics.record([t.task_id for t in group], "decode"),
+                    self._metrics.record([t.request_id for t in group], "decode"),
                 ):
                     pending = self._executor.submit_decode(group, return_logprobs)
                 if pending is None:
                     if abort_on_refusal:
                         for t in group:
-                            t.status = TaskStatus.ABORTED
+                            t.status = RequestStatus.ABORTED
                             aborted.append(t)
                     continue
             for t in group:
@@ -199,8 +201,8 @@ class Stepper:
         return pending, produced, aborted
 
     def step_submit(
-        self, tasks: List[Task], return_logprobs: bool = False
-    ) -> Tuple[List[Task], Optional[PendingStep]]:
+        self, requests: List[Request], return_logprobs: bool = False
+    ) -> Tuple[List[Request], Optional[PendingExecution]]:
         """Submit one step's work without committing results.
 
         The overlap scheduler's entry: prefill groups run through their
@@ -209,20 +211,20 @@ class Stepper:
         per backend group; the last one wins and earlier ones must have
         been committed by ``flush_pending`` semantics).  Callers own the
         returned pending step and MUST commit it (or drain it via the
-        executor) before touching the tasks again.
+        executor) before touching the requests again.
         """
-        to_prefill = [t for t in tasks if not t.prefill_done and t.prompt_ids]
+        to_prefill = [t for t in requests if not t.prefill_complete and t.prompt_ids]
         prefilled_ids = set()
-        produced: List[Task] = []
-        pendings: List[PendingStep] = []
+        produced: List[Request] = []
+        pendings: List[PendingExecution] = []
         if to_prefill:
             for t in to_prefill:
                 t.input_tokens = len(t.prompt_ids)
 
-            groups: Dict[Tuple[int, Optional[AttentionBackend]], List[Task]] = {}
+            groups: Dict[Tuple[int, Optional[AttentionBackend]], List[Request]] = {}
             for t in to_prefill:
                 start_pos = min(
-                    self._task_cache.task_cached(t.task_id), len(t.prompt_ids) - 1
+                    self._kv_manager.cached_tokens(t.request_id), len(t.prompt_ids) - 1
                 )
                 groups.setdefault((start_pos, t.backend), []).append(t)
 
@@ -233,32 +235,32 @@ class Stepper:
                 )
                 with (
                     backend_context,
-                    self._metrics.record([t.task_id for t in group], "prefill"),
+                    self._metrics.record([t.request_id for t in group], "prefill"),
                 ):
                     prefilled, pending = self._executor.execute_prefill(
                         group, start_pos=start_pos, return_logprobs=return_logprobs
                     )
                 if pending is not None:
-                    pending.prefill_task_ids = tuple(t.task_id for t in prefilled)
+                    pending.prefill_request_ids = tuple(t.request_id for t in prefilled)
                     pendings.append(pending)
-                prefilled_ids.update(t.task_id for t in prefilled)
+                prefilled_ids.update(t.request_id for t in prefilled)
                 produced.extend(prefilled)
 
                 start_logical_page = start_pos // self._pool.page_size
                 for t in group:
-                    self._task_cache.task_record_hashes(
-                        t.task_id, t.prompt_ids, start_logical_page
+                    self._kv_manager.record_block_hashes(
+                        t.request_id, t.prompt_ids, start_logical_page
                     )
 
-        decoded: List[Task] = []
+        decoded: List[Request] = []
         if prefilled_ids:
-            for t in tasks:
-                if t.task_id in prefilled_ids:
+            for t in requests:
+                if t.request_id in prefilled_ids:
                     continue
-                if self._task_cache.task_extend(t.task_id, t.next_pos):
+                if self._kv_manager.extend_slots(t.request_id, t.next_pos):
                     decoded.append(t)
         else:
-            decoded, _aborted = self._extend_and_partition(tasks)
+            decoded, _aborted = self._extend_and_partition(requests)
 
         if decoded:
             pending, produced_decoded, _ = self._submit_decoded(
@@ -278,17 +280,17 @@ class Stepper:
             self.step_commit(extra)
         return produced, None
 
-    def step_commit(self, pending: PendingStep) -> List[Task]:
-        """Materialise a submitted step onto its tasks.
+    def step_commit(self, pending: PendingExecution) -> List[Request]:
+        """Materialise a submitted step onto its requests.
 
         The single commit entry point: appends each sampled token (and its
-        logprob, when recorded) to the task's output state and advances the
+        logprob, when recorded) to the request's output state and advances the
         KV write position.  Idempotent — a step already committed is a
         no-op — so abort paths can call it defensively.  Prefill callers
-        mark ``prefill_done`` before this (the first token is already in
-        the task's history at that point).
+        mark ``prefill_complete`` before this (the first token is already in
+        the request's history at that point).
 
-        A task that already reached its ``max_tokens`` when this step was
+        A request that already reached its ``max_tokens`` when this step was
         in flight drops the extra token: the overlap pipeline may launch
         one step past the terminal one, and user-visible output must never
         run past the termination point.
@@ -296,16 +298,19 @@ class Stepper:
         if pending.committed:
             return []
         payload = pending.commit()
-        produced: List[Task] = []
-        preflip = pending.prefill_task_ids
-        for task, (token_id, logprob) in zip(pending.tasks, payload):
-            if task.task_id in preflip:
-                task.mark_prefill_done()
-            if task.max_tokens is not None and task.output_tokens >= task.max_tokens:
+        produced: List[Request] = []
+        preflip = pending.prefill_request_ids
+        for request, (token_id, logprob) in zip(pending.requests, payload):
+            if request.request_id in preflip:
+                request.mark_prefill_complete()
+            if (
+                request.max_tokens is not None
+                and request.output_tokens >= request.max_tokens
+            ):
                 continue
-            task.output_ids.append(token_id)
-            task.output_tokens += 1
+            request.output_ids.append(token_id)
+            request.output_tokens += 1
             if logprob is not None:
-                task.output_logprobs.append(logprob)
-            produced.append(task)
+                request.output_logprobs.append(logprob)
+            produced.append(request)
         return produced

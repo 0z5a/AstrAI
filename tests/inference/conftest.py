@@ -45,8 +45,8 @@ def mock_engine():
     mock.get_stats.return_value = {
         "total_tasks": 0,
         "total_tokens": 0,
-        "active_tasks": 0,
-        "waiting_queue": 0,
+        "running": 0,
+        "waiting": 0,
     }
     mock.tokenizer.encode.return_value = [1, 2, 3]
     mock.tokenizer.decode.return_value = "mock response"

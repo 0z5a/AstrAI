@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, random_split
 from astrai.config.model_config import ConfigFactory
 from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
-from astrai.inference.scheduler import InferenceScheduler
+from astrai.inference.core.scheduler import Scheduler
 from astrai.model.components.lora import inject_lora
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction
 from astrai.parallel.executor import (
@@ -626,7 +626,7 @@ class TrainContextBuilder:
 
         def _colocated(max_batch_size: int) -> ColocatedBackend:
             return ColocatedBackend(
-                InferenceScheduler(
+                Scheduler(
                     model=context.model,
                     tokenizer=tokenizer,
                     max_batch_size=max_batch_size,

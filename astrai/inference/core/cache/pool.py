@@ -1,10 +1,10 @@
-"""KV cache orchestration: PagePool + TaskCacheManager.
+"""KV cache orchestration: BlockPool + KVCacheManager.
 
-PagePool owns the physical buffers (``KVStorage`` + ``ReqToTokenPool``)
+BlockPool owns the physical buffers (``KVStorage`` + ``ReqToTokenPool``)
 and wires them to an allocation strategy.  It assembles the ``KVCache``
 dataclass passed to the model forward.
 
-TaskCacheManager owns the ``task_id`` → ``TaskCacheState`` mapping and
+KVCacheManager owns the ``request_id`` → ``RequestCacheState`` mapping and
 delegates physical slot allocation to the strategy, and KV bind to the pool.
 
 See ``cache_buffer.py`` for the raw buffer primitives and ``cache_strategy.py``
@@ -16,15 +16,15 @@ from typing import Dict, List, Optional
 
 import torch
 
-from astrai.inference.cache.strategy import (
+from astrai.inference.core.cache.strategy import (
     AllocationStrategy,
     Allocator,
     ContiguousStrategy,
     PagedStrategy,
     RadixCache,
-    TaskCacheState,
+    RequestCacheState,
 )
-from astrai.inference.workspace import Q_TILE_ROWS, InferenceWorkspace
+from astrai.inference.worker.workspace import Q_TILE_ROWS, InferenceWorkspace
 from astrai.model.kv_cache import (
     DecodeKVCache,
     KVCache,
@@ -33,22 +33,22 @@ from astrai.model.kv_cache import (
     ReqToTokenPool,
 )
 
-# Re-export everything so existing ``from astrai.inference.cache import ...``
+# Re-export everything so existing ``from astrai.inference.core.cache import ...``
 # continues to work unchanged after the file split.
 __all__ = [
-    "KVCache",
-    "PrefillKVCache",
-    "DecodeKVCache",
-    "KVStorage",
-    "ReqToTokenPool",
-    "Allocator",
-    "RadixCache",
     "AllocationStrategy",
+    "Allocator",
+    "BlockPool",
     "ContiguousStrategy",
+    "DecodeKVCache",
+    "KVCache",
+    "KVCacheManager",
+    "KVStorage",
     "PagedStrategy",
-    "PagePool",
-    "TaskCacheManager",
-    "TaskCacheState",
+    "PrefillKVCache",
+    "RadixCache",
+    "ReqToTokenPool",
+    "RequestCacheState",
 ]
 
 # ---- helpers ----
@@ -69,7 +69,7 @@ def _is_steady_increment(
     )
 
 
-# ---- task-scoped bind state ----
+# ---- request-scoped bind state ----
 @dataclass
 class _BindState:
     """Cached bind metadata for steady-state decode increment detection."""
@@ -81,11 +81,11 @@ class _BindState:
 # ---- pool + manager ----
 
 
-class PagePool:
+class BlockPool:
     """Physical KV cache: buffers + req-to-token table + allocation strategy + bind.
 
-    Does not know about tasks — task lifecycle is managed by
-    :class:`TaskCacheManager`, which holds a reference to this pool.
+    Does not know about requests — request lifecycle is managed by
+    :class:`KVCacheManager`, which holds a reference to this pool.
     """
 
     def __init__(
@@ -155,11 +155,11 @@ class PagePool:
         start_pos: Optional[int] = None,
         incremental: bool = False,
     ) -> KVCache:
-        """Assemble the ``KVCache`` metadata for a batch of tasks.
+        """Assemble the ``KVCache`` metadata for a batch of requests.
 
         Args:
             req_indices: request slot indices (from ``ReqToTokenPool``).
-            seq_lens:    current sequence length per task.
+            seq_lens:    current sequence length per request.
             workspace:   pre-allocated fixed-shape buffers (CUDA-graph safe).
             start_pos:   if set, produce **prefill** cache (full q_len range).
                          If ``None``, produce **decode** cache (last position).
@@ -270,57 +270,57 @@ class PagePool:
             )
 
 
-class TaskCacheManager:
-    """Task ↔ KV slot lifecycle manager.
+class KVCacheManager:
+    """Request ↔ KV slot lifecycle manager.
 
-    Sole owner of ``task_id → TaskCacheState``.  Delegates physical slot
+    Sole owner of ``request_id → RequestCacheState``.  Delegates physical slot
     allocation to the strategy (via ``pool.strategy``) and KV bind to
     ``pool.bind_tasks()``.
 
     Usage::
 
-        pool = PagePool(...)
-        mgr = TaskCacheManager(pool)
-        mgr.task_alloc("req_1", [101, 202, 303])
+        pool = BlockPool(...)
+        mgr = KVCacheManager(pool)
+        mgr.alloc_slots("req_1", [101, 202, 303])
         ...
         kv = mgr.bind(["req_1"], workspace)
     """
 
-    def __init__(self, pool: PagePool):
+    def __init__(self, pool: BlockPool):
         self._pool = pool
         self._strategy = pool.strategy
         self._req_pool = pool.req_pool
         self._max_seq_len = pool.max_seq_len
-        self._states: Dict[str, TaskCacheState] = {}
+        self._states: Dict[str, RequestCacheState] = {}
         self._bind_state: Optional[_BindState] = None
         self._bind_was_steady = False
 
-    # -- public task lifecycle --
+    # -- public request lifecycle --
 
-    def task_alloc(self, task_id: str, prompt_ids: List[int]) -> bool:
+    def alloc_slots(self, request_id: str, prompt_ids: List[int]) -> bool:
         self._bind_state = None
         req_slots = self._req_pool.alloc(1)
         if req_slots is None:
             return False
-        state = TaskCacheState(req_idx=req_slots[0])
-        self._states[task_id] = state
+        state = RequestCacheState(req_idx=req_slots[0])
+        self._states[request_id] = state
         if not self._strategy.alloc(state, prompt_ids):
-            self._rollback(state, task_id)
+            self._rollback(state, request_id)
             return False
         self._strategy.write_indices(state, prompt_ids)
         state.length = len(prompt_ids)
         return True
 
-    def task_free(self, task_id: str):
+    def free_slots(self, request_id: str):
         self._bind_state = None
-        state = self._states.pop(task_id, None)
+        state = self._states.pop(request_id, None)
         if state is None:
             return
         self._strategy.free(state)
         self._req_pool.free([state.req_idx])
 
-    def task_extend(self, task_id: str, pos: int) -> bool:
-        state = self._states.get(task_id)
+    def extend_slots(self, request_id: str, pos: int) -> bool:
+        state = self._states.get(request_id)
         if state is None or pos >= self._max_seq_len:
             return False
         if not self._strategy.extend(state, pos):
@@ -328,23 +328,23 @@ class TaskCacheManager:
         state.length = pos + 1
         return True
 
-    def task_extend_batch(
-        self, task_ids: List[str], positions: List[int]
+    def extend_slots_batch(
+        self, request_ids: List[str], positions: List[int]
     ) -> List[bool]:
-        """``task_extend`` for a whole decode step, one strategy call.
+        """``extend_slots`` for a whole decode step, one strategy call.
 
-        The decode-steady hot path extends every active task by exactly
+        The decode-steady hot path extends every active request by exactly
         one position; a single batched strategy call replaces one
-        allocation round-trip per task (see
-        ``PagedStrategy.extend_batch``).  Per-task semantics are
+        allocation round-trip per request (see
+        ``PagedStrategy.extend_batch``).  Per-request semantics are
         unchanged: a missing state or an out-of-cap position fails that
-        task alone.
+        request alone.
         """
-        results = [False] * len(task_ids)
+        results = [False] * len(request_ids)
         live_idx: List[int] = []
-        live_states: List[TaskCacheState] = []
+        live_states: List[RequestCacheState] = []
         live_pos: List[int] = []
-        for i, tid in enumerate(task_ids):
+        for i, tid in enumerate(request_ids):
             state = self._states.get(tid)
             if state is not None and positions[i] < self._max_seq_len:
                 live_idx.append(i)
@@ -360,44 +360,46 @@ class TaskCacheManager:
         return results
 
     @property
-    def task_count(self) -> int:
-        """Number of tasks currently holding KV request state."""
+    def request_count(self) -> int:
+        """Number of requests currently holding KV request state."""
         return len(self._states)
 
-    def task_cached(self, task_id: str) -> int:
-        state = self._states.get(task_id)
+    def cached_tokens(self, request_id: str) -> int:
+        state = self._states.get(request_id)
         return state.cached if state is not None else 0
 
-    def task_record_hashes(
-        self, task_id: str, prompt_ids: List[int], start_logical_page: int = 0
+    def record_block_hashes(
+        self, request_id: str, prompt_ids: List[int], start_logical_page: int = 0
     ):
-        state = self._states.get(task_id)
+        state = self._states.get(request_id)
         if state is not None:
             self._strategy.record_hashes(state, prompt_ids, start_logical_page)
 
     def invalidate_cache(self) -> int:
-        """Drop reusable KV entries once all task-owned entries are released."""
+        """Drop reusable KV entries once all request-owned entries are released."""
         if self._states:
-            raise RuntimeError("Cannot invalidate KV cache while tasks are active")
+            raise RuntimeError("Cannot invalidate KV cache while requests are active")
         self._bind_state = None
         self._bind_was_steady = False
         return self._strategy.invalidate_cache()
 
     @staticmethod
-    def task_cacheable_ids(task_id: str, prompt_ids: List[int], output_ids: List[int]):
+    def request_cacheable_ids(
+        request_id: str, prompt_ids: List[int], output_ids: List[int]
+    ):
         return list(prompt_ids) + list(output_ids[:-1])
 
     # -- bind (assemble KVCache for the model forward) --
 
     def bind(
         self,
-        task_ids: List[str],
+        request_ids: List[str],
         workspace: InferenceWorkspace,
         device: Optional[torch.device] = None,
         start_pos: Optional[int] = None,
     ) -> KVCache:
-        """Build ``KVCache`` for an ordered list of task IDs."""
-        states = [self._states[tid] for tid in task_ids]
+        """Build ``KVCache`` for an ordered list of request IDs."""
+        states = [self._states[tid] for tid in request_ids]
         req_indices = [s.req_idx for s in states]
         seq_lens = [s.length for s in states]
         sig = tuple(req_indices)
@@ -427,12 +429,12 @@ class TaskCacheManager:
 
     @property
     def bind_was_steady(self) -> bool:
-        """True if the last bind was a steady-state increment (same tasks, +1 seq_lens)."""
+        """True if the last bind was a steady-state increment (same requests, +1 seq_lens)."""
         return self._bind_was_steady
 
     # -- internals --
 
-    def _rollback(self, state: TaskCacheState, task_id: str):
+    def _rollback(self, state: RequestCacheState, request_id: str):
         self._strategy.free(state)
         self._req_pool.free([state.req_idx])
-        self._states.pop(task_id, None)
+        self._states.pop(request_id, None)

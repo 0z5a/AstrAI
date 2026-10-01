@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from astrai.inference import build_engine, get_app
+from astrai.inference.frontend.engine import _StreamChunk
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.serialization import save_model
 from tests.helpers import CHAT_TEMPLATE, build_test_tokenizer, make_tiny_config
@@ -33,11 +34,16 @@ def test_health_with_model(client, loaded_model):
 def test_chat_completions_non_stream(client, loaded_model):
     """POST /v1/chat/completions with stream=false returns OpenAI-style JSON."""
 
-    async def async_gen():
-        yield "Assistant reply"
+    async def events_gen():
+        yield _StreamChunk(
+            text="Assistant reply",
+            delta_token_ids=[1],
+            current_token_ids=[1],
+            stopped=False,
+        )
 
     get_app().state.engine = loaded_model
-    loaded_model.generate_async.return_value = async_gen()
+    loaded_model.generate_events.return_value = events_gen()
     response = client.post(
         "/v1/chat/completions",
         json={
@@ -58,12 +64,22 @@ def test_chat_completions_non_stream(client, loaded_model):
 def test_chat_completions_stream(client, loaded_model):
     """POST /v1/chat/completions with stream=true returns SSE stream."""
 
-    async def async_gen():
-        yield "cumulative1"
-        yield "cumulative2"
+    async def events_gen():
+        yield _StreamChunk(
+            text="cumulative1",
+            delta_token_ids=[1],
+            current_token_ids=[1],
+            stopped=False,
+        )
+        yield _StreamChunk(
+            text="cumulative2",
+            delta_token_ids=[1],
+            current_token_ids=[1],
+            stopped=False,
+        )
 
     get_app().state.engine = loaded_model
-    loaded_model.generate_async.return_value = async_gen()
+    loaded_model.generate_events.return_value = events_gen()
     response = client.post(
         "/v1/chat/completions",
         json={
@@ -86,11 +102,16 @@ def test_chat_completions_stream(client, loaded_model):
 def test_messages_non_stream(client, loaded_model):
     """POST /v1/messages with stream=false returns Anthropic-style JSON."""
 
-    async def async_gen():
-        yield "Assistant reply"
+    async def events_gen():
+        yield _StreamChunk(
+            text="Assistant reply",
+            delta_token_ids=[1],
+            current_token_ids=[1],
+            stopped=False,
+        )
 
     get_app().state.engine = loaded_model
-    loaded_model.generate_async.return_value = async_gen()
+    loaded_model.generate_events.return_value = events_gen()
     response = client.post(
         "/v1/messages",
         json={
@@ -113,12 +134,22 @@ def test_messages_non_stream(client, loaded_model):
 def test_messages_stream(client, loaded_model):
     """POST /v1/messages with stream=true returns Anthropic SSE stream."""
 
-    async def async_gen():
-        yield "cumulative1"
-        yield "cumulative2"
+    async def events_gen():
+        yield _StreamChunk(
+            text="cumulative1",
+            delta_token_ids=[1],
+            current_token_ids=[1],
+            stopped=False,
+        )
+        yield _StreamChunk(
+            text="cumulative2",
+            delta_token_ids=[1],
+            current_token_ids=[1],
+            stopped=False,
+        )
 
     get_app().state.engine = loaded_model
-    loaded_model.generate_async.return_value = async_gen()
+    loaded_model.generate_events.return_value = events_gen()
     response = client.post(
         "/v1/messages",
         json={
@@ -144,11 +175,13 @@ def test_messages_stream(client, loaded_model):
 def test_messages_with_system(client, loaded_model):
     """POST /v1/messages with system prompt."""
 
-    async def async_gen():
-        yield "Reply"
+    async def events_gen():
+        yield _StreamChunk(
+            text="Reply", delta_token_ids=[1], current_token_ids=[1], stopped=False
+        )
 
     get_app().state.engine = loaded_model
-    loaded_model.generate_async.return_value = async_gen()
+    loaded_model.generate_events.return_value = events_gen()
     response = client.post(
         "/v1/messages",
         json={
@@ -167,16 +200,19 @@ def test_chat_completions_stop_sequence(client, loaded_model):
     """POST /v1/chat/completions with stop parameter truncates at stop sequence."""
     closed = []
 
-    async def async_gen():
+    async def events_gen():
         try:
-            yield "Hello"
-            yield "X"
-            yield "world"
+            yield _StreamChunk(
+                text="Hello", delta_token_ids=[1], current_token_ids=[1], stopped=False
+            )
+            yield _StreamChunk(
+                text="X", delta_token_ids=[1], current_token_ids=[1], stopped=True
+            )
         finally:
             closed.append(True)
 
     get_app().state.engine = loaded_model
-    loaded_model.generate_async.return_value = async_gen()
+    loaded_model.generate_events.return_value = events_gen()
     response = client.post(
         "/v1/chat/completions",
         json={
@@ -198,16 +234,19 @@ def test_chat_completions_stop_sequence_stream(client, loaded_model):
     """POST /v1/chat/completions with stop parameter truncates SSE stream."""
     closed = []
 
-    async def async_gen():
+    async def events_gen():
         try:
-            yield "Hello"
-            yield "X"
-            yield "world"
+            yield _StreamChunk(
+                text="Hello", delta_token_ids=[1], current_token_ids=[1], stopped=False
+            )
+            yield _StreamChunk(
+                text="X", delta_token_ids=[1], current_token_ids=[1], stopped=True
+            )
         finally:
             closed.append(True)
 
     get_app().state.engine = loaded_model
-    loaded_model.generate_async.return_value = async_gen()
+    loaded_model.generate_events.return_value = events_gen()
     response = client.post(
         "/v1/chat/completions",
         json={
