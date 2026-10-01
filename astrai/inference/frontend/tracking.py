@@ -7,14 +7,9 @@ chunk type carries structured output to protocol adapters.
 
 import threading
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 from astrai.inference.core.events import (
-    FINISH_ABORTED,
-    FINISH_CANCELLED,
-    FINISH_LENGTH,
-    FINISH_REJECTED,
-    FINISH_STOP_TOKEN,
     RequestError,
     RequestFinished,
 )
@@ -28,16 +23,28 @@ class EventQueueSink(OutputEventSink):
     protocol formatting, user callbacks) runs wherever the queue is
     drained.  The bound is per request, not global: a slow consumer
     applies backpressure to its own requests only.
+
+    When a terminal event (:class:`RequestFinished` / :class:`RequestError`)
+    is queued, ``on_terminal`` fires for that request — the core's event
+    contract guarantees exactly one terminal event, queued after all of the
+    request's tokens, so the flag doubles as a completion signal for
+    consumers that only want the final result.
     """
 
-    def __init__(self, maxlen: int = 4096):
+    def __init__(
+        self,
+        maxlen: int = 4096,
+        on_terminal: Optional[Callable[[str], None]] = None,
+    ):
         self._lock = threading.Lock()
         self._queues: Dict[str, Deque[Any]] = {}
         self._maxlen = maxlen
+        self._on_terminal = on_terminal
 
-    def register(self, request_id: str) -> None:
+    def register(self, request_id: str, maxlen: Optional[int] = None) -> None:
         with self._lock:
-            self._queues[request_id] = deque(maxlen=self._maxlen)
+            bound = self._maxlen if maxlen is None else maxlen
+            self._queues[request_id] = deque(maxlen=bound)
 
     def unregister(self, request_id: str) -> None:
         with self._lock:
@@ -45,12 +52,20 @@ class EventQueueSink(OutputEventSink):
 
     def __call__(self, events: List[Any]) -> None:
         # Fast path: bucket events per request under one lock, then notify.
+        terminal: List[str] = []
         with self._lock:
             for event in events:
                 rid = event.request_id
                 queue = self._queues.get(rid)
                 if queue is not None:
                     queue.append(event)
+                    if isinstance(event, (RequestFinished, RequestError)):
+                        terminal.append(rid)
+        # Signalled outside the lock, after the terminal event is queued:
+        # a woken consumer always finds it in the drain.
+        if self._on_terminal is not None:
+            for rid in terminal:
+                self._on_terminal(rid)
 
 
 class RequestTracker:
@@ -63,7 +78,10 @@ class RequestTracker:
     """
 
     def __init__(self):
-        self._sink = EventQueueSink()
+        # Terminal events flip the finished flag as they are queued (sink
+        # callback), so ``wait`` / ``is_finished`` are true the moment the
+        # scheduler has finished a request — independent of any consumer.
+        self._sink = EventQueueSink(on_terminal=self.mark_finished)
         self._finished: Dict[str, threading.Event] = {}
         self._lock = threading.Lock()
 
@@ -71,8 +89,10 @@ class RequestTracker:
     def sink(self) -> EventQueueSink:
         return self._sink
 
-    def register(self, request_id: str) -> threading.Event:
-        self._sink.register(request_id)
+    def register(
+        self, request_id: str, maxlen: Optional[int] = None
+    ) -> threading.Event:
+        self._sink.register(request_id, maxlen=maxlen)
         with self._lock:
             done = self._finished[request_id] = threading.Event()
         return done

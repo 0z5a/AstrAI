@@ -11,12 +11,11 @@ import asyncio
 import gc
 import logging
 import threading
-from collections import deque
+import time
 from pathlib import Path
 from typing import (
     Any,
     AsyncGenerator,
-    Deque,
     Dict,
     Generator,
     List,
@@ -32,7 +31,6 @@ from astrai.extension import ATTN_BACKEND, AttentionBackend, get_backend
 from astrai.inference.core.cache.pool import BlockPool
 from astrai.inference.core.events import (
     RequestError,
-    RequestFinished,
     TokenDelta,
 )
 from astrai.inference.core.request import STOP
@@ -50,12 +48,18 @@ from astrai.tokenize import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
+# Whole-batch budget of a blocking generate() — matches the previous
+# GenerateResult.wait_completion default.
+_GENERATE_TIMEOUT_S = 300.0
+
 
 class GenerateResult:
-    """Thread-safe token accumulator for streaming and non-streaming modes.
+    """Thread-safe token accumulator for incremental consumers.
 
-    Kept as the public return contract of the synchronous ``generate``:
-    consumers see the same ``(idx, token)`` / ``STOP`` protocol as before.
+    Blocking ``generate`` no longer routes through it (it folds
+    completion-driven on the caller's thread), but the class stays public:
+    its ``(idx, token)`` / ``STOP`` protocol is what streaming adapters and
+    custom consumers build on.
     """
 
     def __init__(self, count: int = 1):
@@ -146,6 +150,7 @@ class InferenceEngine:
         if resolved_len is None:
             cfg_len = getattr(model.config, "max_position_embeddings", None)
             resolved_len = cfg_len if cfg_len is not None else 4096
+        self._max_seq_len = int(resolved_len)
         self._input_processor = InputProcessor(tokenizer, int(resolved_len))
 
         self.scheduler.start()
@@ -449,6 +454,55 @@ class InferenceEngine:
 
         return _agen()
 
+    def _collect_blocking(
+        self, request_ids: List[str], is_batch: bool
+    ) -> Union[str, List[str]]:
+        """Non-streaming tail of ``generate``: wait for every request's
+        terminal event, then fold all output at once on the caller's thread.
+
+        The core's event contract ends every request with exactly one
+        terminal event, queued after all of its tokens, and the sink flags
+        the tracker as it queues that event.  The caller therefore parks on
+        ``Event.wait`` — no thread wakes per scheduler step, no GIL relay
+        with the decode loop — and detokenization runs once, after the
+        batch has finished, where the non-streaming consumer wants it.
+        """
+        deadline = time.monotonic() + _GENERATE_TIMEOUT_S
+        for rid in request_ids:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self._tracker.wait(rid, timeout=remaining):
+                completed = sum(1 for r in request_ids if self._tracker.is_finished(r))
+                for r in request_ids:
+                    self._core.abort_request(r)
+                for r in request_ids:
+                    self._tracker.unregister(r)
+                raise TimeoutError(
+                    f"Generation timeout after {_GENERATE_TIMEOUT_S}s "
+                    f"({completed}/{len(request_ids)} completed)"
+                )
+
+        results = [""] * len(request_ids)
+        for idx, rid in enumerate(request_ids):
+            proc = OutputProcessor(rid, self.tokenizer)
+            try:
+                for event in self._tracker.drain(rid):
+                    if isinstance(event, RequestError):
+                        logger.error(
+                            "request %s failed (%s): %s",
+                            rid,
+                            event.error_code,
+                            event.message,
+                        )
+                        break
+                    proc.push(event)
+            except Exception:
+                # The request already finished; keep its partial text
+                # rather than losing the whole batch to one bad fold.
+                logger.exception("output fold failed for %s", rid)
+            results[idx] = proc.state.text
+            self._tracker.unregister(rid)
+        return results if is_batch else results[0]
+
     def _generate(
         self,
         prompts: List[str],
@@ -462,14 +516,15 @@ class InferenceEngine:
         rep_window: int,
     ) -> Union[Generator, str, List[str]]:
         n = len(prompts)
-        result = GenerateResult(count=n)
         # One batched tokenize on the caller's thread, ids minted up front;
         # the scheduler receives the same ids so events can never precede
-        # their consumer.
+        # their consumer.  Queues are sized for the longest possible
+        # generation: the non-streaming fold runs once, at completion, so
+        # each request's events accumulate until then.
         processed = self._input_processor.process_batch(prompts)
         request_ids = [item.request_id for item in processed]
         for rid in request_ids:
-            self._tracker.register(rid)
+            self._tracker.register(rid, maxlen=self._max_seq_len + 1)
         self._core.send_requests(
             prompts=prompts,
             max_tokens=max_tokens,
@@ -483,63 +538,8 @@ class InferenceEngine:
             backend=get_backend(use_default=False),
         )
 
-        # A single fold thread per generate() call drains the queues and
-        # pushes text/STOP into GenerateResult — consumer callbacks stay
-        # off the scheduler loop thread entirely.
-        def _fold():
-            pending = set(request_ids)
-            idx_of = {rid: i for i, rid in enumerate(request_ids)}
-            processors = {
-                rid: OutputProcessor(rid, self.tokenizer) for rid in request_ids
-            }
-            try:
-                while pending:
-                    progressed = False
-                    for rid in list(pending):
-                        try:
-                            for event in self._tracker.drain(rid):
-                                progressed = True
-                                proc = processors[rid]
-                                text, _ = proc.push(event)
-                                if text:
-                                    result.append_batch([(idx_of[rid], text)])
-                                if proc.finished:
-                                    result.append_batch([(idx_of[rid], STOP)])
-                                    self._tracker.mark_finished(rid)
-                                    pending.discard(rid)
-                                    break
-                        except Exception:
-                            # A per-request fold failure must not hang the
-                            # caller: terminate that request's result slot.
-                            logger.exception("output fold failed for %s", rid)
-                            result.append_batch([(idx_of[rid], STOP)])
-                            self._tracker.mark_finished(rid)
-                            pending.discard(rid)
-                    if not pending:
-                        break
-                    if not progressed and not self._tracker.wait(
-                        next(iter(pending)), timeout=0.05
-                    ):
-                        continue
-            finally:
-                # Whatever happened above, no slot may be left unfilled.
-                for rid in pending:
-                    result.append_batch([(idx_of[rid], STOP)])
-                    self._tracker.mark_finished(rid)
-                for rid in request_ids:
-                    self._tracker.unregister(rid)
-
         if not stream:
-            try:
-                fold = threading.Thread(target=_fold, daemon=True)
-                fold.start()
-                result.wait_completion()
-            except TimeoutError:
-                for rid in request_ids:
-                    self._core.abort_request(rid)
-                raise
-            res = result.get_results()
-            return res if is_batch else res[0]
+            return self._collect_blocking(request_ids, is_batch)
 
         remaining = n
 
@@ -565,7 +565,6 @@ class InferenceEngine:
                             if proc.finished:
                                 finished[idx_of[rid]] = True
                                 remaining -= 1
-                                self._tracker.mark_finished(rid)
                                 break
                     if remaining > 0 and not progressed:
                         self._tracker.wait(request_ids[0], timeout=0.05)

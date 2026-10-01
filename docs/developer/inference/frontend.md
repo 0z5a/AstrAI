@@ -64,12 +64,13 @@ classDiagram
     }
     class RequestTracker {
         +EventQueueSink sink
-        +register(request_id) Event
+        +register(request_id, maxlen) Event
         +drain(request_id) List
         +wait(request_id, timeout) bool
-        +mark_finished(request_id)
+        +is_finished(request_id) bool
     }
     class GenerateResult {
+        public accumulator for streaming adapters
         +tokens / results
         +append_batch(items)
         +wait_completion(timeout)
@@ -92,7 +93,6 @@ classDiagram
     InferenceEngine --> InputProcessor : uses
     InferenceEngine --> OutputProcessor : folds events
     InferenceEngine *-- RequestTracker
-    InferenceEngine --> GenerateResult : sync aggregation
     InputProcessor ..> ProcessedInput : produces
     OutputProcessor *-- StopSequenceChecker
     RequestTracker ..> OutputEvent : consumes
@@ -120,11 +120,28 @@ classDiagram
 - **`RequestTracker`** holds bounded per-request event queues fed by the
   scheduler loop thread. The loop thread only appends; all consumer work
   (detokenize, protocol formatting, user callbacks) runs where the queue
-  is drained.
+  is drained. The sink flags the request's finished ``Event`` the moment
+  it queues the terminal event — completion is observable without a
+  consumer folding the stream.
+
+## Blocking generate is completion-driven
+
+Non-streaming `generate` runs **no helper thread**. It submits, parks the
+caller on the per-request finished events, and when every request has
+terminated folds all events at once on the caller's thread
+(`_collect_blocking`). Per-step fold wake-ups were a measured host
+overhead: each wake is a GIL handoff with the scheduler loop at exactly
+the worst time (between commit and the next submit). Folding once, after
+the batch is done, moves the same work off the decode loop entirely; the
+event queues for blocking generate are sized to `max_seq_len + 1` so
+accumulating until completion never drops tokens. Streaming entry points
+keep incremental folding — their consumers want text as it is produced.
 
 ## Error containment
 
-The `_generate` fold thread is fault-tolerant: a per-request fold
-failure terminates that request's result slot with `STOP` instead of
-hanging `wait_completion` forever. The scheduler's `_emit_events` catches
-sink exceptions — consumer failures never reach the engine loop.
+The completion-driven fold is fault-tolerant: a per-request fold failure
+keeps that request's partial text instead of losing the whole batch, and
+a `RequestError` terminal event is logged and reported through the same
+partial-text path rather than hanging the caller. The scheduler's
+`_emit_events` catches sink exceptions — consumer failures never reach
+the engine loop.

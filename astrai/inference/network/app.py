@@ -88,6 +88,12 @@ class MessagesRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = app.state.server_config
+    # Serving rides overlapped commits by default: the depth-2 pipeline
+    # hides the commit-window host work behind the next forward (measured
+    # -2.1ms/step at B=128, see notes/decode-host-overhead-attribution).
+    # Callers that depend on synchronous finish semantics opt out with an
+    # explicit enable_overlap=False in the server config.
+    config.setdefault("enable_overlap", True)
     if not config.get("_test", False):
         try:
             app.state.engine = build_engine(**config)

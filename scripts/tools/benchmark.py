@@ -228,6 +228,7 @@ class GenerationBenchmark:
         prompt_length: int = 512,
         gen_length: int = 128,
         num_trials: int = 5,
+        overlap: bool = False,
     ) -> BenchmarkResult:
         if self.tokenizer is None:
             raise ValueError("Engine decode benchmark requires a tokenizer")
@@ -250,6 +251,7 @@ class GenerationBenchmark:
             cache=pool,
             enable_cuda_graph=self.cuda_graph,
             backend=self.backend,
+            enable_overlap=overlap,
         )
         prompts = [prompt] * batch_size
 
@@ -260,6 +262,18 @@ class GenerationBenchmark:
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
 
+            # Prefill probe: every timed trial regenerates the batch, so
+            # the raw wall time amortizes one B×prompt_len prefill per
+            # trial.  Time one max_tokens=1 generation — one prefill plus
+            # a single decode step plus retirement, i.e. a slight
+            # overcount of the prefill share — and report the per-step
+            # decode cost with and without it.
+            t_probe = time.perf_counter()
+            engine.generate(prompts, max_tokens=1, temperature=0.0)
+            if self.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            prefill_ms = (time.perf_counter() - t_probe) * 1000
+
             t0 = time.perf_counter()
             for _ in range(num_trials):
                 engine.generate(prompts, max_tokens=gen_length, temperature=0.0)
@@ -269,17 +283,23 @@ class GenerationBenchmark:
         finally:
             engine.shutdown()
 
+        steps = gen_length * num_trials
+        decode_ms_total = max(elapsed * 1000 - num_trials * prefill_ms, 0.0)
         tokens = batch_size * gen_length * num_trials
         return BenchmarkResult(
             name="decode",
             batch_size=batch_size,
             seq_len=gen_length,
             tokens_per_second=tokens / elapsed,
-            latency_ms=elapsed / (gen_length * num_trials) * 1000,
+            latency_ms=elapsed / steps * 1000,
             metadata={
                 "benchmark_type": "engine_decode",
                 "num_trials": num_trials,
                 "prompt_length": prompt_tokens,
+                "kv_len_range": [prompt_tokens, prompt_tokens + gen_length],
+                "decode_ms_per_step_excl_prefill": decode_ms_total / steps,
+                "prefill_ms_per_trial": prefill_ms,
+                "overlap": overlap,
                 "backend": engine.backend_name,
                 "cuda_graph": engine.cuda_graph_enabled,
             },
@@ -437,6 +457,11 @@ def print_benchmark_result(result: BenchmarkResult) -> None:
     help="Enable or disable CUDA graph capture for engine decode.",
 )
 @click.option(
+    "--overlap/--no-overlap",
+    default=False,
+    help="Enable the overlapped-commit pipeline for the engine decode benchmark.",
+)
+@click.option(
     "--ckpt",
     required=False,
     default=None,
@@ -466,6 +491,7 @@ def benchmark_command(
     prefill_only: bool,
     decode_only: bool,
     cuda_graph: bool,
+    overlap: bool,
     ckpt: Optional[str],
     config_path: Optional[Path],
 ) -> None:
@@ -532,6 +558,7 @@ def benchmark_command(
                 prompt_length=prompt_length,
                 gen_length=gen_length,
                 num_trials=num_trials,
+                overlap=overlap,
             )
             print_benchmark_result(result)
 
