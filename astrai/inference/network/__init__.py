@@ -14,7 +14,7 @@ from astrai.inference.network.app import (
     get_app,
     run_server,
 )
-from astrai.inference.network.protocol import GenContext, ProtocolHandler, StopChecker
+from astrai.inference.network.protocol import GenContext, ProtocolHandler
 from astrai.inference.network.tool_parser import (
     BaseToolParser,
     SimpleJsonToolParser,
@@ -31,7 +31,6 @@ __all__ = [
     "MessagesRequest",
     "ProtocolHandler",
     "SimpleJsonToolParser",
-    "StopChecker",
     "ToolDef",
     "ToolParserFactory",
     "get_app",

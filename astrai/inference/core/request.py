@@ -377,19 +377,6 @@ class RequestManager:
                 callback(STOP)
         return immediate, cancelled
 
-    def remove_request(self, request_id: str) -> List[Request]:
-        """Backward-compatible alias for cancellation."""
-        immediate, _ = self.cancel_request(request_id)
-        return immediate
-
-    def invoke_callback(self, request_id: str, token: Any):
-        with self._lock:
-            cb = self._callbacks.get(request_id)
-        if isinstance(cb, BatchedStreamCallback):
-            cb([(request_id, token)])
-        elif cb:
-            cb(token)
-
     def invoke_callbacks(self, events: List[Tuple[str, Any]]) -> None:
         """Dispatch one decode step's ``(request_id, token)`` events.
 

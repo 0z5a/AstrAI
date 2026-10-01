@@ -80,9 +80,9 @@ def test_request_tracker_events_only_reach_registered_requests():
         RequestFinished,
         TokenDelta,
     )
-    from astrai.inference.frontend.engine import _RequestTracker
+    from astrai.inference.frontend.tracking import RequestTracker
 
-    tracker = _RequestTracker()
+    tracker = RequestTracker()
     done = tracker.register("t0")
     tracker.sink([TokenDelta("t0", 11, 1), TokenDelta("t0", 12, 2)])
     events = tracker.drain("t0")

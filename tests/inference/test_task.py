@@ -84,10 +84,10 @@ def test_task_manager_long_prompt_truncated_not_stopped():
     assert len(tm.waiting[0].prompt_ids) == 16
 
 
-def test_task_manager_remove_task():
+def test_task_manager_remove_request():
     tm = RequestManager(tokenizer=_make_mock_tokenizer())
     tid = tm.add_request("test")
-    tm.remove_request(tid)
+    tm.cancel_request(tid)
     assert len(tm.waiting) == 0
 
 
@@ -257,12 +257,12 @@ def test_invoke_callbacks_batches_sink_events_and_keeps_plain_per_token():
     assert sink.batches == [[(tid_a, "x"), (tid_b, "y"), (tid_a, STOP)]]
 
 
-def test_invoke_callback_delivers_single_event_to_batched_sink():
+def test_invoke_callbacks_delivers_single_event_to_batched_sink():
     tm = RequestManager(tokenizer=_make_mock_tokenizer())
     sink = RecordingSink()
     request_id = tm.add_request("test", stream_callback=sink)
 
-    tm.invoke_callback(request_id, STOP)
+    tm.invoke_callbacks([(request_id, STOP)])
 
     assert sink.batches == [[(request_id, STOP)]]
 

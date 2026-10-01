@@ -268,14 +268,13 @@ class Allocator:
 class RadixNode:
     """A page-aligned edge in the CPU-side prefix radix trie."""
 
-    __slots__ = ("parent", "children", "page_idx", "tokens", "lock_ref")
+    __slots__ = ("parent", "children", "page_idx", "tokens")
 
     def __init__(self, parent=None, tokens=(), page_idx=None):
         self.parent = parent
         self.children: Dict[tuple, "RadixNode"] = {}
         self.page_idx = page_idx
         self.tokens = tuple(tokens)
-        self.lock_ref = 0
 
 
 class RadixCache:
@@ -339,13 +338,6 @@ class RadixCache:
                 self._page_to_node.pop(replaced, None)
             node.page_idx = page_idx
             self._page_to_node[page_idx] = node
-
-    def release(self, pages: List[int]) -> None:
-        with self._lock:
-            for page_idx in pages:
-                node = self._page_to_node.get(page_idx)
-                if node is not None and node.lock_ref:
-                    node.lock_ref -= 1
 
 
 class AllocationStrategy(ABC):

@@ -1,11 +1,12 @@
-"""Unit tests for protocol builders, StopChecker, GenContext, StopInfo."""
+"""Unit tests for protocol builders, GenContext, StopInfo."""
 
 import json
 from unittest.mock import MagicMock
 
+from astrai.inference.frontend.output_processor import StopSequenceChecker
 from astrai.inference.network.anthropic import AnthropicResponseBuilder
 from astrai.inference.network.openai import OpenAIResponseBuilder
-from astrai.inference.network.protocol import GenContext, StopChecker, StopInfo
+from astrai.inference.network.protocol import GenContext, StopInfo
 
 
 def _make_ctx(**kwargs):
@@ -56,19 +57,22 @@ def _make_anthropic_builder():
     return builder
 
 
-def test_check_finds_match():
-    sc = StopChecker(["stop", "end"])
-    assert sc.check("hello stop world") == "stop"
+def test_stop_sequence_checker_finds_match():
+    sc = StopSequenceChecker(["stop", "end"])
+    text, stopped = sc.push("hello stop world")
+    assert stopped and sc.matched == "stop"
 
 
-def test_check_returns_none_when_no_match():
-    sc = StopChecker(["stop"])
-    assert sc.check("hello world") is None
+def test_stop_sequence_checker_buffers_ambiguous_tail():
+    sc = StopSequenceChecker(["stop"])
+    text, stopped = sc.push("hello sto")
+    assert not stopped and text == "hello "  # tail kept for straddle matching
 
 
-def test_check_empty_sequences():
-    sc = StopChecker([])
-    assert sc.check("hello") is None
+def test_stop_sequence_checker_empty_sequences():
+    sc = StopSequenceChecker([])
+    text, stopped = sc.push("hello")
+    assert not stopped and text == "hello"
 
 
 def test_openai_prepare_returns_prompt_ctx_stops():

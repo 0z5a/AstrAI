@@ -287,7 +287,7 @@ def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
         try:
             add_ready.wait(timeout=5.0)
             for request_id in results["added"][:10]:
-                scheduler.remove_request(request_id)
+                scheduler.cancel_request(request_id)
                 results["removed"].append(request_id)
         except Exception as e:
             results["errors"].append(f"Remove: {str(e)}")
@@ -694,7 +694,7 @@ def test_scheduler_rejects_weight_update_with_queued_tasks(device):
     try:
         with pytest.raises(RuntimeError, match="while requests are queued"):
             scheduler.update_weights(1)
-        scheduler.remove_request(request_id)
+        scheduler.cancel_request(request_id)
         assert scheduler.update_weights(1) == 1
     finally:
         scheduler.stop()

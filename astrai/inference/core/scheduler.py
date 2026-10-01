@@ -248,6 +248,16 @@ class Scheduler:
         """Version of the model weights used for subsequent generations."""
         return self._policy_guard.policy_version
 
+    @property
+    def max_batch_size(self) -> int:
+        """Executor batch capacity (fixed-shape buffer bound)."""
+        return self._requests.max_batch_size
+
+    @property
+    def model(self) -> AutoModel:
+        """The shared model object (train-serve colocated weights)."""
+        return self._executor.model
+
     def _ensure_weight_update_ready(self) -> None:
         """Check weight update preconditions. Must be called under the lock."""
         if self._loop_thread is not None and self._loop_thread.is_alive():

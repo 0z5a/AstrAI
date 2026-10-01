@@ -35,104 +35,20 @@ from astrai.inference.core.events import (
     RequestFinished,
     TokenDelta,
 )
-from astrai.inference.core.scheduler import OutputEventSink, Scheduler
+from astrai.inference.core.request import STOP
+from astrai.inference.core.scheduler import Scheduler
 from astrai.inference.frontend.core_client import EngineCoreClient, InprocClient
 from astrai.inference.frontend.input_processor import InputProcessor
 from astrai.inference.frontend.output_processor import OutputProcessor
+from astrai.inference.frontend.tracking import (
+    RequestTracker,
+    StreamChunk,
+    map_finish_reason,
+)
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 
 logger = logging.getLogger(__name__)
-
-
-class _EventQueueSink(OutputEventSink):
-    """Bounded per-request event queues, fed by the scheduler loop thread.
-
-    The loop thread only appends and notifies — consumer code (detokenize,
-    protocol formatting, user callbacks) runs wherever the queue is
-    drained.  The bound is per request, not global: a slow consumer
-    applies backpressure to its own requests only.
-    """
-
-    def __init__(self, maxlen: int = 4096):
-        self._lock = threading.Lock()
-        self._queues: Dict[str, Deque[Any]] = {}
-        self._maxlen = maxlen
-
-    def register(self, request_id: str) -> None:
-        with self._lock:
-            self._queues[request_id] = deque(maxlen=self._maxlen)
-
-    def unregister(self, request_id: str) -> None:
-        with self._lock:
-            self._queues.pop(request_id, None)
-
-    def __call__(self, events: List[Any]) -> None:
-        # Fast path: bucket events per request under one lock, then notify.
-        with self._lock:
-            for event in events:
-                rid = event.request_id
-                queue = self._queues.get(rid)
-                if queue is not None:
-                    queue.append(event)
-
-
-class _RequestTracker:
-    """Frontend bookkeeping: request_id -> queue + lifecycle flag.
-
-    Mirrors vLLM's ``RequestTracker``: the engine mints the id, registers
-    the queue BEFORE the request reaches the scheduler, and therefore no
-    event can ever precede its consumer (the old ``_ResultSink`` replay
-    buffer existed only because ids were minted in the core).
-    """
-
-    def __init__(self):
-        self._sink = _EventQueueSink()
-        self._finished: Dict[str, threading.Event] = {}
-        self._lock = threading.Lock()
-
-    @property
-    def sink(self) -> _EventQueueSink:
-        return self._sink
-
-    def register(self, request_id: str) -> threading.Event:
-        self._sink.register(request_id)
-        with self._lock:
-            done = self._finished[request_id] = threading.Event()
-        return done
-
-    def unregister(self, request_id: str) -> None:
-        self._sink.unregister(request_id)
-        with self._lock:
-            self._finished.pop(request_id, None)
-
-    def is_finished(self, request_id: str) -> bool:
-        with self._lock:
-            done = self._finished.get(request_id)
-        return done is not None and done.is_set()
-
-    def mark_finished(self, request_id: str) -> None:
-        with self._lock:
-            done = self._finished.get(request_id)
-        if done is not None:
-            done.set()
-
-    def drain(self, request_id: str) -> List[Any]:
-        """Pop all pending events for one request (non-blocking)."""
-        with self._sink._lock:
-            queue = self._sink._queues.get(request_id)
-            if queue is None:
-                return []
-            out = list(queue)
-            queue.clear()
-        return out
-
-    def wait(self, request_id: str, timeout: Optional[float] = None) -> bool:
-        with self._lock:
-            done = self._finished.get(request_id)
-        if done is None:
-            return True
-        return done.wait(timeout=timeout)
 
 
 class GenerateResult:
@@ -155,7 +71,6 @@ class GenerateResult:
         self.append_batch([(idx, token)])
 
     def append_batch(self, items: List[Tuple[int, Any]]) -> None:
-        STOP = _STOP_SENTINEL
         if not items:
             return
         with self._cond:
@@ -195,60 +110,6 @@ class GenerateResult:
             return self.results.copy()
 
 
-# The STOP sentinel stays defined in the request module (single source);
-# GenerateResult references it lazily to avoid import cycles at module init.
-from astrai.inference.core.request import STOP as _STOP_SENTINEL  # noqa: E402
-
-
-class _StreamChunk:
-    """One structured output chunk (text + token ids + terminal facts)."""
-
-    __slots__ = (
-        "text",
-        "delta_token_ids",
-        "current_token_ids",
-        "stopped",
-        "finish_reason",
-        "prompt_tokens",
-        "completion_tokens",
-        "stop_sequence",
-    )
-
-    def __init__(
-        self,
-        text: str,
-        delta_token_ids: List[int],
-        current_token_ids: List[int],
-        stopped: bool,
-    ):
-        self.text = text
-        self.delta_token_ids = delta_token_ids
-        self.current_token_ids = current_token_ids
-        self.stopped = stopped
-        self.finish_reason: Optional[str] = None
-        self.prompt_tokens: int = 0
-        self.completion_tokens: int = 0
-        self.stop_sequence: Optional[str] = None
-
-    @property
-    def is_final(self) -> bool:
-        return self.finish_reason is not None
-
-
-def _map_finish_reason(reason: Optional[str]) -> str:
-    """Internal event reasons → protocol-neutral finish vocabulary."""
-    from astrai.inference.core import events as _events
-
-    mapping = {
-        _events.FINISH_STOP_TOKEN: "stop",
-        _events.FINISH_LENGTH: "length",
-        _events.FINISH_CANCELLED: "cancelled",
-        _events.FINISH_ABORTED: "aborted",
-        _events.FINISH_REJECTED: "rejected",
-    }
-    return mapping.get(reason or "", "stop")
-
-
 class InferenceEngine:
     """Unified inference engine backed by continuous-batching scheduler."""
 
@@ -279,7 +140,7 @@ class InferenceEngine:
         # All core access goes through the EngineCoreClient seam (T0:
         # in-process direct calls; T1 swaps in a transport client).
         self._core: EngineCoreClient = InprocClient(self.scheduler)
-        self._tracker = _RequestTracker()
+        self._tracker = RequestTracker()
         self.scheduler.set_event_sink(self._tracker.sink)
         resolved_len = max_seq_len
         if resolved_len is None:
@@ -326,31 +187,6 @@ class InferenceEngine:
         )
         return processed.request_id
 
-    def _stream_events(self, request_id: str, stop_sequences=None):
-        """Sync generator over one request's output events."""
-        tracker = self._tracker
-        processor = OutputProcessor(
-            request_id, self.tokenizer, stop_sequences=stop_sequences
-        )
-        try:
-            while True:
-                for event in tracker.drain(request_id):
-                    text, _stopped = processor.push(event)
-                    if text:
-                        yield text
-                    if processor.finished:
-                        return
-                if tracker.is_finished(request_id):
-                    # Drain once more, then exit.
-                    for event in tracker.drain(request_id):
-                        text, _ = processor.push(event)
-                        if text:
-                            yield text
-                    return
-                tracker.wait(request_id, timeout=0.05)
-        finally:
-            tracker.unregister(request_id)
-
     async def _stream_events_async(self, request_id: str, stop_sequences=None):
         """Async generator over one request's output events."""
         tracker = self._tracker
@@ -375,9 +211,6 @@ class InferenceEngine:
                 await asyncio.to_thread(tracker.wait, request_id, 0.05)
         finally:
             tracker.unregister(request_id)
-
-    def _terminal_to_stop(self, event) -> bool:
-        return isinstance(event, (RequestFinished, RequestError))
 
     # ---- public API (signatures unchanged) ----
 
@@ -488,7 +321,7 @@ class InferenceEngine:
 
         # The executor holds max_batch_size worth of fixed-shape buffers, so
         # split a long batch here rather than failing deep in the executor.
-        chunk = max(1, self.scheduler._requests.max_batch_size)
+        chunk = max(1, self.scheduler.max_batch_size)
         results: List[Any] = []
         for start in range(0, len(prompts), chunk):
             results.extend(
@@ -574,14 +407,14 @@ class InferenceEngine:
                             [event.token_id] if isinstance(event, TokenDelta) else []
                         )
                         if text or stopped or processor.finished:
-                            chunk = _StreamChunk(
+                            chunk = StreamChunk(
                                 text=text,
                                 delta_token_ids=delta_ids,
                                 current_token_ids=list(processor.state.token_ids),
                                 stopped=stopped,
                             )
                             if processor.finished:
-                                chunk.finish_reason = _map_finish_reason(
+                                chunk.finish_reason = map_finish_reason(
                                     processor.state.finish_reason
                                 )
                                 chunk.prompt_tokens = processor.state.prompt_tokens
@@ -594,13 +427,13 @@ class InferenceEngine:
                         for event in tracker.drain(request_id):
                             processor.push(event)
                         if processor.finished:
-                            chunk = _StreamChunk(
+                            chunk = StreamChunk(
                                 text="",
                                 delta_token_ids=[],
                                 current_token_ids=list(processor.state.token_ids),
                                 stopped=False,
                             )
-                            chunk.finish_reason = _map_finish_reason(
+                            chunk.finish_reason = map_finish_reason(
                                 processor.state.finish_reason
                             )
                             chunk.prompt_tokens = processor.state.prompt_tokens
@@ -671,7 +504,7 @@ class InferenceEngine:
                                 if text:
                                     result.append_batch([(idx_of[rid], text)])
                                 if proc.finished:
-                                    result.append_batch([(idx_of[rid], _STOP_SENTINEL)])
+                                    result.append_batch([(idx_of[rid], STOP)])
                                     self._tracker.mark_finished(rid)
                                     pending.discard(rid)
                                     break
@@ -679,7 +512,7 @@ class InferenceEngine:
                             # A per-request fold failure must not hang the
                             # caller: terminate that request's result slot.
                             logger.exception("output fold failed for %s", rid)
-                            result.append_batch([(idx_of[rid], _STOP_SENTINEL)])
+                            result.append_batch([(idx_of[rid], STOP)])
                             self._tracker.mark_finished(rid)
                             pending.discard(rid)
                     if not pending:
@@ -691,7 +524,7 @@ class InferenceEngine:
             finally:
                 # Whatever happened above, no slot may be left unfilled.
                 for rid in pending:
-                    result.append_batch([(idx_of[rid], _STOP_SENTINEL)])
+                    result.append_batch([(idx_of[rid], STOP)])
                     self._tracker.mark_finished(rid)
                 for rid in request_ids:
                     self._tracker.unregister(rid)

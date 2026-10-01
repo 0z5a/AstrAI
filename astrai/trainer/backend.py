@@ -92,7 +92,7 @@ class ColocatedBackend:
         return self.scheduler.policy_version
 
     def generate(self, prompt_ids_list: List[List[int]], **kwargs):
-        model = self.scheduler._executor.model
+        model = self.scheduler.model
         was_training = model.training
         model.eval()
         try:

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from astrai.inference import build_engine, get_app
-from astrai.inference.frontend.engine import _StreamChunk
+from astrai.inference.frontend.tracking import StreamChunk
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.serialization import save_model
 from tests.helpers import CHAT_TEMPLATE, build_test_tokenizer, make_tiny_config
@@ -35,7 +35,7 @@ def test_chat_completions_non_stream(client, loaded_model):
     """POST /v1/chat/completions with stream=false returns OpenAI-style JSON."""
 
     async def events_gen():
-        yield _StreamChunk(
+        yield StreamChunk(
             text="Assistant reply",
             delta_token_ids=[1],
             current_token_ids=[1],
@@ -65,13 +65,13 @@ def test_chat_completions_stream(client, loaded_model):
     """POST /v1/chat/completions with stream=true returns SSE stream."""
 
     async def events_gen():
-        yield _StreamChunk(
+        yield StreamChunk(
             text="cumulative1",
             delta_token_ids=[1],
             current_token_ids=[1],
             stopped=False,
         )
-        yield _StreamChunk(
+        yield StreamChunk(
             text="cumulative2",
             delta_token_ids=[1],
             current_token_ids=[1],
@@ -103,7 +103,7 @@ def test_messages_non_stream(client, loaded_model):
     """POST /v1/messages with stream=false returns Anthropic-style JSON."""
 
     async def events_gen():
-        yield _StreamChunk(
+        yield StreamChunk(
             text="Assistant reply",
             delta_token_ids=[1],
             current_token_ids=[1],
@@ -135,13 +135,13 @@ def test_messages_stream(client, loaded_model):
     """POST /v1/messages with stream=true returns Anthropic SSE stream."""
 
     async def events_gen():
-        yield _StreamChunk(
+        yield StreamChunk(
             text="cumulative1",
             delta_token_ids=[1],
             current_token_ids=[1],
             stopped=False,
         )
-        yield _StreamChunk(
+        yield StreamChunk(
             text="cumulative2",
             delta_token_ids=[1],
             current_token_ids=[1],
@@ -176,7 +176,7 @@ def test_messages_with_system(client, loaded_model):
     """POST /v1/messages with system prompt."""
 
     async def events_gen():
-        yield _StreamChunk(
+        yield StreamChunk(
             text="Reply", delta_token_ids=[1], current_token_ids=[1], stopped=False
         )
 
@@ -202,10 +202,10 @@ def test_chat_completions_stop_sequence(client, loaded_model):
 
     async def events_gen():
         try:
-            yield _StreamChunk(
+            yield StreamChunk(
                 text="Hello", delta_token_ids=[1], current_token_ids=[1], stopped=False
             )
-            yield _StreamChunk(
+            yield StreamChunk(
                 text="X", delta_token_ids=[1], current_token_ids=[1], stopped=True
             )
         finally:
@@ -236,10 +236,10 @@ def test_chat_completions_stop_sequence_stream(client, loaded_model):
 
     async def events_gen():
         try:
-            yield _StreamChunk(
+            yield StreamChunk(
                 text="Hello", delta_token_ids=[1], current_token_ids=[1], stopped=False
             )
-            yield _StreamChunk(
+            yield StreamChunk(
                 text="X", delta_token_ids=[1], current_token_ids=[1], stopped=True
             )
         finally:

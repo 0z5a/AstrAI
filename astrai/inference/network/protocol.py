@@ -1,4 +1,4 @@
-"""Orchestration layer: ProtocolHandler, StopChecker, GenContext, StopInfo, ResponseBuilder, SSE utils.
+"""Orchestration layer: ProtocolHandler, GenContext, StopInfo, ResponseBuilder, SSE utils.
 
 ProtocolHandler orchestrates the async generation loop and delegates
 protocol-specific formatting to a ResponseBuilder.
@@ -48,19 +48,6 @@ class StopInfo:
     matched: Optional[str] = None
     body: str = ""
     yielded: str = ""
-
-
-class StopChecker:
-    """Scans accumulated text for stop sequence matches."""
-
-    def __init__(self, sequences: List[str]):
-        self._sequences = [s for s in sequences if s]
-
-    def check(self, text: str) -> Optional[str]:
-        for seq in self._sequences:
-            if seq in text:
-                return seq
-        return None
 
 
 class ResponseBuilder(ABC):
