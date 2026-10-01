@@ -9,10 +9,36 @@ parameters, so a single pipeline works for any batch size.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
+
+
+@dataclass(frozen=True)
+class SamplingMeta:
+    """Host-side facts about the batch's sampling parameters.
+
+    Each fact replaces a device-tensor predicate (``.any()`` / ``.item()``)
+    that would otherwise force a device-to-host sync on the decode hot path.
+    The executor resolves them once from the task attributes (plain Python
+    numbers) and threads them through :func:`sample` /
+    :func:`build_sampling_pipeline`; steady-state decode then reuses both.
+
+    Attributes:
+        greedy: All temperatures are exactly zero (argmax short-circuit).
+        any_temp_not_one: Any temperature differs from 1.0 (scaling active).
+        max_top_k: Max top-k across the batch, clamped at 0 (0 disables).
+        any_topp_lt1: Any top_p is below 1.0 (nucleus filter active).
+        has_freq: Any non-zero frequency penalty.
+    """
+
+    greedy: bool
+    any_temp_not_one: bool
+    max_top_k: int
+    any_topp_lt1: bool
+    has_freq: bool
 
 
 class BaseSamplingStrategy(ABC):
@@ -64,10 +90,18 @@ class TemperatureStrategy(BaseSamplingStrategy):
 
     Args:
         temperature: Scalar or ``[batch]`` tensor.
+        meta: Host-resolved batch facts; when given, ``greedy`` /
+            ``any_temp_not_one`` are read here instead of probing the
+            temperature tensor on device.
     """
 
-    def __init__(self, temperature: Union[float, Tensor] = 1.0):
+    def __init__(
+        self,
+        temperature: Union[float, Tensor] = 1.0,
+        meta: Optional[SamplingMeta] = None,
+    ):
         self.temperature = temperature
+        self.meta = meta
 
     @staticmethod
     def is_greedy_temperature(temperature: Union[float, Tensor]) -> bool:
@@ -77,6 +111,8 @@ class TemperatureStrategy(BaseSamplingStrategy):
 
     @property
     def is_greedy(self) -> bool:
+        if self.meta is not None:
+            return self.meta.greedy
         return self.is_greedy_temperature(self.temperature)
 
     @property
@@ -94,6 +130,12 @@ class TemperatureStrategy(BaseSamplingStrategy):
     ) -> Tensor:
         t = self.temperature
         if isinstance(t, Tensor):
+            if self.meta is not None:
+                if not self.meta.any_temp_not_one:
+                    return logits
+                t = t.to(logits.device, non_blocking=True).view(-1, 1)
+                logits = logits / torch.clamp(t, min=1e-8)
+                return logits
             t = t.to(logits.device, non_blocking=True).view(-1, 1)
             t = torch.clamp(t, min=1e-8)
             if (t != 1.0).any():
@@ -108,6 +150,10 @@ class TopKStrategy(BaseSamplingStrategy):
 
     Args:
         top_k: Scalar or ``[batch]`` tensor (0 disables).
+        meta: Host-resolved batch facts; when given, ``max_top_k`` replaces
+            the ``tk.max().item()`` device probe and the per-row threshold
+            gather runs without any boolean indexing (``tensor[bool_mask]``
+            resolves element counts on host, i.e. another hidden sync).
     """
 
     @property
@@ -115,8 +161,13 @@ class TopKStrategy(BaseSamplingStrategy):
         # The argmax token always ranks first, so any k >= 1 keeps it.
         return True
 
-    def __init__(self, top_k: Union[int, Tensor] = 0):
+    def __init__(
+        self,
+        top_k: Union[int, Tensor] = 0,
+        meta: Optional[SamplingMeta] = None,
+    ):
         self.top_k = top_k
+        self.meta = meta
 
     def apply(
         self,
@@ -127,6 +178,27 @@ class TopKStrategy(BaseSamplingStrategy):
     ) -> Tensor:
         tk = self.top_k
         if isinstance(tk, Tensor):
+            if self.meta is not None:
+                max_k = min(self.meta.max_top_k, logits.size(-1))
+                if max_k <= 0:
+                    return logits
+                # Sync-free threshold: per-row k as a gather index instead
+                # of boolean row selection. k == 0 rows fall back to -inf
+                # (no filtering) via the where() branch.
+                tk_dev = tk.to(logits.device, non_blocking=True).clamp(min=0, max=max_k)
+                values, _ = torch.topk(logits, max_k, dim=-1)
+                idx = (tk_dev - 1).clamp(min=0).unsqueeze(-1)
+                thresholds = values.gather(-1, idx)
+                # [B] mask against [B, 1] values would broadcast along
+                # dim 1; align both to [B, 1] before the where.
+                active = (tk_dev > 0).unsqueeze(-1)
+                thresholds = torch.where(
+                    active,
+                    thresholds,
+                    torch.full_like(thresholds, -float("inf")),
+                )
+                logits[logits < thresholds] = filter_value
+                return logits
             tk = tk.to(logits.device, non_blocking=True).long().clamp(min=0)
             max_k = int(tk.max().item())
             if max_k <= 0:
@@ -156,6 +228,8 @@ class TopPStrategy(BaseSamplingStrategy):
 
     Args:
         top_p: Scalar or ``[batch]`` tensor (1.0 disables).
+        meta: Host-resolved batch facts; when given, ``any_topp_lt1``
+            replaces the ``(tp < 1.0).any()`` device probe.
     """
 
     @property
@@ -163,8 +237,13 @@ class TopPStrategy(BaseSamplingStrategy):
         # Nucleus filtering always keeps the highest-probability token.
         return True
 
-    def __init__(self, top_p: Union[float, Tensor] = 1.0):
+    def __init__(
+        self,
+        top_p: Union[float, Tensor] = 1.0,
+        meta: Optional[SamplingMeta] = None,
+    ):
         self.top_p = top_p
+        self.meta = meta
 
     def _apply(
         self, logits: Tensor, top_p: Union[float, Tensor], filter_value: float
@@ -188,6 +267,11 @@ class TopPStrategy(BaseSamplingStrategy):
     ) -> Tensor:
         tp = self.top_p
         if isinstance(tp, Tensor):
+            if self.meta is not None:
+                if not self.meta.any_topp_lt1:
+                    return logits
+                tp = tp.to(logits.device, non_blocking=True)
+                return self._apply(logits, tp.view(-1, 1), filter_value)
             tp = tp.to(logits.device, non_blocking=True)
             if (tp < 1.0).any():
                 logits = self._apply(logits, tp.view(-1, 1), filter_value)
@@ -212,10 +296,17 @@ class FrequencyPenaltyStrategy(BaseSamplingStrategy):
 
     Args:
         penalty: Scalar or ``[batch]`` tensor (0.0 disables, range -2.0~2.0).
+        meta: Host-resolved batch facts; when given, ``has_freq`` replaces
+            the ``(p == 0.0).all()`` device probe.
     """
 
-    def __init__(self, penalty: Union[float, Tensor] = 0.0):
+    def __init__(
+        self,
+        penalty: Union[float, Tensor] = 0.0,
+        meta: Optional[SamplingMeta] = None,
+    ):
         self.penalty = penalty
+        self.meta = meta
 
     def apply(
         self,
@@ -229,9 +320,14 @@ class FrequencyPenaltyStrategy(BaseSamplingStrategy):
 
         p = self.penalty
         if isinstance(p, Tensor):
-            p = p.to(logits.device, non_blocking=True).view(-1)
-            if (p == 0.0).all():
-                return logits
+            if self.meta is not None:
+                if not self.meta.has_freq:
+                    return logits
+                p = p.to(logits.device, non_blocking=True).view(-1)
+            else:
+                p = p.to(logits.device, non_blocking=True).view(-1)
+                if (p == 0.0).all():
+                    return logits
         elif p == 0.0:
             return logits
 
@@ -377,6 +473,42 @@ class SamplingPipeline(BaseSamplingStrategy):
 
 
 @torch.inference_mode()
+def build_sampling_pipeline(
+    temperature: Union[float, Tensor] = 1.0,
+    top_k: Union[int, Tensor] = 0,
+    top_p: Union[float, Tensor] = 1.0,
+    frequency_penalty: Union[float, Tensor] = 0.0,
+    meta: Optional[SamplingMeta] = None,
+) -> SamplingPipeline:
+    """Assemble the strategy pipeline for :func:`sample`'s parameters.
+
+    Split out of :func:`sample` so steady-state decode can build it once
+    per ordered batch and reuse it across steps (the parameter tensors and
+    the host facts in ``meta`` are constant while the batch is unchanged),
+    instead of constructing four strategy objects every decode step.
+    """
+    strategies: List[BaseSamplingStrategy] = []
+    if meta is not None:
+        if meta.has_freq:
+            # Penalty first, on the raw logits (OpenAI semantics): applying
+            # it after a temperature scaling would shrink it by the
+            # temperature and annihilate it entirely at temperature=0.
+            strategies.append(FrequencyPenaltyStrategy(frequency_penalty, meta))
+    elif (isinstance(frequency_penalty, Tensor) and (frequency_penalty != 0).any()) or (
+        not isinstance(frequency_penalty, Tensor) and frequency_penalty != 0
+    ):
+        strategies.append(FrequencyPenaltyStrategy(frequency_penalty))
+    strategies.extend(
+        [
+            TemperatureStrategy(temperature, meta),
+            TopKStrategy(top_k, meta),
+            TopPStrategy(top_p, meta),
+        ]
+    )
+    return SamplingPipeline(strategies)
+
+
+@torch.inference_mode()
 def sample(
     logits: Tensor,
     temperature: Union[float, Tensor] = 1.0,
@@ -387,6 +519,7 @@ def sample(
     input_mask: Optional[Tensor] = None,
     filter_value: float = -float("inf"),
     return_logprobs: bool = False,
+    meta: Optional[SamplingMeta] = None,
 ):
     """Apply sampling strategies then sample (softmax + multinomial).
 
@@ -404,38 +537,29 @@ def sample(
         frequency_penalty: Penalty per occurrence for repeated tokens
             (0.0 disables, range -2.0~2.0).
         input_ids: Previously generated token IDs ``[batch, seq_len]``.
-        input_mask: Boolean mask for ``input_ids`` padding.
+        input_mask: Boolean mask for ``[batch, seq_len]``.
         return_logprobs: If ``True``, also return the log-probability
             of each sampled token under the raw (pre-strategy) model
             distribution — usable directly for RL rollout (PPO/GRPO
             importance ratios against the training-side policy logprobs).
+        meta: Host-resolved batch facts; when given, every device-side
+            parameter probe in the pipeline (greedy check, temperature
+            != 1, top-k max, top-p < 1, penalty == 0) is replaced by the
+            pre-computed host booleans, keeping the decode hot path free
+            of device-to-host syncs.
 
     Returns:
         Sampled token IDs ``[batch]``, or — when ``return_logprobs`` is
         ``True`` — a ``(token_ids, chosen_logprobs)`` tuple where
         ``chosen_logprobs`` has shape ``[batch]``.
     """
-    has_freq = (
-        (isinstance(frequency_penalty, Tensor) and (frequency_penalty != 0).any())
-        if isinstance(frequency_penalty, Tensor)
-        else frequency_penalty != 0
-    )
-
-    strategies: List[BaseSamplingStrategy] = []
-    if has_freq:
-        # Penalty first, on the raw logits (OpenAI semantics): applying it
-        # after a temperature scaling would shrink it by the temperature
-        # and annihilate it entirely at temperature=0.
-        strategies.append(FrequencyPenaltyStrategy(frequency_penalty))
-    strategies.extend(
-        [
-            TemperatureStrategy(temperature),
-            TopKStrategy(top_k),
-            TopPStrategy(top_p),
-        ]
-    )
-
-    return SamplingPipeline(strategies).sample(
+    return build_sampling_pipeline(
+        temperature,
+        top_k,
+        top_p,
+        frequency_penalty,
+        meta=meta,
+    ).sample(
         logits,
         filter_value=filter_value,
         input_ids=input_ids,

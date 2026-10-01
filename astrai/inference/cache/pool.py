@@ -16,13 +16,6 @@ from typing import Dict, List, Optional
 
 import torch
 
-from astrai.inference.cache.buffer import (
-    DecodeKVCache,
-    KVCache,
-    KVStorage,
-    PrefillKVCache,
-    ReqToTokenPool,
-)
 from astrai.inference.cache.strategy import (
     AllocationStrategy,
     Allocator,
@@ -32,6 +25,13 @@ from astrai.inference.cache.strategy import (
     TaskCacheState,
 )
 from astrai.inference.workspace import Q_TILE_ROWS, InferenceWorkspace
+from astrai.model.kv_cache import (
+    DecodeKVCache,
+    KVCache,
+    KVStorage,
+    PrefillKVCache,
+    ReqToTokenPool,
+)
 
 # Re-export everything so existing ``from astrai.inference.cache import ...``
 # continues to work unchanged after the file split.
@@ -49,21 +49,9 @@ __all__ = [
     "PagePool",
     "TaskCacheManager",
     "TaskCacheState",
-    "page_hash",
 ]
 
 # ---- helpers ----
-
-
-def page_hash(
-    token_ids: List[int], page_idx: int, page_size: int, parent_hash: int = 0
-) -> int:
-    start = page_idx * page_size
-    end = min(start + page_size, len(token_ids))
-    h = parent_hash
-    for i in range(start, end):
-        h = (h * 31 + token_ids[i]) & 0xFFFFFFFFFFFFFFFF
-    return h
 
 
 def _is_steady_increment(
@@ -340,6 +328,37 @@ class TaskCacheManager:
         state.length = pos + 1
         return True
 
+    def task_extend_batch(
+        self, task_ids: List[str], positions: List[int]
+    ) -> List[bool]:
+        """``task_extend`` for a whole decode step, one strategy call.
+
+        The decode-steady hot path extends every active task by exactly
+        one position; a single batched strategy call replaces one
+        allocation round-trip per task (see
+        ``PagedStrategy.extend_batch``).  Per-task semantics are
+        unchanged: a missing state or an out-of-cap position fails that
+        task alone.
+        """
+        results = [False] * len(task_ids)
+        live_idx: List[int] = []
+        live_states: List[TaskCacheState] = []
+        live_pos: List[int] = []
+        for i, tid in enumerate(task_ids):
+            state = self._states.get(tid)
+            if state is not None and positions[i] < self._max_seq_len:
+                live_idx.append(i)
+                live_states.append(state)
+                live_pos.append(positions[i])
+        if not live_idx:
+            return results
+        extended = self._strategy.extend_batch(live_states, live_pos)
+        for i, state, pos, ok in zip(live_idx, live_states, live_pos, extended):
+            if ok:
+                state.length = pos + 1
+                results[i] = True
+        return results
+
     @property
     def task_count(self) -> int:
         """Number of tasks currently holding KV request state."""
@@ -391,6 +410,11 @@ class TaskCacheManager:
         )
         self._bind_state = _BindState(sig, list(seq_lens))
         self._bind_was_steady = incremental
+
+        # req_to_token rows are read on-device by every decode bind
+        # (out_cache_loc gather), incremental or not — push any host-staged
+        # slot tails so the device rows are current before the gather runs.
+        self._strategy.flush_slots(states, device or workspace.device)
 
         return self._pool.bind_tasks(
             req_indices,

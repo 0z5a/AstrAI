@@ -23,9 +23,8 @@ import click
 import torch
 import torch.nn.functional as F
 
-from astrai.extension import is_available
-from astrai.extension.ops.gemm import quant_gemm
-from astrai.extension.quantize import quantize_act_int8, quantize_weight_int8
+from astrai.extension import is_available, quantize_act_int8, quantize_weight_int8
+from astrai.extension.kernel.gemm import quant_gemm
 
 # GEMM shapes as (N, K) weight mats; M comes from --m-values.
 GEMM_SHAPES = (
@@ -44,7 +43,7 @@ FP8_FORMATS = (
 )
 
 # Every dtype pairing the gemm dispatch instantiates (find_gemm_dispatch in
-# csrc/kernels/gemm/gemm.cu): each row names the cell, then the activation
+# csrc/gemm/gemm.cu): each row names the cell, then the activation
 # and weight kinds. Asymmetric low-bit mixes — int8 x fp8, mismatched fp8
 # formats, quantized acts against bf16 weights — have no kernel and no row.
 GEMM_COMBOS = (

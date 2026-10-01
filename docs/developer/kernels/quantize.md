@@ -1,7 +1,7 @@
 # Quantize (FP8)
 
-> Kernel modules `csrc/kernels/quantize/`; python adapters in
-> `astrai/extension/ops/quantize.py`, strategy layer (recipes,
+> Kernel module `csrc/quantize/` (bindings.cu + entry.cu); python adapters in
+> `astrai/extension/kernel/quantize.py`, strategy layer (recipes,
 > `fp8_autocast`, aten::linear override) in
 > `astrai/extension/quantize.py`.
 
@@ -71,6 +71,6 @@ scales (ue8m0 bytes 0x7f = 2^0, selectors inert — the scale-factored product
 is the plain product): the plain fp8 `mma.sync` decodes at half rate on
 consumer Blackwell (measured 506 vs 1011 TFLOPS issue rate), while the
 block_scale form runs full rate with the same register contract. The cell
-gates on cc == 120 (kill switch `ops.gemm.set_staging(mx=False)`); its inert scale
+gates on cc == 120 (kill switch `kernel.gemm.set_staging(mx=False)`; its inert scale
 operands are also the seam where real per-block (MX) scaling would attach.
 

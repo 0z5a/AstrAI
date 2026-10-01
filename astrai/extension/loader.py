@@ -9,7 +9,7 @@ registry needs no change here.
 
 Loading is **lazy and centralized**: module names are discovered eagerly
 (cheap glob), but each ``.so`` is imported on first use via the single
-``get_module`` accessor, then cached. The wrapper modules (``ops/*.py``) never
+``get_module`` accessor, then cached. The wrapper modules (``kernel/*.py``) never
 touch the internals or keep their own caches — they call ``get_module(name)``
 (or ``is_available(name)`` when a torch fallback is acceptable). A kernel that
 failed to build (or is running on a CPU-only machine) is ``None`` in the cache,

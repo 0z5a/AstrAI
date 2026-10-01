@@ -55,6 +55,12 @@ class RawRollout:
             need text).
         response_texts: Decoded response strings, shape ``[B, G]``
             (for reward models).
+        finish_reasons: Scheduler termination reason per response
+            (``"stop"`` or ``"length"``), shape ``[B][G]``.  Truncated
+            responses must not be mistaken for finished episodes: PPO
+            treats the last valid token as terminal either way, but the
+            truncation rate is the observable that says the max-token
+            budget — not the policy — ended the episode.
     """
 
     prompts: Tensor
@@ -66,6 +72,7 @@ class RawRollout:
     prompt_texts: List[str] = field(default_factory=list)
     response_texts: List[List[str]] = field(default_factory=list)
     sampling_groups: List["DynamicSamplingGroup"] = field(default_factory=list)
+    finish_reasons: List[List[str]] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
@@ -455,6 +462,7 @@ class RolloutGenerator:
 
         flat_idx = 0
         response_texts: List[List[str]] = [[] for _ in range(B)]
+        finish_reasons: List[List[str]] = [[] for _ in range(B)]
         for i in range(B):
             for g in range(G):
                 result = results[flat_idx]
@@ -472,6 +480,7 @@ class RolloutGenerator:
                 response_texts[i].append(
                     self.tokenizer.decode(token_ids, skip_special_tokens=True)
                 )
+                finish_reasons[i].append(result.finish_reason)
 
         return RawRollout(
             prompts=prompts_tensor,
@@ -482,6 +491,7 @@ class RolloutGenerator:
             policy_version=generation_version,
             prompt_texts=prompt_texts,
             response_texts=response_texts,
+            finish_reasons=finish_reasons,
         )
 
     def _prepare_prompts(self, batch: Dict) -> Tuple[List[str], List[List[int]]]:
@@ -682,6 +692,7 @@ class RolloutRunner:
             prompt_texts=raw.prompt_texts,
             response_texts=raw.response_texts,
             sampling_groups=raw.sampling_groups,
+            finish_reasons=raw.finish_reasons,
         )
 
     @staticmethod
@@ -797,6 +808,7 @@ class RolloutRunner:
         prompt_texts: List[str] = []
         response_texts: List[List[str]] = []
         sampling_groups: List[DynamicSamplingGroup] = []
+        finish_reasons: List[List[str]] = []
 
         for destination, (result, source, record) in enumerate(ordered):
             if result.policy_version != policy_version:
@@ -814,6 +826,7 @@ class RolloutRunner:
             prompt_texts.append(result.prompt_texts[source])
             response_texts.append(result.response_texts[source])
             sampling_groups.append(record)
+            finish_reasons.append(result.finish_reasons[source] if result.finish_reasons else [])
 
         return RolloutResult(
             prompts=prompts,
@@ -826,6 +839,7 @@ class RolloutRunner:
             prompt_texts=prompt_texts,
             response_texts=response_texts,
             sampling_groups=sampling_groups,
+            finish_reasons=finish_reasons,
         )
 
     def _generate_dynamic(self, batch: Dict) -> RolloutResult:
@@ -1248,13 +1262,19 @@ class RolloutEvaluator:
         rewards = _score_rewards(self.reward_model, raw)
         lengths = raw.response_mask.sum(dim=-1).to(torch.float32)
         std = rewards.std(unbiased=False).item() if rewards.numel() > 1 else 0.0
-        return {
+        metrics = {
             "reward_mean": rewards.mean().item(),
             "reward_std": std,
             "reward_max": rewards.max().item(),
             "response_len_mean": lengths.mean().item(),
             "num_responses": float(rewards.numel()),
         }
+        flat_reasons = [reason for group in raw.finish_reasons for reason in group]
+        if flat_reasons:
+            metrics["truncation_rate"] = sum(
+                1 for reason in flat_reasons if reason == "length"
+            ) / len(flat_reasons)
+        return metrics
 
 
 def _score_rewards(reward_model: BaseRewardModel, raw: RawRollout) -> Tensor:

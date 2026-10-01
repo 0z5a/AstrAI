@@ -1,13 +1,13 @@
 # Rotary Embedding
 
-> Kernel `csrc/kernels/rotary_emb.cu`; python adapter
-> `astrai/extension/ops/rotary.py`, dispatch in
+> Kernel `csrc/rotary_emb.cu`; python adapter
+> `astrai/extension/kernel/rotary.py`, dispatch in
 > `astrai/extension/backend/rotary.py`.
 
 ## Kernel
 ### Rotary Embedding Kernel
 
-The `rotary_emb` kernel (`csrc/kernels/rotary_emb.cu`) fuses cos/sin lookup and rotation into a single kernel:
+The `rotary_emb` kernel (`csrc/rotary_emb.cu`) fuses cos/sin lookup and rotation into a single kernel:
 
 - One thread per (head, dim-pair), vectorized `__nv_bfloat162` load/store
 - f32 cos/sin input, bf16 compute and output
@@ -25,6 +25,6 @@ No context-manager switching needed — the dispatch is automatic per call.
 
 ## Wrapper
 
-`astrai/extension/ops/rotary.py` provides the wrapper for the rotary
+`astrai/extension/kernel/rotary.py` provides the wrapper for the rotary
 embedding kernel. Fallback to torch complex multiply is handled by
 `backend/rotary.py`.
