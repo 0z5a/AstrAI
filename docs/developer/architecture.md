@@ -714,14 +714,14 @@ classDiagram
         }
 
         class ColocatedBackend {
-            +InferenceScheduler scheduler
+            +Scheduler scheduler
             +generate(prompt_ids_list, **kwargs)
         }
 
         class ReplicaBackend {
             +nn.Module model
             +torch.device device
-            +InferenceScheduler scheduler
+            +Scheduler scheduler
             +generate(prompt_ids_list, **kwargs)
         }
 
@@ -865,261 +865,76 @@ classDiagram
 
     namespace inference {
         class InferenceEngine {
-            +nn.Module model
-            +AutoTokenizer tokenizer
-            +InferenceScheduler scheduler
-            +generate(prompt, stream, max_tokens, temperature, top_p, top_k, frequency_penalty, rep_window) Union[Generator, str, List[str]]
-            +generate_async(prompt, max_tokens, temperature, top_p, top_k, frequency_penalty, rep_window) AsyncGenerator
-            +get_stats() Dict
-            +shutdown()
+            +generate() / generate_async() / generate_events() / score()
         }
-
-        class GPUModelRunner {
-            +AutoModel model
-            +PagePool kv_cache
-            +TaskCacheManager task_cache
-            +InferenceWorkspace _workspace
-            +Optional[str] device
-            +Optional[torch.dtype] dtype
-            +execute_prefill(tasks, start_pos=0)
-            +execute_decode(tasks, return_logprobs=False) Union[List[int], List[Tuple[int, float]]]
-        }
-
-        class InferenceWorkspace {
-            +int max_batch_size
-            +int max_seq_len
-            +torch.device device
-            +torch.dtype dtype
-            +Tensor arange
-            +Tensor input_mask
-            +Tensor input_ids
-            +Tensor req_pool_indices
-            +Tensor seq_lens
-            +Tensor kv_indptr
-            +Tensor qo_indptr
-            +Tensor inc
-            +Tensor out_cache_loc
-            +fill_input_ids(ids) Tensor
-            +decode_mask(position_ids, total_len) Tensor
-        }
-
-        class InferenceScheduler {
-            +PagePool _cache
-            +TaskCacheManager _task_cache
-            +GPUModelRunner _executor
-            +TaskManager _task_mgr
-            +Event _stop_event
-            +Thread _loop_thread
-            +int max_seq_len
-            +str device
-            +torch.dtype dtype
-            +int policy_version
-            +add_task(prompt, **kwargs) str
-            +remove_task(task_id)
-            +start()
-            +stop()
-            +get_stats() Dict
-            +update_weights(policy_version) int
-            +run_batch(prompt_ids_list, max_tokens, temperature, top_p, top_k, frequency_penalty, rep_window, return_logprobs) Union[List[List[int]], List[Tuple[List[int], List[float]]]]
-        }
-
-        class Allocator {
-            +int _free_mask
-            +List[int] _refs
-            +OrderedDict _lru
-            +alloc() int
-            +free(idx, keep_cached)
-            +inc_ref(idx)
-            +touch(idx)
-            +ref_count(idx) int
-            +clear_cached() int
-        }
-
-        class RadixNode {
-            +RadixNode parent
-            +Dict children
-            +Optional[int] page_idx
-            +Tuple tokens
-            +int lock_ref
-        }
-
-        class RadixCache {
-            +int _page_size
-            +evict(page_idx)
-            +has_page(idx) bool
-            +lookup(token_ids) List[int]
-            +record(page_idx, token_ids, logical_page_idx)
-            +release(pages)
-        }
-
-        class AllocationStrategy {
+        class EngineCoreClient {
             <<abstract>>
-            +alloc(state, prompt_ids) bool
-            +free(state)
-            +extend(state, pos) bool
-            +write_indices(state, prompt_ids)
-            +record_hashes(state, prompt_ids, start_logical_page)
-            +invalidate_cache() int
         }
-
-        class ContiguousStrategy {
-            +write_indices(state, prompt_ids)
+        class InprocClient
+        class InputProcessor
+        class OutputProcessor
+        class Scheduler {
+            +run_busy_loop()
+            +run_batch() / score_ids()
         }
-
-        class PagedStrategy {
-            -Allocator _alloc
-            -RadixCache _prefix
+        class RequestManager {
+            waiting / running
         }
-
-        class KVStorage {
-            +int size
-            +Tensor k_buffer
-            +Tensor v_buffer
-            +get_key_buffer(layer_id) Tensor
-            +get_value_buffer(layer_id) Tensor
-            +set_kv_buffer(layer_id, loc, k, v)
+        class Request {
+            +num_computed_tokens
         }
-
-        class ReqToTokenPool {
-            +int size
-            +int max_context_len
-            +Tensor req_to_token
-            +alloc(num_reqs) List[int]
-            +free(req_indices)
-            +write(indices, values)
+        class SchedulerStep
+        class KVCacheManager
+        class BlockPool
+        class PolicyVersionGuard
+        class GPUModelRunner {
+            +execute_prefill() / submit_decode()
         }
-
-        class KVCache {
-            +Tensor k_buffer
-            +Tensor v_buffer
-            +Tensor req_to_token
-            +Tensor req_pool_indices
-            +Tensor seq_lens
-            +Tensor out_cache_loc
-            +int max_len
-            +Optional[Tensor] kv_indptr
-            +Optional[Tensor] qo_indptr
-            +Optional[Tensor] decode_o_part
-            +Optional[Tensor] decode_ml_part
-            +Optional[Tensor] decode_out
+        class PendingExecution {
+            +commit()
         }
-
-        class PagePool {
-            +int page_size
-            +bool contiguous
-            -KVStorage _storage
-            -ReqToTokenPool _req_pool
-            -AllocationStrategy _strategy
-            +strategy AllocationStrategy
-            +req_pool ReqToTokenPool
-            +bind_tasks(req_indices, seq_lens, workspace, device, start_pos, incremental) KVCache
-        }
-
-        class TaskCacheManager {
-            -PagePool _pool
-            -Dict _states
-            +task_alloc(task_id, prompt_ids) bool
-            +task_free(task_id)
-            +task_extend(task_id, pos) bool
-            +task_cached(task_id) int
-            +task_record_hashes(task_id, prompt_ids, start_logical_page)
-            +invalidate_cache() int
-            +bind(task_ids, workspace) KVCache
-        }
-
-    class Task {
-        +str task_id
-        +List prompt_ids
-        +Optional[int] max_tokens
-        +float temperature
-        +float top_p
-        +int top_k
-        +float frequency_penalty
-        +int rep_window
-        +TaskStatus status
-        +List output_ids
-        +int input_tokens
-        +int output_tokens
-        +float arrival_time
-        +Optional[float] finish_time
-        +int next_pos
-        +is_finished(stop_ids) bool
-    }
-
-        class TaskStatus {
-            <<enumeration>>
-            PENDING
-            RUNNING
-            FINISHED
-            ABORTED
-        }
-
-        class TaskManager {
-            +AutoTokenizer tokenizer
-            +int max_batch_size
-            +int max_seq_len
-            +Deque waiting_queue
-            +List active_tasks
-            +add_task(prompt, max_tokens, temperature, top_p, top_k, stream_callback) str
-            +remove_task(task_id) List[Task]
-            +remove_finished_tasks(stop_ids) List[Task]
-            +pull_candidates(n) List[Task]
-            +activate(task)
-            +return_to_waiting(tasks)
-            +get_active_tasks() List[Task]
-            +has_work() bool
-            +wait_for_tasks(timeout)
-            +get_waiting_tasks() List[Task]
-            +clear_queues()
-            +wake()
-            +get_stats() Dict
-        }
-
+        class CUDAGraphRunner
+        class InferenceWorkspace
+        class SamplingPipeline
         class BaseSamplingStrategy {
             <<abstract>>
-            +apply(logits, filter_value, input_ids, input_mask) Tensor
         }
+        class TemperatureStrategy
+        class TopKStrategy
+        class TopPStrategy
+        class FrequencyPenaltyStrategy
+        class GenerateResult
+        class StreamDecoder
+        class Allocator {
+            bitmap free-set + LRU
+        }
+        class RadixCache
+        class RadixNode
+        class AllocationStrategy {
+            <<abstract>>
+        }
+        class ContiguousStrategy
+        class PagedStrategy
 
-        class TemperatureStrategy {
-            +float temperature
-            +apply(logits, filter_value, input_ids, input_mask) Tensor
-        }
+        InferenceEngine *-- EngineCoreClient
+        EngineCoreClient <|.. InprocClient
+        InferenceEngine --> InputProcessor
+        InferenceEngine --> OutputProcessor
+        InprocClient ..> Scheduler : direct call
+        Scheduler *-- RequestManager
+        Scheduler *-- SchedulerStep
+        Scheduler *-- KVCacheManager
+        Scheduler *-- PolicyVersionGuard
+        RequestManager o-- Request
+        KVCacheManager --> BlockPool
+        SchedulerStep --> GPUModelRunner
+        GPUModelRunner --> PendingExecution
+        GPUModelRunner *-- CUDAGraphRunner
+        GPUModelRunner *-- InferenceWorkspace
+        GPUModelRunner --> SamplingPipeline
+    }
 
-        class TopKStrategy {
-            +int top_k
-            +apply(logits, filter_value, input_ids, input_mask) Tensor
-        }
-
-        class TopPStrategy {
-            +float top_p
-            +apply(logits, filter_value, input_ids, input_mask) Tensor
-        }
-
-        class FrequencyPenaltyStrategy {
-            +float penalty
-            +apply(logits, filter_value, input_ids, input_mask) Tensor
-        }
-
-        class SamplingPipeline {
-            +List[BaseSamplingStrategy] strategies
-            +apply(logits, filter_value, input_ids, input_mask) Tensor
-            +sample(logits, filter_value, input_ids, input_mask, return_logprobs) Union[Tensor, Tuple[Tensor, Tensor]]
-        }
-
-        class StreamDecoder {
-            +push(token_id) str
-        }
-
-        class GenerateResult {
-            +List[Tuple[int, str]] tokens
-            +List[str] results
-            +List[bool] _done
-            +append(token, idx)
-            +get_results() List[str]
-            +pop_all() List[Tuple[int, str]]
-            +wait(timeout) bool
-            +wait_completion(timeout)
-        }
+    namespace network {
 
         class ChatMessage {
             +str role
@@ -1446,19 +1261,19 @@ classDiagram
     LaunchStrategy <|-- TorchrunStrategy
     LaunchStrategy <|-- LocalStrategy
     %% --- Composition (strong ownership, part destroyed with whole) ---
-    PagePool *-- KVStorage
-    PagePool *-- ReqToTokenPool
-    PagePool *-- AllocationStrategy
+    BlockPool *-- KVStorage
+    BlockPool *-- ReqToTokenPool
+    BlockPool *-- AllocationStrategy
     PagedStrategy *-- Allocator
     PagedStrategy *-- RadixCache
-    TaskCacheManager o-- PagePool
+    KVCacheManager --> BlockPool
     RadixCache *-- RadixNode
-    InferenceEngine *-- InferenceScheduler
-    InferenceScheduler *-- PagePool
-    InferenceScheduler *-- TaskCacheManager
-    InferenceScheduler *-- GPUModelRunner
+    InferenceEngine *-- Scheduler
+    Scheduler *-- BlockPool
+    Scheduler *-- KVCacheManager
+    SchedulerStep --> GPUModelRunner
     GPUModelRunner *-- InferenceWorkspace
-    InferenceScheduler *-- TaskManager
+    Scheduler *-- RequestManager
     AutoRegressiveLM *-- DecoderBlock
     AutoRegressiveLM *-- RotaryEmbedding
     AutoRegressiveLM *-- Embedding
@@ -1527,8 +1342,8 @@ classDiagram
     TrainContextBuilder ..> RDSampler : creates
     Checkpoint ..> Checkpoint : serializes
     CheckpointCallback ..> Checkpoint : creates
-    PagePool ..> KVCache : binds
-    PagePool ..> InferenceWorkspace : fills
+    BlockPool ..> KVCache : binds
+    BlockPool ..> InferenceWorkspace : fills
     InferenceEngine ..> GenerateResult : uses
     InferenceEngine ..> GenerateResult : creates
     OpenAIResponseBuilder ..> ChatCompletionRequest : receives
@@ -1536,8 +1351,8 @@ classDiagram
     ProtocolHandler ..> StopChecker : creates
     ProtocolHandler ..> GenContext : creates
     RolloutGenerator ..> RolloutBackend : generates via
-    ColocatedBackend ..> InferenceScheduler : wraps
-    ReplicaBackend ..> InferenceScheduler : owns
+    ColocatedBackend ..> Scheduler : wraps
+    ReplicaBackend ..> Scheduler : owns
     P2PCopyPublisher ..> ReplicaBackend : syncs weights
     BaseStrategy ..> WeightPublisher : commits publish
     RolloutRunner ..> RolloutGenerator : uses
@@ -1549,13 +1364,13 @@ classDiagram
     Trainer --> TrainConfig
     DPOStrategy --> AutoModel
     GRPOStrategy --> AutoModel : policy/old/ref
-    InferenceScheduler --> Task
-    InferenceScheduler --> TaskStatus
-    Task --> TaskStatus
+    Scheduler --> Request
+    Scheduler --> RequestStatus
+    Request --> RequestStatus
     InferenceEngine --> AutoModel
     GPUModelRunner --> AutoModel
-    GPUModelRunner --> TaskCacheManager
-    TaskManager --> AutoTokenizer
+    GPUModelRunner ..> KVCacheManager : TYPE_CHECKING only
+    RequestManager --> AutoTokenizer
 
 ```
 
@@ -1571,7 +1386,7 @@ classDiagram
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator, RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher | Training workflow (online RL rollout via injectable backends) |
-| **astrai.inference** | InferenceEngine, InferenceScheduler, GPUModelRunner, InferenceWorkspace, PagePool, TaskCacheManager, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, AllocationStrategy, ContiguousStrategy, PagedStrategy, Task, TaskManager, TaskStatus, StreamDecoder, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
+| **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, EngineCoreClient/InprocClient, events (TokenDelta/RequestFinished/RequestError), GenerateResult · core: Scheduler, SchedulerStep, RequestManager, Request/RequestStatus, KVCacheManager, BlockPool, AllocationStrategy (Contiguous/Paged), Allocator, RadixCache, PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
 | **astrai.extension** | `backend` policy package, `kernel` kernel-wrapper package, `fp8.py` FP8 strategy layer, AttentionBackend, TorchNativeBackend, CudaBackend, FlashAttnBackend, attention, attn_backend, ATTN_BACKEND, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optim** | OptimizerFactory, MuonAdamW, NoraNadamW, ManoAdamW, composite_step/composite_zero_grad/composite_state_dict, partition_optimizer_parameters | Built-in optimizers (`muon_adamw` / `nora_nadamw` / `mano_adamw`) with shared composite-optimizer helpers |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch, executors & gradient accumulation |
@@ -1590,12 +1405,15 @@ classDiagram
 | **Builder** | `TrainContextBuilder` | Chain-building training context |
 | **Observer** | `TrainCallback`, callback implementations | Training process monitoring |
 | **Context** | `TrainContext` | Unified training state bag |
-| **Object Pool** | `Allocator`, `PagePool` | Page-based KV cache with LRU eviction |
+| **Object Pool** | `Allocator`, `BlockPool` | Page-based KV cache with LRU eviction |
 | **Strategy (Attention)** | `AttentionBackend`, `CudaBackend`, `FlashAttnBackend`, `TorchNativeBackend` | Attention computation backend switching via context manager |
 | **Auto-dispatch (Rotary)** | `apply_rotary_emb`, `backend/rotary.py`, `kernel/rotary.py` | Rotary embedding CUDA kernel auto-dispatch with torch fallback |
 | **Executor** | `BaseExecutor`, `NoneExecutor`, `DDPExecutor`, `FSDPExecutor` | Gradient accumulation & model distribution |
 | **Storage** | `Store`, `MmapStore`, `JsonlStore` | Format-agnostic data access with multi-segment support |
-| **Producer-Consumer** | `InferenceScheduler`, `Task`, queues | Continuous batching |
+| **Producer-Consumer** | `Scheduler`, `Request`, waiting/running queues | Continuous batching |
+| **Observer (events)** | `OutputEventSink`, `_EventQueueSink`, `_CallbackBridge` | Scheduler loop pushes token-id events; consumers run off the loop thread |
+| **Command** | `PendingExecution` submit/commit | Deferred, idempotent result materialization (decode overlap) |
+| **Facade (KV)** | `KVCacheManager` over `BlockPool`/strategies | Single accounting surface for the scheduler |
 | **Model Registry** | `ModelFactory`, `AutoRegressiveLM`, `EmbeddingEncoder` | Model-type dynamic loading |
 | **Optimizer Routing** | `OptimizerFactory`, `MuonAdamW`, `NoraNadamW`, `ManoAdamW` | Route parameter groups (matrices vs. embeddings/heads/norms) through different optimizers |
 
@@ -1605,7 +1423,7 @@ classDiagram
 2. **Training Flow**: `Trainer` → `TrainContextBuilder` → `TrainContext`, uses `BaseStrategy` for loss, `BaseExecutor` for gradient accumulation + model distribution; with `cp_size > 1` the strategy is wrapped in `CPStrategy` (sequence sharding + ring attention)
 3. **Strategy Selection**: `StrategyFactory` creates strategy by `train_type`
 4. **Executor Selection**: `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
-5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.kernel`. Attention uses cuda > flash > torch priority unless explicitly selected by `set_op("attention", ...)` or `attn_backend()`
+5. **Inference Flow**: `InferenceEngine` (frontend) → `Scheduler`/`SchedulerStep` (core) → `GPUModelRunner` (worker) → `AutoRegressiveLM`, backed by `KVCacheManager` + `BlockPool` + `SamplingPipeline`; output flows back as events (see [developer/inference/events.md](inference/events.md)). `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.kernel`. Attention uses cuda > flash > torch priority unless explicitly selected by `set_op("attention", ...)` or `attn_backend()`
 (the `ASTR_BACKEND` env var is a deprecated seed). Rotary embedding auto-dispatches to the CUDA op when supported, else torch complex multiply.
 6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` launch the world; `ParallelTopology` decomposes it into `dp × cp × tp` with one process group per mesh dimension — a singleton for inactive dimensions — `CPStrategy`/`CPState` shard sequences across cp ranks, and `TPState` shards Linear projections over features across tp ranks
 7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (`MmapStore`/`JsonlStore`) loads data with explicit `_length` and multi-segment `_data`

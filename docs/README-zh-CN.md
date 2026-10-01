@@ -243,6 +243,7 @@ SSE 流式格式、错误码和统计端点详见[推理文档](guides/inference
 | [数据流程](./developer/dataflow.md) | 数据管道、存储后端与数据集架构 |
 | [内部实现](./developer/internals.md) | 训练原理：损失公式、回调生命周期、KV Cache |
 | [CUDA kernel](./developer/kernels/README.md) | CUDA kernel 文档：GEMM / 注意力 / RoPE 的数学契约、设计笔记与构建 |
+| [推理引擎内部](./developer/inference/README.md) | 推理引擎三层架构(frontend/core/worker)类图、事件流与请求生命周期 |
 | [Docker 服务部署](./developer/docker-serving.md) | YAML 驱动的容器化服务（`serve.yaml`、`serve.sh`） |
 | [Docker 训练部署](./developer/docker-training.md) | YAML 驱动的容器化训练（`train.yaml`、`train.sh`） |
 
