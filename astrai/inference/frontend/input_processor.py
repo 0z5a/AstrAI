@@ -51,6 +51,9 @@ class InputProcessor:
         ids = self._tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         if ids and isinstance(ids[0], list):  # batched tokenizer shape
             ids = ids[0]
+        return self._make_processed_input(prompt, ids)
+
+    def _make_processed_input(self, prompt: str, ids: List[int]) -> ProcessedInput:
         if not ids:
             raise ValueError("prompt encoded to zero tokens; refusing to schedule")
         if len(ids) > self._max_seq_len:
@@ -75,20 +78,10 @@ class InputProcessor:
             isinstance(ids, list) for ids in encoded
         ):
             encoded = [self._coerce_single(self._tokenizer.encode(p)) for p in prompts]
-        out: List[ProcessedInput] = []
-        for prompt, ids in zip(prompts, encoded):
-            if not ids:
-                raise ValueError("prompt encoded to zero tokens; refusing to schedule")
-            if len(ids) > self._max_seq_len:
-                ids = ids[-self._max_seq_len :]
-            out.append(
-                ProcessedInput(
-                    request_id=self.new_request_id(),
-                    prompt_ids=list(ids),
-                    prompt_text=prompt,
-                )
-            )
-        return out
+        return [
+            self._make_processed_input(prompt, ids)
+            for prompt, ids in zip(prompts, encoded)
+        ]
 
     @staticmethod
     def _coerce_single(ids) -> List[int]:

@@ -117,12 +117,15 @@ classDiagram
   `InprocClient` (plain method calls on the live `Scheduler`); a T1
   serving deployment replaces it with a transport client and nothing
   else in the engine or the protocol adapters changes.
-- **`RequestTracker`** holds bounded per-request event queues fed by the
-  scheduler loop thread. The loop thread only appends; all consumer work
-  (detokenize, protocol formatting, user callbacks) runs where the queue
-  is drained. The sink flags the request's finished ``Event`` the moment
-  it queues the terminal event — completion is observable without a
-  consumer folding the stream.
+- **`RequestTracker`** holds bounded per-request event queues for blocking
+  consumers and supports async subscriptions for streaming consumers. A
+  subscriber atomically takes the queued backlog and becomes the live route;
+  the scheduler thread batches notifications per event loop and hands events
+  to each stream's ``asyncio.Queue``. Detokenization and protocol formatting
+  stay on the consumer loop, outside the sink lock. The sink flags the
+  request's finished ``Event`` when it receives the terminal event, so
+  completion is observable without a consumer folding the stream.
+
 
 ## Blocking generate is completion-driven
 

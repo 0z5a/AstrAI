@@ -198,24 +198,19 @@ class InferenceEngine:
         processor = OutputProcessor(
             request_id, self.tokenizer, stop_sequences=stop_sequences
         )
-        loop = asyncio.get_running_loop()
+        queue, pending = tracker.subscribe_async(request_id, asyncio.get_running_loop())
         try:
             while True:
-                for event in tracker.drain(request_id):
+                events = pending if pending else await queue.get()
+                pending = []
+                for event in events:
                     text, _stopped = processor.push(event)
                     if text:
                         yield text
-                    if processor.finished:
+                    if processor.finished or isinstance(event, RequestError):
                         return
-                if tracker.is_finished(request_id):
-                    for event in tracker.drain(request_id):
-                        text, _ = processor.push(event)
-                        if text:
-                            yield text
-                    return
-                await asyncio.to_thread(tracker.wait, request_id, 0.05)
         finally:
-            tracker.unregister(request_id)
+            tracker.unsubscribe_async(request_id)
 
     # ---- public API (signatures unchanged) ----
 
@@ -365,8 +360,16 @@ class InferenceEngine:
             finally:
                 if not self._tracker.is_finished(request_id):
                     self._core.abort_request(request_id)
+                self._tracker.unregister(request_id)
 
         return _agen()
+
+    @staticmethod
+    def _set_terminal_chunk(chunk: StreamChunk, processor: OutputProcessor) -> None:
+        chunk.finish_reason = map_finish_reason(processor.state.finish_reason)
+        chunk.prompt_tokens = processor.state.prompt_tokens
+        chunk.completion_tokens = len(processor.state.token_ids)
+        chunk.stop_sequence = processor.state.stop_sequence
 
     def generate_events(
         self,
@@ -379,7 +382,7 @@ class InferenceEngine:
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
         stop_sequences: Optional[List[str]] = None,
-    ) -> AsyncGenerator["_StreamChunk", None]:
+    ) -> AsyncGenerator["StreamChunk", None]:
         """Async generation yielding structured chunks (vLLM OutputProcessor).
 
         Each chunk carries the incremental ``text`` plus the running token
@@ -404,9 +407,14 @@ class InferenceEngine:
                 self.tokenizer,
                 stop_sequences=stop_sequences,
             )
+            queue, pending = tracker.subscribe_async(
+                request_id, asyncio.get_running_loop()
+            )
             try:
                 while True:
-                    for event in tracker.drain(request_id):
+                    events = pending if pending else await queue.get()
+                    pending = []
+                    for event in events:
                         text, stopped = processor.push(event)
                         delta_ids = (
                             [event.token_id] if isinstance(event, TokenDelta) else []
@@ -419,36 +427,13 @@ class InferenceEngine:
                                 stopped=stopped,
                             )
                             if processor.finished:
-                                chunk.finish_reason = map_finish_reason(
-                                    processor.state.finish_reason
-                                )
-                                chunk.prompt_tokens = processor.state.prompt_tokens
-                                chunk.completion_tokens = len(processor.state.token_ids)
-                                chunk.stop_sequence = processor.state.stop_sequence
+                                self._set_terminal_chunk(chunk, processor)
                             yield chunk
-                        if processor.finished:
+                        if processor.finished or isinstance(event, RequestError):
                             return
-                    if tracker.is_finished(request_id):
-                        for event in tracker.drain(request_id):
-                            processor.push(event)
-                        if processor.finished:
-                            chunk = StreamChunk(
-                                text="",
-                                delta_token_ids=[],
-                                current_token_ids=list(processor.state.token_ids),
-                                stopped=False,
-                            )
-                            chunk.finish_reason = map_finish_reason(
-                                processor.state.finish_reason
-                            )
-                            chunk.prompt_tokens = processor.state.prompt_tokens
-                            chunk.completion_tokens = len(processor.state.token_ids)
-                            chunk.stop_sequence = processor.state.stop_sequence
-                            yield chunk
-                        return
-                    await asyncio.to_thread(tracker.wait, request_id, 0.05)
             finally:
-                if not processor.finished:
+                tracker.unsubscribe_async(request_id)
+                if not processor.finished and not tracker.is_finished(request_id):
                     self._core.abort_request(request_id)
                 tracker.unregister(request_id)
 
@@ -457,25 +442,27 @@ class InferenceEngine:
     def _collect_blocking(
         self, request_ids: List[str], is_batch: bool
     ) -> Union[str, List[str]]:
-        """Non-streaming tail of ``generate``: wait for every request's
-        terminal event, then fold all output at once on the caller's thread.
+        """Wait for terminal events, then decode each request's tokens once."""
+        bulk_decode = getattr(self.tokenizer, "_tokenizer", None) is not None
+        return self._collect_blocking_events(request_ids, is_batch, bulk_decode)
 
-        The core's event contract ends every request with exactly one
-        terminal event, queued after all of its tokens, and the sink flags
-        the tracker as it queues that event.  The caller therefore parks on
-        ``Event.wait`` — no thread wakes per scheduler step, no GIL relay
-        with the decode loop — and detokenization runs once, after the
-        batch has finished, where the non-streaming consumer wants it.
-        """
+    def _collect_blocking_incremental(
+        self, request_ids: List[str], is_batch: bool
+    ) -> Union[str, List[str]]:
+        return self._collect_blocking_events(request_ids, is_batch, bulk_decode=False)
+
+    def _collect_blocking_events(
+        self, request_ids: List[str], is_batch: bool, bulk_decode: bool
+    ) -> Union[str, List[str]]:
         deadline = time.monotonic() + _GENERATE_TIMEOUT_S
         for rid in request_ids:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not self._tracker.wait(rid, timeout=remaining):
                 completed = sum(1 for r in request_ids if self._tracker.is_finished(r))
-                for r in request_ids:
-                    self._core.abort_request(r)
-                for r in request_ids:
-                    self._tracker.unregister(r)
+                for request_id in request_ids:
+                    self._core.abort_request(request_id)
+                for request_id in request_ids:
+                    self._tracker.unregister(request_id)
                 raise TimeoutError(
                     f"Generation timeout after {_GENERATE_TIMEOUT_S}s "
                     f"({completed}/{len(request_ids)} completed)"
@@ -483,25 +470,46 @@ class InferenceEngine:
 
         results = [""] * len(request_ids)
         for idx, rid in enumerate(request_ids):
-            proc = OutputProcessor(rid, self.tokenizer)
             try:
-                for event in self._tracker.drain(rid):
+                events = self._tracker.drain(rid)
+                if not bulk_decode:
+                    results[idx] = self._fold_events_incrementally(rid, events)
+                    continue
+
+                token_ids = []
+                for event in events:
                     if isinstance(event, RequestError):
-                        logger.error(
-                            "request %s failed (%s): %s",
-                            rid,
-                            event.error_code,
-                            event.message,
-                        )
+                        results[idx] = self._fold_events_incrementally(rid, events)
                         break
-                    proc.push(event)
+                    if isinstance(event, TokenDelta):
+                        token_ids.append(event.token_id)
+                else:
+                    try:
+                        results[idx] = self.tokenizer.decode(
+                            token_ids, skip_special_tokens=True
+                        )
+                    except Exception:
+                        logger.exception("bulk output decode failed for %s", rid)
+                        results[idx] = self._fold_events_incrementally(rid, events)
             except Exception:
-                # The request already finished; keep its partial text
-                # rather than losing the whole batch to one bad fold.
                 logger.exception("output fold failed for %s", rid)
-            results[idx] = proc.state.text
-            self._tracker.unregister(rid)
+            finally:
+                self._tracker.unregister(rid)
         return results if is_batch else results[0]
+
+    def _fold_events_incrementally(self, request_id: str, events: List[Any]) -> str:
+        proc = OutputProcessor(request_id, self.tokenizer)
+        for event in events:
+            if isinstance(event, RequestError):
+                logger.error(
+                    "request %s failed (%s): %s",
+                    request_id,
+                    event.error_code,
+                    event.message,
+                )
+                break
+            proc.push(event)
+        return proc.state.text
 
     def _generate(
         self,

@@ -5,9 +5,10 @@ the bounded per-request queues the scheduler loop appends into, and the
 chunk type carries structured output to protocol adapters.
 """
 
+import asyncio
 import threading
 from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from astrai.inference.core.events import (
     RequestError,
@@ -16,13 +17,17 @@ from astrai.inference.core.events import (
 from astrai.inference.core.scheduler import OutputEventSink
 
 
+def _deliver_async_events(deliveries) -> None:
+    for queue, events in deliveries:
+        queue.put_nowait(events)
+
+
 class EventQueueSink(OutputEventSink):
     """Bounded per-request event queues, fed by the scheduler loop thread.
 
-    The loop thread only appends and notifies — consumer code (detokenize,
-    protocol formatting, user callbacks) runs wherever the queue is
-    drained.  The bound is per request, not global: a slow consumer
-    applies backpressure to its own requests only.
+    The scheduler thread appends to bounded queues for blocking consumers
+    and forwards subscribed async streams to their event loop. Consumer code
+    (detokenize, protocol formatting, user callbacks) runs outside the sink.
 
     When a terminal event (:class:`RequestFinished` / :class:`RequestError`)
     is queued, ``on_terminal`` fires for that request — the core's event
@@ -38,6 +43,9 @@ class EventQueueSink(OutputEventSink):
     ):
         self._lock = threading.Lock()
         self._queues: Dict[str, Deque[Any]] = {}
+        self._async_subscribers: Dict[
+            str, Tuple[asyncio.AbstractEventLoop, asyncio.Queue]
+        ] = {}
         self._maxlen = maxlen
         self._on_terminal = on_terminal
 
@@ -49,20 +57,63 @@ class EventQueueSink(OutputEventSink):
     def unregister(self, request_id: str) -> None:
         with self._lock:
             self._queues.pop(request_id, None)
+            self._async_subscribers.pop(request_id, None)
+
+    def subscribe_async(
+        self, request_id: str, loop: asyncio.AbstractEventLoop
+    ) -> Tuple[asyncio.Queue, List[Any]]:
+        queue = asyncio.Queue()
+        with self._lock:
+            events = self._queues.get(request_id)
+            if events is None:
+                raise KeyError(f"request {request_id!r} is not registered")
+            pending = list(events)
+            events.clear()
+            self._async_subscribers[request_id] = (loop, queue)
+        return queue, pending
+
+    def unsubscribe_async(self, request_id: str) -> None:
+        with self._lock:
+            self._async_subscribers.pop(request_id, None)
 
     def __call__(self, events: List[Any]) -> None:
-        # Fast path: bucket events per request under one lock, then notify.
         terminal: List[str] = []
+        by_loop: Dict[
+            asyncio.AbstractEventLoop, List[Tuple[str, asyncio.Queue, List[Any]]]
+        ] = {}
         with self._lock:
             for event in events:
                 rid = event.request_id
                 queue = self._queues.get(rid)
-                if queue is not None:
+                subscriber = self._async_subscribers.get(rid)
+                if subscriber is not None:
+                    loop, async_queue = subscriber
+                    deliveries = by_loop.setdefault(loop, [])
+                    if deliveries and deliveries[-1][1] is async_queue:
+                        deliveries[-1][2].append(event)
+                    else:
+                        deliveries.append((rid, async_queue, [event]))
+                elif queue is not None:
                     queue.append(event)
-                    if isinstance(event, (RequestFinished, RequestError)):
-                        terminal.append(rid)
-        # Signalled outside the lock, after the terminal event is queued:
-        # a woken consumer always finds it in the drain.
+                if queue is not None and isinstance(
+                    event, (RequestFinished, RequestError)
+                ):
+                    terminal.append(rid)
+
+        for loop, deliveries in by_loop.items():
+            scheduled = [(queue, batch) for _, queue, batch in deliveries]
+            try:
+                loop.call_soon_threadsafe(_deliver_async_events, scheduled)
+            except RuntimeError:
+                with self._lock:
+                    for rid, queue, batch in deliveries:
+                        if self._async_subscribers.get(rid) != (loop, queue):
+                            continue
+                        self._async_subscribers.pop(rid, None)
+                        pending = self._queues.get(rid)
+                        if pending is not None:
+                            pending.extend(batch)
+
         if self._on_terminal is not None:
             for rid in terminal:
                 self._on_terminal(rid)
@@ -112,6 +163,14 @@ class RequestTracker:
             done = self._finished.get(request_id)
         if done is not None:
             done.set()
+
+    def subscribe_async(
+        self, request_id: str, loop: asyncio.AbstractEventLoop
+    ) -> Tuple[asyncio.Queue, List[Any]]:
+        return self._sink.subscribe_async(request_id, loop)
+
+    def unsubscribe_async(self, request_id: str) -> None:
+        self._sink.unsubscribe_async(request_id)
 
     def drain(self, request_id: str) -> List[Any]:
         """Pop all pending events for one request (non-blocking)."""

@@ -1,7 +1,7 @@
 import json
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import click
 import torch
@@ -19,6 +19,21 @@ from astrai.tokenize import AutoTokenizer
 _DTYPES = ["bfloat16", "float16", "float32"]
 _CACHES = ["contiguous", "paged"]
 _BACKENDS = AttentionBackendFactory.list_registered()
+
+
+def _parse_kv_windows(value: Optional[str]) -> List[int]:
+    if value is None or not value.strip():
+        return []
+    try:
+        windows = [int(part.strip()) for part in value.split(",")]
+    except ValueError as exc:
+        raise click.BadParameter("KV windows must be comma-separated integers") from exc
+    if any(window < 4 for window in windows):
+        raise click.BadParameter("KV windows must be at least 4 tokens")
+    if len(set(windows)) != len(windows):
+        raise click.BadParameter("KV windows must not contain duplicates")
+    return windows
+
 
 # Default 1B GQA preset matching the project checkpoint architecture.
 _DEFAULT_CONFIG = {
@@ -117,26 +132,40 @@ class GenerationBenchmark:
         batch_size: int,
         prompt_len: int,
         workspace: InferenceWorkspace,
+        skip_lm_head: bool = False,
+        prefill_chunk_size: Optional[int] = None,
     ) -> list:
-        input_ids = torch.randint(
-            0, self.config.vocab_size, (batch_size * prompt_len,), device=self.device
+        token_ids = torch.randint(
+            0,
+            self.config.vocab_size,
+            (batch_size, prompt_len),
+            device=self.device,
         )
-        position_ids = torch.arange(
-            prompt_len, dtype=torch.long, device=self.device
-        ).repeat(batch_size)
+        chunk_size = prefill_chunk_size or prompt_len
 
         request_ids = [f"bench_{i}" for i in range(batch_size)]
         for tid in request_ids:
             task_cache.alloc_slots(tid, list(range(prompt_len)))
 
-        kv_cache = task_cache.bind(request_ids, workspace, self.device, start_pos=0)
         with torch.inference_mode(), attn_backend(self.backend):
-            self.model(
-                input_ids,
-                kv_cache=kv_cache,
-                position_ids=position_ids,
-                fwd="prefill",
-            )
+            for start_pos in range(0, prompt_len, chunk_size):
+                end_pos = min(start_pos + chunk_size, prompt_len)
+                kv_cache = task_cache.bind(
+                    request_ids,
+                    workspace,
+                    self.device,
+                    start_pos=start_pos,
+                    seq_ends=[end_pos] * batch_size,
+                )
+                self.model(
+                    token_ids[:, start_pos:end_pos].reshape(-1),
+                    kv_cache=kv_cache,
+                    position_ids=torch.arange(
+                        start_pos, end_pos, dtype=torch.long, device=self.device
+                    ).repeat(batch_size),
+                    fwd="prefill",
+                    skip_lm_head=skip_lm_head,
+                )
         torch.cuda.synchronize()
         return request_ids
 
@@ -305,6 +334,97 @@ class GenerationBenchmark:
             },
         )
 
+    def run_fixed_kv_decode_benchmark(
+        self,
+        batch_size: int,
+        kv_len: int,
+        window_steps: int,
+    ) -> BenchmarkResult:
+        if kv_len < 4:
+            raise ValueError("kv_len must be at least 4 for graph warmup")
+        if window_steps < 1:
+            raise ValueError("window_steps must be positive")
+
+        max_seq_len = kv_len + window_steps + 1
+        pool = self._make_pool(batch_size, max_seq_len)
+        workspace = self._make_workspace(pool, self.config)
+        task_cache = self._make_task_cache(pool)
+        warmup_len = kv_len - 3
+        request_ids = self._run_prefill(
+            pool,
+            task_cache,
+            batch_size,
+            warmup_len,
+            workspace,
+            skip_lm_head=True,
+            prefill_chunk_size=256,
+        )
+
+        b = batch_size
+        input_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
+        position_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
+        gctx = CUDAGraphRunner(enabled=True)
+        graph_key = (b,)
+
+        def decode_graph_step(
+            seq_len: int,
+            start_event: Optional[torch.cuda.Event] = None,
+            end_event: Optional[torch.cuda.Event] = None,
+        ) -> None:
+            input_ids_buf.copy_(
+                torch.randint(0, self.config.vocab_size, (b,), device=self.device)
+            )
+            position_ids_buf[:] = seq_len
+            if not all(task_cache.extend_slots_batch(request_ids, [seq_len] * b)):
+                raise RuntimeError("failed to extend KV slots for fixed-KV benchmark")
+            kv_cache = task_cache.bind(request_ids, workspace, self.device)
+            with torch.inference_mode(), attn_backend(self.backend):
+                if start_event is not None:
+                    start_event.record()
+                gctx.forward(
+                    self.model,
+                    key=graph_key,
+                    input_ids=input_ids_buf,
+                    kv_cache=kv_cache,
+                    position_ids=position_ids_buf,
+                    fwd="decode",
+                )
+                if end_event is not None:
+                    end_event.record()
+
+        for seq_len in range(warmup_len, kv_len):
+            decode_graph_step(seq_len)
+        torch.cuda.synchronize()
+
+        start_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(window_steps)
+        ]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(window_steps)]
+        for index, seq_len in enumerate(range(kv_len, kv_len + window_steps)):
+            decode_graph_step(seq_len, start_events[index], end_events[index])
+        torch.cuda.synchronize()
+        elapsed_ms = sum(
+            start.elapsed_time(end) for start, end in zip(start_events, end_events)
+        )
+        elapsed = elapsed_ms / 1000
+        tokens = batch_size * window_steps
+        return BenchmarkResult(
+            name="decode",
+            batch_size=batch_size,
+            seq_len=window_steps,
+            tokens_per_second=tokens / elapsed,
+            latency_ms=elapsed_ms / window_steps,
+            metadata={
+                "benchmark_type": "fixed_kv_decode",
+                "kv_len_range": [kv_len + 1, kv_len + window_steps],
+                "window_steps": window_steps,
+                "timing": "cuda_event_model_forward",
+                "cache": self.cache_type,
+                "backend": str(self.backend),
+                "cuda_graph": True,
+            },
+        )
+
     def _run_graph_decode_benchmark(
         self,
         batch_size: int,
@@ -449,6 +569,18 @@ def print_benchmark_result(result: BenchmarkResult) -> None:
 @click.option("--prompt_length", type=int, default=512, help="Prompt length.")
 @click.option("--gen_length", type=int, default=128, help="Generation length.")
 @click.option("--num_trials", type=int, default=5, help="Number of trials.")
+@click.option(
+    "--kv-windows",
+    default=None,
+    help="Comma-separated KV lengths for fixed-context decode measurements.",
+)
+@click.option(
+    "--window-steps",
+    type=click.IntRange(min=1),
+    default=64,
+    show_default=True,
+    help="Decode steps measured at each fixed-KV window.",
+)
 @click.option("--prefill_only", is_flag=True, help="Prefill benchmark only.")
 @click.option("--decode_only", is_flag=True, help="Decode benchmark only.")
 @click.option(
@@ -488,6 +620,8 @@ def benchmark_command(
     prompt_length: int,
     gen_length: int,
     num_trials: int,
+    kv_windows: Optional[str],
+    window_steps: int,
     prefill_only: bool,
     decode_only: bool,
     cuda_graph: bool,
@@ -501,6 +635,14 @@ def benchmark_command(
         "float16": torch.float16,
         "float32": torch.float32,
     }
+    kv_window_values = _parse_kv_windows(kv_windows)
+    if kv_window_values and (prefill_only or not decode_only):
+        raise click.BadParameter(
+            "--kv-windows requires --decode-only and cannot be combined "
+            "with --prefill_only"
+        )
+    if kv_window_values and not cuda_graph:
+        raise click.BadParameter("--kv-windows requires CUDA graphs")
 
     if ckpt is not None:
         click.echo(f"Loading model from {ckpt} ...")
@@ -521,7 +663,11 @@ def benchmark_command(
             f"({sum(p.numel() for p in model.parameters()) / 1e9:.2f}B params)"
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(ckpt or Path("params"))
+    tokenizer = (
+        None
+        if kv_window_values
+        else AutoTokenizer.from_pretrained(ckpt or Path("params"))
+    )
 
     model.to(device=device, dtype=dtype_map[dtype])
     model.eval()
@@ -544,23 +690,34 @@ def benchmark_command(
             f"Benchmark: device={device} dtype={dtype} backend={name}", bold=True
         )
 
-        if not decode_only:
-            result = bench.run_prefill_benchmark(
-                batch_size=batch_size,
-                prompt_length=prompt_length,
-                num_trials=num_trials,
-            )
-            print_benchmark_result(result)
+        if kv_window_values:
+            for kv_len in kv_window_values:
+                result = bench.run_fixed_kv_decode_benchmark(
+                    batch_size=batch_size,
+                    kv_len=kv_len,
+                    window_steps=window_steps,
+                )
+                print_benchmark_result(result)
+                if device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+        else:
+            if not decode_only:
+                result = bench.run_prefill_benchmark(
+                    batch_size=batch_size,
+                    prompt_length=prompt_length,
+                    num_trials=num_trials,
+                )
+                print_benchmark_result(result)
 
-        if not prefill_only:
-            result = bench.run_decoding_benchmark(
-                batch_size=batch_size,
-                prompt_length=prompt_length,
-                gen_length=gen_length,
-                num_trials=num_trials,
-                overlap=overlap,
-            )
-            print_benchmark_result(result)
+            if not prefill_only:
+                result = bench.run_decoding_benchmark(
+                    batch_size=batch_size,
+                    prompt_length=prompt_length,
+                    gen_length=gen_length,
+                    num_trials=num_trials,
+                    overlap=overlap,
+                )
+                print_benchmark_result(result)
 
 
 if __name__ == "__main__":
