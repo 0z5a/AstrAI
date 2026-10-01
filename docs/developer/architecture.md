@@ -876,7 +876,7 @@ classDiagram
             +shutdown()
         }
 
-        class Executor {
+        class GPUModelRunner {
             +AutoModel model
             +PagePool kv_cache
             +TaskCacheManager task_cache
@@ -908,7 +908,7 @@ classDiagram
         class InferenceScheduler {
             +PagePool _cache
             +TaskCacheManager _task_cache
-            +Executor _executor
+            +GPUModelRunner _executor
             +TaskManager _task_mgr
             +Event _stop_event
             +Thread _loop_thread
@@ -1461,8 +1461,8 @@ classDiagram
     InferenceEngine *-- InferenceScheduler
     InferenceScheduler *-- PagePool
     InferenceScheduler *-- TaskCacheManager
-    InferenceScheduler *-- Executor
-    Executor *-- InferenceWorkspace
+    InferenceScheduler *-- GPUModelRunner
+    GPUModelRunner *-- InferenceWorkspace
     InferenceScheduler *-- TaskManager
     AutoRegressiveLM *-- DecoderBlock
     AutoRegressiveLM *-- RotaryEmbedding
@@ -1558,8 +1558,8 @@ classDiagram
     InferenceScheduler --> TaskStatus
     Task --> TaskStatus
     InferenceEngine --> AutoModel
-    Executor --> AutoModel
-    Executor --> TaskCacheManager
+    GPUModelRunner --> AutoModel
+    GPUModelRunner --> TaskCacheManager
     TaskManager --> AutoTokenizer
 
 ```
@@ -1576,8 +1576,8 @@ classDiagram
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator, RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher | Training workflow (online RL rollout via injectable backends) |
-| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, InferenceWorkspace, PagePool, TaskCacheManager, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, AllocationStrategy, ContiguousStrategy, PagedStrategy, Task, TaskManager, TaskStatus, StreamDecoder, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
-| **astrai.extension** | `backend` policy package, `ops` kernel-wrapper package, `fp8.py` FP8 strategy layer, AttentionBackend, TorchNativeBackend, CudaBackend, FlashAttnBackend, attention, attn_backend, ATTN_BACKEND, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
+| **astrai.inference** | InferenceEngine, InferenceScheduler, GPUModelRunner, InferenceWorkspace, PagePool, TaskCacheManager, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, AllocationStrategy, ContiguousStrategy, PagedStrategy, Task, TaskManager, TaskStatus, StreamDecoder, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
+| **astrai.extension** | `backend` policy package, `kernel` kernel-wrapper package, `fp8.py` FP8 strategy layer, AttentionBackend, TorchNativeBackend, CudaBackend, FlashAttnBackend, attention, attn_backend, ATTN_BACKEND, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optim** | OptimizerFactory, MuonAdamW, NoraNadamW, ManoAdamW, composite_step/composite_zero_grad/composite_state_dict, partition_optimizer_parameters | Built-in optimizers (`muon_adamw` / `nora_nadamw` / `mano_adamw`) with shared composite-optimizer helpers |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch, executors & gradient accumulation |
 | **astrai.factory** | BaseFactory | Component registration |
@@ -1597,7 +1597,7 @@ classDiagram
 | **Context** | `TrainContext` | Unified training state bag |
 | **Object Pool** | `Allocator`, `PagePool` | Page-based KV cache with LRU eviction |
 | **Strategy (Attention)** | `AttentionBackend`, `CudaBackend`, `FlashAttnBackend`, `TorchNativeBackend` | Attention computation backend switching via context manager |
-| **Auto-dispatch (Rotary)** | `apply_rotary_emb`, `backend/rotary.py`, `ops/rotary.py` | Rotary embedding CUDA kernel auto-dispatch with torch fallback |
+| **Auto-dispatch (Rotary)** | `apply_rotary_emb`, `backend/rotary.py`, `kernel/rotary.py` | Rotary embedding CUDA kernel auto-dispatch with torch fallback |
 | **Executor** | `BaseExecutor`, `NoneExecutor`, `DDPExecutor`, `FSDPExecutor` | Gradient accumulation & model distribution |
 | **Storage** | `Store`, `MmapStore`, `JsonlStore` | Format-agnostic data access with multi-segment support |
 | **Producer-Consumer** | `InferenceScheduler`, `Task`, queues | Continuous batching |
@@ -1610,7 +1610,7 @@ classDiagram
 2. **Training Flow**: `Trainer` → `TrainContextBuilder` → `TrainContext`, uses `BaseStrategy` for loss, `BaseExecutor` for gradient accumulation + model distribution; with `cp_size > 1` the strategy is wrapped in `CPStrategy` (sequence sharding + ring attention)
 3. **Strategy Selection**: `StrategyFactory` creates strategy by `train_type`
 4. **Executor Selection**: `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
-5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.ops`. Attention uses cuda > flash > torch priority unless explicitly selected by `set_op("attention", ...)` or `attn_backend()`
+5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.kernel`. Attention uses cuda > flash > torch priority unless explicitly selected by `set_op("attention", ...)` or `attn_backend()`
 (the `ASTR_BACKEND` env var is a deprecated seed). Rotary embedding auto-dispatches to the CUDA op when supported, else torch complex multiply.
 6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` launch the world; `ParallelTopology` decomposes it into `dp × cp × tp` with one process group per mesh dimension — a singleton for inactive dimensions — `CPStrategy`/`CPState` shard sequences across cp ranks, and `TPState` shards Linear projections over features across tp ranks
 7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (`MmapStore`/`JsonlStore`) loads data with explicit `_length` and multi-segment `_data`

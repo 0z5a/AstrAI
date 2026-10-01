@@ -7,7 +7,7 @@ seq_lens with padding mask), and end-to-end scheduler.run_batch.
 import torch
 
 from astrai.extension import ATTN_BACKEND, attn_backend
-from astrai.extension.ops.attention import attn_paged_decode
+from astrai.extension.kernel.attention import attn_paged_decode
 from astrai.inference.cache import PagePool, TaskCacheManager
 from astrai.inference.runtime.graph import CudaGraphContext
 from astrai.inference.scheduler import InferenceScheduler

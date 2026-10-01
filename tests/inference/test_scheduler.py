@@ -2,6 +2,7 @@
 
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,9 +12,17 @@ import torch
 from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
 from astrai.inference import GenerationResult, InferenceScheduler
 from astrai.inference.metrics import MetricsCollector
-from astrai.inference.runtime.executor import DecodeSteadyState, Executor
+from astrai.inference.runtime.model_runner import (
+    DecodeSteadyState,
+    GPUModelRunner,
+)
+from astrai.inference.runtime.pending import (
+    BatchSnapshot,
+    PendingStep,
+    ResultRing,
+)
 from astrai.inference.runtime.stepper import Stepper
-from astrai.inference.task import Task
+from astrai.inference.task import STOP, BatchedStreamCallback, Task
 from astrai.model.transformer import AutoRegressiveLM
 from tests.helpers import FakeTokenizer, make_rollout_config
 
@@ -93,6 +102,10 @@ def test_generation_loop_activates_backend_in_worker_thread():
     scheduler._backend = TorchNativeBackend()
     scheduler._stop_event = threading.Event()
     scheduler._task_cache = MagicMock()
+    scheduler._retired = []
+    scheduler._executor = MagicMock()
+    scheduler._executor.peek_pending.return_value = None
+    scheduler._stepper = MagicMock()
 
     observed = []
     task_mgr = MagicMock()
@@ -123,6 +136,7 @@ def test_step_splits_decode_batch_by_request_backend():
     scheduler._cache = SimpleNamespace(page_size=1)
     scheduler._task_cache = MagicMock()
     scheduler._task_cache.task_extend.return_value = True
+    scheduler._task_cache.task_extend_batch.return_value = [True, True]
     scheduler._metrics = MetricsCollector()
     scheduler._executor = MagicMock()
     scheduler._stepper = Stepper(
@@ -131,11 +145,20 @@ def test_step_splits_decode_batch_by_request_backend():
 
     observed = []
 
-    def execute(tasks, **kwargs):
+    def submit(*args, **kwargs):
+        tasks = args[0]
         observed.append((type(get_backend()), [task.task_id for task in tasks]))
-        return [1] * len(tasks)
+        return PendingStep(
+            snapshot=BatchSnapshot(
+                task_ids=tuple(t.task_id for t in tasks),
+                kv_positions=(0,),
+                policy_version=0,
+            ),
+            tasks=list(tasks),
+            tokens=torch.tensor([1] * len(tasks), dtype=torch.long),
+        )
 
-    scheduler._executor.execute_decode.side_effect = execute
+    scheduler._executor.submit_decode.side_effect = submit
 
     torch_task = Task("torch", [1], backend=TorchNativeBackend())
     cuda_task = Task("cuda", [1], backend=CudaBackend())
@@ -173,7 +196,11 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
 
     scheduler._executor.execute_prefill.return_value = (
         [long, short],
-        [11, 12],
+        PendingStep(
+            snapshot=BatchSnapshot(("long", "short"), (0,), 0),
+            tasks=[long, short],
+            tokens=torch.tensor([11, 12], dtype=torch.long),
+        ),
     )
 
     produced, aborted = scheduler._step([short, long])
@@ -188,7 +215,7 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
 
 
 def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
-    executor = object.__new__(Executor)
+    executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
     executor.task_cache = MagicMock()
     executor.task_cache.bind.return_value = MagicMock()
@@ -200,17 +227,21 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
         return {"logits": all_logits[logits_positions]}
 
     executor.model = MagicMock(side_effect=fake_model)
-    executor._sample_logits = MagicMock(
-        return_value=([101, 102], torch.tensor([101, 102]))
+    executor._submit_sample = MagicMock(
+        return_value=PendingStep(
+            snapshot=BatchSnapshot(("a", "b"), (0,), 0),
+            tasks=[],
+            tokens=torch.tensor([101, 102]),
+        )
     )
 
     task_b = Task("b", [20, 21, 22, 23, 24])
     task_a = Task("a", [10, 11, 12])
 
-    tasks, output = executor.execute_prefill([task_b, task_a], start_pos=1)
+    tasks, pending = executor.execute_prefill([task_b, task_a], start_pos=1)
 
     assert tasks == [task_a, task_b]
-    assert output == [101, 102]
+    assert pending.commit() == [(101, None), (102, None)]
     model_args, model_kwargs = executor.model.call_args
     assert model_args[0].tolist() == [11, 12, 21, 22, 23, 24]
     assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
@@ -218,7 +249,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     executor.task_cache.bind.assert_called_once_with(
         ["a", "b"], executor._workspace, start_pos=1
     )
-    sample_args, sample_kwargs = executor._sample_logits.call_args
+    sample_args, sample_kwargs = executor._submit_sample.call_args
     torch.testing.assert_close(sample_args[0], all_logits[[1, 5]])
     assert sample_args[1] == [task_a, task_b]
     assert sample_args[2] is False
@@ -739,13 +770,15 @@ def test_run_batch_details_report_extension_failure_and_cleanup(device):
 
 
 def test_decode_does_not_reuse_previous_batch_state():
-    executor = object.__new__(Executor)
+    executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
     executor.task_cache = MagicMock()
     executor.task_cache.bind_was_steady = True
     executor.task_cache.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
+    executor._pending = None
+    executor._result_ring = ResultRing(16, executor.device)
 
     workspace = MagicMock()
     workspace.max_batch_size = 16
@@ -758,11 +791,14 @@ def test_decode_does_not_reuse_previous_batch_state():
     )
 
     old_info = object()
-    new_info = object()
+    new_info = SimpleNamespace(has_freq=False)
     executor._decode_cache = DecodeSteadyState(("old",), [2], old_info)
-    executor._sample_logits = MagicMock(
-        return_value=([3], torch.tensor([3], dtype=torch.long))
+    pending_result = PendingStep(
+        snapshot=BatchSnapshot(("new",), (8,), 0),
+        tasks=[],
+        tokens=torch.tensor([3], dtype=torch.long),
     )
+    executor._submit_sample = MagicMock(return_value=pending_result)
 
     task = Task("new", list(range(8)), temperature=0)
     task.input_tokens = 8
@@ -770,22 +806,22 @@ def test_decode_does_not_reuse_previous_batch_state():
     task.mark_prefill_done()
 
     with patch(
-        "astrai.inference.runtime.executor._build_sampling_batch_info",
+        "astrai.inference.runtime.model_runner._build_sampling_batch_info",
         return_value=new_info,
     ):
         assert executor.execute_decode([task]) == [3]
 
     assert workspace.position_ids.tolist() == [8]
     assert executor._decode_cache.task_sig == ("new",)
-    executor._sample_logits.assert_called_once()
-    args, kwargs = executor._sample_logits.call_args
+    executor._submit_sample.assert_called_once()
+    args, kwargs = executor._submit_sample.call_args
     assert args[1:] == ([task], False)
     assert kwargs["info"] is new_info
 
 
 def test_decode_fills_input_ids_from_device_on_matching_signature():
     """Steady-state decode copies cached device tokens, skipping the host."""
-    executor = object.__new__(Executor)
+    executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
     executor.task_cache = MagicMock()
     executor.task_cache.bind_was_steady = True
@@ -804,10 +840,16 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
         return_value={"logits": torch.zeros(1, 1, 10, dtype=torch.float32)}
     )
 
-    info = object()
+    info = SimpleNamespace(has_freq=False)
     tokens = torch.tensor([3], dtype=torch.long)
     executor._decode_cache = DecodeSteadyState(("t1",), [2], info, last_tokens=tokens)
-    executor._sample_logits = MagicMock(return_value=([3], tokens))
+    executor._pending = None
+    executor._result_ring = ResultRing(16, executor.device)
+    executor._submit_sample = MagicMock(
+        return_value=PendingStep(
+            snapshot=BatchSnapshot(("t1",), (3,), 0), tasks=[], tokens=tokens
+        )
+    )
 
     task = Task("t1", list(range(8)), temperature=0)
     task.input_tokens = 8
@@ -815,7 +857,7 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     task.mark_prefill_done()
 
     with patch(
-        "astrai.inference.runtime.executor._build_sampling_batch_info",
+        "astrai.inference.runtime.model_runner._build_sampling_batch_info",
         return_value=info,
     ):
         assert executor.execute_decode([task]) == [3]
@@ -883,6 +925,64 @@ def test_scheduler_release_resume_preserves_greedy_generation(device, monkeypatc
         scheduler.stop()
 
 
+class _MultiPatch:
+    def __init__(self, patches):
+        self._patches = patches
+
+    def __enter__(self):
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in self._patches:
+            p.stop()
+        return False
+
+
+def test_steady_decode_submit_path_is_sync_free(device):
+    """Gate: no hidden device-to-host syncs on the steady decode hot path.
+
+    After the first decode step of an unchanged batch (the steady state the
+    serving loop lives in), one ``execute_decode`` call must not resolve any
+    device predicate or scalar to host: ``Tensor.item``/``any``/``all``
+    probes are patched to raise, and only ``tolist`` stays legal (it is
+    the single intentional commit point that yields the sampled tokens).
+    """
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        prompts = [[10, 20, 30, 40], [5, 6, 7, 8]]
+        # First run_batch call warms everything the steady state touches
+        # (prefill, first decode, sampling-info build) so the instrumented
+        # second batch enters steady state from its first step.
+        scheduler.run_batch(prompts, max_tokens=2, temperature=0.7, top_k=10)
+        torch.manual_seed(1234)
+
+        banned = (
+            torch.Tensor.item,
+            torch.Tensor.any,
+            torch.Tensor.all,
+        )
+        calls: list = []
+
+        def _spy(name, orig):
+            def _impl(self, *a, **k):
+                calls.append(name)
+                return orig(self, *a, **k)
+
+            return _impl
+
+        patched = tuple(
+            patch.object(torch.Tensor, name, _spy(name, orig))
+            for name, orig in zip(("item", "any", "all"), banned)
+        )
+        with _MultiPatch(patched):
+            scheduler.run_batch(prompts, max_tokens=2, temperature=0.7, top_k=10)
+        assert not calls, f"steady decode resolved device predicates on host: {calls}"
+    finally:
+        scheduler.stop()
+
+
 def test_scheduler_release_rejects_externally_owned_cache(device):
     scheduler, tokenizer, model = _make_real_scheduler(device)
     external_cache = scheduler._cache
@@ -902,3 +1002,268 @@ def test_scheduler_release_rejects_externally_owned_cache(device):
         assert external_scheduler._cache is external_cache
     finally:
         external_scheduler.stop()
+
+
+def test_run_batch_greedy_reproducible_across_calls(device):
+    """Greedy decode is bit-identical across invocations of one scheduler.
+
+    Guards the submit/commit split without RNG in play: argmax tokens must
+    be stable when the same batch runs twice through the same engine.
+
+    Stochastic reproducibility across run_batch calls is deliberately NOT
+    asserted: bf16 GEMM reductions are not bit-deterministic under
+    different kernel interleavings, and the async result relay changes the
+    host/GPU overlap between calls. Same-seed replay is only guaranteed
+    within identical execution conditions.
+    """
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        prompts = [[10, 20, 30, 40], [7, 8, 9]]
+        first = scheduler.run_batch(prompts, max_tokens=6, temperature=0)
+        second = scheduler.run_batch(prompts, max_tokens=6, temperature=0)
+        assert first == second
+        assert all(len(ids) == 6 for ids in first)
+    finally:
+        scheduler.stop()
+
+
+def test_pending_step_commit_is_idempotent(device):
+    """A committed step cannot double-append tokens to its tasks."""
+    tokens = torch.tensor([5, 6], dtype=torch.long)
+    logprobs = torch.tensor([-1.5, -2.5], dtype=torch.float32)
+    pending = PendingStep(
+        snapshot=BatchSnapshot(("a", "b"), (0, 0), 0),
+        tasks=[object(), object()],
+        tokens=tokens,
+        logprobs=logprobs,
+    )
+    first = pending.commit()
+    second = pending.commit()
+    assert first == second
+    assert first == [(5, -1.5), (6, -2.5)]
+    assert pending.committed
+
+
+def test_submit_decode_returns_pending_without_touching_tasks(device):
+    """The submit half leaves task output state untouched.
+
+    Core of the B1 contract: after submit, no token is appended — the
+    scheduler may still roll the batch back.  (The KV write cursor is a
+    submit-side property — see Stepper._submit_decoded — because the
+    launched work owns its write slot; commit only materialises results.)
+    """
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        prompts = [[10, 20, 30, 40]]
+        scheduler.run_batch(prompts, max_tokens=2, temperature=0.7)
+        tasks = [
+            Task(
+                task_id=f"probe_{uuid.uuid4().hex[:8]}",
+                prompt_ids=[10, 20, 30, 40],
+                max_tokens=4,
+                temperature=0.7,
+            )
+        ]
+        task = tasks[0]
+        if not scheduler._task_cache.task_alloc(task.task_id, task.prompt_ids):
+            pytest.skip("KV allocation failed")
+        task.input_tokens = len(task.prompt_ids)
+        # Prefill through the real stepper path so KV state is complete.
+        with scheduler._backend_context():
+            scheduler._stepper.step([task])
+            assert task.prefill_done
+            pending = scheduler._executor.submit_decode([task])
+        assert pending is not None
+        try:
+            n_prefilled = len(task.output_ids)
+            assert task.output_tokens == n_prefilled
+            scheduler._stepper.step_commit(pending)
+            assert len(task.output_ids) == n_prefilled + 1
+            assert task.output_tokens == n_prefilled + 1
+        finally:
+            scheduler._task_cache.task_free(task.task_id)
+    finally:
+        scheduler.stop()
+
+
+def test_online_loop_overlap_generates_and_admits_midstream(device):
+    """End-to-end online generation rides the overlap pipeline.
+
+    A real model serves one request through the scheduler thread, then a
+    second request joins mid-decode.  The overlap branch (submit current,
+    commit previous) must deliver every token of both requests in order,
+    handle the mid-run batch change through its drain-and-sync fallback,
+    and leave no in-flight step behind at stop.
+    """
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
+    tok = FakeTokenizer()
+    scheduler = InferenceScheduler(
+        model=model,
+        tokenizer=tok,
+        max_batch_size=8,
+        max_seq_len=64,
+        enable_overlap=True,
+    )
+
+    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_task's
+    # contract is the flat single-string shape, so unwrap it here.
+    class _UnwrappingTokenizer:
+        def __init__(self, inner):
+            object.__setattr__(self, "_inner", inner)
+            object.__setattr__(self, "stop_ids", inner.stop_ids)
+
+        def encode(self, prompt, **kw):
+            out = self._inner.encode(prompt, **kw)
+            return out[0] if isinstance(out[0], list) else out
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    scheduler._task_mgr.tokenizer = _UnwrappingTokenizer(tok)
+
+    # StreamDecoder requires the Rust tokenizer's ``_tokenizer`` handle,
+    # which FakeTokenizer does not provide; the online e2e only needs
+    # per-token text events, so substitute a trivial decoder.
+    class _FakeStreamDecoder:
+        def __init__(self, tokenizer):
+            pass
+
+        def push(self, token_id):
+            return f"<{token_id}>" if token_id > 2 else ""
+
+    events: dict = {"first": [], "second": []}
+    done: dict = {"first": threading.Event(), "second": threading.Event()}
+
+    def make_sink(tag):
+        class _Sink(BatchedStreamCallback):
+            def __call__(self, batch):
+                for task_id, token in batch:
+                    events[tag].append(token)
+                    if token is STOP:
+                        done[tag].set()
+
+        return _Sink()
+
+    try:
+        with patch("astrai.inference.task.StreamDecoder", _FakeStreamDecoder):
+            scheduler.start()
+            scheduler.add_task(
+                "a" * 8, max_tokens=12, stream_callback=make_sink("first")
+            )
+            time.sleep(0.2)  # let the first request enter steady decode
+            scheduler.add_task(
+                "b" * 8, max_tokens=12, stream_callback=make_sink("second")
+            )
+            assert done["first"].wait(timeout=10)
+            assert done["second"].wait(timeout=10)
+            assert all(t is not STOP for t in events["first"][:-1])
+            assert all(t is not STOP for t in events["second"][:-1])
+            # STOP callbacks fire at commit, but the overlap loop may still
+            # hold the FINAL submitted step in the executor slot (the step
+            # launched past the terminal one) for one more iteration. Wait
+            # for the drain instead of racing it.
+            deadline = time.time() + 5
+            while scheduler._executor.peek_pending() is not None:
+                if time.time() > deadline:
+                    pytest.fail("overlap loop left a step pending after finish")
+                time.sleep(0.01)
+            stats = scheduler.get_stats()
+            assert stats["in_flight_tasks"] == 0
+            assert stats["kv_cache_tasks"] == 0
+    finally:
+        scheduler.stop()
+
+
+def test_overlap_loop_matches_synchronous_tokens(device):
+    """Overlap decode commits every step: token stream identical to sync.
+
+    Regression gate for the clear_pending bug: the steady overlap branch
+    used to detach the JUST-SUBMITTED pending step (the executor slot
+    already held the new step, not the one being committed), so every
+    other steady iteration's tokens never committed -- tasks finished at
+    the KV cap with half their tokens and interleaved-token detext.
+    Token-count gates cannot see this on small configs (the tasks still
+    finish); only the full sequence comparison against the synchronous
+    run_batch reference catches it.
+    """
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
+    tokenizer = FakeTokenizer()
+    scheduler = InferenceScheduler(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=8,
+        max_seq_len=64,
+        enable_overlap=True,
+    )
+
+    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_task's
+    # contract is the flat single-string shape, so unwrap here (same
+    # workaround as the overlap e2e test).
+    class _UnwrappingTokenizer:
+        def __init__(self, inner):
+            object.__setattr__(self, "_inner", inner)
+            object.__setattr__(self, "stop_ids", inner.stop_ids)
+
+        def encode(self, prompt, **kw):
+            out = self._inner.encode(prompt, **kw)
+            return out[0] if isinstance(out[0], list) else out
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    scheduler._task_mgr.tokenizer = _UnwrappingTokenizer(tokenizer)
+
+    # StreamDecoder needs the Rust handle FakeTokenizer lacks; emit the
+    # token id itself as the "text" so the sink sees every token.
+    class _IdDecoder:
+        def __init__(self, tokenizer):
+            pass
+
+        def push(self, token_id):
+            return str(token_id)
+
+    class _TokenSink(BatchedStreamCallback):
+        def __init__(self):
+            self.events: list = []
+
+        def __call__(self, batch):
+            self.events.extend(batch)
+
+    prompts = ["a" * 8, "b" * 8, "c" * 8]
+    sink = _TokenSink()
+    scheduler.start()
+    try:
+        # Synchronous reference: same model, same prompts, greedy.
+        reference = scheduler.run_batch(
+            [[ord(c) for c in p] for p in prompts], max_tokens=12, temperature=0
+        )
+        assert all(len(ids) == 12 for ids in reference)
+
+        with patch("astrai.inference.task.StreamDecoder", _IdDecoder):
+            task_ids = [
+                scheduler.add_task(
+                    p, max_tokens=12, stream_callback=sink, temperature=0
+                )
+                for p in prompts
+            ]
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                stops = sum(1 for _tid, tok in sink.events if tok is STOP)
+                if stops == 3:
+                    break
+                time.sleep(0.01)
+
+        by_task = {tid: [] for tid in task_ids}
+        for tid, token in sink.events:
+            if token is not STOP:
+                by_task[tid].append(int(token))
+        for i, tid in enumerate(task_ids):
+            assert by_task[tid] == list(reference[i]), (
+                f"task {i} overlap stream {by_task[tid]} != reference "
+                f"{list(reference[i])}"
+            )
+        assert scheduler._executor.peek_pending() is None
+    finally:
+        scheduler.stop()

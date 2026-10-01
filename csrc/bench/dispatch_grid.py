@@ -29,7 +29,7 @@ from pathlib import Path
 import click
 import torch
 
-from astrai.extension import ops, plan
+from astrai.extension import kernel, plan
 
 COMBOS = {
     "w16a16": (torch.bfloat16, torch.bfloat16),
@@ -96,10 +96,10 @@ def main(
 ):
     # A clean logic map: the shipped builtin rows, no runtime override or
     # injected tier shadowing them (model_capture's --check does the same).
-    ops.gemm.set_table("")
+    kernel.gemm.set_table("")
     plan.configure(rows="", tier="injected")
-    ops.gemm.set_planner(planner)
-    names = ops.gemm.get_module("gemm").tile_class_names()
+    kernel.gemm.set_planner(planner)
+    names = kernel.gemm.get_module("gemm").tile_class_names()
 
     rows_out: list[dict] | None = [] if csv_path is not None else None
     for combo in (c for c in combos.split(",") if c):
@@ -115,7 +115,7 @@ def main(
             for n in n_grid:
                 pick_by_k: dict[tuple[str, str], int] = {}
                 for k in k_grid:
-                    d = ops.gemm.probe(m, n, k, act, weight)
+                    d = kernel.gemm.probe(m, n, k, act, weight)
                     dec = (d["source"], recipe_name(d, names))
                     decisions[dec] += 1
                     pick_by_k[dec] = k
@@ -150,7 +150,7 @@ def main(
             for m in m_grid:
                 for n in n_grid:
                     for k in k_grid:
-                        d = ops.gemm.probe(m, n, k, act, weight)
+                        d = kernel.gemm.probe(m, n, k, act, weight)
                         rows_out.append(
                             {
                                 "combo": combo,
@@ -162,7 +162,7 @@ def main(
                                 "raster": d["raster"],
                             }
                         )
-    ops.gemm.set_planner("")  # restore the shipped default
+    kernel.gemm.set_planner("")  # restore the shipped default
     if rows_out is not None and csv_path is not None:
         with csv_path.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows_out[0]))

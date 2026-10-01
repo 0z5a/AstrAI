@@ -12,7 +12,7 @@ import re
 import pytest
 import torch
 
-from astrai.extension import ops, plan
+from astrai.extension import kernel, plan
 from astrai.extension.loader import is_available
 
 pytestmark = [
@@ -29,56 +29,56 @@ def _clean_plan_state():
     # Both row tiers, not just the override: set_table("") clears the
     # override rows only, so an injected row leaked from another test would
     # keep answering ahead of the planner under test.
-    ops.gemm.set_table("")
+    kernel.gemm.set_table("")
     plan.configure(rows="", tier="injected")
-    ops.gemm.set_planner("")  # back to the shipped default
-    ops.gemm.set_staging()
-    ops.gemm.set_log(False)
+    kernel.gemm.set_planner("")  # back to the shipped default
+    kernel.gemm.set_staging()
+    kernel.gemm.set_log(False)
     yield
-    ops.gemm.set_table("")
+    kernel.gemm.set_table("")
     plan.configure(rows="", tier="injected")
-    ops.gemm.set_planner("")  # back to the shipped default
-    ops.gemm.set_staging()
-    ops.gemm.set_log(False)
+    kernel.gemm.set_planner("")  # back to the shipped default
+    kernel.gemm.set_staging()
+    kernel.gemm.set_log(False)
 
 
 class TestMode:
     def test_default_is_hybrid(self):
         # The shipped default: rows when any exist, else the model. The
         # compiled-in tables are empty, so a fresh process gets the model.
-        state = ops.gemm.state()
+        state = kernel.gemm.state()
         assert state["planner"] == "hybrid"
-        assert ops.gemm.probe(*SHAPE)["source"] == "model"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
 
     def test_model_mode_skips_the_rows(self):
-        ops.gemm.set_planner("model")
-        ops.gemm.set_table(ROW)
-        assert ops.gemm.state()["planner"] == "model"
-        assert ops.gemm.probe(*SHAPE)["source"] == "model"
+        kernel.gemm.set_planner("model")
+        kernel.gemm.set_table(ROW)
+        assert kernel.gemm.state()["planner"] == "model"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
 
     def test_hybrid_prefers_rows_then_model(self):
-        ops.gemm.set_planner("hybrid")
-        assert ops.gemm.probe(*SHAPE)["source"] == "model"
-        ops.gemm.set_table(ROW)  # a row now owns the shape
-        assert ops.gemm.probe(*SHAPE)["source"] == "override"
-        ops.gemm.set_table("-")  # every row tier off
-        assert ops.gemm.probe(*SHAPE)["source"] == "model"
+        kernel.gemm.set_planner("hybrid")
+        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
+        kernel.gemm.set_table(ROW)  # a row now owns the shape
+        assert kernel.gemm.probe(*SHAPE)["source"] == "override"
+        kernel.gemm.set_table("-")  # every row tier off
+        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
 
     def test_model_only_ignores_the_table(self):
-        ops.gemm.set_planner("model")
-        ops.gemm.set_table(ROW)
-        assert ops.gemm.probe(*SHAPE)["source"] == "model"
+        kernel.gemm.set_planner("model")
+        kernel.gemm.set_table(ROW)
+        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
 
     def test_invalid_mode_rejected(self):
         with pytest.raises(ValueError):
-            ops.gemm.set_planner("cost-model")
+            kernel.gemm.set_planner("cost-model")
 
 
 class TestTable:
     def test_override_rows_take_the_shape(self):
-        installed = ops.gemm.set_table(ROW)
+        installed = kernel.gemm.set_table(ROW)
         assert installed == 1
-        info = ops.gemm.probe(*SHAPE)
+        info = kernel.gemm.probe(*SHAPE)
         assert info["source"] == "override"
         assert (info["cta"], info["stages"], info["kk"]) == (1, 3, 64)
 
@@ -86,33 +86,33 @@ class TestTable:
         # "-" disables override, injected and builtin alike; what answers
         # after that is the planner mode's business: the model under the
         # shipped hybrid default, the degraded ladder under "table".
-        ops.gemm.set_table("-")
-        assert ops.gemm.probe(*SHAPE)["source"] == "model"
-        ops.gemm.set_planner("table")
-        assert ops.gemm.probe(*SHAPE)["source"] == "degraded"
+        kernel.gemm.set_table("-")
+        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
+        kernel.gemm.set_planner("table")
+        assert kernel.gemm.probe(*SHAPE)["source"] == "degraded"
 
     def test_clear_restores_the_default(self):
-        ops.gemm.set_table(ROW)
-        ops.gemm.set_table("")
-        assert ops.gemm.state()["table"]["override_rows"] == 0
+        kernel.gemm.set_table(ROW)
+        kernel.gemm.set_table("")
+        assert kernel.gemm.state()["table"]["override_rows"] == 0
         # The builtin tables ship empty, so the model answers again.
-        assert ops.gemm.probe(*SHAPE)["source"] == "model"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
 
     def test_injected_rows_rank_below_override(self):
         plan.configure(rows=ROW, tier="injected")
-        assert ops.gemm.state()["table"]["injected_rows"] == 1
-        assert ops.gemm.probe(*SHAPE)["source"] == "injected"
-        ops.gemm.set_table("511 513 8191 0 0 0 2 2 0 64")
-        assert ops.gemm.probe(*SHAPE)["source"] == "override"
+        assert kernel.gemm.state()["table"]["injected_rows"] == 1
+        assert kernel.gemm.probe(*SHAPE)["source"] == "injected"
+        kernel.gemm.set_table("511 513 8191 0 0 0 2 2 0 64")
+        assert kernel.gemm.probe(*SHAPE)["source"] == "override"
 
 
 class TestStaging:
     def test_state_reports_the_switches(self):
-        assert ops.gemm.state()["staging"] == {"tma": True, "mx": True}
-        ops.gemm.set_staging(tma=False)
-        assert ops.gemm.state()["staging"] == {"tma": False, "mx": True}
-        ops.gemm.set_staging(mx=False)
-        assert ops.gemm.state()["staging"] == {"tma": False, "mx": False}
+        assert kernel.gemm.state()["staging"] == {"tma": True, "mx": True}
+        kernel.gemm.set_staging(tma=False)
+        assert kernel.gemm.state()["staging"] == {"tma": False, "mx": True}
+        kernel.gemm.set_staging(mx=False)
+        assert kernel.gemm.state()["staging"] == {"tma": False, "mx": False}
 
 
 class TestCompiledInTables:
@@ -122,7 +122,7 @@ class TestCompiledInTables:
         # signature-guarded, so it serves exactly there. On any other part
         # "builtin" never appears, which is what keeps the rows from
         # leaking onto a machine they were not measured on.
-        sig = ops.gemm.facts()
+        sig = kernel.gemm.facts()
         measured_here = (
             sig["cc"] == 120
             and sig["sms"] == 170
@@ -131,24 +131,24 @@ class TestCompiledInTables:
         )
         in_band = ((128, 2048, 4096), (2048, 14336, 4096))
         for shape in in_band:
-            src = ops.gemm.probe(*shape)["source"]
+            src = kernel.gemm.probe(*shape)["source"]
             if measured_here:
                 assert src == "builtin"
             else:
                 assert src != "builtin"
         # Bands the model already wins stay the model's even where the
         # rows are live (the diff only claims measured >=2% wins).
-        assert ops.gemm.probe(512, 11008, 4096)["source"] != "override"
+        assert kernel.gemm.probe(512, 11008, 4096)["source"] != "override"
 
 
 class TestProbe:
     def test_reports_the_query_key(self):
-        info = ops.gemm.probe(*SHAPE)
+        info = kernel.gemm.probe(*SHAPE)
         assert info["perf_class"] == 0  # bf16 x bf16
         assert info["crosswise"] == 0  # the NT fused-linear shape
 
     def test_vocabulary_carries_geometry(self):
-        rows = ops.gemm.tile_vocabulary()
+        rows = kernel.gemm.tile_vocabulary()
         assert rows, "the vocabulary must not be empty"
         for entry in rows:
             (
@@ -183,7 +183,7 @@ class TestProbe:
             assert threads > 0 and smem > 0
 
     def test_facts_are_populated(self):
-        facts = ops.gemm.facts()
+        facts = kernel.gemm.facts()
         assert facts["sms"] > 0
         assert facts["cc"] >= 80
         assert facts["l2_bytes"] > 0
@@ -253,12 +253,12 @@ class TestModelRule:
         # the default chain) cannot answer in its place. Staging is pinned
         # on too: the cost branches on it, and a leaked tma=False from an
         # earlier test would silently move the pick to the cp.async form.
-        ops.gemm.set_planner("model")
-        ops.gemm.set_staging(tma=True)
-        facts = ops.gemm.facts()
+        kernel.gemm.set_planner("model")
+        kernel.gemm.set_staging(tma=True)
+        facts = kernel.gemm.facts()
         vocab = [
             entry
-            for entry in ops.gemm.tile_vocabulary()
+            for entry in kernel.gemm.tile_vocabulary()
             if (entry[0], entry[1], entry[2]) == (0, 2, 2)  # NT, bf16 x bf16
         ]
         assert vocab, "the vocabulary carries no bf16 x bf16 candidates"
@@ -271,7 +271,7 @@ class TestModelRule:
                     by_recipe[tuple(entry[3:6])] = cost
             assert by_recipe, f"no resident candidate for {shape}"
 
-            info = ops.gemm.probe(*shape)
+            info = kernel.gemm.probe(*shape)
             assert info["source"] == "model", shape
             picked = (info["cta"], info["stages"], info["kk"])
             assert picked in by_recipe, f"{shape}: {picked} is not a candidate"
@@ -286,7 +286,7 @@ class TestPlanFacade:
 
     def test_config_agrees_with_the_wire(self):
         cfg = plan.config
-        wire = ops.gemm.state()
+        wire = kernel.gemm.state()
         assert cfg.planner == wire["planner"]
         assert cfg.planner_mode == wire["planner_mode"]
         assert cfg.log == wire["log"]
@@ -317,7 +317,7 @@ class TestPlanFacade:
         assert after.planner == "hybrid"  # unset resolves to the shipped default
 
     def test_override_restores_knobs_and_rows(self):
-        ops.gemm.set_table(ROW)  # a tier the block must bring back
+        kernel.gemm.set_table(ROW)  # a tier the block must bring back
         plan.configure(planner="model", tma=False)
         before = plan.config
         with plan.override(
@@ -336,7 +336,7 @@ class TestPlanFacade:
         assert plan.config == before
 
     def test_saved_config_reinstalls_in_one_call(self):
-        ops.gemm.set_table(ROW)
+        kernel.gemm.set_table(ROW)
         plan.configure(planner="table", log=True, tma=False)
         saved = plan.config
         plan.configure(planner="model", log=False, tma=True, rows="", tier="override")
@@ -357,17 +357,17 @@ class TestPlanFacade:
         plan.configure(rows=ROW, tier="injected")
         assert plan.config.injected_rows == 1
         assert plan.config.override_rows == 0
-        assert ops.gemm.probe(*SHAPE)["source"] == "injected"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "injected"
         plan.configure(rows=ROW, tier="override")
-        assert ops.gemm.probe(*SHAPE)["source"] == "override"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "override"
 
     def test_probe_facts_tiles_are_records(self):
         info = plan.probe(*SHAPE)
         assert info.source == info["source"]
         assert isinstance(info.cta, int)
-        assert plan.facts.cc == ops.gemm.facts()["cc"]
+        assert plan.facts.cc == kernel.gemm.facts()["cc"]
         tiles = plan.tiles()
-        raw = ops.gemm.tile_vocabulary()
+        raw = kernel.gemm.tile_vocabulary()
         assert len(tiles) == len(raw)
         first = tiles[0]
         assert first[3] == first.cta  # row[3] still the CTA class
@@ -411,7 +411,9 @@ class TestCrossLanguageSpellings:
         # echoes the numbers the text carried (the record keeps the spelling
         # in step with the vocabulary, so the row is legal by construction).
         tile = next(t for t in plan.tiles() if (t.crosswise, t.ba, t.bb) == (0, 2, 2))
-        ops.gemm.set_table(f"511 513 8191 0 0 0 {tile.cta} {tile.stages} 0 {tile.kk}")
+        kernel.gemm.set_table(
+            f"511 513 8191 0 0 0 {tile.cta} {tile.stages} 0 {tile.kk}"
+        )
         picked = plan.probe(*SHAPE)
         assert picked.source == "override"
         assert (picked.cta, picked.stages, picked.kk) == (

@@ -22,8 +22,8 @@ from astrai.extension.dispatch import (
     resolve,
     tensor_axes,
 )
+from astrai.extension.kernel.rotary import rotary_emb as _cuda_rotary
 from astrai.extension.loader import is_available
-from astrai.extension.ops.rotary import rotary_emb as _cuda_rotary
 
 _SPEC_CUDA = (
     axis("device_cuda").truthy()

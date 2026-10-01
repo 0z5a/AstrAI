@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from astrai.extension import quantize as f8mod
+import astrai.extension.autocast as f8mod
 from tests.conftest import skip_no_fp8
 
 DEV = "cuda"

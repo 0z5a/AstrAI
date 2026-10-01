@@ -16,7 +16,7 @@ from astrai.extension import (
 )
 from astrai.inference.cache import PagePool, TaskCacheManager
 from astrai.inference.metrics import MetricsCollector
-from astrai.inference.runtime.executor import Executor
+from astrai.inference.runtime.model_runner import GPUModelRunner
 from astrai.inference.runtime.stepper import Stepper
 from astrai.inference.task import (
     STOP,
@@ -57,6 +57,7 @@ class InferenceScheduler:
         enable_cuda_graph: bool = True,
         backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
         policy_version: int = 0,
+        enable_overlap: bool = False,
     ):
         if (
             isinstance(policy_version, bool)
@@ -64,6 +65,10 @@ class InferenceScheduler:
             or policy_version < 0
         ):
             raise ValueError("policy_version must be a non-negative integer")
+        # Depth-2 submit/commit overlap for steady online decode batches.
+        # Keep opt-in because its benefit depends on serving workload; the
+        # contract is exercised regardless, while run_batch stays synchronous.
+        self._enable_overlap = enable_overlap
         config = model.config
         self._model = model
         self._enable_cuda_graph = enable_cuda_graph
@@ -128,7 +133,7 @@ class InferenceScheduler:
                 self._backend = get_backend()
             self._runtime_backend = get_backend()
             self._backend_name = type(self._runtime_backend).__name__
-            self._executor = Executor(
+            self._executor = GPUModelRunner(
                 model=self._model,
                 kv_cache=self._cache,
                 task_cache=self._task_cache,
@@ -143,6 +148,9 @@ class InferenceScheduler:
 
         self._stop_event = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
+        # Finished tasks whose KV slots are still written by the in-flight
+        # step; freed once that step is committed (see _run_generation_loop).
+        self._retired: List[Task] = []
         self._policy_guard = PolicyVersionGuard(
             policy_version,
             ensure_ready=self._ensure_weight_update_ready,
@@ -180,6 +188,10 @@ class InferenceScheduler:
             raise RuntimeError("Stop the scheduler before updating model weights")
         if self._task_mgr.get_active_tasks() or self._task_mgr.get_waiting_tasks():
             raise RuntimeError("Cannot update model weights while tasks are queued")
+        # Drain any submitted-but-uncommitted step: its KV writes and
+        # device references must land before the world changes underneath.
+        if not self._released:
+            self._executor.flush_pending(self._stepper)
 
     def update_weights(self, policy_version: int) -> int:
         """Acknowledge an in-place weight update and invalidate stale KV state.
@@ -210,6 +222,10 @@ class InferenceScheduler:
     def add_task(self, prompt: str, **kwargs) -> str:
         self._require_runtime()
         return self._task_mgr.add_task(prompt, **kwargs)
+
+    def add_tasks(self, prompts: List[str], **kwargs) -> List[str]:
+        """Batch add with one tokenizer ``encode_batch``; see TaskManager."""
+        return self._task_mgr.add_tasks(prompts, **kwargs)
 
     def cancel_task(self, task_id: str) -> bool:
         """Cancel a waiting or active task without freeing in-use KV state."""
@@ -255,20 +271,49 @@ class InferenceScheduler:
         return self._stepper.step(tasks, return_logprobs=return_logprobs)
 
     def _run_generation_loop(self):
-        stop_ids = self._task_mgr.tokenizer.stop_ids
+        # Set membership is O(1); the tokenizer rebuilds the list on every
+        # attribute access, and both the finished-task scan and the
+        # per-step terminal check probe it (×2 per task per step before).
+        stop_ids = frozenset(self._task_mgr.tokenizer.stop_ids)
         try:
             with self._backend_context():
                 while not self._stop_event.is_set():
                     finished = self._task_mgr.remove_finished_tasks(stop_ids)
-                    for task in finished:
-                        if task.status == TaskStatus.FINISHED:
-                            self._task_cache.task_record_hashes(
-                                task.task_id,
-                                self._task_cache.task_cacheable_ids(
-                                    task.task_id, task.prompt_ids, task.output_ids
-                                ),
-                            )
-                        self._task_cache.task_free(task.task_id)
+                    retired = getattr(self, "_retired", None)
+                    if finished:
+                        # A finished task whose KV is still written by the
+                        # in-flight (uncommitted) step must not free its
+                        # slots yet — the slots could be reallocated and
+                        # corrupted mid-flight.  Such tasks are deferred to
+                        # the next iteration's drain (the pending step is
+                        # always committed before a batch change there).
+                        pending = self._executor.peek_pending()
+                        inflight_ids = (
+                            set(pending.snapshot.task_ids)
+                            if pending is not None and not pending.committed
+                            else frozenset()
+                        )
+                        for task in finished:
+                            if task.status == TaskStatus.FINISHED:
+                                self._task_cache.task_record_hashes(
+                                    task.task_id,
+                                    self._task_cache.task_cacheable_ids(
+                                        task.task_id, task.prompt_ids, task.output_ids
+                                    )
+                                    if self._cache.page_size > 1
+                                    else task.prompt_ids,
+                                )
+                            if retired is not None and task.task_id in inflight_ids:
+                                retired.append(task)
+                            else:
+                                self._task_cache.task_free(task.task_id)
+
+                    if retired:
+                        pending = self._executor.peek_pending()
+                        if pending is None or pending.committed:
+                            for task in retired:
+                                self._task_cache.task_free(task.task_id)
+                            retired.clear()
 
                     active = self._task_mgr.get_active_tasks()
                     available = self._task_mgr.max_batch_size - len(active)
@@ -286,28 +331,91 @@ class InferenceScheduler:
                                         task.input_tokens,
                                         task.output_tokens,
                                     )
+                                else:
+                                    # Just activated: extend the snapshot
+                                    # taken above instead of re-listing the
+                                    # whole active set a second time.
+                                    active.append(task)
                             else:
                                 failed.append(task)
                         if failed:
                             self._task_mgr.return_to_waiting(failed)
 
-                    if not self._task_mgr.has_work():
-                        self._task_mgr.wait_for_tasks(timeout=1.0)
-                        continue
+                    if not active:
+                        # Idle path: drain any residual step and release
+                        # deferred retirements BEFORE parking, so the loop
+                        # never waits with an uncommitted step in flight.
+                        self._executor.flush_pending(self._stepper)
+                        if retired:
+                            for task in retired:
+                                self._task_cache.task_free(task.task_id)
+                            retired.clear()
+                        if not self._task_mgr.has_work():
+                            self._task_mgr.wait_for_tasks(timeout=1.0)
+                            continue
+                        # Refill was rejected (KV pressure): re-check after
+                        # waiting so a slot freed elsewhere is picked up.
+                        active = [
+                            task
+                            for task in self._task_mgr.get_active_tasks()
+                            if task.status != TaskStatus.ABORTED
+                        ]
 
+                    # Drop any ABORTED members (status can flip during a
+                    # step) before stepping.
                     active = [
-                        task
-                        for task in self._task_mgr.get_active_tasks()
-                        if task.status != TaskStatus.ABORTED
+                        task for task in active if task.status != TaskStatus.ABORTED
                     ]
 
-                    decoded, aborted = self._stepper.step(active)
+                    # ---- overlap pipeline (depth 2) ----
+                    # Submit the current step first, then commit the step
+                    # submitted one iteration ago: the commit's host work
+                    # (tolist wait, decode, callbacks) then overlaps the
+                    # GPU computing the step just launched.  Only steady
+                    # decode batches ride the pipeline — a changed batch
+                    # (finish, join, prefill mix) drains first and falls
+                    # back to the synchronous step, because the next
+                    # submit's inputs depend on committed task state.
+                    pending = self._executor.peek_pending()
+                    aborted: List[Task] = []
+                    overlap = self._enable_overlap
+                    steady = (
+                        overlap
+                        and active
+                        and pending is not None
+                        and pending.snapshot.task_ids
+                        == tuple(t.task_id for t in active)
+                        and all(t.prefill_done for t in active)
+                        and self._executor.can_overlap_submit()
+                    )
+                    if steady:
+                        # step_submit owns the executor's pending slot: the
+                        # step it launches replaces the in-flight one, so the
+                        # slot must NOT be cleared again here — clearing it
+                        # would drop the just-submitted step (its tokens then
+                        # never commit; every other steady iteration lost a
+                        # token and tasks aborted at the KV cap instead of
+                        # max_tokens).
+                        produced, new_pending = self._stepper.step_submit(active)
+                        committed = self._stepper.step_commit(pending)
+                    else:
+                        self._executor.flush_pending(self._stepper)
+                        produced, aborted = self._stepper.step(active)
+                        new_pending = None
+                        committed = produced
+
+                    decoded = [t for t in committed if t.status != TaskStatus.ABORTED]
 
                     # One dispatch per step: batch-aware sinks take their
                     # lock (and wake waiters) once instead of once per token.
                     events: List[Tuple[str, Any]] = [(t.task_id, STOP) for t in aborted]
                     for t in decoded:
                         if t.status == TaskStatus.ABORTED:
+                            continue
+                        if not t.output_ids:
+                            # Defensive: a decoded task with no committed
+                            # token yet (cannot happen on the contract's
+                            # happy path) must not crash the loop.
                             continue
                         new_text = t.decode_new_token(self._task_mgr.tokenizer)
                         if new_text:
@@ -320,6 +428,7 @@ class InferenceScheduler:
         except Exception as e:
             self._stop_event.set()
             logger.error(f"Scheduler loop crashed: {e}", exc_info=True)
+            self._executor.flush_pending(self._stepper)
             self._abort_and_clear(free_waiting=False)
 
     def start(self):
@@ -400,7 +509,7 @@ class InferenceScheduler:
         cache = PagePool(**self._cache_spec)
         task_cache = TaskCacheManager(cache)
         with attn_backend(self._runtime_backend):
-            executor = Executor(
+            executor = GPUModelRunner(
                 model=self._model,
                 kv_cache=cache,
                 task_cache=task_cache,

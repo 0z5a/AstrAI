@@ -35,8 +35,8 @@ from pathlib import Path
 import click
 import torch
 
-from astrai.extension import ops
-from astrai.extension.ops.gemm import quant_gemm
+from astrai.extension import kernel
+from astrai.extension.kernel.gemm import quant_gemm
 
 _TUNE = Path(__file__).resolve().parent / "tune_plan_table.py"
 
@@ -162,7 +162,7 @@ def main(
                 for trial in range(trials):
                     order = ("model", recipe) if trial % 2 == 0 else (recipe, "model")
                     for arm in order:
-                        ops.gemm.set_table("" if arm == "model" else row)
+                        kernel.gemm.set_table("" if arm == "model" else row)
                         for _ in range(warmup):
                             run()
                         torch.cuda.synchronize()
@@ -208,7 +208,7 @@ def main(
                     f"x{gain:.3f}{flag}",
                     flush=True,
                 )
-    ops.gemm.set_table("")
+    kernel.gemm.set_table("")
 
     rows = tpt.build_rows(results, min_gain=min_gain / 100.0, full_coverage=False)
     if emit == "cpp":
