@@ -916,22 +916,6 @@ classDiagram
         class ContiguousStrategy
         class PagedStrategy
 
-        InferenceEngine *-- EngineCoreClient
-        EngineCoreClient <|.. InprocClient
-        InferenceEngine --> InputProcessor
-        InferenceEngine --> OutputProcessor
-        InprocClient ..> Scheduler : direct call
-        Scheduler *-- RequestManager
-        Scheduler *-- SchedulerStep
-        Scheduler *-- KVCacheManager
-        Scheduler *-- PolicyVersionGuard
-        RequestManager o-- Request
-        KVCacheManager --> BlockPool
-        SchedulerStep --> GPUModelRunner
-        GPUModelRunner --> PendingExecution
-        GPUModelRunner *-- CUDAGraphRunner
-        GPUModelRunner *-- InferenceWorkspace
-        GPUModelRunner --> SamplingPipeline
     }
 
     namespace network {
@@ -1372,6 +1356,22 @@ classDiagram
     GPUModelRunner ..> KVCacheManager : TYPE_CHECKING only
     RequestManager --> AutoTokenizer
 
+    InferenceEngine *-- EngineCoreClient
+    EngineCoreClient <|.. InprocClient
+    InferenceEngine --> InputProcessor
+    InferenceEngine --> OutputProcessor
+    InprocClient ..> Scheduler : direct call
+    Scheduler *-- RequestManager
+    Scheduler *-- SchedulerStep
+    Scheduler *-- KVCacheManager
+    Scheduler *-- PolicyVersionGuard
+    RequestManager o-- Request
+    KVCacheManager --> BlockPool
+    SchedulerStep --> GPUModelRunner
+    GPUModelRunner --> PendingExecution
+    GPUModelRunner *-- CUDAGraphRunner
+    GPUModelRunner *-- InferenceWorkspace
+    GPUModelRunner --> SamplingPipeline
 ```
 
 
