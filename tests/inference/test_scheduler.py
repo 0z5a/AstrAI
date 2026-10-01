@@ -210,9 +210,15 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
     produced, aborted = scheduler._step([short, long])
 
     assert aborted == []
-    assert produced == [long, short]
+    # ``produced`` is now the live set (callers drive it): same members,
+    # caller order, not just the requests that sampled this step.
+    assert set(produced) == {long, short}
+    assert produced == [short, long]
     scheduler._executor.execute_prefill.assert_called_once_with(
-        [short, long], start_pos=0, return_logprobs=False
+        [short, long],
+        start_pos=0,
+        return_logprobs=False,
+        num_tokens=[3, 5],
     )
     assert long.output_ids == [11]
     assert short.output_ids == [12]
@@ -251,7 +257,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
     assert model_kwargs["logits_positions"].tolist() == [1, 5]
     executor.kv_manager.bind.assert_called_once_with(
-        ["a", "b"], executor._workspace, start_pos=1
+        ["a", "b"], executor._workspace, start_pos=1, seq_ends=[3, 5]
     )
     sample_args, sample_kwargs = executor._submit_sample.call_args
     torch.testing.assert_close(sample_args[0], all_logits[[1, 5]])
@@ -1197,3 +1203,239 @@ def test_overlap_loop_matches_synchronous_tokens(device):
         assert scheduler._executor.peek_pending() is None
     finally:
         scheduler.stop()
+
+
+def test_stop_leaves_state_intact_when_loop_does_not_drain():
+    """stop() must not clear queues under a live loop (KV double-free race).
+
+    A loop stuck longer than the 2s join used to be followed blindly by
+    _abort_and_clear + handle reset: the still-running thread would then
+    free the same slots again, and a second start() could race the old
+    loop.  The fixed contract: on drain failure stop() keeps the handle
+    and the request state, and start() refuses to spawn a second loop.
+    """
+    scheduler = object.__new__(Scheduler)
+    scheduler._stop_event = threading.Event()
+    scheduler._requests = MagicMock()
+    scheduler._loop_thread = MagicMock()
+    scheduler._loop_thread.is_alive.return_value = True
+    # join "times out": is_alive stays True on both probes.
+
+    scheduler.stop()
+
+    # The live loop's world is left untouched.
+    assert scheduler._loop_thread is not None
+    scheduler._requests.clear_queues.assert_not_called()
+    scheduler._requests.get_running_requests.assert_not_called()
+
+    # start() refuses to launch a second loop alongside the live one.
+    with patch("astrai.inference.core.scheduler.threading.Thread") as TH:
+        scheduler.start()
+        TH.assert_not_called()
+
+
+def test_stop_clears_state_when_loop_drains_normally():
+    """After a clean drain the handle resets and terminal cleanup runs."""
+    scheduler = object.__new__(Scheduler)
+    scheduler._stop_event = threading.Event()
+    scheduler._requests = MagicMock()
+    scheduler._requests.get_running_requests.return_value = []
+    scheduler._requests.get_waiting_requests.return_value = []
+    scheduler._loop_thread = MagicMock()
+    scheduler._loop_thread.is_alive.return_value = True  # first probe (before join)
+
+    def join_side_effect(timeout=None):
+        scheduler._loop_thread.is_alive.return_value = False
+
+    scheduler._loop_thread.join.side_effect = join_side_effect
+
+    scheduler.stop()
+
+    assert scheduler._loop_thread is None
+    scheduler._requests.clear_queues.assert_called_once()
+
+
+def test_admission_rejects_requests_that_can_never_fit(device):
+    """The livelock guard: a prompt larger than the whole paged pool is
+    terminated (FINISH_REJECTED) instead of retrying alloc forever."""
+    import torch as _torch
+
+    from astrai.inference.core.scheduler import Scheduler
+    from astrai.model.transformer import AutoRegressiveLM
+    from tests.helpers import FakeTokenizer, make_rollout_config
+
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        max_batch_size=2,
+        max_seq_len=64,
+        enable_cuda_graph=False,
+        page_size=2,
+        kv_tokens=16,  # 8 pages × 2 tokens = 16 token slots total
+    )
+    sink_events = []
+    from astrai.inference.core.scheduler import OutputEventSink
+
+    class _Capture(OutputEventSink):
+        def __call__(self, events):
+            sink_events.extend(events)
+
+    scheduler.set_event_sink(_Capture())
+    try:
+        scheduler.start()
+        # 60-token prompt can never fit a 16-slot pool.
+        rid = scheduler.add_request(prompt="x" * 60, max_tokens=4)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if any(
+                getattr(e, "request_id", None) == rid
+                and getattr(e, "finish_reason", None) == "rejected"
+                for e in sink_events
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("oversized request was never rejected")
+        # And the queue drained: no spinning leftovers.
+        deadline = time.time() + 5
+        while time.time() < deadline and scheduler._requests.get_waiting_requests():
+            time.sleep(0.05)
+        assert not scheduler._requests.get_waiting_requests()
+    finally:
+        scheduler.stop()
+
+
+def test_paged_pool_selected_via_scheduler_kwargs(device):
+    """page_size/kv_tokens reach the BlockPool: paged strategy + prefix cache."""
+    import torch as _torch
+
+    from astrai.inference.core.scheduler import Scheduler
+    from astrai.model.transformer import AutoRegressiveLM
+    from tests.helpers import FakeTokenizer, make_rollout_config
+
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        max_batch_size=2,
+        max_seq_len=64,
+        enable_cuda_graph=False,
+        page_size=4,
+        kv_tokens=128,
+    )
+    try:
+        assert not scheduler._cache.contiguous
+        assert scheduler._cache.page_size == 4
+        assert scheduler._cache.n_tokens == 128
+        # End-to-end: generation works on the paged path.
+        out = scheduler.run_batch([[10, 11, 12, 13, 14]], max_tokens=3, temperature=0.0)
+        assert len(out[0]) == 3
+    finally:
+        scheduler.stop()
+
+
+def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
+    """Chunked prefill is token-identical to whole-prompt prefill.
+
+    Same model, same prompts, greedy: a small budget forces each prompt
+    through multiple continuation chunks (KV-only forwards) before its
+    final chunk samples; the sampled sequence must equal the unchunked
+    reference exactly.  Also asserts the budget actually split the work
+    (chunked forward count > reference forward count).
+    """
+    import torch as _torch
+
+    from astrai.inference.core.scheduler import Scheduler
+    from astrai.model.transformer import AutoRegressiveLM
+    from tests.helpers import FakeTokenizer, make_rollout_config
+
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+
+    prompts = [[10, 11, 12, 13, 14, 15, 16, 17], [40, 41, 42, 43], [5, 6, 7]]
+
+    ref_sched = Scheduler(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        max_batch_size=8,
+        max_seq_len=64,
+        enable_cuda_graph=False,
+    )
+    fwd_calls = []
+    orig_prefill = ref_sched._executor.execute_prefill
+
+    def counting_prefill(requests, **kw):
+        fwd_calls.append(
+            sum(kw.get("num_tokens") or [len(r.prompt_ids) for r in requests])
+        )
+        return orig_prefill(requests, **kw)
+
+    ref_sched._executor.execute_prefill = counting_prefill
+    try:
+        reference = ref_sched.run_batch(
+            [list(p) for p in prompts], max_tokens=5, temperature=0.0
+        )
+    finally:
+        ref_sched.stop()
+    ref_forwards = len(fwd_calls)
+
+    chunked = Scheduler(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        max_batch_size=8,
+        max_seq_len=64,
+        enable_cuda_graph=False,
+        token_budget=3,  # every prompt needs >=2 windows
+    )
+    try:
+        # Sanity: budget must actually be in force.
+        assert chunked._stepper._token_budget == 3
+        chunked_result = chunked.run_batch(
+            [list(p) for p in prompts], max_tokens=5, temperature=0.0
+        )
+    finally:
+        chunked.stop()
+
+    assert chunked_result == reference, (chunked_result, reference)
+    assert all(len(ids) == 5 for ids in chunked_result)
+
+
+def test_chunked_prefill_budget_caps_forward_tokens(device):
+    """No prefill forward under a budget carries more than budget tokens."""
+    import torch as _torch
+
+    from astrai.inference.core.scheduler import Scheduler
+    from astrai.model.transformer import AutoRegressiveLM
+    from tests.helpers import FakeTokenizer, make_rollout_config
+
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        max_batch_size=8,
+        max_seq_len=64,
+        enable_cuda_graph=False,
+        token_budget=4,
+    )
+    seen = []
+    orig = scheduler._executor.execute_prefill
+
+    def spy(requests, **kw):
+        seen.append(sum(kw.get("num_tokens") or []))
+        return orig(requests, **kw)
+
+    scheduler._executor.execute_prefill = spy
+    try:
+        out = scheduler.run_batch(
+            [[10, 11, 12, 13, 14, 15, 16, 17, 18, 19]], max_tokens=2, temperature=0.0
+        )
+        assert len(out[0]) == 2
+    finally:
+        scheduler.stop()
+    assert seen, "no prefill forwards observed"
+    assert max(seen) <= 4, seen
+    assert len(seen) >= 3, f"expected multiple chunks, got {seen}"

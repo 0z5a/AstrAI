@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 import torch
 
+from astrai.config.inference_config import InferenceConfig
 from astrai.extension import (
     ATTN_BACKEND,
     AttentionBackend,
@@ -19,6 +20,7 @@ from astrai.inference.core.events import (  # noqa: I001 module path, not the fr
     FINISH_ABORTED,
     FINISH_CANCELLED,
     FINISH_LENGTH,
+    FINISH_REJECTED,
     FINISH_STOP_TOKEN,
     RequestError,
     RequestFinished,
@@ -41,6 +43,7 @@ from astrai.tokenize.tokenizer import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+_config = InferenceConfig()
 
 
 def _with_weight_lock(method):
@@ -118,6 +121,9 @@ class Scheduler:
         backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
         policy_version: int = 0,
         enable_overlap: bool = False,
+        page_size: Optional[int] = None,
+        kv_tokens: Optional[int] = None,
+        token_budget: Optional[int] = None,
     ):
         if (
             isinstance(policy_version, bool)
@@ -148,6 +154,14 @@ class Scheduler:
         if cache is not None:
             self._cache = cache
         else:
+            # page_size/kv_tokens select the paged strategy with prefix
+            # caching; the default stays contiguous (static partitions),
+            # which rollout-sized serving keeps as the zero-config path.
+            pool_kwargs: Dict[str, Any] = {}
+            if page_size is not None:
+                pool_kwargs["page_size"] = page_size
+            if kv_tokens is not None:
+                pool_kwargs["n_tokens"] = kv_tokens
             self._cache = BlockPool(
                 n_layers=config.num_hidden_layers,
                 n_kv_heads=config.num_key_value_heads,
@@ -156,6 +170,7 @@ class Scheduler:
                 max_seq_len=self.max_seq_len,
                 device=self.device,
                 dtype=self.dtype,
+                **pool_kwargs,
             )
 
         self._metrics = MetricsCollector()
@@ -187,8 +202,14 @@ class Scheduler:
                 enable_cuda_graph=enable_cuda_graph,
             )
 
+        # 0/None both mean "no chunking": whole-remaining-prompt prefills.
+        effective_budget = token_budget or _config.max_num_batched_tokens or None
         self._stepper = SchedulerStep(
-            self._cache, self._kv_manager, self._executor, self._metrics
+            self._cache,
+            self._kv_manager,
+            self._executor,
+            self._metrics,
+            token_budget=effective_budget,
         )
 
         self._stop_event = threading.Event()
@@ -368,7 +389,17 @@ class Scheduler:
                     if available > 0:
                         candidates = self._requests.pull_waiting(available)
                         failed = []
+                        hopeless = []
                         for request in candidates:
+                            if not self._kv_manager.can_ever_fit(
+                                len(request.prompt_ids)
+                            ):
+                                # Larger than the whole pool even with every
+                                # cached page evicted: retrying would spin
+                                # the allocator forever (the livelock), so
+                                # terminate the request instead.
+                                hopeless.append(request)
+                                continue
                             if self._kv_manager.alloc_slots(
                                 request.request_id, request.prompt_ids
                             ):
@@ -386,6 +417,26 @@ class Scheduler:
                                     active.append(request)
                             else:
                                 failed.append(request)
+                        if hopeless:
+                            # Terminal events first (consumers unblock),
+                            # then release their queue records.
+                            self._emit_events(
+                                [
+                                    RequestFinished(
+                                        request_id=request.request_id,
+                                        finish_reason=FINISH_REJECTED,
+                                        prompt_tokens=len(request.prompt_ids),
+                                    )
+                                    for request in hopeless
+                                ]
+                            )
+                            for request in hopeless:
+                                self._metrics.mark_finished(
+                                    request.request_id,
+                                    len(request.prompt_ids),
+                                    0,
+                                )
+                            self._requests.discard_waiting(hopeless)
                         if failed:
                             self._requests.return_to_waiting(failed)
 
@@ -519,8 +570,21 @@ class Scheduler:
     def stop(self):
         self._stop_event.set()
         self._requests.wake()
-        if self._loop_thread is not None:
-            self._loop_thread.join(timeout=2.0)
+        thread = self._loop_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        if thread is not None and thread.is_alive():
+            # The loop did not drain in time (a stuck forward, a slow
+            # callback).  Clearing queues underneath a live loop would
+            # double-free KV slots and let a second start() race it, so
+            # leave the thread handle in place: callers can retry stop(),
+            # and start() refuses to launch a second loop while it lives.
+            logger.warning(
+                "scheduler loop did not stop within 2s; keeping thread "
+                "handle and request state — call stop() again once the "
+                "blocking work drains"
+            )
+            return
         self._loop_thread = None
         self._abort_and_clear(free_waiting=True)
         if torch.cuda.is_available():

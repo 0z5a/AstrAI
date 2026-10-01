@@ -124,9 +124,10 @@ class Request:
         not yet written to KV."""
         self.num_computed_tokens = self.input_tokens
 
-    def advance_kv(self):
-        """One more position written to KV (after a decode forward)."""
-        self.num_computed_tokens += 1
+    def advance_kv(self, n: int = 1):
+        """``n`` more positions written to KV (decode steps pass 1;
+        a prefill continuation chunk passes its window length)."""
+        self.num_computed_tokens += n
 
     def decode_next_token(self, tokenizer: AutoTokenizer) -> str:
         """Decode the last appended output token, buffering incomplete
@@ -218,6 +219,10 @@ class RequestManager:
         request_id = request_id or f"req_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         if prompt_ids is None:
             prompt_ids = self.tokenizer.encode(prompt)
+            # Some tokenizers answer a bare string with the batched shape
+            # ([[ids]]); unwrap so one prompt is always a flat id list.
+            if prompt_ids and isinstance(prompt_ids[0], list):
+                prompt_ids = prompt_ids[0]
         if not prompt_ids:
             # An empty prompt never completes prefill (``prefill_complete`` stays
             # False) and would crash the decode path on ``prompt_ids[-1]``;
@@ -472,6 +477,18 @@ class RequestManager:
             request.status = RequestStatus.RUNNING
             self.running.append(request)
             return True
+
+    def discard_waiting(self, requests: List[Request]):
+        """Drop already-pulled waiting requests without re-queueing.
+
+        Used by the admission livelock guard: requests that can never fit
+        the pool are terminated (terminal event already emitted) rather
+        than returned to the queue to spin forever.
+        """
+        with self._lock:
+            for request in requests:
+                self._requests.pop(request.request_id, None)
+                self._callbacks.pop(request.request_id, None)
 
     def return_to_waiting(self, requests: List[Request]):
         cancelled = []

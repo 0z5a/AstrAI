@@ -221,6 +221,22 @@ class Allocator:
                 if lowest_word < self._first_nonempty:
                     self._first_nonempty = lowest_word
 
+    def can_ever_satisfy(self, n_pages: int) -> bool:
+        """Whether ``n_pages`` could ever be allocated, evicting freely.
+
+        A request larger than the whole pool must be rejected at admission
+        instead of looping: every retry would promote (and evict) the same
+        pages forever — the busy-spin livelock this check exists to close.
+        Must be called without the lock held (read-only probes).
+        """
+        with self._lock:
+            return n_pages <= self._n_pages
+
+    def reclaimable_pages(self) -> int:
+        """Pages currently cached-but-unreferenced (LRU entries)."""
+        with self._lock:
+            return len(self._lru)
+
     def inc_ref(self, idx: int):
         with self._lock:
             self._refs[idx] += 1
@@ -382,6 +398,10 @@ class AllocationStrategy(ABC):
     def invalidate_cache(self) -> int:
         """Drop reusable KV entries after an inference weight update."""
         return 0
+
+    def can_ever_fit(self, n_tokens: int) -> bool:
+        """Whether a request of ``n_tokens`` could ever be admitted."""
+        return True
 
 
 class ContiguousStrategy(AllocationStrategy):
@@ -622,3 +642,11 @@ class PagedStrategy(AllocationStrategy):
         if self._prefix is None:
             return 0
         return self._alloc.clear_cached()
+
+    def can_ever_fit(self, n_tokens: int) -> bool:
+        # Page-align the request the same way ``alloc`` does; prefix hits
+        # can only shrink the need, so the unaligned upper bound is a
+        # safe admission test (a borderline request simply waits for a
+        # hit it might not get, never spins forever).
+        n_pages = (n_tokens + self._page_size - 1) // self._page_size
+        return self._alloc.can_ever_satisfy(n_pages)

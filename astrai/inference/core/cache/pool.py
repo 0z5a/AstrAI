@@ -383,6 +383,14 @@ class KVCacheManager:
         self._bind_was_steady = False
         return self._strategy.invalidate_cache()
 
+    def can_ever_fit(self, n_tokens: int) -> bool:
+        """Whether a request of ``n_tokens`` could ever be admitted.
+
+        The admission-time livelock guard: requests that can never fit are
+        rejected outright by the scheduler instead of retrying forever.
+        """
+        return self._strategy.can_ever_fit(n_tokens)
+
     @staticmethod
     def request_cacheable_ids(
         request_id: str, prompt_ids: List[int], output_ids: List[int]
@@ -397,11 +405,23 @@ class KVCacheManager:
         workspace: InferenceWorkspace,
         device: Optional[torch.device] = None,
         start_pos: Optional[int] = None,
+        seq_ends: Optional[List[int]] = None,
     ) -> KVCache:
-        """Build ``KVCache`` for an ordered list of request IDs."""
+        """Build ``KVCache`` for an ordered list of request IDs.
+
+        ``seq_ends`` (chunked prefill) overrides the per-request sequence
+        length with the chunk window's end: attention reads the prefix
+        ``[0, start_pos)`` plus this window only, and ``out_cache_loc``
+        covers exactly the window's write positions.  Without it the
+        states' full lengths are used, as before.
+        """
         states = [self._states[tid] for tid in request_ids]
         req_indices = [s.req_idx for s in states]
         seq_lens = [s.length for s in states]
+        if seq_ends is not None:
+            if len(seq_ends) != len(states):
+                raise ValueError("seq_ends must match request_ids in length")
+            seq_lens = list(seq_ends)
         sig = tuple(req_indices)
 
         prev = self._bind_state

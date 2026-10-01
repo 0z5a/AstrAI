@@ -319,8 +319,24 @@ class GPUModelRunner:
         requests: List[Request],
         start_pos: int = 0,
         return_logprobs: bool = False,
+        num_tokens: Optional[List[int]] = None,
     ):
-        requests = sorted(requests, key=lambda t: t.request_id)
+        """Prefill (a chunk of) each request's prompt; sample only at chunk ends.
+
+        With ``num_tokens=None`` this is the historical whole-remaining-prompt
+        call.  The chunked-prefill path passes one window per request:
+        ``(start_pos, num_tokens[i])`` covers the tokens this step computes.
+        A request whose window does not reach its prompt end is a
+        **continuation chunk** — its forward runs purely to materialize KV,
+        ``logits_positions`` skips it, and no token is sampled for it (the
+        caller advances ``num_computed_tokens`` instead); the final chunk of
+        each request samples its next token from the window's last position.
+        """
+        # Sort for a deterministic packed order and carry the per-request
+        # windows along: num_tokens arrives in the CALLER's request order.
+        order = sorted(range(len(requests)), key=lambda i: requests[i].request_id)
+        requests = [requests[i] for i in order]
+        num_tokens = [num_tokens[i] for i in order] if num_tokens else None
         batch_sz = len(requests)
 
         # Validate batch size bounds
@@ -331,15 +347,32 @@ class GPUModelRunner:
             )
 
         prompt_lens = [len(t.prompt_ids) for t in requests]
+        if num_tokens is None:
+            num_tokens = [prompt_len - start_pos for prompt_len in prompt_lens]
+        if len(num_tokens) != batch_sz:
+            raise ValueError("num_tokens must supply one window length per request")
 
         # Validate inputs before any resource allocation
-        if any(start_pos >= prompt_len for prompt_len in prompt_lens):
-            raise ValueError("prefill start_pos must precede every prompt end")
+        for prompt_len, n in zip(prompt_lens, num_tokens):
+            if start_pos >= prompt_len or n <= 0 or start_pos + n > prompt_len:
+                raise ValueError(
+                    "prefill window must lie strictly inside the prompt: "
+                    f"start_pos={start_pos} n={n} prompt_len={prompt_len}"
+                )
 
-        q_lens = [prompt_len - start_pos for prompt_len in prompt_lens]
+        # Only the requests whose window reaches the prompt end sample a
+        # token; continuation chunks run forward for KV materialization.
+        sample_mask = [
+            start_pos + n == prompt_len
+            for prompt_len, n in zip(prompt_lens, num_tokens)
+        ]
 
         input_ids = torch.tensor(
-            [token for t in requests for token in t.prompt_ids[start_pos:]],
+            [
+                token
+                for t, n in zip(requests, num_tokens)
+                for token in t.prompt_ids[start_pos : start_pos + n]
+            ],
             dtype=torch.long,
             device=self.device,
         )
@@ -348,22 +381,30 @@ class GPUModelRunner:
         position_ids = torch.cat(
             [
                 torch.arange(
-                    start_pos, prompt_len, dtype=torch.long, device=self.device
+                    start_pos, start_pos + n, dtype=torch.long, device=self.device
                 )
-                for prompt_len in prompt_lens
+                for n in num_tokens
             ]
         )
 
-        # Last packed position per request; the model projects only these rows.
-        last_token_indices = (
-            torch.tensor(q_lens, dtype=torch.long, device=self.device).cumsum(0) - 1
-        )
+        # Last packed position per SAMPLING request; the model projects
+        # only these rows.  ``logits_positions`` indexes the PACKED rows,
+        # so a sampling request's offset must include the windows of every
+        # earlier request in the batch — sampling and continuation chunks
+        # alike (continuation windows occupy packed rows too).
+        if any(sample_mask):
+            packed_ends = torch.tensor(num_tokens, dtype=torch.long).cumsum(0) - 1
+            last_token_indices = packed_ends[
+                torch.tensor(sample_mask, dtype=torch.bool)
+            ].to(self.device)
+        else:
+            last_token_indices = torch.empty(0, dtype=torch.long, device=self.device)
 
         with (
             torch.inference_mode(),
             timed(
-                f"execute_prefill b={batch_sz} tokens={sum(q_lens)} "
-                f"q_len={min(q_lens)}..{max(q_lens)}",
+                f"execute_prefill b={batch_sz} tokens={sum(num_tokens)} "
+                f"q_len={min(num_tokens)}..{max(num_tokens)}",
                 logger,
             ),
         ):
@@ -374,13 +415,20 @@ class GPUModelRunner:
                     request_ids,
                     self._workspace,
                     start_pos=start_pos,
+                    seq_ends=[start_pos + n for n in num_tokens],
                 ),
                 fwd="prefill",
                 logits_positions=last_token_indices,
             )
             logits = outputs["logits"]
 
-        pending = self._submit_sample(logits, requests, return_logprobs)
+        sampling_requests = [t for t, m in zip(requests, sample_mask) if m]
+        if sampling_requests:
+            pending = self._submit_sample(logits, sampling_requests, return_logprobs)
+        else:
+            # Continuation-only step: nothing to sample, nothing to commit.
+            # Return a None pending so the caller only advances KV cursors.
+            return requests, None
         return requests, pending
 
     def execute_score(
