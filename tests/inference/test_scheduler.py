@@ -1352,14 +1352,24 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
     from astrai.model.transformer import AutoRegressiveLM
     from tests.helpers import FakeTokenizer, make_rollout_config
 
+    _torch.manual_seed(0)
+
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+
+    # Greedy over a random init can argmax the stop id and finish early,
+    # which breaks the exact-length gate below on a torch build whose init
+    # draw differs.  This test gates prefill-chunking parity, not stopping:
+    # the tokenizer stops nothing, so every request runs to max_tokens on
+    # every build.
+    tokenizer = FakeTokenizer()
+    tokenizer.stop_ids = []
 
     prompts = [[10, 11, 12, 13, 14, 15, 16, 17], [40, 41, 42, 43], [5, 6, 7]]
 
     ref_sched = Scheduler(
         model=model,
-        tokenizer=FakeTokenizer(),
+        tokenizer=tokenizer,
         max_batch_size=8,
         max_seq_len=64,
         enable_cuda_graph=False,
@@ -1384,7 +1394,7 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
 
     chunked = Scheduler(
         model=model,
-        tokenizer=FakeTokenizer(),
+        tokenizer=tokenizer,
         max_batch_size=8,
         max_seq_len=64,
         enable_cuda_graph=False,
@@ -1411,11 +1421,18 @@ def test_chunked_prefill_budget_caps_forward_tokens(device):
     from astrai.model.transformer import AutoRegressiveLM
     from tests.helpers import FakeTokenizer, make_rollout_config
 
+    _torch.manual_seed(0)
+
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+    # Same deflake as the parity gate above: stopping is orthogonal to the
+    # budget being tested, and a random-init argmax onto the stop id would
+    # truncate the exact-length assert on some torch builds.
+    tokenizer = FakeTokenizer()
+    tokenizer.stop_ids = []
     scheduler = Scheduler(
         model=model,
-        tokenizer=FakeTokenizer(),
+        tokenizer=tokenizer,
         max_batch_size=8,
         max_seq_len=64,
         enable_cuda_graph=False,
