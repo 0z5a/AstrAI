@@ -1,7 +1,7 @@
 """FP8 lifecycle: ring checkpointing, recompute safety, recipe invalidation.
 
 The TE-pattern adaptations (2026-09-20, see
-notes/fp8-framework-survey-2026-09-20.md):
+notes/astrai-fp8.md):
 
 - A1 checkpointing — the delayed-scaling rings (scale / amax history / index)
   survive save/resume, the way TE persists fp8_meta with the checkpoint.
@@ -33,14 +33,14 @@ import pytest
 import torch
 from torch import nn
 
-import astrai.extension.quantize as f8mod
-from astrai.extension.loader import get_module
-from astrai.extension.quantize import (
+import astrai.extension.autocast as f8mod
+from astrai.extension.autocast import (
     FP8Recipe,
     fp8_autocast,
     fp8_load_state_dict,
     fp8_state_dict,
 )
+from astrai.extension.loader import get_module
 from tests.conftest import skip_no_fp8
 
 
@@ -206,7 +206,7 @@ def test_recipe_change_rebuilds_rings():
     dev = torch.device("cuda")
     x = torch.randn(8, 64, device=dev, dtype=torch.bfloat16)
     lin = _linear(6)
-    from astrai.extension.ops.quantize import K_FOLD_SLOTS
+    from astrai.extension.kernel.quantize import K_FOLD_SLOTS
 
     with fp8_autocast(enabled=True, recipe=FP8Recipe(history_len=4)):
         lin(x)
@@ -226,7 +226,9 @@ def test_recipe_change_rebuilds_rings():
     with fp8_autocast(enabled=True, recipe=FP8Recipe(history_len=8)):
         lin(x)
         lin(x)
-    assert _meta(lin.weight, history_len=8)["x"]["idx"] == 3
+    # The repeated activation is folded once within the region and its cast
+    # is shared by the second call.
+    assert _meta(lin.weight, history_len=8)["x"]["idx"] == 2
 
 
 @skip_no_fp8

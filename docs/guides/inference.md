@@ -71,7 +71,7 @@ extension implementation is split into two layers:
 
 - `astrai.extension.backend` owns capability checks, backend selection,
   fallback, and KV cache I/O.
-- `astrai.extension.ops` contains direct wrappers around compiled CUDA kernels;
+- `astrai.extension.kernel` contains direct wrappers around compiled CUDA kernels;
   these wrappers raise if a kernel is unavailable and do not fall back.
 
 Attention computation (cache I/O + SDPA/kernel dispatch) is decoupled from the model via `AttentionBackend` ABC:
@@ -114,7 +114,7 @@ Fallback: when `CudaBackend` cannot handle an input (wrong dtype or head_dim), `
 
 This fallback is performed by the public `attention(...)` policy entry point
 only when no backend was explicitly selected. Import from
-`astrai.extension.ops` only for direct kernel tests or when failure on a missing
+`astrai.extension.kernel` only for direct kernel tests or when failure on a missing
 kernel is the intended behavior.
 
 ### Rotary Embedding Backend

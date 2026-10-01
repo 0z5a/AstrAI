@@ -4,23 +4,25 @@ quant_gemm family test: correctness for every operand dtype combination
 per-row / per-channel scales, fp32 output) + a per-combination TFLOPS table
 over llama-linear shapes through the production NT route.
 
-nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
+nvcc -I csrc/include -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
     -o /tmp/quant_gemm_test && /tmp/quant_gemm_test
 */
 
 #include "test_utils.cuh"
 
-#include <cuda_fp8.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <type_traits>
 #include <vector>
 
-#include "common/launch.cuh"
-#include "gemm/gemm.cuh"
+#include <kernel/gemm.cuh>
+#include <launcher/planning.h>
+#include <utils/define.cuh>
+#include <utils/launch.cuh>
 
 using namespace astrai::quant;
 using namespace astrai::gemm;
@@ -34,20 +36,12 @@ namespace {
 // Element conversions: host fp32 -> ElemT for the upload, ElemT -> fp32 in
 // the reference kernel, OutT -> fp32 after the download. fp8 goes through
 // the type constructors; bf16 keeps the rounding intrinsics.
-template <typename ElemT>
-static inline ElemT to_elem(float x) {
-    return ElemT(x);
-}
-template <>
-inline int8_t to_elem<int8_t>(float x) {
+template <typename ElemT> static inline ElemT to_elem(float x) { return ElemT(x); }
+template <> inline int8_t to_elem<int8_t>(float x) {
     return (int8_t)fmaxf(-127.0f, fminf(127.0f, lroundf(x)));
 }
-template <>
-inline __nv_bfloat16 to_elem<__nv_bfloat16>(float x) {
-    return f2bf(x);
-}
-template <typename ElemT>
-__device__ __forceinline__ float elem2f(ElemT x) {
+template <> inline __nv_bfloat16 to_elem<__nv_bfloat16>(float x) { return f2bf(x); }
+template <typename ElemT> DEVICE_FORCEINLINE float elem2f(ElemT x) {
     if constexpr (std::is_same_v<ElemT, __nv_bfloat16>)
         return __bfloat162float(x);
     else
@@ -61,14 +55,22 @@ static inline float out2f(float x) { return x; }
 // major along the output dim, 0 = contract-contiguous (the "colmajor" of
 // the canonical [K][N] view).
 template <typename ElemA, typename ElemB>
-__global__ static void naive_gemm_ref(const ElemA* a, const ElemB* b,
-                                      float* out, int m, int n, int k,
-                                      int a_ld, int b_ld, int a_rm, int b_rm,
+__global__ static void naive_gemm_ref(const ElemA* a,
+                                      const ElemB* b,
+                                      float* out,
+                                      int m,
+                                      int n,
+                                      int k,
+                                      int a_ld,
+                                      int b_ld,
+                                      int a_rm,
+                                      int b_rm,
                                       const float* b_col_scale,
                                       const float* a_row_scale) {
     const int i = blockIdx.y * 32 + threadIdx.y;
     const int j = blockIdx.x * 32 + threadIdx.x;
-    if (i >= m || j >= n) return;
+    if (i >= m || j >= n)
+        return;
     const float sc = b_col_scale ? b_col_scale[j] : 1.0f;
     const float sa = a_row_scale ? a_row_scale[i] : 1.0f;
     float acc = 0.f;
@@ -84,18 +86,28 @@ __global__ static void naive_gemm_ref(const ElemA* a, const ElemB* b,
 // run the naive reference, launch through `dispatch(GemmParams&)`, compare
 // with tolerance `tol * max(|ref|, 1.0)` (the printed max_rel normalizes
 // by max(|ref|, 0.5)). ElemT and OutT are independent knobs.
-template <typename ElemA, typename ElemB = ElemA, typename OutT = __nv_bfloat16,
-          typename Fn>
-static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
-                       int a_ld, int b_ld, int a_rm, int b_rm, const char* tag,
-                       float tol, Fn&& dispatch,
+template <typename ElemA, typename ElemB = ElemA, typename OutT = __nv_bfloat16, typename Fn>
+static bool check_gemm(const float* ha,
+                       const float* hb,
+                       int m,
+                       int n,
+                       int k,
+                       int a_ld,
+                       int b_ld,
+                       int a_rm,
+                       int b_rm,
+                       const char* tag,
+                       float tol,
+                       Fn&& dispatch,
                        const std::vector<float>& b_col_scale = {},
                        const std::vector<float>& a_row_scale = {}) {
     const size_t na = (size_t)m * k, nb = (size_t)n * k, nout = (size_t)m * n;
     std::vector<ElemA> qa(na);
     std::vector<ElemB> qb(nb);
-    for (size_t i = 0; i < na; ++i) qa[i] = to_elem<ElemA>(ha[i]);
-    for (size_t i = 0; i < nb; ++i) qb[i] = to_elem<ElemB>(hb[i]);
+    for (size_t i = 0; i < na; ++i)
+        qa[i] = to_elem<ElemA>(ha[i]);
+    for (size_t i = 0; i < nb; ++i)
+        qb[i] = to_elem<ElemB>(hb[i]);
     ElemA* da;
     ElemB* db;
     OutT* dout;
@@ -109,22 +121,18 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
     cudaMalloc(&d_scale, 4);
     cudaMemcpy(da, qa.data(), na * sizeof(ElemA), cudaMemcpyHostToDevice);
     cudaMemcpy(db, qb.data(), nb * sizeof(ElemB), cudaMemcpyHostToDevice);
-    const float one = 1.0f;  // fp8 epilogues read *scale; bf16 ignores it
+    const float one = 1.0f; // fp8 epilogues read *scale; bf16 ignores it
     cudaMemcpy(d_scale, &one, 4, cudaMemcpyHostToDevice);
     if (!b_col_scale.empty()) {
         cudaMalloc(&d_bscale, b_col_scale.size() * 4);
-        cudaMemcpy(d_bscale, b_col_scale.data(), b_col_scale.size() * 4,
-                   cudaMemcpyHostToDevice);
+        cudaMemcpy(d_bscale, b_col_scale.data(), b_col_scale.size() * 4, cudaMemcpyHostToDevice);
     }
     if (!a_row_scale.empty()) {
         cudaMalloc(&d_ascale, a_row_scale.size() * 4);
-        cudaMemcpy(d_ascale, a_row_scale.data(), a_row_scale.size() * 4,
-                   cudaMemcpyHostToDevice);
+        cudaMemcpy(d_ascale, a_row_scale.data(), a_row_scale.size() * 4, cudaMemcpyHostToDevice);
     }
-    naive_gemm_ref<ElemA, ElemB>
-        <<<dim3((n + 31) / 32, (m + 31) / 32), dim3(32, 32)>>>(
-            da, db, d_ref, m, n, k, a_ld, b_ld, a_rm, b_rm, d_bscale,
-            d_ascale);
+    naive_gemm_ref<ElemA, ElemB><<<dim3((n + 31) / 32, (m + 31) / 32), dim3(32, 32)>>>(
+        da, db, d_ref, m, n, k, a_ld, b_ld, a_rm, b_rm, d_bscale, d_ascale);
     ASTRAI_LAUNCH_CHECK();
 
     GemmParams p = {};
@@ -156,14 +164,13 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
     } else {
         std::vector<OutT> hout(nout);
         std::vector<float> href(nout);
-        cudaMemcpy(hout.data(), dout, nout * sizeof(OutT),
-                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(hout.data(), dout, nout * sizeof(OutT), cudaMemcpyDeviceToHost);
         cudaMemcpy(href.data(), d_ref, nout * 4, cudaMemcpyDeviceToHost);
         for (size_t i = 0; i < nout && ok; ++i) {
             const float err = fabsf(out2f(hout[i]) - href[i]);
-            max_rel = fmax(max_rel,
-                           (double)(err / fmaxf(fabsf(href[i]), 0.5f)));
-            if (err > tol * fmaxf(fabsf(href[i]), 1.0f)) ok = false;
+            max_rel = fmax(max_rel, (double)(err / fmaxf(fabsf(href[i]), 0.5f)));
+            if (err > tol * fmaxf(fabsf(href[i]), 1.0f))
+                ok = false;
         }
         printf("  %-18s max_rel=%.4f %s\n", tag, max_rel, ok ? "PASS" : "FAIL");
     }
@@ -172,8 +179,10 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
     cudaFree(dout);
     cudaFree(d_ref);
     cudaFree(d_scale);
-    if (d_bscale) cudaFree(d_bscale);
-    if (d_ascale) cudaFree(d_ascale);
+    if (d_bscale)
+        cudaFree(d_bscale);
+    if (d_ascale)
+        cudaFree(d_ascale);
     return ok;
 }
 
@@ -183,8 +192,7 @@ static bool check_gemm(const float* ha, const float* hb, int m, int n, int k,
 // ---------------------------------------------------------------------------
 
 // [rows][cols] -> [cols][rows] storage materialization.
-static std::vector<float> transpose(const std::vector<float>& x, int rows,
-                                    int cols) {
+static std::vector<float> transpose(const std::vector<float>& x, int rows, int cols) {
     std::vector<float> t((size_t)rows * cols);
     for (int i = 0; i < rows; ++i)
         for (int j = 0; j < cols; ++j)
@@ -196,15 +204,16 @@ static std::vector<float> transpose(const std::vector<float>& x, int rows,
 // the per-row scale (amax / qmax — 127 for int8, 448/57344 for fp8) and
 // divides the buffer by it, so the kernel (which re-applies the scale in
 // its epilogue) and the naive reference see the same quantized values.
-static std::vector<float> div_row_scales(std::vector<float>& x, int rows,
-                                         int cols, float qmax = 127.f) {
+static std::vector<float>
+div_row_scales(std::vector<float>& x, int rows, int cols, float qmax = 127.f) {
     std::vector<float> s(rows);
     for (int i = 0; i < rows; ++i) {
         float amax = 1e-6f;
         for (int j = 0; j < cols; ++j)
             amax = fmaxf(amax, fabsf(x[(size_t)i * cols + j]));
         s[i] = amax / qmax;
-        for (int j = 0; j < cols; ++j) x[(size_t)i * cols + j] /= s[i];
+        for (int j = 0; j < cols; ++j)
+            x[(size_t)i * cols + j] /= s[i];
     }
     return s;
 }
@@ -216,30 +225,34 @@ static std::vector<float> div_row_scales(std::vector<float>& x, int rows,
 // storages (post-quantization); transposed variants materialize here.
 template <typename ElemA, typename ElemB = ElemA>
 static bool check_all_layouts(const std::vector<float>& ha,
-                              const std::vector<float>& hb, int m, int n,
-                              int k, const char* tag, float tol,
+                              const std::vector<float>& hb,
+                              int m,
+                              int n,
+                              int k,
+                              const char* tag,
+                              float tol,
                               const std::vector<float>& b_scale = {},
                               const std::vector<float>& a_scale = {}) {
-    const std::vector<float> ha_t = transpose(ha, m, k);  // [K][M]
-    const std::vector<float> hb_t = transpose(hb, n, k);  // [K][N]
+    const std::vector<float> ha_t = transpose(ha, m, k); // [K][M]
+    const std::vector<float> hb_t = transpose(hb, n, k); // [K][N]
     struct Lay {
         bool ta, tb;
         int ald, bld;
         const char* name;
     };
-    const Lay lays[] = {{false, true, k, k, "NT"}, {true, false, m, n, "TN"},
-                        {true, true, m, k, "TT"}, {false, false, k, n, "NN"}};
+    const Lay lays[] = {{false, true, k, k, "NT"},
+                        {true, false, m, n, "TN"},
+                        {true, true, m, k, "TT"},
+                        {false, false, k, n, "NN"}};
     bool ok = true;
     for (const Lay& l : lays) {
         char name[32];
         snprintf(name, sizeof(name), "%s %s", tag, l.name);
         ok &= check_gemm<ElemA, ElemB>(
-            l.ta ? ha_t.data() : ha.data(), l.tb ? hb.data() : hb.data(), m,
-            n, k, l.ald, l.bld, !l.ta, !l.tb, name, tol,
-            [&](GemmParams& p) {
-                gemm_dispatch<ElemA, ElemB>(p, 0, l.ta, l.tb);
-            },
-            b_scale, a_scale);
+            l.ta ? ha_t.data() : ha.data(), l.tb ? hb.data() : hb.data(), m, n, k, l.ald, l.bld,
+            !l.ta, !l.tb, name, tol,
+            [&](GemmParams& p) { gemm_dispatch<ElemA, ElemB>(p, 0, l.ta, l.tb); }, b_scale,
+            a_scale);
     }
     return ok;
 }
@@ -247,11 +260,18 @@ static bool check_all_layouts(const std::vector<float>& ha,
 // Shorthands over check_gemm for the two repeating dispatch shapes: a
 // pinned Policy the plan ladder would not route the shape to, and the
 // production dtype-generic dispatch at explicit trans flags.
-template <typename ElemA, typename ElemB, typename Policy,
-          typename OutT = __nv_bfloat16>
-static bool check_pinned(const float* ha, const float* hb, int m, int n, int k,
-                         int a_ld, int b_ld, int a_rm, int b_rm,
-                         const char* tag, float tol,
+template <typename ElemA, typename ElemB, typename Policy, typename OutT = __nv_bfloat16>
+static bool check_pinned(const float* ha,
+                         const float* hb,
+                         int m,
+                         int n,
+                         int k,
+                         int a_ld,
+                         int b_ld,
+                         int a_rm,
+                         int b_rm,
+                         const char* tag,
+                         float tol,
                          const std::vector<float>& b_scale = {},
                          const std::vector<float>& a_scale = {}) {
     return check_gemm<ElemA, ElemB, OutT>(
@@ -260,17 +280,25 @@ static bool check_pinned(const float* ha, const float* hb, int m, int n, int k,
 }
 
 template <typename ElemA, typename ElemB, typename OutT = __nv_bfloat16>
-static bool check_dispatch(const float* ha, const float* hb, int m, int n, int k,
-                           int a_ld, int b_ld, int a_rm, int b_rm,
-                           const char* tag, float tol, bool ta, bool tb,
+static bool check_dispatch(const float* ha,
+                           const float* hb,
+                           int m,
+                           int n,
+                           int k,
+                           int a_ld,
+                           int b_ld,
+                           int a_rm,
+                           int b_rm,
+                           const char* tag,
+                           float tol,
+                           bool ta,
+                           bool tb,
                            const std::vector<float>& b_scale = {},
                            const std::vector<float>& a_scale = {}) {
     return check_gemm<ElemA, ElemB, OutT>(
         ha, hb, m, n, k, a_ld, b_ld, a_rm, b_rm, tag, tol,
-        [ta, tb](GemmParams& p) {
-            gemm_dispatch<ElemA, ElemB, OutT>(p, 0, ta, tb);
-        },
-        b_scale, a_scale);
+        [ta, tb](GemmParams& p) { gemm_dispatch<ElemA, ElemB, OutT>(p, 0, ta, tb); }, b_scale,
+        a_scale);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,16 +309,25 @@ static bool check_dispatch(const float* ha, const float* hb, int m, int n, int k
 // the fast interior loop follows the dual-congruous rule, grouped raster 8
 // matches the production dispatch.
 template <typename LA, typename LB, int kK, int Stages>
-using CasePolicy = GemmPolicy<
-    __nv_fp8_e4m3, __nv_fp8_e4m3, LA, LB,
-    GemmTileConfig<Shape<128, 128, kK>, Shape<64, 32>, Stages>,
-    RowMajor, __nv_bfloat16>;
+using CasePolicy = GemmPolicy<__nv_fp8_e4m3,
+                              __nv_fp8_e4m3,
+                              LA,
+                              LB,
+                              GemmTileConfig<Shape<128, 128, kK>, Shape<64, 32>, Stages>,
+                              RowMajor,
+                              __nv_bfloat16>;
 
 // fp8 e4m3 layout case: direct big-CTA policy (dispatch=0), the production
 // NN-swap route (1) or the production NT route (2).
 template <typename LA, typename LB, int kK, int Stages>
-static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
-                          int k, int a_ld, int b_ld, const char* tag,
+static bool run_gemm_case(const float* ha,
+                          const float* hb,
+                          int m,
+                          int n,
+                          int k,
+                          int a_ld,
+                          int b_ld,
+                          const char* tag,
                           int dispatch = 0) {
     auto launch = [&](GemmParams& p) {
         if (dispatch == 1)
@@ -307,9 +344,8 @@ static bool run_gemm_case(const float* ha, const float* hb, int m, int n,
             launch_policy<CasePolicy<LA, LB, kK, Stages>>(p, 0);
     };
     return check_gemm<__nv_fp8_e4m3, __nv_fp8_e4m3>(
-        ha, hb, m, n, k, a_ld, b_ld,
-        !std::is_same_v<LA, ColMajor>, !std::is_same_v<LB, ColMajor>, tag,
-        0.06f, launch);
+        ha, hb, m, n, k, a_ld, b_ld, !std::is_same_v<LA, ColMajor>, !std::is_same_v<LB, ColMajor>,
+        tag, 0.06f, launch);
 }
 
 static bool test_gemm() {
@@ -320,37 +356,33 @@ static bool test_gemm() {
     struct {
         int m, n, k;
     } cfgs[] = {
-        {128, 128, 128}, {256, 128, 256}, {128, 256, 64},
-        {100, 130, 96},  {64, 64, 160},   {300, 200, 320},
-        {2048, 256, 512}, {1024, 1024, 512},
+        {128, 128, 128}, {256, 128, 256}, {128, 256, 64},   {100, 130, 96},
+        {64, 64, 160},   {300, 200, 320}, {2048, 256, 512}, {1024, 1024, 512},
     };
     bool all = true;
     for (auto& c : cfgs) {
         std::vector<float> ha((size_t)c.m * c.k), hb((size_t)c.k * c.n);
-        for (float& v : ha) v = randf();
-        for (float& v : hb) v = randf();
-        const std::vector<float> hb_col = transpose(hb, c.k, c.n);  // [N][K]
-        const std::vector<float> ha_t = transpose(ha, c.m, c.k);    // [K][M]
+        for (float& v : ha)
+            v = randf();
+        for (float& v : hb)
+            v = randf();
+        const std::vector<float> hb_col = transpose(hb, c.k, c.n); // [N][K]
+        const std::vector<float> ha_t = transpose(ha, c.m, c.k);   // [K][M]
         printf("%dx%dx%d:\n", c.m, c.n, c.k);
-        all &= run_gemm_case<RowMajor, ColMajor, 32, 3>(ha.data(), hb_col.data(),
-                                                        c.m, c.n, c.k, c.k, c.k,
-                                                        "NT K32");
-        all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(ha.data(), hb_col.data(),
-                                                        c.m, c.n, c.k, c.k, c.k,
-                                                        "NT K64");
-        all &= run_gemm_case<RowMajor, RowMajor, 64, 2>(
-            ha.data(), hb.data(), c.m, c.n, c.k, c.k, c.n, "NN swap", 1);
-        all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(
-            ha.data(), hb_col.data(), c.m, c.n, c.k, c.k, c.k, "NT disp", 2);
-        all &= run_gemm_case<ColMajor, ColMajor, 32, 3>(ha_t.data(), hb_col.data(),
-                                                        c.m, c.n, c.k, c.m, c.k,
-                                                        "TN K32");
-        all &= run_gemm_case<ColMajor, ColMajor, 64, 2>(ha_t.data(), hb_col.data(),
-                                                        c.m, c.n, c.k, c.m, c.k,
-                                                        "TN K64");
-        all &= run_gemm_case<ColMajor, RowMajor, 64, 2>(ha_t.data(), hb.data(),
-                                                        c.m, c.n, c.k, c.m, c.n,
-                                                        "TT K64");
+        all &= run_gemm_case<RowMajor, ColMajor, 32, 3>(ha.data(), hb_col.data(), c.m, c.n, c.k,
+                                                        c.k, c.k, "NT K32");
+        all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(ha.data(), hb_col.data(), c.m, c.n, c.k,
+                                                        c.k, c.k, "NT K64");
+        all &= run_gemm_case<RowMajor, RowMajor, 64, 2>(ha.data(), hb.data(), c.m, c.n, c.k, c.k,
+                                                        c.n, "NN swap", 1);
+        all &= run_gemm_case<RowMajor, ColMajor, 64, 2>(ha.data(), hb_col.data(), c.m, c.n, c.k,
+                                                        c.k, c.k, "NT disp", 2);
+        all &= run_gemm_case<ColMajor, ColMajor, 32, 3>(ha_t.data(), hb_col.data(), c.m, c.n, c.k,
+                                                        c.m, c.k, "TN K32");
+        all &= run_gemm_case<ColMajor, ColMajor, 64, 2>(ha_t.data(), hb_col.data(), c.m, c.n, c.k,
+                                                        c.m, c.k, "TN K64");
+        all &= run_gemm_case<ColMajor, RowMajor, 64, 2>(ha_t.data(), hb.data(), c.m, c.n, c.k, c.m,
+                                                        c.n, "TT K64");
     }
     return all;
 }
@@ -362,37 +394,33 @@ static bool test_gemm() {
 
 static bool test_dtype_combos() {
     bool all = true;
-    auto prep = [](std::vector<float>& a, std::vector<float>& b, int m, int n,
-                   int k, int seed) {
+    auto prep = [](std::vector<float>& a, std::vector<float>& b, int m, int n, int k, int seed) {
         srand(seed);
         a.resize((size_t)m * k);
         b.resize((size_t)n * k);
-        for (float& v : a) v = randf();
-        for (float& v : b) v = randf();
+        for (float& v : a)
+            v = randf();
+        for (float& v : b)
+            v = randf();
     };
 
     // W16A16: all four layouts through the production dispatch, plus pinned
     // big/small tile variants (the plan ladder routes 256x256 to the small
     // CTA, so the big CTA needs pinning).
-    using Bf16Big =
-        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2,
-                   RowMajor, __nv_bfloat16>;
-    using Bf16Small =
-        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3,
-                   RowMajor, __nv_bfloat16>;
+    using Bf16Big = GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor,
+                               Tile_128x128x64_W64x32_S2, RowMajor, __nv_bfloat16>;
+    using Bf16Small = GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor,
+                                 Tile_64x64x64_W16x32_S3, RowMajor, __nv_bfloat16>;
     printf("W16A16 (bf16 x bf16, all layouts):\n");
     for (int k : {64, 128, 320, 512}) {
         std::vector<float> ha, hb;
         prep(ha, hb, 256, 256, k, 1234 + k);
         printf(" 256x256x%d:\n", k);
-        all &= check_all_layouts<__nv_bfloat16>(ha, hb, 256, 256, k, "w16a16",
-                                                0.02f);
+        all &= check_all_layouts<__nv_bfloat16>(ha, hb, 256, 256, k, "w16a16", 0.02f);
         all &= check_pinned<__nv_bfloat16, __nv_bfloat16, Bf16Big>(
-            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w16a16 big 128x128", 0.02f);
+            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0, "w16a16 big 128x128", 0.02f);
         all &= check_pinned<__nv_bfloat16, __nv_bfloat16, Bf16Small>(
-            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w16a16 small 64x64", 0.02f);
+            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0, "w16a16 small 64x64", 0.02f);
     }
 
     // W8A16 weight-only: bf16 activation x per-channel-scaled int8 weight.
@@ -400,75 +428,60 @@ static bool test_dtype_combos() {
     // scale into the epilogue. All four storage layouts run through the
     // production dispatch (NN takes the direct mixed instantiation), with
     // pinned tile variants the plan ladder would not route 256x256 to.
-    using MixedBig =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2,
-                   RowMajor, __nv_bfloat16>;
-    using MixedSmall =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3,
-                   RowMajor, __nv_bfloat16>;
+    using MixedBig = GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor,
+                                Tile_128x128x64_W64x32_S2, RowMajor, __nv_bfloat16>;
+    using MixedSmall = GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor,
+                                  Tile_64x64x64_W16x32_S3, RowMajor, __nv_bfloat16>;
     // The tall 64x128 CTA: plan rows route production shapes to it, so its
     // ring and epilogue reclaim need a cell the correctness suite launches.
-    using MixedTall =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_64x128x32_W32x32_S3,
-                   RowMajor, __nv_bfloat16>;
-    using MixedTT =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2,
-                   RowMajor, __nv_bfloat16>;
-    using TTSmallS2 =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_64x64x64_W16x32_S2,
-                   RowMajor, __nv_bfloat16>;
-    using TTNarrow =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x64x64_W32x32_S2,
-                   RowMajor, __nv_bfloat16>;
-    using TTBigFast =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2,
-                   RowMajor, __nv_bfloat16>;
-    using MixedTN =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, Tile_128x128x64_W64x32_S2,
-                   RowMajor, __nv_bfloat16>;
-    using MixedNN =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, RowMajor, Tile_128x128x64_W64x32_S2,
-                   RowMajor, __nv_bfloat16>;
+    using MixedTall = GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor,
+                                 Tile_64x128x32_W32x32_S3, RowMajor, __nv_bfloat16>;
+    using MixedTT = GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2,
+                               RowMajor, __nv_bfloat16>;
+    using TTSmallS2 = GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_64x64x64_W16x32_S2,
+                                 RowMajor, __nv_bfloat16>;
+    using TTNarrow = GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x64x64_W32x32_S2,
+                                RowMajor, __nv_bfloat16>;
+    using TTBigFast = GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor,
+                                 Tile_128x128x64_W64x32_S2, RowMajor, __nv_bfloat16>;
+    using MixedTN = GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, Tile_128x128x64_W64x32_S2,
+                               RowMajor, __nv_bfloat16>;
+    using MixedNN = GemmPolicy<__nv_bfloat16, int8_t, RowMajor, RowMajor, Tile_128x128x64_W64x32_S2,
+                               RowMajor, __nv_bfloat16>;
     printf("W8A16 (bf16 act x int8 weight, all layouts):\n");
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;
         prep(ha, hb, 256, 256, k, 777 + k);
         const std::vector<float> scale = div_row_scales(hb, 256, k);
         printf(" 256x256x%d:\n", k);
-        all &= check_all_layouts<__nv_bfloat16, int8_t>(ha, hb, 256, 256, k,
-                                                        "w8a16", 0.02f, scale);
+        all &= check_all_layouts<__nv_bfloat16, int8_t>(ha, hb, 256, 256, k, "w8a16", 0.02f, scale);
         all &= check_pinned<__nv_bfloat16, int8_t, MixedBig>(
-            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w8a16 big 128x128", 0.02f, scale);
+            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0, "w8a16 big 128x128", 0.02f, scale);
         all &= check_pinned<__nv_bfloat16, int8_t, MixedSmall>(
-            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w8a16 small 64x64", 0.02f, scale);
-        all &= check_pinned<__nv_bfloat16, int8_t, MixedTall>(
-            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w8a16 tall 64x128 kk32 s3", 0.02f, scale);
+            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0, "w8a16 small 64x64", 0.02f, scale);
+        all &= check_pinned<__nv_bfloat16, int8_t, MixedTall>(ha.data(), hb.data(), 256, 256, k, k,
+                                                              k, 1, 0, "w8a16 tall 64x128 kk32 s3",
+                                                              0.02f, scale);
         if (k == 320) {
             // Crosswise/dual-row-major big CTA pinned (the planner routes
             // 256x256 crosswise to the small CTA).
             const std::vector<float> ha_t = transpose(ha, 256, k);
             const std::vector<float> hb_t = transpose(hb, 256, k);
             all &= check_pinned<__nv_bfloat16, int8_t, MixedTT>(
-                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a16 TT big", 0.02f, scale);
-            all &= check_pinned<__nv_bfloat16, int8_t, TTSmallS2>(
-                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a16 TT smallS2", 0.02f, scale);
+                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0, "w8a16 TT big", 0.02f, scale);
+            all &= check_pinned<__nv_bfloat16, int8_t, TTSmallS2>(ha_t.data(), hb.data(), 256, 256,
+                                                                  k, 256, k, 0, 0,
+                                                                  "w8a16 TT smallS2", 0.02f, scale);
             all &= check_pinned<__nv_bfloat16, int8_t, TTNarrow>(
-                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a16 TT narrow", 0.02f, scale);
-            all &= check_pinned<__nv_bfloat16, int8_t, TTBigFast>(
-                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a16 TT bigfast", 0.02f, scale);
-            all &= check_pinned<__nv_bfloat16, int8_t, MixedTN>(
-                ha_t.data(), hb_t.data(), 256, 256, k, 256, 256, 0, 1,
-                "w8a16 TN big", 0.02f, scale);
+                ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0, "w8a16 TT narrow", 0.02f, scale);
+            all &= check_pinned<__nv_bfloat16, int8_t, TTBigFast>(ha_t.data(), hb.data(), 256, 256,
+                                                                  k, 256, k, 0, 0,
+                                                                  "w8a16 TT bigfast", 0.02f, scale);
+            all &= check_pinned<__nv_bfloat16, int8_t, MixedTN>(ha_t.data(), hb_t.data(), 256, 256,
+                                                                k, 256, 256, 0, 1, "w8a16 TN big",
+                                                                0.02f, scale);
             all &= check_pinned<__nv_bfloat16, int8_t, MixedNN>(
-                ha.data(), hb_t.data(), 256, 256, k, k, 256, 1, 1,
-                "w8a16 NN big", 0.02f, scale);
+                ha.data(), hb_t.data(), 256, 256, k, k, 256, 1, 1, "w8a16 NN big", 0.02f, scale);
         }
     }
 
@@ -483,9 +496,9 @@ static bool test_dtype_combos() {
         const std::vector<float> ha_t = transpose(ha, 100, 96);
         const std::vector<float> hb_t = transpose(hb, 130, 96);
         printf("W8A16 odd shape (100x130x96, TN):\n");
-        all &= check_dispatch<__nv_bfloat16, int8_t>(
-            ha_t.data(), hb_t.data(), 100, 130, 96, 100, 130, 0, 1,
-            "w8a16 TN odd", 0.02f, /*ta=*/true, /*tb=*/false, scale);
+        all &= check_dispatch<__nv_bfloat16, int8_t>(ha_t.data(), hb_t.data(), 100, 130, 96, 100,
+                                                     130, 0, 1, "w8a16 TN odd", 0.02f, /*ta=*/true,
+                                                     /*tb=*/false, scale);
     }
 
     // W8A8 dynamic: per-row-scaled int8 activation x per-channel-scaled
@@ -493,9 +506,8 @@ static bool test_dtype_combos() {
     // All four storage layouts (NN rides the symmetric swap rewrite),
     // plus a pinned big-CTA instantiation at k=320.
     {
-        using W8A8Big =
-            GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2,
-                       RowMajor, __nv_bfloat16>;
+        using W8A8Big = GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2,
+                                   RowMajor, __nv_bfloat16>;
         printf("W8A8 (int8 act x int8 weight, all layouts):\n");
         for (int k : {64, 320, 512}) {
             std::vector<float> ha, hb;
@@ -503,12 +515,11 @@ static bool test_dtype_combos() {
             const std::vector<float> rscale = div_row_scales(ha, 256, k);
             const std::vector<float> cscale = div_row_scales(hb, 256, k);
             printf(" 256x256x%d:\n", k);
-            all &= check_all_layouts<int8_t>(ha, hb, 256, 256, k, "w8a8",
-                                             0.02f, cscale, rscale);
+            all &= check_all_layouts<int8_t>(ha, hb, 256, 256, k, "w8a8", 0.02f, cscale, rscale);
             if (k == 320) {
-                all &= check_pinned<int8_t, int8_t, W8A8Big>(
-                    ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-                    "w8a8 big 128x128", 0.02f, cscale, rscale);
+                all &= check_pinned<int8_t, int8_t, W8A8Big>(ha.data(), hb.data(), 256, 256, k, k,
+                                                             k, 1, 0, "w8a8 big 128x128", 0.02f,
+                                                             cscale, rscale);
             }
         }
     }
@@ -522,8 +533,7 @@ static bool test_dtype_combos() {
         prep(ha, hb, 256, 256, k, 999 + k);
         const std::vector<float> rscale = div_row_scales(ha, 256, k);
         printf(" 256x256x%d:\n", k);
-        all &= check_all_layouts<int8_t, __nv_bfloat16>(ha, hb, 256, 256, k,
-                                                        "a8w16", 0.02f, {},
+        all &= check_all_layouts<int8_t, __nv_bfloat16>(ha, hb, 256, 256, k, "a8w16", 0.02f, {},
                                                         rscale);
     }
 
@@ -531,9 +541,8 @@ static bool test_dtype_combos() {
     // production-planned route through the dtype-generic dispatch. The
     // narrow tile's 32KB output fits the 36KB reclaimed operand rings
     // (launch_plan compile-time-reroutes the 128x128 CTA for fat outputs).
-    using Fp8F32Out =
-        GemmPolicy<__nv_fp8_e4m3, __nv_fp8_e4m3, RowMajor, ColMajor,
-                   Tile_128x64x64_W32x32_S2, RowMajor, float>;
+    using Fp8F32Out = GemmPolicy<__nv_fp8_e4m3, __nv_fp8_e4m3, RowMajor, ColMajor,
+                                 Tile_128x64x64_W32x32_S2, RowMajor, float>;
     printf("fp8 operands, fp32 output:\n");
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;
@@ -543,9 +552,9 @@ static bool test_dtype_combos() {
         all &= check_pinned<__nv_fp8_e4m3, __nv_fp8_e4m3, Fp8F32Out, float>(
             ha.data(), hb.data(), 300, 200, k, k, k, 1, 0, tag, 0.02f);
         snprintf(tag, sizeof(tag), "f32-out disp K%d", k);
-        all &= check_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3, float>(
-            ha.data(), hb.data(), 300, 200, k, k, k, 1, 0, tag, 0.02f,
-            /*ta=*/false, /*tb=*/true);
+        all &= check_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3, float>(ha.data(), hb.data(), 300, 200,
+                                                                   k, k, k, 1, 0, tag, 0.02f,
+                                                                   /*ta=*/false, /*tb=*/true);
     }
     return all;
 }
@@ -560,19 +569,24 @@ static bool test_dtype_combos() {
 
 using bf16_ = __nv_bfloat16;
 template <typename ElemA, typename ElemB>
-static void bench_combo(int m, int n, int k, const char* tag, float qa_max,
-                        float qb_max) {
+static void bench_combo(int m, int n, int k, const char* tag, float qa_max, float qb_max) {
     srand(7);
     std::vector<float> ha((size_t)m * k), hb((size_t)n * k);
-    for (float& v : ha) v = randf();
-    for (float& v : hb) v = randf();
+    for (float& v : ha)
+        v = randf();
+    for (float& v : hb)
+        v = randf();
     std::vector<float> sa, sb;
-    if (qa_max > 0) sa = div_row_scales(ha, m, k, qa_max);
-    if (qb_max > 0) sb = div_row_scales(hb, n, k, qb_max);
+    if (qa_max > 0)
+        sa = div_row_scales(ha, m, k, qa_max);
+    if (qb_max > 0)
+        sb = div_row_scales(hb, n, k, qb_max);
     std::vector<ElemA> qa((size_t)m * k);
     std::vector<ElemB> qb((size_t)n * k);
-    for (size_t i = 0; i < qa.size(); ++i) qa[i] = to_elem<ElemA>(ha[i]);
-    for (size_t i = 0; i < qb.size(); ++i) qb[i] = to_elem<ElemB>(hb[i]);
+    for (size_t i = 0; i < qa.size(); ++i)
+        qa[i] = to_elem<ElemA>(ha[i]);
+    for (size_t i = 0; i < qb.size(); ++i)
+        qb[i] = to_elem<ElemB>(hb[i]);
 
     ElemA* da;
     ElemB* db;
@@ -616,9 +630,8 @@ static void bench_combo(int m, int n, int k, const char* tag, float qa_max,
     p.out_ld = n;
 
     double flops = 2.0 * m * n * k;
-    BenchResult r = bench_kernel(
-        [&] { gemm_dispatch<ElemA, ElemB>(p, 0, false, true); }, 3, 10,
-        flops);
+    BenchResult r =
+        bench_kernel([&] { gemm_dispatch<ElemA, ElemB>(p, 0, false, true); }, 3, 10, flops);
     char cfg[64];
     snprintf(cfg, sizeof(cfg), "%-16s %5dx%-5dx%-5d", tag, m, n, k);
     print_bench_row(cfg, r);
@@ -627,18 +640,22 @@ static void bench_combo(int m, int n, int k, const char* tag, float qa_max,
     cudaFree(db);
     cudaFree(dout);
     cudaFree(d_one);
-    if (d_sa) cudaFree(d_sa);
-    if (d_sb) cudaFree(d_sb);
+    if (d_sa)
+        cudaFree(d_sa);
+    if (d_sb)
+        cudaFree(d_sb);
 }
 
 static void bench_dtype_combos() {
     printf("\n===== QUANT_GEMM COMBO BENCH (production NT route) =====\n");
     print_bench_header();
-    struct Shape { int m, n, k; };
+    struct Shape {
+        int m, n, k;
+    };
     const Shape shapes[] = {
-        {4096, 4096, 4096},   // square
-        {2048, 4096, 4096},   // batched linear
-        {4096, 14336, 4096},  // llama up_gate
+        {4096, 4096, 4096},  // square
+        {2048, 4096, 4096},  // batched linear
+        {4096, 14336, 4096}, // llama up_gate
     };
     for (const Shape& s : shapes) {
         bench_combo<bf16_, bf16_>(s.m, s.n, s.k, "W16A16", 0, 0);
@@ -649,13 +666,14 @@ static void bench_dtype_combos() {
     }
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     print_test_header();
     bool ok = test_gemm();
     ok &= test_dtype_combos();
     printf(ok ? "All PASS\n" : "FAILURES\n");
-    if (ok) bench_dtype_combos();
+    if (ok)
+        bench_dtype_combos();
     return ok ? 0 : 1;
 }
