@@ -1,128 +1,111 @@
 # Worker Layer
 
-`astrai/inference/worker/` — model execution only (vLLM analogue: the
-Worker process's `GPUModelRunner`; here in-process). Worker code does
-not import request-lifecycle types: its only core dependency is a
-`TYPE_CHECKING` reference for the KV manager's `bind()` interface.
+`astrai/inference/worker/` executes model work in-process. It owns input
+assembly, device buffers, sampling, CUDA graphs and result materialization.
+It does not own request lifecycle or retain core `Request` objects.
 
-## Classes
+## Data boundary
+
+The neutral `contracts.py` defines immutable execution-request descriptions,
+`SchedulerOutput` and `ModelRunnerOutput`. A plan identifies its step, policy
+version and request windows. It contains execution data, not a reference to a
+live scheduler request. The returned results identify the requests to which
+rows belong; the core must not infer that correspondence from a mutable batch.
+
+The core applies results to requests. Worker-side result materialization does
+not append output tokens, decide a request's final service state, emit terminal
+events or release logical request KV allocations.
 
 ```mermaid
 classDiagram
     direction TB
     class GPUModelRunner {
-        +AutoModel model
-        +BlockPool kv_cache
-        +KVCacheManager kv_manager
-        +InferenceWorkspace _workspace
-        +CUDAGraphRunner _graph_ctx
-        +ResultRing _result_ring
-        +DecodeSteadyState _decode_cache
-        +execute_prefill(requests, start_pos, return_logprobs)
-        +submit_decode(requests, return_logprobs) Optional~PendingExecution~
-        +execute_decode(requests, return_logprobs) List
-        +execute_score(requests, per_token) List
-        +peek_pending() / clear_pending() / flush_pending(stepper)
-        +can_overlap_submit() bool
+        execute immutable request windows
+        assemble attention metadata
+        forward and sample
     }
     class PendingExecution {
-        <<COMMAND · two-phase>>
-        +BatchSnapshot snapshot
-        +List requests
-        +Tensor tokens / logprobs
-        +prefill_request_ids
-        +commit() List~Tuple~
-        +committed bool
-    }
-    class BatchSnapshot {
-        <<frozen>>
-        +Tuple request_ids
-        +Tuple kv_positions
-        +int policy_version
+        execution identity
+        device tokens and logprobs
+        completion and host-result resources
+        idempotent materialization
     }
     class ResultRing {
-        depth-2 pinned host slots
-        on a dedicated copy stream
-        +post(pending) bool
-        +release(pending)
-    }
-    class CUDAGraphRunner {
-        +forward(model, key, **kwargs) Dict
-        one graph per (batch_size,) key
-        capture on second call, replay after
-    }
-    class InferenceWorkspace {
-        <<FLYWEIGHT · fixed addresses>>
-        +Tensor input_ids / position_ids
-        +Tensor req_pool_indices / seq_lens
-        +Tensor kv_indptr / qo_indptr
-        +Tensor out_cache_loc / inc
-        +fill_input_ids(ids) Tensor
-        +fill_input_ids_from_device(tokens)
-        +decode_mask(position_ids, total_len)
+        pinned host slots
+        dedicated copy stream
     }
     class DecodeSteadyState {
-        +Tuple task_sig
-        +SamplingBatchInfo sampling_info
-        +Tensor last_tokens
-        reused while the ordered batch is unchanged
+        ordered request identity
+        cached sampling metadata
+        device token relay
     }
-    class SamplingBatchInfo {
-        +Tensor temperatures / top_ks / top_ps
-        +Tensor freq_penalties
-        +bool has_freq
-        +SamplingMeta meta
-        +SamplingPipeline pipeline
+    class InferenceWorkspace {
+        fixed-address device buffers
+        pinned input staging
     }
-    class SamplingPipeline {
-        <<STRATEGY CHAIN>>
-        Temperature → TopK → TopP → FrequencyPenalty
-    }
+    class CUDAGraphRunner
+    class SamplingPipeline
 
     GPUModelRunner *-- InferenceWorkspace
     GPUModelRunner *-- CUDAGraphRunner
     GPUModelRunner *-- ResultRing
     GPUModelRunner *-- DecodeSteadyState
-    GPUModelRunner --> PendingExecution : produces
-    PendingExecution *-- BatchSnapshot
-    DecodeSteadyState *-- SamplingBatchInfo
-    SamplingBatchInfo --> SamplingPipeline
-    ResultRing ..> PendingExecution : posts D2H
+    GPUModelRunner --> PendingExecution
+    GPUModelRunner --> SamplingPipeline
+    ResultRing --> PendingExecution : output copy
 ```
 
-## The submit/commit contract
+## Submit and materialize
 
-Decode runs as two phases (the vLLM `execute_model` / `sample_tokens`
-split):
+AstrAI's submit/commit boundary separates **forward plus sampling submission**
+from **host result materialization**. It is not the same split as vLLM's
+`execute_model`/`sample_tokens`, which separates forward from sampling.
 
-- **`submit_decode`** launches forward + sampling without resolving a
-  single device value on the host and returns a `PendingExecution`
-  holding device-resident tokens. Nothing here mutates request output
-  state. KV positions advance at submit time (the write slot is a
-  property of the launched work, which is what lets the next submit
-  overlap the previous step).
-- **`commit()`** is the single sanctioned host materialization point:
-  it waits the posted copy event (async path via `ResultRing` on a
-  dedicated copy stream) or falls back to `tolist()`, then appends
-  tokens/logprobs. Idempotent — abort paths may call it defensively.
+- Submission produces device-resident sampled tokens and optional raw-model
+  logprobs without resolving their values on the host.
+- `ResultRing` can post a nonblocking copy into pinned storage on a dedicated
+  stream. The pending handle owns the associated result slot until it is
+  materialized and released.
+- Materialization waits for the copy when necessary and produces an immutable
+  result with execution/request identity. It is safe to invoke defensively
+  more than once; the core separately ensures exactly-once state application.
+- An execution without a sampled token, such as an intermediate prefill
+  chunk, still has a completion boundary. Its KV cannot be advertised as a
+  reusable prefix before that boundary.
 
-Tokens from the previous step stay on device
-(`DecodeSteadyState.last_tokens`); a matching batch signature fills the
-next step's `input_ids` device-to-device, so steady decode never
-round-trips token ids through the host.
+Every backend sub-batch needs its own accounted-for handle/result. A later
+submission must not silently overwrite an earlier handle. Discarding an
+output because of cancellation, EOS or version mismatch does not remove the
+need to retire its copy, device and KV references safely.
 
-## CUDA graphs
+## Preserved decode fast path
 
-`CUDAGraphRunner` captures one graph per `(batch_size,)` key: first call
-at a key warms up, second captures (after a drain), subsequent calls
-replay. All tensor arguments must live at stable addresses — that is the
-`InferenceWorkspace` contract: per-step buffers are allocated once at
-init and sliced per step, with host staging through pinned buffers.
-Sampling runs outside the graph (it consumes mutable RNG state).
+`DecodeSteadyState` identifies the ordered batch by request identity, not just
+by physical request slots that may be reused. For an unchanged supported
+batch, the previous sampled token fills the next input device-to-device.
+Sampling metadata and fixed-address workspace are reused rather than rebuilt
+from GPU predicates each step.
 
-## Known gaps
+`SamplingPipeline` applies frequency penalties before temperature/top-k/top-p.
+Raw-model logprobs are computed before those sampling transformations, preserving
+the rollout contract. Frequency-history changes may require a drain or metadata
+refresh; the zero-host-synchronization claim applies to the supported steady
+CUDA decode path, not every fallback and sampling combination.
 
-Scheduling-level work still open in this layer's callers: chunked
-prefill windows (`execute_prefill` currently takes one shared `start_pos`
-and runs the whole remaining prompt) and the token budget that would cap
-per-step forward tokens. See the repo-root design document's [A] items.
+`CUDAGraphRunner` retains the pure-decode path. Graph inputs must live at stable
+addresses owned by `InferenceWorkspace`, and capture must not race outstanding
+work on those buffers. Sampling remains outside the captured forward. An
+in-place weight update does not by itself change parameter addresses.
+
+## Prefill and future mixed execution
+
+Chunked prefill already supports bounded windows and suppresses sampling for
+nonfinal chunks. Current calls use a shared start offset within a prefill
+sub-batch. This is not yet a single globally budgeted mixed prefill/decode
+forward.
+
+The model/KV ABI already represents packed token inputs with query offsets,
+KV lengths and slot mappings. A later mixed-forward stage can supply
+per-request windows and sampling-row mappings while preserving the pure-decode
+fast path. It should not require another directory migration or an immediate
+replacement of the attention kernels, allocator or prefix index.

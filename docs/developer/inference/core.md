@@ -1,178 +1,142 @@
 # Core Layer
 
-`astrai/inference/core/` — the engine core (vLLM analogue: the
-EngineCore process's scheduler + KV accounting; here a single-writer
-loop thread in-process). The core emits output events; it never
-detokenizes and never runs consumer callbacks.
+`astrai/inference/core/` owns request lifecycle and logical KV accounting.
+It runs in the same process as the model and trainer. The frontend receives
+token-ID events; model execution consumes neutral data contracts.
 
-## Classes
+## Driver versus scheduler
+
+`EngineCore` coordinates the busy loop, in-flight execution, result draining,
+shutdown and the shared operation boundary. `Scheduler` retains the public
+facade used by serving and rollout, owns the request queues and KV manager,
+and supplies scheduling and result-application operations.
 
 ```mermaid
 classDiagram
     direction TB
+    class EngineCore {
+        loop and lifecycle
+        in-flight executions
+        drain before resource release
+        shared policy operation lock
+    }
     class Scheduler {
-        +run_busy_loop()
-        +run_batch(prompt_ids_list, ...) List
-        +score_ids(prompts, conts, per_token) List
-        +add_request(prompt, **kwargs) str
-        +add_requests(prompts, **kwargs) List~str~
-        +cancel_request(request_id) bool
-        +set_event_sink(sink)
-        +start() / stop()
-        +update_weights(policy_version) int
-        +apply_weight_update(policy_version, update)
-        single-writer loop thread:
-        cleanup → admit → overlap step → emit events
-    }
-    class OutputEventSink {
-        <<abstract · observer outlet>>
-        +__call__(events)
-        invoked on the loop thread; must be fast
-    }
-    class CallbackBridge {
-        default sink: events → legacy
-        stream-callback protocol (STOP sentinel)
-    }
-    class RequestManager {
-        +AutoTokenizer tokenizer
-        +Deque waiting
-        +List running
-        +add_request(s)(prompt, ..., request_id, prompt_ids)
-        +cancel_request(request_id) Tuple
-        +remove_finished_requests(stop_ids) List~Request~
-        +pull_waiting(n) / activate(request)
-        +invoke_callbacks(events)
-        +get_running_requests() / get_waiting_requests()
-    }
-    class Request {
-        +str request_id
-        +List prompt_ids
-        +List output_ids
-        +int num_computed_tokens
-        +int input_tokens / output_tokens
-        +RequestStatus status
-        +mark_prefill_complete()
-        +advance_kv(n)
-        +next_pos int
-        +is_finished(stop_ids) bool
-    }
-    class RequestStatus {
-        <<enumeration>>
-        PENDING
-        RUNNING
-        FINISHED
-        ABORTED
+        schedule()
+        update_from_output()
+        add_request() / add_requests()
+        cancel_request()
+        run_batch() / score_ids()
+        start() / stop()
     }
     class SchedulerStep {
-        +step(requests) Tuple
-        +step_submit(requests) Tuple
-        +step_commit(pending) List~Request~
-        decode-first → continuation chunk → new first chunk
+        compatibility and scheduling helper
+    }
+    class RequestManager {
+        waiting / running
+        request lookup
+    }
+    class Request {
+        request identity and status
+        prompt and committed output
+        scheduling progress
+    }
+    class KVCacheManager {
+        alloc_slots() / extend_slots_batch()
+        record_block_hashes(materialized_end)
+        free_slots() / invalidate_cache()
     }
     class PolicyVersionGuard {
-        +RLock lock
-        +int policy_version
-        +update_weights(version) int
-        +apply_weight_update(version, update)
-        +with_policy_snapshot(inspect)
-        monotonic version over shared weights
-    }
-    class MetricsCollector {
-        +register(request_id)
-        +mark_finished(request_id, in, out)
-        +record(request_ids, phase)
+        RLock
+        monotonic policy version
+        apply_weight_update()
     }
 
-    class KVCacheManager {
-        +Dict states request_id → RequestCacheState
-        +alloc_slots(request_id, prompt_ids) bool
-        +free_slots(request_id)
-        +extend_slots(request_id, pos) bool
-        +extend_slots_batch(ids, positions) List~bool~
-        +cached_tokens(request_id) int
-        +record_block_hashes(request_id, ids, start)
-        +bind(request_ids, workspace, start_pos) KVCache
-        +invalidate_cache() int
-    }
-    class BlockPool {
-        +KVStorage storage
-        +ReqToTokenPool req_pool
-        +int page_size
-        +bind_tasks(...) KVCache
-    }
-    class AllocationStrategy {
-        <<abstract · STRATEGY>>
-        +alloc(state, prompt_ids) bool
-        +free(state)
-        +extend(state, pos) bool
-        +extend_batch(states, positions)
-    }
-    class ContiguousStrategy {
-        static partition, no prefix cache
-    }
-    class PagedStrategy {
-        +Allocator alloc bitmap+LRU
-        +RadixCache prefix
-        extend_batch: one word-indexed harvest
-    }
-    class RequestCacheState {
-        +int req_idx
-        +int length / cached
-        +List pages
-        +List slots host-staged tail
-    }
-
-    Scheduler *-- RequestManager
+    Scheduler *-- EngineCore
+    EngineCore --> Scheduler : schedule and apply
     Scheduler *-- SchedulerStep
+    Scheduler *-- RequestManager
+    RequestManager o-- Request
     Scheduler *-- KVCacheManager
     Scheduler *-- PolicyVersionGuard
-    Scheduler *-- MetricsCollector
-    Scheduler --> OutputEventSink : emits via _emit_events
-    OutputEventSink <|.. CallbackBridge
-    RequestManager o-- Request : waiting / running
-    KVCacheManager --> BlockPool : delegates
-    BlockPool *-- AllocationStrategy
-    AllocationStrategy <|.. ContiguousStrategy
-    AllocationStrategy <|.. PagedStrategy
-    KVCacheManager o-- RequestCacheState : per-request
+    EngineCore --> PolicyVersionGuard : operation boundary
 ```
 
-## The busy loop
+The mutable `Request` belongs to the core. Planning captures an execution
+snapshot; worker execution must not read a changing request or append to its
+output. Result application validates execution/request identity and policy
+version, then advances the corresponding live request. Reapplying a result
+must not append the same token twice.
 
-`Scheduler.run_busy_loop` is a plain Python loop on its own thread (no
-asyncio — the vLLM EngineCore discipline). Each iteration:
+`SchedulerStep` is retained for internal compatibility. It does not justify
+passing `Request` objects through the worker boundary, nor may it create a
+second result-application path that bypasses request lifecycle rules.
 
-1. **cleanup** — `remove_finished_requests(stop_ids)`; a finished
-   request whose KV is still written by the in-flight step is *retired*
-   (slot freed next iteration, after the pending step commits);
-2. **admit** — waiting requests get KV slots (`alloc_slots`);
-3. **step** — steady decode batches ride the depth-2 submit/commit
-   overlap pipeline (`enable_overlap`); any batch change drains first
-   and falls back to the synchronous step;
-4. **emit** — one `OutputEvent` batch per step: `TokenDelta` per
-   committed token plus `RequestFinished`; no text, no callbacks.
+## Execution and event ordering
+
+A step has three distinct responsibilities:
+
+1. **Plan:** choose request windows and reserve the required KV resources.
+2. **Execute:** submit the immutable plan; preserve its association with all
+   execution handles, including multiple backend groups.
+3. **Apply:** materialize the result, match it by identity, update request
+   state and emit accepted token/terminal events.
+
+Controlled decode overlap can submit a later step before an earlier result
+is applied. Therefore an optimistic scheduling cursor is not proof that all
+its KV is complete, and it is not an output-token count. Cancellation and
+EOS may cause an already-submitted token to be discarded. That execution
+still has to retire before its pages, result slots or request slots are
+reused.
+
+A change in the running batch drains prior work through the same result
+application and event path. Draining is not merely a synchronization call:
+any accepted tokens produced by the drained executions must be delivered.
+Stopping similarly drains or safely retires in-flight work before clearing
+request/KV state. A timed-out join retains the live thread and its state;
+a second loop must not be started over it.
 
 ## KV accounting
 
-`KVCacheManager` is the facade the scheduler talks to; `BlockPool` owns
-the physical buffers (`KVStorage` + `ReqToTokenPool`) and an
-`AllocationStrategy`:
+`KVCacheManager` owns request allocation state. `BlockPool` owns the physical
+storage, token mapping and allocation strategy:
 
-- **ContiguousStrategy** — static per-request partitions (the default
-  constructor path; no prefix cache).
-- **PagedStrategy** — dynamic pages from a bitmask allocator (word-index
-  harvest for batched extends), optional `RadixCache` prefix index keyed
-  by exact token-page edges. Only complete, materialized pages are
-  shared; the final sampled token is excluded (not yet in KV).
+- **ContiguousStrategy:** static request partitions, no prefix reuse.
+- **PagedStrategy:** logical pages from a bitmap/LRU allocator; radix prefix
+  indexing is enabled for page sizes greater than one.
 
-`Request.num_computed_tokens` is the single scheduling state variable —
-the vLLM model: every optimization (chunked prefill, prefix hits,
-overlap) changes how it advances, not the scheduler's branches.
+A decode token requires an updated token-to-slot mapping even if it needs no
+new page. Page allocation and slot-map updates are separate operations.
+
+Prefix publication requires
+`record_block_hashes(..., materialized_end=exclusive_token_end)`. The boundary
+must come from completed execution, not from prompt length, allocated page
+count, or a cursor already advanced for a later in-flight step. Only complete
+pages below that boundary can be published. The sampled token is not yet in
+KV until a subsequent model execution consumes it.
+
+Radix re-recording must preserve valid descendants, and removal of an
+ancestor must not leave descendants advertised by the reverse index. Physical
+allocator references and prefix-index reachability are separate invariants.
+
+Both cache strategies preallocate a GPU arena. Paged allocation currently
+reserves prompt pages at admission; chunking limits computation, not that
+initial reservation. Global token budgets, progressive prompt allocation and
+recompute preemption are not introduced by this ownership refactor.
 
 ## Policy versioning
 
-`PolicyVersionGuard` is the train-serve weight protocol (no vLLM
-counterpart): weights are mutated in place under its RLock; versions are
-monotonic; every commit invalidates cached KV produced by older weights
-(`invalidate_cache`). Weight updates require the loop stopped and queues
-drained (`_ensure_weight_update_ready`).
+`PolicyVersionGuard` remains the train/serve protocol: an RLock protects
+in-place weight mutation and monotonically increasing versions. Every weight
+commit invalidates KV from older weights. Execution plans carry the actual
+version; a stale result cannot be applied as a new-version token.
+
+Generation, scoring, admission and weight mutation use the same operation
+boundary. Weight mutation requires a stopped/drained engine with no queued
+requests. Colocated rollout holds the snapshot boundary around eval-mode
+entry, generation and restoration. Replica publishers enter the receiving
+backend's mutation boundary **before** copying weights, rather than copying
+first and validating the version afterward.
+
+No process boundary or model copy is added for colocated rollout. Existing
+`run_batch` token/logprob results and the policy-version API remain the
+training-facing interface.

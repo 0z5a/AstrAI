@@ -1,114 +1,111 @@
 # Inference Engine Internals
 
-The inference engine follows the vLLM v1 layering — as **three one-way
-in-process layers** (no process boundary: colocated RL rollout shares the
-model object with the trainer, which `PolicyVersionGuard` depends on):
+Inference uses three one-way **in-process** layers. The colocated rollout
+backend shares the trainer's model object, so `EngineCore` is a driver,
+not a process or an RPC server.
 
 ```text
 astrai/inference/
-  frontend/   engine facade · input/output processors · events · core client
-  core/       scheduler · request lifecycle · KV accounting · versioning
-  worker/     model runner · pending steps · CUDA graphs · sampler · workspace
-  network/    OpenAI/Anthropic protocol adapters (frontend deployment)
+  contracts.py  immutable scheduling and execution data
+  frontend/     engine facade, input/output processing, tracking, core client
+  core/         EngineCore driver, Scheduler, request lifecycle, KV accounting
+  worker/       model runner, pending execution, CUDA graphs, sampling, workspace
+  network/      OpenAI/Anthropic protocol adapters
 ```
 
-Dependency rule, enforced by import direction:
-**frontend → core → worker → model/KV ABI**. The worker's only dependency
-on the core is a `TYPE_CHECKING` type reference (it consumes the KV
-manager's `bind()` interface); the core never imports the frontend at
-runtime (events live in `core/events.py` and are re-exported).
+The dependency direction is **frontend → core → worker → model/KV ABI**.
+All layers may use the neutral data contracts. Worker code must not import
+core request-lifecycle types at runtime or retain mutable `Request` objects.
+`tests/inference/test_layering.py` checks the runtime import direction.
 
-## Folder contents
+## Documents
 
 | Document | Scope |
 |----------|-------|
-| [frontend.md](frontend.md) | `InferenceEngine`, `InputProcessor`, `OutputProcessor`, `EngineCoreClient`, the output-event contract |
-| [core.md](core.md) | `Scheduler` busy loop, `RequestManager`, `SchedulerStep`, `KVCacheManager`/`BlockPool`, `PolicyVersionGuard` |
-| [worker.md](worker.md) | `GPUModelRunner`, `PendingExecution` (submit/commit), `CUDAGraphRunner`, `ResultRing`, `SamplingPipeline`, `InferenceWorkspace` |
-| [events.md](events.md) | The event flow end-to-end (sequence diagram), request state machine, design-pattern view |
+| [frontend.md](frontend.md) | Engine facade, input/output processing, request tracking and event consumption |
+| [core.md](core.md) | Driver, scheduling, result application, KV ownership and policy versioning |
+| [worker.md](worker.md) | Execution contracts, pending results, sampling, workspace and CUDA graphs |
+| [events.md](events.md) | Event order, terminal states, cancellation and shutdown |
 
-## Layer overview
+## Ownership
 
 ```mermaid
 classDiagram
     direction LR
-    namespace frontend {
-        class InferenceEngine {
-            <<FACADE>>
-            +generate() / generate_async()
-            +generate_events() / score()
-        }
-        class EngineCoreClient {
-            <<abstract>>
-            +send_request(s)()
-            +abort_request() / stats()
-        }
-        class InprocClient
-        class InputProcessor {
-            tokenize · mints request ids
-        }
-        class OutputProcessor {
-            detokenize · stop · usage
-        }
+    class InferenceEngine
+    class InprocClient
+    class EngineCore {
+        driver and operation lock
+        in-flight execution and draining
     }
-    namespace core {
-        class Scheduler {
-            +run_busy_loop()
-            emits token-id events only
-        }
-        class RequestManager {
-            waiting / running queues
-        }
-        class KVCacheManager {
-            alloc_slots / bind()
-        }
-        class PolicyVersionGuard {
-            train-serve weight protocol
-        }
+    class Scheduler {
+        request state and KV accounting
+        schedule / update_from_output
     }
-    namespace worker {
-        class GPUModelRunner {
-            +execute_prefill() / submit_decode()
-        }
-        class PendingExecution {
-            +commit() sole D2H point
-        }
-        class CUDAGraphRunner
-        class InferenceWorkspace {
-            fixed-address buffers
-        }
+    class GPUModelRunner {
+        execute immutable plans
+        device buffers and sampling
     }
+    class SchedulerOutput
+    class ModelRunnerOutput
+    class PendingExecution
 
-    InferenceEngine *-- EngineCoreClient
-    EngineCoreClient <|.. InprocClient
-    InprocClient ..> Scheduler : direct call
-    InferenceEngine --> InputProcessor
-    InferenceEngine --> OutputProcessor
-    Scheduler *-- RequestManager
-    Scheduler *-- KVCacheManager
-    Scheduler *-- PolicyVersionGuard
-    Scheduler --> GPUModelRunner : via SchedulerStep
-    GPUModelRunner --> PendingExecution : produces
-    GPUModelRunner *-- CUDAGraphRunner
-    GPUModelRunner *-- InferenceWorkspace
+    InferenceEngine --> InprocClient
+    InprocClient --> Scheduler : public facade
+    Scheduler *-- EngineCore
+    EngineCore --> Scheduler : plan and apply results
+    EngineCore --> GPUModelRunner : execute
+    Scheduler --> SchedulerOutput
+    GPUModelRunner --> PendingExecution
+    PendingExecution --> ModelRunnerOutput
+    ModelRunnerOutput --> Scheduler
 ```
 
-## Naming
+The `Scheduler` public facade remains compatible with existing callers:
+`start`/`stop`, `run_batch`, `score_ids`, request submission and the
+policy-version protocol. The driver owns execution orchestration; the
+scheduler owns the mutable request state. `SchedulerStep` remains an
+internal compatibility/planning helper rather than a second request owner.
 
-Class names follow vLLM v1 where the concept is the same
-(`Scheduler`, `Request.num_computed_tokens`, `KVCacheManager`,
-`GPUModelRunner`, `run_busy_loop`). AstrAI-only concepts keep their names
-(`PolicyVersionGuard`, `InferenceEngine`, `SchedulerStep` — the latter
-merges into `schedule()`/`update_from_output()` when the scheduler-output
-data contract lands). See the repo-root design document
-(`astrai-inference-refactor-design.md`) for the full rename map and the
-deliberate non-goals (no EngineCore process, no ZMQ, no mixin towers).
+## Stages 0 and 1
 
-## Status of known gaps
+These stages establish correctness and ownership without changing the
+scheduling policy into a global token scheduler:
 
-The layering above is the implemented structure (commit `1c59adb`).
-Behavior-level work still open: token-budget scheduling with chunked
-prefill (decode currently waits behind full prefills), `stop()` race
-hardening, and routing the production `BlockPool` construction through
-`PagedStrategy` + `RadixCache` (the paged path is implemented and tested
-but not selected by default constructors).
+- Terminal events are emitted once, after every accepted token event.
+  Cancellation, rejection, zero-output requests and errors must also
+  terminate their consumers.
+- Every submitted execution is accounted for, including backend sub-batches,
+  drains at a batch change, and shutdown. Discarding a cancelled result does
+  not permit releasing its still-in-flight KV resources.
+- Plans and worker results carry execution identity and the real policy
+  version. Worker outputs are matched by request identity, not by assuming
+  that a batch's mutable request list remains unchanged.
+- Paged cache mapping is updated even when a decode token fits in an already
+  allocated page. Prefix publication requires an explicit materialized
+  token boundary; allocated but uncomputed pages are not reusable prefixes.
+- Shared-model generation, scoring and weight updates use the same policy
+  operation boundary. Colocated model-mode changes and replica weight
+  copies are included in that boundary.
+
+## Preserved fast paths and remaining work
+
+Fixed-address workspace, pure-decode CUDA graphs, GPU token relay, pinned
+result copying, controlled decode overlap, and completion-driven blocking
+output collection remain in place.
+
+Chunked prefill already exists, but its current budget is a **local prefill
+forward budget**, not a global scheduling-step budget. Chunking remains off
+by default. Decode-first global budget scheduling and a single packed
+prefill/decode forward are later stages, not part of stages 0 and 1.
+
+Paged allocation is selectable but is not the default. `kv_tokens=None`
+selects contiguous allocation; a finite `kv_tokens` selects paged allocation,
+and `page_size > 1` additionally enables the radix prefix index. Both modes
+preallocate their GPU storage arena. The paged path currently reserves the
+prompt's pages at admission; progressive prompt-page allocation and
+recompute preemption are subsequent resource-policy work.
+
+The workspace-root design documents contain historical diagrams. This
+folder describes the current implementation and deliberately does not
+prescribe EngineCore/Worker processes, ZMQ, or the full vLLM feature matrix.

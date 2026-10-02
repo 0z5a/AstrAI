@@ -36,8 +36,8 @@ classDiagram
         +shutdown()
     }
     class InprocClient {
-        T0: direct method calls
-        T1 swaps in a transport client
+        direct calls to Scheduler facade
+        shared in-process EngineCore
     }
     class InputProcessor {
         +AutoTokenizer _tokenizer
@@ -113,10 +113,11 @@ classDiagram
   text to count tokens). Degrades to token-id-as-string when the
   tokenizer lacks the Rust streaming handle, so a stream always
   terminates.
-- **`EngineCoreClient`** is the only path from frontend to core. T0 uses
-  `InprocClient` (plain method calls on the live `Scheduler`); a T1
-  serving deployment replaces it with a transport client and nothing
-  else in the engine or the protocol adapters changes.
+- **`EngineCoreClient`** routes submission, cancellation and shutdown through
+  `InprocClient` and the live `Scheduler` facade. The facade delegates
+  execution lifecycle to its in-process `EngineCore`; no transport or model
+  process is introduced. Existing score and diagnostic access through the
+  scheduler uses the same core operation boundary.
 - **`RequestTracker`** holds bounded per-request event queues for blocking
   consumers and supports async subscriptions for streaming consumers. A
   subscriber atomically takes the queued backlog and becomes the live route;
@@ -148,3 +149,12 @@ a `RequestError` terminal event is logged and reported through the same
 partial-text path rather than hanging the caller. The scheduler's
 `_emit_events` catches sink exceptions — consumer failures never reach
 the engine loop.
+
+Text-stop completion is separate from core completion. An early text stop,
+consumer exception or closed iterator aborts the unfinished core request;
+a naturally delivered core terminal does not trigger a redundant abort.
+The tracker marks terminal state before notifying a consumer and ignores
+subsequent duplicate/late events. Single-character stop strings retain no
+ambiguous suffix, while a natural terminal flushes the unmatched suffix.
+Prompt usage is initialized from the already-tokenized input so an early
+text stop still reports the correct prompt length.
