@@ -20,6 +20,7 @@ from typing import (
 from tokenizers.decoders import DecodeStream
 
 from astrai.config.inference_config import InferenceConfig
+from astrai.inference.contracts import ExecutionRequest, RequestIdentity, SamplingParams
 from astrai.inference.core.metrics import MetricsCollector
 from astrai.tokenize.tokenizer import AutoTokenizer
 
@@ -98,7 +99,9 @@ class Request:
         backend: Optional["AttentionBackend"] = None,
     ):
         self.request_id = request_id
-        self.prompt_ids = prompt_ids
+        self.identity = RequestIdentity(request_id, uuid.uuid4().hex)
+        self.prompt_ids = list(prompt_ids)
+        self._prompt_snapshot = tuple(prompt_ids)
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
@@ -106,6 +109,9 @@ class Request:
         self.frequency_penalty = frequency_penalty
         self.rep_window = rep_window
         self.backend = backend
+        self._sampling = SamplingParams(
+            temperature, top_p, top_k, frequency_penalty, rep_window
+        )
 
         # Scoring only: how many trailing tokens of ``prompt_ids`` form the
         # continuation to score.  Zero for generation requests.
@@ -117,7 +123,29 @@ class Request:
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.num_computed_tokens: int = 0
+        self.num_materialized_tokens: int = 0
+        self.finish_reason: Optional[str] = None
+        self.error_reason: Optional[str] = None
+        self.terminal_emitted = False
+        self.emit_events = True
         self._decoder: Optional[StreamDecoder] = None
+
+    def execution(self, phase: str, position: int, num_tokens: int) -> ExecutionRequest:
+        """Detach all mutable request state at the core/worker boundary."""
+        return ExecutionRequest(
+            identity=self.identity,
+            prompt_ids=self._prompt_snapshot,
+            input_token_id=self.output_ids[-1]
+            if self.output_ids
+            else self.prompt_ids[-1],
+            position=position,
+            num_tokens=num_tokens,
+            phase=phase,
+            sampling=self._sampling,
+            output_ids=tuple(self.output_ids) if self.frequency_penalty else (),
+            cont_len=self.cont_len,
+            backend=self.backend,
+        )
 
     def mark_prefill_complete(self):
         """Prompt KV is materialized by prefill; first output sampled but
@@ -280,6 +308,8 @@ class RequestManager:
         if not prompts:
             return []
         if prompts_ids is not None:
+            if len(prompts_ids) != len(prompts):
+                raise ValueError("prompts_ids must match prompts in length")
             encoded = prompts_ids
         else:
             encoded = self.tokenizer.encode(list(prompts))
@@ -287,6 +317,8 @@ class RequestManager:
                 raise ValueError("batch tokenizer returned unexpected shape")
         if request_ids is not None and len(request_ids) != len(prompts):
             raise ValueError("request_ids must match prompts in length")
+        if stream_callbacks is not None and len(stream_callbacks) != len(prompts):
+            raise ValueError("stream_callbacks must match prompts in length")
 
         request_ids_out: List[str] = []
         requests: List[Request] = []
@@ -322,13 +354,31 @@ class RequestManager:
             requests.append(request)
             request_ids_out.append(request_id)
 
-        callbacks = stream_callbacks or [None] * len(requests)
-        for request, callback in zip(requests, callbacks):
-            self._register_request(request, callback)
+        callbacks = (
+            stream_callbacks if stream_callbacks is not None else [None] * len(requests)
+        )
+        # Validate and install the whole batch in one critical section. A
+        # duplicate later in the batch must not leave an unowned prefix queued.
+        with self._lock:
+            if len(set(request_ids_out)) != len(request_ids_out):
+                raise ValueError("duplicate request ids in batch")
+            if any(rid in self._requests for rid in request_ids_out):
+                raise ValueError("duplicate live request id in batch")
+            for request, callback in zip(requests, callbacks):
+                self.waiting.append(request)
+                self._requests[request.request_id] = request
+                self._total_requests += 1
+                if callback is not None:
+                    self._callbacks[request.request_id] = callback
+                if self._metrics is not None:
+                    self._metrics.register(request.request_id)
+        self._request_event.set()
         return request_ids_out
 
     def _register_request(self, request: "Request", stream_callback=None) -> None:
         with self._lock:
+            if request.request_id in self._requests:
+                raise ValueError(f"duplicate live request id: {request.request_id}")
             self.waiting.append(request)
             self._requests[request.request_id] = request
             self._total_requests += 1
@@ -340,7 +390,9 @@ class RequestManager:
 
         self._request_event.set()
 
-    def cancel_request(self, request_id: str) -> Tuple[List[Request], bool]:
+    def cancel_request(
+        self, request_id: str, *, notify_callback: bool = True
+    ) -> Tuple[List[Request], bool]:
         """Mark a request cancelled and return requests safe to clean immediately.
 
         Registered stream callbacks receive the terminal ``STOP`` sentinel
@@ -353,7 +405,11 @@ class RequestManager:
         immediate: List[Request] = []
         with self._lock:
             request = self._requests.get(request_id)
-            callback = self._callbacks.pop(request_id, None)
+            callback = (
+                self._callbacks.pop(request_id, None)
+                if notify_callback
+                else self._callbacks.get(request_id)
+            )
             if request is None or request.status in (
                 RequestStatus.FINISHED,
                 RequestStatus.ABORTED,
@@ -370,7 +426,7 @@ class RequestManager:
                 self._requests.pop(request_id, None)
                 immediate = [request]
 
-        if cancelled and callback is not None:
+        if cancelled and notify_callback and callback is not None:
             if isinstance(callback, BatchedStreamCallback):
                 callback([(request_id, STOP)])
             else:
@@ -511,6 +567,20 @@ class RequestManager:
     def get_waiting_requests(self) -> List[Request]:
         with self._lock:
             return list(self.waiting)
+
+    def get_request(self, request_id: str) -> Optional[Request]:
+        with self._lock:
+            return self._requests.get(request_id)
+
+    def discard(self, request: Request) -> None:
+        """Remove a terminal request after its event and execution fence."""
+        with self._lock:
+            self.waiting = deque(r for r in self.waiting if r is not request)
+            self.running = [r for r in self.running if r is not request]
+            if self._requests.get(request.request_id) is request:
+                self._requests.pop(request.request_id, None)
+            self._callbacks.pop(request.request_id, None)
+            self._total_tokens += request.output_tokens
 
     def clear_queues(self):
         with self._lock:

@@ -112,7 +112,7 @@ class OpenAIResponseBuilder(ResponseBuilder):
         ]
 
     def format_chunk(self, token: str, **kwargs) -> List[str]:
-        body = kwargs.get("body", "")
+        body = kwargs.pop("body", "")
         if self._parser is not None:
             return self._format_tool_chunk(body, **kwargs)
 
@@ -225,7 +225,7 @@ class OpenAIResponseBuilder(ResponseBuilder):
                             }
                         )
                     )
-        finish_reason = "stop"
+        finish_reason = "length" if stop.finish_reason == "length" else "stop"
         if self._parser is not None and self._parser.has_tool_calls:
             finish_reason = "tool_calls"
         return events + [
@@ -287,7 +287,9 @@ class OpenAIResponseBuilder(ResponseBuilder):
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
+                    "finish_reason": "length"
+                    if stop.finish_reason == "length"
+                    else "stop",
                 }
             ],
             "usage": {

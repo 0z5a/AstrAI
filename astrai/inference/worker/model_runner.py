@@ -1,6 +1,6 @@
 import logging
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from astrai.config.inference_config import InferenceConfig
+from astrai.extension import attn_backend
 from astrai.extension.backend.attention import (
     CudaBackend,
     get_backend,
@@ -17,10 +18,9 @@ if TYPE_CHECKING:
     # Type-only dependency: the worker consumes the KV manager's ``bind``
     # interface; importing it at runtime would create a core↔worker cycle.
     from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
-from astrai.inference.core.request import Request
+from astrai.inference.contracts import ExecutionRequest, SchedulerOutput
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.pending import (
-    BatchSnapshot,
     PendingExecution,
     ResultRing,
 )
@@ -96,13 +96,15 @@ class DecodeSteadyState:
     device-to-device copy.
     """
 
-    task_sig: tuple
-    positions: list[int]
+    task_sig: Any
+    positions: List[int]
     sampling_info: SamplingBatchInfo
     last_tokens: Optional[Tensor] = None
 
 
-def _build_sampling_batch_info(requests: List[Request], device) -> SamplingBatchInfo:
+def _build_sampling_batch_info(
+    requests: List[ExecutionRequest], device
+) -> SamplingBatchInfo:
     pin = str(device).startswith("cuda")
     freq_list = [t.frequency_penalty for t in requests]
     temps = [t.temperature for t in requests]
@@ -316,10 +318,12 @@ class GPUModelRunner:
 
     def execute_prefill(
         self,
-        requests: List[Request],
+        requests: List[ExecutionRequest],
         start_pos: int = 0,
         return_logprobs: bool = False,
         num_tokens: Optional[List[int]] = None,
+        *,
+        plan: SchedulerOutput,
     ):
         """Prefill (a chunk of) each request's prompt; sample only at chunk ends.
 
@@ -424,16 +428,20 @@ class GPUModelRunner:
 
         sampling_requests = [t for t, m in zip(requests, sample_mask) if m]
         if sampling_requests:
-            pending = self._submit_sample(logits, sampling_requests, return_logprobs)
+            pending = self._submit_sample(
+                logits, sampling_requests, return_logprobs, plan=plan
+            )
         else:
-            # Continuation-only step: nothing to sample, nothing to commit.
-            # Return a None pending so the caller only advances KV cursors.
-            return requests, None
+            pending = PendingExecution(snapshot=plan)
+        # Even a KV-only chunk must complete before publishing pages/freeing KV.
+        if torch.device(self.device).type == "cuda":
+            pending.completion_event = torch.cuda.Event()
+            pending.completion_event.record()
         return requests, pending
 
     def execute_score(
         self,
-        requests: List[Request],
+        requests: List[ExecutionRequest],
         per_token: bool = False,
     ) -> List[Any]:
         """Teacher-forced log-probabilities for a batch of prompts.
@@ -520,7 +528,11 @@ class GPUModelRunner:
         return out
 
     def submit_decode(
-        self, requests: List[Request], return_logprobs: bool = False
+        self,
+        requests: List[ExecutionRequest],
+        return_logprobs: bool = False,
+        *,
+        plan: SchedulerOutput,
     ) -> Optional[PendingExecution]:
         """Launch one decode step without resolving any value on host.
 
@@ -551,7 +563,7 @@ class GPUModelRunner:
 
         ws = self._workspace
         request_ids = [t.request_id for t in requests]
-        task_sig = tuple(request_ids)
+        task_sig = tuple(t.identity for t in requests)
         cur_positions = [t.next_pos for t in requests]
 
         # ---- pre-replay: update input buffers in-place ----
@@ -573,18 +585,13 @@ class GPUModelRunner:
         pending_same_batch = (
             self._pending is not None
             and not self._pending.committed
-            and self._pending.snapshot.request_ids == task_sig
+            and self._pending.snapshot.identities == task_sig
         )
         if cache_valid and cached.last_tokens is not None:
             with torch.inference_mode():
                 input_ids = ws.fill_input_ids_from_device(cached.last_tokens)
         else:
-            input_ids = ws.fill_input_ids(
-                [
-                    t.output_ids[-1] if t.output_ids else t.prompt_ids[-1]
-                    for t in requests
-                ]
-            )
+            input_ids = ws.fill_input_ids([t.input_token_id for t in requests])
 
         kv_cache = self.kv_manager.bind(request_ids, ws)
 
@@ -638,7 +645,9 @@ class GPUModelRunner:
                 )
             logits = outputs["logits"]
 
-        pending = self._submit_sample(logits, requests, return_logprobs, info=info)
+        pending = self._submit_sample(
+            logits, requests, return_logprobs, info=info, plan=plan
+        )
         self._result_ring.post(pending)
         self._decode_cache.last_tokens = pending.tokens
         self._pending = pending
@@ -647,9 +656,11 @@ class GPUModelRunner:
     def _submit_sample(
         self,
         logits: Tensor,
-        requests: List[Request],
+        requests: List[ExecutionRequest],
         return_logprobs: bool = False,
         info: Optional[SamplingBatchInfo] = None,
+        *,
+        plan: SchedulerOutput,
     ) -> PendingExecution:
         """Sample from ``logits`` into a :class:`PendingExecution`.
 
@@ -705,14 +716,9 @@ class GPUModelRunner:
         else:
             tokens, logprobs = result, None
 
-        snapshot = BatchSnapshot(
-            request_ids=tuple(t.request_id for t in requests),
-            kv_positions=tuple(t.next_pos for t in requests),
-            policy_version=0,
-        )
         return PendingExecution(
-            snapshot=snapshot,
-            requests=list(requests),
+            snapshot=plan,
+            sampled_identities=tuple(t.identity for t in requests),
             tokens=tokens,
             logprobs=logprobs,
         )
@@ -745,48 +751,55 @@ class GPUModelRunner:
         cached = self._decode_cache
         return cached is None or not getattr(cached.sampling_info, "has_freq", False)
 
-    def flush_pending(self, stepper=None) -> Optional[PendingExecution]:
-        """Commit and clear any in-flight submitted step.
+    def execute_model(self, plan: SchedulerOutput):
+        """Yield every launched group's handle, including KV-only prefills.
 
-        The drain point for every state transition that must not race an
-        outstanding step: weight updates, KV invalidation, shutdown, and
-        the frequency-penalty fallback inside :meth:`submit_decode`
-        (via the SchedulerStep).  Returns the drained step, or ``None``.
+        Yielding immediately transfers resource ownership to EngineCore even
+        when a later backend group fails. The runner never commits core state.
         """
-        pending = self._pending
-        if pending is None:
-            return None
-        self._pending = None
-        if pending.committed:
-            return pending
-        if stepper is not None:
-            stepper.step_commit(pending)
-        else:
-            pending.commit()
-        return pending
+        groups = {}
+        for request in plan.requests:
+            key = (
+                request.phase,
+                request.backend,
+                request.position if request.phase == "prefill" else None,
+            )
+            groups.setdefault(key, []).append(request)
+        for (phase, backend, start_pos), requests in groups.items():
+            subplan = plan.select(requests)
+            with attn_backend(backend) if backend is not None else nullcontext():
+                if phase == "prefill":
+                    _, pending = self.execute_prefill(
+                        requests,
+                        start_pos=start_pos,
+                        num_tokens=[r.num_tokens for r in requests],
+                        return_logprobs=plan.return_logprobs,
+                        plan=subplan,
+                    )
+                else:
+                    pending = self.submit_decode(
+                        requests, plan.return_logprobs, plan=subplan
+                    )
+                    if pending is None:
+                        raise RuntimeError("decode submit requires a drained history")
+            yield pending
+
+    def synchronize(self) -> None:
+        """Fence work that threw before it could return an execution handle."""
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def execute_decode(
-        self, requests: List[Request], return_logprobs: bool = False
+        self,
+        requests: List[ExecutionRequest],
+        return_logprobs: bool = False,
+        *,
+        plan: SchedulerOutput,
     ) -> List[int]:
-        """Decode next token for each request (submit + immediate commit).
-
-        Compatibility shell over :meth:`submit_decode`: same ordering
-        guarantees and same return contract as before the split, for the
-        synchronous callers (``run_batch``, RL rollout).  The SchedulerStep's
-        overlapping path uses ``submit_decode`` + deferred commit instead.
-
-        Returns:
-            ``List[int]`` of sampled token IDs, or
-            ``List[Tuple[int, float]]`` of ``(token_id, logprob)`` when
-            ``return_logprobs`` is ``True``.
-        """
-        pending = self.submit_decode(requests, return_logprobs)
+        pending = self.submit_decode(requests, return_logprobs, plan=plan)
         if pending is None:
-            # submit_decode refuses only the freq-penalty-with-pending
-            # combination; with no pending step in flight it cannot happen,
-            # so reaching here means the caller bypassed the contract.
-            raise RuntimeError("execute_decode: submit refused an empty batch")
+            raise RuntimeError("execute_decode: submit refused")
         payload = pending.commit()
         if return_logprobs:
-            return [(tid, lp) for tid, lp in payload]
-        return [tid for tid, _ in payload]
+            return [(r.token_id, r.logprob) for r in payload.results]
+        return [r.token_id for r in payload.results]

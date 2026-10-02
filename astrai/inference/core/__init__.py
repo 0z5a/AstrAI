@@ -6,6 +6,7 @@ weights shared with the trainer.  The core emits output events; it never
 detokenizes and never runs consumer callbacks.
 """
 
+from astrai.inference.core.engine_core import EngineCore
 from astrai.inference.core.request import (
     STOP,
     BatchedStreamCallback,
@@ -21,6 +22,7 @@ from astrai.inference.core.stepper import SchedulerStep
 __all__ = [
     "STOP",
     "BatchedStreamCallback",
+    "EngineCore",
     "GenerationResult",
     "OutputEventSink",
     "Request",

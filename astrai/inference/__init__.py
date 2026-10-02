@@ -14,6 +14,8 @@ Layering (mirrors vLLM v1's process topology, in-process):
 Dependency rule (one-way): frontend → core → worker → model/KV ABI.
 """
 
+from astrai.inference.contracts import ModelRunnerOutput, SchedulerOutput
+from astrai.inference.core.engine_core import EngineCore
 from astrai.inference.core.events import (
     RequestError,
     RequestFinished,
@@ -39,12 +41,14 @@ from astrai.inference.worker.sample import sample
 __all__ = [
     "STOP",
     "BatchedStreamCallback",
+    "EngineCore",
     "EngineCoreClient",
     "GPUModelRunner",
     "GenerationResult",
     "InferenceEngine",
     "InprocClient",
     "InputProcessor",
+    "ModelRunnerOutput",
     "OutputProcessor",
     "Request",
     "RequestError",
@@ -52,6 +56,7 @@ __all__ = [
     "RequestManager",
     "RequestStatus",
     "Scheduler",
+    "SchedulerOutput",
     "TokenDelta",
     "build_engine",
     "get_app",

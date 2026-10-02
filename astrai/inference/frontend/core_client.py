@@ -1,10 +1,8 @@
-"""Engine-core client seam (vLLM: core_client.py, InprocClient).
+"""In-process request and event boundary for the inference frontend.
 
-The frontend talks to the scheduler exclusively through this interface.
-T0 (in-process serving / colocated RL) uses the direct-call implementation
-below — same object, zero transport.  A T1 deployment replaces it with a
-transport client (e.g. ZMQ) without touching the engine or the protocol
-adapters, which is the entire point of the seam.
+The Scheduler facade delegates execution and lifecycle operations to its
+EngineCore. Both remain in the training model's process; request submission
+and cancellation share the core's operation lock with model execution.
 """
 
 from typing import List
@@ -35,11 +33,7 @@ class EngineCoreClient:
 
 
 class InprocClient(EngineCoreClient):
-    """Direct in-process client (vLLM's UniProcExecutor analogue).
-
-    Holds the live :class:`Scheduler`; every call is a plain method
-    invocation.  Idle when the scheduler loop owns the core.
-    """
+    """Direct client of the Scheduler facade and its in-process EngineCore."""
 
     def __init__(self, scheduler: Scheduler):
         self._scheduler = scheduler

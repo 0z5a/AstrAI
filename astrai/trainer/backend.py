@@ -92,13 +92,16 @@ class ColocatedBackend:
         return self.scheduler.policy_version
 
     def generate(self, prompt_ids_list: List[List[int]], **kwargs):
-        model = self.scheduler.model
-        was_training = model.training
-        model.eval()
-        try:
-            return self.scheduler.run_batch(prompt_ids_list, **kwargs)
-        finally:
-            model.train(was_training)
+        def generate_with_snapshot(_version):
+            model = self.scheduler.model
+            was_training = model.training
+            model.eval()
+            try:
+                return self.scheduler.run_batch(prompt_ids_list, **kwargs)
+            finally:
+                model.train(was_training)
+
+        return self.scheduler.with_policy_snapshot(generate_with_snapshot)
 
     def update_weights(self, policy_version: int) -> int:
         return self.scheduler.update_weights(policy_version)
@@ -205,17 +208,19 @@ class P2PCopyPublisher:
         self._pairs = None
 
     def publish(self, policy_version: int, source: nn.Module) -> None:
-        if self._pairs is None:
-            src = strip_compile_prefix(dict(source.state_dict(keep_vars=True)))
-            dst = dict(self._backend.model.state_dict(keep_vars=True))
-            missing = set(dst) - set(src)
-            if missing:
-                raise RuntimeError(
-                    f"replica has parameters absent from the training "
-                    f"model: {sorted(missing)[:5]}"
-                )
-            self._pairs = [(src[name], dst[name]) for name in dst]
-        with torch.no_grad():
-            for src_tensor, dst_tensor in self._pairs:
-                dst_tensor.copy_(src_tensor)
-        self._backend.update_weights(policy_version)
+        def copy_weights(_version):
+            if self._pairs is None:
+                src = strip_compile_prefix(dict(source.state_dict(keep_vars=True)))
+                dst = dict(self._backend.model.state_dict(keep_vars=True))
+                missing = set(dst) - set(src)
+                if missing:
+                    raise RuntimeError(
+                        f"replica has parameters absent from the training "
+                        f"model: {sorted(missing)[:5]}"
+                    )
+                self._pairs = [(src[name], dst[name]) for name in dst]
+            with torch.no_grad():
+                for src_tensor, dst_tensor in self._pairs:
+                    dst_tensor.copy_(src_tensor)
+
+        self._backend.apply_weight_update(policy_version, copy_weights)

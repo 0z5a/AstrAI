@@ -3,10 +3,25 @@
 import json
 from unittest.mock import MagicMock
 
-from astrai.inference.frontend.output_processor import StopSequenceChecker
+import pytest
+
+from astrai.inference.core.events import (
+    FINISH_ABORTED,
+    FINISH_CANCELLED,
+    FINISH_LENGTH,
+    FINISH_STOP_TOKEN,
+    RequestError,
+    RequestFinished,
+    TokenDelta,
+)
+from astrai.inference.frontend.output_processor import (
+    OutputProcessor,
+    StopSequenceChecker,
+)
 from astrai.inference.network.anthropic import AnthropicResponseBuilder
 from astrai.inference.network.openai import OpenAIResponseBuilder
 from astrai.inference.network.protocol import GenContext, StopInfo
+from tests.helpers import FakeTokenizer
 
 
 def _make_ctx(**kwargs):
@@ -73,6 +88,93 @@ def test_stop_sequence_checker_empty_sequences():
     sc = StopSequenceChecker([])
     text, stopped = sc.push("hello")
     assert not stopped and text == "hello"
+
+
+def test_stop_sequence_checker_single_character_never_repeats_text():
+    checker = StopSequenceChecker(["!"])
+    assert checker.push("a") == ("a", False)
+    assert checker.push("b") == ("b", False)
+    assert checker.flush() == ""
+    assert checker.push("c!ignored") == ("c", True)
+    assert checker.flush() == ""
+
+
+def test_stop_sequence_checker_cross_token_match_discards_only_stop_and_suffix():
+    checker = StopSequenceChecker(["END"])
+    assert checker.push("hello EN") == ("hello ", False)
+    assert checker.push("D ignored") == ("", True)
+    assert checker.push("more ignored") == ("", True)
+    assert checker.flush() == ""
+
+
+def test_stop_sequence_checker_flushes_unmatched_tail_once():
+    checker = StopSequenceChecker(["END"])
+    assert checker.push("hello EN") == ("hello ", False)
+    assert checker.flush() == "EN"
+    assert checker.flush() == ""
+
+
+def test_stop_sequence_checker_uses_earliest_match_not_stop_list_order():
+    checker = StopSequenceChecker(["later", "early"])
+    assert checker.push("before early and later") == ("before ", True)
+    assert checker.matched == "early"
+    assert checker.flush() == ""
+
+
+@pytest.mark.parametrize("reason", [FINISH_STOP_TOKEN, FINISH_LENGTH, FINISH_CANCELLED])
+def test_output_processor_flushes_unmatched_tail_on_core_terminal(reason):
+    processor = OutputProcessor(
+        "r", FakeTokenizer(), stop_sequences=["END"], prompt_tokens=7
+    )
+    processor._decoder = MagicMock()
+    processor._decoder.push.side_effect = ["hello ", "EN", ""]
+    chunks = [processor.push(TokenDelta("r", i, i))[0] for i in range(1, 4)]
+    terminal = RequestFinished("r", reason, 7, 3)
+    tail, stopped = processor.push(terminal)
+    assert not stopped
+    assert tail == "EN"
+    assert "".join(chunks) + tail == processor.state.text == "hello EN"
+    assert processor.finished
+    assert processor.state.finish_reason == reason
+    assert processor.state.stop_sequence is None
+    assert processor.usage() == (7, 3)
+    assert processor.push(terminal) == ("", False)
+    assert processor.push(TokenDelta("r", 4, 4)) == ("", False)
+    assert processor.state.text == "hello EN"
+
+
+def test_output_processor_text_stop_keeps_prompt_usage_without_core_terminal():
+    processor = OutputProcessor(
+        "r", FakeTokenizer(), stop_sequences=["END"], prompt_tokens=7
+    )
+    processor._decoder = MagicMock()
+    processor._decoder.push.side_effect = ["hello E", "ND ignored"]
+    first, _ = processor.push(TokenDelta("r", 11, 1))
+    last, stopped = processor.push(TokenDelta("r", 12, 2))
+    assert stopped
+    assert processor.finished
+    assert first + last == processor.state.text == "hello "
+    assert processor.state.stop_sequence == "END"
+    assert processor.usage() == (7, 2)
+    assert processor.push(RequestFinished("r", FINISH_CANCELLED, 7, 2)) == (
+        "",
+        False,
+    )
+    assert processor.state.finish_reason == FINISH_STOP_TOKEN
+    assert processor.state.text == "hello "
+
+
+def test_output_processor_error_is_terminal_and_preserves_partial_text():
+    processor = OutputProcessor(
+        "r", FakeTokenizer(), stop_sequences=["END"], prompt_tokens=7
+    )
+    processor._decoder = MagicMock()
+    processor._decoder.push.return_value = "EN"
+    assert processor.push(TokenDelta("r", 11, 1)) == ("", False)
+    assert processor.push(RequestError("r", "test", "failed")) == ("EN", False)
+    assert processor.finished
+    assert processor.state.finish_reason == FINISH_ABORTED
+    assert processor.usage() == (7, 1)
 
 
 def test_openai_prepare_returns_prompt_ctx_stops():
@@ -207,7 +309,7 @@ def test_anthropic_format_stream_end_with_stop_trims_and_emits_remaining():
     ctx = _make_ctx(completion_tokens=7)
     stop = StopInfo(
         matched="END",
-        body="Hello world END extra",
+        body="Hello world ",
         yielded="Hello ",
     )
     events = builder.format_stream_end(ctx, stop)
@@ -229,7 +331,7 @@ def test_anthropic_format_stream_end_stop_trimmed_already_yielded():
     ctx = _make_ctx()
     stop = StopInfo(
         matched="END",
-        body="Hello END",
+        body="Hello ",
         yielded="Hello ",
     )
     events = builder.format_stream_end(ctx, stop)
@@ -238,11 +340,11 @@ def test_anthropic_format_stream_end_stop_trimmed_already_yielded():
     assert types == ["content_block_stop", "message_delta", "message_stop"]
 
 
-def test_anthropic_format_response_with_stop_trims_content():
+def test_anthropic_format_response_with_stop_preserves_trimmed_content():
     builder = _make_anthropic_builder()
     ctx = _make_ctx()
-    stop = StopInfo(matched="STOP", body="text STOP extra", yielded="text ")
-    resp = builder.format_response(ctx, "text STOP extra", stop)
+    stop = StopInfo(matched="STOP", body="text ", yielded="text ")
+    resp = builder.format_response(ctx, "text ", stop)
     assert resp["content"][0]["text"] == "text "
     assert resp["stop_reason"] == "stop_sequence"
     assert resp["stop_sequence"] == "STOP"

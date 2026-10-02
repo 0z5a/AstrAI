@@ -69,7 +69,8 @@ class Allocator:
         self._n_pages = n_pages
         self._refs: List[int] = [0] * n_pages
         self._lru: OrderedDict[int, None] = OrderedDict()
-        self.on_evict: Optional[Callable[[int], None]] = None
+        # Eviction may revoke an entire prefix subtree, not just its root.
+        self.on_evict: Optional[Callable[[int], Optional[List[int]]]] = None
         self._lock = threading.Lock()
         self._sync_words()
 
@@ -113,6 +114,37 @@ class Allocator:
         if w < self._first_nonempty:
             self._first_nonempty = w
 
+    def _discard_cached(self, idxs: List[int]) -> int:
+        """Release revoked cache identities; caller holds ``_lock``.
+
+        Referenced pages remain owned by their requests. Only unreferenced
+        LRU pages return to the free mask, without recursively evicting.
+        """
+        released = 0
+        for idx in idxs:
+            if idx not in self._lru:
+                continue
+            if self._refs[idx] != 0:
+                raise RuntimeError("Cannot invalidate a referenced cache page")
+            del self._lru[idx]
+            self._mask_free_bit(idx)
+            released += 1
+        return released
+
+    def discard_cached(self, idxs: List[int]) -> int:
+        """Forget identities revoked by prefix replacement or relocation."""
+        if not idxs:
+            return 0
+        with self._lock:
+            return self._discard_cached(idxs)
+
+    def _evict_cached(self, idx: int) -> int:
+        """Evict one LRU victim and reclaim its revoked descendants."""
+        revoked = self.on_evict(idx) if self.on_evict is not None else None
+        released = self._discard_cached(revoked or [])
+        # Also support callbacks that only notify and return None.
+        return released + self._discard_cached([idx])
+
     def alloc(self) -> int:
         with self._lock:
             if self._free_mask:
@@ -122,15 +154,10 @@ class Allocator:
                 self._refs[idx] = 1
                 return idx
             if self._lru:
-                idx, _ = self._lru.popitem(last=False)
-                if self.on_evict:
-                    self.on_evict(idx)
+                idx = next(iter(self._lru))
+                self._evict_cached(idx)
+                self._mask_alloc_bits([idx])
                 self._refs[idx] = 1
-                # LRU promotion: the bit was set by the caller before or
-                # during eviction; clear it in both structures now.
-                self._free_mask &= ~(1 << idx)
-                w = idx >> 6
-                self._words[w] &= ~(1 << (idx & 63))
                 return idx
             return -1
 
@@ -146,16 +173,11 @@ class Allocator:
             return []
         with self._lock:
             free = self._free_mask.bit_count()
-            if free < n:
-                promoted = 0
-                while free + promoted < n and self._lru:
-                    idx, _ = self._lru.popitem(last=False)
-                    if self.on_evict:
-                        self.on_evict(idx)
-                    self._mask_free_bit(idx)
-                    promoted += 1
-                if free + promoted < n:
-                    return None
+            if free + len(self._lru) < n:
+                return None
+            while free < n:
+                # One ancestor eviction can release several LRU pages.
+                free += self._evict_cached(next(iter(self._lru)))
             # Word-index harvest: only the words actually consumed are
             # touched, so a fragmented pool costs the skipped empty words
             # (cursor advance) instead of a big-int limb walk per page.
@@ -254,15 +276,10 @@ class Allocator:
     def clear_cached(self) -> int:
         """Release every unreferenced LRU page back to the free pool."""
         with self._lock:
-            cached = list(self._lru)
-            self._lru.clear()
-            for idx in cached:
-                if self._refs[idx] != 0:
-                    raise RuntimeError("Cannot invalidate a referenced cache page")
-                if self.on_evict:
-                    self.on_evict(idx)
-                self._mask_free_bit(idx)
-            return len(cached)
+            count = len(self._lru)
+            while self._lru:
+                self._evict_cached(next(iter(self._lru)))
+            return count
 
 
 class RadixNode:
@@ -286,15 +303,28 @@ class RadixCache:
         self._page_to_node: Dict[int, RadixNode] = {}
         self._lock = threading.Lock()
 
-    def evict(self, idx: int):
+    def _remove_subtree(self, node: RadixNode) -> List[int]:
+        """Remove every dependent identity; caller holds ``_lock``."""
+        if node.parent is not None:
+            node.parent.children.pop(node.tokens, None)
+        revoked: List[int] = []
+        pending = [node]
+        while pending:
+            child = pending.pop()
+            pending.extend(child.children.values())
+            if child.page_idx is not None:
+                revoked.append(child.page_idx)
+                self._page_to_node.pop(child.page_idx, None)
+            child.page_idx = None
+            child.parent = None
+            child.children.clear()
+        return revoked
+
+    def evict(self, idx: int) -> List[int]:
+        """Revoke a page and its subtree; return identities for the allocator."""
         with self._lock:
-            node = self._page_to_node.pop(idx, None)
-            if node is None:
-                return
-            node.page_idx = None
-            parent = node.parent
-            if parent is not None:
-                parent.children.pop(node.tokens, None)
+            node = self._page_to_node.get(idx)
+            return self._remove_subtree(node) if node is not None else []
 
     def has_page(self, idx: int) -> bool:
         with self._lock:
@@ -315,14 +345,21 @@ class RadixCache:
                 node = child
             return hits
 
-    def record(self, page_idx: int, token_ids: List[int], logical_page_idx: int):
+    def record(
+        self, page_idx: int, token_ids: List[int], logical_page_idx: int
+    ) -> List[int]:
+        """Index a materialized page and return revoked physical identities.
+
+        Re-recording the same page/prefix is a no-op. Replacing its physical
+        page at the same prefix preserves descendants (their token context
+        is unchanged); moving a physical page to another prefix revokes its
+        old subtree. Only pages with already-indexed ancestors are reachable
+        and may be recorded.
+        """
         with self._lock:
             full_pages = len(token_ids) // self._page_size
-            if logical_page_idx >= full_pages:
-                return
-            old = self._page_to_node.pop(page_idx, None)
-            if old is not None and old.parent is not None:
-                old.parent.children.pop(old.tokens, None)
+            if logical_page_idx < 0 or logical_page_idx >= full_pages:
+                return []
 
             node = self._root
             for i in range(logical_page_idx + 1):
@@ -330,14 +367,29 @@ class RadixCache:
                 page_tokens = tuple(token_ids[start : start + self._page_size])
                 child = node.children.get(page_tokens)
                 if child is None:
+                    if i < logical_page_idx:
+                        node = None
+                        break
                     child = RadixNode(node, page_tokens)
                     node.children[page_tokens] = child
                 node = child
-            if node.page_idx is not None and node.page_idx != page_idx:
-                replaced = node.page_idx
-                self._page_to_node.pop(replaced, None)
+
+            old = self._page_to_node.get(page_idx)
+            if old is node and node is not None:
+                return []
+            revoked = self._remove_subtree(old) if old is not None else []
+            # A missing ancestor, or relocating an ancestor into its own
+            # subtree, cannot leave a reachable entry at the destination.
+            if node is None or node.parent is None:
+                return revoked
+            if node.page_idx is not None:
+                revoked.append(node.page_idx)
+                self._page_to_node.pop(node.page_idx, None)
             node.page_idx = page_idx
             self._page_to_node[page_idx] = node
+            if old is not None:
+                revoked.remove(page_idx)
+            return revoked
 
 
 class AllocationStrategy(ABC):
@@ -377,6 +429,8 @@ class AllocationStrategy(ABC):
         state: RequestCacheState,
         prompt_ids: List[int],
         start: int,
+        *,
+        materialized_end: int,
     ) -> None: ...
 
     def flush_slots(self, states: List[RequestCacheState], device) -> None:
@@ -420,6 +474,8 @@ class ContiguousStrategy(AllocationStrategy):
         state: RequestCacheState,
         prompt_ids: List[int],
         start: int,
+        *,
+        materialized_end: int,
     ) -> None:
         pass
 
@@ -488,9 +544,6 @@ class PagedStrategy(AllocationStrategy):
     def free(self, state: RequestCacheState) -> None:
         if self._prefix is not None:
             self._alloc.free_many(state.pages, keep_cached_for=self._prefix.has_page)
-            for p in state.pages:
-                if not self._prefix.has_page(p):
-                    self._prefix.evict(p)
         else:
             self._alloc.free_many(state.pages)
 
@@ -534,13 +587,14 @@ class PagedStrategy(AllocationStrategy):
         for i, (state, pos) in enumerate(zip(states, positions)):
             if pos // page_size >= len(state.pages):
                 need.append(i)
-        if not need:
-            return [True] * len(states)
-        pages = self._alloc.alloc_many(len(need))
-        if pages is None or len(pages) < len(need):
-            return [self.extend(s, p) for s, p in zip(states, positions)]
-        for i, p in zip(need, pages):
-            states[i].pages.append(p)
+        if need:
+            pages = self._alloc.alloc_many(len(need))
+            if pages is None or len(pages) < len(need):
+                return [self.extend(s, p) for s, p in zip(states, positions)]
+            for i, p in zip(need, pages):
+                states[i].pages.append(p)
+        # Existing pages still need their new decode position mapped. Page
+        # reservation alone does not initialize the whole req_to_token row.
         results = [True] * len(states)
         for state, pos in zip(states, positions):
             page_idx = pos // page_size
@@ -623,12 +677,24 @@ class PagedStrategy(AllocationStrategy):
         state: RequestCacheState,
         prompt_ids: List[int],
         start: int,
+        *,
+        materialized_end: int,
     ) -> None:
+        """Publish complete pages below the exclusive, materialized KV end.
+
+        Reserved pages and the full prompt length are not evidence that a
+        chunk has run. The caller must explicitly report its computed end.
+        """
+        if materialized_end < 0 or start < 0:
+            raise ValueError("materialized_end and start must be nonnegative")
         if self._prefix is None:
             return
-        full = len(prompt_ids) // self._page_size
+        full = min(materialized_end, len(prompt_ids)) // self._page_size
         for i in range(start, min(full, len(state.pages))):
-            self._prefix.record(state.pages[i], prompt_ids, i)
+            revoked = self._prefix.record(state.pages[i], prompt_ids, i)
+            # Radix mutations finish before taking the allocator lock:
+            # allocator-driven eviction takes these locks in the other order.
+            self._alloc.discard_cached(revoked)
 
     def invalidate_cache(self) -> int:
         if self._prefix is None:

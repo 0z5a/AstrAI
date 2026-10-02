@@ -11,15 +11,13 @@ import torch
 
 from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
 from astrai.inference import GenerationResult, Scheduler
-from astrai.inference.core.metrics import MetricsCollector
+from astrai.inference.contracts import SchedulerOutput
 from astrai.inference.core.request import STOP, BatchedStreamCallback, Request
-from astrai.inference.core.stepper import SchedulerStep
 from astrai.inference.worker.model_runner import (
     DecodeSteadyState,
     GPUModelRunner,
 )
 from astrai.inference.worker.pending import (
-    BatchSnapshot,
     PendingExecution,
     ResultRing,
 )
@@ -100,69 +98,45 @@ def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
 
 
 def test_generation_loop_activates_backend_in_worker_thread():
-    scheduler = object.__new__(Scheduler)
+    scheduler, _, _ = _make_real_scheduler("cpu")
     scheduler._backend = TorchNativeBackend()
-    scheduler._stop_event = threading.Event()
-    scheduler._kv_manager = MagicMock()
-    scheduler._retired = []
-    scheduler._executor = MagicMock()
-    scheduler._executor.peek_pending.return_value = None
-    scheduler._stepper = MagicMock()
-
     observed = []
-    task_mgr = MagicMock()
-    task_mgr.tokenizer.stop_ids = [0]
-    task_mgr.remove_finished_requests.return_value = []
-    task_mgr.get_running_requests.return_value = []
-    task_mgr.max_batch_size = 1
-    task_mgr.pull_waiting.return_value = []
-    task_mgr.has_requests.return_value = False
 
     def observe_backend(*args, **kwargs):
         observed.append(type(get_backend()))
         scheduler._stop_event.set()
 
-    task_mgr.wait_for_requests.side_effect = observe_backend
-    scheduler._requests = task_mgr
-
-    thread = threading.Thread(target=scheduler.run_busy_loop)
-    thread.start()
-    thread.join(timeout=5)
-
-    assert not thread.is_alive()
+    scheduler._requests.wait_for_requests = observe_backend
+    scheduler.start()
+    scheduler._loop_thread.join(timeout=5)
+    assert not scheduler._loop_thread.is_alive()
     assert observed == [TorchNativeBackend]
+    scheduler.stop()
+
+
+def _make_contract_scheduler():
+    scheduler, _, _ = _make_real_scheduler("cpu")
+    kv = scheduler._kv_manager = MagicMock()
+    kv.cached_tokens.return_value = 0
+    kv.extend_slots_batch.side_effect = lambda ids, positions: [True] * len(ids)
+    return scheduler
 
 
 def test_step_splits_decode_batch_by_request_backend():
-    scheduler = object.__new__(Scheduler)
-    scheduler._cache = SimpleNamespace(page_size=1)
-    scheduler._kv_manager = MagicMock()
-    scheduler._kv_manager.extend_slots.return_value = True
-    scheduler._kv_manager.extend_slots_batch.return_value = [True, True]
-    scheduler._metrics = MetricsCollector()
-    scheduler._executor = MagicMock()
-    scheduler._stepper = SchedulerStep(
-        scheduler._cache, scheduler._kv_manager, scheduler._executor, scheduler._metrics
-    )
-
+    scheduler = _make_contract_scheduler()
     observed = []
 
-    def submit(*args, **kwargs):
-        requests = args[0]
+    def submit(requests, return_logprobs=False, *, plan):
         observed.append(
             (type(get_backend()), [request.request_id for request in requests])
         )
         return PendingExecution(
-            snapshot=BatchSnapshot(
-                request_ids=tuple(t.request_id for t in requests),
-                kv_positions=(0,),
-                policy_version=0,
-            ),
-            requests=list(requests),
-            tokens=torch.tensor([1] * len(requests), dtype=torch.long),
+            snapshot=plan,
+            sampled_identities=tuple(r.identity for r in requests),
+            tokens=torch.tensor([7] * len(requests), dtype=torch.long),
         )
 
-    scheduler._executor.submit_decode.side_effect = submit
+    scheduler._executor.submit_decode = MagicMock(side_effect=submit)
 
     torch_task = Request("torch", [1], backend=TorchNativeBackend())
     cuda_task = Request("cuda", [1], backend=CudaBackend())
@@ -176,6 +150,9 @@ def test_step_splits_decode_batch_by_request_backend():
 
     assert aborted == []
     assert produced == [torch_task, cuda_task]
+    assert torch_task.output_ids == [1, 7]
+    assert cuda_task.output_ids == [1, 7]
+    assert not scheduler._planned
     assert observed == [
         (TorchNativeBackend, ["torch"]),
         (CudaBackend, ["cuda"]),
@@ -183,29 +160,20 @@ def test_step_splits_decode_batch_by_request_backend():
 
 
 def test_step_batches_ragged_prefill_with_shared_cache_start():
-    scheduler = object.__new__(Scheduler)
-    scheduler._cache = SimpleNamespace(page_size=64)
-    scheduler._kv_manager = MagicMock()
-    scheduler._kv_manager.cached_tokens.return_value = 0
-    scheduler._metrics = MetricsCollector()
-    scheduler._executor = MagicMock()
-    scheduler._stepper = SchedulerStep(
-        scheduler._cache, scheduler._kv_manager, scheduler._executor, scheduler._metrics
-    )
-
+    scheduler = _make_contract_scheduler()
     short = Request("short", [1, 2, 3])
     long = Request("long", [4, 5, 6, 7, 8])
-    for request in (short, long):
-        scheduler._metrics.register(request.request_id)
 
-    scheduler._executor.execute_prefill.return_value = (
-        [long, short],
-        PendingExecution(
-            snapshot=BatchSnapshot(("long", "short"), (0,), 0),
-            requests=[long, short],
+    def prefill(requests, *, plan, **kwargs):
+        # Worker packing order deliberately differs from scheduler order.
+        packed = sorted(requests, key=lambda r: r.request_id)
+        return packed, PendingExecution(
+            snapshot=plan,
+            sampled_identities=tuple(r.identity for r in packed),
             tokens=torch.tensor([11, 12], dtype=torch.long),
-        ),
-    )
+        )
+
+    scheduler._executor.execute_prefill = MagicMock(side_effect=prefill)
 
     produced, aborted = scheduler._step([short, long])
 
@@ -214,12 +182,11 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
     # caller order, not just the requests that sampled this step.
     assert set(produced) == {long, short}
     assert produced == [short, long]
-    scheduler._executor.execute_prefill.assert_called_once_with(
-        [short, long],
-        start_pos=0,
-        return_logprobs=False,
-        num_tokens=[3, 5],
-    )
+    args, kwargs = scheduler._executor.execute_prefill.call_args
+    assert [r.identity for r in args[0]] == [short.identity, long.identity]
+    assert kwargs["start_pos"] == 0
+    assert kwargs["num_tokens"] == [3, 5]
+    assert kwargs["plan"].policy_version == scheduler.policy_version
     assert long.output_ids == [11]
     assert short.output_ids == [12]
 
@@ -237,21 +204,26 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
         return {"logits": all_logits[logits_positions]}
 
     executor.model = MagicMock(side_effect=fake_model)
+    task_b = Request("b", [20, 21, 22, 23, 24]).execution("prefill", 1, 4)
+    task_a = Request("a", [10, 11, 12]).execution("prefill", 1, 2)
+    plan = SchedulerOutput(1, 9, (task_b, task_a))
     executor._submit_sample = MagicMock(
         return_value=PendingExecution(
-            snapshot=BatchSnapshot(("a", "b"), (0,), 0),
-            requests=[],
+            snapshot=plan,
+            sampled_identities=(task_a.identity, task_b.identity),
             tokens=torch.tensor([101, 102]),
         )
     )
 
-    task_b = Request("b", [20, 21, 22, 23, 24])
-    task_a = Request("a", [10, 11, 12])
-
-    requests, pending = executor.execute_prefill([task_b, task_a], start_pos=1)
+    requests, pending = executor.execute_prefill(
+        [task_b, task_a], start_pos=1, plan=plan
+    )
 
     assert requests == [task_a, task_b]
-    assert pending.commit() == [(101, None), (102, None)]
+    assert [(r.identity, r.token_id) for r in pending.commit().results] == [
+        (task_b.identity, 102),
+        (task_a.identity, 101),
+    ]
     model_args, model_kwargs = executor.model.call_args
     assert model_args[0].tolist() == [11, 12, 21, 22, 23, 24]
     assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
@@ -263,7 +235,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     torch.testing.assert_close(sample_args[0], all_logits[[1, 5]])
     assert sample_args[1] == [task_a, task_b]
     assert sample_args[2] is False
-    assert sample_kwargs == {}
+    assert sample_kwargs == {"plan": plan}
 
 
 def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
@@ -804,26 +776,25 @@ def test_decode_does_not_reuse_previous_batch_state():
     old_info = object()
     new_info = SimpleNamespace(has_freq=False)
     executor._decode_cache = DecodeSteadyState(("old",), [2], old_info)
+    request = Request("new", list(range(8)), temperature=0)
+    request.output_ids = [7]
+    request = request.execution("decode", 8, 1)
+    plan = SchedulerOutput(1, 2, (request,))
     pending_result = PendingExecution(
-        snapshot=BatchSnapshot(("new",), (8,), 0),
-        requests=[],
+        snapshot=plan,
+        sampled_identities=(request.identity,),
         tokens=torch.tensor([3], dtype=torch.long),
     )
     executor._submit_sample = MagicMock(return_value=pending_result)
-
-    request = Request("new", list(range(8)), temperature=0)
-    request.input_tokens = 8
-    request.output_ids = [7]
-    request.mark_prefill_complete()
 
     with patch(
         "astrai.inference.worker.model_runner._build_sampling_batch_info",
         return_value=new_info,
     ):
-        assert executor.execute_decode([request]) == [3]
+        assert executor.execute_decode([request], plan=plan) == [3]
 
     assert workspace.position_ids.tolist() == [8]
-    assert executor._decode_cache.task_sig == ("new",)
+    assert executor._decode_cache.task_sig == (request.identity,)
     executor._submit_sample.assert_called_once()
     args, kwargs = executor._submit_sample.call_args
     assert args[1:] == ([request], False)
@@ -853,30 +824,31 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
 
     info = SimpleNamespace(has_freq=False)
     tokens = torch.tensor([3], dtype=torch.long)
-    executor._decode_cache = DecodeSteadyState(("t1",), [2], info, last_tokens=tokens)
+    request = Request("t1", list(range(8)), temperature=0)
+    request.output_ids = [7]
+    request = request.execution("decode", 3, 1)
+    plan = SchedulerOutput(1, 2, (request,))
+    executor._decode_cache = DecodeSteadyState(
+        (request.identity,), [2], info, last_tokens=tokens
+    )
     executor._pending = None
     executor._result_ring = ResultRing(16, executor.device)
     executor._submit_sample = MagicMock(
         return_value=PendingExecution(
-            snapshot=BatchSnapshot(("t1",), (3,), 0), requests=[], tokens=tokens
+            snapshot=plan, sampled_identities=(request.identity,), tokens=tokens
         )
     )
-
-    request = Request("t1", list(range(8)), temperature=0)
-    request.input_tokens = 8
-    request.output_ids = [7]
-    request.mark_prefill_complete()
 
     with patch(
         "astrai.inference.worker.model_runner._build_sampling_batch_info",
         return_value=info,
     ):
-        assert executor.execute_decode([request]) == [3]
+        assert executor.execute_decode([request], plan=plan) == [3]
 
     workspace.fill_input_ids.assert_not_called()
     workspace.fill_input_ids_from_device.assert_called_once_with(tokens)
     assert workspace.position_ids.tolist() == [3]
-    assert executor._decode_cache.task_sig == ("t1",)
+    assert executor._decode_cache.task_sig == (request.identity,)
     assert executor._decode_cache.last_tokens is tokens
 
 
@@ -965,16 +937,17 @@ def test_pending_step_commit_is_idempotent(device):
     """A committed step cannot double-append tokens to its requests."""
     tokens = torch.tensor([5, 6], dtype=torch.long)
     logprobs = torch.tensor([-1.5, -2.5], dtype=torch.float32)
+    entries = tuple(Request(rid, [1]).execution("prefill", 0, 1) for rid in ("a", "b"))
     pending = PendingExecution(
-        snapshot=BatchSnapshot(("a", "b"), (0, 0), 0),
-        requests=[object(), object()],
+        snapshot=SchedulerOutput(7, 3, entries),
+        sampled_identities=tuple(r.identity for r in entries),
         tokens=tokens,
         logprobs=logprobs,
     )
     first = pending.commit()
     second = pending.commit()
-    assert first == second
-    assert first == [(5, -1.5), (6, -2.5)]
+    assert first is second
+    assert [(r.token_id, r.logprob) for r in first.results] == [(5, -1.5), (6, -2.5)]
     assert pending.committed
 
 
@@ -1008,7 +981,8 @@ def test_submit_decode_returns_pending_without_touching_tasks(device):
         with scheduler._backend_context():
             scheduler._stepper.step([request])
             assert request.prefill_complete
-            pending = scheduler._executor.submit_decode([request])
+            plan = scheduler.schedule([request])
+            pending = scheduler._executor.submit_decode(list(plan.requests), plan=plan)
         assert pending is not None
         try:
             n_prefilled = len(request.output_ids)
@@ -1214,45 +1188,35 @@ def test_stop_leaves_state_intact_when_loop_does_not_drain():
     loop.  The fixed contract: on drain failure stop() keeps the handle
     and the request state, and start() refuses to spawn a second loop.
     """
-    scheduler = object.__new__(Scheduler)
-    scheduler._stop_event = threading.Event()
-    scheduler._requests = MagicMock()
-    scheduler._loop_thread = MagicMock()
+    scheduler = _make_contract_scheduler()
+    scheduler.engine_core.loop_thread = MagicMock()
     scheduler._loop_thread.is_alive.return_value = True
-    # join "times out": is_alive stays True on both probes.
+    scheduler.release_finished = MagicMock()
 
-    scheduler.stop()
-
-    # The live loop's world is left untouched.
+    assert scheduler.stop() is False
     assert scheduler._loop_thread is not None
-    scheduler._requests.clear_queues.assert_not_called()
-    scheduler._requests.get_running_requests.assert_not_called()
+    scheduler.release_finished.assert_not_called()
 
-    # start() refuses to launch a second loop alongside the live one.
-    with patch("astrai.inference.core.scheduler.threading.Thread") as TH:
+    with patch("astrai.inference.core.engine_core.threading.Thread") as TH:
         scheduler.start()
         TH.assert_not_called()
 
 
 def test_stop_clears_state_when_loop_drains_normally():
     """After a clean drain the handle resets and terminal cleanup runs."""
-    scheduler = object.__new__(Scheduler)
-    scheduler._stop_event = threading.Event()
-    scheduler._requests = MagicMock()
-    scheduler._requests.get_running_requests.return_value = []
-    scheduler._requests.get_waiting_requests.return_value = []
-    scheduler._loop_thread = MagicMock()
-    scheduler._loop_thread.is_alive.return_value = True  # first probe (before join)
+    scheduler = _make_contract_scheduler()
+    scheduler.add_request("waiting", max_tokens=8)
+    scheduler.engine_core.loop_thread = MagicMock()
+    scheduler._loop_thread.is_alive.return_value = True
 
     def join_side_effect(timeout=None):
         scheduler._loop_thread.is_alive.return_value = False
 
     scheduler._loop_thread.join.side_effect = join_side_effect
-
-    scheduler.stop()
-
+    assert scheduler.stop() is True
     assert scheduler._loop_thread is None
-    scheduler._requests.clear_queues.assert_called_once()
+    assert not scheduler._requests.has_requests()
+    assert not scheduler._states
 
 
 def test_admission_rejects_requests_that_can_never_fit(device):
@@ -1390,7 +1354,6 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
         )
     finally:
         ref_sched.stop()
-    ref_forwards = len(fwd_calls)
 
     chunked = Scheduler(
         model=model,

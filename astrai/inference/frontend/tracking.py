@@ -43,6 +43,7 @@ class EventQueueSink(OutputEventSink):
     ):
         self._lock = threading.Lock()
         self._queues: Dict[str, Deque[Any]] = {}
+        self._terminal: set[str] = set()
         self._async_subscribers: Dict[
             str, Tuple[asyncio.AbstractEventLoop, asyncio.Queue]
         ] = {}
@@ -53,11 +54,13 @@ class EventQueueSink(OutputEventSink):
         with self._lock:
             bound = self._maxlen if maxlen is None else maxlen
             self._queues[request_id] = deque(maxlen=bound)
+            self._terminal.discard(request_id)
 
     def unregister(self, request_id: str) -> None:
         with self._lock:
             self._queues.pop(request_id, None)
             self._async_subscribers.pop(request_id, None)
+            self._terminal.discard(request_id)
 
     def subscribe_async(
         self, request_id: str, loop: asyncio.AbstractEventLoop
@@ -77,7 +80,6 @@ class EventQueueSink(OutputEventSink):
             self._async_subscribers.pop(request_id, None)
 
     def __call__(self, events: List[Any]) -> None:
-        terminal: List[str] = []
         by_loop: Dict[
             asyncio.AbstractEventLoop, List[Tuple[str, asyncio.Queue, List[Any]]]
         ] = {}
@@ -85,6 +87,8 @@ class EventQueueSink(OutputEventSink):
             for event in events:
                 rid = event.request_id
                 queue = self._queues.get(rid)
+                if queue is None or rid in self._terminal:
+                    continue
                 subscriber = self._async_subscribers.get(rid)
                 if subscriber is not None:
                     loop, async_queue = subscriber
@@ -93,12 +97,15 @@ class EventQueueSink(OutputEventSink):
                         deliveries[-1][2].append(event)
                     else:
                         deliveries.append((rid, async_queue, [event]))
-                elif queue is not None:
+                else:
                     queue.append(event)
-                if queue is not None and isinstance(
-                    event, (RequestFinished, RequestError)
-                ):
-                    terminal.append(rid)
+                if isinstance(event, (RequestFinished, RequestError)):
+                    self._terminal.add(rid)
+                    # Publish the core terminal fact before a draining caller
+                    # or async delivery can observe it. This bookkeeping-only
+                    # callback must not re-enter the sink.
+                    if self._on_terminal is not None:
+                        self._on_terminal(rid)
 
         for loop, deliveries in by_loop.items():
             scheduled = [(queue, batch) for _, queue, batch in deliveries]
@@ -106,17 +113,16 @@ class EventQueueSink(OutputEventSink):
                 loop.call_soon_threadsafe(_deliver_async_events, scheduled)
             except RuntimeError:
                 with self._lock:
+                    restored = set()
                     for rid, queue, batch in deliveries:
-                        if self._async_subscribers.get(rid) != (loop, queue):
-                            continue
-                        self._async_subscribers.pop(rid, None)
+                        if rid not in restored:
+                            if self._async_subscribers.get(rid) != (loop, queue):
+                                continue
+                            self._async_subscribers.pop(rid, None)
+                            restored.add(rid)
                         pending = self._queues.get(rid)
                         if pending is not None:
                             pending.extend(batch)
-
-        if self._on_terminal is not None:
-            for rid in terminal:
-                self._on_terminal(rid)
 
 
 class RequestTracker:
@@ -143,9 +149,9 @@ class RequestTracker:
     def register(
         self, request_id: str, maxlen: Optional[int] = None
     ) -> threading.Event:
-        self._sink.register(request_id, maxlen=maxlen)
         with self._lock:
             done = self._finished[request_id] = threading.Event()
+        self._sink.register(request_id, maxlen=maxlen)
         return done
 
     def unregister(self, request_id: str) -> None:

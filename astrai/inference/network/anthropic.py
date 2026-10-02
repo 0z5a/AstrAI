@@ -25,6 +25,12 @@ def _extract_text(content: Union[str, List[Dict[str, Any]]]) -> str:
     return ""
 
 
+def _stop_reason(stop: StopInfo) -> str:
+    if stop.matched:
+        return "stop_sequence"
+    return "max_tokens" if stop.finish_reason == "length" else "end_turn"
+
+
 class AnthropicResponseBuilder(ResponseBuilder):
     def prepare(
         self, request: BaseModel, engine: InferenceEngine
@@ -86,20 +92,9 @@ class AnthropicResponseBuilder(ResponseBuilder):
 
     def format_stream_end(self, ctx: GenContext, stop: StopInfo) -> List[str]:
         events: List[str] = []
-        if stop.matched:
-            trimmed = stop.body[: stop.body.rfind(stop.matched)]
-            unyielded = trimmed[len(stop.yielded) :]
-            if unyielded:
-                events.append(
-                    sse_event(
-                        {
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": unyielded},
-                        },
-                        event="content_block_delta",
-                    )
-                )
+        unyielded = stop.body[len(stop.yielded) :]
+        if unyielded:
+            events.extend(self.format_chunk(unyielded))
         events.append(
             sse_event(
                 {"type": "content_block_stop", "index": 0},
@@ -111,10 +106,13 @@ class AnthropicResponseBuilder(ResponseBuilder):
                 {
                     "type": "message_delta",
                     "delta": {
-                        "stop_reason": "stop_sequence" if stop.matched else "end_turn",
+                        "stop_reason": _stop_reason(stop),
                         "stop_sequence": stop.matched,
                     },
-                    "usage": {"output_tokens": ctx.completion_tokens},
+                    "usage": {
+                        "input_tokens": ctx.prompt_tokens,
+                        "output_tokens": ctx.completion_tokens,
+                    },
                 },
                 event="message_delta",
             )
@@ -125,15 +123,13 @@ class AnthropicResponseBuilder(ResponseBuilder):
     def format_response(
         self, ctx: GenContext, content: str, stop: StopInfo
     ) -> Dict[str, Any]:
-        if stop.matched:
-            content = content[: content.rfind(stop.matched)]
         return {
             "id": ctx.resp_id,
             "type": "message",
             "role": "assistant",
             "model": ctx.model,
             "content": [{"type": "text", "text": content}],
-            "stop_reason": "stop_sequence" if stop.matched else "end_turn",
+            "stop_reason": _stop_reason(stop),
             "stop_sequence": stop.matched,
             "usage": {
                 "input_tokens": ctx.prompt_tokens,

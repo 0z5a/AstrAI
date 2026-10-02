@@ -369,11 +369,28 @@ class KVCacheManager:
         return state.cached if state is not None else 0
 
     def record_block_hashes(
-        self, request_id: str, prompt_ids: List[int], start_logical_page: int = 0
+        self,
+        request_id: str,
+        prompt_ids: List[int],
+        start_logical_page: int = 0,
+        *,
+        materialized_end: int,
     ):
+        """Publish full pages whose KV is materialized below an exclusive end.
+
+        ``materialized_end`` is an absolute token position, not the number
+        of tokens in this chunk. It is mandatory because allocation reserves
+        the whole prompt before any KV is written. A completed full prefill
+        explicitly passes ``len(prompt_ids)``; a chunk passes its actual end.
+        """
         state = self._states.get(request_id)
         if state is not None:
-            self._strategy.record_hashes(state, prompt_ids, start_logical_page)
+            self._strategy.record_hashes(
+                state,
+                prompt_ids,
+                start_logical_page,
+                materialized_end=materialized_end,
+            )
 
     def invalidate_cache(self) -> int:
         """Drop reusable KV entries once all request-owned entries are released."""

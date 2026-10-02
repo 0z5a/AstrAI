@@ -43,11 +43,12 @@ class GenContext:
 
 @dataclass
 class StopInfo:
-    """Stop-check result passed to format_stream_end / format_response."""
+    """Terminal metadata; body has already been trimmed by OutputProcessor."""
 
     matched: Optional[str] = None
     body: str = ""
     yielded: str = ""
+    finish_reason: Optional[str] = None
 
 
 class ResponseBuilder(ABC):
@@ -137,17 +138,18 @@ class ProtocolHandler:
                 async for chunk in agen:
                     body += chunk.text
                     ctx.completion_tokens += len(chunk.delta_token_ids)
+                    if chunk.text or chunk.delta_token_ids:
+                        for event in self.builder.format_chunk(
+                            chunk.text,
+                            body=body,
+                            current_token_ids=chunk.current_token_ids,
+                            delta_token_ids=chunk.delta_token_ids,
+                        ):
+                            yield event
+                    yielded += chunk.text
                     if chunk.stopped or chunk.is_final:
                         final = chunk
                         break
-                    for event in self.builder.format_chunk(
-                        chunk.text,
-                        body=body,
-                        current_token_ids=chunk.current_token_ids,
-                        delta_token_ids=chunk.delta_token_ids,
-                    ):
-                        yield event
-                    yielded += chunk.text
             finally:
                 await agen.aclose()
 
@@ -158,7 +160,9 @@ class ProtocolHandler:
                     matched=final.stop_sequence,
                     body=body,
                     yielded=yielded,
+                    finish_reason=final.finish_reason,
                 )
+                ctx.prompt_tokens = final.prompt_tokens
                 ctx.completion_tokens = final.completion_tokens
             else:
                 stop = StopInfo(matched=None, body=body, yielded=yielded)
@@ -189,7 +193,11 @@ class ProtocolHandler:
             await agen.aclose()
 
         stop = (
-            StopInfo(matched=final.stop_sequence, body=body)
+            StopInfo(
+                matched=final.stop_sequence,
+                body=body,
+                finish_reason=final.finish_reason,
+            )
             if final is not None
             else StopInfo(matched=None, body=body)
         )

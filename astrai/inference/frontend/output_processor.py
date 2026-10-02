@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 from astrai.inference.core.events import (
     FINISH_STOP_TOKEN,
+    RequestError,
     RequestFinished,
     TokenDelta,
 )
@@ -48,16 +49,20 @@ class StopSequenceChecker:
         """
         if not self._sequences:
             return text, False
-        self._buffer += text
         if self.matched is not None:
             return "", True
+        self._buffer += text
+        first = len(self._buffer)
         for seq in self._sequences:
-            if seq in self._buffer:
+            position = self._buffer.find(seq)
+            if 0 <= position < first:
+                first = position
                 self.matched = seq
-                head = self._buffer.split(seq)[0]
-                return head, True
+        if self.matched is not None:
+            head, self._buffer = self._buffer[:first], ""
+            return head, True
         if self._max_len <= 1:
-            return self._buffer, False
+            return self.flush(), False
         keep = self._max_len - 1
         if len(self._buffer) > keep:
             release, self._buffer = (
@@ -105,13 +110,16 @@ class OutputProcessor:
         tokenizer: AutoTokenizer,
         stop_sequences: Optional[List[str]] = None,
         keep_token_ids: bool = False,
+        *,
+        prompt_tokens: int = 0,
     ):
         self._id = request_id
         self._tokenizer = tokenizer
         self._decoder = StreamDecoder(tokenizer)
         self._stop = StopSequenceChecker(stop_sequences or [])
         self._keep_ids = keep_token_ids
-        self.state = ProcessedOutput(request_id=request_id)
+        # Text-level stops can finish before any core terminal event arrives.
+        self.state = ProcessedOutput(request_id=request_id, prompt_tokens=prompt_tokens)
 
     @property
     def finished(self) -> bool:
@@ -122,7 +130,6 @@ class OutputProcessor:
         if self.finished:
             return "", False
         if isinstance(event, TokenDelta):
-            self.state.prompt_tokens = max(self.state.prompt_tokens, 0)
             try:
                 raw = self._decoder.push(event.token_id)
             except Exception:
@@ -137,18 +144,16 @@ class OutputProcessor:
             if stopped:
                 self._finish(FINISH_STOP_TOKEN)
             return text, stopped
-        if isinstance(event, RequestFinished):
-            self.state.prompt_tokens = event.prompt_tokens
-            self.state.token_ids = list(event.token_ids) or self.state.token_ids
-            if self.state.finish_reason is None:
-                self.state.finish_reason = event.finish_reason
-            tail = (
-                self._stop.flush() if event.finish_reason != FINISH_STOP_TOKEN else ""
-            )
+        if isinstance(event, (RequestFinished, RequestError)):
+            if isinstance(event, RequestFinished):
+                self.state.prompt_tokens = event.prompt_tokens
+                self.state.token_ids = list(event.token_ids) or self.state.token_ids
+            self._finish(event.finish_reason)
+            # A sampled EOS is not a matched text stop: its ambiguous tail
+            # still belongs to the response, just as on length/cancellation.
+            tail = self._stop.flush()
             self.state.text += tail
             return tail, False
-        # RequestError and unknown events: fold minimal state, let the
-        # frontend's error path own the semantics.
         return "", False
 
     def usage(self) -> Tuple[int, int]:

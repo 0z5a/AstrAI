@@ -36,7 +36,7 @@ from astrai.inference.core.events import (
 from astrai.inference.core.request import STOP
 from astrai.inference.core.scheduler import Scheduler
 from astrai.inference.frontend.core_client import EngineCoreClient, InprocClient
-from astrai.inference.frontend.input_processor import InputProcessor
+from astrai.inference.frontend.input_processor import InputProcessor, ProcessedInput
 from astrai.inference.frontend.output_processor import OutputProcessor
 from astrai.inference.frontend.tracking import (
     RequestTracker,
@@ -174,43 +174,42 @@ class InferenceEngine:
         top_k: int,
         frequency_penalty: float,
         rep_window: int,
-    ) -> str:
+        backend: Optional[AttentionBackend],
+    ) -> ProcessedInput:
         """Tokenize + submit one prompt; the id exists before the core does."""
         processed = self._input_processor.process(prompt)
-        self._tracker.register(processed.request_id)
-        self._core.send_request(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            rep_window=rep_window,
-            request_id=processed.request_id,
-            prompt_ids=processed.prompt_ids,
-            backend=get_backend(use_default=False),
-        )
-        return processed.request_id
-
-    async def _stream_events_async(self, request_id: str, stop_sequences=None):
-        """Async generator over one request's output events."""
-        tracker = self._tracker
-        processor = OutputProcessor(
-            request_id, self.tokenizer, stop_sequences=stop_sequences
-        )
-        queue, pending = tracker.subscribe_async(request_id, asyncio.get_running_loop())
+        self._tracker.register(processed.request_id, maxlen=self._max_seq_len + 1)
         try:
-            while True:
-                events = pending if pending else await queue.get()
-                pending = []
-                for event in events:
-                    text, _stopped = processor.push(event)
-                    if text:
-                        yield text
-                    if processor.finished or isinstance(event, RequestError):
-                        return
-        finally:
-            tracker.unsubscribe_async(request_id)
+            self._core.send_request(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                rep_window=rep_window,
+                request_id=processed.request_id,
+                prompt_ids=processed.prompt_ids,
+                backend=backend,
+            )
+        except BaseException:
+            self._release_requests([processed.request_id])
+            raise
+        return processed
+
+    def _release_requests(self, request_ids: List[str]) -> None:
+        """Cancel unfinished core work and always discard frontend bookkeeping."""
+        for request_id in request_ids:
+            try:
+                # Frontend text stops are not core terminal events. Conversely,
+                # a terminal already queued by the core needs no extra abort,
+                # even if the consumer has not folded that event yet.
+                if not self._tracker.is_finished(request_id):
+                    self._core.abort_request(request_id)
+            except Exception:
+                logger.exception("request cancellation failed for %s", request_id)
+            finally:
+                self._tracker.unregister(request_id)
 
     # ---- public API (signatures unchanged) ----
 
@@ -343,7 +342,7 @@ class InferenceEngine:
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
     ) -> AsyncGenerator[str, None]:
-        request_id = self._submit_prompt(
+        chunks = self.generate_events(
             prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -355,12 +354,11 @@ class InferenceEngine:
 
         async def _agen():
             try:
-                async for text in self._stream_events_async(request_id):
-                    yield text
+                async for chunk in chunks:
+                    if chunk.text:
+                        yield chunk.text
             finally:
-                if not self._tracker.is_finished(request_id):
-                    self._core.abort_request(request_id)
-                self._tracker.unregister(request_id)
+                await chunks.aclose()
 
         return _agen()
 
@@ -390,28 +388,35 @@ class InferenceEngine:
         ``finish_reason``.  Protocol adapters consume this instead of
         re-tokenizing text to count tokens.
         """
-        request_id = self._submit_prompt(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            rep_window=rep_window,
-        )
+        # Capture the caller's backend, but defer submission until consumption:
+        # closing a never-started generator cannot run its finally block.
+        backend = get_backend(use_default=False)
 
         async def _agen():
+            processed = self._submit_prompt(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                rep_window=rep_window,
+                backend=backend,
+            )
+            request_id = processed.request_id
             tracker = self._tracker
-            processor = OutputProcessor(
-                request_id,
-                self.tokenizer,
-                stop_sequences=stop_sequences,
-            )
-            queue, pending = tracker.subscribe_async(
-                request_id, asyncio.get_running_loop()
-            )
+            terminal_chunk = None
             try:
-                while True:
+                processor = OutputProcessor(
+                    request_id,
+                    self.tokenizer,
+                    stop_sequences=stop_sequences,
+                    prompt_tokens=len(processed.prompt_ids),
+                )
+                queue, pending = tracker.subscribe_async(
+                    request_id, asyncio.get_running_loop()
+                )
+                while not processor.finished:
                     events = pending if pending else await queue.get()
                     pending = []
                     for event in events:
@@ -428,14 +433,15 @@ class InferenceEngine:
                             )
                             if processor.finished:
                                 self._set_terminal_chunk(chunk, processor)
+                                terminal_chunk = chunk
+                                break
                             yield chunk
-                        if processor.finished or isinstance(event, RequestError):
-                            return
             finally:
-                tracker.unsubscribe_async(request_id)
-                if not processor.finished and not tracker.is_finished(request_id):
-                    self._core.abort_request(request_id)
-                tracker.unregister(request_id)
+                self._release_requests([request_id])
+            # Release before yielding the terminal chunk: callers may pause or
+            # stop iteration here without resuming the generator again.
+            if terminal_chunk is not None:
+                yield terminal_chunk
 
         return _agen()
 
@@ -455,47 +461,46 @@ class InferenceEngine:
         self, request_ids: List[str], is_batch: bool, bulk_decode: bool
     ) -> Union[str, List[str]]:
         deadline = time.monotonic() + _GENERATE_TIMEOUT_S
-        for rid in request_ids:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not self._tracker.wait(rid, timeout=remaining):
-                completed = sum(1 for r in request_ids if self._tracker.is_finished(r))
-                for request_id in request_ids:
-                    self._core.abort_request(request_id)
-                for request_id in request_ids:
-                    self._tracker.unregister(request_id)
-                raise TimeoutError(
-                    f"Generation timeout after {_GENERATE_TIMEOUT_S}s "
-                    f"({completed}/{len(request_ids)} completed)"
-                )
+        try:
+            for rid in request_ids:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._tracker.wait(rid, timeout=remaining):
+                    completed = sum(
+                        1 for r in request_ids if self._tracker.is_finished(r)
+                    )
+                    raise TimeoutError(
+                        f"Generation timeout after {_GENERATE_TIMEOUT_S}s "
+                        f"({completed}/{len(request_ids)} completed)"
+                    )
 
-        results = [""] * len(request_ids)
-        for idx, rid in enumerate(request_ids):
-            try:
-                events = self._tracker.drain(rid)
-                if not bulk_decode:
-                    results[idx] = self._fold_events_incrementally(rid, events)
-                    continue
+            results = [""] * len(request_ids)
+            for idx, rid in enumerate(request_ids):
+                try:
+                    events = self._tracker.drain(rid)
+                    if not bulk_decode:
+                        results[idx] = self._fold_events_incrementally(rid, events)
+                        continue
 
-                token_ids = []
-                for event in events:
-                    if isinstance(event, RequestError):
-                        results[idx] = self._fold_events_incrementally(rid, events)
-                        break
-                    if isinstance(event, TokenDelta):
-                        token_ids.append(event.token_id)
-                else:
-                    try:
-                        results[idx] = self.tokenizer.decode(
-                            token_ids, skip_special_tokens=True
-                        )
-                    except Exception:
-                        logger.exception("bulk output decode failed for %s", rid)
-                        results[idx] = self._fold_events_incrementally(rid, events)
-            except Exception:
-                logger.exception("output fold failed for %s", rid)
-            finally:
-                self._tracker.unregister(rid)
-        return results if is_batch else results[0]
+                    token_ids = []
+                    for event in events:
+                        if isinstance(event, RequestError):
+                            results[idx] = self._fold_events_incrementally(rid, events)
+                            break
+                        if isinstance(event, TokenDelta):
+                            token_ids.append(event.token_id)
+                    else:
+                        try:
+                            results[idx] = self.tokenizer.decode(
+                                token_ids, skip_special_tokens=True
+                            )
+                        except Exception:
+                            logger.exception("bulk output decode failed for %s", rid)
+                            results[idx] = self._fold_events_incrementally(rid, events)
+                except Exception:
+                    logger.exception("output fold failed for %s", rid)
+            return results if is_batch else results[0]
+        finally:
+            self._release_requests(request_ids)
 
     def _fold_events_incrementally(self, request_id: str, events: List[Any]) -> str:
         proc = OutputProcessor(request_id, self.tokenizer)
@@ -531,34 +536,41 @@ class InferenceEngine:
         # each request's events accumulate until then.
         processed = self._input_processor.process_batch(prompts)
         request_ids = [item.request_id for item in processed]
-        for rid in request_ids:
-            self._tracker.register(rid, maxlen=self._max_seq_len + 1)
-        self._core.send_requests(
-            prompts=prompts,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            rep_window=rep_window,
-            request_ids=request_ids,
-            prompts_ids=[item.prompt_ids for item in processed],
-            backend=get_backend(use_default=False),
-        )
+        backend = get_backend(use_default=False)
+
+        def submit():
+            for rid in request_ids:
+                self._tracker.register(rid, maxlen=self._max_seq_len + 1)
+            try:
+                self._core.send_requests(
+                    prompts=prompts,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    frequency_penalty=frequency_penalty,
+                    rep_window=rep_window,
+                    request_ids=request_ids,
+                    prompts_ids=[item.prompt_ids for item in processed],
+                    backend=backend,
+                )
+            except BaseException:
+                self._release_requests(request_ids)
+                raise
 
         if not stream:
+            submit()
             return self._collect_blocking(request_ids, is_batch)
 
-        remaining = n
-
         def gen():
-            nonlocal remaining
-            finished = [False] * n
-            idx_of = {rid: i for i, rid in enumerate(request_ids)}
-            processors = {
-                rid: OutputProcessor(rid, self.tokenizer) for rid in request_ids
-            }
+            submit()
             try:
+                remaining = n
+                finished = [False] * n
+                idx_of = {rid: i for i, rid in enumerate(request_ids)}
+                processors = {
+                    rid: OutputProcessor(rid, self.tokenizer) for rid in request_ids
+                }
                 while remaining > 0:
                     progressed = False
                     for rid in request_ids:
@@ -575,13 +587,12 @@ class InferenceEngine:
                                 remaining -= 1
                                 break
                     if remaining > 0 and not progressed:
-                        self._tracker.wait(request_ids[0], timeout=0.05)
+                        waiting_id = next(
+                            rid for rid in request_ids if not finished[idx_of[rid]]
+                        )
+                        self._tracker.wait(waiting_id, timeout=0.05)
             finally:
-                for idx, rid in enumerate(request_ids):
-                    if not finished[idx]:
-                        self._core.abort_request(rid)
-                for rid in request_ids:
-                    self._tracker.unregister(rid)
+                self._release_requests(request_ids)
 
         return gen()
 
