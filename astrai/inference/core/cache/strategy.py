@@ -1,9 +1,9 @@
 """KV cache allocation layer.
 
 Encapsulates the physical slot allocation policy, isolated from GPU buffers
-and task lifecycle management.
+and request lifecycle management.
 
-- ``TaskCacheState``: data contract between strategy and manager (per-task slot state)
+- ``RequestCacheState``: data contract between strategy and manager (per-request slot state)
 - ``Allocator``:       bitmask-based page allocator with LRU eviction
 - ``RadixCache``:      page-granular prefix index (exact token match)
 - ``AllocationStrategy``: ABC for physical slot allocation
@@ -20,15 +20,15 @@ import torch
 
 from astrai.model.kv_cache import ReqToTokenPool
 
-# ---- data contract: per-task slot state ----
+# ---- data contract: per-request slot state ----
 
 
 @dataclass
-class TaskCacheState:
-    """Per-task cache allocation state.
+class RequestCacheState:
+    """Per-request cache allocation state.
 
-    Co-locates all task-owned cache metadata so the alloc/free/extend
-    lifecycle is atomic.  Owned by ``TaskCacheManager``, consumed by
+    Co-locates all request-owned cache metadata so the alloc/free/extend
+    lifecycle is atomic.  Owned by ``KVCacheManager``, consumed by
     every ``AllocationStrategy`` method.
 
     ``slots`` mirrors the page-size-1 tail of ``req_to_token[req_idx]`` on
@@ -221,6 +221,22 @@ class Allocator:
                 if lowest_word < self._first_nonempty:
                     self._first_nonempty = lowest_word
 
+    def can_ever_satisfy(self, n_pages: int) -> bool:
+        """Whether ``n_pages`` could ever be allocated, evicting freely.
+
+        A request larger than the whole pool must be rejected at admission
+        instead of looping: every retry would promote (and evict) the same
+        pages forever — the busy-spin livelock this check exists to close.
+        Must be called without the lock held (read-only probes).
+        """
+        with self._lock:
+            return n_pages <= self._n_pages
+
+    def reclaimable_pages(self) -> int:
+        """Pages currently cached-but-unreferenced (LRU entries)."""
+        with self._lock:
+            return len(self._lru)
+
     def inc_ref(self, idx: int):
         with self._lock:
             self._refs[idx] += 1
@@ -252,14 +268,13 @@ class Allocator:
 class RadixNode:
     """A page-aligned edge in the CPU-side prefix radix trie."""
 
-    __slots__ = ("parent", "children", "page_idx", "tokens", "lock_ref")
+    __slots__ = ("parent", "children", "page_idx", "tokens")
 
     def __init__(self, parent=None, tokens=(), page_idx=None):
         self.parent = parent
         self.children: Dict[tuple, "RadixNode"] = {}
         self.page_idx = page_idx
         self.tokens = tuple(tokens)
-        self.lock_ref = 0
 
 
 class RadixCache:
@@ -324,13 +339,6 @@ class RadixCache:
             node.page_idx = page_idx
             self._page_to_node[page_idx] = node
 
-    def release(self, pages: List[int]) -> None:
-        with self._lock:
-            for page_idx in pages:
-                node = self._page_to_node.get(page_idx)
-                if node is not None and node.lock_ref:
-                    node.lock_ref -= 1
-
 
 class AllocationStrategy(ABC):
     """Physical slot allocation policy.
@@ -340,18 +348,18 @@ class AllocationStrategy(ABC):
     """
 
     @abstractmethod
-    def alloc(self, state: TaskCacheState, prompt_ids: List[int]) -> bool: ...
+    def alloc(self, state: RequestCacheState, prompt_ids: List[int]) -> bool: ...
 
     @abstractmethod
-    def free(self, state: TaskCacheState) -> None: ...
+    def free(self, state: RequestCacheState) -> None: ...
 
     @abstractmethod
-    def extend(self, state: TaskCacheState, pos: int) -> bool: ...
+    def extend(self, state: RequestCacheState, pos: int) -> bool: ...
 
     def extend_batch(
-        self, states: List[TaskCacheState], positions: List[int]
+        self, states: List[RequestCacheState], positions: List[int]
     ) -> List[bool]:
-        """Extend many tasks by one position each; per-item success flags.
+        """Extend many requests by one position each; per-item success flags.
 
         Default: loop ``extend``.  Strategies with a per-extension
         allocation cost override this with a batched harvest.
@@ -359,17 +367,19 @@ class AllocationStrategy(ABC):
         return [self.extend(s, p) for s, p in zip(states, positions)]
 
     @abstractmethod
-    def write_indices(self, state: TaskCacheState, prompt_ids: List[int]) -> None: ...
+    def write_indices(
+        self, state: RequestCacheState, prompt_ids: List[int]
+    ) -> None: ...
 
     @abstractmethod
     def record_hashes(
         self,
-        state: TaskCacheState,
+        state: RequestCacheState,
         prompt_ids: List[int],
         start: int,
     ) -> None: ...
 
-    def flush_slots(self, states: List[TaskCacheState], device) -> None:
+    def flush_slots(self, states: List[RequestCacheState], device) -> None:
         """Push host-staged slot maps to the device row.
 
         Only the paged strategy stages slots on the host; the default is a
@@ -381,6 +391,10 @@ class AllocationStrategy(ABC):
         """Drop reusable KV entries after an inference weight update."""
         return 0
 
+    def can_ever_fit(self, n_tokens: int) -> bool:
+        """Whether a request of ``n_tokens`` could ever be admitted."""
+        return True
+
 
 class ContiguousStrategy(AllocationStrategy):
     """Static contiguous allocation: slots are pre-assigned at pool init.
@@ -389,21 +403,21 @@ class ContiguousStrategy(AllocationStrategy):
     because ``ReqToTokenPool`` is pre-filled with contiguous ranges.
     """
 
-    def alloc(self, state: TaskCacheState, prompt_ids: List[int]) -> bool:
+    def alloc(self, state: RequestCacheState, prompt_ids: List[int]) -> bool:
         return True
 
-    def free(self, state: TaskCacheState) -> None:
+    def free(self, state: RequestCacheState) -> None:
         pass
 
-    def extend(self, state: TaskCacheState, pos: int) -> bool:
+    def extend(self, state: RequestCacheState, pos: int) -> bool:
         return True
 
-    def write_indices(self, state: TaskCacheState, prompt_ids: List[int]) -> None:
+    def write_indices(self, state: RequestCacheState, prompt_ids: List[int]) -> None:
         pass
 
     def record_hashes(
         self,
-        state: TaskCacheState,
+        state: RequestCacheState,
         prompt_ids: List[int],
         start: int,
     ) -> None:
@@ -453,7 +467,7 @@ class PagedStrategy(AllocationStrategy):
         ]
         self._flush_ring = 0
 
-    def alloc(self, state: TaskCacheState, prompt_ids: List[int]) -> bool:
+    def alloc(self, state: RequestCacheState, prompt_ids: List[int]) -> bool:
         if self._prefix is not None:
             hits = self._prefix.lookup(prompt_ids)
             state.cached = len(hits) * self._page_size
@@ -471,7 +485,7 @@ class PagedStrategy(AllocationStrategy):
         state.pages.extend(new_pages)
         return True
 
-    def free(self, state: TaskCacheState) -> None:
+    def free(self, state: RequestCacheState) -> None:
         if self._prefix is not None:
             self._alloc.free_many(state.pages, keep_cached_for=self._prefix.has_page)
             for p in state.pages:
@@ -480,7 +494,7 @@ class PagedStrategy(AllocationStrategy):
         else:
             self._alloc.free_many(state.pages)
 
-    def extend(self, state: TaskCacheState, pos: int) -> bool:
+    def extend(self, state: RequestCacheState, pos: int) -> bool:
         page_idx = pos // self._page_size
         if page_idx >= len(state.pages):
             p = self._alloc.alloc()
@@ -500,20 +514,20 @@ class PagedStrategy(AllocationStrategy):
         return True
 
     def extend_batch(
-        self, states: List[TaskCacheState], positions: List[int]
+        self, states: List[RequestCacheState], positions: List[int]
     ) -> List[bool]:
-        """Extend a decode step's tasks with ONE word-indexed harvest.
+        """Extend a decode step's requests with ONE word-indexed harvest.
 
         ``extend`` allocates at most one page per call through the
         big-int-masked ``Allocator.alloc`` (~13us on serving-scale pools;
         128 per decode step = ~1.7ms of host time).  In the steady decode
         loop every state needs exactly one new page, so the batch asks
         the allocator once and hands the pages out lowest-first — the
-        same order the per-task lsb scans would have produced, making
+        same order the per-request lsb scans would have produced, making
         the harvest unobservable in slot numbering.  When the batch
         harvest cannot satisfy every state (a mixed batch or pool
-        pressure), the call falls back to per-task ``extend`` so the
-        success/failure ORDER matches the historical per-task path.
+        pressure), the call falls back to per-request ``extend`` so the
+        success/failure ORDER matches the historical per-request path.
         """
         page_size = self._page_size
         need: List[int] = []
@@ -537,7 +551,7 @@ class PagedStrategy(AllocationStrategy):
                 self._req_pool.req_to_token[state.req_idx, pos] = slot
         return results
 
-    def write_indices(self, state: TaskCacheState, prompt_ids: List[int]) -> None:
+    def write_indices(self, state: RequestCacheState, prompt_ids: List[int]) -> None:
         total = min(len(prompt_ids), len(state.pages) * self._page_size)
         if total <= 0:
             return
@@ -562,14 +576,14 @@ class PagedStrategy(AllocationStrategy):
         state._slots = list(vals)
         state._flushed = total
 
-    def flush_slots(self, states: List[TaskCacheState], device) -> None:
+    def flush_slots(self, states: List[RequestCacheState], device) -> None:
         # req_to_token rows are gathered on-device by every decode bind
         # (out_cache_loc), so staged tails must land there before the
         # gather runs — steady incremental steps included. The staged tails
         # of the whole batch are concatenated into ONE tensor write (one
-        # H2D per step instead of one per task; 128 per-task copies cost
+        # H2D per step instead of one per request; 128 per-request copies cost
         # ~5ms/step at serving batch sizes) using a built-once scatter
-        # index (task row, in-row offset) pairs.
+        # index (request row, in-row offset) pairs.
         flat_vals: List[int] = []
         row_idx: List[int] = []
         col_idx: List[int] = []
@@ -606,7 +620,7 @@ class PagedStrategy(AllocationStrategy):
 
     def record_hashes(
         self,
-        state: TaskCacheState,
+        state: RequestCacheState,
         prompt_ids: List[int],
         start: int,
     ) -> None:
@@ -620,3 +634,11 @@ class PagedStrategy(AllocationStrategy):
         if self._prefix is None:
             return 0
         return self._alloc.clear_cached()
+
+    def can_ever_fit(self, n_tokens: int) -> bool:
+        # Page-align the request the same way ``alloc`` does; prefix hits
+        # can only shrink the need, so the unaligned upper bound is a
+        # safe admission test (a borderline request simply waits for a
+        # hit it might not get, never spins forever).
+        n_pages = (n_tokens + self._page_size - 1) // self._page_size
+        return self._alloc.can_ever_satisfy(n_pages)

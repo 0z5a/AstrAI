@@ -142,7 +142,7 @@ def generate_all(
         bodies = extract_completions(raw, problem["entry_point"])
         results.append(
             dict(
-                task_id=problem["task_id"],
+                request_id=problem["request_id"],
                 entry_point=problem["entry_point"],
                 prompt=problem["prompt"],
                 test=problem["test"],
@@ -153,12 +153,12 @@ def generate_all(
 
 
 def he_codes(item: dict, test_timeout: float):
-    """(task_id, [(full_code, timeout), ...]) — prompt + completion + test block."""
+    """(request_id, [(full_code, timeout), ...]) — prompt + completion + test block."""
     codes = [
         (item["prompt"] + c + "\n" + item["test"], test_timeout)
         for c in item["completions"]
     ]
-    return item["task_id"], codes
+    return item["request_id"], codes
 
 
 def run_pipeline(cfg: EvalConfig) -> Dict:

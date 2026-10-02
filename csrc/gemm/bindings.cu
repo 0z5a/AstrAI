@@ -1,13 +1,15 @@
-// pybind surface of the gemm module: every py:: spelling in the family lives
-// here — the None-tolerant argument marshalling, the dict shapes of the
-// planner's introspection, and the module registration. The typed C++ face is
-// api/gemm.h; gemm.cu holds the implementations.
-//
-// Dictionaries are the wire here, in both directions: the state report and the
-// config patch. Each key set is spelled exactly once — the report's keys below,
-// the patch's in `kPatchKeys` — next to the struct they mirror, because
-// csrc/bench's dispatch_grid / model_capture / diff_rows / tune_plan_table read
-// those keys and astrai.extension.plan writes them.
+/*
+ * pybind surface of the gemm module: every py:: spelling in the family lives
+ * here — the None-tolerant argument marshalling, the dict shapes of the
+ * planner's introspection, and the module registration. The typed C++ face is
+ * api/gemm.h; gemm.cu holds the implementations.
+ *
+ * Dictionaries are the wire here, in both directions: the state report and the
+ * config patch. Each key set is spelled exactly once — the report's keys below,
+ * the patch's in `kPatchKeys` — next to the struct they mirror, because
+ * csrc/bench's dispatch_grid / model_capture / diff_rows / tune_plan_table read
+ * those keys and astrai.extension.plan writes them.
+ */
 
 #include <torch/extension.h>
 
@@ -27,8 +29,10 @@ void bind_fp8(py::module& m);
 namespace gemm {
 namespace {
 
-// py::object -> torch::Tensor with a uniform error message; a none object
-// stays undefined (callers gate on is_none()).
+/*
+ * py::object -> torch::Tensor with a uniform error message; a none object
+ * stays undefined (callers gate on is_none()).
+ */
 torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
     try {
         return o.cast<torch::Tensor>();
@@ -38,9 +42,11 @@ torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
     }
 }
 
-// pybind surface: None-tolerant operand scales and bias (``cast_tensor_arg``
-// keeps the "must be a torch.Tensor or None" message), then the shared
-// implementation the composed fp8 linear also calls (see api/gemm.h).
+/*
+ * pybind surface: None-tolerant operand scales and bias (``cast_tensor_arg``
+ * keeps the "must be a torch.Tensor or None" message), then the shared
+ * implementation the composed fp8 linear also calls (see api/gemm.h).
+ */
 torch::Tensor quant_gemm(torch::Tensor a,
                          torch::Tensor b,
                          py::object a_scale,
@@ -57,10 +63,10 @@ torch::Tensor quant_gemm(torch::Tensor a,
                            opt(bias, "bias"));
 }
 
-// ---------------------------------------------------------------------------
-// Marshal the typed planner surface into the dict shapes the Python tools
-// read. One key list per struct, no second copy anywhere.
-// ---------------------------------------------------------------------------
+/*
+ * Marshal the typed planner surface into the dict shapes the Python tools
+ * read. One key list per struct, no second copy anywhere.
+ */
 
 py::dict probe_dict(const PlanProbe& r) {
     py::dict d;
@@ -103,18 +109,22 @@ py::dict facts_dict() {
     return d;
 }
 
-// A patch arrives as one dict, and a key that is absent leaves its knob alone —
-// that is the whole contract. The dict is the point: with a positional parameter
-// list this file had to spell the same seven names three times (the converter's
-// parameters, its conversion bodies, and the registration's py::arg list) on top
-// of api/gemm.h's struct and astrai.extension.plan's ``configure`` signature.
-// The table below is the C++ half of that vocabulary; those other two are the
-// typed and the documented ends.
+/*
+ * A patch arrives as one dict, and a key that is absent leaves its knob alone —
+ * that is the whole contract. The dict is the point: with a positional parameter
+ * list this file had to spell the same seven names three times (the converter's
+ * parameters, its conversion bodies, and the registration's py::arg list) on top
+ * of api/gemm.h's struct and astrai.extension.plan's ``configure`` signature.
+ * The table below is the C++ half of that vocabulary; those other two are the
+ * typed and the documented ends.
+ */
 
-// A str planner is the binding's spelling of the mode: "" restores the unset
-// state (the env seed decides, and hybrid is what an unseeded process resolves
-// to), a name selects a mode, an int passes straight through for configure() to
-// range-check.
+/*
+ * A str planner is the binding's spelling of the mode: "" restores the unset
+ * state (the env seed decides, and hybrid is what an unseeded process resolves
+ * to), a name selects a mode, an int passes straight through for configure() to
+ * range-check.
+ */
 void patch_planner(GemmConfigPatch& patch, const py::object& value) {
     if (py::isinstance<py::str>(value)) {
         const std::string name = value.cast<std::string>();
@@ -132,8 +142,10 @@ void patch_planner(GemmConfigPatch& patch, const py::object& value) {
     patch.planner_mode = value.cast<int>();
 }
 
-// ``rows`` is a row-file path or inline row text; ``tier`` names which row
-// source it addresses ("override", the experimenter's, is the default).
+/*
+ * ``rows`` is a row-file path or inline row text; ``tier`` names which row
+ * source it addresses ("override", the experimenter's, is the default).
+ */
 void patch_rows(GemmConfigPatch& patch, const py::object& value) {
     patch.rows = value.cast<std::string>();
 }
@@ -219,9 +231,11 @@ py::dict config_state_binding() { return config_dict(config_state()); }
 } // namespace astrai
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // The fp8 training linear (forward + backward) lives in this module:
-    // its composition launches through the GEMM dispatch below, whose
-    // plan table / planner state must stay single-source.
+    /*
+     * The fp8 training linear (forward + backward) lives in this module:
+     * its composition launches through the GEMM dispatch below, whose
+     * plan table / planner state must stay single-source.
+     */
     astrai::fp8::bind_fp8(m);
     m.def("quant_gemm", &astrai::gemm::quant_gemm, py::arg("a"), py::arg("b"),
           py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
@@ -234,9 +248,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("configure", &astrai::gemm::configure_binding, py::arg("patch"),
           "Apply a config patch (a dict of the plan's knobs) and return the "
           "resulting state");
-    // The patch-dict schema, so a capability probe can tell a stale build from
-    // a current one: ``configure``'s old keyword signature is not
-    // distinguishable by hasattr, only by calling it.
+    /*
+     * The patch-dict schema, so a capability probe can tell a stale build from
+     * a current one: ``configure``'s old keyword signature is not
+     * distinguishable by hasattr, only by calling it.
+     */
     m.attr("CONFIG_API") = 2;
     m.def("config_state", &astrai::gemm::config_state_binding,
           "The whole plan configuration, as a re-installable value");

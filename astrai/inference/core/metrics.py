@@ -1,4 +1,4 @@
-"""Unified per-task perf/stats: timing records, context-manager scopes, aggregate reporting."""
+"""Unified per-request perf/stats: timing records, context-manager scopes, aggregate reporting."""
 
 import threading
 import time
@@ -14,13 +14,13 @@ _config = InferenceConfig()
 
 @dataclass
 class TaskTiming:
-    """Timestamp snapshots and computed metrics for one generation task.
+    """Timestamp snapshots and computed metrics for one generation request.
 
-    Created by :class:`MetricsCollector` at task-registration time;
+    Created by :class:`MetricsCollector` at request-registration time;
     updated via ``record`` / ``mark_finished``.
     """
 
-    task_id: str
+    request_id: str
     arrival_time: float
     prefill_start_time: Optional[float] = None
     first_token_time: Optional[float] = None
@@ -84,7 +84,7 @@ class TaskTiming:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "task_id": self.task_id,
+            "request_id": self.request_id,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "queue_wait_ms": (
@@ -112,17 +112,17 @@ class TaskTiming:
 
 
 class MetricsCollector:
-    """Single-owner perf/stats hub for all generation tasks.
+    """Single-owner perf/stats hub for all generation requests.
 
     Usage::
 
         metrics = MetricsCollector()
-        metrics.register(task_id, arrival_time)
+        metrics.register(request_id, arrival_time)
 
-        with metrics.record(task_ids, "prefill"):
+        with metrics.record(request_ids, "prefill"):
             run_prefill(...)
 
-        metrics.mark_finished(task_id, input_tokens, output_tokens)
+        metrics.mark_finished(request_id, input_tokens, output_tokens)
 
         stats = metrics.get_stats()
     """
@@ -139,17 +139,17 @@ class MetricsCollector:
         self._e2e_ms_sum = 0.0
         self._e2e_ms_count = 0
 
-    def register(self, task_id: str):
-        """Create a timing record for a newly-created task."""
+    def register(self, request_id: str):
+        """Create a timing record for a newly-created request."""
         with self._lock:
-            self._timings[task_id] = TaskTiming(
-                task_id=task_id, arrival_time=time.time()
+            self._timings[request_id] = TaskTiming(
+                request_id=request_id, arrival_time=time.time()
             )
 
-    def mark_finished(self, task_id: str, input_tokens: int, output_tokens: int):
-        """Close timing for a finished/aborted task and move it to completed."""
+    def mark_finished(self, request_id: str, input_tokens: int, output_tokens: int):
+        """Close timing for a finished/aborted request and move it to completed."""
         with self._lock:
-            timing = self._timings.pop(task_id, None)
+            timing = self._timings.pop(request_id, None)
             if timing is None:
                 return
             timing.finish_time = time.time()
@@ -162,14 +162,14 @@ class MetricsCollector:
 
     @contextmanager
     def record(
-        self, task_ids: List[str], phase: Literal["prefill", "decode"]
+        self, request_ids: List[str], phase: Literal["prefill", "decode"]
     ) -> Generator[None, None, None]:
         tic = time.time()
         yield
         toc = time.time()
         dt = toc - tic
         with self._lock:
-            for tid in task_ids:
+            for tid in request_ids:
                 t = self._timings.get(tid)
                 if t is None:
                     continue

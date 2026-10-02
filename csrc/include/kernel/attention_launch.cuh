@@ -1,9 +1,11 @@
-// Shared attention launch vocabulary — split-KV heuristic, head_dim guard,
-// causal×mask dispatch ladder, kernel-family launchers with their tile-config
-// maps, and the four family dispatchers. Pure CUDA, no torch: the standalone
-// harnesses compile the exact code the production dispatch runs, and each
-// production .cu is then exactly one torch-facing function. Kernel bodies
-// live in kernel/attention_split_{q,kv}.cuh.
+/*
+ * Shared attention launch vocabulary — split-KV heuristic, head_dim guard,
+ * causal×mask dispatch ladder, kernel-family launchers with their tile-config
+ * maps, and the four family dispatchers. Pure CUDA, no torch: the standalone
+ * harnesses compile the exact code the production dispatch runs, and each
+ * production .cu is then exactly one torch-facing function. Kernel bodies
+ * live in kernel/attention_split_{q,kv}.cuh.
+ */
 
 #pragma once
 
@@ -22,12 +24,16 @@
 namespace astrai {
 namespace attention {
 
-// The one list of instantiated head dims — the dispatch switch, the fatal
-// message and (drift-asserted) the Python backend's HEAD_DIMS all read it.
+/*
+ * The one list of instantiated head dims — the dispatch switch, the fatal
+ * message and (drift-asserted) the Python backend's HEAD_DIMS all read it.
+ */
 #define ASTRAI_ATTN_HEAD_DIMS(X) X(32) X(64) X(128) X(256)
 
-// A head dim no kernel was instantiated for — the launch discipline: never
-// run a kernel that was not built for the shape.
+/*
+ * A head dim no kernel was instantiated for — the launch discipline: never
+ * run a kernel that was not built for the shape.
+ */
 [[noreturn]] inline void head_dim_fatal(int head_dim) {
     std::fprintf(
         stderr,
@@ -39,18 +45,20 @@ namespace attention {
     std::exit(EXIT_FAILURE);
 }
 
-// Split-KV count: fill exactly one wave of blocks.
-//
-// The GPU runs blocks in waves of (SM count x resident blocks per SM). A
-// grid smaller than a wave leaves SMs idle; a grid that crosses into a
-// second wave pays a full extra wave of latency for the few straggler
-// blocks. So the split count is chosen to bring the grid as close to one
-// full wave as possible without crossing it:
-//   grid = base_blocks * splits <= wave_capacity
-//   =>   splits = floor(wave_capacity / base_blocks)
-// The work caps still apply: never more splits than the tile count allows
-// (each split needs at least min_tiles_per_split tiles to not be pure
-// combine overhead) and never more than MAX_SPLITS.
+/*
+ * Split-KV count: fill exactly one wave of blocks.
+ *
+ * The GPU runs blocks in waves of (SM count x resident blocks per SM). A
+ * grid smaller than a wave leaves SMs idle; a grid that crosses into a
+ * second wave pays a full extra wave of latency for the few straggler
+ * blocks. So the split count is chosen to bring the grid as close to one
+ * full wave as possible without crossing it:
+ *   grid = base_blocks * splits <= wave_capacity
+ *   =>   splits = floor(wave_capacity / base_blocks)
+ * The work caps still apply: never more splits than the tile count allows
+ * (each split needs at least min_tiles_per_split tiles to not be pure
+ * combine overhead) and never more than MAX_SPLITS.
+ */
 inline int compute_num_splits(int base_blocks,
                               int tiles_total,
                               int wave_capacity,
@@ -61,12 +69,14 @@ inline int compute_num_splits(int base_blocks,
     return std::max(1, std::min(wave_capacity / std::max(base_blocks, 1), cap));
 }
 
-// Wave capacity = SM count x blocks resident per SM, for one decode kernel
-// instantiation. Residency depends on the kernel's shared memory and
-// register footprint, so it is queried from the occupancy API rather than
-// assumed. The query and the device-property reads are not free and decode
-// launches per token, so the answer is memoized per instantiation (the
-// lambda runs once).
+/*
+ * Wave capacity = SM count x blocks resident per SM, for one decode kernel
+ * instantiation. Residency depends on the kernel's shared memory and
+ * register footprint, so it is queried from the occupancy API rather than
+ * assumed. The query and the device-property reads are not free and decode
+ * launches per token, so the answer is memoized per instantiation (the
+ * lambda runs once).
+ */
 template <typename Kernel>
 inline int decode_wave_capacity(Kernel kernel, int threads) {
     static int capacity = [kernel, threads] {
@@ -84,11 +94,13 @@ inline int decode_wave_capacity(Kernel kernel, int threads) {
     return capacity;
 }
 
-// Dispatch IsCausal × HasMask. FN is a function template
-// <int HEAD_DIM, bool IsCausal, bool HasMask>; HEAD_DIM forwards first so
-// callers spell it once:
-//   DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-//                        launcher<KV>::template launch, HEAD_DIM, p, stream);
+/*
+ * Dispatch IsCausal × HasMask. FN is a function template
+ * <int HEAD_DIM, bool IsCausal, bool HasMask>; HEAD_DIM forwards first so
+ * callers spell it once:
+ *   DISPATCH_CAUSAL_MASK(is_causal, has_mask,
+ *                        launcher<KV>::template launch, HEAD_DIM, p, stream);
+ */
 #define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...)                               \
     do {                                                                                           \
         if (is_causal) {                                                                           \
@@ -104,9 +116,11 @@ inline int decode_wave_capacity(Kernel kernel, int threads) {
         }                                                                                          \
     } while (0)
 
-// Kernel-family launchers. Every supported target is sm_80+, so the
-// tensor-core kernels are the only implementations; both families expose
-// the same static launch<HEAD_DIM, IsCausal, HasMask> interface.
+/*
+ * Kernel-family launchers. Every supported target is sm_80+, so the
+ * tensor-core kernels are the only implementations; both families expose
+ * the same static launch<HEAD_DIM, IsCausal, HasMask> interface.
+ */
 
 template <int BC_> struct PrefillKernelConfig {
     static constexpr int BC = BC_;
@@ -114,8 +128,10 @@ template <int BC_> struct PrefillKernelConfig {
     static constexpr int STAGES = 2;
 };
 
-// Prefill tile-config map (BC by head_dim × causal), shared by the
-// contiguous and paged entries. Unsupported head dims have no mapping.
+/*
+ * Prefill tile-config map (BC by head_dim × causal), shared by the
+ * contiguous and paged entries. Unsupported head dims have no mapping.
+ */
 template <int HEAD_DIM, bool IsCausal> struct PrefillConfigMap;
 
 template <> struct PrefillConfigMap<32, false> : PrefillKernelConfig<32> {};
@@ -133,9 +149,11 @@ template <typename QSchedule, typename KV> struct PrefillLauncher {
         using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
         using Traits =
             KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES, typename KV::Elem>;
-        // PackGQA-folded grid: each block owns BLOCK_M packed (head,row) rows
-        // of the request's packed space; grid.y is the kv head (see the
-        // prefill kernel header for the fold math).
+        /*
+         * PackGQA-folded grid: each block owns BLOCK_M packed (head,row) rows
+         * of the request's packed space; grid.y is the kv head (see the
+         * prefill kernel header for the fold math).
+         */
         constexpr int BLOCK_M = Traits::BR * Config::WARPS;
         dim3 grid(QSchedule::packed_grid_x(p, BLOCK_M, BLOCK_M), p.kv_head,
                   QSchedule::host_grid_batch(p));
@@ -146,9 +164,11 @@ template <typename QSchedule, typename KV> struct PrefillLauncher {
     }
 };
 
-// BC=16: halves smem (16KB vs 32KB) → doubles occupancy; for D=256 it also
-// cuts register pressure enough for STAGES=2 within the 32KB budget,
-// eliminating the 176-byte spill of STAGES=1+BC=32.
+/*
+ * BC=16: halves smem (16KB vs 32KB) → doubles occupancy; for D=256 it also
+ * cuts register pressure enough for STAGES=2 within the 32KB budget,
+ * eliminating the 176-byte spill of STAGES=1+BC=32.
+ */
 template <typename KV> struct DecodeLauncher {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
     static void launch(AttentionParams& p, cudaStream_t stream) {
@@ -170,12 +190,14 @@ template <typename KV> struct DecodeLauncher {
     }
 };
 
-// Family dispatchers — shared between the production .cu entries and the
-// standalone torch-free harnesses, which compile them directly (a .o link
-// would drag the pybind module and torch in). T is the element type; the
-// head dim switches here because it selects tile configs, not storage. The
-// four entries differ only in the policy pair, so they funnel into one impl
-// per family.
+/*
+ * Family dispatchers — shared between the production .cu entries and the
+ * standalone torch-free harnesses, which compile them directly (a .o link
+ * would drag the pybind module and torch in). T is the element type; the
+ * head dim switches here because it selects tile configs, not storage. The
+ * four entries differ only in the policy pair, so they funnel into one impl
+ * per family.
+ */
 
 template <typename QSchedule, typename KV, int HEAD_DIM>
 static inline void dispatch_prefill_impl(AttentionParams& p, cudaStream_t stream) {
@@ -186,17 +208,10 @@ static inline void dispatch_prefill_impl(AttentionParams& p, cudaStream_t stream
     DISPATCH_CAUSAL_MASK(is_causal, has_mask, Launcher::template launch, HEAD_DIM, p, stream);
 }
 
-template <typename QSchedule, typename KV, int HEAD_DIM>
-static inline void dispatch_paged_prefill_impl(AttentionParams& p, cudaStream_t stream) {
-    bool is_causal = (p.causal_offset >= 0);
-    bool has_mask = (p.use_mask && p.mask);
-
-    using Launcher = PrefillLauncher<QSchedule, KV>;
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask, Launcher::template launch, HEAD_DIM, p, stream);
-}
-
-// Decode funnel: the causal/mask ladder plus the combine pass reducing the
-// split partials.
+/*
+ * Decode funnel: the causal/mask ladder plus the combine pass reducing the
+ * split partials.
+ */
 template <typename KV, int HEAD_DIM>
 static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream) {
     bool is_causal = (p.causal_offset >= 0);
@@ -209,10 +224,12 @@ static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream)
     ASTRAI_LAUNCH_CHECK();
 }
 
-// One table-driven head-dim dispatch per family: the caller passes a
-// Fn object exposing template <int HEAD_DIM> operator()(AttentionParams&,
-// cudaStream_t); the switch stamps one call per list row. The four family
-// entries below differ only in the policy pair they bind.
+/*
+ * One table-driven head-dim dispatch per family: the caller passes a
+ * Fn object exposing template <int HEAD_DIM> operator()(AttentionParams&,
+ * cudaStream_t); the switch stamps one call per list row. The four family
+ * entries below differ only in the policy pair they bind.
+ */
 template <typename Fn>
 static inline void dispatch_head_dim(AttentionParams& p, cudaStream_t stream) {
     switch (p.head_dim) {
@@ -264,9 +281,11 @@ static inline void dispatch_paged_decode(AttentionParams& p, cudaStream_t stream
     dispatch_head_dim<DispatchPagedDecode<T>>(p, stream);
 }
 
-// Per-family wrappers: a class template per entry (function templates
-// cannot be template-template arguments), each forwarding to the free
-// dispatch function above.
+/*
+ * Per-family wrappers: a class template per entry (function templates
+ * cannot be template-template arguments), each forwarding to the free
+ * dispatch function above.
+ */
 template <typename T> struct AttnDispatchDecode {
     static void run(AttentionParams& p, cudaStream_t stream) { dispatch_decode<T>(p, stream); }
 };

@@ -149,7 +149,7 @@ def _truncation_metric(finish_reasons: List[List[str]]) -> Dict[str, Tensor]:
 
     Distinguishes natural stops from length-truncated generations: a high
     truncation rate means the overlong penalty (and PPO's no-bootstrap-at-
-    truncation convention) dominates the objective rather than the task
+    truncation convention) dominates the objective rather than the request
     reward.  Empty when the rollout carried no finish reasons (offline
     batches, or rollouts produced before the field existed).
     """

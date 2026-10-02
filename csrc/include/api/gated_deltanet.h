@@ -1,5 +1,7 @@
-// GDN entry points: fwd prepares the chunked forward's operands, bwd is the
-// first stage of the reverse pass (the chunked kernels are not in the tree).
+/*
+ * GDN entry points: fwd prepares the chunked forward's operands, bwd is the
+ * first stage of the reverse pass (the chunked kernels are not in the tree).
+ */
 
 #pragma once
 

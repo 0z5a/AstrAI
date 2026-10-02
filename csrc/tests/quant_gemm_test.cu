@@ -29,13 +29,15 @@ using namespace astrai::gemm;
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Shared GEMM correctness harness — upload / reference / launch / compare
-// ---------------------------------------------------------------------------
+/*
+ * Shared GEMM correctness harness — upload / reference / launch / compare
+ */
 
-// Element conversions: host fp32 -> ElemT for the upload, ElemT -> fp32 in
-// the reference kernel, OutT -> fp32 after the download. fp8 goes through
-// the type constructors; bf16 keeps the rounding intrinsics.
+/*
+ * Element conversions: host fp32 -> ElemT for the upload, ElemT -> fp32 in
+ * the reference kernel, OutT -> fp32 after the download. fp8 goes through
+ * the type constructors; bf16 keeps the rounding intrinsics.
+ */
 template <typename ElemT> static inline ElemT to_elem(float x) { return ElemT(x); }
 template <> inline int8_t to_elem<int8_t>(float x) {
     return (int8_t)fmaxf(-127.0f, fminf(127.0f, lroundf(x)));
@@ -50,10 +52,12 @@ template <typename ElemT> DEVICE_FORCEINLINE float elem2f(ElemT x) {
 static inline float out2f(__nv_bfloat16 x) { return __bfloat162float(x); }
 static inline float out2f(float x) { return x; }
 
-// Naive fp32 reference on the GPU (O(m*n) to check instead of O(m*n*k) to
-// compute on the host). a_rm/b_rm select each operand's storage: 1 = row
-// major along the output dim, 0 = contract-contiguous (the "colmajor" of
-// the canonical [K][N] view).
+/*
+ * Naive fp32 reference on the GPU (O(m*n) to check instead of O(m*n*k) to
+ * compute on the host). a_rm/b_rm select each operand's storage: 1 = row
+ * major along the output dim, 0 = contract-contiguous (the "colmajor" of
+ * the canonical [K][N] view).
+ */
 template <typename ElemA, typename ElemB>
 __global__ static void naive_gemm_ref(const ElemA* a,
                                       const ElemB* b,
@@ -82,10 +86,12 @@ __global__ static void naive_gemm_ref(const ElemA* a,
     out[i * n + j] = acc;
 }
 
-// One correctness case: convert the fp32 host operands to ElemT, upload,
-// run the naive reference, launch through `dispatch(GemmParams&)`, compare
-// with tolerance `tol * max(|ref|, 1.0)` (the printed max_rel normalizes
-// by max(|ref|, 0.5)). ElemT and OutT are independent knobs.
+/*
+ * One correctness case: convert the fp32 host operands to ElemT, upload,
+ * run the naive reference, launch through `dispatch(GemmParams&)`, compare
+ * with tolerance `tol * max(|ref|, 1.0)` (the printed max_rel normalizes
+ * by max(|ref|, 0.5)). ElemT and OutT are independent knobs.
+ */
 template <typename ElemA, typename ElemB = ElemA, typename OutT = __nv_bfloat16, typename Fn>
 static bool check_gemm(const float* ha,
                        const float* hb,
@@ -186,10 +192,10 @@ static bool check_gemm(const float* ha,
     return ok;
 }
 
-// ---------------------------------------------------------------------------
-// Shared section helpers: storage materialization, int8 scale setup, and
-// the four-layout production-dispatch sweep every dtype section reuses.
-// ---------------------------------------------------------------------------
+/*
+ * Shared section helpers: storage materialization, int8 scale setup, and
+ * the four-layout production-dispatch sweep every dtype section reuses.
+ */
 
 // [rows][cols] -> [cols][rows] storage materialization.
 static std::vector<float> transpose(const std::vector<float>& x, int rows, int cols) {
@@ -200,10 +206,12 @@ static std::vector<float> transpose(const std::vector<float>& x, int rows, int c
     return t;
 }
 
-// Symmetric scale setup for one host operand stored [rows][cols]: returns
-// the per-row scale (amax / qmax — 127 for int8, 448/57344 for fp8) and
-// divides the buffer by it, so the kernel (which re-applies the scale in
-// its epilogue) and the naive reference see the same quantized values.
+/*
+ * Symmetric scale setup for one host operand stored [rows][cols]: returns
+ * the per-row scale (amax / qmax — 127 for int8, 448/57344 for fp8) and
+ * divides the buffer by it, so the kernel (which re-applies the scale in
+ * its epilogue) and the naive reference see the same quantized values.
+ */
 static std::vector<float>
 div_row_scales(std::vector<float>& x, int rows, int cols, float qmax = 127.f) {
     std::vector<float> s(rows);
@@ -218,11 +226,13 @@ div_row_scales(std::vector<float>& x, int rows, int cols, float qmax = 127.f) {
     return s;
 }
 
-// One dtype pair through ALL FOUR storage layouts of the production
-// dispatch: NT (congruous, the nn.Linear main path), TN/TT (crosswise A),
-// NN (dual N-contiguous — the swap rewrite for symmetric pairs, the direct
-// mixed instantiation otherwise). ha/hb are the canonical [M][K]/[N][K]
-// storages (post-quantization); transposed variants materialize here.
+/*
+ * One dtype pair through ALL FOUR storage layouts of the production
+ * dispatch: NT (congruous, the nn.Linear main path), TN/TT (crosswise A),
+ * NN (dual N-contiguous — the swap rewrite for symmetric pairs, the direct
+ * mixed instantiation otherwise). ha/hb are the canonical [M][K]/[N][K]
+ * storages (post-quantization); transposed variants materialize here.
+ */
 template <typename ElemA, typename ElemB = ElemA>
 static bool check_all_layouts(const std::vector<float>& ha,
                               const std::vector<float>& hb,
@@ -257,9 +267,11 @@ static bool check_all_layouts(const std::vector<float>& ha,
     return ok;
 }
 
-// Shorthands over check_gemm for the two repeating dispatch shapes: a
-// pinned Policy the plan ladder would not route the shape to, and the
-// production dtype-generic dispatch at explicit trans flags.
+/*
+ * Shorthands over check_gemm for the two repeating dispatch shapes: a
+ * pinned Policy the plan ladder would not route the shape to, and the
+ * production dtype-generic dispatch at explicit trans flags.
+ */
 template <typename ElemA, typename ElemB, typename Policy, typename OutT = __nv_bfloat16>
 static bool check_pinned(const float* ha,
                          const float* hb,
@@ -301,13 +313,15 @@ static bool check_dispatch(const float* ha,
         a_scale);
 }
 
-// ---------------------------------------------------------------------------
-// fp8 e4m3 GEMM — all four operand layouts x K-tiles x production routes
-// ---------------------------------------------------------------------------
+/*
+ * fp8 e4m3 GEMM — all four operand layouts x K-tiles x production routes
+ */
 
-// Big-CTA policies for the direct-layout cases: kK/Stages vary per case;
-// the fast interior loop follows the dual-congruous rule, grouped raster 8
-// matches the production dispatch.
+/*
+ * Big-CTA policies for the direct-layout cases: kK/Stages vary per case;
+ * the fast interior loop follows the dual-congruous rule, grouped raster 8
+ * matches the production dispatch.
+ */
 template <typename LA, typename LB, int kK, int Stages>
 using CasePolicy = GemmPolicy<__nv_fp8_e4m3,
                               __nv_fp8_e4m3,
@@ -317,8 +331,10 @@ using CasePolicy = GemmPolicy<__nv_fp8_e4m3,
                               RowMajor,
                               __nv_bfloat16>;
 
-// fp8 e4m3 layout case: direct big-CTA policy (dispatch=0), the production
-// NN-swap route (1) or the production NT route (2).
+/*
+ * fp8 e4m3 layout case: direct big-CTA policy (dispatch=0), the production
+ * NN-swap route (1) or the production NT route (2).
+ */
 template <typename LA, typename LB, int kK, int Stages>
 static bool run_gemm_case(const float* ha,
                           const float* hb,
@@ -331,14 +347,18 @@ static bool run_gemm_case(const float* ha,
                           int dispatch = 0) {
     auto launch = [&](GemmParams& p) {
         if (dispatch == 1)
-            // Production route, NN: the dual-N-contiguous problem has no
-            // dedicated instantiation — canonicalize_gemm swaps to the
-            // transposed <ColMajor, ColMajor> kernel with its out-transposed
-            // epilogue (see gemm.cuh).
+            /*
+             * Production route, NN: the dual-N-contiguous problem has no
+             * dedicated instantiation — canonicalize_gemm swaps to the
+             * transposed <ColMajor, ColMajor> kernel with its out-transposed
+             * epilogue (see gemm.cuh).
+             */
             gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(p, 0, false, false);
         else if (dispatch == 2)
-            // Production route, NT: exercises plan_gemm's small/narrow/big
-            // selection for this shape.
+            /*
+             * Production route, NT: exercises plan_gemm's small/narrow/big
+             * selection for this shape.
+             */
             gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(p, 0, false, true);
         else
             launch_policy<CasePolicy<LA, LB, kK, Stages>>(p, 0);
@@ -349,9 +369,11 @@ static bool run_gemm_case(const float* ha,
 }
 
 static bool test_gemm() {
-    // Deterministic operand data: the fp8 tolerances below are calibrated
-    // against a fixed rand stream (seeded here — never rely on the default
-    // first-call seed).
+    /*
+     * Deterministic operand data: the fp8 tolerances below are calibrated
+     * against a fixed rand stream (seeded here — never rely on the default
+     * first-call seed).
+     */
     srand(0);
     struct {
         int m, n, k;
@@ -387,10 +409,10 @@ static bool test_gemm() {
     return all;
 }
 
-// ---------------------------------------------------------------------------
-// Dtype combinations — bf16/int8/fp8 operand pairs (all four layouts),
-// per-row / per-channel scales, fp32 output
-// ---------------------------------------------------------------------------
+/*
+ * Dtype combinations — bf16/int8/fp8 operand pairs (all four layouts),
+ * per-row / per-channel scales, fp32 output
+ */
 
 static bool test_dtype_combos() {
     bool all = true;
@@ -404,9 +426,11 @@ static bool test_dtype_combos() {
             v = randf();
     };
 
-    // W16A16: all four layouts through the production dispatch, plus pinned
-    // big/small tile variants (the plan ladder routes 256x256 to the small
-    // CTA, so the big CTA needs pinning).
+    /*
+     * W16A16: all four layouts through the production dispatch, plus pinned
+     * big/small tile variants (the plan ladder routes 256x256 to the small
+     * CTA, so the big CTA needs pinning).
+     */
     using Bf16Big = GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor,
                                Tile_128x128x64_W64x32_S2, RowMajor, __nv_bfloat16>;
     using Bf16Small = GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor,
@@ -423,17 +447,21 @@ static bool test_dtype_combos() {
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0, "w16a16 small 64x64", 0.02f);
     }
 
-    // W8A16 weight-only: bf16 activation x per-channel-scaled int8 weight.
-    // The kernel dequantizes B fragments in-register and folds the channel
-    // scale into the epilogue. All four storage layouts run through the
-    // production dispatch (NN takes the direct mixed instantiation), with
-    // pinned tile variants the plan ladder would not route 256x256 to.
+    /*
+     * W8A16 weight-only: bf16 activation x per-channel-scaled int8 weight.
+     * The kernel dequantizes B fragments in-register and folds the channel
+     * scale into the epilogue. All four storage layouts run through the
+     * production dispatch (NN takes the direct mixed instantiation), with
+     * pinned tile variants the plan ladder would not route 256x256 to.
+     */
     using MixedBig = GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor,
                                 Tile_128x128x64_W64x32_S2, RowMajor, __nv_bfloat16>;
     using MixedSmall = GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor,
                                   Tile_64x64x64_W16x32_S3, RowMajor, __nv_bfloat16>;
-    // The tall 64x128 CTA: plan rows route production shapes to it, so its
-    // ring and epilogue reclaim need a cell the correctness suite launches.
+    /*
+     * The tall 64x128 CTA: plan rows route production shapes to it, so its
+     * ring and epilogue reclaim need a cell the correctness suite launches.
+     */
     using MixedTall = GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor,
                                  Tile_64x128x32_W32x32_S3, RowMajor, __nv_bfloat16>;
     using MixedTT = GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2,
@@ -463,8 +491,10 @@ static bool test_dtype_combos() {
                                                               k, 1, 0, "w8a16 tall 64x128 kk32 s3",
                                                               0.02f, scale);
         if (k == 320) {
-            // Crosswise/dual-row-major big CTA pinned (the planner routes
-            // 256x256 crosswise to the small CTA).
+            /*
+             * Crosswise/dual-row-major big CTA pinned (the planner routes
+             * 256x256 crosswise to the small CTA).
+             */
             const std::vector<float> ha_t = transpose(ha, 256, k);
             const std::vector<float> hb_t = transpose(hb, 256, k);
             all &= check_pinned<__nv_bfloat16, int8_t, MixedTT>(
@@ -485,10 +515,12 @@ static bool test_dtype_combos() {
         }
     }
 
-    // Odd-shape mixed TN: a_ld=100 (200B rows) and b_ld=130 are not
-    // 16B-run aligned, forcing the crosswise scalar fallback on both
-    // operands; k=96 predicates the second k-tile's contract tail and
-    // m=100 exercises the row tail.
+    /*
+     * Odd-shape mixed TN: a_ld=100 (200B rows) and b_ld=130 are not
+     * 16B-run aligned, forcing the crosswise scalar fallback on both
+     * operands; k=96 predicates the second k-tile's contract tail and
+     * m=100 exercises the row tail.
+     */
     {
         std::vector<float> ha, hb;
         prep(ha, hb, 100, 130, 96, 555);
@@ -501,10 +533,12 @@ static bool test_dtype_combos() {
                                                      /*tb=*/false, scale);
     }
 
-    // W8A8 dynamic: per-row-scaled int8 activation x per-channel-scaled
-    // int8 weight — BOTH operands dequantize in-register to the bf16 mma.
-    // All four storage layouts (NN rides the symmetric swap rewrite),
-    // plus a pinned big-CTA instantiation at k=320.
+    /*
+     * W8A8 dynamic: per-row-scaled int8 activation x per-channel-scaled
+     * int8 weight — BOTH operands dequantize in-register to the bf16 mma.
+     * All four storage layouts (NN rides the symmetric swap rewrite),
+     * plus a pinned big-CTA instantiation at k=320.
+     */
     {
         using W8A8Big = GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2,
                                    RowMajor, __nv_bfloat16>;
@@ -524,9 +558,11 @@ static bool test_dtype_combos() {
         }
     }
 
-    // A8W16 (the mirrored mixed pair): int8 activation dequantizes on the
-    // A side while the bf16 weight rides the ldmatrix path — exercises the
-    // split kSegXorA/kSegXorB addressing across all four layouts.
+    /*
+     * A8W16 (the mirrored mixed pair): int8 activation dequantizes on the
+     * A side while the bf16 weight rides the ldmatrix path — exercises the
+     * split kSegXorA/kSegXorB addressing across all four layouts.
+     */
     printf("A8W16 (int8 act x bf16 weight, all layouts):\n");
     for (int k : {64, 320}) {
         std::vector<float> ha, hb;
@@ -537,10 +573,12 @@ static bool test_dtype_combos() {
                                                         rscale);
     }
 
-    // fp32 output (OutT = float): one fixed narrow-CTA policy and one
-    // production-planned route through the dtype-generic dispatch. The
-    // narrow tile's 32KB output fits the 36KB reclaimed operand rings
-    // (launch_plan compile-time-reroutes the 128x128 CTA for fat outputs).
+    /*
+     * fp32 output (OutT = float): one fixed narrow-CTA policy and one
+     * production-planned route through the dtype-generic dispatch. The
+     * narrow tile's 32KB output fits the 36KB reclaimed operand rings
+     * (launch_plan compile-time-reroutes the 128x128 CTA for fat outputs).
+     */
     using Fp8F32Out = GemmPolicy<__nv_fp8_e4m3, __nv_fp8_e4m3, RowMajor, ColMajor,
                                  Tile_128x64x64_W32x32_S2, RowMajor, float>;
     printf("fp8 operands, fp32 output:\n");
@@ -559,13 +597,13 @@ static bool test_dtype_combos() {
     return all;
 }
 
-// ---------------------------------------------------------------------------
-// Combination effect bench: each dtype pair through the production NT
-// route (the nn.Linear main path) at llama-linear shapes. qa_max/qb_max
-// >0 quantizes that operand (127 int8 / 448 fp8) and threads the
-// per-row/per-channel scales through the epilogue, matching how the
-// strategy layer feeds the kernel.
-// ---------------------------------------------------------------------------
+/*
+ * Combination effect bench: each dtype pair through the production NT
+ * route (the nn.Linear main path) at llama-linear shapes. qa_max/qb_max
+ * >0 quantizes that operand (127 int8 / 448 fp8) and threads the
+ * per-row/per-channel scales through the epilogue, matching how the
+ * strategy layer feeds the kernel.
+ */
 
 using bf16_ = __nv_bfloat16;
 template <typename ElemA, typename ElemB>

@@ -1,34 +1,16 @@
-// Backward of the Gated DeltaNet output stage (FLA's `chunk_bwd_o`).
-//
-// Forward, per chunk of one (b, h), on head-major tensors:
-//
-//   gh    = chunk-local cumsum of the gate
-//   decay = e^(gh_j - gh_l) for j >= l, zero above the diagonal
-//   A     = (q k^T) * decay
-//   qe    = q * e^gh
-//   o     = scale * (qe @ h + A @ v_new)
-//
-// so the reverse pass over one chunk is
-//
-//   dO     = scale * do
-//   dA     = dO @ v_new^T                      (reduces over V)
-//   d_qe   = dO @ h^T                          (reduces over V)
-//   dv_new = A^T @ dO
-//   dh    += qe^T @ dO                         (accumulated across chunks)
-//   dq     = d_qe * e^gh + (dA * decay) @ k
-//   dk     = (dA * decay)^T @ q
-//   dgh    = sum_K(d_qe * qe) + rowsum(dA * A) - colsum(dA * A)
-//
-// `dh` and `dv_new` are written by more than one stage of the reverse pass, so
-// they are float32 accumulators that this kernel adds into with atomics; every
-// other output is owned by exactly one block.
-//
-// This version uses plain FMA rather than tensor cores. The reverse pass is
-// where a wrong index is expensive to find, so it is written to be checkable
-// against autograd first; the tiling follows the 99 KB shared-memory ceiling of
-// this part (one block per SM), which is also why `do` is read from global
-// rather than staged — the accesses within a warp hit the same address and
-// broadcast.
+/*
+ * Backward of GDN output stage (FLA chunk_bwd_o). Per chunk:
+ *   gh=cumsum(g), decay[j,l]=exp(gh_j-gh_l) for j>=l (0 otherwise),
+ *   A=(qk^T)*decay,
+ *   qe=q*e^gh, o=scale*(qe@h + A@v_new).
+ *   dO=scale*do, dA=dO@v_new^T, d_qe=dO@h^T, dv_new=A^T@dO,
+ *   dh+=qe^T@dO, dq=d_qe*e^gh+(dA*decay)@k, dk=(dA*decay)^T@q,
+ *   dgh=sum_K(d_qe*qe)+rowsum(dA*A)-colsum(dA*A).
+ * dh and dv_new use float32 atomics across stages; other outputs are block-owned.
+ * Plain FMA keeps this reference easy to check against autograd. Tiling fits
+ * the 99KB shared-memory limit (one block/SM); do is read globally for warp
+ * broadcast.
+ */
 
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
@@ -76,10 +58,12 @@ __global__ void gated_deltanet_bwd_o_kernel(const __nv_bfloat16* __restrict__ q,
     float* a_s = reinterpret_cast<float*>(h_s + kHElem);
     float* gh_s = a_s + kQElem;
     float* dgh_s = gh_s + kChunk;
-    // e^gh, precomputed: every decay below is a ratio of these rather than an
-    // exp in the innermost loop, which is where the time went (the dh loop alone
-    // was recomputing 4096 exponentials per thread). The ratio is safe because
-    // decay only ever uses j >= l, where it is <= 1.
+    /*
+     * e^gh, precomputed: every decay below is a ratio of these rather than an
+     * exp in the innermost loop, which is where the time went (the dh loop alone
+     * was recomputing 4096 exponentials per thread). The ratio is safe because
+     * decay only ever uses j >= l, where it is <= 1.
+     */
     float* egh_s = dgh_s + kChunk;
 
     const int tid = threadIdx.x;
@@ -135,8 +119,10 @@ __global__ void gated_deltanet_bwd_o_kernel(const __nv_bfloat16* __restrict__ q,
     }
     __syncthreads();
 
-    // dA and d_qe: each thread owns a fixed set of outputs and reduces over the
-    // full V extent, so both live in registers across the whole pass.
+    /*
+     * dA and d_qe: each thread owns a fixed set of outputs and reduces over the
+     * full V extent, so both live in registers across the whole pass.
+     */
     float da_reg[kAPerThread];
     float dqe_reg[kDPerThread];
 #pragma unroll
@@ -156,10 +142,12 @@ __global__ void gated_deltanet_bwd_o_kernel(const __nv_bfloat16* __restrict__ q,
         const int idx = tid + i * kThreads;
         const int j = idx / kHeadDim;
         const int d = idx % kHeadDim;
-        // d_qe = dO @ h^T: the reduction runs over V, which is h's second axis,
-        // and K is the free one. Summing over h's first axis instead is silently
-        // correct whenever h happens to be symmetric, so this axis assignment is
-        // the thing to re-check if dq ever drifts.
+        /*
+         * d_qe = dO @ h^T: the reduction runs over V, which is h's second axis,
+         * and K is the free one. Summing over h's first axis instead is silently
+         * correct whenever h happens to be symmetric, so this axis assignment is
+         * the thing to re-check if dq ever drifts.
+         */
         float acc = 0.0f;
         for (int v = 0; v < kHeadDim; ++v) {
             acc = fmaf(__bfloat162float(do_base[j * kHeadDim + v]),
@@ -198,8 +186,10 @@ __global__ void gated_deltanet_bwd_o_kernel(const __nv_bfloat16* __restrict__ q,
     }
     __syncthreads();
 
-    // Publish dA so the dq/dk/dgh products can read it, and fold the two dgh
-    // terms that only need dA, A and the gate.
+    /*
+     * Publish dA so the dq/dk/dgh products can read it, and fold the two dgh
+     * terms that only need dA, A and the gate.
+     */
     for (int i = 0; i < kAPerThread; ++i) {
         const int idx = tid + i * kThreads;
         const int j = idx / kChunk;

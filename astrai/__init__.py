@@ -17,9 +17,17 @@ from astrai.dataset import (
     StoreFactory,
 )
 from astrai.factory import BaseFactory
-from astrai.inference import InferenceEngine, build_engine, get_app, run_server, sample
+from astrai.inference import (
+    EngineCoreClient,
+    InferenceEngine,
+    InprocClient,
+    build_engine,
+    get_app,
+    run_server,
+    sample,
+)
 from astrai.inference.network import ProtocolHandler
-from astrai.inference.runtime.sample import SamplingPipeline
+from astrai.inference.worker.sample import SamplingPipeline
 from astrai.logging import setup_logging
 from astrai.model import (
     AutoModel,

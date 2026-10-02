@@ -1,8 +1,10 @@
 #pragma once
-// Collective epilogue: fused bias, the bf16 scatter of the fp32
-// accumulators through the reclaimed operand shared memory, and the
-// coalesced copy-out. The staging swizzle is one instance of the unified
-// family (utils/swizzle.cuh) shared with the operand staging in load.cuh.
+/*
+ * Collective epilogue: fused bias, the bf16 scatter of the fp32
+ * accumulators through the reclaimed operand shared memory, and the
+ * coalesced copy-out. The staging swizzle is one instance of the unified
+ * family (utils/swizzle.cuh) shared with the operand staging in load.cuh.
+ */
 
 #include <policy.cuh>
 #include <utils/define.cuh>
@@ -13,10 +15,12 @@
 namespace astrai {
 namespace gemm {
 
-// Output-element packing facts for the staging tile: elements per 16B
-// chunk, pair packing for the vectorized scatter, and the scalar
-// conversion. bf16 is the fused-linear default; fp32 keeps the fp32
-// accumulators unrounded (training dX/dW style outputs).
+/*
+ * Output-element packing facts for the staging tile: elements per 16B
+ * chunk, pair packing for the vectorized scatter, and the scalar
+ * conversion. bf16 is the fused-linear default; fp32 keeps the fp32
+ * accumulators unrounded (training dX/dW style outputs).
+ */
 template <typename OutT> struct OutElem;
 
 template <> struct OutElem<__nv_bfloat16> {
@@ -41,9 +45,11 @@ template <typename Policy> struct GemmCollectiveEpilogue {
     using Traits = typename Policy::Traits;
     using OutT = typename Policy::OutT;
     using OE = OutElem<OutT>;
-    // The mainloop's accumulator element: fp32 for the float mma families,
-    // int32 for the native s8 pair — the scale/bias folding below applies
-    // after the int->float conversion, so both share one scatter path.
+    /*
+     * The mainloop's accumulator element: fp32 for the float mma families,
+     * int32 for the native s8 pair — the scale/bias folding below applies
+     * after the int->float conversion, so both share one scatter path.
+     */
     using AccT = typename Traits::AccT;
     static constexpr bool kStreamOut = Policy::kStreamOut;
     static constexpr int kBlockM = Traits::kBlockM;
@@ -57,13 +63,17 @@ template <typename Policy> struct GemmCollectiveEpilogue {
     const float* const b_scale; // [b_scale_n] col factor or null
     const __nv_bfloat16* const bias;
     const int64_t m, n, out_ld;
-    // Output orientation from the policy tag (CUTLASS LayoutC): the NN
-    // swap computes E = B^T A^T, instantiated with LayoutOut = ColMajor.
+    /*
+     * Output orientation from the policy tag (CUTLASS LayoutC): the NN
+     * swap computes E = B^T A^T, instantiated with LayoutOut = ColMajor.
+     */
     static constexpr bool t_out = !std::is_same_v<typename Policy::LayoutTagOut, RowMajor>;
-    // Staged row width (rows and row length trade places under the swap),
-    // its 16B-chunk count, and the staged-output layout — composition
-    // (Swizzle, Layout<Shape, Stride>) over the chunk grid; a custom
-    // instance (the row field XORs straight onto the chunk field).
+    /*
+     * Staged row width (rows and row length trade places under the swap),
+     * its 16B-chunk count, and the staged-output layout — composition
+     * (Swizzle, Layout<Shape, Stride>) over the chunk grid; a custom
+     * instance (the row field XORs straight onto the chunk field).
+     */
     static constexpr int kRowElems = t_out ? kBlockM : kBlockN;
     static constexpr int kRowRows = t_out ? kBlockN : kBlockM;
     static constexpr int kRowChunks = kRowElems / OE::kChunkElems;
@@ -71,8 +81,10 @@ template <typename Policy> struct GemmCollectiveEpilogue {
     using OutLayout =
         decltype(composition(Swizzle<kRowBits, kRowBits>{},
                              Layout<Shape<kRowRows, kRowChunks>, Stride<kRowChunks, 1>>{}));
-    // The staged output tile, typed by OutLayout (utils/tensor.cuh):
-    // operator()(row, elem) is the swizzled address.
+    /*
+     * The staged output tile, typed by OutLayout (utils/tensor.cuh):
+     * operator()(row, elem) is the swizzled address.
+     */
     const Tensor<PtrEngine<OutT>, OutLayout> out_tile;
     const int row_elems, row_chunks;
     const int warp_m, warp_n, group, thread_in_group;
@@ -90,27 +102,33 @@ template <typename Policy> struct GemmCollectiveEpilogue {
           warp_m((tid >> 5) / Traits::kWarpsN), warp_n((tid >> 5) % Traits::kWarpsN),
           group((tid & 31) >> 2), thread_in_group(tid & 3), block_m(block_m), block_n(block_n) {}
 
-    // Swizzled address of one 16B chunk (row r, chunk c) of the staged
-    // tile — the OutLayout instance riding out_tile. Plain orientation:
-    // kBlockM rows of kBlockN elems; out-transposed (swap dispatch): rows
-    // and row length trade places. Both row-chunk counts are powers of
-    // two, keeping the XOR swizzle well-defined.
+    /*
+     * Swizzled address of one 16B chunk (row r, chunk c) of the staged
+     * tile — the OutLayout instance riding out_tile. Plain orientation:
+     * kBlockM rows of kBlockN elems; out-transposed (swap dispatch): rows
+     * and row length trade places. Both row-chunk counts are powers of
+     * two, keeping the XOR swizzle well-defined.
+     */
     DEVICE_FORCEINLINE OutT* out_chunk(int r, int c) const {
         return out_tile(r, c << OE::kChunkShift);
     }
     DEVICE_FORCEINLINE OutT* out_elem(int r, int v) const { return out_tile(r, v); }
 
-    // Scatter the accumulators into the staging tile: the operand rings are
-    // dead once the mainloop ends, so their space stages the bf16 output
-    // tile. Threads scatter (STS.32 of bf16x2 pairs), a barrier makes the
-    // tile coherent, then the whole CTA copies it out in fully-coalesced
-    // 16B chunks. The 16B-chunk XOR swizzle keeps both the scatter and the
-    // gather conflict-free.
+    /*
+     * Scatter the accumulators into the staging tile: the operand rings are
+     * dead once the mainloop ends, so their space stages the bf16 output
+     * tile. Threads scatter (STS.32 of bf16x2 pairs), a barrier makes the
+     * tile coherent, then the whole CTA copies it out in fully-coalesced
+     * 16B chunks. The 16B-chunk XOR swizzle keeps both the scatter and the
+     * gather conflict-free.
+     */
     DEVICE_FORCEINLINE void stage(AccTensor& acc) const {
-        // Fused bias: added to the fp32 accumulator before the single bf16
-        // rounding. The per-lane loads are L1 broadcasts; rows past the
-        // edge skip the load (their smem slots never copy out). Under
-        // the swapped orientation the bias indexes D-cols = the kernel's rows.
+        /*
+         * Fused bias: added to the fp32 accumulator before the single bf16
+         * rounding. The per-lane loads are L1 broadcasts; rows past the
+         * edge skip the load (their smem slots never copy out). Under
+         * the swapped orientation the bias indexes D-cols = the kernel's rows.
+         */
         const int local_col0 = warp_n * Traits::kWarpN + thread_in_group * 2;
         const int64_t bias_col0 = block_n * kBlockN;
         const int64_t bias_row0 = block_m * kBlockM;
@@ -129,9 +147,11 @@ template <typename Policy> struct GemmCollectiveEpilogue {
                     const float rfac = row_factor(grow, m);
                     const float rfac8 = row_factor(grow + 8, m);
                     const auto& cell = *acc(mt, nt);
-                    // Two bf16x2 stores per accumulator tile: rows g and
-                    // g+8 of the m16n8 output, columns tig*2/tig*2+1 inside
-                    // one 16B chunk.
+                    /*
+                     * Two bf16x2 stores per accumulator tile: rows g and
+                     * g+8 of the m16n8 output, columns tig*2/tig*2+1 inside
+                     * one 16B chunk.
+                     */
                     const int off = col & (OE::kChunkElems - 1); // in-chunk elems
                     *reinterpret_cast<typename OE::T2*>(out_chunk(r0, col >> OE::kChunkShift) +
                                                         off) =
@@ -144,14 +164,16 @@ template <typename Policy> struct GemmCollectiveEpilogue {
                 }
             }
         } else {
-            // Transposed scatter: accumulator (kernel row r0, col) is
-            // D[col0_global + col][row0_global + r0], staged at T[col][r0].
-            // The acc pair spans two staged rows, so these are scalar
-            // stores (the swap path is the rare NN layout). OOB elements
-            // store dead lanes of the tile, never copied out. The factors
-            // keep their D roles (bias/b_scale on D-cols, a_scale on
-            // D-rows) — only the kernel axis playing each role swaps, so
-            // the same helpers serve.
+            /*
+             * Transposed scatter: accumulator (kernel row r0, col) is
+             * D[col0_global + col][row0_global + r0], staged at T[col][r0].
+             * The acc pair spans two staged rows, so these are scalar
+             * stores (the swap path is the rare NN layout). OOB elements
+             * store dead lanes of the tile, never copied out. The factors
+             * keep their D roles (bias/b_scale on D-cols, a_scale on
+             * D-rows) — only the kernel axis playing each role swaps, so
+             * the same helpers serve.
+             */
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const int col = local_col0 + nt * 8;
@@ -174,10 +196,12 @@ template <typename Policy> struct GemmCollectiveEpilogue {
         }
     }
 
-    // Coalesced copy-out: thread -> one 16B chunk; consecutive threads walk
-    // a row so each global transaction covers a full 128B line. Under the
-    // swap the staged rows are D-rows counted from block_n's stripe while
-    // the row length is kernel m', so row/stride flip to the swapped dims.
+    /*
+     * Coalesced copy-out: thread -> one 16B chunk; consecutive threads walk
+     * a row so each global transaction covers a full 128B line. Under the
+     * swap the staged rows are D-rows counted from block_n's stripe while
+     * the row length is kernel m', so row/stride flip to the swapped dims.
+     */
     DEVICE_FORCEINLINE void store(OutT* out) const {
         constexpr int kTotalChunks =
             kBlockM * (kBlockN / OE::kChunkElems); // == kBlockN * (kBlockM/chunk)
@@ -199,23 +223,29 @@ template <typename Policy> struct GemmCollectiveEpilogue {
             if (col + OE::kChunkElems <= row_stride &&
                 (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
                 if constexpr (Policy::kStoreWriteThrough) {
-                    // Streaming write-through: the output is read-once (no
-                    // future reuse), so bypass the L2 write-back stage and
-                    // preserve L2 for the reused weight/activation tiles.
-                    // Measured neutral-to-negative on the 4090's shapes
-                    // (a process-alternated A/B flipped sign between runs),
-                    // so the fused-linear default stays the plain store.
+                    /*
+                     * Streaming write-through: the output is read-once (no
+                     * future reuse), so bypass the L2 write-back stage and
+                     * preserve L2 for the reused weight/activation tiles.
+                     * Measured neutral-to-negative on the 4090's shapes
+                     * (a process-alternated A/B flipped sign between runs),
+                     * so the fused-linear default stays the plain store.
+                     */
                     __stwt(reinterpret_cast<uint4*>(dst), v);
                 } else if constexpr (kStreamOut) {
-                    // Evict-first streaming store knob: neutral on L20
-                    // squares, -3..4% on rects; kept for other SKUs.
+                    /*
+                     * Evict-first streaming store knob: neutral on L20
+                     * squares, -3..4% on rects; kept for other SKUs.
+                     */
                     __stcs(reinterpret_cast<uint4*>(dst), v);
                 } else {
                     *reinterpret_cast<uint4*>(dst) = v;
                 }
             } else {
-                // Row-edge chunk or an odd-stride row base: spill the
-                // elements that survive the row edge.
+                /*
+                 * Row-edge chunk or an odd-stride row base: spill the
+                 * elements that survive the row edge.
+                 */
                 const OutT* elems = reinterpret_cast<const OutT*>(&v);
                 for (int e = 0; e < OE::kChunkElems && col + e < row_stride; ++e)
                     dst[e] = elems[e];
@@ -232,10 +262,12 @@ template <typename Policy> struct GemmCollectiveEpilogue {
   private:
     static constexpr int kCtaThreads = Traits::kCtaThreads;
 
-    // Orientation-shared factor reads for the scatter: bias indexes D-cols,
-    // b_scale D-cols and a_scale D-rows in BOTH orientations. The load
-    // flavors stay as they always were — b_scale/bias keep the L1-friendly
-    // plain loads (broadcast cols), a_scale the streaming __ldcg (per-row).
+    /*
+     * Orientation-shared factor reads for the scatter: bias indexes D-cols,
+     * b_scale D-cols and a_scale D-rows in BOTH orientations. The load
+     * flavors stay as they always were — b_scale/bias keep the L1-friendly
+     * plain loads (broadcast cols), a_scale the streaming __ldcg (per-row).
+     */
     DEVICE_FORCEINLINE float bias_at(int64_t i, int64_t ext) const {
         return bias && i < ext ? __bfloat162float(bias[i]) : 0.0f;
     }

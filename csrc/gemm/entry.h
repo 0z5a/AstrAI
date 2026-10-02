@@ -1,28 +1,30 @@
 #pragma once
-// quant_gemm's op entry ladder, in one place: classify the dtype pair, gate
-// the device, resolve the dequant scales, resolve layouts/leading dims,
-// validate the geometry, allocate, fill GemmParams, dispatch. Declared in
-// api/gemm.h; the pybind spelling is in bindings.cu; gemm.cu's
-// quant_gemm_impl is the thin wrapper that instantiates the ladder with the
-// family's dtype-pair lookup. The family's TU-local impl header (the
-// attention/entry.h shape): it lives beside its consumers, not in
-// include/launcher/, which keeps declaration surfaces only.
-//
-// The lookup is a template parameter on purpose: the pair table and the
-// switch stamped from it are gemm.cu's (anonymous namespace, TU-internal by
-// design), so passing the lookup in keeps this header free of any
-// include-order contract — it includes at the top of its TU like any other
-// header.
-//
-// Scale contract — the one spelling the docs and the Python adapters point
-// at instead of restating: a scale is a contiguous CUDA float32 tensor of
-// numel 1 (per-tensor device scalar) or the operand's extent (per-row
-// activations a_scale[m], per-channel weights b_scale[n]). Both fold
-// multiplicatively into the epilogue, so both must be indexable by output
-// coordinates; a scale indexed along K cannot be represented here — it would
-// have to apply inside the mainloop accumulation (GemmParams says the same;
-// docs/developer/kernels/gemm.md, "Scales", is the prose home). Per side:
-// int8 requires its scale, fp8 takes one optionally, bf16 rejects one.
+/*
+ * quant_gemm's op entry ladder, in one place: classify the dtype pair, gate
+ * the device, resolve the dequant scales, resolve layouts/leading dims,
+ * validate the geometry, allocate, fill GemmParams, dispatch. Declared in
+ * api/gemm.h; the pybind spelling is in bindings.cu; gemm.cu's
+ * quant_gemm_impl is the thin wrapper that instantiates the ladder with the
+ * family's dtype-pair lookup. The family's TU-local impl header (the
+ * attention/entry.h shape): it lives beside its consumers, not in
+ * include/launcher/, which keeps declaration surfaces only.
+ *
+ * The lookup is a template parameter on purpose: the pair table and the
+ * switch stamped from it are gemm.cu's (anonymous namespace, TU-internal by
+ * design), so passing the lookup in keeps this header free of any
+ * include-order contract — it includes at the top of its TU like any other
+ * header.
+ *
+ * Scale contract — the one spelling the docs and the Python adapters point
+ * at instead of restating: a scale is a contiguous CUDA float32 tensor of
+ * numel 1 (per-tensor device scalar) or the operand's extent (per-row
+ * activations a_scale[m], per-channel weights b_scale[n]). Both fold
+ * multiplicatively into the epilogue, so both must be indexable by output
+ * coordinates; a scale indexed along K cannot be represented here — it would
+ * have to apply inside the mainloop accumulation (GemmParams says the same;
+ * docs/developer/kernels/gemm.md, "Scales", is the prose home). Per side:
+ * int8 requires its scale, fp8 takes one optionally, bf16 rejects one.
+ */
 
 #include <algorithm>
 
@@ -41,13 +43,15 @@ namespace gemm {
 
 namespace {
 
-// Inner-layout resolution for one GEMM operand. The user flag names the math
-// (0 = last two dims are [rows][contract], 1 = transposed); the storage may
-// independently be a col-major view (.t() of a contiguous buffer), which
-// folds into the returned dispatch flag at zero copy — the kernel's
-// LayoutA/LayoutB tags cover both storages. m/n/k derive from the user flag
-// only. Tensors whose inner dims are neither natural layout fall back to
-// .contiguous().
+/*
+ * Inner-layout resolution for one GEMM operand. The user flag names the math
+ * (0 = last two dims are [rows][contract], 1 = transposed); the storage may
+ * independently be a col-major view (.t() of a contiguous buffer), which
+ * folds into the returned dispatch flag at zero copy — the kernel's
+ * LayoutA/LayoutB tags cover both storages. m/n/k derive from the user flag
+ * only. Tensors whose inner dims are neither natural layout fall back to
+ * .contiguous().
+ */
 bool resolve_operand(const torch::Tensor& t_in,
                      bool flag,
                      int64_t& ld,
@@ -85,17 +89,19 @@ QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent, const cha
 
 } // namespace
 
-// The single quantized-GEMM entry body (one kernel for every cell, the only
-// kernel-facing export). The dtype pair picks the mma mode:
-//   bf16 x bf16 (W16A16)        — no scales
-//   bf16 x int8 (W8A16)         — b_scale required
-//   int8 x int8 (W8A8)          — both scales required
-//   fp8 x fp8, matching formats — both scales optional
-// Scale arity is validated per side: int8 requires its dequant scale, fp8
-// takes one optionally (per-tensor scalar or the operand's extent), bf16
-// rejects one (nothing to dequant). The body packs GemmParams (batch
-// broadcast rules, zero-copy transposed views, fused bf16 bias) and hands
-// it to the dtype-pair dispatch `Lookup` selects.
+/*
+ * The single quantized-GEMM entry body (one kernel for every cell, the only
+ * kernel-facing export). The dtype pair picks the mma mode:
+ *   bf16 x bf16 (W16A16)        — no scales
+ *   bf16 x int8 (W8A16)         — b_scale required
+ *   int8 x int8 (W8A8)          — both scales required
+ *   fp8 x fp8, matching formats — both scales optional
+ * Scale arity is validated per side: int8 requires its dequant scale, fp8
+ * takes one optionally (per-tensor scalar or the operand's extent), bf16
+ * rejects one (nothing to dequant). The body packs GemmParams (batch
+ * broadcast rules, zero-copy transposed views, fused bf16 bias) and hands
+ * it to the dtype-pair dispatch `Lookup` selects.
+ */
 template <auto Lookup>
 torch::Tensor quant_gemm_ladder(torch::Tensor a,
                                 torch::Tensor b,
@@ -109,8 +115,10 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     const bool f8a = dt_a == torch::kFloat8_e4m3fn || dt_a == torch::kFloat8_e5m2;
     const bool f8b = dt_b == torch::kFloat8_e4m3fn || dt_b == torch::kFloat8_e5m2;
     const bool b16a = dt_a == torch::kBFloat16, b16b = dt_b == torch::kBFloat16;
-    // The supported-pair set is validated once, by the dispatch switch's
-    // default arm (the Lookup), with the operand dtypes in the message.
+    /*
+     * The supported-pair set is validated once, by the dispatch switch's
+     * default arm (the Lookup), with the operand dtypes in the message.
+     */
     if (f8a || f8b) {
         astrai::quant::check_fp8_device(a.device().index());
     }
@@ -186,16 +194,18 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     p.out_batch_stride = m * n;
     p.out_ld = static_cast<int>(n);
 
-    // Empty problems never reach a kernel. The grid is ceil(m/bm) x ceil(n/bn),
-    // so a zero extent is a zero-dimension launch — an illegal configuration
-    // that today kills the process through the launch check — while the result
-    // is empty by construction (numel 0, so the allocation's contents are
-    // unobservable). The guard sits after every check on purpose: an empty
-    // call still validates its configuration instead of silently accepting an
-    // invalid one (the DeepGEMM early_return semantics, placed late).
-    // k == 0 needs no guard: the mainloop runs zero iterations and the
-    // epilogue writes the empty sum — zero, plus bias
-    // (tests/extension/test_w8.py pins both, and the empty-m/n shapes).
+    /*
+     * Empty problems never reach a kernel. The grid is ceil(m/bm) x ceil(n/bn),
+     * so a zero extent is a zero-dimension launch — an illegal configuration
+     * that today kills the process through the launch check — while the result
+     * is empty by construction (numel 0, so the allocation's contents are
+     * unobservable). The guard sits after every check on purpose: an empty
+     * call still validates its configuration instead of silently accepting an
+     * invalid one (the DeepGEMM early_return semantics, placed late).
+     * k == 0 needs no guard: the mainloop runs zero iterations and the
+     * epilogue writes the empty sum — zero, plus bias
+     * (tests/extension/test_w8.py pins both, and the empty-m/n shapes).
+     */
     if (m == 0 || n == 0)
         return output;
 

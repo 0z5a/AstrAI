@@ -22,7 +22,7 @@ class SamplingMeta:
 
     Each fact replaces a device-tensor predicate (``.any()`` / ``.item()``)
     that would otherwise force a device-to-host sync on the decode hot path.
-    The executor resolves them once from the task attributes (plain Python
+    The executor resolves them once from the request attributes (plain Python
     numbers) and threads them through :func:`sample` /
     :func:`build_sampling_pipeline`; steady-state decode then reuses both.
 

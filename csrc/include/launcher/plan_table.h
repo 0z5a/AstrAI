@@ -1,10 +1,12 @@
 #pragma once
-// AOT dispatch table: measured best-recipe rows per (shape band, dtype class,
-// layout class). Sources, override first: ASTR_GEMM_TABLE rows file (tuning
-// without a rebuild), then the compiled-in GENERATED rows (paste what the
-// measurement script emits; it never writes source). An empty table misses
-// every lookup and dispatch falls to the degraded rows. The sweep times the
-// NT layout, so pasted rows carry crosswise 0. Field order: the parser below.
+/*
+ * AOT dispatch table: measured best-recipe rows per (shape band, dtype class,
+ * layout class). Sources, override first: ASTR_GEMM_TABLE rows file (tuning
+ * without a rebuild), then the compiled-in GENERATED rows (paste what the
+ * measurement script emits; it never writes source). An empty table misses
+ * every lookup and dispatch falls to the degraded rows. The sweep times the
+ * NT layout, so pasted rows carry crosswise 0. Field order: the parser below.
+ */
 
 #include <algorithm>
 #include <array>
@@ -24,43 +26,55 @@
 namespace astrai {
 namespace gemm {
 
-// Ring K when the row file omits the field (the manifest holds kK twins;
-// the measured winner is kK=32 on most shapes but not all).
+/*
+ * Ring K when the row file omits the field (the manifest holds kK twins;
+ * the measured winner is kK=32 on most shapes but not all).
+ */
 static constexpr int kTableRowK = 64;
-// Field counts the parser reads: current, legacy 9 (no k), +k-band 12,
-// +wave-gate 13, +wave-permille 14.
+/*
+ * Field counts the parser reads: current, legacy 9 (no k), +k-band 12,
+ * +wave-gate 13, +wave-permille 14.
+ */
 static constexpr int kRowFields = 10;
 static constexpr int kRowFieldsLegacyK = 9;
 static constexpr int kRowFieldsKband = 12;
 static constexpr int kRowFieldsWave = 13;
 static constexpr int kRowFieldsWavePermille = 14;
 
-// Upper bound of the perf_class field, mirroring GemmPerfClass's last
-// enumerator (kF8A8, policy.cuh — where the enum now lives).
+/*
+ * Upper bound of the perf_class field, mirroring GemmPerfClass's last
+ * enumerator (kF8A8, policy.cuh — where the enum now lives).
+ */
 static constexpr int kMaxPerfClass = 3;
 
-// The k-tile depths the manifests carry; any other depth matches no tile
-// and launches nothing, so it is rejected.
+/*
+ * The k-tile depths the manifests carry; any other depth matches no tile
+ * and launches nothing, so it is rejected.
+ */
 inline constexpr bool row_k_supported(int kk) { return kk == 32 || kk == 64; }
 
-// Ring depths a row may name. Enumerated, not a range, so a gap cannot pass
-// as "inside 2..5": s4/s5 stay parseable for old sweep files, but no ladder
-// instantiates past s3 (the s4/s5 twins were a measured wash, removed).
+/*
+ * Ring depths a row may name. Enumerated, not a range, so a gap cannot pass
+ * as "inside 2..5": s4/s5 stay parseable for old sweep files, but no ladder
+ * instantiates past s3 (the s4/s5 twins were a measured wash, removed).
+ */
 inline constexpr bool row_stages_supported(int stages) {
     return stages == 2 || stages == 3 || stages == 4 || stages == 5;
 }
-// One tuned row. Bands are (min, max] — min exclusive, 0 unbounded — K band
-// included. perf_class is the GemmPerfClass id, crosswise the operand count
-// (-1 = any for both); raster 0 resolves through plan_raster at this row's
-// geometry; kk defaults to kTableRowK. The K band exists because the recipe
-// flips with K (wide CTA wants K > ~256, kK=32 twin wins short K hardest).
-//
-// The wave gates match only while this tile's grid covers that much of the
-// machine: bare form grid >= n * sms, wave form grid * 1000 >= n * sms *
-// resident (resident priced from the row's ring). 0 = no gate. Prefer the
-// wave form — dimensionless, survives a different SM count or smem; literal
-// bounds (a measured crossover, "a row above answers this band") are
-// device-calibrated and want a re-measure elsewhere.
+/*
+ * One tuned row. Bands are (min, max] — min exclusive, 0 unbounded — K band
+ * included. perf_class is the GemmPerfClass id, crosswise the operand count
+ * (-1 = any for both); raster 0 resolves through plan_raster at this row's
+ * geometry; kk defaults to kTableRowK. The K band exists because the recipe
+ * flips with K (wide CTA wants K > ~256, kK=32 twin wins short K hardest).
+ *
+ * The wave gates match only while this tile's grid covers that much of the
+ * machine: bare form grid >= n * sms, wave form grid * 1000 >= n * sms *
+ * resident (resident priced from the row's ring). 0 = no gate. Prefer the
+ * wave form — dimensionless, survives a different SM count or smem; literal
+ * bounds (a measured crossover, "a row above answers this band") are
+ * device-calibrated and want a re-measure elsewhere.
+ */
 struct TableRow {
     TileClass cta;
     int64_t m_min;
@@ -78,23 +92,29 @@ struct TableRow {
     int min_wave_permille = 0;
 };
 
-// CTA geometry of one class, off kTileClassCta (self-asserted against the
-// tiles), so the numbers cannot drift from what the ladders instantiate.
+/*
+ * CTA geometry of one class, off kTileClassCta (self-asserted against the
+ * tiles), so the numbers cannot drift from what the ladders instantiate.
+ */
 inline constexpr void plan_row_geometry(TileClass cta, int& bm, int& bn) {
     bm = kTileClassCta[(int)cta][0];
     bn = kTileClassCta[(int)cta][1];
 }
 
-// Everything a plan decision is priced against is PlanQuery — now policy.cuh
-// (the kernel-side vocabulary), so this header compiles against types the
-// launchers already see.
+/*
+ * Everything a plan decision is priced against is PlanQuery — now policy.cuh
+ * (the kernel-side vocabulary), so this header compiles against types the
+ * launchers already see.
+ */
 
-// CTAs of one plan's tile per SM, or 0 when unpriced/unlaunchable. Minimum
-// of smem-per-SM over the ring and the __launch_bounds__ hint — the hint is
-// a FLOOR on the real count (the exact figure needs a driver query a pure
-// planner cannot make), so resident_model <= resident_true fires the wave
-// gate early, never late. Exact for the 512-thread tiles where the register
-// file binds (64 regs x 512 x 2 = 64K) — the only gated ring today.
+/*
+ * CTAs of one plan's tile per SM, or 0 when unpriced/unlaunchable. Minimum
+ * of smem-per-SM over the ring and the __launch_bounds__ hint — the hint is
+ * a FLOOR on the real count (the exact figure needs a driver query a pure
+ * planner cannot make), so resident_model <= resident_true fires the wave
+ * gate early, never late. Exact for the 512-thread tiles where the register
+ * file binds (64 regs x 512 x 2 = 64K) — the only gated ring today.
+ */
 inline int plan_resident_ctas(TileClass cta, int stages, int kk, const PlanQuery& q) {
     const DeviceFacts& dev = q.dev;
     if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0)
@@ -107,10 +127,12 @@ inline int plan_resident_ctas(TileClass cta, int stages, int kk, const PlanQuery
     return std::min(dev.smem_per_sm / ring, min_ctas_for_ring(ring));
 }
 
-// First matching row wins (generated tables are non-overlapping). q.k <= 0
-// is the open-K reading (degraded rows, no-depth callers); q.dev.sms <= 0
-// skips gated rows rather than guessing, and the lookup still ends at the
-// degraded rows — planning stays total.
+/*
+ * First matching row wins (generated tables are non-overlapping). q.k <= 0
+ * is the open-K reading (degraded rows, no-depth callers); q.dev.sms <= 0
+ * skips gated rows rather than guessing, and the lookup still ends at the
+ * degraded rows — planning stays total.
+ */
 inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQuery& q) {
     for (int i = 0; i < count; ++i) {
         const TableRow& r = rows[i];
@@ -126,8 +148,10 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQ
             continue;
         if (r.crosswise != -1 && r.crosswise != q.crosswise)
             continue;
-        // An open row (both bounds 0) matches any K, including the k <= 0
-        // callers; a bounded row only matches a real depth.
+        /*
+         * An open row (both bounds 0) matches any K, including the k <= 0
+         * callers; a bounded row only matches a real depth.
+         */
         if (r.k_min != 0 || r.k_max != 0) {
             if (q.k <= 0)
                 continue;
@@ -136,10 +160,12 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQ
             if (r.k_max != 0 && q.k > r.k_max)
                 continue;
         }
-        // Wave gates: the row's own geometry prices the grid, so a row cannot
-        // state a fill it could not itself satisfy. min_ctas_per_sm is the
-        // bare CTAs-per-SM form; min_wave_permille the wave form, whose
-        // resident term is priced from the row's ring on this device.
+        /*
+         * Wave gates: the row's own geometry prices the grid, so a row cannot
+         * state a fill it could not itself satisfy. min_ctas_per_sm is the
+         * bare CTAs-per-SM form; min_wave_permille the wave form, whose
+         * resident term is priced from the row's ring on this device.
+         */
         if (r.min_ctas_per_sm > 0 || r.min_wave_permille > 0) {
             if (q.dev.sms <= 0)
                 continue;
@@ -161,30 +187,36 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQ
     return nullptr;
 }
 
-// Row file format: one row per line, whitespace-separated
-//   m_min m_max n_min n_max perf_class crosswise cta stages raster
-//   [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
-// '#' starts a comment; perf_class 0..3 or -1; crosswise 0..2 or -1; cta is the
-// TileClass ordinal (the policy.cuh enum order); stages 2..5 parse, but no
-// ladder instantiates a tile past s3 — plan_from_row rejects a deeper ring
-// outright, so a stale sweep row naming s4/s5 falls to the next source. The
-// trailing 'k' defaults to kTableRowK, which is what the sweep
-// scripts leave off.
-// The trailing forms are additive — a row that omits them behaves exactly as
-// it did before they existed, which is what keeps hand-edited tuning files and
-// older sweeps valid. Invalid lines are warn-and-skip: a malformed row must
-// never block a launch the fallback would serve.
+/*
+ * Row file format: one row per line, whitespace-separated
+ *   m_min m_max n_min n_max perf_class crosswise cta stages raster
+ *   [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
+ * '#' starts a comment; perf_class 0..3 or -1; crosswise 0..2 or -1; cta is the
+ * TileClass ordinal (the policy.cuh enum order); stages 2..5 parse, but no
+ * ladder instantiates a tile past s3 — plan_from_row rejects a deeper ring
+ * outright, so a stale sweep row naming s4/s5 falls to the next source. The
+ * trailing 'k' defaults to kTableRowK, which is what the sweep
+ * scripts leave off.
+ * The trailing forms are additive — a row that omits them behaves exactly as
+ * it did before they existed, which is what keeps hand-edited tuning files and
+ * older sweeps valid. Invalid lines are warn-and-skip: a malformed row must
+ * never block a launch the fallback would serve.
+ */
 
 // lo <= v <= hi, for the fields whose legal values are a contiguous interval.
 inline constexpr bool in_range(int v, int lo, int hi) { return v >= lo && v <= hi; }
 
-// A band is (min, max]: min exclusive, 0 = unbounded, so the sentinel stays
-// out of the ordering test. max == min is an empty band — legal, and simply
-// never matched.
+/*
+ * A band is (min, max]: min exclusive, 0 = unbounded, so the sentinel stays
+ * out of the ordering test. max == min is an empty band — legal, and simply
+ * never matched.
+ */
 inline constexpr bool row_band_ok(int64_t min, int64_t max) { return max == 0 || max >= min; }
 
-// First out-of-range field, or nullptr: one check per line so the warning
-// names the hand-edited column that is wrong.
+/*
+ * First out-of-range field, or nullptr: one check per line so the warning
+ * names the hand-edited column that is wrong.
+ */
 inline const char* plan_row_error(const TableRow& row, int fields) {
     if (fields != kRowFields && fields != kRowFieldsLegacyK && fields != kRowFieldsKband &&
         fields != kRowFieldsWave && fields != kRowFieldsWavePermille)
@@ -220,18 +252,22 @@ inline void warn_bad_row(const std::string& path, int lineno, const char* why) {
                  why);
 }
 
-// One row-file line (label names the source in warnings). Mutated in place
-// (the '#' comment cut); both the file and runtime-injection readers go
-// through here so the two cannot drift.
+/*
+ * One row-file line (label names the source in warnings). Mutated in place
+ * (the '#' comment cut); both the file and runtime-injection readers go
+ * through here so the two cannot drift.
+ */
 inline void
 parse_plan_table_line(char* line, const char* label, int lineno, std::vector<TableRow>& rows) {
     if (char* hash = std::strchr(line, '#'); hash != nullptr)
         *hash = '\0';
     long long m_min, m_max, n_min, n_max;
     int perf_class, crosswise, cta, stages, raster;
-    // sscanf leaves a variable alone when its conversion fails, so a row
-    // that omits the trailing fields keeps the defaults here: the legacy
-    // and k-less field counts need no repair pass.
+    /*
+     * sscanf leaves a variable alone when its conversion fails, so a row
+     * that omits the trailing fields keeps the defaults here: the legacy
+     * and k-less field counts need no repair pass.
+     */
     int kk = kTableRowK;
     long long k_min = 0, k_max = 0;
     int min_ctas_per_sm = 0;
@@ -242,8 +278,10 @@ parse_plan_table_line(char* line, const char* label, int lineno, std::vector<Tab
                     &k_max, &min_ctas_per_sm, &min_wave_permille);
     if (got == EOF)
         return; // blank or comment-only line
-    // cta is read as the TileClass ordinal, so it is the one field checked
-    // before there is a row to validate; plan_row_error takes the rest.
+    /*
+     * cta is read as the TileClass ordinal, so it is the one field checked
+     * before there is a row to validate; plan_row_error takes the rest.
+     */
     if (!in_range(cta, 0, kTileClassCount - 1)) {
         warn_bad_row(label, lineno, "cta index");
         return;
@@ -283,8 +321,10 @@ inline bool parse_plan_table_file(const std::string& path, std::vector<TableRow>
     return true;
 }
 
-// The same parser over in-memory row text: the runtime channel and the file
-// path accept identical syntax. Returns the surviving row count.
+/*
+ * The same parser over in-memory row text: the runtime channel and the file
+ * path accept identical syntax. Returns the surviving row count.
+ */
 inline int
 parse_plan_table_text(const std::string& text, const char* label, std::vector<TableRow>& rows) {
     const int before = (int)rows.size();
@@ -300,21 +340,25 @@ parse_plan_table_text(const std::string& text, const char* label, std::vector<Ta
         line.push_back('\0');
         parse_plan_table_line(&line[0], label, lineno, rows);
         line.clear();
-        // The trailing newline of the final chunk loops once more with an
-        // empty string; an empty line parses to nothing, so the extra pass
-        // is harmless.
+        /*
+         * The trailing newline of the final chunk loops once more with an
+         * empty string; an empty line parses to nothing, so the extra pass
+         * is harmless.
+         */
     }
     return (int)rows.size() - before;
 }
 
-// One row tier's backing store: mutex-guarded, replaced wholesale (never
-// mutated in place), lookups copy the row out under the lock — a concurrent
-// install cannot dangle a pointer a launched plan holds. Two instances:
-// override (the configure rows channel, outranks everything) and injected
-// (the autotuner's measured winners; ranked below the env file, which is
-// the experimenter's). `source` is the install spec, kept so the config
-// state can re-install exactly (re-emitting parsed rows would lose the
-// gates the text format cannot express).
+/*
+ * One row tier's backing store: mutex-guarded, replaced wholesale (never
+ * mutated in place), lookups copy the row out under the lock — a concurrent
+ * install cannot dangle a pointer a launched plan holds. Two instances:
+ * override (the configure rows channel, outranks everything) and injected
+ * (the autotuner's measured winners; ranked below the env file, which is
+ * the experimenter's). `source` is the install spec, kept so the config
+ * state can re-install exactly (re-emitting parsed rows would lose the
+ * gates the text format cannot express).
+ */
 class RowSource {
   public:
     void set_from(std::string source, std::vector<TableRow> rows) {
@@ -355,8 +399,10 @@ inline RowSource& plan_table_injected_source() {
     return source;
 }
 
-// The planner-rank vocabulary, one place: the strings configure() takes
-// and config_state() returns for GemmConfig::planner.
+/*
+ * The planner-rank vocabulary, one place: the strings configure() takes
+ * and config_state() returns for GemmConfig::planner.
+ */
 inline constexpr const char* kPlannerModeNames[] = {"table", "hybrid", "model"};
 inline constexpr int kPlannerModeCount = 3;
 inline bool parse_planner_mode(const std::string& name, int& out) {
@@ -368,8 +414,10 @@ inline bool parse_planner_mode(const std::string& name, int& out) {
     return false;
 }
 
-// Legacy ASTR_GEMM_* env vars, read once on first touch; configure() writes
-// the atomics directly and bypasses this.
+/*
+ * Legacy ASTR_GEMM_* env vars, read once on first touch; configure() writes
+ * the atomics directly and bypasses this.
+ */
 inline void gemm_config_seed_once() {
     static const bool seeded = [] {
         GemmConfig& c = gemm_config();
@@ -399,8 +447,10 @@ inline void gemm_config_seed_once() {
     (void)seeded;
 }
 
-// Resolved views (unset falls to the default, never to a later env read);
-// the three launch-side knobs' resolved views are policy.cuh's.
+/*
+ * Resolved views (unset falls to the default, never to a later env read);
+ * the three launch-side knobs' resolved views are policy.cuh's.
+ */
 inline int gemm_planner_mode() {
     gemm_config_seed_once();
     const int v = gemm_config().planner.load(std::memory_order_relaxed);
@@ -411,37 +461,41 @@ inline bool gemm_table_off() {
     return gemm_config().table_off.load(std::memory_order_relaxed) > 0;
 }
 
-// clang-format off
-// BEGIN GENERATED
-// Rows are the measured DIFF of the model, not full coverage: emitted only
-// where a recipe beat the model's dispatch by >=2% in interleaved A/B
-// (four rounds/point; the sweep's model reference runs last, at the hottest
-// clock — 10-20% underprice on heavy shapes, measured 2026-09-14). Ties and
-// unmeasured bands serve the model. Measured 2026-09-14, this box: sm_120 /
-// RTX 5090 / 170 SMs, M {1..4096} x N {1024..28672} x K {1536,4096,8192},
-// 2% production-semantics holdout.
-//
-// Crosswise F8A8 rows (2026-09-19): the wide CTA joined the byte ladders
-// for crosswise staging, moving the L2 re-read wall — the 64x64 model pick
-// streams 4.8GB of operands through L2 on the qkv cell (84.7% L2 SOL, 48%
-// compute) vs 2.4GB (128-row) and 1.8GB (wide). m=16384, astrai_1b
-// projections, four A/B rounds/point. NN rows band the canonicalized
-// aspect; (16384,1536) splits by exact k band into square (k=1536) and
-// mlp_down (k=6912). Bands are the measured points only. The kK=32 unlock
-// replaced three rows after a four-round confirm: square NN/TT and mlp_down
-// NN run the kK=32 big CTA (the kK=32 narrow lost everywhere, -8..-34%);
-// kK=64 keeps the other nine points.
-//
-// A stale row is worse than none (2026-09-14 +33% lesson): the tier is
-// signature-guarded by kBuiltinPlanMeasuredOn — mismatch serves nothing,
-// chain runs override -> injected -> [no builtin] -> model -> degraded.
-// Another part gets its own sweep, never these rows.
+/*
+ * clang-format off
+ * BEGIN GENERATED
+ * Rows are the measured DIFF of the model, not full coverage: emitted only
+ * where a recipe beat the model's dispatch by >=2% in interleaved A/B
+ * (four rounds/point; the sweep's model reference runs last, at the hottest
+ * clock — 10-20% underprice on heavy shapes, measured 2026-09-14). Ties and
+ * unmeasured bands serve the model. Measured 2026-09-14, this box: sm_120 /
+ * RTX 5090 / 170 SMs, M {1..4096} x N {1024..28672} x K {1536,4096,8192},
+ * 2% production-semantics holdout.
+ *
+ * Crosswise F8A8 rows (2026-09-19): the wide CTA joined the byte ladders
+ * for crosswise staging, moving the L2 re-read wall — the 64x64 model pick
+ * streams 4.8GB of operands through L2 on the qkv cell (84.7% L2 SOL, 48%
+ * compute) vs 2.4GB (128-row) and 1.8GB (wide). m=16384, astrai_1b
+ * projections, four A/B rounds/point. NN rows band the canonicalized
+ * aspect; (16384,1536) splits by exact k band into square (k=1536) and
+ * mlp_down (k=6912). Bands are the measured points only. The kK=32 unlock
+ * replaced three rows after a four-round confirm: square NN/TT and mlp_down
+ * NN run the kK=32 big CTA (the kK=32 narrow lost everywhere, -8..-34%);
+ * kK=64 keeps the other nine points.
+ *
+ * A stale row is worse than none (2026-09-14 +33% lesson): the tier is
+ * signature-guarded by kBuiltinPlanMeasuredOn — mismatch serves nothing,
+ * chain runs override -> injected -> [no builtin] -> model -> degraded.
+ * Another part gets its own sweep, never these rows.
+ */
 
 static constexpr std::array<TableRow, 29> kBuiltinPlanW16A16 = {{
-    // Prepended so its band wins over the 128x128 kk32 row below, 3.0-3.2x
-    // off here: n <= 256 gives that tile 40 blocks over 170 SMs where this
-    // fills 160 (interleaved A/B, 2026-09-14, n=256, k {2048,4096},
-    // m {1792..2560}; the band is the measured one).
+    /*
+     * Prepended so its band wins over the 128x128 kk32 row below, 3.0-3.2x
+     * off here: n <= 256 gives that tile 40 blocks over 170 SMs where this
+     * fills 160 (interleaved A/B, 2026-09-14, n=256, k {2048,4096},
+     * m {1792..2560}; the band is the measured one).
+     */
     {TileClass::kSmall64, 1536, 3072, 0, 256, 0, 0, 3, 0, 64},
     {TileClass::kTall64x128, 3072, 0, 5120, 8576, 0, 0, 2, 0, 32},
     {TileClass::kTall64x128, 0, 12, 8576, 19840, 0, 0, 3, 0, 32},
@@ -473,9 +527,11 @@ static constexpr std::array<TableRow, 29> kBuiltinPlanW16A16 = {{
     {TileClass::kBig128, 768, 0, 19840, 0, 0, 0, 2, 0, 64},
 }};
 static constexpr std::array<TableRow, 23> kBuiltinPlanW8A16 = {{
-    // Same narrow-N pathology and fix as the W16A16 row above: the 128x128
-    // kk64 row below is 2.9-3.1x off at n=256, m 1792..2560 (A/B, 2026-09-14,
-    // k=4096); the band is the measured one.
+    /*
+     * Same narrow-N pathology and fix as the W16A16 row above: the 128x128
+     * kk64 row below is 2.9-3.1x off at n=256, m 1792..2560 (A/B, 2026-09-14,
+     * k=4096); the band is the measured one.
+     */
     {TileClass::kSmall64, 1536, 3072, 0, 256, 1, 0, 3, 0, 64},
     {TileClass::kTall64x128, 0, 96, 8576, 19840, 1, 0, 3, 0, 32},
     {TileClass::kTall64x128, 0, 4, 19840, 0, 1, 0, 2, 0, 32},
@@ -501,9 +557,11 @@ static constexpr std::array<TableRow, 23> kBuiltinPlanW8A16 = {{
     {TileClass::kBig128, 768, 0, 19840, 0, 1, 0, 3, 0, 64},
 }};
 static constexpr std::array<TableRow, 29> kBuiltinPlanW8A8 = {{
-    // The narrow-N pathology of the W16A16/W8A16 rows above, same band and
-    // same winner: the 128x128 kk64 row below measured 1.56-1.74x off at n=256,
-    // m 1792..2560 (interleaved A/B, 2026-09-14, k=4096).
+    /*
+     * The narrow-N pathology of the W16A16/W8A16 rows above, same band and
+     * same winner: the 128x128 kk64 row below measured 1.56-1.74x off at n=256,
+     * m 1792..2560 (interleaved A/B, 2026-09-14, k=4096).
+     */
     {TileClass::kSmall64, 1536, 3072, 0, 256, 2, 0, 3, 0, 64},
     {TileClass::kSmall64, 12, 768, 0, 1280, 2, 0, 3, 0, 64},
     {TileClass::kBig128, 1536, 3072, 0, 1280, 2, 0, 3, 0, 64},
@@ -535,9 +593,11 @@ static constexpr std::array<TableRow, 29> kBuiltinPlanW8A8 = {{
     {TileClass::kWide128x256, 384, 0, 19840, 0, 2, 0, 2, 0, 64},
 }};
 static constexpr std::array<TableRow, 41> kBuiltinPlanF8A8 = {{
-    // The same narrow-N pathology, band and winner as above: the 128x128
-    // kk64 row below measured 1.72-1.91x off at n=256, m 1792..2560 (A/B,
-    // 2026-09-14, k=4096).
+    /*
+     * The same narrow-N pathology, band and winner as above: the 128x128
+     * kk64 row below measured 1.72-1.91x off at n=256, m 1792..2560 (A/B,
+     * 2026-09-14, k=4096).
+     */
     {TileClass::kSmall64, 1536, 3072, 0, 256, 3, 0, 3, 0, 64},
     {TileClass::kSmall64, 12, 768, 0, 1280, 3, 0, 3, 0, 64},
     {TileClass::kBig128, 1536, 3072, 0, 1280, 3, 0, 3, 0, 64},
@@ -567,15 +627,19 @@ static constexpr std::array<TableRow, 41> kBuiltinPlanF8A8 = {{
     {TileClass::kWide128x256, 384, 768, 19840, 0, 3, 0, 2, 0, 64},
     {TileClass::kBig128, 768, 1536, 19840, 0, 3, 0, 2, 0, 64},
     {TileClass::kWide128x256, 1536, 0, 19840, 0, 3, 0, 2, 0, 64},
-    // Crosswise rows, 2026-09-19 (block comment above): qkv. NN bands the
-    // swapped aspect (canonicalize_gemm plans NN as 6144x16384).
+    /*
+     * Crosswise rows, 2026-09-19 (block comment above): qkv. NN bands the
+     * swapped aspect (canonicalize_gemm plans NN as 6144x16384).
+     */
     {TileClass::kBig128, 6143, 6144, 16383, 16384, 3, 1, 2, 0, 64, 1535, 1536},
     {TileClass::kBig128, 16383, 16384, 6143, 6144, 3, 1, 2, 0, 64, 1535, 1536},
     {TileClass::kWide128x256, 16383, 16384, 6143, 6144, 3, 2, 2, 0, 64, 1535, 1536},
-    // square (k=1536) and mlp_down (k=6912) share the (16384,1536) aspect;
-    // the exact k band splits them. kK=32 big CTA carries NN/TT (deeper 32KB
-    // ring, same 2.4GB of L2 traffic at higher occupancy), TN keeps wide
-    // kK=64.
+    /*
+     * square (k=1536) and mlp_down (k=6912) share the (16384,1536) aspect;
+     * the exact k band splits them. kK=32 big CTA carries NN/TT (deeper 32KB
+     * ring, same 2.4GB of L2 traffic at higher occupancy), TN keeps wide
+     * kK=64.
+     */
     {TileClass::kBig128, 1535, 1536, 16383, 16384, 3, 1, 3, 0, 32, 1535, 1536},
     {TileClass::kBig128, 16383, 16384, 1535, 1536, 3, 1, 3, 0, 32, 1535, 1536},
     {TileClass::kWide128x256, 16383, 16384, 1535, 1536, 3, 2, 2, 0, 64, 1535, 1536},
@@ -601,12 +665,16 @@ inline bool builtin_rows_match_device(const DeviceFacts& dev) {
            dev.l2_bytes == m.l2_bytes;
 }
 
-// END GENERATED
-// clang-format on
+/*
+ * END GENERATED
+ * clang-format on
+ */
 
-// Builtin table for one dtype class; count receives its row count. An empty
-// table (the shipped default) returns a valid pointer and a zero count, so
-// plan_row_for matches nothing and the chain falls through to the model.
+/*
+ * Builtin table for one dtype class; count receives its row count. An empty
+ * table (the shipped default) returns a valid pointer and a zero count, so
+ * plan_row_for matches nothing and the chain falls through to the model.
+ */
 inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) {
     switch (perf_class) {
     case 0:
@@ -627,13 +695,15 @@ inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) 
     }
 }
 
-// Last-resort rows for the chain's tail: the M band's dominant recipe from
-// the full-coverage sweep (small for short M, narrow mid, big past mid) —
-// a safe default, never best. Open N with -1 keys matches every shape, so
-// planning stays a total function; the RowSetPlanner over them reads the
-// M band alone (the m-only query below carries the matcher's "strictly
-// past the min" caveat: an n of 0 sits ON the open bound, so a 1 stands
-// for "some real n").
+/*
+ * Last-resort rows for the chain's tail: the M band's dominant recipe from
+ * the full-coverage sweep (small for short M, narrow mid, big past mid) —
+ * a safe default, never best. Open N with -1 keys matches every shape, so
+ * planning stays a total function; the RowSetPlanner over them reads the
+ * M band alone (the m-only query below carries the matcher's "strictly
+ * past the min" caveat: an n of 0 sits ON the open bound, so a 1 stands
+ * for "some real n").
+ */
 static constexpr TableRow kDegradedPlanRows[] = {
     {TileClass::kSmall64, 0, 512, 0, 0, -1, -1, 2, 0},
     {TileClass::kNarrow128x64, 512, 3072, 0, 0, -1, -1, 2, 0},
