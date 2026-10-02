@@ -903,7 +903,6 @@ classDiagram
         class TopKStrategy
         class TopPStrategy
         class FrequencyPenaltyStrategy
-        class GenerateResult
         class StreamDecoder
         class Allocator {
             bitmap free-set + LRU
@@ -1007,9 +1006,9 @@ classDiagram
             -async _handle_non_stream(agen, ctx, stop_sequences) Dict
         }
 
-        class StopChecker {
-            +__init__(sequences)
-            +check(text) Optional[str]
+        class StopSequenceChecker {
+            +push(text) Tuple[str, bool]
+            incremental windowed stop matching
         }
 
         class GenContext {
@@ -1328,11 +1327,9 @@ classDiagram
     CheckpointCallback ..> Checkpoint : creates
     BlockPool ..> KVCache : binds
     BlockPool ..> InferenceWorkspace : fills
-    InferenceEngine ..> GenerateResult : uses
-    InferenceEngine ..> GenerateResult : creates
     OpenAIResponseBuilder ..> ChatCompletionRequest : receives
     AnthropicResponseBuilder ..> MessagesRequest : receives
-    ProtocolHandler ..> StopChecker : creates
+    ProtocolHandler ..> StopSequenceChecker : uses
     ProtocolHandler ..> GenContext : creates
     RolloutGenerator ..> RolloutBackend : generates via
     ColocatedBackend ..> Scheduler : wraps
@@ -1386,7 +1383,7 @@ classDiagram
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator, RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher | Training workflow (online RL rollout via injectable backends) |
-| **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, EngineCoreClient/InprocClient, events (TokenDelta/RequestFinished/RequestError), GenerateResult · core: Scheduler, SchedulerStep, RequestManager, Request/RequestStatus, KVCacheManager, BlockPool, AllocationStrategy (Contiguous/Paged), Allocator, RadixCache, PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
+| **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, EngineCoreClient/InprocClient, events (TokenDelta/RequestFinished/RequestError) · core: Scheduler, SchedulerStep, RequestManager, Request/RequestStatus, KVCacheManager, BlockPool, AllocationStrategy (Contiguous/Paged), Allocator, RadixCache, PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
 | **astrai.extension** | `backend` policy package, `kernel` kernel-wrapper package, `fp8.py` FP8 strategy layer, AttentionBackend, TorchNativeBackend, CudaBackend, FlashAttnBackend, attention, attn_backend, ATTN_BACKEND, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optim** | OptimizerFactory, MuonAdamW, NoraNadamW, ManoAdamW, composite_step/composite_zero_grad/composite_state_dict, partition_optimizer_parameters | Built-in optimizers (`muon_adamw` / `nora_nadamw` / `mano_adamw`) with shared composite-optimizer helpers |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch, executors & gradient accumulation |
@@ -1411,7 +1408,7 @@ classDiagram
 | **Executor** | `BaseExecutor`, `NoneExecutor`, `DDPExecutor`, `FSDPExecutor` | Gradient accumulation & model distribution |
 | **Storage** | `Store`, `MmapStore`, `JsonlStore` | Format-agnostic data access with multi-segment support |
 | **Producer-Consumer** | `Scheduler`, `Request`, waiting/running queues | Continuous batching |
-| **Observer (events)** | `OutputEventSink`, `_EventQueueSink`, `_CallbackBridge` | Scheduler loop pushes token-id events; consumers run off the loop thread |
+| **Observer (events)** | `OutputEventSink`, `EventQueueSink` | Scheduler loop pushes token-id events through the installed sink; consumers run off the loop thread |
 | **Command** | `PendingExecution` submit/commit | Deferred, idempotent result materialization (decode overlap) |
 | **Facade (KV)** | `KVCacheManager` over `BlockPool`/strategies | Single accounting surface for the scheduler |
 | **Model Registry** | `ModelFactory`, `AutoRegressiveLM`, `EmbeddingEncoder` | Model-type dynamic loading |

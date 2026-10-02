@@ -103,7 +103,7 @@ frontend. `score_ids` runs under the same operation boundary. Active online
 requests are not interleaved with an independent synchronous run on shared
 workspace/KV state.
 
-Legacy callbacks remain adapters of core events. They are not a separate
-cancellation/termination authority. The HTTP frontend uses the queue sink;
-blocking generation collects after completion, and streaming generation
-consumes incrementally.
+Consumers receive core events only through the sink installed via
+``set_event_sink``: the HTTP frontend and streaming generation use the
+tracker's queue sink, and blocking generation collects after completion.
+There is no callback channel anymore; the sink is the single event outlet.

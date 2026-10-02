@@ -69,13 +69,6 @@ classDiagram
         +wait(request_id, timeout) bool
         +is_finished(request_id) bool
     }
-    class GenerateResult {
-        public accumulator for streaming adapters
-        +tokens / results
-        +append_batch(items)
-        +wait_completion(timeout)
-        +get_results() List~str~
-    }
     class OutputEvent {
         <<frozen · core/events.py>>
         TokenDelta(request_id, token_id, sequence_no)

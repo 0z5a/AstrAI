@@ -8,7 +8,7 @@
 - [Continuous Batching](#continuous-batching)
 - [Sampling](#sampling-strategy-pattern)
 - [Protocol Handlers](#protocol-handlers-strategy-pattern)
-- [Engine & GenerateResult](#engine--generateresult)
+- [Engine](#engine)
 - [HTTP API](#http-api) — endpoints, SSE, errors, stats
 - [Engine API](#engine-api)
 
@@ -182,7 +182,7 @@ class ProtocolHandler:  # concrete orchestrator
 
 Adding a protocol = one builder file, no handler subclassing needed.
 
-## Engine & GenerateResult
+## Engine
 
 ```
 InferenceEngine (frontend layer)
@@ -199,9 +199,9 @@ carries the incremental `text`, `delta_token_ids`, and — on the final chunk �
 exact `usage` and a mapped `finish_reason` (no re-tokenizing text to count
 tokens). Internally the engine mints request ids up front (`InputProcessor`),
 folds scheduler events through `OutputProcessor` (detokenize, stop matching,
-usage), and reaches the core only via `EngineCoreClient`. `GenerateResult`
-remains the synchronous aggregation view: `Condition` for non-streaming
-(`wait_completion()`), `Event` for streaming (`wait()`).
+usage), and reaches the core only via `EngineCoreClient`. Blocking `generate` folds
+the request's events on the caller's thread once the terminal event lands;
+there is no intermediate accumulator object.
 
 See [developer/inference/](../developer/inference/) for per-layer class
 diagrams and the end-to-end event flow.
