@@ -179,7 +179,7 @@ Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
 
 `online_grpo` and `online_dpo` use the respective GRPO and DPO strategies with
 a `RolloutRunner`. The runner renders prompts through the tokenizer chat
-template, generates grouped responses through `InferenceScheduler`, then scores
+template, generates grouped responses through `Scheduler`, then scores
 them with a `BaseRewardModel`. It refreshes cached rollouts every
 `rollout_interval` optimizer steps. `online_grpo` carries the sampler's aligned
 behaviour log-probabilities into the loss, so it does not allocate or synchronize

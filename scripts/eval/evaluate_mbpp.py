@@ -4,7 +4,7 @@ Mirrors the HumanEval harness (generate -> extract -> execute -> pass@k) with
 MBPP specifics:
   - **chat-template zero-shot** prompt: this suite's SFT models derail on the
     raw 3-shot completion transcript (completions blend shot content), so the
-    task description + asserts + canonical signature go through the tokenizer's
+    request description + asserts + canonical signature go through the tokenizer's
     chat template — same convention as MMLU/IFEval in this repo. Absolute
     numbers are NOT comparable to published raw-few-shot MBPP results;
     cross-checkpoint comparisons are.
@@ -12,7 +12,7 @@ MBPP specifics:
   - pass@1 / pass@10 over n unique extracted completions
 
 Data: `google-research-datasets/mbpp` "full" config, test split (500 problems,
-task_ids 11-510). Local cache: ./mbpp/mbpp_test.jsonl.
+request_ids 11-510). Local cache: ./mbpp/mbpp_test.jsonl.
 """
 
 import argparse
@@ -84,13 +84,13 @@ def download(data_dir: str = "./mbpp"):
 
 
 def build_prompt(problem: dict, tokenizer) -> str:
-    """Chat-wrapped task + asserts + exact signature.
+    """Chat-wrapped request + asserts + exact signature.
 
     The signature line comes from the canonical solution's first def — without
     it, ~65% of failures are NameError/TypeError from the model inventing
-    function names (tests use names like `remove_Occ` that the task text never
+    function names (tests use names like `remove_Occ` that the request text never
     states). With the signature this matches HumanEval semantics (signature
-    given, logic is the task).
+    given, logic is the request).
     """
     sig = next(
         (
@@ -158,7 +158,7 @@ def generate_all(engine, problems: Sequence[dict], cfg: EvalConfig) -> List[dict
         bodies = [c for c in (clean_completion(r) for r in raw) if c]
         results.append(
             dict(
-                task_id=problem["task_id"],
+                request_id=problem["request_id"],
                 text=problem["text"],
                 test_list=problem["test_list"],
                 test_setup_code=problem.get("test_setup_code", ""),
@@ -169,12 +169,12 @@ def generate_all(engine, problems: Sequence[dict], cfg: EvalConfig) -> List[dict
 
 
 def mbpp_codes(item: dict, test_timeout: float):
-    """(task_id, [(full_code, timeout), ...]) — completion + assert block."""
+    """(request_id, [(full_code, timeout), ...]) — completion + assert block."""
     tests = "\n".join(item["test_list"])
     setup = item["test_setup_code"]
     prefix = setup + "\n" if setup else ""
     codes = [(prefix + c + "\n" + tests, test_timeout) for c in item["completions"]]
-    return item["task_id"], codes
+    return item["request_id"], codes
 
 
 def run_pipeline(cfg: EvalConfig) -> dict:

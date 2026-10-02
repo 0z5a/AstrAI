@@ -17,7 +17,7 @@ import click
 import torch
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.inference.scheduler import InferenceScheduler
+from astrai.inference.core.scheduler import Scheduler
 from astrai.model.transformer import AutoRegressiveLM
 
 _ASTRAI_1B = {
@@ -103,7 +103,7 @@ def main(
     source_commit: Optional[str],
     output: Optional[Path],
 ):
-    """Measure memory reclaimed by ``InferenceScheduler.release()``."""
+    """Measure memory reclaimed by ``Scheduler.release()``."""
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA is required")
     if prompt_len + max_tokens > max_seq_len:
@@ -124,7 +124,7 @@ def main(
     torch.cuda.empty_cache()
     model_only_mib = _memory_mib(target)
 
-    scheduler = InferenceScheduler(
+    scheduler = Scheduler(
         model=model,
         tokenizer=_TokenIdsOnlyTokenizer(),
         max_batch_size=batch_size,

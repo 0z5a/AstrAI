@@ -10,8 +10,10 @@ __global__ void rotary_emb_kernel(const __nv_bfloat16* __restrict__ x,
                                   int n_tokens,
                                   int n_heads,
                                   int head_dim) {
-    // Each head tiles into exact 2-pair chunks: one 8B x access and one 16B
-    // cos/sin access per chunk (head_dim % 4 == 0 is enforced on the host).
+    /*
+     * Each head tiles into exact 2-pair chunks: one 8B x access and one 16B
+     * cos/sin access per chunk (head_dim % 4 == 0 is enforced on the host).
+     */
     const int chunks = head_dim >> 2;
     const int total = n_tokens * n_heads * chunks;
 

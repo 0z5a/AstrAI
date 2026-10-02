@@ -4,12 +4,14 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-// Pure POD/traits header — no .cuh/CUDA-kernel includes; raw __nv_* spellings
-// only. Quantize-side declarations only: GEMM's dtype-neutral tags/POD live in
-// gemm/common.h, the fp8 tile traits in gemm/policy.cuh.
-//
-// FP8 formats are the raw element types (__nv_fp8_e4m3 / __nv_fp8_e5m2), named
-// from the output dtype by the bindings — no format enum.
+/*
+ * Pure POD/traits header — no .cuh/CUDA-kernel includes; raw __nv_* spellings
+ * only. Quantize-side declarations only: GEMM's dtype-neutral tags/POD live in
+ * gemm/common.h, the fp8 tile traits in gemm/policy.cuh.
+ *
+ * FP8 formats are the raw element types (__nv_fp8_e4m3 / __nv_fp8_e5m2), named
+ * from the output dtype by the bindings — no format enum.
+ */
 
 namespace astrai {
 namespace quant {
@@ -18,37 +20,45 @@ inline bool sm_at_least(int device_major, int device_minor, int major, int minor
     return device_major > major || (device_major == major && device_minor >= minor);
 }
 
-// FP8 tensor-core MMA (`mma.sync.aligned.m16n8k32`) needs Ada (sm_89) or newer;
-// sm_80 has no fp8 instructions. Checked at the bindings' entry.
+/*
+ * FP8 tensor-core MMA (`mma.sync.aligned.m16n8k32`) needs Ada (sm_89) or newer;
+ * sm_80 has no fp8 instructions. Checked at the bindings' entry.
+ */
 inline constexpr int kMinSmForFp8Major = 8;
 inline constexpr int kMinSmForFp8Minor = 9;
 
-// Which orientations a pass produces: RowMajor = x8, Transposed = the
-// [cols][rows] x8T, Dual = both from one read. Transposed/Dual feed the
-// backward's NT fast path (K-contiguous operands).
+/*
+ * Which orientations a pass produces: RowMajor = x8, Transposed = the
+ * [cols][rows] x8T, Dual = both from one read. Transposed/Dual feed the
+ * backward's NT fast path (K-contiguous operands).
+ */
 enum class QuantLayout : int {
     RowMajor = 0,
     Transposed = 1,
     Dual = 2,
 };
 
-// Ring-fold scratch lines: the fused amax is RMW-spread over this many slots
-// (block id mod kFoldSlots) instead of one contended address — a 49k-block grid
-// otherwise serializes on a single L2 atomic. The last-finishing block folds the
-// slots, publishes the scale and re-zeroes them.
+/*
+ * Ring-fold scratch lines: the fused amax is RMW-spread over this many slots
+ * (block id mod kFoldSlots) instead of one contended address — a 49k-block grid
+ * otherwise serializes on a single L2 atomic. The last-finishing block folds the
+ * slots, publishes the scale and re-zeroes them.
+ */
 inline constexpr int kFoldSlots = 32;
 static_assert((kFoldSlots & (kFoldSlots - 1)) == 0,
               "the scratch is addressed by a power-of-two mask");
 
-// The delayed-scaling ring's slot offsets — one source for the kernel's fold and
-// every host view:
-//
-//   [ hist n | scale0 | recip0 | amax | done | scratch kFoldSlots | scale1 | recip1 ]
-//
-// Pair 0/1 is the composed ring's double buffer and pair 0 keeps the legacy
-// offsets, so ``size(1)`` is the stateless extent. The history length is not
-// recoverable from numel (the trailing pair reads back as history), so callers
-// state it.
+/*
+ * The delayed-scaling ring's slot offsets — one source for the kernel's fold and
+ * every host view:
+ *
+ *   [ hist n | scale0 | recip0 | amax | done | scratch kFoldSlots | scale1 | recip1 ]
+ *
+ * Pair 0/1 is the composed ring's double buffer and pair 0 keeps the legacy
+ * offsets, so ``size(1)`` is the stateless extent. The history length is not
+ * recoverable from numel (the trailing pair reads back as history), so callers
+ * state it.
+ */
 struct RingLayout {
     int64_t hist_len = 0;
 
@@ -80,17 +90,21 @@ struct QuantParams {
     // The round's raw-domain amax, as folded into hist[hist_idx]. Null skips it.
     float* __restrict__ amax = nullptr;
 
-    // Delayed-scaling ring fold: the last-finishing block folds the round's amax
-    // into hist[hist_idx], reduces the window and publishes the next scale,
-    // replacing the host update chain. Blocks RMW into
-    // amax_scratch[block id mod kFoldSlots]. Every ring pointer below is
-    // meaningful only when this is set (bind_ring).
+    /*
+     * Delayed-scaling ring fold: the last-finishing block folds the round's amax
+     * into hist[hist_idx], reduces the window and publishes the next scale,
+     * replacing the host update chain. Blocks RMW into
+     * amax_scratch[block id mod kFoldSlots]. Every ring pointer below is
+     * meaningful only when this is set (bind_ring).
+     */
     bool fold_ring = false;
     float* __restrict__ hist = nullptr; // [hist_len] amax history window
     float* __restrict__ scale_out = nullptr;
-    // The published scale's correctly rounded reciprocal (__frcp_rn), in the
-    // slot the next quantize reads as its multiplier — publishing both here keeps
-    // the host out of the per-step scale chain.
+    /*
+     * The published scale's correctly rounded reciprocal (__frcp_rn), in the
+     * slot the next quantize reads as its multiplier — publishing both here keeps
+     * the host out of the per-step scale chain.
+     */
     float* __restrict__ scale_recip_out = nullptr;
     float* __restrict__ amax_scratch = nullptr; // [kFoldSlots] RMW lines
     unsigned int* __restrict__ done = nullptr;  // block-completion counter
@@ -103,10 +117,12 @@ struct QuantParams {
     int rows = 0;
     int cols = 0;
 
-    // Element strides of output_ptr in (row, col) input coordinates; the
-    // row-major placement is (cols, 1). The transposed copy's placement is NOT
-    // this pair's swap (that holds only on square shapes) but the canonical
-    // (1, rows) consumer contract, derived from p.rows in-kernel.
+    /*
+     * Element strides of output_ptr in (row, col) input coordinates; the
+     * row-major placement is (cols, 1). The transposed copy's placement is NOT
+     * this pair's swap (that holds only on square shapes) but the canonical
+     * (1, rows) consumer contract, derived from p.rows in-kernel.
+     */
     int out_row_stride = 0;
     int out_col_stride = 0;
 };

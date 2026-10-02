@@ -12,8 +12,7 @@ nvcc -I csrc/include -arch=sm_89 -O3 \
 
 using namespace astrai::attention;
 
-// The dispatchers take the element type and resolve head_dim internally, so a
-// case is one call — no per-head-dim functor (the harness stays torch-free).
+/* Dispatch resolves head_dim from the element type, keeping the harness torch-free. */
 using bf16 = astrai::bf16;
 
 // Split-K scratch (torch-free)
@@ -33,10 +32,7 @@ static void free_scratch(DecodeScratch& sc) {
     cudaFree(sc.ml_part);
 }
 
-// ======================================================================
-// Shared contiguous-attention harness: random q/k/v, params with default
-// strides, dispatch (decode or prefill), CPU reference, tolerance table.
-// ======================================================================
+/* Shared contiguous test harness for decode, prefill, and CPU-reference checks. */
 static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D, int causal, bool decode) {
     size_t nQ = (size_t)B * Hq * ql * D, nKV = (size_t)B * Hk * kl * D;
     float *hQ = new float[nQ], *hK = new float[nKV], *hV = new float[nKV];
@@ -135,8 +131,7 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D, int cau
     return pass ? 0 : 1;
 }
 
-// Shared bench: alloc + params identical to the test harness; one timed
-// launch path through bench_kernel (test_utils.cuh).
+/* Time the same decode/prefill dispatch used by the correctness harness. */
 static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D, int causal, bool decode) {
     size_t nQ = (size_t)B * Hq * ql * D, nKV = (size_t)B * Hk * kl * D;
     bf16 *dQ, *dK, *dV, *dO;
@@ -199,14 +194,10 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D, int causa
         free_scratch(sc);
 }
 
-// ======================================================================
-// MAIN
-// ======================================================================
-
 int main() {
     int fail = 0;
 
-    // ---- DECODE ----
+    // DECODE
     {
         // B, Hq, Hk, seq_len, D, causal
         const int configs[][6] = {
@@ -241,7 +232,7 @@ int main() {
             bench_contig(bc[ci][0], bc[ci][1], bc[ci][2], 1, bc[ci][3], 128, 0, /*decode=*/true);
     }
 
-    // ---- PREFILL ----
+    // PREFILL
     {
         // B, Hq, Hk, q_len, kv_len, D, causal
         const int configs[][7] = {

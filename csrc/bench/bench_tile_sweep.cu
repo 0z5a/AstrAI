@@ -77,31 +77,31 @@ inline int8_t quant_i8(float v) {
     return (int8_t)std::max(-127.0f, std::min(127.0f, std::round(v * 200.0f)));
 }
 
-// ---------------------------------------------------------------------------
-// The tile grid, instantiated rather than hand-listed.
-//
-// A hand-written list has to know the kernel's instantiation constraints by
-// heart and gets them wrong silently: a configuration the staging cannot load
-// surfaces as a static_assert deep in the load path, one failed build at a
-// time. So the axes below are enumerated at compile time and each combination
-// is filtered by tile_ok(), which restates — in one place, beside the axes —
-// the asserts the kernel carries:
-//
-//   warp tiling   kWarpM % 16 == 0, kWarpN % 8 == 0, warp tiles tile the CTA
-//   k depth       kK % kMmaK == 0, and kK*elem <= 128: ComposedLayout needs
-//                 kRowShift = kShift - log2(kChunks) >= 0 with
-//                 kChunks = kK*elem/16, so Swizzle<4,3> caps kK at 64 for
-//                 2-byte and 128 for 1-byte operands
-//   staging       kTileLines*kChunks % kThreads == 0 with a power-of-two
-//                 quotient, per operand (load_operand_tile), kTileLines being
-//                 the CTA extent on a congruous stage
-//   reclaim       bm*bn*sizeof(OutT) <= ring_smem_bytes(...), the epilogue's
-//                 reuse of the operand rings for the output tile
-//
-// What survives is what this dtype pair can actually run. The grid is the
-// measured space; the production manifest (manifest_for) is consulted only to
-// label which survivors production itself can select.
-// ---------------------------------------------------------------------------
+/*
+ * The tile grid, instantiated rather than hand-listed.
+ *
+ * A hand-written list has to know the kernel's instantiation constraints by
+ * heart and gets them wrong silently: a configuration the staging cannot load
+ * surfaces as a static_assert deep in the load path, one failed build at a
+ * time. So the axes below are enumerated at compile time and each combination
+ * is filtered by tile_ok(), which restates — in one place, beside the axes —
+ * the asserts the kernel carries:
+ *
+ *   warp tiling   kWarpM % 16 == 0, kWarpN % 8 == 0, warp tiles tile the CTA
+ *   k depth       kK % kMmaK == 0, and kK*elem <= 128: ComposedLayout needs
+ *                 kRowShift = kShift - log2(kChunks) >= 0 with
+ *                 kChunks = kK*elem/16, so Swizzle<4,3> caps kK at 64 for
+ *                 2-byte and 128 for 1-byte operands
+ *   staging       kTileLines*kChunks % kThreads == 0 with a power-of-two
+ *                 quotient, per operand (load_operand_tile), kTileLines being
+ *                 the CTA extent on a congruous stage
+ *   reclaim       bm*bn*sizeof(OutT) <= ring_smem_bytes(...), the epilogue's
+ *                 reuse of the operand rings for the output tile
+ *
+ * What survives is what this dtype pair can actually run. The grid is the
+ * measured space; the production manifest (manifest_for) is consulted only to
+ * label which survivors production itself can select.
+ */
 template <int M, int N> struct Geom {
     static constexpr int kM = M;
     static constexpr int kN = N;
@@ -110,15 +110,17 @@ template <int M, int N> struct Geom {
 using CtaGeoms =
     std::tuple<Geom<64, 64>, Geom<128, 64>, Geom<128, 128>, Geom<64, 128>, Geom<128, 256>>;
 
-// The warp axis: tiles of 16..128 per side at aspect ratios 1:2 .. 2:1 (the
-// shapes a warp tiling can sensibly take; the extreme slivers — one m16 or
-// n8 strip against a long other side — are out of scope). kWarpN stays a
-// multiple of 16 because mainloop.cuh declares the paired-B fragment array
-// unconditionally, so kNt == 1 instantiates nowhere. Where a tile does not
-// divide the CTA, or the CTA's warp count leaves the pinned 4/8 band
-// (tile_ok), the combination drops out. The 2026-09-15 pinning covered
-// four of these nine; cuBLAS on this box runs 64x64, which was none of the
-// four.
+/*
+ * The warp axis: tiles of 16..128 per side at aspect ratios 1:2 .. 2:1 (the
+ * shapes a warp tiling can sensibly take; the extreme slivers — one m16 or
+ * n8 strip against a long other side — are out of scope). kWarpN stays a
+ * multiple of 16 because mainloop.cuh declares the paired-B fragment array
+ * unconditionally, so kNt == 1 instantiates nowhere. Where a tile does not
+ * divide the CTA, or the CTA's warp count leaves the pinned 4/8 band
+ * (tile_ok), the combination drops out. The 2026-09-15 pinning covered
+ * four of these nine; cuBLAS on this box runs 64x64, which was none of the
+ * four.
+ */
 using WarpGeoms = std::tuple<Geom<16, 16>,
                              Geom<16, 32>,
                              Geom<32, 16>,
@@ -129,10 +131,12 @@ using WarpGeoms = std::tuple<Geom<16, 16>,
                              Geom<64, 128>,
                              Geom<128, 64>>;
 
-// The load bus rule, one spelling with load.cuh's loader: a side's chunks
-// either divide the threads (each thread one aligned power-of-two run) or
-// under-subscribe the bus (each participating thread one chunk, the
-// surplus skips). A side that can do neither has no schedule.
+/*
+ * The load bus rule, one spelling with load.cuh's loader: a side's chunks
+ * either divide the threads (each thread one aligned power-of-two run) or
+ * under-subscribe the bus (each participating thread one chunk, the
+ * surplus skips). A side that can do neither has no schedule.
+ */
 constexpr bool bus_fits(int chunks, int threads) {
     const int cpt = chunks < threads ? 1 : chunks / threads;
     return cpt > 0 && (cpt & (cpt - 1)) == 0 && (chunks % threads == 0 || chunks < threads);
@@ -147,24 +151,30 @@ constexpr bool tile_ok() {
     constexpr int kChunksB = Cta::kN * (KK * (int)sizeof(EB) / 16);
     constexpr int kRing =
         ring_smem_bytes(Cta::kM, Cta::kN, KK, S, (int)sizeof(EA), (int)sizeof(EB));
-    // mainloop.cuh's B-fragment pairing (kPairB), restated: on when B feeds
-    // the mma natively (no in-register dequant) and its k-tile holds <= 4
-    // 16B chunks. It folds two adjacent n8 cells per load. The paired
-    // fragment array is declared unconditionally, so even where the pairing
-    // is off a warp tile must span at least two n8 cells to instantiate.
+    /*
+     * mainloop.cuh's B-fragment pairing (kPairB), restated: on when B feeds
+     * the mma natively (no in-register dequant) and its k-tile holds <= 4
+     * 16B chunks. It folds two adjacent n8 cells per load. The paired
+     * fragment array is declared unconditionally, so even where the pairing
+     * is off a warp tile must span at least two n8 cells to instantiate.
+     */
     constexpr bool kPairB = !gemm_mma_traits<EA, EB>::kDequantB && KK * (int)sizeof(EB) / 16 <= 4;
-    // Warp count per CTA is pinned to 4 or 8 (128/256 threads): the band
-    // every production tile except the 16-warp manifest entries sits in
-    // (128x128x32_W32x32_S2 on the two-byte/mixed ladder,
-    // 128x256x64_W64x32_S2 on the byte ladder — those drop out of the grid
-    // and print planned="?").
+    /*
+     * Warp count per CTA is pinned to 4 or 8 (128/256 threads): the band
+     * every production tile except the 16-warp manifest entries sits in
+     * (128x128x32_W32x32_S2 on the two-byte/mixed ladder,
+     * 128x256x64_W64x32_S2 on the byte ladder — those drop out of the grid
+     * and print planned="?").
+     */
     constexpr int kWarps = kThreads / 32;
-    // load.cuh's line/run split needs a thread's 16B run inside ONE staged
-    // line (kCpt <= kChunks); fully subscribed that is "the staged extent
-    // <= threads". The static_assert pair there missed it until 2026-09-16:
-    // the violators (64x64x32 with a 64x64 warp, 128x256x32 with W64x128 or
-    // W128x64 warps) deadlock the kernel at 100% GPU instead of failing to
-    // build. Restated here so the grid never names one.
+    /*
+     * load.cuh's line/run split needs a thread's 16B run inside ONE staged
+     * line (kCpt <= kChunks); fully subscribed that is "the staged extent
+     * <= threads". The static_assert pair there missed it until 2026-09-16:
+     * the violators (64x64x32 with a 64x64 warp, 128x256x32 with W64x128 or
+     * W128x64 warps) deadlock the kernel at 100% GPU instead of failing to
+     * build. Restated here so the grid never names one.
+     */
     return (kWarps == 4 || kWarps == 8) && Cta::kM <= kThreads && Cta::kN <= kThreads &&
            Warp::kM % 16 == 0 && Warp::kN % 16 == 0 && Cta::kM % Warp::kM == 0 &&
            Cta::kN % Warp::kN == 0 && KK % kMmaK == 0 && KK * (int)sizeof(EA) <= 128 &&
@@ -173,11 +183,13 @@ constexpr bool tile_ok() {
            Cta::kM * Cta::kN * 2 <= kRing;
 }
 
-// The grid container is a plain type list, NOT std::tuple: libstdc++
-// tuple_cat runs an is_convertible validity check that recurses once per
-// element, and grids of this size (a few hundred entries) exceed the
-// frontend's instantiation depth. A variadic list concatenates at constant
-// depth and iterates as a fold expression.
+/*
+ * The grid container is a plain type list, NOT std::tuple: libstdc++
+ * tuple_cat runs an is_convertible validity check that recurses once per
+ * element, and grids of this size (a few hundred entries) exceed the
+ * frontend's instantiation depth. A variadic list concatenates at constant
+ * depth and iterates as a fold expression.
+ */
 template <typename... Ts> struct TileList {};
 
 template <typename EA, typename EB, typename Cta, typename Warp, int KK, typename... Done>
@@ -202,10 +214,12 @@ constexpr auto add_stages(TileList<Done...> acc) {
     }
 }
 
-// The k-tile depth axis: 32/64 (the twins every manifest carries) plus 128,
-// which the staging swizzle admits for 1-byte operands only (KK*elem <= 128
-// in tile_ok). add_ks was named for this axis but only ever instantiated
-// KK=32 — the kk64 half of the production vocabulary was never swept.
+/*
+ * The k-tile depth axis: 32/64 (the twins every manifest carries) plus 128,
+ * which the staging swizzle admits for 1-byte operands only (KK*elem <= 128
+ * in tile_ok). add_ks was named for this axis but only ever instantiated
+ * KK=32 — the kk64 half of the production vocabulary was never swept.
+ */
 template <typename EA, typename EB, typename Cta, typename Warp> constexpr auto add_ks() {
     return add_stages<EA, EB, Cta, Warp, 128, 2, 3, 4>(add_stages<EA, EB, Cta, Warp, 64, 2, 3, 4>(
         add_stages<EA, EB, Cta, Warp, 32, 2, 3, 4>(TileList<>{})));
@@ -244,9 +258,11 @@ template <typename... Ls> struct grid_size<TileList<Ls...>> {
     static constexpr int value = (0 + ... + list_len(Ls{}));
 };
 
-// Which entries production can select: a membership test over the pair's
-// manifest, not a position convention, so the prod column stays honest as the
-// manifest grows.
+/*
+ * Which entries production can select: a membership test over the pair's
+ * manifest, not a position convention, so the prod column stays honest as the
+ * manifest grows.
+ */
 template <typename T, typename Tuple> struct tuple_contains : std::false_type {};
 template <typename T, typename... Ts>
 struct tuple_contains<T, std::tuple<Ts...>> : std::bool_constant<(std::is_same_v<T, Ts> || ...)> {};
@@ -258,8 +274,10 @@ template <typename EA, typename EB> struct Space {
     }
 };
 
-// The structural token the aliases are spelled with, built from the type's
-// own parameters so a printed name cannot drift from the tile.
+/*
+ * The structural token the aliases are spelled with, built from the type's
+ * own parameters so a printed name cannot drift from the tile.
+ */
 template <typename Tile> std::string tile_name() {
     char buf[64];
     std::snprintf(buf, sizeof buf, "Tile_%lldx%lldx%lld_W%lldx%lld_S%d",
@@ -269,9 +287,11 @@ template <typename Tile> std::string tile_name() {
     return std::string(buf);
 }
 
-// Every candidate of the nested grid, in order; the global index is a
-// RUNTIME value (the fold keeps every type-level walk at constant depth; the
-// fn contract is operator()<Tile>(int index)).
+/*
+ * Every candidate of the nested grid, in order; the global index is a
+ * RUNTIME value (the fold keeps every type-level walk at constant depth; the
+ * fn contract is operator()<Tile>(int index)).
+ */
 template <typename... Ts, typename Fn> void for_each_flat(TileList<Ts...>, int& index, Fn&& fn) {
     ((fn.template operator()<Ts>(index++)), ...);
 }
@@ -290,17 +310,20 @@ struct Row {
     double ms = 0.0;
     double tflops = 0.0;
     double max_rel = 0.0; // vs the reference candidate's output
-    // Two independent witnesses that the timed work happened and was this
-    // candidate: the output checksum (a stale buffer from a launch that never
-    // ran repeats the previous candidate's) and a wall-clock best-of that does
-    // not share the event timer's assumptions.
+    /*
+     * Two independent witnesses that the timed work happened and was this
+     * candidate: the output checksum (a stale buffer from a launch that never
+     * ran repeats the previous candidate's) and a wall-clock best-of that does
+     * not share the event timer's assumptions.
+     */
     double checksum = 0.0;
     double ms_wall = 0.0;
     int launch_err = 0;
 };
 
-// One shape, one dtype pair, every candidate of the grid.
-// ---------------------------------------------------------------------------
+/*
+ * One shape, one dtype pair, every candidate of the grid.
+ */
 template <typename EA, typename EB, typename OutT>
 std::vector<Row>
 sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const char* only) {
@@ -343,9 +366,11 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
     const DeviceFacts dev = device_facts();
     const double flops = 2.0 * m * n * k;
     using Tiles = typename Space<EA, EB>::Tiles;
-    // Progress goes to stderr (CSV owns stdout): the per-shape rows only
-    // print at the end, and a few hundred candidates of checksum loops are
-    // minutes of silence without a live counter.
+    /*
+     * Progress goes to stderr (CSV owns stdout): the per-shape rows only
+     * print at the end, and a few hundred candidates of checksum loops are
+     * minutes of silence without a live counter.
+     */
     const int total = (int)grid_size<Tiles>::value;
     int done = 0;
     std::vector<Row> rows;
@@ -353,9 +378,11 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
     bool have_reference = false;
 
     for_each_candidate(Tiles{}, [&]<typename Tile>(int index) {
-        // --only: measure just the candidates whose tile name contains the
-        // substring (everything still instantiates — the grid is compile
-        // time). The bisect tool for a candidate that hangs or MISMATCHes.
+        /*
+         * --only: measure just the candidates whose tile name contains the
+         * substring (everything still instantiates — the grid is compile
+         * time). The bisect tool for a candidate that hangs or MISMATCHes.
+         */
         if (only != nullptr && std::strstr(tile_name<Tile>().c_str(), only) == nullptr)
             return;
         Row row;
@@ -366,15 +393,19 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
         constexpr int kRing = ring_smem_bytes((int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN,
                                               (int)Tile::CtaShape::kK, (int)Tile::kStages,
                                               (int)sizeof(EA), (int)sizeof(EB));
-        // The epilogue reclaims the operand rings for the output tile; a
-        // configuration that cannot is not a candidate (its kernel would not
-        // even instantiate — the launcher static_asserts on it).
+        /*
+         * The epilogue reclaims the operand rings for the output tile; a
+         * configuration that cannot is not a candidate (its kernel would not
+         * even instantiate — the launcher static_asserts on it).
+         */
         constexpr bool kReclaim =
             (int)Tile::CtaShape::kM * (int)Tile::CtaShape::kN * (int)sizeof(OutT) <= kRing;
-        // The illegal configurations must not be *named*, not merely skipped:
-        // the kernel static_asserts on the reclaim budget, and launch_policy
-        // instantiates it, so the guard has to be an if/else chain rather
-        // than an early return.
+        /*
+         * The illegal configurations must not be *named*, not merely skipped:
+         * the kernel static_asserts on the reclaim budget, and launch_policy
+         * instantiates it, so the guard has to be an if/else chain rather
+         * than an early return.
+         */
         if constexpr (!kReclaim) {
             row.why = "output exceeds the reclaimed ring";
         } else {
@@ -399,8 +430,10 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
                 p.out_ld = n;
                 p.batch = 1;
                 p.out_batch_stride = m * n;
-                // Raster is a property of the geometry, and production recomputes it
-                // per tile; match that so the comparison is apples-to-apples.
+                /*
+                 * Raster is a property of the geometry, and production recomputes it
+                 * per tile; match that so the comparison is apples-to-apples.
+                 */
                 p.raster = plan_raster(plan_query<EA, EB, RowMajor, ColMajor>(p, dev),
                                        (int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN);
 
@@ -456,10 +489,12 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
     return rows;
 }
 
-// The production-manifest entry a decision names. The full grid carries
-// several warp twins per CTA class, and the manifest itself splits one class
-// across warp shapes (big kk32 s2 is the 16-warp twin, s3 the 8-warp), so
-// (cta class, stages) alone matches two entries — the plan's kk decides.
+/*
+ * The production-manifest entry a decision names. The full grid carries
+ * several warp twins per CTA class, and the manifest itself splits one class
+ * across warp shapes (big kk32 s2 is the 16-warp twin, s3 the 8-warp), so
+ * (cta class, stages) alone matches two entries — the plan's kk decides.
+ */
 template <typename EA, typename EB> int planned_candidate_index(const PlanDecision& d) {
     int found = -1;
     for_each_candidate(typename Space<EA, EB>::Tiles{}, [&]<typename Tile>(int index) {
@@ -493,13 +528,17 @@ void report_shape(const char* cfg,
     p.m = m;
     p.n = n;
     p.k = k;
-    // The sweep only times the NT (fused-linear) route, which is the layout
-    // pair the candidates above are built with; the plan derives its own
-    // perf class, widths and crosswise count from those same tags.
+    /*
+     * The sweep only times the NT (fused-linear) route, which is the layout
+     * pair the candidates above are built with; the plan derives its own
+     * perf class, widths and crosswise count from those same tags.
+     */
     const PlanDecision plan = plan_dispatch_for<EA, EB, RowMajor, ColMajor>(p);
     const int pi = planned_candidate_index<EA, EB>(plan);
-    // Rows may be filtered (--only), so look the planned index up rather
-    // than indexing; a filtered-out plan prints as "?".
+    /*
+     * Rows may be filtered (--only), so look the planned index up rather
+     * than indexing; a filtered-out plan prints as "?".
+     */
     const Row* planned_row = nullptr;
     for (const Row& r : rows)
         if (r.index == pi) {
@@ -522,8 +561,10 @@ void report_shape(const char* cfg,
         std::printf("# %s %s: no feasible candidate\n", dtype_tag, cfg);
         return;
     }
-    // best_prod is null when --only filtered out every prod row: print a
-    // dash rather than dereference.
+    /*
+     * best_prod is null when --only filtered out every prod row: print a
+     * dash rather than dereference.
+     */
     const double planned_tflops = planned_row ? planned_row->tflops : 0.0;
     const char* prod_name = best_prod ? best_prod->tile.c_str() : "-";
     const double prod_tflops = best_prod ? best_prod->tflops : 0.0;
@@ -544,10 +585,12 @@ void report_shape(const char* cfg,
     (void)dev;
 }
 
-// The full combination set, host-only: one line per candidate the grid
-// instantiates for a dtype family — the same enumeration a sweep would time —
-// so coverage questions are answerable before paying the compile, and a
-// --list run doubles as the change record for the grid itself.
+/*
+ * The full combination set, host-only: one line per candidate the grid
+ * instantiates for a dtype family — the same enumeration a sweep would time —
+ * so coverage questions are answerable before paying the compile, and a
+ * --list run doubles as the change record for the grid itself.
+ */
 template <typename EA, typename EB> void list_space(const char* tag) {
     using Tiles = typename Space<EA, EB>::Tiles;
     std::printf("# %s candidates=%d\n", tag, (int)grid_size<Tiles>::value);
@@ -591,8 +634,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // --list is host-only (no device touch, no shapes needed): it prints the
-    // whole instantiated grid per built dtype family and exits.
+    /*
+     * --list is host-only (no device touch, no shapes needed): it prints the
+     * whole instantiated grid per built dtype family and exits.
+     */
     if (list) {
         const bool l_bf16 =
             std::strcmp(dtype_arg, "bf16") == 0 || std::strcmp(dtype_arg, "both") == 0;
@@ -624,8 +669,10 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // A spread across the regimes the plan table's bands separate: square
-    // small/mid/large, a long-K 4k square, a wide-N decode shape, skinny N.
+    /*
+     * A spread across the regimes the plan table's bands separate: square
+     * small/mid/large, a long-K 4k square, a wide-N decode shape, skinny N.
+     */
     const char* default_shapes = "256:256:256,512:512:512,1024:1024:1024,2048:2048:2048,"
                                  "4096:4096:4096,4096:4096:1024,64:4096:4096,4096:64:4096";
     const char* shapes = shape_arg ? shape_arg : default_shapes;

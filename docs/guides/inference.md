@@ -27,14 +27,15 @@ RoPE is applied **before** KV cache write, not after — otherwise position enco
 Three-layer separation (SGLang-inspired): storage, index table, allocator.
 
 ```
-PagePool (top-level manager, orchestrates all layers)
-  ├── KVStorage              k_buffer / v_buffer [n_layers, size, n_kv_heads, head_dim]
-  ├── ReqToTokenPool         req_to_token [num_reqs, max_ctx_len] → physical token slot
-  ├── Allocator              bitmask-based page allocator + ref-count + LRU (paged mode only)
-  └── RadixCache             exact, page-aligned prefix matching (paged mode, page_size > 1)
+KVCacheManager (per-request accounting; core/kv_cache_manager.py)
+  └── BlockPool (physical buffers + strategy; core/cache/pool.py)
+        ├── KVStorage          k_buffer / v_buffer [n_layers, size, n_kv_heads, head_dim]
+        ├── ReqToTokenPool     req_to_token [num_reqs, max_ctx_len] → physical token slot
+        ├── Allocator          bitmask-based page allocator + ref-count + LRU (paged mode only)
+        └── RadixCache         exact, page-aligned prefix matching (paged mode, page_size > 1)
 ```
 
-`PagePool` supports two modes:
+`BlockPool` supports two modes:
 
 - **Contiguous (default)**: pre-allocates `max_batch_size * max_seq_len` token slots. `req_to_token` is a trivial linear mapping (`slot = req_idx * max_seq_len + pos`). No dynamic allocation.
 - **Paged** (`page_size=1` or `>1` with `n_tokens` set): shared token pool with on-demand allocation. `Allocator` provides ref-counted allocation and LRU eviction. When `page_size > 1`, `RadixCache` also enables prefix sharing.
@@ -131,16 +132,20 @@ attention backends share the same rotary dispatch — it is backend-agnostic.
 
 ## Continuous Batching
 
-`InferenceScheduler` runs a daemon thread with a 4-phase loop:
+`Scheduler` runs a daemon thread (`run_busy_loop`) with a 4-phase loop:
 
 ```
-1. Cleanup → Record complete materialized pages, then release task-owned KV resources
-2. Refill  → Pop from waiting_queue, task_alloc resources, activate
+1. Cleanup → Record complete materialized pages, then release request-owned KV resources
+2. Refill  → Pop from waiting, alloc_slots resources, activate
 3. Prefill → Group by (prompt_len, start_pos), run full forward
 4. Decode  → Run single-token forward for each same-position group
 ```
 
-For in-process training rollout, `InferenceScheduler.update_weights(version)`
+Each step's results leave the loop as output events (`TokenDelta` /
+`RequestFinished`); text rendering happens in the frontend's
+`OutputProcessor`, never on the loop thread.
+
+For in-process training rollout, `Scheduler.update_weights(version)`
 acknowledges that the shared model was updated in place. Versions are monotonic;
 the scheduler rejects updates while requests are queued and invalidates reusable
 prefix KV pages before exposing the new version. Synchronous `run_batch()` and
@@ -203,20 +208,27 @@ Adding a protocol = one builder file, no handler subclassing needed.
 ## Engine & GenerateResult
 
 ```
-InferenceEngine
-  ├── generate(prompt, stream, ...) → str | List[str] | Generator
-  ├── generate_async(prompt, ...)   → AsyncGenerator
-  ├── get_stats()                   → Dict
-  ├── release() / resume()          → bool
+InferenceEngine (frontend layer)
+  ├── generate(prompt, stream, ...)   → str | List[str] | Generator
+  ├── generate_async(prompt, ...)     → AsyncGenerator[str]
+  ├── generate_events(prompt, ...)    → AsyncGenerator[StreamChunk]  (text + token ids + usage)
+  ├── score(prompt, continuation, ...) → log-probabilities
+  ├── release() / resume()            → bool
+  ├── get_stats()                     → Dict
   └── shutdown()
 ```
 
-Use `scripts/tools/benchmark_inference_lifecycle.py` to measure reclaimed memory,
-release/resume latency, and greedy-output parity for the AstrAI 1B preset. The
-[L20 results](../benchmarks/inference_release_resume_l20.md) include raw JSON for
-2K, 8K, and 32K context bounds.
+`generate_events` is the structured entry for protocol adapters: each chunk
+carries the incremental `text`, `delta_token_ids`, and — on the final chunk —
+exact `usage` and a mapped `finish_reason` (no re-tokenizing text to count
+tokens). Internally the engine mints request ids up front (`InputProcessor`),
+folds scheduler events through `OutputProcessor` (detokenize, stop matching,
+usage), and reaches the core only via `EngineCoreClient`. `GenerateResult`
+remains the synchronous aggregation view: `Condition` for non-streaming
+(`wait_completion()`), `Event` for streaming (`wait()`).
 
-`GenerateResult` uses `Condition` for non-streaming (`wait_completion()`) and `Event` for streaming (`wait()`). Stream callback is `cb(token)`.
+See [developer/inference/](../developer/inference/) for per-layer class
+diagrams and the end-to-end event flow.
 
 ## Launching the Server
 
@@ -423,3 +435,8 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
 ```
 
 > Document Update Time: 2026-08-22
+
+Use `scripts/tools/benchmark_inference_lifecycle.py` to measure reclaimed memory,
+release/resume latency, and greedy-output parity for the AstrAI 1B preset. The
+[L20 results](../benchmarks/inference_release_resume_l20.md) include raw JSON for
+2K, 8K, and 32K context bounds.

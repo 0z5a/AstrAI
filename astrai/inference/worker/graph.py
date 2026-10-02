@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 
 
-class CudaGraphContext:
+class CUDAGraphRunner:
     """CUDA-graph capture/replay for decode steps.
 
     Parameters:
@@ -24,7 +24,7 @@ class CudaGraphContext:
 
     Usage::
 
-        gctx = CudaGraphContext()
+        gctx = CUDAGraphRunner()
         with torch.inference_mode():
             outputs = gctx.forward(
                 model,

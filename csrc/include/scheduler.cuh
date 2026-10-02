@@ -1,17 +1,19 @@
 #pragma once
-// Tile scheduler: the linear CTA id maps to (block_m, block_n) in a
-// runtime-selected raster order (GemmParams::raster):
-//   raster > 0 — grouped raster: a group of `raster` M-tile rows sweeps
-//     all N columns, M walked fastest inside the group, so consecutive
-//     CTAs share one B column stripe (tall-ish outputs);
-//   raster < 0 — mirrored: a group of -raster N-tile columns sweeps all
-//     M rows, N walked fastest, consecutive CTAs share one A row stripe
-//     (wide outputs, e.g. dW = g^T @ x);
-//   raster == 0 — plain N-fastest raster (kRasterGroup=0's measured best
-//     for dX's crosswise-B layouts where grouping was neutral).
-// The order is a runtime value (chosen by plan_gemm's aspect heuristic)
-// because making it a template parameter would multiply kernel
-// instantiations; the scheduler runs once per CTA, so the branch is free.
+/*
+ * Tile scheduler: the linear CTA id maps to (block_m, block_n) in a
+ * runtime-selected raster order (GemmParams::raster):
+ *   raster > 0 — grouped raster: a group of `raster` M-tile rows sweeps
+ *     all N columns, M walked fastest inside the group, so consecutive
+ *     CTAs share one B column stripe (tall-ish outputs);
+ *   raster < 0 — mirrored: a group of -raster N-tile columns sweeps all
+ *     M rows, N walked fastest, consecutive CTAs share one A row stripe
+ *     (wide outputs, e.g. dW = g^T @ x);
+ *   raster == 0 — plain N-fastest raster (kRasterGroup=0's measured best
+ *     for dX's crosswise-B layouts where grouping was neutral).
+ * The order is a runtime value (chosen by plan_gemm's aspect heuristic)
+ * because making it a template parameter would multiply kernel
+ * instantiations; the scheduler runs once per CTA, so the branch is free.
+ */
 
 namespace astrai {
 namespace gemm {

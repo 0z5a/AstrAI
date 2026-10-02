@@ -30,7 +30,7 @@ def _imported_modules(path: Path) -> set[str]:
 
     Relative imports are resolved against the file's package path so
     ``from ..inference.cache import KVCache`` is caught as
-    ``astrai.inference.cache``.
+    ``astrai.inference.core.cache``.
     """
     package = ["astrai"] + list(path.relative_to(_REPO_ROOT / "astrai").parts[:-1])
     tree = ast.parse(path.read_text(), filename=str(path))
@@ -97,9 +97,9 @@ def test_model_package_imports_without_inference_package():
 
 
 def test_cache_facade_reexports_the_model_buffers():
-    """``astrai.inference.cache`` stays a working facade over the buffers'
+    """``astrai.inference.core.cache`` stays a working facade over the buffers'
     new home — same objects, not copies."""
-    import astrai.inference.cache as cache_facade
+    import astrai.inference.core.cache as cache_facade
     import astrai.model.kv_cache as kv_cache
 
     assert cache_facade.KVCache is kv_cache.KVCache

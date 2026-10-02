@@ -58,7 +58,7 @@ def _assert_shard_mechanics(cp_state, device):
 def _assert_cp_matches_single_device(strategy, batch, topology):
     """The CPStrategy composition matches the stock strategy exactly.
 
-    Forward: the reported task loss is the true global mean.  Backward:
+    Forward: the reported request loss is the true global mean.  Backward:
     each rank holds grads of (local_sum * cp / global_count), so the sum
     over cp ranks is cp x the single-device mean-loss grads — normalize
     before comparing.  bf16 logits plus the ring's LSE merge both add

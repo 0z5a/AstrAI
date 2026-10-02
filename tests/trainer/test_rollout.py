@@ -5,8 +5,8 @@ import threading
 import pytest
 import torch
 
-from astrai.inference.scheduler import InferenceScheduler
-from astrai.inference.task import GenerationResult
+from astrai.inference.core.request import GenerationResult
+from astrai.inference.core.scheduler import Scheduler
 from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
 from astrai.trainer.rollout import (
     BaseRewardModel,
@@ -47,7 +47,7 @@ class NonFiniteRewardModel(BaseRewardModel):
 
 
 def _make_scheduler(model, tokenizer, max_batch_size=8, max_len=128):
-    return InferenceScheduler(
+    return Scheduler(
         model=model,
         tokenizer=tokenizer,
         max_batch_size=max_batch_size,

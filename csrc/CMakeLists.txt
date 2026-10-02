@@ -166,12 +166,9 @@ foreach(entry IN LISTS KERNEL_MODULES)
 
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
 
-    # Per-family arch lists: the fp8 mma cells static_assert below sm_89
-    # (MmaOp's kMinArch = 890), so the fp8 modules compile only the 89+
-    # subset of the requested arches — a compute_80 device pass would trip
-    # the assert at template instantiation. Every other family carries the
-    # full list (its oldest cell is sm_80). The 120a image below keys on
-    # the shared list, so it rides along whenever 120 is requested.
+    # GEMM/quantize instantiate FP8 MMA cells (kMinArch=sm_89), so filter
+    # their arch lists to requested 8.9+ targets. Other kernels support
+    # sm_80+ and keep the full list, including any requested 120a image.
     set(_target_arches "${ASTRAI_CUDA_ARCH_LIST}")
     if(name STREQUAL "gemm" OR name STREQUAL "quantize")
         set(_target_arches "")
