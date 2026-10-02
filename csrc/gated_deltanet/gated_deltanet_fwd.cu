@@ -1,18 +1,8 @@
 /*
- * GDN preparation kernels: projection layout to chunk-kernel layout, in two launches.
- *
- * The chunked GDN kernels want head-major tensors ([B, H, T, D], head dim
- * contiguous) with L2-normalized query/key rows and the gate pre-scanned into a
- * chunk-local cumsum. What the layer's projections plus the local convolution
- * hand over is [B, H, D, T] — head and head-dim outer, *token inner* — so going
- * from one to the other is a real transpose, not a relabeling.
- *
- * Doing that with torch costs more than all four GDN kernels together: measured
- * at T=2048 and T=8192 the transposes, dtype casts, L2 norms and the cumsum were
- * 53% and 59% of the operator's wall clock, because each was its own launch over
- * the whole tensor. Here the source tile is read with the token axis coalesced,
- * staged in shared memory, and read back transposed so the head-dim axis of the
- * store is coalesced too. The two operations collapse into two launches.
+ * Two-launch GDN preparation: transpose projections [B,H,D,T] to [B,H,T,D],
+ * L2-normalize Q/K, and compute the chunk-local gate cumsum. Tiled shared-memory
+ * transpose coalesces both axes and fuses separate transpose/cast/norm/scan
+ * launches, which took 53%/59% of operator time at T=2048/8192.
  */
 
 #include <c10/cuda/CUDAGuard.h>
@@ -28,11 +18,8 @@ constexpr int kThreads = 256;
 constexpr int kHeadDim = 128; // D: the Qwen3.5 linear-attention head shape
 constexpr int kTile = 64;     // tokens per block
 constexpr int kQuarters = 4;  // norm reduction is split kQuarters ways
-/*
- * Row pitch in shared memory. 66 bf16 is 33 words, so the transposed read (one
- * thread per head dim) walks consecutive banks instead of colliding; a 16-byte
- * multiple would be conflict-prone, which is why the vector stores below are
- * scalar.
+/* kTile+2 bf16 values give a 33-word pitch for conflict-free transposed reads;
+ * keep the stores scalar to avoid bank conflicts.
  */
 constexpr int kPitch = kTile + 2;
 

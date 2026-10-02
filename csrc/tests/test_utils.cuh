@@ -69,7 +69,7 @@ inline void print_bench_row(const char* cfg, const BenchResult& r) {
     printf("%-46s | %7.4f ms | %6.2f\n", cfg, r.ms, r.tflops);
 }
 
-// ---- validation table (kernel vs CPU reference) ----
+// Validation table (kernel vs CPU reference)
 inline void print_test_header() {
     printf("%-46s | %11s | %11s | %6s\n", "config", "max_abs_err", "max_rel_err", "result");
     printf("----------------------------------------------------------------"
@@ -119,14 +119,9 @@ template <typename P> inline void set_default_strides(P& p) {
 }
 
 /*
- * Generic CPU reference for multi-query / grouped-query attention.
- * Tensor shapes (all float*):
- *   Q : [B, Hq, q_len, D]
- *   K : [B, Hk, kv_len, D]
- *   V : [B, Hk, kv_len, D]
- *   O : [B, Hq, q_len, D]
- * mask: if q_len == 1, shape is [B, kv_len]; otherwise mask is not supported.
- * causal_offset: -1 = non-causal; >=0 = absolute position of first Q token.
+ * CPU MQA/GQA reference: Q/O [B,Hq,q_len,D], K/V [B,Hk,kv_len,D].
+ * Mask is supported only for q_len=1 ([B,kv_len]). causal_offset=-1 disables
+ * causality; otherwise it is the absolute position of the first Q token.
  */
 static void cpu_attention_ref(const float* Q,
                               const float* K,

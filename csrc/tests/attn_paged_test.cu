@@ -154,7 +154,7 @@ static void cpu_paged_prefill_ref(const float* Q,
     }
 }
 
-// ---- paged validation table (kernel vs CPU ref, abs error only) ----
+// Paged validation table (kernel vs CPU ref; absolute error)
 inline void print_paged_header() {
     printf("%-58s | %11s | %6s\n", "config", "max_err", "result");
     printf("----------------------------------------------------------------"

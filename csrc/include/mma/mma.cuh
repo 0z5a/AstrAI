@@ -282,7 +282,7 @@ template <typename InT> struct MxMmaOp;
 ASTRAI_MX_MMA_OP(__nv_fp8_e4m3, "e4m3")
 ASTRAI_MX_MMA_OP(__nv_fp8_e5m2, "e5m2")
 
-// --- convenience views over the trait layers --------------------------------
+// Convenience views over the trait layers
 
 /*
  * Compile-time facts of an input type's MMA, flattened for the layers that

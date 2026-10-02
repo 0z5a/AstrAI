@@ -1,20 +1,8 @@
 /*
- * Unified staging-swizzle vocabulary, CUTLASS-style: a swizzle is a TYPE
- * composed with a layout into the staged tile's address map — "a bijection
- * over the LINEAR 16B-chunk index, Swizzle<Bits,Shift>{}(L) = L ^
- * ((L>>Shift)&(2^Bits-1))" applied to the row-major chunk layout. One
- * declared instance per staged tile names the whole map (loaders, fragment
- * readers and lane-offset mirrors consume the same type), so every staged
- * tile is one (Bits, Shift) pair:
- *
- *   congruous tile 2B elems: <3,3> (TMA SWIZZLE_128B); 1B elems: <2,3> (64B);
- *   crosswise trans tile:    <3, log2 chunks>; epilogue wide-row: <log2, log2>
- *
- * The Shift==3 members ARE the hardware TMA swizzle modes — kTmaMode marks
- * them (the descriptor derives its enum from the same Bits; TMA applies the
- * XOR to the ABSOLUTE smem address, so consumers align the tile to 1024B or
- * phase by the tile's address bits). The vocabulary costs one IMAD + one XOR
- * per use. Extent vocabulary (Shape/Stride) lives in shape.cuh.
+ * Type-level swizzle over row-major 16B chunks:
+ * index ^ ((index >> Shift) & ((1 << Bits) - 1)). Loaders and readers share
+ * the layout type. This encoder accepts <2, 3> (64B) and <3, 3> (128B); TMA swizzles
+ * absolute shared addresses, so callers must honor the required alignment.
  */
 
 #pragma once
@@ -56,13 +44,8 @@ struct Layout<Shape<Rows, Chunks>, Stride<RowStride, ColStride>> {
     }
 };
 
-/*
- * composition(Swizzle, Layout): the swizzle bijection pre-folded to its
- * closed two-coordinate form, chunk' = (chunk & ~kMask) | ((chunk ^
- * (row>>kRowShift)) & kMask). The XOR derives from the row ALONE, so it
- * computes in parallel with the chunk extraction instead of serializing
- * behind the row*stride IMAD (CUTLASS 2.x iterators apply the swizzle the
- * same way); row bits are narrower than the chunk field, so no carry.
+/* Compose the swizzle into a two-coordinate map; its row-only XOR computes
+ * independently of the chunk offset and cannot carry into the row term.
  */
 template <typename SwzT, typename LayT> struct ComposedLayout {
     using Swz = SwzT;

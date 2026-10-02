@@ -145,20 +145,11 @@ bind_ring(QuantParams& p, const RingView& r, int64_t hist_idx, double fp8_max, d
 }
 
 /*
- * One quantize pass, end to end: validation, output allocation, launch.
- * ``layout`` picks which orientations are produced; ``transposed_dtype``
- * (default: the row-major dtype) casts the transposed orientation in a
- * different fp8 format — the hybrid training pair casts the forward format
- * on one side and the backward format on the other from a single read, and
- * since the two conversions are elementwise the mixed pass is bit-identical
- * to two single-format passes. A ring switches on the in-kernel
- * delayed-scaling fold (amax history + the published scale and its
- * reciprocal); without one the kernel runs a pure scale+cast.
- * ``pub_scale``/``pub_recip`` redirect where the fold publishes (default:
- * the ring's own slots) — the double-buffered ring's "next" pair, so the
- * consumer keeps reading the untouched current pair and needs no snapshot
- * clone. A ring also requires ``hist_len`` (see RingLayout); one without is
- * rejected rather than guessed.
+ * Validates and launches one pass; layout selects row-major/transposed outputs.
+ * transposed_dtype defaults to dtype_a; differing formats convert from one
+ * read and match two single-format passes. A ring enables delayed-scaling fold
+ * and requires hist_len; publication overrides can target its next scale/
+ * reciprocal pair to avoid a snapshot. Without a ring, only scale and cast run.
  */
 QuantizeOutputs run_quantize(torch::Tensor x,
                              torch::Tensor scale,

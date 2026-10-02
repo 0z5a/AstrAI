@@ -153,7 +153,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
             process_tile(it, it);
     }
 
-    // ---- write UN-normalised partials for this split ----
+    // Write unnormalized partials for this split
     auto split_slot = [&](int h) -> size_t {
         size_t bh = (size_t)batch * p.q_head + h;
         return bh * MAX_SPLITS + split;

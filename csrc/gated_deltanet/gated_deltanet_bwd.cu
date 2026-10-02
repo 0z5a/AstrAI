@@ -1,34 +1,14 @@
 /*
- * Backward of the Gated DeltaNet output stage (FLA's `chunk_bwd_o`).
- *
- * Forward, per chunk of one (b, h), on head-major tensors:
- *
- *   gh    = chunk-local cumsum of the gate
- *   decay = e^(gh_j - gh_l) for j >= l, zero above the diagonal
- *   A     = (q k^T) * decay
- *   qe    = q * e^gh
- *   o     = scale * (qe @ h + A @ v_new)
- *
- * so the reverse pass over one chunk is
- *
- *   dO     = scale * do
- *   dA     = dO @ v_new^T                      (reduces over V)
- *   d_qe   = dO @ h^T                          (reduces over V)
- *   dv_new = A^T @ dO
- *   dh    += qe^T @ dO                         (accumulated across chunks)
- *   dq     = d_qe * e^gh + (dA * decay) @ k
- *   dk     = (dA * decay)^T @ q
- *   dgh    = sum_K(d_qe * qe) + rowsum(dA * A) - colsum(dA * A)
- *
- * `dh` and `dv_new` are written by more than one stage of the reverse pass, so
- * they are float32 accumulators that this kernel adds into with atomics; every
- * other output is owned by exactly one block.
- *
- * This version uses plain FMA rather than tensor cores. The reverse pass is
- * where a wrong index is expensive to find, so it is written to be checkable
- * against autograd first; the tiling follows the 99 KB shared-memory ceiling of
- * this part (one block per SM), which is also why `do` is read from global
- * rather than staged — the accesses within a warp hit the same address and
+ * Backward of GDN output stage (FLA chunk_bwd_o). Per chunk:
+ *   gh=cumsum(g), decay[j,l]=exp(gh_j-gh_l) for j>=l (0 otherwise),
+ *   A=(qk^T)*decay,
+ *   qe=q*e^gh, o=scale*(qe@h + A@v_new).
+ *   dO=scale*do, dA=dO@v_new^T, d_qe=dO@h^T, dv_new=A^T@dO,
+ *   dh+=qe^T@dO, dq=d_qe*e^gh+(dA*decay)@k, dk=(dA*decay)^T@q,
+ *   dgh=sum_K(d_qe*qe)+rowsum(dA*A)-colsum(dA*A).
+ * dh and dv_new use float32 atomics across stages; other outputs are block-owned.
+ * Plain FMA keeps this reference easy to check against autograd. Tiling fits
+ * the 99KB shared-memory limit (one block/SM); do is read globally for warp
  * broadcast.
  */
 

@@ -5,30 +5,9 @@
 #include <utils/dtype.cuh>
 
 /*
- * Attention layout policies keep Q scheduling independent from K/V storage.
- * DenseQSchedule / PackedQSchedule map blocks to Q tiles; ContigKV / PagedKV
- * resolve logical K/V positions to physical addresses. This lets the shared
- * kernels compose Q layout and K/V storage without coupling the two concerns.
- *
- *   ContigKV<T>:  K/V are dense [batch, kv_head, kv_len, head_dim] tensors.
- *              Params fields used: k, v, kv_stride_*, kv_len, q_len,
- *              q_b_stride, causal_offset.
- *   PagedKV<T>:   K/V live in a flat pool [size, kv_head, head_dim] indexed via
- *              req_to_token.  Params fields used: k_cache, v_cache,
- *              req_to_token, req_pool_indices, kv_indptr, qo_indptr,
- *              max_context_len, q_l_stride.
- *
- * The K/V policy is also where the element type is bound: AttentionParams
- * itself is dtype-agnostic (void* pointers + a dtype tag) and the kernels read
- * the element type back off the policy they were instantiated with
- * (`using T = typename KV::Elem;`), so the dispatch's dtype axis is exactly
- * "which KV instantiation".  Every method takes the params by reference; the
- * typed views below (kptr/vptr/...) are the only place void* becomes T*.
- *
- * Addressing state that is constant across a whole kernel invocation for one
- * (batch, kv_head) pair is captured once by make_ctx<HEAD_DIM>() and passed
- * to kv_addr, so the load loops never redo the hoistable base computation
- * (e.g. the req_pool_indices global read) element-by-element.
+ * Q scheduling is independent of K/V storage. DenseQSchedule/PackedQSchedule
+ * map Q tiles; ContigKV/PagedKV resolve logical K/V positions and bind Elem.
+ * make_ctx hoists per-(batch, kv_head) address state outside the load loops.
  */
 
 namespace astrai {
@@ -146,7 +125,7 @@ struct KVAddr {
     bool valid;
 };
 
-// ---- Contiguous K/V ----
+// Contiguous K/V
 template <typename T> struct ContigKV {
     using Elem = T;
     static constexpr bool kPaged = false;
@@ -210,7 +189,7 @@ template <typename T> struct ContigKV {
     }
 };
 
-// ---- Paged (SGLang-style flat pool) K/V ----
+// Paged K/V backed by an SGLang-style flat pool
 template <typename T> struct PagedKV {
     using Elem = T;
     static constexpr bool kPaged = true;

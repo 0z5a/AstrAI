@@ -103,47 +103,19 @@ constexpr int ring_smem_bytes(int bm, int bn, int k, int stages, int ba, int bb)
 }
 
 /*
- * Resident-CTA hint for a ring of `bytes` bytes — __launch_bounds__'s second
- * argument, and so the per-thread register budget every kernel of that
- * geometry is compiled to (regs_per_sm / (threads * hint)). One source:
- * GemmSmem states it to the compiler and the planner's residency model
- * (plan_table.h) prices the same rule, so a ring the planner counts as two
- * CTAs per SM is one the compiler also fitted.
- *
- * The 48KB watermark is a preference, not a device limit — well under every
- * supported part's per-block opt-in ceiling, it reads "a ring that fits in
- * half of Ada's smem is worth splitting the register file for". It is
- * therefore NOT the smem term of residency: that term is priced from
- * DeviceFacts::smem_per_sm, because a part with more smem per SM packs more
- * CTAs than a watermark fixed at one device's figure allows.
+ * Shared compiler/planner CTA hint and register budget. The 48 KiB watermark
+ * is a preference, not a device limit; occupancy still uses each device's
+ * smem_per_sm so larger-memory GPUs can pack additional CTAs.
  */
 constexpr int min_ctas_for_ring(int bytes) { return bytes <= 48 * 1024 ? 2 : 1; }
 
-/*
- * Which storages take the DIRECT (crosswise) staging path. A stored [K][M]
- * (ColMajor) and B stored [K][N] (RowMajor) each keep the tile's rows along K,
- * so their load walks memory crosswise; the other two are congruous and stage
- * as-is. The operand role rides the function name because a tag alone does not
- * say which side it is: the canonical A is [M][K] and B is [K][N], so
- * ColMajor means crosswise for A and congruous for B. Everything else in this
- * directory spells the predicate from these two — crosswise_of() sums them,
- * GemmSmem reads them per operand, the ladder picks its kind from them.
- */
+/* Crosswise staging uses ColMajor A or RowMajor B; the other layouts stage as-is. */
 template <typename Layout> constexpr bool direct_a() { return std::is_same_v<Layout, ColMajor>; }
 template <typename Layout> constexpr bool direct_b() { return std::is_same_v<Layout, RowMajor>; }
 
-/*
- * Layout-aware shared-memory budget and occupancy hint. Every operand ring
- * holds kStages+1 buffers: the load for tile i+kStages targets slot
- * (i-1)%(kStages+1) — already consumed — so neither load path needs a
- * post-compute barrier (one __syncthreads per k-tile). The register-budget
- * hint comes from min_ctas_for_ring below.
- */
+/* Each kStages+1 ring reuses an already-consumed slot, avoiding a post-compute barrier. */
 template <typename Traits, typename LayoutA, typename LayoutB> struct GemmSmem {
-    /*
-     * Crosswise (direct-load) operands: A ColMajor storage, B RowMajor
-     * storage (B's tag is relative to the canonical [K][N]).
-     */
+    /* Crosswise operands: ColMajor A or RowMajor B. */
     static constexpr bool kDirectA = direct_a<LayoutA>();
     static constexpr bool kDirectB = direct_b<LayoutB>();
     static constexpr int kRingDepth = Traits::kStages + 1;
@@ -157,20 +129,10 @@ template <typename Traits, typename LayoutA, typename LayoutB> struct GemmSmem {
 };
 
 /*
- * Tile recipe (CUTLASS-style configuration type): one named bundle of CTA
- * shape, warp tiling and pipeline depth. Extending the launch ladder = one
- * alias here + one planner branch (never re-spelled positional ints).
- *
- * There is no loop-specialization axis: every tile carries both mainloop
- * copies and the per-CTA runtime verdict (use_interior_copy, mainloop.cuh)
- * picks one — interior, 16B-aligned, K-tail-free CTAs take the predication-
- * free copy. A compile-time kFastLoop flag once spelled the "fast twin"
- * here, but its one remaining effect (the big CTA downgraded to the
- * predicated twin on crosswise staging) measured BACKWARDS on this part:
- * interleaved A/B 2026-09-16 (sm_120, TT route, cp.async) has the
- * predication-free copy 9-19% FASTER on both big kk twins, and the
- * downgrade was unreachable through the planner anyway (the model's
- * residency rule never picks big on the crosswise ladder).
+ * Named CTA/warp/stage recipe; adding a tile needs one alias and planner branch.
+ * CTAs use the predication-free copy only when aligned, interior, and K-tail-free.
+ * The crosswise big-CTA downgrade tested 9-19% slower on sm_120 (TT, cp.async;
+ * 2026-09-16), and the planner never selects that downgrade.
  */
 template <typename CtaShape_, typename WarpShape_, int Stages_> struct GemmTileConfig {
     using CtaShape = CtaShape_;
@@ -223,25 +185,15 @@ using small_16w_t = GemmTileConfig<typename Tile::CtaShape, Shape<16, 16>, Tile:
  */
 using Tile_64x64x32_W16x32_S2 = GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 2>;
 using Tile_64x64x32_W16x32_S3 = GemmTileConfig<Shape<64, 64, 32>, Shape<16, 32>, 3>;
-/*
- * The tall 64x128 CTA (N:M = 2:1): the tile sweep's champion at wide N and
- * at the parity square on the congruous ladder (up to 1.089x over the best
- * previously reachable recipe), so it joins the manifest rather than living
- * in the sweep grid only.
- */
+/* Tall 64x128 won wide-N sweep and congruous square, up to 1.089x over prior best. */
 using Tile_64x128x32_W32x32_S2 = GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 2>;
 using Tile_64x128x32_W32x32_S3 = GemmTileConfig<Shape<64, 128, 32>, Shape<32, 32>, 3>;
 using Tile_128x64x32_W32x32_S2 = GemmTileConfig<Shape<128, 64, 32>, Shape<32, 32>, 2>;
 using Tile_128x128x32_W64x32_S3 = GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 3>;
 /*
- * 16 warps per CTA on the 128x128x32 ring (32x32 warp tiles, 512 threads):
- * same CTA geometry, same 48KB ring, twice the warps. The 8-warp twin above
- * leaves the tensor pipe waiting at every fragment boundary; doubling the warps
- * per partition is worth 7-14% on every large fused-linear shape and costs
- * nothing on the small ones (13 shapes measured, only 512x1536x1536 gives up
- * 1.2%, and that shape is served by the 64x64 rows). The residency budget
- * still holds: 512 threads x 2 CTAs needs <= 64 registers, which the smaller
- * 32x32 warp tile's accumulator (32 fp32 cells) leaves room for.
+ * 16-warp 128x128x32 keeps the 48KB ring and avoids tensor-pipe stalls. It
+ * gained 7-14% on 12/13 fused-linear cases; 512x1536x1536 (-1.2%) uses 64x64.
+ * Two CTAs fit the register budget: 512 threads need <=64 registers each.
  */
 using Tile_128x128x32_W32x32_S2 = GemmTileConfig<Shape<128, 128, 32>, Shape<32, 32>, 2>;
 /*
@@ -269,15 +221,8 @@ template <typename Tile> constexpr TileClass tile_class() {
         return TileClass::kSmall64;
 }
 
-/*
- * The one rule the launch resolvers ask: does this tile take the widening?
- * Any pair with a 2-byte operand (a 1-byte x 1-byte pair keeps the 8-warp
- * tile — its ladder is out of scope here, and W8A8's own cell is not
- * issue-starved), the small CTA only, and kK=64 only (a kK=32 16-warp form
- * would leave half the threads idle on the 2-byte side and three quarters
- * on the 1-byte side; the skip makes it legal, not worthwhile). Named
- * rather than inlined in the resolvers so the tests can pin all three arms
- * without a launch.
+/* Widen only the small kK=64 tile when either operand is 2-byte. The kK=32
+ * form wastes lanes; byte pairs keep the 8-warp tile. Tests pin this rule.
  */
 template <typename ElemA, typename ElemB, typename Tile>
 using warp_widened_t =
@@ -302,12 +247,8 @@ static_assert((int)TileClass::kSmall64 == 0 && (int)TileClass::kNarrow128x64 == 
                   (int)TileClass::kTall64x128 == 4,
               "kTileClassCta is indexed by TileClass: keep the enum in table order");
 
-/*
- * One row per class is kTileClassCta's contract (cta_matches_class pins it to
- * the tiles the ladders instantiate), so its extent is the class count. The
- * row file's cta column (plan_table.h) is bounds-checked against this and then
- * read as the TileClass ordinal: the file's numbering and the enum's are one
- * fact, not two tables to keep in sync.
+/* One geometry row per TileClass, in enum order; plan-table cta values use
+ * the same ordinals after bounds checking.
  */
 inline constexpr int kTileClassCount = (int)(sizeof(kTileClassCta) / sizeof(kTileClassCta[0]));
 
@@ -334,14 +275,9 @@ static_assert(cta_matches_class<Tile_64x64x64_W16x32_S2>() &&
 template <typename... Ts> using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
 
 /*
- * The shared ladder: the geometries every staging path instantiates.
- * load_operand_tile stages a crosswise operand as kK lines of (M or N)*elem/16
- * chunks; an under-subscribed bus (fewer chunks than threads, the 1-byte
- * side of a kK=32 twin) is a predicated skip there, so membership is a
- * choice, not a bus constraint — the shared six is simply what every
- * staging path wants; the wide CTA is 1-byte-only besides. The 16-warp
- * small is a resolver substitution, never a manifest entry, so the bus
- * never gated it either way. Every other manifest contains these.
+ * The shared six recipes appear in every staging ladder. Crosswise 1-byte
+ * kK=32 loads skip inactive lanes, so bus width does not constrain
+ * membership. The wide CTA is byte-only; 16-warp small is resolver-only.
  */
 using TileManifestCross = std::tuple<Tile_128x128x64_W64x32_S2,
                                      Tile_128x128x64_W64x32_S3,
@@ -351,23 +287,12 @@ using TileManifestCross = std::tuple<Tile_128x128x64_W64x32_S2,
                                      Tile_64x64x64_W16x32_S3>;
 
 /*
- * The dispatch manifests (CUTLASS builder-table style): every recipe the
- * launch ladders select over, keyed by the plan's CTA class, ring depth and
- * k-tile depth. Split by operand width because the reclaim budget
- * (bm*bn*sizeof(OutT) <= ring) and the load-path divisibility both bind
- * harder on the narrowest ring: the byte manifest cannot carry the kK=32
- * big CTA (32KB of output over a 24KB ring) — the 16-warp small is a
- * resolver substitution, not an entry, and stays off a byte pair by rule —
- * and the two-byte manifest has no use for the
- * 128x256 CTA, whose ring only fits a 1-byte pair. The big entries carry the
- * fast variant; the cp.async ladder downgrades to the non-fast twin for
- * crosswise staging at its resolver.
- *
- * The congruous ladder: the shared six plus the kK=32 twins, swept on the
- * dual-congruous (NT) route. Order is load-bearing — dispatch_tile takes the
- * first entry whose (class, stages, kK) matches. The small CTA's 16-warp
- * widening is not an entry here: it is a resolver substitution (small_16w_t)
- * so the same key stays legal on 1-byte operands.
+ * Ordered recipes selected by CTA class, stages, and kK; first match wins.
+ * Width-specific ladders enforce load-divisibility and output-reclaim limits.
+ * Byte omits big kK=32 S2 (24KB ring < 32KB output) and 16-warp small;
+ * two-byte omits 128x256 (its ring fits only byte operands). Big entries use
+ * fast copies; crosswise cp.async resolves to the non-fast twin. Congruous adds kK=32
+ * twins; 16-warp widening remains a resolver substitution, not a manifest row.
  */
 using TileManifest = tuple_cat_t<TileManifestCross,
                                  std::tuple<Tile_64x64x32_W16x32_S2,
@@ -379,16 +304,10 @@ using TileManifest = tuple_cat_t<TileManifestCross,
                                             Tile_64x128x32_W32x32_S3>>;
 
 /*
- * The 1-byte ladder: the shared six plus the wide CTA at kK 64, and the
- * 32-deep-ring kK=32 big CTA. The kK=32 crosswise feed runs its packed grid
- * at half bus, and the kK=32 narrow twin measured that penalty losing
- * everywhere (-8..-34% vs its own kK=64 twin across m=8192/16384, and the
- * model mis-picked it on unmeasured bands) — it stays off this ladder; the
- * 128x128x32 S3, whose deeper 32KB ring exactly reclaims its output, is the
- * one kK=32 point that pays. The S2 big twin (24KB ring) still cannot
- * reclaim its 32KB output — it waits on a direct-store epilogue. The
- * 16-warp small substitution stays off this ladder by rule (see
- * warp_widened_t).
+ * Byte ladder adds 128x256x64 S2 and 128x128x32 S3. Exclude crosswise kK=32
+ * narrow: half-bus loads measured 8-34% slower than kK=64, and the planner
+ * mis-picked it on unseen bands. S3's 32KB ring reclaims its output; S2's
+ * 24KB ring requires direct-store epilogue. 16-warp small remains resolver-only.
  */
 using TileManifestByte =
     tuple_cat_t<TileManifestCross,
@@ -404,20 +323,12 @@ template <typename LayoutA, typename LayoutB> constexpr int crosswise_of() {
 }
 
 /*
- * Which of the ladders a (staging path, operand widths) pair selects —
- * the one rule behind both the type-level alias and the planner's runtime
- * lookup, so the two cannot disagree about which tiles a plan may reach.
- * 1-byte pairs keep their own ladder regardless of staging — the wide CTA
- * rides it for the congruous route, and crosswise staging measures into it
- * too (its ring is (stages+1)*kK*(bm+bn) = 72KB at 512 threads, and both
- * direct sides fit the packed carry: 256 units for the 128-row side, an
- * exact 512 for the 256-row one); no kK=32 tile pays on a 1-byte pair (see
- * TileManifestByte). Crosswise staging keeps the conservative six for the
- * 2-byte and mixed widths (different staging budget); a mixed width pair
- * rides the congruous ladder — the predicated skip carries its thinner
- * 1-byte bus, the small CTA widens on it, and every kK=32 twin's ring and
- * reclaim budget hold at the mixed widths (the big twin's 32KB output
- * against its 48KB ring included).
+ * One rule drives type-level aliases and runtime plan lookup. Byte pairs use
+ * their ladder on either staging path; only the big S3 is a kK=32 entry. The
+ * wide CTA has a 72KB ring and packed carries of 256/512 units. Crosswise
+ * 2-byte and mixed pairs use the shared ladder; congruous mixed pairs use
+ * theirs. Predicated skips handle the 1-byte side; the small CTA widens, and
+ * kK=32 reclaim fits (big: 32KB output in a 48KB ring).
  */
 enum class ManifestKind { kCrosswise, kTwoByte, kMixed, kByte };
 

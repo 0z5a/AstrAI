@@ -1,20 +1,8 @@
 /*
- * Tensor vocabulary after CUTLASS/cute's Tensor<Engine, Layout>: ONE tensor
- * type — storage (engine) and addressing (layout) are its two template
- * parameters, every operation dispatches to a layout op. Use sites spell
- * Tensor<...> directly; no second names.
- *
- *   engines:  PtrEngine<T> (shared/global pointer), ArrayEngine<T, N>
- *             (registers — cute's Array role: mma fragments are arrays)
- *   layouts:  the ComposedLayout instances of utils/swizzle.cuh (16B chunk
- *             grids, dtype-agnostic) + RingLayout / CellLayout here
- *   ops:      make_ring (construct over a raw carve), stage_of (slice one
- *             ring slot's tile — cute's tensor slicing)
- *
- * A staged tile is Tensor<PtrEngine<Elem>, ComposedLayout>; the ring adds
- * the slot dimension via RingLayout; the accumulator is
- * Tensor<ArrayEngine<CFrag>, CellLayout>. All carriers are standard-layout
- * types and every method folds away at -O3 — the SASS is unchanged.
+ * Tensor<Engine, Layout> separates storage from indexing. PtrEngine and
+ * ArrayEngine provide pointer and register storage; ComposedLayout, RingLayout,
+ * and CellLayout map staged chunks, ring slots, and accumulator cells. make_ring
+ * constructs a ring and stage_of slices a slot. All operations inline away.
  */
 
 #pragma once
@@ -26,7 +14,7 @@
 
 namespace astrai {
 
-// --- engines -----------------------------------------------------------------
+// Engines
 
 /*
  * Shared/global-memory storage: the engine knows the element, the layout
@@ -52,7 +40,7 @@ template <typename T, int N> struct ArrayEngine {
     DEVICE_FORCEINLINE const T* base() const { return storage; }
 };
 
-// --- layouts (the tensor's address maps; chunk-grid ops are dtype-blind) -----
+// Layouts: address maps; chunk-grid operations are dtype-blind
 
 /*
  * Ring layout: slot rotation over a per-stage chunk grid — the staged
@@ -82,18 +70,9 @@ template <int kCols> struct CellLayout {
     }
 };
 
-// --- the tensor ---------------------------------------------------------------
+// Tensor
 
-/*
- * cute's Tensor<Engine, Layout>: operator() dispatches to the layout op
- * and indexes the engine — the tensor itself holds no address math.
- * Chunk-unit layouts (ComposedLayout / RingLayout) speak 16B chunks, so
- * the tensor applies its dtype's element scaling and keeps the LAST
- * coordinate element-granular; the chunk-grid swizzle stays dtype-blind.
- * Addresses come back as pointers (the smem seams feed cp.async /
- * ldmatrix byte math); element-unit layouts (CellLayout) address whole
- * engine cells.
- */
+/* Chunk layouts scale 16B indices by Elem; CellLayout addresses whole engine cells. */
 template <typename EngineT, typename LayoutT> struct Tensor {
     using Elem = typename EngineT::Elem;
     using Layout = LayoutT;
@@ -103,13 +82,9 @@ template <typename EngineT, typename LayoutT> struct Tensor {
     LayoutT layout;
 
     /*
-     * Chunk-unit 2-coordinate tile view: the row term and the layout's
-     * swizzled chunk scale separately in 32-BIT (one IMAD + one shift) and
-     * widen once at the pointer add — a 64-bit multiply on this chain
-     * regressed the crosswise-direct readers' register budget. The XOR
-     * derives from the row ALONE (ComposedLayout's closed form) — it must
-     * not serialize behind the row*stride IMAD (a linearized form
-     * regressed W8A8 up to +29%; see docs/developer/kernels/gemm.md).
+     * Keep row and swizzled-chunk offsets separate in 32-bit arithmetic, then
+     * widen once for the pointer add. The XOR depends on row alone; linearizing
+     * it behind row*stride regressed W8A8 by up to 29% (see GEMM notes).
      */
     template <bool kChunk = LayoutT::kChunkUnit, std::enable_if_t<kChunk, int> = 0>
     DEVICE_FORCEINLINE Elem* operator()(int row, int col) const {
@@ -140,7 +115,7 @@ template <typename EngineT, typename LayoutT> struct Tensor {
     }
 };
 
-// --- the tensor ops (factories + slicing, cute's make_tensor / slice role) --
+// Tensor factories and slicing
 
 // Construct the staged ring tensor over a raw shared-memory carve.
 template <typename ElemT, typename StageLay, int kSlots>

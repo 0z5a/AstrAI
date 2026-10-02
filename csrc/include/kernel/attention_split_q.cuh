@@ -119,7 +119,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
             t_end = bt;
     }
 
-    // ---- Load tile lambda: predicated cp.async (addressing via KV policy) ----
+    // Load tile via predicated cp.async and KV policy
     auto load_tile = [&](int ti, int buf) {
         load_kv_tile<Traits>(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
             int token = KV::resolve_token(p, kctx, kc, valid);
@@ -127,7 +127,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
         });
     };
 
-    // ---- Prologue: issue first tile load ----
+    // Prologue: issue first tile load
     load_tile(0, 0);
 
     for (int ti = 0; ti <= t_end; ti++) {
@@ -167,7 +167,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
         }
     }
 
-    // ---- write output: packed element-pair stores ----
+    // Write packed element-pair output
     float rl0 = (l0 > 1e-20f) ? (1.0f / l0) : 0.0f;
     float rl1 = (l1 > 1e-20f) ? (1.0f / l1) : 0.0f;
     T* __restrict__ o_gmem = static_cast<T*>(p.o_ptr);
