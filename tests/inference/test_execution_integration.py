@@ -3,7 +3,13 @@ from collections import Counter
 
 import pytest
 
-from astrai.inference.core.events import RequestError, RequestFinished, TokenDelta
+from astrai.inference.core.events import (
+    FINISH_LENGTH,
+    FINISH_STOP_TOKEN,
+    RequestError,
+    RequestFinished,
+    TokenDelta,
+)
 from astrai.inference.core.scheduler import Scheduler
 
 
@@ -71,7 +77,18 @@ def test_online_batch_changes_preserve_events_and_greedy_tokens(
             range(1, len(deltas) + 1)
         )
         terminal = request_events[-1]
-        assert terminal.completion_tokens == len(deltas) == limits[request_id]
+        # The fixture model is randomly initialized: greedy decoding may
+        # emit a stop token (<pad>) before max_tokens. That is a correct
+        # terminal, not a failure — both reasons must keep the invariants.
+        assert terminal.finish_reason in (FINISH_LENGTH, FINISH_STOP_TOKEN)
+        assert terminal.completion_tokens == len(deltas)
+        if terminal.finish_reason == FINISH_LENGTH:
+            assert len(deltas) == limits[request_id]
+        else:
+            # A stop token sampled on the FINAL allowed token is a normal
+            # full-length generation that happened to end on a stop id.
+            assert len(deltas) <= limits[request_id]
+            assert deltas[-1].token_id in scheduler.stop_ids
         assert terminal.prompt_tokens == len(prompt)
         expected = scheduler.run_batch(
             [prompt],
@@ -79,4 +96,6 @@ def test_online_batch_changes_preserve_events_and_greedy_tokens(
             temperature=0,
             return_details=True,
         )[0]
-        assert [event.token_id for event in deltas] == expected.token_ids
+        # The online run stops at the first sampled stop token; run_batch
+        # keeps decoding to max_tokens, so compare only the emitted prefix.
+        assert [event.token_id for event in deltas] == expected.token_ids[: len(deltas)]
