@@ -1,0 +1,300 @@
+#pragma once
+#include <cuda_bf16.h>
+#include <api/attention_common.h>
+#include <utils/define.cuh>
+#include <utils/dtype.cuh>
+
+/*
+ * Q scheduling is independent of K/V storage. DenseQSchedule/PackedQSchedule
+ * map Q tiles; ContigKV/PagedKV resolve logical K/V positions and bind Elem.
+ * make_ctx hoists per-(batch, kv_head) address state outside the load loops.
+ */
+
+namespace astrai {
+namespace attention {
+
+/*
+ * Q scheduling policies
+ *
+ * Map CUDA blocks to request-local Q tiles independently of K/V storage.
+ * Dense tensors encode the request in blockIdx.z; packed ragged tensors use
+ * a compact precomputed work map indexed by blockIdx.x.
+ */
+
+struct DenseQSchedule {
+    static HOST_FORCEINLINE int host_grid_batch(const AttentionParams& p) { return p.batch; }
+
+    static DEVICE_FORCEINLINE void map_block(const AttentionParams&, int& batch, int& q_tile) {
+        batch = blockIdx.z;
+        q_tile = blockIdx.x;
+    }
+
+    /*
+     * PackGQA-folded prefill mapping: the block's row space is the packed
+     * (head, row) space of the request — G heads folded, h = idx % G,
+     * m = idx / G over the GLOBAL packed index (a per-block offset would
+     * shift the head phase when block_m % G != 0). Dense tensors tile the
+     * packed space G*q_len directly.
+     */
+    static HOST_FORCEINLINE int
+    packed_grid_x(const AttentionParams& p, int, int block_m) {
+        const int G = p.q_head / p.kv_head;
+        return (p.q_len * G + block_m - 1) / block_m;
+    }
+
+    static DEVICE_FORCEINLINE void
+    map_packed_block(const AttentionParams&, int block_m, int& batch, int& packed0) {
+        batch = blockIdx.z;
+        packed0 = blockIdx.x * block_m;
+    }
+
+    static DEVICE_FORCEINLINE int q_len(const AttentionParams& p, int) { return p.q_len; }
+
+    static DEVICE_FORCEINLINE int q_base(const AttentionParams& p, int batch, int q_head) {
+        return batch * p.q_b_stride + q_head * p.q_h_stride;
+    }
+};
+
+struct PackedQSchedule {
+    static HOST_FORCEINLINE int host_q_blocks(const AttentionParams& p, int) {
+        return p.num_q_tiles;
+    }
+
+    static HOST_FORCEINLINE int host_grid_batch(const AttentionParams&) { return 1; }
+
+    static DEVICE_FORCEINLINE void map_block(const AttentionParams& p, int& batch, int& q_tile) {
+        batch = p.q_tile_to_batch[blockIdx.x];
+        q_tile = p.q_tile_to_index[blockIdx.x];
+    }
+
+    /*
+     * PackGQA-folded prefill mapping: the host tile maps are built in
+     * HOST_Q_TILE_ROWS granularity and stay head-agnostic; host tile t covers
+     * rows [t*HQR, (t+1)*HQR) of every head, i.e. packed idx
+     * [t*HQR*G, ...+HQR*G). Blocks carve that space in block_m steps; the
+     * kernel decodes h = idx % G over the request-local packed index.
+     * qo_indptr is a device pointer — the host grid derives from the tile
+     * count alone (a request's last tile is padded up by the host builder).
+     */
+    static HOST_FORCEINLINE int
+    packed_grid_x(const AttentionParams& p, int, int block_m) {
+        const int blocks_per_host_tile = (p.q_head / p.kv_head) * HOST_Q_TILE_ROWS / block_m;
+        return p.num_q_tiles * blocks_per_host_tile;
+    }
+
+    static DEVICE_FORCEINLINE void
+    map_packed_block(const AttentionParams& p, int block_m, int& batch, int& packed0) {
+        const int G = p.q_head / p.kv_head;
+        const int blocks_per_host_tile = G * HOST_Q_TILE_ROWS / block_m;
+        const int host_tile = blockIdx.x / blocks_per_host_tile;
+        batch = p.q_tile_to_batch[host_tile];
+        const int in_tile = blockIdx.x - host_tile * blocks_per_host_tile;
+        packed0 = p.q_tile_to_index[host_tile] * HOST_Q_TILE_ROWS * G + in_tile * block_m;
+    }
+
+    static DEVICE_FORCEINLINE int q_len(const AttentionParams& p, int batch) {
+        return p.qo_indptr[batch + 1] - p.qo_indptr[batch];
+    }
+
+    static DEVICE_FORCEINLINE int q_base(const AttentionParams& p, int batch, int q_head) {
+        return p.qo_indptr[batch] * p.q_l_stride + q_head * p.q_h_stride;
+    }
+};
+
+// Hoisted per-(batch, kv_head) addressing context.
+struct KVContext {
+    int kv_base;         // contig: batch*kv_b_stride + kv_head*kv_h_stride
+    int req_idx;         // paged: req_pool_indices[batch]
+    int64_t rtt_stride;  // paged: max_context_len
+    int64_t pool_stride; // paged: kv_head * HEAD_DIM
+    int64_t head_off;    // paged: kv_head * HEAD_DIM
+};
+
+/*
+ * Per-element K/V global addresses for one (kc, d) position of a K/V tile.
+ * The pointers are ALWAYS the computed addresses (never nullptr) — callers
+ * gate on `valid` (cp.async src_size=0, or a guarded scalar deref).  `valid`
+ * starts as "within the request's seq_len"; the paged policy further degrades
+ * it when req_to_token maps the position to a negative slot (empty padding).
+ * This matches the original hand-rolled load loops, where the address was
+ * always formed and the predicate decided whether anything was read.
+ */
+struct KVAddr {
+    const void* k;
+    const void* v;
+    bool valid;
+};
+
+// Contiguous K/V
+template <typename T> struct ContigKV {
+    using Elem = T;
+    static constexpr bool kPaged = false;
+
+    /*
+     * Typed views of the params' dtype-agnostic pointers. The restrict
+     * locals at the deref sites re-state the alias promise the void* -> T*
+     * cast drops.
+     */
+    static DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
+        return static_cast<const T*>(p.k_ptr);
+    }
+    static DEVICE_FORCEINLINE const T* vptr(const AttentionParams& p) {
+        return static_cast<const T*>(p.v_ptr);
+    }
+
+    static HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) { return p.kv_len; }
+
+    // decode: same offset (q_len == 1, so there is no row stride component)
+    static DEVICE_FORCEINLINE int q_decode_base(const AttentionParams& p, int batch, int q_head) {
+        return batch * p.q_b_stride + q_head * p.q_h_stride;
+    }
+
+    static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int) { return p.kv_len; }
+    static DEVICE_FORCEINLINE int causal_offset(const AttentionParams& p, int, int) {
+        return p.causal_offset;
+    }
+    // decode: exclusive bound of the single query's attend range
+    static DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams& p, int) {
+        return (p.kv_len < p.causal_offset + 1) ? p.kv_len : (p.causal_offset + 1);
+    }
+
+    template <int HEAD_DIM>
+    static DEVICE_FORCEINLINE KVContext make_ctx(const AttentionParams& p, int batch, int kv_head) {
+        KVContext c = {};
+        c.kv_base = batch * p.kv_b_stride + kv_head * p.kv_h_stride;
+        return c;
+    }
+    static DEVICE_FORCEINLINE int
+    resolve_token(const AttentionParams& p, const KVContext& c, int kc, bool valid) {
+        return valid ? kc : -1;
+    }
+    static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(const AttentionParams& p,
+                                                        const KVContext& c,
+                                                        int token,
+                                                        int d) {
+        const bool valid = token >= 0;
+        const int safe_token = valid ? token : 0;
+        const int64_t gmem_off =
+            (int64_t)c.kv_base + (int64_t)safe_token * p.kv_l_stride + (int64_t)d * p.kv_d_stride;
+        const T* __restrict__ k = kptr(p);
+        const T* __restrict__ v = vptr(p);
+        return {&k[gmem_off], &v[gmem_off], valid};
+    }
+
+    template <int VEC>
+    static DEVICE_FORCEINLINE KVAddr decode_addr(
+        const AttentionParams& p, const KVContext& c, int, int, int kc, int d, bool valid, bool) {
+        int token = resolve_token(p, c, kc, valid);
+        return kv_addr_from_token(p, c, token, d);
+    }
+};
+
+// Paged K/V backed by an SGLang-style flat pool
+template <typename T> struct PagedKV {
+    using Elem = T;
+    static constexpr bool kPaged = true;
+
+    static DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
+        return static_cast<const T*>(p.k_ptr);
+    }
+    static DEVICE_FORCEINLINE const T* vptr(const AttentionParams& p) {
+        return static_cast<const T*>(p.v_ptr);
+    }
+    static DEVICE_FORCEINLINE const T* new_kptr(const AttentionParams& p) {
+        return static_cast<const T*>(p.new_k_ptr);
+    }
+    static DEVICE_FORCEINLINE const T* new_vptr(const AttentionParams& p) {
+        return static_cast<const T*>(p.new_v_ptr);
+    }
+
+    static HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) { return p.max_context_len; }
+
+    // decode: Q is [batch, q_head, head_dim], so batch is the outer row
+    static DEVICE_FORCEINLINE int q_decode_base(const AttentionParams& p, int batch, int q_head) {
+        return batch * p.q_l_stride + q_head * p.q_h_stride;
+    }
+
+    static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
+        return p.kv_indptr[batch + 1] - p.kv_indptr[batch];
+    }
+    static DEVICE_FORCEINLINE int causal_offset(const AttentionParams& p, int batch, int q_len) {
+        return kv_len(p, batch) - q_len;
+    }
+    // decode: the query is the last token, so [0, seq_len) IS its causal range
+    static DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams& p, int batch) {
+        return kv_len(p, batch);
+    }
+
+    template <int HEAD_DIM>
+    static DEVICE_FORCEINLINE KVContext make_ctx(const AttentionParams& p, int batch, int kv_head) {
+        KVContext c = {};
+        c.req_idx = p.req_pool_indices[batch];
+        c.rtt_stride = (int64_t)p.max_context_len;
+        c.pool_stride = (int64_t)p.kv_head * HEAD_DIM;
+        c.head_off = (int64_t)kv_head * HEAD_DIM;
+        return c;
+    }
+    static DEVICE_FORCEINLINE int
+    resolve_token(const AttentionParams& p, const KVContext& c, int kc, bool valid) {
+        return valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : -1;
+    }
+    static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(const AttentionParams& p,
+                                                        const KVContext& c,
+                                                        int slot,
+                                                        int d) {
+        const bool valid = slot >= 0;
+        const int safe_slot = valid ? slot : 0;
+        const int64_t gmem_off = (int64_t)safe_slot * c.pool_stride + c.head_off + d;
+        const T* __restrict__ k = kptr(p);
+        const T* __restrict__ v = vptr(p);
+        return {&k[gmem_off], &v[gmem_off], valid};
+    }
+
+    static DEVICE_FORCEINLINE KVAddr new_kv_addr(const AttentionParams& p,
+                                                 int batch,
+                                                 int kv_head,
+                                                 int d) {
+        const int64_t off =
+            (int64_t)batch * p.new_kv_b_stride + (int64_t)kv_head * p.new_kv_h_stride + d;
+        const T* __restrict__ nk = new_kptr(p);
+        const T* __restrict__ nv = new_vptr(p);
+        return {&nk[off], &nv[off], true};
+    }
+
+    static DEVICE_FORCEINLINE void store_new_kv(
+        const AttentionParams& p, const KVContext& c, int seq_len, int d, const KVAddr& src) {
+        int slot = resolve_token(p, c, seq_len - 1, true);
+        const int64_t off = (int64_t)slot * c.pool_stride + c.head_off + d;
+        T* __restrict__ k = const_cast<T*>(kptr(p));
+        T* __restrict__ v = const_cast<T*>(vptr(p));
+        k[off] = *reinterpret_cast<const T*>(src.k);
+        v[off] = *reinterpret_cast<const T*>(src.v);
+    }
+
+    template <int VEC>
+    static DEVICE_FORCEINLINE KVAddr decode_addr(const AttentionParams& p,
+                                                 const KVContext& c,
+                                                 int batch,
+                                                 int kv_head,
+                                                 int kc,
+                                                 int d,
+                                                 bool valid,
+                                                 bool persist) {
+        if (p.new_k_ptr && valid && kc == kv_len(p, batch) - 1) {
+            KVAddr src = new_kv_addr(p, batch, kv_head, d);
+            if (persist) {
+#pragma unroll
+                for (int j = 0; j < VEC; j++) {
+                    KVAddr value = new_kv_addr(p, batch, kv_head, d + j);
+                    store_new_kv(p, c, kc + 1, d + j, value);
+                }
+            }
+            return src;
+        }
+        int token = resolve_token(p, c, kc, valid);
+        return kv_addr_from_token(p, c, token, d);
+    }
+};
+
+} // namespace attention
+} // namespace astrai

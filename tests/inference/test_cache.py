@@ -1,21 +1,22 @@
 """Unit tests for inference cache components."""
 
+import random
+
 import pytest
 import torch
 
-from astrai.inference.cache import (
+from astrai.inference.core.cache import (
     Allocator,
+    BlockPool,
+    KVCacheManager,
     KVStorage,
-    PagePool,
     RadixCache,
     ReqToTokenPool,
-    TaskCacheManager,
-    page_hash,
 )
-from astrai.inference.workspace import InferenceWorkspace
+from astrai.inference.worker.workspace import InferenceWorkspace
 
 
-def _ws(pool: PagePool) -> InferenceWorkspace:
+def _ws(pool: BlockPool) -> InferenceWorkspace:
     """Workspace sized to the pool (bind_tasks requires it)."""
     return InferenceWorkspace(
         pool.max_batch_size,
@@ -27,16 +28,8 @@ def _ws(pool: PagePool) -> InferenceWorkspace:
     )
 
 
-def _make_task_cache(pool: PagePool) -> TaskCacheManager:
-    return TaskCacheManager(pool)
-
-
-# ---- page_hash ----
-
-
-def test_page_hash_different_page_differs():
-    token_ids = list(range(256))
-    assert page_hash(token_ids, 0, 64) != page_hash(token_ids, 1, 64)
+def _make_task_cache(pool: BlockPool) -> KVCacheManager:
+    return KVCacheManager(pool)
 
 
 # ---- Allocator ----
@@ -156,7 +149,7 @@ def test_prefix_cache_does_not_record_partial_page():
 def test_page_pool_task_cacheable_ids_excludes_unmaterialized_tail():
     pool = _make_paged_pool_ps64()
     task_cache = _make_task_cache(pool)
-    assert task_cache.task_cacheable_ids("missing", [1, 2], [3, 4]) == [1, 2, 3]
+    assert task_cache.request_cacheable_ids("missing", [1, 2], [3, 4]) == [1, 2, 3]
 
 
 # ---- ReqToTokenPool ----
@@ -202,7 +195,7 @@ def test_kv_storage_buffer_shape():
     assert storage.v_buffer.shape == (3, 32, 8, 16)
 
 
-# ---- PagePool (contiguous mode) ----
+# ---- BlockPool (contiguous mode) ----
 
 
 def _make_contiguous_pool(**kwargs):
@@ -216,39 +209,39 @@ def _make_contiguous_pool(**kwargs):
         dtype=torch.float32,
     )
     defaults.update(kwargs)
-    return PagePool(**defaults)
+    return BlockPool(**defaults)
 
 
 def test_page_pool_contiguous_task_alloc_free():
     pool = _make_contiguous_pool()
     task_cache = _make_task_cache(pool)
-    assert task_cache.task_alloc("t1", [1, 2, 3])
+    assert task_cache.alloc_slots("t1", [1, 2, 3])
     assert "t1" in task_cache._states
-    task_cache.task_free("t1")
+    task_cache.free_slots("t1")
     assert "t1" not in task_cache._states
 
 
 def test_page_pool_contiguous_task_extend():
     pool = _make_contiguous_pool()
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", [1, 2, 3])
-    assert task_cache.task_extend("t1", 3)
-    assert task_cache.task_extend("t1", 63)
-    assert not task_cache.task_extend("t1", 64)
+    task_cache.alloc_slots("t1", [1, 2, 3])
+    assert task_cache.extend_slots("t1", 3)
+    assert task_cache.extend_slots("t1", 63)
+    assert not task_cache.extend_slots("t1", 64)
 
 
 def test_page_pool_contiguous_task_cached():
     pool = _make_contiguous_pool()
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", [1, 2, 3])
-    assert task_cache.task_cached("t1") == 0
+    task_cache.alloc_slots("t1", [1, 2, 3])
+    assert task_cache.cached_tokens("t1") == 0
 
 
 def test_page_pool_contiguous_bind_tasks_prefill():
     pool = _make_contiguous_pool()
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", list(range(10)))
-    task_cache.task_alloc("t2", list(range(10)))
+    task_cache.alloc_slots("t1", list(range(10)))
+    task_cache.alloc_slots("t2", list(range(10)))
     kv = task_cache.bind(["t1", "t2"], _ws(pool), start_pos=0)
     assert kv.out_cache_loc.shape == (20,)
     assert kv.out_cache_loc.dtype == torch.int32
@@ -270,11 +263,11 @@ def test_page_pool_bind_tasks_builds_compact_q_tile_mapping():
 def test_page_pool_contiguous_bind_tasks_decode():
     pool = _make_contiguous_pool()
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", list(range(10)))
-    task_cache.task_alloc("t2", list(range(8)))
+    task_cache.alloc_slots("t1", list(range(10)))
+    task_cache.alloc_slots("t2", list(range(8)))
     # Simulate one decode extension so seq_lens advance to 11 and 9.
-    assert task_cache.task_extend("t1", 10)
-    assert task_cache.task_extend("t2", 8)
+    assert task_cache.extend_slots("t1", 10)
+    assert task_cache.extend_slots("t2", 8)
     kv = task_cache.bind(["t1", "t2"], _ws(pool))
     assert kv.out_cache_loc.shape == (2,)
     assert kv.seq_lens.tolist() == [11, 9]
@@ -284,7 +277,7 @@ def test_page_pool_contiguous_bind_roundtrip():
     """Write KV via bind_tasks, then gather via req_to_token indexing."""
     pool = _make_contiguous_pool(n_layers=1, n_kv_heads=2, head_dim=4)
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", list(range(4)))
+    task_cache.alloc_slots("t1", list(range(4)))
 
     kv = task_cache.bind(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
@@ -299,7 +292,7 @@ def test_page_pool_contiguous_bind_roundtrip():
     assert torch.allclose(gathered_v, v)
 
 
-# ---- PagePool (paged mode, page_size=1) ----
+# ---- BlockPool (paged mode, page_size=1) ----
 
 
 def _make_paged_pool(**kwargs):
@@ -315,13 +308,13 @@ def _make_paged_pool(**kwargs):
         n_tokens=128,
     )
     defaults.update(kwargs)
-    return PagePool(**defaults)
+    return BlockPool(**defaults)
 
 
 def test_page_pool_paged_task_alloc():
     pool = _make_paged_pool()
     task_cache = _make_task_cache(pool)
-    assert task_cache.task_alloc("t1", list(range(10)))
+    assert task_cache.alloc_slots("t1", list(range(10)))
     state = task_cache._states["t1"]
     assert len(state.pages) == 10
     assert pool.req_pool.req_to_token[state.req_idx, 0].item() == state.pages[0]
@@ -330,8 +323,8 @@ def test_page_pool_paged_task_alloc():
 def test_page_pool_paged_task_extend():
     pool = _make_paged_pool()
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", list(range(4)))
-    assert task_cache.task_extend("t1", 4)
+    task_cache.alloc_slots("t1", list(range(4)))
+    assert task_cache.extend_slots("t1", 4)
     req_idx = task_cache._states["t1"].req_idx
     slot = pool.req_pool.req_to_token[req_idx, 4].item()
     assert slot >= 0
@@ -340,8 +333,8 @@ def test_page_pool_paged_task_extend():
 def test_page_pool_paged_task_free_releases_slots():
     pool = _make_paged_pool(n_tokens=16)
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", list(range(8)))
-    task_cache.task_free("t1")
+    task_cache.alloc_slots("t1", list(range(8)))
+    task_cache.free_slots("t1")
     assert "t1" not in task_cache._states
     assert len(pool.req_pool.free_slots) == 4
 
@@ -349,7 +342,7 @@ def test_page_pool_paged_task_free_releases_slots():
 def test_page_pool_paged_bind_roundtrip():
     pool = _make_paged_pool(n_layers=1, n_kv_heads=2, head_dim=4)
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", list(range(4)))
+    task_cache.alloc_slots("t1", list(range(4)))
 
     kv = task_cache.bind(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
@@ -362,7 +355,7 @@ def test_page_pool_paged_bind_roundtrip():
     assert torch.allclose(gathered_k, k)
 
 
-# ---- PagePool (paged mode, page_size>1) ----
+# ---- BlockPool (paged mode, page_size>1) ----
 
 
 def _make_paged_pool_ps64(**kwargs):
@@ -378,15 +371,15 @@ def _make_paged_pool_ps64(**kwargs):
         n_tokens=512,
     )
     defaults.update(kwargs)
-    return PagePool(**defaults)
+    return BlockPool(**defaults)
 
 
 def test_page_pool_paged_ps64_task_alloc():
     pool = _make_paged_pool_ps64()
     task_cache = _make_task_cache(pool)
     prompt = list(range(200))
-    assert task_cache.task_alloc("t1", prompt)
-    assert task_cache.task_cached("t1") == 0
+    assert task_cache.alloc_slots("t1", prompt)
+    assert task_cache.cached_tokens("t1") == 0
     n_pages = (200 + 63) // 64
     assert len(task_cache._states["t1"].pages) == n_pages
 
@@ -394,8 +387,8 @@ def test_page_pool_paged_ps64_task_alloc():
 def test_page_pool_paged_ps64_task_extend_crosses_page():
     pool = _make_paged_pool_ps64()
     task_cache = _make_task_cache(pool)
-    task_cache.task_alloc("t1", list(range(64)))
-    assert task_cache.task_extend("t1", 64)
+    task_cache.alloc_slots("t1", list(range(64)))
+    assert task_cache.extend_slots("t1", 64)
     assert len(task_cache._states["t1"].pages) >= 2
 
 
@@ -404,11 +397,11 @@ def test_page_pool_prefix_hit_populates_request_mapping():
     task_cache = _make_task_cache(pool)
     prompt = [11, 12, 13, 14]
 
-    assert task_cache.task_alloc("first", prompt)
-    task_cache.task_record_hashes("first", prompt)
-    task_cache.task_free("first")
+    assert task_cache.alloc_slots("first", prompt)
+    task_cache.record_block_hashes("first", prompt)
+    task_cache.free_slots("first")
 
-    assert task_cache.task_alloc("second", prompt)
+    assert task_cache.alloc_slots("second", prompt)
     second_state = task_cache._states["second"]
     expected = [
         page * pool.page_size + offset
@@ -428,26 +421,26 @@ def test_task_cache_invalidation_drops_cross_version_prefix_hits():
     task_cache = _make_task_cache(pool)
     prompt = [11, 12, 13, 14]
 
-    assert task_cache.task_alloc("first", prompt)
-    task_cache.task_record_hashes("first", prompt)
-    task_cache.task_free("first")
-    assert task_cache.task_alloc("cached", prompt)
-    assert task_cache.task_cached("cached") == len(prompt)
+    assert task_cache.alloc_slots("first", prompt)
+    task_cache.record_block_hashes("first", prompt)
+    task_cache.free_slots("first")
+    assert task_cache.alloc_slots("cached", prompt)
+    assert task_cache.cached_tokens("cached") == len(prompt)
 
-    with pytest.raises(RuntimeError, match="while tasks are active"):
+    with pytest.raises(RuntimeError, match="while requests are active"):
         task_cache.invalidate_cache()
 
-    task_cache.task_free("cached")
+    task_cache.free_slots("cached")
     assert task_cache.invalidate_cache() == 2
-    assert task_cache.task_alloc("after_update", prompt)
-    assert task_cache.task_cached("after_update") == 0
+    assert task_cache.alloc_slots("after_update", prompt)
+    assert task_cache.cached_tokens("after_update") == 0
 
 
 def test_page_pool_paged_ps64_bind_roundtrip():
     pool = _make_paged_pool_ps64(n_layers=1, n_kv_heads=2, head_dim=4)
     task_cache = _make_task_cache(pool)
     prompt = list(range(128))
-    task_cache.task_alloc("t1", prompt)
+    task_cache.alloc_slots("t1", prompt)
 
     kv = task_cache.bind(["t1"], _ws(pool), start_pos=0)
     k = torch.randn(1, 128, 2, 4)
@@ -458,3 +451,164 @@ def test_page_pool_paged_ps64_bind_roundtrip():
     indices = kv.req_to_token[kv.req_pool_indices, :128]
     gathered_k = kv.k_buffer[0, indices]
     assert torch.allclose(gathered_k, k)
+
+
+def test_page_pool_paged_steady_decode_slots_reach_device():
+    """The extend fast path stages slot ids on the host; every bind (the
+    steady incremental decode path included) gathers req_to_token rows
+    on-device, so the staged tails must land there before the gather."""
+    pool = _make_paged_pool(n_tokens=64, max_seq_len=16)
+    task_cache = _make_task_cache(pool)
+    ws = _ws(pool)
+    prompt = list(range(4))
+    assert task_cache.alloc_slots("t1", prompt)
+
+    # Prefill bind flushes the whole staged prefix.
+    task_cache.bind(["t1"], ws, start_pos=0)
+    state = task_cache._states["t1"]
+
+    # Decode steps: extend stages one slot per token, bind (incremental or
+    # not) must push it to the device row.
+    for pos in range(4, 10):
+        assert task_cache.extend_slots("t1", pos)
+        task_cache.bind(["t1"], ws)
+        device_row = pool.req_pool.req_to_token[state.req_idx, : pos + 1].tolist()
+        expected = [p * pool.page_size for p in state.pages[: pos + 1]]
+        assert device_row == expected
+
+
+def test_allocator_alloc_many_matches_free_set_exactly():
+    """Bulk allocation must yield exactly the pages the free set held.
+
+    The word-window harvest once re-issued already-harvested pages (stale
+    mask read across windows) and once left cleared pages marked free
+    (mixed absolute/shifted bit coordinates); this randomized
+    reference-model check pins the mask == free-set invariant.
+    """
+    rng = random.Random(7)
+    alloc = Allocator(300)
+    free = set(range(300))
+    held = []
+    for _ in range(400):
+        if free and rng.random() < 0.55:
+            n = rng.randint(1, 25)
+            got = alloc.alloc_many(n)
+            if got is None:
+                assert len(free) < n
+                continue
+            assert len(got) == n
+            assert len(set(got)) == n
+            for p in got:
+                assert p in free
+                free.remove(p)
+            held.append(got)
+        elif held:
+            g = held.pop(rng.randrange(len(held)))
+            alloc.free_many(g)
+            free.update(g)
+        mask = alloc._free_mask
+        for p in range(300):
+            assert bool(mask >> p & 1) == (p in free)
+
+
+def test_allocator_alloc_many_fragmentation_roundtrip():
+    alloc = Allocator(10000)
+    first = alloc.alloc_many(100)
+    alloc.free_many(first[0::2])
+    assert alloc.alloc_many(50) == sorted(first[0::2])
+
+
+def test_extend_batch_matches_per_task_extend():
+    """Batched decode-step extension is observably identical to per-request.
+
+    Steady decode extends every request by exactly one position; the batch
+    must produce the same pages, the same slot staging and the same
+    length bookkeeping as the historical per-request loop, including the
+    page ORDER (both harvest lowest-first).
+    """
+
+    def make_pool():
+        return BlockPool(
+            n_layers=2,
+            n_kv_heads=1,
+            head_dim=4,
+            max_batch_size=8,
+            max_seq_len=64,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            page_size=1,
+            n_tokens=8 * 64,
+        )
+
+    pool_a, pool_b = make_pool(), make_pool()
+    mgr_a = _make_task_cache(pool_a)
+    mgr_b = _make_task_cache(pool_b)
+    ws = _ws(pool_a)
+
+    ids = [f"t{i}" for i in range(4)]
+    for tid in ids:
+        assert mgr_a.alloc_slots(tid, [10, 20, 30])
+        assert mgr_b.alloc_slots(tid, [10, 20, 30])
+
+    # Per-request reference: four extends at position 3.
+    for tid in ids:
+        assert mgr_a.extend_slots(tid, 3)
+    # Batched: same positions through one strategy call.
+    assert mgr_b.extend_slots_batch(list(ids), [3] * 4) == [True] * 4
+
+    for tid in ids:
+        sa = mgr_a._states[tid]
+        sb = mgr_b._states[tid]
+        assert sa.pages == sb.pages
+        assert sa._slots == sb._slots
+        assert sa.length == sb.length == 4
+
+    # Next positions stay in lockstep, and bind flushes both equally.
+    assert mgr_b.extend_slots_batch(list(ids), [4] * 4) == [True] * 4
+    for tid in ids:
+        assert mgr_a.extend_slots(tid, 4)
+    mgr_a.bind(ids, ws)
+    mgr_b.bind(ids, _ws(pool_b))
+    for tid in ids:
+        sa = mgr_a._states[tid]
+        sb = mgr_b._states[tid]
+        assert sa._slots == sb._slots
+        assert sa.length == sb.length == 5
+
+    # A missing request fails alone; the rest still extend.
+    assert mgr_b.extend_slots_batch(["ghost"] + ids[1:], [5] * 4) == [
+        False,
+        True,
+        True,
+        True,
+    ]
+
+
+def test_extend_batch_falls_back_when_pool_runs_dry():
+    """Pool exhaustion keeps per-request success ORDER via the fallback.
+
+    The batch harvest cannot satisfy every state when the pool is
+    nearly empty; the strategy then re-runs per-request extend so failure
+    lands on the same requests the historical loop would have failed.
+    """
+    # 6 pages total: 4 consumed by prompts, 2 free.
+    pool = BlockPool(
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=4,
+        max_batch_size=4,
+        max_seq_len=8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        page_size=1,
+        n_tokens=6,
+    )
+    mgr = _make_task_cache(pool)
+    ids = [f"dry{i}" for i in range(4)]
+    for tid in ids:
+        # One page each leaves 2 free for decode extension.
+        assert mgr.alloc_slots(tid, [7])
+    results = mgr.extend_slots_batch(list(ids), [1] * 4)
+    assert results == [True, True, False, False]
+    for tid, ok in zip(ids, results):
+        assert (mgr._states[tid].length == 2) == ok

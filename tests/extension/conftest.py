@@ -42,13 +42,13 @@ def _reset_dispatch_state():
 
     dispatch._selection = None
     dispatch.invalidate()
-    from astrai.extension import ops
+    from astrai.extension import kernel
     from astrai.extension.loader import is_available
 
     if is_available("gemm"):
-        ops.gemm.set_table("")
-        ops.gemm.set_planner("")  # back to the shipped default
+        kernel.gemm.set_table("")
+        kernel.gemm.set_planner("")  # back to the shipped default
         # staging too: the planner prices per staging variant (gemm.cuh
         # cost_of branches on q.tma), so a test leaving tma disabled would
         # silently move every later probe to the cp.async cost form
-        ops.gemm.set_staging(tma=True, mx=True)
+        kernel.gemm.set_staging(tma=True, mx=True)

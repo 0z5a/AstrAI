@@ -5,7 +5,7 @@ it renders prompts, expands groups, pads and decodes.  Where the
 prefill/decode loop executes, on which model object and device, is a
 backend concern:
 
-- :class:`ColocatedBackend` wraps an :class:`InferenceScheduler` that
+- :class:`ColocatedBackend` wraps an :class:`Scheduler` that
   shares the *training* model object in-process (the historical rollout
   path; weight updates are free because there is only one model).
 - :class:`ReplicaBackend` owns a frozen copy of the policy on its own
@@ -25,7 +25,7 @@ from typing import Callable, List, Optional, Protocol, TypeVar
 import torch
 from torch import nn
 
-from astrai.inference.scheduler import InferenceScheduler
+from astrai.inference.core.scheduler import Scheduler
 from astrai.parallel.executor import strip_compile_prefix
 
 T = TypeVar("T")
@@ -35,7 +35,7 @@ def _device_context(device):
     """Pin CUDA work to ``device``; a no-op on CPU.
 
     CUDA graph capture/replay binds to the calling thread's current
-    device (``CudaGraphContext`` uses a bare ``torch.cuda.CUDAGraph()``),
+    device (``CUDAGraphRunner`` uses a bare ``torch.cuda.CUDAGraph()``),
     so a scheduler living on a non-current device must be constructed
     and driven under ``torch.cuda.device``.
     """
@@ -80,7 +80,7 @@ class ColocatedBackend:
     eval mode and restores its prior mode afterwards.
     """
 
-    def __init__(self, scheduler: InferenceScheduler):
+    def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
 
     @property
@@ -92,7 +92,7 @@ class ColocatedBackend:
         return self.scheduler.policy_version
 
     def generate(self, prompt_ids_list: List[List[int]], **kwargs):
-        model = self.scheduler._executor.model
+        model = self.scheduler.model
         was_training = model.training
         model.eval()
         try:
@@ -133,7 +133,7 @@ class ReplicaBackend:
     ):
         model.eval()
         with _device_context(device):
-            self.scheduler = InferenceScheduler(
+            self.scheduler = Scheduler(
                 model=model,
                 tokenizer=tokenizer,
                 max_batch_size=max_batch_size,

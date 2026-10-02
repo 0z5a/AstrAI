@@ -35,7 +35,7 @@ import click
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from astrai.extension.ops.gemm import probe, quant_gemm, set_planner  # noqa: E402
+from astrai.extension.kernel.gemm import probe, quant_gemm, set_planner  # noqa: E402
 
 FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0

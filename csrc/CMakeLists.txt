@@ -103,7 +103,7 @@ set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
     CACHE STRING "CUDA architectures (derived from ASTRAI_CUDA_ARCH)" FORCE)
 
 # Kernel registry — one module per entry: name (.so / pybind name, globally
-# unique across families), then its source paths under kernels/ (whitespace-
+# unique across families), then its source paths under csrc/ (whitespace-
 # separated, so a long list may wrap across lines with indentation: a module
 # may span several TUs; gemm is split into per-dtype-pair instantiation units
 # (one explicit gemm_dispatch instantiation each), so the heavy template work
@@ -117,17 +117,22 @@ set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
 # that cannot compile. The remaining kernels are still useful on sm_80+
 # (including sm_86).
 set(KERNEL_MODULES
-    "attn_decode|attention/decode.cu"
-    "attn_prefill|attention/prefill.cu"
-    "attn_paged_decode|attention/paged_decode.cu"
-    "attn_paged_prefill|attention/paged_prefill.cu"
+    "attention|attention/decode.cu
+         attention/prefill.cu
+         attention/paged_decode.cu
+         attention/paged_prefill.cu
+         attention/bindings.cu"
     "rotary_emb|rotary_emb.cu"
+    "gated_deltanet|gated_deltanet/gated_deltanet_fwd.cu
+         gated_deltanet/gated_deltanet_bwd.cu
+         gated_deltanet/bindings.cu"
 )
 
 if(ASTRAI_CUDA_ARCH_LIST)
     if(ASTRAI_CUDA_ARCH_MAX GREATER_EQUAL 89)
         list(APPEND KERNEL_MODULES
-            "quantize|quantize/quantize.cu"
+            "quantize|quantize/bindings.cu
+                  quantize/entry.cu"
             "gemm|gemm/gemm.cu
                   gemm/bindings.cu
                   gemm/fp8_linear.cu
@@ -135,7 +140,8 @@ if(ASTRAI_CUDA_ARCH_LIST)
                   gemm/gemm_bf16_int8.cu
                   gemm/gemm_int8_int8.cu
                   gemm/gemm_fp8_e4m3_fp8_e4m3.cu
-                  gemm/gemm_fp8_e5m2_fp8_e5m2.cu")
+                  gemm/gemm_fp8_e5m2_fp8_e5m2.cu
+                  quantize/entry.cu")
     else()
         message(WARNING
             "FP8 operator disabled: max ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "
@@ -155,17 +161,14 @@ foreach(entry IN LISTS KERNEL_MODULES)
     list(REMOVE_AT _parts 0)
     # Whitespace, not just spaces: the source list may wrap across lines.
     separate_arguments(_srcs NATIVE_COMMAND "${_parts}")
-    list(TRANSFORM _srcs PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/kernels/")
+    list(TRANSFORM _srcs PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
     add_library(${name} MODULE ${_srcs})
 
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
 
-    # Per-family arch lists: the fp8 mma cells static_assert below sm_89
-    # (MmaOp's kMinArch = 890), so the fp8 modules compile only the 89+
-    # subset of the requested arches — a compute_80 device pass would trip
-    # the assert at template instantiation. Every other family carries the
-    # full list (its oldest cell is sm_80). The 120a image below keys on
-    # the shared list, so it rides along whenever 120 is requested.
+    # GEMM/quantize instantiate FP8 MMA cells (kMinArch=sm_89), so filter
+    # their arch lists to requested 8.9+ targets. Other kernels support
+    # sm_80+ and keep the full list, including any requested 120a image.
     set(_target_arches "${ASTRAI_CUDA_ARCH_LIST}")
     if(name STREQUAL "gemm" OR name STREQUAL "quantize")
         set(_target_arches "")
@@ -180,7 +183,7 @@ foreach(entry IN LISTS KERNEL_MODULES)
         CUDA_ARCHITECTURES "${_target_arches}")
 
     target_include_directories(${name} PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/kernels"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
         "${TORCH_HOME}/include"
         "${TORCH_HOME}/include/torch/csrc/api/include"
         "${PYTHON_INCLUDE_DIR}")
@@ -211,3 +214,12 @@ foreach(entry IN LISTS KERNEL_MODULES)
             "rate on sm_120")
     endif()
 endforeach()
+
+# No IDE-indexing target here, deliberately: every device header under
+# include/ is already included by a real TU (kernel/gemm.cuh,
+# kernel/attention_launch.cuh, policy.cuh, quantize/entry.cu, ...), so any
+# language server that reads this build's compile commands already resolves
+# the whole stage tree. The DeepGEMM pattern (csrc/indexing/main.cu) exists
+# for a JIT library whose device code no CMake target instantiates; copied
+# here it would only add a decorative target. Don't re-add it without a
+# device header that no TU includes.

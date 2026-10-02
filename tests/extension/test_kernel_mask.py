@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from astrai.extension.ops.attention import attn_prefill
+from astrai.extension.kernel.attention import attn_prefill
 from tests.conftest import skip_no_kernel
 from tests.extension.conftest import D
 

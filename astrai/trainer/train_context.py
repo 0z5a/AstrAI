@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, random_split
 from astrai.config.model_config import ConfigFactory
 from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
-from astrai.inference.scheduler import InferenceScheduler
+from astrai.inference.core.scheduler import Scheduler
 from astrai.model.components.lora import inject_lora
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction
 from astrai.parallel.executor import (
@@ -39,7 +39,12 @@ from astrai.trainer.backend import (
     ReplicaBackend,
 )
 from astrai.trainer.metric_util import GradSNRTracker
-from astrai.trainer.optional_extras import restore_checkpoint_extras
+from astrai.trainer.optional_extras import (
+    component_extra_keys,
+    load_component_extra,
+    require_component_extras,
+    restore_checkpoint_extras,
+)
 from astrai.trainer.rollout import (
     RolloutEvaluator,
     RolloutGenerator,
@@ -413,6 +418,9 @@ class TrainContextBuilder:
             cp_state = CPState(self._topology)
         kwargs = dict(cfg.strategy_kwargs)
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
+        kwargs.setdefault("rl_update_epochs", cfg.rl_update_epochs)
+        kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)
+        kwargs.setdefault("gradient_chunked_logprobs", cfg.gradient_chunked_logprobs)
         if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"):
             kwargs["ref_model"] = create_ref_model(
                 cfg.model_fn,
@@ -446,7 +454,29 @@ class TrainContextBuilder:
             # implements the token-mean two-phase protocol; CPStrategy owns
             # the shard entry and the loss rescale.
             context.strategy = CPStrategy(context.strategy, cp_state)
+        self._restore_reference_model(context)
         return kwargs
+
+    def _restore_reference_model(self, context: TrainContext) -> None:
+        """Pin the resumed strategy's KL anchor to the checkpoint's reference.
+
+        ``create_ref_model`` always rebuilds the reference from the
+        *restored* actor, so without the persisted copy a resume would
+        silently move the DPO/GRPO KL target — a different optimization
+        objective after the restart.  Fresh runs keep the actor-derived
+        reference (that *is* the intended anchor); warm starts via
+        ``param_path`` without ``resume=True`` likewise.  The key and the
+        missing-entry policy (fatal unless ``allow_reference_reanchor``) are
+        declared in ``optional_extras.COMPONENT_EXTRAS``.
+        """
+        ref_model = getattr(context.strategy, "ref_model", None)
+        if ref_model is None:
+            return
+        if not self._resume or context.checkpoint is None:
+            return
+        load_component_extra(
+            context.checkpoint.extra, "reference_model", ref_model, self.config
+        )
 
     def _validate_tp(self) -> None:
         """Guard the tensor-parallel support surface at build time."""
@@ -498,24 +528,23 @@ class TrainContextBuilder:
 
         The critic backbone warm-starts from the policy weights (standard
         actor-critic initialization; the fresh value head is the only
-        randomly-initialized part).  On resume, ``value_model`` /
+        randomly-initialized part).  On resume, the ``value_model`` /
         ``value_optimizer`` checkpoint extras override the warm start —
-        and their absence is fatal rather than a silent fresh critic.
+        and their absence is fatal rather than a silent fresh critic.  Both
+        keys, and that fatal policy, are declared in
+        ``optional_extras.COMPONENT_EXTRAS``.
         """
         cfg = self.config
         device = get_current_device()
         checkpoint = context.checkpoint
+        critic_keys = component_extra_keys("critic", "critic_optimizer")
         if checkpoint is not None:
-            missing = [
-                name
-                for name in ("value_model", "value_optimizer")
-                if name not in checkpoint.extra
-            ]
-            if missing:
-                raise ValueError(
-                    "online_ppo resume requires critic state in the "
-                    f"checkpoint; missing extras: {', '.join(missing)}"
-                )
+            require_component_extras(
+                checkpoint.extra,
+                critic_keys,
+                strategy=cfg.strategy,
+                requirement="critic state",
+            )
 
         state_dict = executor.unwrap_model(context.model)
         if executor.use_distributed:
@@ -538,14 +567,16 @@ class TrainContextBuilder:
                     f"{unexpected_missing[:3]}"
                 )
         if checkpoint is not None:
-            critic.load_state_dict(checkpoint.extra["value_model"])
+            load_component_extra(checkpoint.extra, "value_model", critic, cfg)
         critic = critic.to(device)
         critic.train()
 
         optimizer_factory = cfg.critic_optimizer_fn or cfg.optimizer_fn
         critic_optimizer = optimizer_factory(critic)
         if checkpoint is not None:
-            critic_optimizer.load_state_dict(checkpoint.extra["value_optimizer"])
+            load_component_extra(
+                checkpoint.extra, "value_optimizer", critic_optimizer, cfg
+            )
         return critic, critic_optimizer
 
     def _configure_rollout(self, context: TrainContext, strategy_kwargs: dict) -> None:
@@ -598,7 +629,7 @@ class TrainContextBuilder:
 
         def _colocated(max_batch_size: int) -> ColocatedBackend:
             return ColocatedBackend(
-                InferenceScheduler(
+                Scheduler(
                     model=inference_model,
                     tokenizer=tokenizer,
                     max_batch_size=max_batch_size,

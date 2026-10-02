@@ -25,13 +25,13 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from astrai.extension import is_available
-from astrai.extension.ops import (
+from astrai.extension.kernel import (
     attn_decode,
     attn_paged_decode,
     attn_paged_prefill,
     attn_prefill,
 )
-from astrai.inference.workspace import MAX_SPLITS, Q_TILE_ROWS
+from astrai.inference.worker.workspace import MAX_SPLITS, Q_TILE_ROWS
 
 
 @dataclass(frozen=True)
@@ -564,10 +564,10 @@ def benchmark_command(
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA is required")
     kernel_for_suite = {
-        "decode": "attn_decode",
-        "prefill": "attn_prefill",
-        "paged_decode": "attn_paged_decode",
-        "paged_prefill": "attn_paged_prefill",
+        "decode": "attention",
+        "prefill": "attention",
+        "paged_decode": "attention",
+        "paged_prefill": "attention",
     }
     selected = (
         tuple(kernel_for_suite) if "all" in suites else tuple(dict.fromkeys(suites))

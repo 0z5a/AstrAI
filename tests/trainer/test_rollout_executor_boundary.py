@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 import astrai.parallel.executor as executor_module
 from astrai.config import TrainConfig
-from astrai.inference.scheduler import InferenceScheduler
+from astrai.inference.core.scheduler import Scheduler
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.parallel import get_rank, spawn_parallel_fn
 from astrai.parallel.executor import DDPExecutor, FSDPExecutor, NoneExecutor
@@ -136,7 +136,7 @@ def test_train_context_passes_ddp_inference_view_to_rollout(tmp_path, monkeypatc
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(train_context, "InferenceScheduler", _Scheduler)
+    monkeypatch.setattr(train_context, "Scheduler", _Scheduler)
     monkeypatch.setattr(
         train_context.AutoTokenizer,
         "from_pretrained",
@@ -234,7 +234,7 @@ def test_l20_ddp_inference_view_matches_greedy_generation(tmp_path):
         inference_model = DDPExecutor().model_for_inference(wrapped)
         tokenizer = FakeTokenizer()
 
-        baseline = InferenceScheduler(
+        baseline = Scheduler(
             model=model,
             tokenizer=tokenizer,
             max_batch_size=2,
@@ -242,7 +242,7 @@ def test_l20_ddp_inference_view_matches_greedy_generation(tmp_path):
             enable_cuda_graph=False,
             backend="torch_native",
         )
-        ddp_view = InferenceScheduler(
+        ddp_view = Scheduler(
             model=inference_model,
             tokenizer=tokenizer,
             max_batch_size=2,
@@ -284,7 +284,7 @@ def _multi_rank_rollout_then_train_worker():
     # forwards on each rank. This is the deadlock pattern that is unsafe when
     # the DDP wrapper itself is passed to the scheduler.
     inference_model.eval()
-    scheduler = InferenceScheduler(
+    scheduler = Scheduler(
         model=inference_model,
         tokenizer=FakeTokenizer(),
         max_batch_size=1,

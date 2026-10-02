@@ -184,7 +184,7 @@ Three-layer separation (SGLang-inspired):
 - **ReqToTokenPool**: Index table `[req_idx, pos] → physical token slot`, shared across all layers.
 - **Allocator + RadixCache**: Paged-mode allocation with ref-counting, LRU eviction, and exact page-aligned prefix sharing when `page_size > 1`.
 
-`PagePool` orchestrates all three. In contiguous mode (default), `req_to_token` is a trivial linear mapping. In paged mode, slots are allocated on demand. `RadixCache` walks exact token-page edges from the root, preserving parent-prefix context instead of treating a page hash as a globally unique key. Only complete pages whose KV entries have been materialized are shared; partial pages remain request-private and are released at completion. The final sampled token is excluded because it has not yet been decoded into KV.
+`BlockPool` orchestrates all three (the per-request accounting facade is `KVCacheManager`); In contiguous mode (default), `req_to_token` is a trivial linear mapping. In paged mode, slots are allocated on demand. `RadixCache` walks exact token-page edges from the root, preserving parent-prefix context instead of treating a page hash as a globally unique key. Only complete pages whose KV entries have been materialized are shared; partial pages remain request-private and are released at completion. The final sampled token is excluded because it has not yet been decoded into KV.
 
 `bind_tasks()` returns a `KVCache` dataclass with `kv_indptr`, a prefix-sum index over sequence lengths computed once per step and shared across layers. Attention layers access buffers directly — no methods, no abstraction.
 
@@ -193,7 +193,7 @@ Three-layer separation (SGLang-inspired):
 The extension package separates mechanism from policy:
 
 - `astrai/extension/loader.py` discovers and lazily loads the compiled kernel modules (`.so` name = module name = pybind name).
-- `astrai/extension/ops/` contains stateless adapters — one file per compiled kernel module — that call their kernel directly and fail when it is unavailable.
+- `astrai/extension/kernel/` contains stateless adapters — one file per compiled kernel module — that call their kernel directly and fail when it is unavailable.
 - `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O (`dispatch.py` is the family-agnostic selection core it registers into).
 - `astrai/extension/quantize.py` holds every quantization scheme (int8 strategies, fp8 recipes and autocast); its `aten::linear` override installs lazily on the first fp8 activation, so plain imports stay dispatcher-neutral.
 - Model and inference code use the stable `astrai.extension` API instead of selecting ops directly.
@@ -219,7 +219,7 @@ with attn_backend(ATTN_BACKEND.CUDA):
 
 Layout convention: all q/k/v are `[batch, seq_len, n_heads, head_dim]` (blhd). Scale is always `1/sqrt(head_dim)`.
 
-Direct imports from `astrai.extension.ops` are reserved for low-level kernel tests and code that intentionally requires a specific compiled implementation. They do not provide fallback.
+Direct imports from `astrai.extension.kernel` are reserved for low-level kernel tests and code that intentionally requires a specific compiled implementation. They do not provide fallback.
 
 ## Mask Algorithm Internals
 
@@ -266,7 +266,9 @@ The loss is divided by `grad_accum_steps` before `backward()`, so gradients sum 
 
 ### Effective batch size
 
-$$ \text{Effective batch} = \text{dp\_size} \times \text{batch\_per\_device} \times \text{grad\_accum\_steps} $$
+```
+effective_batch = dp_size × batch_per_device × grad_accum_steps
+```
 
 ### Total optimizer steps
 

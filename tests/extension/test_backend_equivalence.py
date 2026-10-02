@@ -7,21 +7,21 @@ seq_lens with padding mask), and end-to-end scheduler.run_batch.
 import torch
 
 from astrai.extension import ATTN_BACKEND, attn_backend
-from astrai.extension.ops.attention import attn_paged_decode
-from astrai.inference.cache import PagePool, TaskCacheManager
-from astrai.inference.runtime.graph import CudaGraphContext
-from astrai.inference.scheduler import InferenceScheduler
-from astrai.inference.workspace import InferenceWorkspace
+from astrai.extension.kernel.attention import attn_paged_decode
+from astrai.inference.core.cache import BlockPool, KVCacheManager
+from astrai.inference.core.scheduler import Scheduler
+from astrai.inference.worker.graph import CUDAGraphRunner
+from astrai.inference.worker.workspace import InferenceWorkspace
 from tests.conftest import skip_no_kernel
 from tests.extension.conftest import D
 from tests.helpers import FakeTokenizer
 
 
-def _mk_task_cache(pool: PagePool) -> TaskCacheManager:
-    return TaskCacheManager(pool)
+def _mk_task_cache(pool: BlockPool) -> KVCacheManager:
+    return KVCacheManager(pool)
 
 
-def _ws(pool: PagePool) -> InferenceWorkspace:
+def _ws(pool: BlockPool) -> InferenceWorkspace:
     return InferenceWorkspace(
         pool.max_batch_size,
         pool.max_seq_len,
@@ -71,7 +71,7 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
     input_ids = torch.tensor(sum(prompt_ids, []), dtype=torch.long, device=device)
     position_ids = torch.cat([torch.arange(len(p), device=device) for p in prompt_ids])
 
-    cache = PagePool(
+    cache = BlockPool(
         n_layers=2,
         n_kv_heads=1,
         head_dim=D,
@@ -83,18 +83,18 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
 
     task_cache = _mk_task_cache(cache)
     ws = _ws(cache)
-    task_cache.task_alloc("t1", prompt_ids[0])
-    task_cache.task_alloc("t2", prompt_ids[1])
+    task_cache.alloc_slots("t1", prompt_ids[0])
+    task_cache.alloc_slots("t2", prompt_ids[1])
     kv1 = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
         out_torch = model(
             input_ids, kv_cache=kv1, position_ids=position_ids, fwd="prefill"
         )
 
-    task_cache.task_free("t1")
-    task_cache.task_free("t2")
-    task_cache.task_alloc("t1", prompt_ids[0])
-    task_cache.task_alloc("t2", prompt_ids[1])
+    task_cache.free_slots("t1")
+    task_cache.free_slots("t2")
+    task_cache.alloc_slots("t1", prompt_ids[0])
+    task_cache.alloc_slots("t2", prompt_ids[1])
     kv2 = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with attn_backend(ATTN_BACKEND.CUDA):
         with torch.inference_mode():
@@ -127,7 +127,7 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     device = "cuda"
 
     prompt_ids = [[1, 2, 3, 4, 5, 6, 7, 8], [10, 11, 12, 13, 14, 15]]
-    cache = PagePool(
+    cache = BlockPool(
         n_layers=2,
         n_kv_heads=1,
         head_dim=D,
@@ -143,8 +143,8 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
 
     task_cache = _mk_task_cache(cache)
     ws = _ws(cache)
-    task_cache.task_alloc("t1", prompt_ids[0])
-    task_cache.task_alloc("t2", prompt_ids[1])
+    task_cache.alloc_slots("t1", prompt_ids[0])
+    task_cache.alloc_slots("t2", prompt_ids[1])
     kv = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
         model(input_ids, kv_cache=kv, position_ids=position_ids, fwd="prefill")
@@ -153,8 +153,8 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     dec_ids = torch.tensor([99, 98], dtype=torch.long, device=device)
     dec_pos = torch.tensor([8, 6], dtype=torch.long, device=device)
 
-    task_cache.task_extend("t1", 8)
-    task_cache.task_extend("t2", 6)
+    task_cache.extend_slots("t1", 8)
+    task_cache.extend_slots("t2", 6)
     kv_t = task_cache.bind(["t1", "t2"], ws)
     with torch.inference_mode():
         out_torch = model(dec_ids, kv_cache=kv_t, position_ids=dec_pos, fwd="decode")
@@ -171,7 +171,7 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
 @skip_no_kernel
 def test_paged_decode_appends_new_kv_in_kernel():
     """Fused decode writes current-token K/V to each request's paged slot."""
-    pool = PagePool(
+    pool = BlockPool(
         n_layers=1,
         n_kv_heads=1,
         head_dim=D,
@@ -184,10 +184,10 @@ def test_paged_decode_appends_new_kv_in_kernel():
     )
     task_cache = _mk_task_cache(pool)
     ws = _ws(pool)
-    task_cache.task_alloc("t1", list(range(8)))
-    task_cache.task_alloc("t2", list(range(6)))
-    task_cache.task_extend("t1", 8)
-    task_cache.task_extend("t2", 6)
+    task_cache.alloc_slots("t1", list(range(8)))
+    task_cache.alloc_slots("t2", list(range(6)))
+    task_cache.extend_slots("t1", 8)
+    task_cache.extend_slots("t2", 6)
     kv_cache = task_cache.bind(["t1", "t2"], ws)
 
     q = torch.randn(2, 2, D, device="cuda", dtype=torch.bfloat16)
@@ -224,7 +224,7 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
     model, _ = cuda_model
     device = "cuda"
     prompt_ids = [1, 2, 3, 4, 5, 6, 7, 8]
-    cache = PagePool(
+    cache = BlockPool(
         n_layers=2,
         n_kv_heads=1,
         head_dim=D,
@@ -235,7 +235,7 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
     )
     task_cache = _mk_task_cache(cache)
     ws = _ws(cache)
-    task_cache.task_alloc("t1", prompt_ids)
+    task_cache.alloc_slots("t1", prompt_ids)
 
     input_ids = torch.tensor(prompt_ids, dtype=torch.long, device=device)
     position_ids = torch.arange(len(prompt_ids), device=device)
@@ -248,7 +248,7 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
             fwd="prefill",
         )
 
-        task_cache.task_extend("t1", len(prompt_ids))
+        task_cache.extend_slots("t1", len(prompt_ids))
         kv_cache = task_cache.bind(["t1"], ws)
         assert kv_cache.req_to_token.dtype == torch.int32
         assert kv_cache.req_pool_indices.dtype == torch.int32
@@ -260,7 +260,7 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
             "kv_cache": kv_cache,
             "fwd": "decode",
         }
-        graph = CudaGraphContext(enabled=True)
+        graph = CUDAGraphRunner(enabled=True)
         graph.forward(model, key=(1,), **decode_args)
         graph.forward(model, key=(1,), **decode_args)
         first = graph.forward(model, key=(1,), **decode_args)["logits"].clone()
@@ -285,7 +285,7 @@ def test_run_batch_cuda_matches_torch_greedy(cuda_model):
 
     prompts = [[1, 2, 3, 4, 5], [10, 11, 12, 13, 14, 15, 16]]
 
-    sched = InferenceScheduler(
+    sched = Scheduler(
         model=model,
         tokenizer=tokenizer,
         max_batch_size=4,
@@ -296,7 +296,7 @@ def test_run_batch_cuda_matches_torch_greedy(cuda_model):
     out_torch = sched.run_batch(prompts, max_tokens=5, temperature=0.0)
     sched.stop()
 
-    cache_cuda = PagePool(
+    cache_cuda = BlockPool(
         n_layers=2,
         n_kv_heads=1,
         head_dim=D,
@@ -305,7 +305,7 @@ def test_run_batch_cuda_matches_torch_greedy(cuda_model):
         device="cuda",
         dtype=torch.bfloat16,
     )
-    sched2 = InferenceScheduler(
+    sched2 = Scheduler(
         model=model,
         tokenizer=tokenizer,
         max_batch_size=4,

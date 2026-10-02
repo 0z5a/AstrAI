@@ -1,43 +1,60 @@
-"""Inference module for continuous batching.
+"""Inference module for continuous batching, in three layers.
 
-Subpackages:
-  - cache/:     KV cache (buffers, strategies, pool)
-  - runtime/:   Execution + sampling (executor, CUDA graph, sampling strategies)
-  - task/:      Request lifecycle + performance metrics
-  - network/:   HTTP protocol handling (server, protocol, OpenAI/Anthropic builders)
+Layering (mirrors vLLM v1's process topology, in-process):
 
-Modules:
-  - scheduler.py:  Continuous batching loop
-  - workspace.py:  Pre-allocated GPU buffers
-  - engine.py:     Facade (InferenceEngine)
+- ``frontend/``  user-facing: engine facade, input/output processors,
+                 output events, engine-core client seam   (vLLM: API proc)
+- ``core/``      engine core: scheduler, request lifecycle, stepper,
+                 KV cache accounting, policy versioning   (vLLM: EngineCore)
+- ``worker/``    model execution: model runner, pending steps, CUDA
+                 graphs, sampler, workspace                (vLLM: Worker)
+- ``network/``   HTTP protocol adapters (OpenAI/Anthropic) — part of the
+                 frontend deployment, kept as its own package.
+
+Dependency rule (one-way): frontend → core → worker → model/KV ABI.
 """
 
-from astrai.inference.engine import InferenceEngine, build_engine
-from astrai.inference.network import get_app, run_server
-from astrai.inference.runtime.executor import Executor
-from astrai.inference.runtime.sample import sample
-from astrai.inference.scheduler import InferenceScheduler
-from astrai.inference.task import (
+from astrai.inference.core.events import (
+    RequestError,
+    RequestFinished,
+    TokenDelta,
+)
+from astrai.inference.core.request import (
     STOP,
     BatchedStreamCallback,
     GenerationResult,
-    Task,
-    TaskManager,
-    TaskStatus,
+    Request,
+    RequestManager,
+    RequestStatus,
 )
+from astrai.inference.core.scheduler import Scheduler
+from astrai.inference.frontend.core_client import EngineCoreClient, InprocClient
+from astrai.inference.frontend.engine import InferenceEngine, build_engine
+from astrai.inference.frontend.input_processor import InputProcessor
+from astrai.inference.frontend.output_processor import OutputProcessor
+from astrai.inference.network import get_app, run_server
+from astrai.inference.worker.model_runner import GPUModelRunner
+from astrai.inference.worker.sample import sample
 
 __all__ = [
-    "InferenceEngine",
-    "build_engine",
-    "InferenceScheduler",
-    "BatchedStreamCallback",
-    "GenerationResult",
-    "Executor",
     "STOP",
-    "Task",
-    "TaskManager",
-    "TaskStatus",
-    "sample",
+    "BatchedStreamCallback",
+    "EngineCoreClient",
+    "GPUModelRunner",
+    "GenerationResult",
+    "InferenceEngine",
+    "InprocClient",
+    "InputProcessor",
+    "OutputProcessor",
+    "Request",
+    "RequestError",
+    "RequestFinished",
+    "RequestManager",
+    "RequestStatus",
+    "Scheduler",
+    "TokenDelta",
+    "build_engine",
     "get_app",
     "run_server",
+    "sample",
 ]

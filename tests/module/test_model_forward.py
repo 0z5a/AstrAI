@@ -69,15 +69,15 @@ def _make_sft_moe_fixture(device):
 
 
 def test_model_forward_contract_uses_dense_training_and_packed_inference():
-    from astrai.inference.cache import PagePool, TaskCacheManager
-    from astrai.inference.workspace import InferenceWorkspace
+    from astrai.inference.core.cache import BlockPool, KVCacheManager
+    from astrai.inference.worker.workspace import InferenceWorkspace
 
     config = AutoRegressiveLMConfig(**TINY_CONFIG)
     model = AutoRegressiveLM(config).eval()
     dense = model(torch.tensor([[1, 2, 3]]))
     assert dense["logits"].shape == (1, 3, config.vocab_size)
 
-    pool = PagePool(
+    pool = BlockPool(
         n_layers=config.num_hidden_layers,
         n_kv_heads=config.num_key_value_heads,
         head_dim=config.hidden_size // config.num_attention_heads,
@@ -86,7 +86,7 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
         device="cpu",
         dtype=torch.float32,
     )
-    cache = TaskCacheManager(pool)
+    cache = KVCacheManager(pool)
     workspace = InferenceWorkspace(
         1,
         config.max_position_embeddings,
@@ -95,7 +95,7 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
         torch.device("cpu"),
         torch.float32,
     )
-    assert cache.task_alloc("t", [1, 2, 3])
+    assert cache.alloc_slots("t", [1, 2, 3])
     packed = model(
         torch.tensor([1, 2, 3]),
         position_ids=torch.arange(3),
@@ -116,15 +116,15 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
 
 def test_forward_logits_positions_projects_only_requested_rows():
     """logits_positions gathers packed rows before the lm_head projection."""
-    from astrai.inference.cache import PagePool, TaskCacheManager
-    from astrai.inference.workspace import InferenceWorkspace
+    from astrai.inference.core.cache import BlockPool, KVCacheManager
+    from astrai.inference.worker.workspace import InferenceWorkspace
 
     config = AutoRegressiveLMConfig(**TINY_CONFIG)
     model = AutoRegressiveLM(config).eval()
     prompts = [[1, 2, 3], [4, 5]]
     last_rows = torch.tensor([len(prompts[0]) - 1, len(prompts) - 1 + len(prompts[1])])
 
-    pool = PagePool(
+    pool = BlockPool(
         n_layers=config.num_hidden_layers,
         n_kv_heads=config.num_key_value_heads,
         head_dim=config.hidden_size // config.num_attention_heads,
@@ -133,7 +133,7 @@ def test_forward_logits_positions_projects_only_requested_rows():
         device="cpu",
         dtype=torch.float32,
     )
-    cache = TaskCacheManager(pool)
+    cache = KVCacheManager(pool)
     workspace = InferenceWorkspace(
         2,
         config.max_position_embeddings,
@@ -143,7 +143,7 @@ def test_forward_logits_positions_projects_only_requested_rows():
         torch.float32,
     )
     for tid, ids in zip(("t1", "t2"), prompts):
-        assert cache.task_alloc(tid, ids)
+        assert cache.alloc_slots(tid, ids)
     input_ids = torch.tensor(sum(prompts, []), dtype=torch.long)
     position_ids = torch.cat([torch.arange(len(p)) for p in prompts])
     with torch.inference_mode():
