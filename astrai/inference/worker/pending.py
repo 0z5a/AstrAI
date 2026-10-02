@@ -54,13 +54,13 @@ class PendingExecution:
             raise RuntimeError("sampled rows do not match their execution identities")
         if logprobs is not None and len(logprobs) != len(tokens):
             raise RuntimeError("logprob rows do not match sampled rows")
-        if len(set(self.sampled_identities)) != len(self.sampled_identities):
-            raise RuntimeError("duplicate sampled execution identity")
         sampled = {
             identity: (token, logprobs[i] if logprobs is not None else None)
             for i, (identity, token) in enumerate(zip(self.sampled_identities, tokens))
         }
-        if not set(sampled).issubset(self.snapshot.identities):
+        if len(sampled) != len(self.sampled_identities):
+            raise RuntimeError("duplicate sampled execution identity")
+        if not sampled.keys() <= self.snapshot._identity_set:  # noqa: SLF001
             raise RuntimeError("sampled identity is not present in execution plan")
         self._payload = ModelRunnerOutput(
             self.snapshot.step_id,

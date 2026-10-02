@@ -8,10 +8,32 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional, Tuple
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class RequestIdentity:
+    """Stable per-incarnation request address.
+
+    ``eq=False`` opts out of the dataclass-generated field-by-field
+    comparison: identities are dict keys in every scheduler hot map
+    (``_planned`` / ``_pending_order`` / ``_ready``) and in the commit-side
+    duplicate check, so hashing and equality drop to tuple speed instead of
+    a generated ``__eq__`` call per lookup.
+    """
+
     request_id: str
     incarnation: str
+
+    def __hash__(self):
+        return hash((self.request_id, self.incarnation))
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if not isinstance(other, RequestIdentity):
+            return NotImplemented
+        return (self.request_id, self.incarnation) == (
+            other.request_id,
+            other.incarnation,
+        )
 
 
 @dataclass(frozen=True)
@@ -89,7 +111,21 @@ class SchedulerOutput:
 
     @property
     def identities(self) -> Tuple[RequestIdentity, ...]:
-        return tuple(r.identity for r in self.requests)
+        cached = self.__dict__.get("_identities_cache")
+        if cached is None:
+            cached = tuple(r.identity for r in self.requests)
+            object.__setattr__(self, "_identities_cache", cached)
+        return cached
+
+    @property
+    def _identity_set(self) -> frozenset:
+        # Commit-side membership checks use this instead of rebuilding a
+        # set from the tuple on every pending commit.
+        cached = self.__dict__.get("_identity_set_cache")
+        if cached is None:
+            cached = frozenset(self.identities)
+            object.__setattr__(self, "_identity_set_cache", cached)
+        return cached
 
     def select(self, requests) -> "SchedulerOutput":
         return SchedulerOutput(

@@ -378,14 +378,17 @@ class Scheduler:
     def update_from_output(self, output: ModelRunnerOutput):
         """Apply identity-addressed rows in per-request step order, exactly once."""
         identities = []
+        seen = set()
         for result in output.results:
-            key = (output.step_id, result.identity)
+            identity = result.identity
+            key = (output.step_id, identity)
             planned = self._planned.get(key)
             if planned is None or output.policy_version != planned[0]:
                 continue
             self._ready.setdefault(key, result)
-            if result.identity not in identities:
-                identities.append(result.identity)
+            if identity not in seen:
+                seen.add(identity)
+                identities.append(identity)
         events, produced = [], []
         for identity in identities:
             order = self._pending_order.get(identity)
