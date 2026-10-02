@@ -1,11 +1,13 @@
 #pragma once
-// Attention's torch-entry marshalling layer: micro-checks, split-partial
-// allocation and the three params packers, shared by the four attention
-// entry .cu files (gemm's equivalent lives in gemm.cu; quantize's in
-// quantize/entry.cu). Lives in the family's TU directory, not
-// include/launcher/: every includer is one of the four .cu files beside
-// it (quoted same-directory include, the gemm/fp8_state.h shape), and the
-// launcher directory keeps only declaration surfaces.
+/*
+ * Attention's torch-entry marshalling layer: micro-checks, split-partial
+ * allocation and the three params packers, shared by the four attention
+ * entry .cu files (gemm's equivalent lives in gemm.cu; quantize's in
+ * quantize/entry.cu). Lives in the family's TU directory, not
+ * include/launcher/: every includer is one of the four .cu files beside
+ * it (quoted same-directory include, the gemm/fp8_state.h shape), and the
+ * launcher directory keeps only declaration surfaces.
+ */
 #include <float.h>
 
 #include <c10/cuda/CUDAGuard.h>
@@ -21,12 +23,14 @@ inline void check_int32(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda() && t.dtype() == torch::kInt32, name, " must be a CUDA int32 tensor");
 }
 
-// ---- Element type ----
-// Every kernel reads q, k and v through ONE element type and writes O with it,
-// so the three must agree. Which scalar types have a kernel behind them is the
-// entry's switch over ASTRAI_ATTN_DTYPE_LIST (api/attention_dtypes.h), taken
-// on q's type; nothing is recorded on the params — the element type reaches the
-// kernel as a template parameter.
+/*
+ * ---- Element type ----
+ * Every kernel reads q, k and v through ONE element type and writes O with it,
+ * so the three must agree. Which scalar types have a kernel behind them is the
+ * entry's switch over ASTRAI_ATTN_DTYPE_LIST (api/attention_dtypes.h), taken
+ * on q's type; nothing is recorded on the params — the element type reaches the
+ * kernel as a template parameter.
+ */
 inline void
 check_qkv_dtype(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Q/K/V must be CUDA tensors");
@@ -36,16 +40,20 @@ check_qkv_dtype(const torch::Tensor& q, const torch::Tensor& k, const torch::Ten
                 "), got ", v.scalar_type());
 }
 
-// Scalar knobs every packer shares: the causal flag and the mask-present
-// bit (an optional holding an undefined tensor counts as "no mask").
+/*
+ * Scalar knobs every packer shares: the causal flag and the mask-present
+ * bit (an optional holding an undefined tensor counts as "no mask").
+ */
 inline void
 start_pack(const c10::optional<torch::Tensor>& mask, int64_t causal_offset, AttentionParams& p) {
     p.causal_offset = (int)causal_offset;
     p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
 }
 
-// Default scale resolution + null output pointers; the entry .cu fills
-// o_ptr / split partials right after packing.
+/*
+ * Default scale resolution + null output pointers; the entry .cu fills
+ * o_ptr / split partials right after packing.
+ */
 inline void finish_pack(double scale, AttentionParams& p) {
     p.scale = (scale > 0.0) ? (float)scale : 1.0f / sqrtf((float)p.head_dim);
     p.o_ptr = nullptr;
@@ -53,10 +61,12 @@ inline void finish_pack(double scale, AttentionParams& p) {
     p.ml_part = nullptr;
 }
 
-// The split kernel unconditionally writes every (batch, q_head, split) slot it
-// owns — including empty split ranges, which store m = -FLT_MAX so the combine
-// skips them. Allocators are therefore left uninitialized (torch::empty); the
-// per-call memset (torch::zeros / torch::full) was pure overhead.
+/*
+ * The split kernel unconditionally writes every (batch, q_head, split) slot it
+ * owns — including empty split ranges, which store m = -FLT_MAX so the combine
+ * skips them. Allocators are therefore left uninitialized (torch::empty); the
+ * per-call memset (torch::zeros / torch::full) was pure overhead.
+ */
 inline void alloc_split_partials(AttentionParams& p) {
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto o_part = torch::empty(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, p.head_dim}, fopt);
@@ -65,9 +75,11 @@ inline void alloc_split_partials(AttentionParams& p) {
     p.ml_part = (float*)ml_part.data_ptr();
 }
 
-// Split partials: validate caller-provided buffers or allocate fresh ones.
-// Always fp32: they are online-softmax accumulators, independent of the
-// precision the Q/K/V buffers carry.
+/*
+ * Split partials: validate caller-provided buffers or allocate fresh ones.
+ * Always fp32: they are online-softmax accumulators, independent of the
+ * precision the Q/K/V buffers carry.
+ */
 inline void resolve_split_buffers(const c10::optional<torch::Tensor>& o_part_buf,
                                   const c10::optional<torch::Tensor>& ml_part_buf,
                                   AttentionParams& p) {
@@ -106,10 +118,12 @@ inline void extract_q_dims_and_strides(torch::Tensor& q, int64_t layout, Attenti
     p.q_d_stride = (int)q.stride(3);
 }
 
-// ---- Shared mask packing ----
-// Accepts 2D [batch, kv_len], 3D [batch, q_len, kv_len],
-// or 4D [batch, n_heads, q_len, kv_len].
-// Head/q dimensions with size 1 broadcast (stride set to 0).
+/*
+ * ---- Shared mask packing ----
+ * Accepts 2D [batch, kv_len], 3D [batch, q_len, kv_len],
+ * or 4D [batch, n_heads, q_len, kv_len].
+ * Head/q dimensions with size 1 broadcast (stride set to 0).
+ */
 
 // Stride of a mask dim that broadcasts when its extent is 1.
 inline int bc_stride(const torch::Tensor& m, int dim) {
@@ -203,10 +217,12 @@ inline void attn_pack_params(torch::Tensor q,
     pack_mask(mask, p);
 }
 
-// ---- Paged preamble shared by the decode and prefill packers ----
-// Flat-pool tensor checks, common dim/stride extraction and raw pointers.
-// Batch resolution differs (decode: q rows; prefill: req_pool_indices) and
-// stays at the caller, as do the head_dim granularity checks.
+/*
+ * ---- Paged preamble shared by the decode and prefill packers ----
+ * Flat-pool tensor checks, common dim/stride extraction and raw pointers.
+ * Batch resolution differs (decode: q rows; prefill: req_pool_indices) and
+ * stays at the caller, as do the head_dim granularity checks.
+ */
 inline void pack_paged_common(torch::Tensor& q,
                               torch::Tensor& k_cache,
                               torch::Tensor& v_cache,
@@ -243,9 +259,11 @@ inline void pack_paged_common(torch::Tensor& q,
     p.max_context_len = (int)req_to_token.size(1);
 }
 
-// ---- attn_pack_paged_decode_params ----
-// SGLang-style: flat KV pool + req_to_token indexing + variable
-// seq_lens via kv_indptr.  Q is [batch, q_head, head_dim] (q_len=1 per req).
+/*
+ * ---- attn_pack_paged_decode_params ----
+ * SGLang-style: flat KV pool + req_to_token indexing + variable
+ * seq_lens via kv_indptr.  Q is [batch, q_head, head_dim] (q_len=1 per req).
+ */
 inline void attn_pack_paged_decode_params(torch::Tensor q,
                                           torch::Tensor k_cache,
                                           torch::Tensor v_cache,
@@ -303,9 +321,11 @@ inline void attn_pack_paged_decode_params(torch::Tensor q,
     finish_pack(scale, p);
 }
 
-// ---- attn_pack_paged_prefill_params ----
-// SGLang-style: flat KV pool + req_to_token + ragged batch via qo_indptr.
-// Q is [total_q, q_head, head_dim] (flattened across all requests).
+/*
+ * ---- attn_pack_paged_prefill_params ----
+ * SGLang-style: flat KV pool + req_to_token + ragged batch via qo_indptr.
+ * Q is [total_q, q_head, head_dim] (flattened across all requests).
+ */
 inline void attn_pack_paged_prefill_params(torch::Tensor q,
                                            torch::Tensor k_cache,
                                            torch::Tensor v_cache,

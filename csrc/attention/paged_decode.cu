@@ -1,7 +1,9 @@
-// SGLang-style paged GQA decode (flat KV pool + req_to_token + kv_indptr)
-// — the implementation of the entry declared in api/attention.h.
-// Device-side code is in kernel/attention_launch.cuh +
-// kernel/attention_split_kv.cuh.
+/*
+ * SGLang-style paged GQA decode (flat KV pool + req_to_token + kv_indptr)
+ * — the implementation of the entry declared in api/attention.h.
+ * Device-side code is in kernel/attention_launch.cuh +
+ * kernel/attention_split_kv.cuh.
+ */
 
 #include "entry.h"
 #include <api/attention.h>

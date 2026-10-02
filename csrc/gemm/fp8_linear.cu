@@ -1,21 +1,23 @@
-// The fp8 training linear — forward *and* backward — in C++: quantize x/w with
-// the delayed-scaling rings, run the pre-quantized GEMMs, keep the transposed
-// operands for the backward, update the rings.
-//
-// It lives in the gemm module because that module owns the GEMM dispatch state
-// (plan table, planner mode, staging switches) — a second copy in another .so
-// would let `set_planner` configure one and the training path launch through the
-// other. Quantize comes in through api/quantize.h, GEMM through
-// api/gemm.h: the same code the standalone bindings run.
-//
-// The composition is C++ because a ``torch::autograd::Function`` runs both
-// directions inside the engine's call — only the dispatcher entry stays in
-// Python, and the per-linear host cost of the old Python chain is gone.
-//
-// Not here by design: the autocast region and recipe/format policy
-// (astrai/extension/quantize.py), the module slot table
-// (astrai/extension/autocast.py), and the rings / cast caches / snapshot
-// (fp8_state.h, same translation unit).
+/*
+ * The fp8 training linear — forward *and* backward — in C++: quantize x/w with
+ * the delayed-scaling rings, run the pre-quantized GEMMs, keep the transposed
+ * operands for the backward, update the rings.
+ *
+ * It lives in the gemm module because that module owns the GEMM dispatch state
+ * (plan table, planner mode, staging switches) — a second copy in another .so
+ * would let `set_planner` configure one and the training path launch through the
+ * other. Quantize comes in through api/quantize.h, GEMM through
+ * api/gemm.h: the same code the standalone bindings run.
+ *
+ * The composition is C++ because a ``torch::autograd::Function`` runs both
+ * directions inside the engine's call — only the dispatcher entry stays in
+ * Python, and the per-linear host cost of the old Python chain is gone.
+ *
+ * Not here by design: the autocast region and recipe/format policy
+ * (astrai/extension/quantize.py), the module slot table
+ * (astrai/extension/autocast.py), and the rings / cast caches / snapshot
+ * (fp8_state.h, same translation unit).
+ */
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -45,22 +47,26 @@ using torch::autograd::tensor_list;
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Composed forward / backward
-// ---------------------------------------------------------------------------
+/*
+ * Composed forward / backward
+ */
 
 struct Fp8FwdOut {
     Tensor out;
-    // The GEMMs' dequant scales. ``sx`` is a ring *view* (no clone) that dies at
-    // that ring's next fold, so it is read only within this call and the backward
-    // after it; ``sw`` is a ring view or, on a cast-cache hit, the cache's
-    // immutable copy — either way it must describe ``w8``'s bytes.
+    /*
+     * The GEMMs' dequant scales. ``sx`` is a ring *view* (no clone) that dies at
+     * that ring's next fold, so it is read only within this call and the backward
+     * after it; ``sw`` is a ring view or, on a cast-cache hit, the cache's
+     * immutable copy — either way it must describe ``w8``'s bytes.
+     */
     Tensor sx, sw;
     Tensor x8T, w8T; // K-contiguous transposed casts (undefined when absent)
 };
 
-// The recipe as resolved for one call; the policy layer reads its region config
-// once and passes the fields down.
+/*
+ * The recipe as resolved for one call; the policy layer reads its region config
+ * once and passes the fields down.
+ */
 struct Fp8Cfg {
     bool dynamic = false;
     int64_t history_len = 16;
@@ -69,9 +75,11 @@ struct Fp8Cfg {
     at::ScalarType fmt_b = at::kFloat8_e5m2;
 };
 
-// One quantize pass through the shared launcher, with the counters tests and
-// benches read. ``pub_scale``/``pub_recip`` redirect the fold's publication into
-// the double buffer's other pair; undefined with no ring.
+/*
+ * One quantize pass through the shared launcher, with the counters tests and
+ * benches read. ``pub_scale``/``pub_recip`` redirect the fold's publication into
+ * the double buffer's other pair; undefined with no ring.
+ */
 quant::QuantizeOutputs run_quant(const Tensor& t,
                                  const Tensor& scale,
                                  quant::QuantLayout layout,
@@ -88,8 +96,10 @@ quant::QuantizeOutputs run_quant(const Tensor& t,
         std::pow(2.0, static_cast<double>(cfg.margin)),
         pub_scale.defined() ? c10::optional<Tensor>(pub_scale) : c10::nullopt,
         pub_recip.defined() ? c10::optional<Tensor>(pub_recip) : c10::nullopt,
-        // The composed ring's state trails a double-buffered scale pair, so the
-        // history length is stated, never derived from numel.
+        /*
+         * The composed ring's state trails a double-buffered scale pair, so the
+         * history length is stated, never derived from numel.
+         */
         cfg.history_len);
 }
 
@@ -138,13 +148,17 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x,
     }
 
     State& st = state();
-    // Slot-addressed when the dispatcher knows the module (``slot >= 0``): the
-    // meta then belongs to the module path and survives a replaced weight
-    // parameter. Bare calls, benches and every existing test pass no slot and
-    // keep the address-keyed lookup byte for byte.
+    /*
+     * Slot-addressed when the dispatcher knows the module (``slot >= 0``): the
+     * meta then belongs to the module path and survives a replaced weight
+     * parameter. Bare calls, benches and every existing test pass no slot and
+     * keep the address-keyed lookup byte for byte.
+     */
     auto meta = get_meta(w, history_len, margin, false, slot);
-    // Host-side seed only when a ring has never been used: both branches need
-    // a valid scale to cast with.
+    /*
+     * Host-side seed only when a ring has never been used: both branches need
+     * a valid scale to cast with.
+     */
     if (!meta->w.initialized)
         meta->w.seed(w, fmt_a, margin);
     const bool cache_activation =
@@ -157,16 +171,20 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x,
     }
     if (!meta->x->initialized)
         meta->x->seed(x, fmt_a, margin);
-    // Pre-quantized fp8 weights: this branch takes w as-is, but the entry check
-    // admits bf16 only — and the ring seed off fp8 values is not the scale the
-    // weight was quantized with. Enabling it needs an explicit ``w_scale``
-    // argument, not a relaxed check.
+    /*
+     * Pre-quantized fp8 weights: this branch takes w as-is, but the entry check
+     * admits bf16 only — and the ring seed off fp8 values is not the scale the
+     * weight was quantized with. Enabling it needs an explicit ``w_scale``
+     * argument, not a relaxed check.
+     */
     const bool w_pre = is_fp8(w.scalar_type());
 
-    // Ring view of the current scale pair: the fold publishes into the other
-    // pair, so this slot still holds the multiplier the cast used when the GEMM
-    // reads it. It dies at this ring's next fold — consumed well before that in
-    // training order (the backward precedes the same linear's next forward).
+    /*
+     * Ring view of the current scale pair: the fold publishes into the other
+     * pair, so this slot still holds the multiplier the cast used when the GEMM
+     * reads it. It dies at this ring's next fold — consumed well before that in
+     * training order (the backward precedes the same linear's next forward).
+     */
     res.sx = meta->x->scale();
     Tensor w8;
     if (!w_pre && meta->cast.valid(w, fmt_a, fmt_b, st.generation)) {
@@ -189,8 +207,10 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x,
             // The entry must outlive the ring pair it came from: immutable copy.
             meta->cast.fill(w, fmt_a, fmt_b, st.generation, w8, res.w8T, res.sw.clone());
         } else {
-            // Ring-free cast (no-grad): folding here would advance the window a
-            // second time per step and desynchronize the recompute.
+            /*
+             * Ring-free cast (no-grad): folding here would advance the window a
+             * second time per step and desynchronize the recompute.
+             */
             w8 = run_quant(w, meta->w.scale_recip(), quant::QuantLayout::RowMajor, fmt_a,
                            c10::nullopt, c10::nullopt, 0, cfg)
                      .out;
@@ -258,10 +278,12 @@ tensor_list fp8_backward_impl(const Tensor& g, const Fp8BwdIn& in) {
         g_ring = meta->g.state;
         g_idx = meta->g.idx;
     }
-    // NT fast path via transposed quantize outputs: g8 + w8T gives grad_x, g8T +
-    // x8T gives grad_w. g is consumed in both orientations (one dual pass feeds
-    // both); x8T/w8T came from the forward or the weight cast cache, so the
-    // backward re-reads neither x nor w.
+    /*
+     * NT fast path via transposed quantize outputs: g8 + w8T gives grad_x, g8T +
+     * x8T gives grad_w. g is consumed in both orientations (one dual pass feeds
+     * both); x8T/w8T came from the forward or the weight cast cache, so the
+     * backward re-reads neither x nor w.
+     */
     const bool delayed = !in.dynamic;
     const auto qg = run_quant(g2, delayed ? meta->g.scale_recip() : sg.reciprocal(),
                               quant::QuantLayout::Dual, in.fmt_b, c10::nullopt, g_ring, g_idx, cfg,
@@ -276,8 +298,10 @@ tensor_list fp8_backward_impl(const Tensor& g, const Fp8BwdIn& in) {
     }
     Tensor grad_x;
     if (is_fp8(in.w.scalar_type())) {
-        // Pre-quantized weight has no transposed copy (grad_w unaffected).
-        // Unreachable through the entry check today — see w_pre above.
+        /*
+         * Pre-quantized weight has no transposed copy (grad_w unaffected).
+         * Unreachable through the entry check today — see w_pre above.
+         */
         grad_x = run_gemm(qg.out, in.w, sg, sw, c10::nullopt, false).reshape(in.x.sizes());
     } else {
         Tensor w8T = in.w8T;
@@ -298,21 +322,25 @@ tensor_list fp8_backward_impl(const Tensor& g, const Fp8BwdIn& in) {
     return {grad_x, grad_w, grad_b};
 }
 
-// apply() demands one returned gradient per forward argument — undefined for the
-// non-tensor ones, which the engine filters out. The slot id is forward-only:
-// backward reaches its meta through the weight the forward saved.
+/*
+ * apply() demands one returned gradient per forward argument — undefined for the
+ * non-tensor ones, which the engine filters out. The slot id is forward-only:
+ * backward reaches its meta through the weight the forward saved.
+ */
 constexpr size_t kFp8TensorInputs = 3; // x, w, bias
 constexpr size_t kFp8ScalarInputs = 8; // update_rings .. slot
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// The autograd node
-// ---------------------------------------------------------------------------
+/*
+ * The autograd node
+ */
 
-// ``forward`` runs inside the engine with grad mode off, so ``update_rings``
-// comes from the dispatcher (the caller's mode): a no-grad pass — checkpointing
-// recompute, inference — reads the rings without folding or advancing them.
+/*
+ * ``forward`` runs inside the engine with grad mode off, so ``update_rings``
+ * comes from the dispatcher (the caller's mode): a no-grad pass — checkpointing
+ * recompute, inference — reads the rings without folding or advancing them.
+ */
 class Fp8Linear : public torch::autograd::Function<Fp8Linear> {
   public:
     static Tensor forward(AutogradContext* ctx,
@@ -390,8 +418,10 @@ Tensor fp8_linear(const Tensor& x,
         TORCH_CHECK(bias->numel() > 0, "fp8 linear: bias must be non-empty");
         bias_t = *bias;
     } else {
-        // One empty placeholder per device: no-bias is the hot path (Linear
-        // defaults to bias=False) and a per-call empty({0}) is an allocation.
+        /*
+         * One empty placeholder per device: no-bias is the hot path (Linear
+         * defaults to bias=False) and a per-call empty({0}) is an allocation.
+         */
         static std::mutex mu;
         static std::unordered_map<c10::DeviceIndex, Tensor> cache;
         const auto dev = x.device().index();
@@ -405,14 +435,16 @@ Tensor fp8_linear(const Tensor& x,
                             margin, fmt_a, fmt_b, slot);
 }
 
-// ---------------------------------------------------------------------------
-// Checkpoint snapshot (A1) and test observability
-// ---------------------------------------------------------------------------
+/*
+ * Checkpoint snapshot (A1) and test observability
+ */
 
-// One ring's checkpoint slice: the buffer plus which scale pair is current (a
-// restore that assumed pair 0 would hand the next forward the wrong multiplier).
-// ``restore_ring`` recomputes the reciprocal rather than trusting the slot —
-// snapshots predating it carry 0 there.
+/*
+ * One ring's checkpoint slice: the buffer plus which scale pair is current (a
+ * restore that assumed pair 0 would hand the next forward the wrong multiplier).
+ * ``restore_ring`` recomputes the reciprocal rather than trusting the slot —
+ * snapshots predating it carry 0 there.
+ */
 py::dict ring_state_dict(const ScaleRing& r) {
     py::dict d;
     d["state"] = r.state.detach().clone();
@@ -422,23 +454,29 @@ py::dict ring_state_dict(const ScaleRing& r) {
     return d;
 }
 
-// Shape matches the Python snapshot (version / entries with shape+dtype plus the
-// three rings), so the trainer's checkpoint-extras bridge is unchanged. v2 adds
-// the slot name/role; a loader ignoring them still binds by (shape, dtype).
+/*
+ * Shape matches the Python snapshot (version / entries with shape+dtype plus the
+ * three rings), so the trainer's checkpoint-extras bridge is unchanged. v2 adds
+ * the slot name/role; a loader ignoring them still binds by (shape, dtype).
+ */
 py::dict fp8_state_dict() {
     State& st = state();
     std::lock_guard<std::mutex> lock(st.mu);
-    // Save only what a resume can bind: an orphan (dead weight) is unreachable,
-    // and in ``order`` it would shift later bindings. Collect first — drop_meta
-    // erases from ``order``, so pruning while walking it invalidates the iterator.
+    /*
+     * Save only what a resume can bind: an orphan (dead weight) is unreachable,
+     * and in ``order`` it would shift later bindings. Collect first — drop_meta
+     * erases from ``order``, so pruning while walking it invalidates the iterator.
+     */
     std::vector<std::shared_ptr<Fp8Meta>> dead;
     for (const auto& meta : st.order)
         if (!meta->alive())
             dead.push_back(meta);
     for (const auto& meta : dead)
         drop_meta(st, meta);
-    // Slotted entries first, in slot order (they bind by name, so the file reads
-    // as the module list); unslotted ones trail in registration order.
+    /*
+     * Slotted entries first, in slot order (they bind by name, so the file reads
+     * as the module list); unslotted ones trail in registration order.
+     */
     std::vector<std::shared_ptr<Fp8Meta>> slotted, rest;
     for (const auto& meta : st.order)
         (meta->slot >= 0 ? slotted : rest).push_back(meta);
@@ -479,9 +517,11 @@ void fp8_load_state_dict(py::dict sd) {
         restore_pending_locked(meta);
 }
 
-// Publish the Python slot table (id -> module path, role glob); replaces the
-// whole map. Names are metadata: fp8_reset drops training state, not the model's
-// shape, so it leaves them alone.
+/*
+ * Publish the Python slot table (id -> module path, role glob); replaces the
+ * whole map. Names are metadata: fp8_reset drops training state, not the model's
+ * shape, so it leaves them alone.
+ */
 void fp8_set_slots(py::list entries) {
     State& st = state();
     std::lock_guard<std::mutex> lock(st.mu);

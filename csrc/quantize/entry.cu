@@ -1,14 +1,16 @@
-// Quantize's entry implementation: the composed one-call pass, the ring
-// binding and the dtype dispatch, compiled into every module that needs the
-// quantize chain — the quantize module itself and the fp8-linear composition
-// in the gemm module (which shares it instead of re-deriving it, so the
-// implementation is a plain .cu listed in both modules' CMake source lists).
-// The declaration surface is api/quantize.h; this TU is the body.
-//
-// The instantiation list lives HERE, not in the header: every expansion site
-// (the refusal message, the dispatch switch, the supported-input check) is
-// in this file, the ASTRAI_GEMM_PAIRS-in-gemm.cu shape — a list that only
-// one TU expands does not need to live where other TUs can see it.
+/*
+ * Quantize's entry implementation: the composed one-call pass, the ring
+ * binding and the dtype dispatch, compiled into every module that needs the
+ * quantize chain — the quantize module itself and the fp8-linear composition
+ * in the gemm module (which shares it instead of re-deriving it, so the
+ * implementation is a plain .cu listed in both modules' CMake source lists).
+ * The declaration surface is api/quantize.h; this TU is the body.
+ *
+ * The instantiation list lives HERE, not in the header: every expansion site
+ * (the refusal message, the dispatch switch, the supported-input check) is
+ * in this file, the ASTRAI_GEMM_PAIRS-in-gemm.cu shape — a list that only
+ * one TU expands does not need to live where other TUs can see it.
+ */
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/EmptyTensor.h>
@@ -27,10 +29,12 @@
 namespace astrai {
 namespace quant {
 
-// Quantize's instantiation list, the attention_dtypes.h shape: torch's own
-// ScalarType names the input dtype at the boundary, the C++ element type is
-// what the kernel takes as a template parameter. The refusal below is
-// generated from the same rows, so the supported set cannot drift.
+/*
+ * Quantize's instantiation list, the attention_dtypes.h shape: torch's own
+ * ScalarType names the input dtype at the boundary, the C++ element type is
+ * what the kernel takes as a template parameter. The refusal below is
+ * generated from the same rows, so the supported set cannot drift.
+ */
 #define ASTRAI_QUANT_IN_DTYPES(X)                                                                  \
     X(torch::kBFloat16, bf16)                                                                      \
     X(torch::kHalf, fp16)                                                                          \
@@ -38,8 +42,10 @@ namespace quant {
 
 namespace {
 
-// A scalar type quantize has no kernel for: say which ones it does have,
-// read off the list above (the attention_dtypes.h pattern).
+/*
+ * A scalar type quantize has no kernel for: say which ones it does have,
+ * read off the list above (the attention_dtypes.h pattern).
+ */
 [[noreturn]] void unsupported_quant_input(at::ScalarType st) {
     std::string instantiated;
 #define ASTRAI_QUANT_NAME_ROW(S, T)                                                                \
@@ -50,9 +56,11 @@ namespace {
                 " (instantiated: ", instantiated, ")");
 }
 
-// Dtype dispatch over the merged quantize launcher: one case per row above
-// for a (possibly mixed) fp8 output pair; the default is unreachable (the
-// entry gate above) but stays a hard error — never a silent re-route.
+/*
+ * Dtype dispatch over the merged quantize launcher: one case per row above
+ * for a (possibly mixed) fp8 output pair; the default is unreachable (the
+ * entry gate above) but stays a hard error — never a silent re-route.
+ */
 template <typename Fp8TA, typename Fp8TB>
 void launch_for_dtype(const torch::Tensor& x, const QuantParams& p, cudaStream_t stream) {
     switch (x.scalar_type()) {
@@ -67,8 +75,10 @@ void launch_for_dtype(const torch::Tensor& x, const QuantParams& p, cudaStream_t
     }
 }
 
-// Row-major format picks the A side, transposed format the B side (both the
-// same in every non-hybrid use).
+/*
+ * Row-major format picks the A side, transposed format the B side (both the
+ * same in every non-hybrid use).
+ */
 void launch_quantize_for(
     const torch::Tensor& x, const QuantParams& p, bool a_e5m2, bool b_e5m2, cudaStream_t stream) {
     if (a_e5m2)
@@ -81,10 +91,12 @@ void launch_quantize_for(
 
 } // namespace
 
-// The delayed-scaling ring as raw device pointers. Offsets are RingLayout's;
-// ``hist_len`` is required (numel cannot recover it — the composed ring's
-// trailing pair overshoots). Pair 1 is that double buffer's, so it is not
-// bound here: its publisher passes its own slots.
+/*
+ * The delayed-scaling ring as raw device pointers. Offsets are RingLayout's;
+ * ``hist_len`` is required (numel cannot recover it — the composed ring's
+ * trailing pair overshoots). Pair 1 is that double buffer's, so it is not
+ * bound here: its publisher passes its own slots.
+ */
 struct RingView {
     float* hist = nullptr;
     float* scale_out = nullptr;
@@ -132,20 +144,22 @@ bind_ring(QuantParams& p, const RingView& r, int64_t hist_idx, double fp8_max, d
     p.pow2_margin = static_cast<float>(pow2_margin);
 }
 
-// One quantize pass, end to end: validation, output allocation, launch.
-// ``layout`` picks which orientations are produced; ``transposed_dtype``
-// (default: the row-major dtype) casts the transposed orientation in a
-// different fp8 format — the hybrid training pair casts the forward format
-// on one side and the backward format on the other from a single read, and
-// since the two conversions are elementwise the mixed pass is bit-identical
-// to two single-format passes. A ring switches on the in-kernel
-// delayed-scaling fold (amax history + the published scale and its
-// reciprocal); without one the kernel runs a pure scale+cast.
-// ``pub_scale``/``pub_recip`` redirect where the fold publishes (default:
-// the ring's own slots) — the double-buffered ring's "next" pair, so the
-// consumer keeps reading the untouched current pair and needs no snapshot
-// clone. A ring also requires ``hist_len`` (see RingLayout); one without is
-// rejected rather than guessed.
+/*
+ * One quantize pass, end to end: validation, output allocation, launch.
+ * ``layout`` picks which orientations are produced; ``transposed_dtype``
+ * (default: the row-major dtype) casts the transposed orientation in a
+ * different fp8 format — the hybrid training pair casts the forward format
+ * on one side and the backward format on the other from a single read, and
+ * since the two conversions are elementwise the mixed pass is bit-identical
+ * to two single-format passes. A ring switches on the in-kernel
+ * delayed-scaling fold (amax history + the published scale and its
+ * reciprocal); without one the kernel runs a pure scale+cast.
+ * ``pub_scale``/``pub_recip`` redirect where the fold publishes (default:
+ * the ring's own slots) — the double-buffered ring's "next" pair, so the
+ * consumer keeps reading the untouched current pair and needs no snapshot
+ * clone. A ring also requires ``hist_len`` (see RingLayout); one without is
+ * rejected rather than guessed.
+ */
 QuantizeOutputs run_quantize(torch::Tensor x,
                              torch::Tensor scale,
                              QuantLayout layout,
@@ -190,8 +204,10 @@ QuantizeOutputs run_quantize(torch::Tensor x,
     p.scale = scale.data_ptr<float>();
     QuantizeOutputs outs;
     if (ring.has_value() && ring->defined()) {
-        // A wrong window is silent (scale slots read as history), so a ring
-        // without its hist_len is an error, not a guess.
+        /*
+         * A wrong window is silent (scale slots read as history), so a ring
+         * without its hist_len is an error, not a guess.
+         */
         TORCH_CHECK(hist_len.has_value(), "quantize: ring_state needs hist_len (the history window "
                                           "length) — the buffer's trailing slots make it "
                                           "unrecoverable from numel");
@@ -209,10 +225,12 @@ QuantizeOutputs run_quantize(torch::Tensor x,
             p.scale_recip_out = pub_recip->data_ptr<float>();
         }
     }
-    // The merged kernel views the whole buffer as one flat [rows][cols]
-    // tile grid: leading dims fold into rows so 1D and 3D inputs are fully
-    // covered. An empty tensor folds to rows=0 with a 1-wide cols axis —
-    // the launcher still fires one block so the ring fold publishes.
+    /*
+     * The merged kernel views the whole buffer as one flat [rows][cols]
+     * tile grid: leading dims fold into rows so 1D and 3D inputs are fully
+     * covered. An empty tensor folds to rows=0 with a 1-wide cols axis —
+     * the launcher still fires one block so the ring fold publishes.
+     */
     const int64_t numel = input.numel();
     const int64_t cols = numel == 0 ? 1 : input.size(-1);
     const int64_t rows = numel / cols;
@@ -220,14 +238,18 @@ QuantizeOutputs run_quantize(torch::Tensor x,
                 "quantize tensor too large for the tiled grid");
     p.rows = static_cast<int>(rows);
     p.cols = static_cast<int>(cols);
-    // The merged kernel takes placement as data: the stride pair for the
-    // row-major side ((cols, 1)); the transposed side derives its canonical
-    // (1, rows) contract in-kernel.
+    /*
+     * The merged kernel takes placement as data: the stride pair for the
+     * row-major side ((cols, 1)); the transposed side derives its canonical
+     * (1, rows) contract in-kernel.
+     */
     p.out_row_stride = p.cols;
     p.out_col_stride = 1;
     if (layout != QuantLayout::Transposed) {
-        // Direct-to-allocator empty (no dispatcher round trip): the outputs
-        // are fresh kernel destinations, never autograd-visible on their own.
+        /*
+         * Direct-to-allocator empty (no dispatcher round trip): the outputs
+         * are fresh kernel destinations, never autograd-visible on their own.
+         */
         outs.out = torch::Tensor(
             at::detail::empty_cuda(input.sizes(), out_dtype, input.device(), std::nullopt));
         p.output_ptr = outs.out.data_ptr();

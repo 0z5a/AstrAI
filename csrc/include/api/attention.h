@@ -1,5 +1,7 @@
-// Attention entry points: implemented by the attention .cu files, which own
-// the pybind surface; the device vocabulary stays in kernel/ (torch-free).
+/*
+ * Attention entry points: implemented by the attention .cu files, which own
+ * the pybind surface; the device vocabulary stays in kernel/ (torch-free).
+ */
 
 #pragma once
 

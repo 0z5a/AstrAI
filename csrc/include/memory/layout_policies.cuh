@@ -4,43 +4,43 @@
 #include <utils/define.cuh>
 #include <utils/dtype.cuh>
 
-// ============================================================================
-// Attention layout policies keep Q scheduling independent from K/V storage.
-// DenseQSchedule / PackedQSchedule map blocks to Q tiles; ContigKV / PagedKV
-// resolve logical K/V positions to physical addresses. This lets the shared
-// kernels compose Q layout and K/V storage without coupling the two concerns.
-//
-//   ContigKV<T>:  K/V are dense [batch, kv_head, kv_len, head_dim] tensors.
-//              Params fields used: k, v, kv_stride_*, kv_len, q_len,
-//              q_b_stride, causal_offset.
-//   PagedKV<T>:   K/V live in a flat pool [size, kv_head, head_dim] indexed via
-//              req_to_token.  Params fields used: k_cache, v_cache,
-//              req_to_token, req_pool_indices, kv_indptr, qo_indptr,
-//              max_context_len, q_l_stride.
-//
-// The K/V policy is also where the element type is bound: AttentionParams
-// itself is dtype-agnostic (void* pointers + a dtype tag) and the kernels read
-// the element type back off the policy they were instantiated with
-// (`using T = typename KV::Elem;`), so the dispatch's dtype axis is exactly
-// "which KV instantiation".  Every method takes the params by reference; the
-// typed views below (kptr/vptr/...) are the only place void* becomes T*.
-//
-// Addressing state that is constant across a whole kernel invocation for one
-// (batch, kv_head) pair is captured once by make_ctx<HEAD_DIM>() and passed
-// to kv_addr, so the load loops never redo the hoistable base computation
-// (e.g. the req_pool_indices global read) element-by-element.
-// ============================================================================
+/*
+ * Attention layout policies keep Q scheduling independent from K/V storage.
+ * DenseQSchedule / PackedQSchedule map blocks to Q tiles; ContigKV / PagedKV
+ * resolve logical K/V positions to physical addresses. This lets the shared
+ * kernels compose Q layout and K/V storage without coupling the two concerns.
+ *
+ *   ContigKV<T>:  K/V are dense [batch, kv_head, kv_len, head_dim] tensors.
+ *              Params fields used: k, v, kv_stride_*, kv_len, q_len,
+ *              q_b_stride, causal_offset.
+ *   PagedKV<T>:   K/V live in a flat pool [size, kv_head, head_dim] indexed via
+ *              req_to_token.  Params fields used: k_cache, v_cache,
+ *              req_to_token, req_pool_indices, kv_indptr, qo_indptr,
+ *              max_context_len, q_l_stride.
+ *
+ * The K/V policy is also where the element type is bound: AttentionParams
+ * itself is dtype-agnostic (void* pointers + a dtype tag) and the kernels read
+ * the element type back off the policy they were instantiated with
+ * (`using T = typename KV::Elem;`), so the dispatch's dtype axis is exactly
+ * "which KV instantiation".  Every method takes the params by reference; the
+ * typed views below (kptr/vptr/...) are the only place void* becomes T*.
+ *
+ * Addressing state that is constant across a whole kernel invocation for one
+ * (batch, kv_head) pair is captured once by make_ctx<HEAD_DIM>() and passed
+ * to kv_addr, so the load loops never redo the hoistable base computation
+ * (e.g. the req_pool_indices global read) element-by-element.
+ */
 
 namespace astrai {
 namespace attention {
 
-// ============================================================================
-// Q scheduling policies
-//
-// Map CUDA blocks to request-local Q tiles independently of K/V storage.
-// Dense tensors encode the request in blockIdx.z; packed ragged tensors use
-// a compact precomputed work map indexed by blockIdx.x.
-// ============================================================================
+/*
+ * Q scheduling policies
+ *
+ * Map CUDA blocks to request-local Q tiles independently of K/V storage.
+ * Dense tensors encode the request in blockIdx.z; packed ragged tensors use
+ * a compact precomputed work map indexed by blockIdx.x.
+ */
 
 struct DenseQSchedule {
     static HOST_FORCEINLINE int host_grid_batch(const AttentionParams& p) { return p.batch; }
@@ -50,11 +50,13 @@ struct DenseQSchedule {
         q_tile = blockIdx.x;
     }
 
-    // PackGQA-folded prefill mapping: the block's row space is the packed
-    // (head, row) space of the request — G heads folded, h = idx % G,
-    // m = idx / G over the GLOBAL packed index (a per-block offset would
-    // shift the head phase when block_m % G != 0). Dense tensors tile the
-    // packed space G*q_len directly.
+    /*
+     * PackGQA-folded prefill mapping: the block's row space is the packed
+     * (head, row) space of the request — G heads folded, h = idx % G,
+     * m = idx / G over the GLOBAL packed index (a per-block offset would
+     * shift the head phase when block_m % G != 0). Dense tensors tile the
+     * packed space G*q_len directly.
+     */
     static HOST_FORCEINLINE int
     packed_grid_x(const AttentionParams& p, int, int block_m) {
         const int G = p.q_head / p.kv_head;
@@ -86,13 +88,15 @@ struct PackedQSchedule {
         q_tile = p.q_tile_to_index[blockIdx.x];
     }
 
-    // PackGQA-folded prefill mapping: the host tile maps are built in
-    // HOST_Q_TILE_ROWS granularity and stay head-agnostic; host tile t covers
-    // rows [t*HQR, (t+1)*HQR) of every head, i.e. packed idx
-    // [t*HQR*G, ...+HQR*G). Blocks carve that space in block_m steps; the
-    // kernel decodes h = idx % G over the request-local packed index.
-    // qo_indptr is a device pointer — the host grid derives from the tile
-    // count alone (a request's last tile is padded up by the host builder).
+    /*
+     * PackGQA-folded prefill mapping: the host tile maps are built in
+     * HOST_Q_TILE_ROWS granularity and stay head-agnostic; host tile t covers
+     * rows [t*HQR, (t+1)*HQR) of every head, i.e. packed idx
+     * [t*HQR*G, ...+HQR*G). Blocks carve that space in block_m steps; the
+     * kernel decodes h = idx % G over the request-local packed index.
+     * qo_indptr is a device pointer — the host grid derives from the tile
+     * count alone (a request's last tile is padded up by the host builder).
+     */
     static HOST_FORCEINLINE int
     packed_grid_x(const AttentionParams& p, int, int block_m) {
         const int blocks_per_host_tile = (p.q_head / p.kv_head) * HOST_Q_TILE_ROWS / block_m;
@@ -127,13 +131,15 @@ struct KVContext {
     int64_t head_off;    // paged: kv_head * HEAD_DIM
 };
 
-// Per-element K/V global addresses for one (kc, d) position of a K/V tile.
-// The pointers are ALWAYS the computed addresses (never nullptr) — callers
-// gate on `valid` (cp.async src_size=0, or a guarded scalar deref).  `valid`
-// starts as "within the request's seq_len"; the paged policy further degrades
-// it when req_to_token maps the position to a negative slot (empty padding).
-// This matches the original hand-rolled load loops, where the address was
-// always formed and the predicate decided whether anything was read.
+/*
+ * Per-element K/V global addresses for one (kc, d) position of a K/V tile.
+ * The pointers are ALWAYS the computed addresses (never nullptr) — callers
+ * gate on `valid` (cp.async src_size=0, or a guarded scalar deref).  `valid`
+ * starts as "within the request's seq_len"; the paged policy further degrades
+ * it when req_to_token maps the position to a negative slot (empty padding).
+ * This matches the original hand-rolled load loops, where the address was
+ * always formed and the predicate decided whether anything was read.
+ */
 struct KVAddr {
     const void* k;
     const void* v;
@@ -145,9 +151,11 @@ template <typename T> struct ContigKV {
     using Elem = T;
     static constexpr bool kPaged = false;
 
-    // Typed views of the params' dtype-agnostic pointers. The restrict
-    // locals at the deref sites re-state the alias promise the void* -> T*
-    // cast drops.
+    /*
+     * Typed views of the params' dtype-agnostic pointers. The restrict
+     * locals at the deref sites re-state the alias promise the void* -> T*
+     * cast drops.
+     */
     static DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
         return static_cast<const T*>(p.k_ptr);
     }

@@ -1,17 +1,19 @@
-// GDN preparation kernels: projection layout to chunk-kernel layout, in two launches.
-//
-// The chunked GDN kernels want head-major tensors ([B, H, T, D], head dim
-// contiguous) with L2-normalized query/key rows and the gate pre-scanned into a
-// chunk-local cumsum. What the layer's projections plus the local convolution
-// hand over is [B, H, D, T] — head and head-dim outer, *token inner* — so going
-// from one to the other is a real transpose, not a relabeling.
-//
-// Doing that with torch costs more than all four GDN kernels together: measured
-// at T=2048 and T=8192 the transposes, dtype casts, L2 norms and the cumsum were
-// 53% and 59% of the operator's wall clock, because each was its own launch over
-// the whole tensor. Here the source tile is read with the token axis coalesced,
-// staged in shared memory, and read back transposed so the head-dim axis of the
-// store is coalesced too. The two operations collapse into two launches.
+/*
+ * GDN preparation kernels: projection layout to chunk-kernel layout, in two launches.
+ *
+ * The chunked GDN kernels want head-major tensors ([B, H, T, D], head dim
+ * contiguous) with L2-normalized query/key rows and the gate pre-scanned into a
+ * chunk-local cumsum. What the layer's projections plus the local convolution
+ * hand over is [B, H, D, T] — head and head-dim outer, *token inner* — so going
+ * from one to the other is a real transpose, not a relabeling.
+ *
+ * Doing that with torch costs more than all four GDN kernels together: measured
+ * at T=2048 and T=8192 the transposes, dtype casts, L2 norms and the cumsum were
+ * 53% and 59% of the operator's wall clock, because each was its own launch over
+ * the whole tensor. Here the source tile is read with the token axis coalesced,
+ * staged in shared memory, and read back transposed so the head-dim axis of the
+ * store is coalesced too. The two operations collapse into two launches.
+ */
 
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
@@ -26,10 +28,12 @@ constexpr int kThreads = 256;
 constexpr int kHeadDim = 128; // D: the Qwen3.5 linear-attention head shape
 constexpr int kTile = 64;     // tokens per block
 constexpr int kQuarters = 4;  // norm reduction is split kQuarters ways
-// Row pitch in shared memory. 66 bf16 is 33 words, so the transposed read (one
-// thread per head dim) walks consecutive banks instead of colliding; a 16-byte
-// multiple would be conflict-prone, which is why the vector stores below are
-// scalar.
+/*
+ * Row pitch in shared memory. 66 bf16 is 33 words, so the transposed read (one
+ * thread per head dim) walks consecutive banks instead of colliding; a 16-byte
+ * multiple would be conflict-prone, which is why the vector stores below are
+ * scalar.
+ */
 constexpr int kPitch = kTile + 2;
 
 // One block per (b, h, token tile).
@@ -61,15 +65,19 @@ __global__ void gated_deltanet_fwd_qkv_kernel(const __nv_bfloat16* __restrict__ 
     const int b = bh / heads;
     const int t0 = tile * kTile;
 
-    // Source row (b, h, d, t) sits at b * stride_b + (h * D + d) * seq + t. The
-    // batch stride is the caller's: q/k/v are slices of one concatenated
-    // convolution buffer, so it spans all three of their channel counts and is
-    // not H * D * T. It only looks that way when the batch size is 1.
+    /*
+     * Source row (b, h, d, t) sits at b * stride_b + (h * D + d) * seq + t. The
+     * batch stride is the caller's: q/k/v are slices of one concatenated
+     * convolution buffer, so it spans all three of their channel counts and is
+     * not H * D * T. It only looks that way when the batch size is 1.
+     */
     const int64_t q_row = static_cast<int64_t>(b) * stride_qb + h * kHeadDim * seq;
     const int64_t k_row = static_cast<int64_t>(b) * stride_kb + h * kHeadDim * seq;
     const int64_t v_row = static_cast<int64_t>(b) * stride_vb + h * kHeadDim * seq;
-    // Two threads per head dim, each taking half the tile's tokens: 8 tokens per
-    // vector load, four loads.
+    /*
+     * Two threads per head dim, each taking half the tile's tokens: 8 tokens per
+     * vector load, four loads.
+     */
     const int load_d = tid >> 1;
     const int load_j = (tid & 1) * (kTile / 2);
 #pragma unroll
@@ -91,9 +99,11 @@ __global__ void gated_deltanet_fwd_qkv_kernel(const __nv_bfloat16* __restrict__ 
     }
     __syncthreads();
 
-    // L2 norm down each token column: kQuarters threads fold part of the column
-    // and the partials combine through shared memory, so the reduction never
-    // needs the whole 128-long column in one thread.
+    /*
+     * L2 norm down each token column: kQuarters threads fold part of the column
+     * and the partials combine through shared memory, so the reduction never
+     * needs the whole 128-long column in one thread.
+     */
     const int col = tid % kTile;
     const int quarter = tid / kTile;
     float q_sum = 0.0f;
@@ -135,9 +145,11 @@ __global__ void gated_deltanet_fwd_qkv_kernel(const __nv_bfloat16* __restrict__ 
     }
 }
 
-// One block per (b, h, chunk), with the block size equal to the chunk. The
-// source is [B, T, H] with H contiguous, so the gather is strided while the
-// scatter is contiguous.
+/*
+ * One block per (b, h, chunk), with the block size equal to the chunk. The
+ * source is [B, T, H] with H contiguous, so the gather is strided while the
+ * scatter is contiguous.
+ */
 __global__ void gated_deltanet_fwd_gates_kernel(const float* __restrict__ g,
                                                 const float* __restrict__ beta,
                                                 float* __restrict__ g_out,
@@ -156,12 +168,16 @@ __global__ void gated_deltanet_fwd_gates_kernel(const float* __restrict__ g,
     const int index = start + i;
 
     scan[i] = g[(b * seq + index) * heads + h];
-    // The first step reads a neighbour, so the stores above must be visible
-    // before the loop starts; without this barrier the scan races.
+    /*
+     * The first step reads a neighbour, so the stores above must be visible
+     * before the loop starts; without this barrier the scan races.
+     */
     __syncthreads();
 
-    // Inclusive scan over the chunk (Hillis-Steele). The chunk size is the block
-    // size, so each doubling needs one barrier pair and no cross-block combine.
+    /*
+     * Inclusive scan over the chunk (Hillis-Steele). The chunk size is the block
+     * size, so each doubling needs one barrier pair and no cross-block combine.
+     */
     for (int step = 1; step < chunk; step <<= 1) {
         const float other = i >= step ? scan[i - step] : 0.0f;
         __syncthreads();
@@ -208,13 +224,17 @@ std::vector<torch::Tensor> gated_deltanet_fwd(torch::Tensor q,
     const int dim = q.size(3);
     TORCH_CHECK(dim == kHeadDim, "head dim must be ", kHeadDim, " for the prep kernel");
     TORCH_CHECK(chunk == kTile, "the scan kernel needs chunk == ", kTile);
-    // Tiles must cover the sequence exactly: the vector loads below do not
-    // mask, and the caller pads to a multiple of the chunk anyway.
+    /*
+     * Tiles must cover the sequence exactly: the vector loads below do not
+     * mask, and the caller pads to a multiple of the chunk anyway.
+     */
     TORCH_CHECK(seq % kTile == 0, "seq must be a multiple of ", kTile);
 
-    // The layer hands over [B, T, H, D] whose memory is laid out as [B, H, D, T],
-    // so the token axis is the contiguous one. Accepting any other layout would
-    // silently read the wrong elements, so it is checked rather than assumed.
+    /*
+     * The layer hands over [B, T, H, D] whose memory is laid out as [B, H, D, T],
+     * so the token axis is the contiguous one. Accepting any other layout would
+     * silently read the wrong elements, so it is checked rather than assumed.
+     */
     for (const auto* named : {&q, &k, &v}) {
         TORCH_CHECK(named->stride(1) == 1 && named->stride(3) == seq &&
                         named->stride(2) == static_cast<int64_t>(seq) * dim,

@@ -10,21 +10,23 @@
 namespace astrai {
 namespace attention {
 
-// Tensor-core prefill flash attention, unified across contiguous and paged
-// K/V via the KV template parameter; S = Q@K^T and O = P@V run on
-// mma.sync.m16n8k16 (f32 accumulate), one warp owning 16 packed rows.
-//
-// PackGQA head folding (FA3-style): the block's row space is the packed
-// (head, row) space of one kv-head group — packed idx in [0, G*rows) with
-// h = idx % G, m = idx / G. Every block covers BLOCK_M = BR*WARPS packed
-// rows of one host tile, K/V tiles loaded once per block and shared by all
-// G heads' rows; any G packs with zero idle warps (G=6 no longer wastes 25%
-// of every block). Rows past a head's q_len tail are masked per-row; G=1
-// (MHA) degenerates to the unfolded layout.
-//
-// KV = ContigKV<T> or PagedKV<T> (T = Traits::Elem); IsCausal/HasMask are
-// compile-time bools — dead branches eliminated in the compute loop.
-// Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2, Elem>.
+/*
+ * Tensor-core prefill flash attention, unified across contiguous and paged
+ * K/V via the KV template parameter; S = Q@K^T and O = P@V run on
+ * mma.sync.m16n8k16 (f32 accumulate), one warp owning 16 packed rows.
+ *
+ * PackGQA head folding (FA3-style): the block's row space is the packed
+ * (head, row) space of one kv-head group — packed idx in [0, G*rows) with
+ * h = idx % G, m = idx / G. Every block covers BLOCK_M = BR*WARPS packed
+ * rows of one host tile, K/V tiles loaded once per block and shared by all
+ * G heads' rows; any G packs with zero idle warps (G=6 no longer wastes 25%
+ * of every block). Rows past a head's q_len tail are masked per-row; G=1
+ * (MHA) degenerates to the unfolded layout.
+ *
+ * KV = ContigKV<T> or PagedKV<T> (T = Traits::Elem); IsCausal/HasMask are
+ * compile-time bools — dead branches eliminated in the compute loop.
+ * Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2, Elem>.
+ */
 template <typename Traits, typename QSchedule, typename KV, bool IsCausal, bool HasMask>
 __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     using T = typename Traits::Elem;
@@ -38,17 +40,21 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
 
     const int G = p.q_head / p.kv_head;
     const int kv_head = blockIdx.y;
-    // scale * log2(e): the exp2 base-change factor folded into every
-    // softmax exponent (see arith/softmax.cuh).
+    /*
+     * scale * log2(e): the exp2 base-change factor folded into every
+     * softmax exponent (see arith/softmax.cuh).
+     */
     const float scale_log2 = p.scale * LOG2E;
 
     int batch, packed0;
     QSchedule::map_packed_block(p, BLOCK_M, batch, packed0);
 
-    // Warp w folds packed rows [warp*BR, (warp+1)*BR) of the block; each mma
-    // row maps to (head, row-within-head) = (idx % G, idx / G) over the
-    // GLOBAL packed index (a block-local decode would shift the head phase
-    // when BLOCK_M % G != 0).
+    /*
+     * Warp w folds packed rows [warp*BR, (warp+1)*BR) of the block; each mma
+     * row maps to (head, row-within-head) = (idx % G, idx / G) over the
+     * GLOBAL packed index (a block-local decode would shift the head phase
+     * when BLOCK_M % G != 0).
+     */
     const int ia = packed0 + warp * Traits::BR + gid;
     const int ib = ia + 8;
     const int h0 = ia % G;
@@ -62,15 +68,19 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     const int causal_off = KV::causal_offset(p, batch, q_len);
     const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
 
-    // Static shared memory: double-buffered K/V (Q goes straight to
-    // registers in mma A-operand layout).
+    /*
+     * Static shared memory: double-buffered K/V (Q goes straight to
+     * registers in mma A-operand layout).
+     */
     __shared__ __align__(16) T sK[Traits::STAGES * Traits::BC * Traits::LD];
     __shared__ __align__(16) T sV[Traits::STAGES * Traits::BC * Traits::LD];
 
-    // Load Q fragments straight from global into mma A-operand layout.
-    // Row b loads through row a's base when both rows sit in the same head
-    // (always true when 8 | G); a BR straddling a head boundary (G not a
-    // multiple of 8) loads row b through its own base instead.
+    /*
+     * Load Q fragments straight from global into mma A-operand layout.
+     * Row b loads through row a's base when both rows sit in the same head
+     * (always true when 8 | G); a BR straddling a head boundary (G not a
+     * multiple of 8) loads row b through its own base instead.
+     */
     const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
     const bool va = mra < q_len, vb = mrb < q_len;
     const T* qb = (h1 == h0) ? q_gmem + QSchedule::q_base(p, batch, kv_head * G + h0)
@@ -94,9 +104,11 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
 
     const int tiles = (seq_len + Traits::BC - 1) / Traits::BC;
 
-    // Causal tile-skip bounds (dead code when IsCausal == false): the
-    // warp-uniform sweep end covers the warp's deepest in-head row; the
-    // block bound covers the whole block's packed space for the shared loop.
+    /*
+     * Causal tile-skip bounds (dead code when IsCausal == false): the
+     * warp-uniform sweep end covers the warp's deepest in-head row; the
+     * block bound covers the whole block's packed space for the shared loop.
+     */
     const int warp_max_m = (packed0 + (warp + 1) * Traits::BR - 1) / G;
     const int block_max_m = (packed0 + BLOCK_M - 1) / G;
 

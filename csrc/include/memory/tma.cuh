@@ -1,30 +1,32 @@
-// TMA staging vocabulary (sm_90+): the device-side cp.async.bulk.tensor
-// emitters with mbarrier completion, plus the host-side tensor-map
-// encoding and its exact-match cache. Pure CUDA + driver API — no torch.
-//
-// The congruous operand staging this feeds is layout-identical to the
-// cp.async rings it replaces: the staging swizzles are already the TMA
-// hardware modes (Swizzle<3,3> = SWIZZLE_128B for 2-byte elements,
-// Swizzle<2,3> = SWIZZLE_64B for 1-byte — see utils/swizzle.cuh), so
-// fragment addressing, the ring slots and the epilogue reclaim are all
-// unchanged. Two TMA-specific facts the rest of the family respects:
-//
-//   * TMA applies its swizzle to the ABSOLUTE shared-memory address, so a
-//     TMA-fed tile must sit on a 1024B boundary (the 128B-mode pattern
-//     period); the kernel aligns the ring base up and budgets the pad.
-//   * OOB coordinates zero-fill the box (rows past M/N, contract past K),
-//     so the predication the cp.async zfill iterators computed per chunk
-//     collapses into the descriptor's bounds — the k tail included.
-//
-// Host side: cuTensorMapEncodeTiled per (pointer, geometry, box) — a few
-// microseconds — cached exact-match so steady-state serving loops (same
-// activation buffer, same weight) pay it once. The driver symbol is
-// dlsym'd, so neither the CMake link line nor the standalone C tests
-// need -lcuda.
-//
-// All includes live at file scope OUTSIDE namespace astrai: standard
-// headers must never be included inside a namespace (their std::
-// declarations would nest and poison later inclusion).
+/*
+ * TMA staging vocabulary (sm_90+): the device-side cp.async.bulk.tensor
+ * emitters with mbarrier completion, plus the host-side tensor-map
+ * encoding and its exact-match cache. Pure CUDA + driver API — no torch.
+ *
+ * The congruous operand staging this feeds is layout-identical to the
+ * cp.async rings it replaces: the staging swizzles are already the TMA
+ * hardware modes (Swizzle<3,3> = SWIZZLE_128B for 2-byte elements,
+ * Swizzle<2,3> = SWIZZLE_64B for 1-byte — see utils/swizzle.cuh), so
+ * fragment addressing, the ring slots and the epilogue reclaim are all
+ * unchanged. Two TMA-specific facts the rest of the family respects:
+ *
+ *   * TMA applies its swizzle to the ABSOLUTE shared-memory address, so a
+ *     TMA-fed tile must sit on a 1024B boundary (the 128B-mode pattern
+ *     period); the kernel aligns the ring base up and budgets the pad.
+ *   * OOB coordinates zero-fill the box (rows past M/N, contract past K),
+ *     so the predication the cp.async zfill iterators computed per chunk
+ *     collapses into the descriptor's bounds — the k tail included.
+ *
+ * Host side: cuTensorMapEncodeTiled per (pointer, geometry, box) — a few
+ * microseconds — cached exact-match so steady-state serving loops (same
+ * activation buffer, same weight) pay it once. The driver symbol is
+ * dlsym'd, so neither the CMake link line nor the standalone C tests
+ * need -lcuda.
+ *
+ * All includes live at file scope OUTSIDE namespace astrai: standard
+ * headers must never be included inside a namespace (their std::
+ * declarations would nest and poison later inclusion).
+ */
 
 #pragma once
 
@@ -47,17 +49,19 @@
 
 namespace astrai {
 
-// ---------------------------------------------------------------------------
-// Device emitters (sm_90+). Declared unconditionally so both compilation
-// passes can name them (the pipeline.cuh mbarrier pattern); the asm
-// bodies compile away on pre-sm_90 passes, where they must never execute.
-// ---------------------------------------------------------------------------
+/*
+ * Device emitters (sm_90+). Declared unconditionally so both compilation
+ * passes can name them (the pipeline.cuh mbarrier pattern); the asm
+ * bodies compile away on pre-sm_90 passes, where they must never execute.
+ */
 
-// One 2D tiled bulk copy: box (x runs the contract dim, y the row dim)
-// from the descriptor into shared memory, completion counted on `bar`'s
-// transaction bytes. Coordinates are in the map's element units — the
-// host encodes byte-granular dims for operand tiles, so x is a byte
-// offset along K.
+/*
+ * One 2D tiled bulk copy: box (x runs the contract dim, y the row dim)
+ * from the descriptor into shared memory, completion counted on `bar`'s
+ * transaction bytes. Coordinates are in the map's element units — the
+ * host encodes byte-granular dims for operand tiles, so x is a byte
+ * offset along K.
+ */
 DEVICE_FORCEINLINE void tma_load_2d(const void* map, uint64_t* bar, void* smem_dst, int x, int y) {
 #if ASTRAI_TMA_ENABLED
     const unsigned dst = __cvta_generic_to_shared(smem_dst);
@@ -75,8 +79,10 @@ DEVICE_FORCEINLINE void tma_load_2d(const void* map, uint64_t* bar, void* smem_d
 #endif
 }
 
-// 3D form: the batch is the outer map dimension (stride-0 broadcast
-// operands encode as 2D and keep the 2D emitter).
+/*
+ * 3D form: the batch is the outer map dimension (stride-0 broadcast
+ * operands encode as 2D and keep the 2D emitter).
+ */
 DEVICE_FORCEINLINE void
 tma_load_3d(const void* map, uint64_t* bar, void* smem_dst, int x, int y, int z) {
 #if ASTRAI_TMA_ENABLED
@@ -96,9 +102,11 @@ tma_load_3d(const void* map, uint64_t* bar, void* smem_dst, int x, int y, int z)
 #endif
 }
 
-// Typed issue: the rank rides the type, so the per-stage 2D/3D pick is a
-// compile-time branch instead of a runtime flag. `z` is dead in the rank-2
-// form (broadcast operands share one 2D map's coordinates across grid.z).
+/*
+ * Typed issue: the rank rides the type, so the per-stage 2D/3D pick is a
+ * compile-time branch instead of a runtime flag. `z` is dead in the rank-2
+ * form (broadcast operands share one 2D map's coordinates across grid.z).
+ */
 template <bool kRank3>
 DEVICE_FORCEINLINE void
 tma_load(const void* map, uint64_t* bar, void* smem_dst, int x, int y, int z) {
@@ -108,16 +116,18 @@ tma_load(const void* map, uint64_t* bar, void* smem_dst, int x, int y, int z) {
         tma_load_2d(map, bar, smem_dst, x, y);
 }
 
-// ---------------------------------------------------------------------------
-// Host: tensor-map encode (driver API via dlsym) + exact-match cache.
-// Unconditional (both passes parse host functions; the dlsym'd symbol
-// only ever runs on the host).
-// ---------------------------------------------------------------------------
+/*
+ * Host: tensor-map encode (driver API via dlsym) + exact-match cache.
+ * Unconditional (both passes parse host functions; the dlsym'd symbol
+ * only ever runs on the host).
+ */
 
-// Map geometry one operand launch needs. Dim/stride/box units are BYTES
-// along the contract dim (dtype CU_TENSOR_MAP_DATA_TYPE_UINT8): the box's
-// inner extent is then exactly the swizzle span (128B for 2-byte
-// elements, 64B for 1-byte), the constraint SWIZZLE_* imposes.
+/*
+ * Map geometry one operand launch needs. Dim/stride/box units are BYTES
+ * along the contract dim (dtype CU_TENSOR_MAP_DATA_TYPE_UINT8): the box's
+ * inner extent is then exactly the swizzle span (128B for 2-byte
+ * elements, 64B for 1-byte), the constraint SWIZZLE_* imposes.
+ */
 struct TmaMapSpec {
     const void* ptr = nullptr;
     uint64_t dim0 = 0;         // contract extent, bytes (K * elem size)
@@ -135,14 +145,16 @@ struct TmaMapSpec {
     }
 };
 
-// Staging-layout -> map facts: the swizzled staging tiles ARE hardware TMA
-// modes (Swizzle<Bits, 3> members — kTmaMode marks them), so one trait over
-// the declared ComposedLayout carries the swizzle width and the box's inner
-// extent — which SWIZZLE_* pins to the mode's span (16B << Bits). The
-// staging layout is the single source: the map's swizzle enum is decoded
-// from its kBits at encode time, not re-derived from sizeof(Elem) as the
-// hand-built specs once did, which could drift from what the fragments
-// actually read.
+/*
+ * Staging-layout -> map facts: the swizzled staging tiles ARE hardware TMA
+ * modes (Swizzle<Bits, 3> members — kTmaMode marks them), so one trait over
+ * the declared ComposedLayout carries the swizzle width and the box's inner
+ * extent — which SWIZZLE_* pins to the mode's span (16B << Bits). The
+ * staging layout is the single source: the map's swizzle enum is decoded
+ * from its kBits at encode time, not re-derived from sizeof(Elem) as the
+ * hand-built specs once did, which could drift from what the fragments
+ * actually read.
+ */
 template <typename StagedT>
 struct TmaSwizzleOf; // undefined: only swizzled congruous staging feeds TMA
 
@@ -152,10 +164,12 @@ template <typename SwzT, typename LayT> struct TmaSwizzleOf<ComposedLayout<SwzT,
     static constexpr uint32_t kBox0Bytes = 16u << kBits; // the swizzle span
 };
 
-// Host spec for one congruous staged operand: the compile-time facts (map
-// dtype facts through the swizzle trait above, box rows through the tile)
-// ride the type; only the runtime geometry (extents / strides / batch)
-// fills the struct. `rows` is M for A, N for B.
+/*
+ * Host spec for one congruous staged operand: the compile-time facts (map
+ * dtype facts through the swizzle trait above, box rows through the tile)
+ * ride the type; only the runtime geometry (extents / strides / batch)
+ * fills the struct. `rows` is M for A, N for B.
+ */
 template <typename ElemT, typename StagedT, int kBoxRows>
 TmaMapSpec
 tma_spec(const void* ptr, int64_t rows, int64_t k, int64_t ld, int batch, int64_t batch_stride) {
@@ -207,26 +221,30 @@ inline bool tma_encode(const TmaMapSpec& s, CUtensorMap* map) {
     const cuuint64_t strides[2] = {s.stride1, rank3 ? s.batch_stride : (cuuint64_t)16};
     const cuuint32_t box[3] = {s.box0, s.box1, 1};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
-    // Hardware swizzle modes exist at 128B and 64B only. A staging layout
-    // narrower than that has no map to encode: one byte per element halves a
-    // line's chunk count, so kK=32 gives Swizzle<1, 3>. Degrading such a tile
-    // to SWIZZLE_NONE used to encode *successfully* while every fragment
-    // reader kept applying the layout's XOR — the two 16-element k-chunks of
-    // each row came out exchanged, silently (measured 2026-09-21: the W8A16
-    // and symmetric-fp8 kK=32 congruous tiles, max abs error ~0.7 on outputs
-    // of sigma ~0.1, while the cp.async twin of the same recipe was exact).
-    // Refuse the map instead, so the caller stages through that twin: it
-    // writes through the layout, and an absent [gemm-plan] tma=true line says
-    // so.
+    /*
+     * Hardware swizzle modes exist at 128B and 64B only. A staging layout
+     * narrower than that has no map to encode: one byte per element halves a
+     * line's chunk count, so kK=32 gives Swizzle<1, 3>. Degrading such a tile
+     * to SWIZZLE_NONE used to encode *successfully* while every fragment
+     * reader kept applying the layout's XOR — the two 16-element k-chunks of
+     * each row came out exchanged, silently (measured 2026-09-21: the W8A16
+     * and symmetric-fp8 kK=32 congruous tiles, max abs error ~0.7 on outputs
+     * of sigma ~0.1, while the cp.async twin of the same recipe was exact).
+     * Refuse the map instead, so the caller stages through that twin: it
+     * writes through the layout, and an absent [gemm-plan] tma=true line says
+     * so.
+     */
     if (s.swizzle_bits != 3 && s.swizzle_bits != 2)
         return false;
     const CUtensorMapSwizzle swz =
         s.swizzle_bits == 3 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
-    // The box's inner extent IS the swizzle span (16B << bits): these staging
-    // layouts are full-line swizzled. Redundant with the trait today — it
-    // derives both from one kBits — but the hand-built specs this layer once
-    // accepted could drift from what the fragments read, so the invariant
-    // stays stated (and cheap) at the encode boundary.
+    /*
+     * The box's inner extent IS the swizzle span (16B << bits): these staging
+     * layouts are full-line swizzled. Redundant with the trait today — it
+     * derives both from one kBits — but the hand-built specs this layer once
+     * accepted could drift from what the fragments read, so the invariant
+     * stays stated (and cheap) at the encode boundary.
+     */
     if (s.box0 != (16u << s.swizzle_bits))
         return false;
     const CUresult r =
@@ -236,23 +254,25 @@ inline bool tma_encode(const TmaMapSpec& s, CUtensorMap* map) {
     return r == CUDA_SUCCESS;
 }
 
-// Exact-match descriptor cache: steady-state calls (same tensors, same
-// tile) hit; a rotating buffer (dynamic M) cycles the small ring. The
-// CUtensorMap is a POD the launcher copies into the kernel parameter.
-//
-// The descriptor is returned BY VALUE, and that is load-bearing. A miss
-// overwrites the ring's oldest slot, and a hit can hand back the very slot
-// the next miss is about to reuse — so a pointer into the ring is only
-// valid until the following lookup, not for the caller's lifetime. The
-// operand pair is exactly two lookups: holding A's pointer across B's let
-// B's eviction rewrite A in place, and both operands then went out as the
-// same map. That is not a wrong answer a cheap test catches — the A tile's
-// TMA transfers B's box, the byte count stops matching the pipeline's
-// expected transaction, and the mbarrier never completes (measured
-// 2026-09-14: hard hang on w8a8 m=1 n=6144 k=1536 with the 128x64x64 s2
-// tile, reproducible on devices 0-3, absent under compute-sanitizer
-// because its allocator shifts the operand addresses and rotates the ring
-// differently).
+/*
+ * Exact-match descriptor cache: steady-state calls (same tensors, same
+ * tile) hit; a rotating buffer (dynamic M) cycles the small ring. The
+ * CUtensorMap is a POD the launcher copies into the kernel parameter.
+ *
+ * The descriptor is returned BY VALUE, and that is load-bearing. A miss
+ * overwrites the ring's oldest slot, and a hit can hand back the very slot
+ * the next miss is about to reuse — so a pointer into the ring is only
+ * valid until the following lookup, not for the caller's lifetime. The
+ * operand pair is exactly two lookups: holding A's pointer across B's let
+ * B's eviction rewrite A in place, and both operands then went out as the
+ * same map. That is not a wrong answer a cheap test catches — the A tile's
+ * TMA transfers B's box, the byte count stops matching the pipeline's
+ * expected transaction, and the mbarrier never completes (measured
+ * 2026-09-14: hard hang on w8a8 m=1 n=6144 k=1536 with the 128x64x64 s2
+ * tile, reproducible on devices 0-3, absent under compute-sanitizer
+ * because its allocator shifts the operand addresses and rotates the ring
+ * differently).
+ */
 class TmaMapCache {
   public:
     std::optional<CUtensorMap> lookup(const TmaMapSpec& s) {

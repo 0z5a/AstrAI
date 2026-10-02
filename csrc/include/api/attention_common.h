@@ -5,9 +5,11 @@
 namespace astrai {
 namespace attention {
 
-// Tensor layout for Q/K/V tensors passed to attention kernels.
-// Internally, kernels always operate on BHLD [batch, n_heads, seq_len, head_dim].
-// When the caller passes BLHD, dims 1 and 2 are transposed at entry.
+/*
+ * Tensor layout for Q/K/V tensors passed to attention kernels.
+ * Internally, kernels always operate on BHLD [batch, n_heads, seq_len, head_dim].
+ * When the caller passes BLHD, dims 1 and 2 are transposed at entry.
+ */
 enum TensorLayout : int {
     BHLD = 0, // [batch, n_heads, seq_len, head_dim]
     BLHD = 1, // [batch, seq_len, n_heads, head_dim]
@@ -16,37 +18,43 @@ enum TensorLayout : int {
 // Split-KV workspace cap: max decode splits per (batch, q_head).
 constexpr int MAX_SPLITS = 32;
 
-// Paged-prefill host Q-tile granularity in q rows: one q_tile_to_index unit
-// covers this many query rows of one request.  Must match Q_TILE_ROWS in
-// astrai/inference/workspace.py, which builds the device-side tile maps.
+/*
+ * Paged-prefill host Q-tile granularity in q rows: one q_tile_to_index unit
+ * covers this many query rows of one request.  Must match Q_TILE_ROWS in
+ * astrai/inference/workspace.py, which builds the device-side tile maps.
+ */
 constexpr int HOST_Q_TILE_ROWS = 64;
 
-// log2(e), the exp2 base-change constant the softmax kernels fold into
-// every exp2 exponent (one FFMA feeding MUFU.EX2 per weight; design in
-// arith/softmax.cuh). Kernels compute scale_log2 = p.scale * LOG2E at entry.
+/*
+ * log2(e), the exp2 base-change constant the softmax kernels fold into
+ * every exp2 exponent (one FFMA feeding MUFU.EX2 per weight; design in
+ * arith/softmax.cuh). Kernels compute scale_log2 = p.scale * LOG2E at entry.
+ */
 constexpr float LOG2E = 1.44269504088896340736f;
 
-// Unified attention params covering BOTH addressing modes:
-//   - Contiguous K/V: dense [batch, kv_head, kv_len, head_dim] tensors (k/v).
-//   - Paged (SGLang-style): flat pool [size, kv_head, head_dim] + req_to_token.
-// Each kernel selects the addressing via a KVSource policy (see
-// layout_policies.cuh); a given call only touches the fields of one mode, so
-// this is a POD shared by both paths rather than two parallel structs that
-// drift out of sync.
-//
-// Dtype-agnostic by design: q/k/v/o pointers are void* and the element type is
-// a compile-time kernel parameter, so ONE struct (and one packer) serves every
-// precision. Each instantiation casts these pointers once at entry (through the
-// KV policy's Elem); device code never branches on a dtype, and nothing in the
-// struct has to name one.
-//
-// Pointer/flag members carry default member initializers: the pointers gate
-// optional paths via null checks (new_k_ptr, mask, o_part, ...), so a stack
-// `AttentionParams p;` left partially packed must never see garbage
-// non-null pointers or a garbage use_mask/causal_offset — that class of bug
-// reads through wild addresses. NSDMI keeps the struct an aggregate (C++17)
-// and trivially copyable, so `= {}`, memcpy-style packing and by-value kernel
-// params all behave exactly as before.
+/*
+ * Unified attention params covering BOTH addressing modes:
+ *   - Contiguous K/V: dense [batch, kv_head, kv_len, head_dim] tensors (k/v).
+ *   - Paged (SGLang-style): flat pool [size, kv_head, head_dim] + req_to_token.
+ * Each kernel selects the addressing via a KVSource policy (see
+ * layout_policies.cuh); a given call only touches the fields of one mode, so
+ * this is a POD shared by both paths rather than two parallel structs that
+ * drift out of sync.
+ *
+ * Dtype-agnostic by design: q/k/v/o pointers are void* and the element type is
+ * a compile-time kernel parameter, so ONE struct (and one packer) serves every
+ * precision. Each instantiation casts these pointers once at entry (through the
+ * KV policy's Elem); device code never branches on a dtype, and nothing in the
+ * struct has to name one.
+ *
+ * Pointer/flag members carry default member initializers: the pointers gate
+ * optional paths via null checks (new_k_ptr, mask, o_part, ...), so a stack
+ * `AttentionParams p;` left partially packed must never see garbage
+ * non-null pointers or a garbage use_mask/causal_offset — that class of bug
+ * reads through wild addresses. NSDMI keeps the struct an aggregate (C++17)
+ * and trivially copyable, so `= {}`, memcpy-style packing and by-value kernel
+ * params all behave exactly as before.
+ */
 struct AttentionParams {
     // Shape
     int batch;

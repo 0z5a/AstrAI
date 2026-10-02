@@ -3,8 +3,10 @@
 #include <api/attention.h>
 #include <api/attention_common.h>
 
-// The attention family's whole pybind surface: four entries, one module
-// (`attention`) — a single PYBIND block, one def per api/attention.h entry.
+/*
+ * The attention family's whole pybind surface: four entries, one module
+ * (`attention`) — a single PYBIND block, one def per api/attention.h entry.
+ */
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attn_decode", &astrai::attention::attn_decode, py::arg("q"), py::arg("k"), py::arg("v"),

@@ -118,14 +118,16 @@ template <typename P> inline void set_default_strides(P& p) {
     p.mask_l_stride = 0;
 }
 
-// Generic CPU reference for multi-query / grouped-query attention.
-// Tensor shapes (all float*):
-//   Q : [B, Hq, q_len, D]
-//   K : [B, Hk, kv_len, D]
-//   V : [B, Hk, kv_len, D]
-//   O : [B, Hq, q_len, D]
-// mask: if q_len == 1, shape is [B, kv_len]; otherwise mask is not supported.
-// causal_offset: -1 = non-causal; >=0 = absolute position of first Q token.
+/*
+ * Generic CPU reference for multi-query / grouped-query attention.
+ * Tensor shapes (all float*):
+ *   Q : [B, Hq, q_len, D]
+ *   K : [B, Hk, kv_len, D]
+ *   V : [B, Hk, kv_len, D]
+ *   O : [B, Hq, q_len, D]
+ * mask: if q_len == 1, shape is [B, kv_len]; otherwise mask is not supported.
+ * causal_offset: -1 = non-causal; >=0 = absolute position of first Q token.
+ */
 static void cpu_attention_ref(const float* Q,
                               const float* K,
                               const float* V,

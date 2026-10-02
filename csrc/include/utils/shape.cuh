@@ -1,10 +1,12 @@
-// Static-geometry vocabulary (cute's Shape<> role), shared by every kernel
-// family: one variadic type names one geometry, wherever a compile-time
-// extent list is needed — the gemm policy's CTA tile Shape<M, N, K> and
-// warp tile Shape<M, N>, the staging layouts' chunk grid Shape<Rows,
-// Chunks>, the mma trait layer's instruction Shape<16, 8, 32>. Extracted
-// from swizzle.cuh (which composes layouts over it) so the mma/policy/
-// epilogue layers spell it without pulling the swizzle machinery in.
+/*
+ * Static-geometry vocabulary (cute's Shape<> role), shared by every kernel
+ * family: one variadic type names one geometry, wherever a compile-time
+ * extent list is needed — the gemm policy's CTA tile Shape<M, N, K> and
+ * warp tile Shape<M, N>, the staging layouts' chunk grid Shape<Rows,
+ * Chunks>, the mma trait layer's instruction Shape<16, 8, 32>. Extracted
+ * from swizzle.cuh (which composes layouts over it) so the mma/policy/
+ * epilogue layers spell it without pulling the swizzle machinery in.
+ */
 
 #pragma once
 
@@ -16,8 +18,10 @@ template <int Acc> struct log2_const<1, Acc> {
     static constexpr int value = Acc;
 };
 
-// Static integer shape: kM/kN/kK read the leading extents (missing ones
-// read 0), so tile recipes and instruction shapes share one spelling.
+/*
+ * Static integer shape: kM/kN/kK read the leading extents (missing ones
+ * read 0), so tile recipes and instruction shapes share one spelling.
+ */
 template <int... Ns> struct Shape {
     static constexpr int kRank = sizeof...(Ns);
     static constexpr int kVals[kRank ? kRank : 1] = {Ns...};

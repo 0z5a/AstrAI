@@ -1,7 +1,9 @@
-// W16A16 instantiation unit: bf16 x bf16 (no scales). One explicit
-// gemm_dispatch instantiation per unit keeps the heavy template work in
-// parallel nvcc jobs; gemm.cu addresses the specialization through its
-// extern template declarations.
+/*
+ * W16A16 instantiation unit: bf16 x bf16 (no scales). One explicit
+ * gemm_dispatch instantiation per unit keeps the heavy template work in
+ * parallel nvcc jobs; gemm.cu addresses the specialization through its
+ * extern template declarations.
+ */
 #include <kernel/gemm.cuh>
 
 namespace astrai {
