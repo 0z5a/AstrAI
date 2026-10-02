@@ -22,14 +22,6 @@ FINISH_CANCELLED = "cancelled"  # user cancelled before completion
 FINISH_ABORTED = "aborted"  # engine-side termination (KV cap…)
 FINISH_REJECTED = "rejected"  # request refused before running
 
-_REASONS = {
-    FINISH_STOP_TOKEN,
-    FINISH_LENGTH,
-    FINISH_CANCELLED,
-    FINISH_ABORTED,
-    FINISH_REJECTED,
-}
-
 
 @dataclass(frozen=True)
 class TokenDelta:
@@ -68,9 +60,3 @@ class RequestError:
     message: str
     retryable: bool = False
     finish_reason: str = FINISH_ABORTED
-
-
-def validate_finish_reason(reason: str) -> str:
-    if reason not in _REASONS:
-        raise ValueError(f"unknown finish reason: {reason!r}")
-    return reason

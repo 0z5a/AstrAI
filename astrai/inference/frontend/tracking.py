@@ -11,6 +11,11 @@ from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from astrai.inference.core.events import (
+    FINISH_ABORTED,
+    FINISH_CANCELLED,
+    FINISH_LENGTH,
+    FINISH_REJECTED,
+    FINISH_STOP_TOKEN,
     RequestError,
     RequestFinished,
 )
@@ -233,13 +238,11 @@ class StreamChunk:
 
 def map_finish_reason(reason: Optional[str]) -> str:
     """Internal event reasons → protocol-neutral finish vocabulary."""
-    from astrai.inference.core import events as _events
-
     mapping = {
-        _events.FINISH_STOP_TOKEN: "stop",
-        _events.FINISH_LENGTH: "length",
-        _events.FINISH_CANCELLED: "cancelled",
-        _events.FINISH_ABORTED: "aborted",
-        _events.FINISH_REJECTED: "rejected",
+        FINISH_STOP_TOKEN: "stop",
+        FINISH_LENGTH: "length",
+        FINISH_CANCELLED: "cancelled",
+        FINISH_ABORTED: "aborted",
+        FINISH_REJECTED: "rejected",
     }
     return mapping.get(reason or "", "stop")

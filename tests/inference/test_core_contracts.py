@@ -17,26 +17,17 @@ from astrai.inference.contracts import (
 from astrai.inference.core.engine_core import EngineCore
 from astrai.inference.core.events import RequestError, RequestFinished, TokenDelta
 from astrai.inference.core.request import Request
-from astrai.inference.core.scheduler import Scheduler
 from astrai.inference.worker.pending import PendingExecution, ResultRing
-from astrai.model.transformer import AutoRegressiveLM
-from tests.helpers import FakeTokenizer, make_rollout_config
+from tests.helpers import FakeTokenizer
+from tests.inference.conftest import make_cpu_model, make_cpu_scheduler
 
 
 @pytest.fixture
 def scheduler():
-    model = AutoRegressiveLM(make_rollout_config(max_position_embeddings=64)).eval()
+    model = make_cpu_model()
     tokenizer = FakeTokenizer()
     tokenizer.stop_ids = [0]
-    sched = Scheduler(
-        model,
-        tokenizer,
-        max_batch_size=4,
-        max_seq_len=64,
-        device="cpu",
-        enable_cuda_graph=False,
-        backend="torch_native",
-    )
+    sched = make_cpu_scheduler(model, tokenizer, max_batch_size=4, device="cpu")
     events = []
     sched.set_event_sink(events.extend)
     yield sched, events
@@ -413,7 +404,7 @@ def test_start_waits_for_weight_mutation(scheduler):
 def test_overlap_rebuilds_shrunken_plan_after_committing_old_history():
     outputs = []
     for overlap in (False, True):
-        model = AutoRegressiveLM(make_rollout_config(max_position_embeddings=64)).eval()
+        model = make_cpu_model()
 
         def forward(ids, *, logits_positions=None, **kwargs):
             ids = ids.reshape(-1)
@@ -426,13 +417,10 @@ def test_overlap_rebuilds_shrunken_plan_after_committing_old_history():
         model.forward = forward
         tokenizer = FakeTokenizer()
         tokenizer.stop_ids = []
-        sched = Scheduler(
+        sched = make_cpu_scheduler(
             model,
             tokenizer,
             max_batch_size=2,
-            max_seq_len=64,
-            enable_cuda_graph=False,
-            backend="torch_native",
             page_size=1,
             kv_tokens=5,
             enable_overlap=overlap,
@@ -488,7 +476,6 @@ def test_online_forward_and_fence_failure_still_emits_one_error(scheduler):
     "kwargs",
     [
         {"request_ids": ["dup", "dup"]},
-        {"stream_callbacks": [None]},
         {"prompts_ids": [[10]]},
     ],
 )
@@ -512,5 +499,5 @@ def test_duplicate_existing_batch_id_does_not_enqueue_valid_prefix(scheduler):
             ["a", "b"], request_ids=["new", "live"], prompts_ids=[[10], [11]]
         )
     assert set(sched._states) == {rid}
-    assert [r.request_id for r in sched._requests.get_waiting_requests()] == [rid]
+    assert [r.request_id for r in sched._requests.waiting] == [rid]
     assert sched.cancel_request(rid)

@@ -9,14 +9,18 @@ import torch
 from torch.utils.data import Dataset
 
 from astrai.config import TrainConfig
-from astrai.model.transformer import AutoRegressiveLM
-from astrai.model.value import ValueModel
 from astrai.serialization import Checkpoint
 from astrai.trainer import train_context
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
 from tests.helpers import CHAT_TEMPLATE
+from tests.trainer.conftest import (
+    make_online_lr_scheduler,
+    make_online_model,
+    make_online_optimizer,
+    make_online_value_model,
+)
 
 
 class InstructionDataset(Dataset):
@@ -66,24 +70,6 @@ def instruction_collate_fn(batch):
         "instruction": [b["instruction"] for b in batch],
         "input": [b.get("input", "") for b in batch],
     }
-
-
-def _model_fn(model_config):
-    return AutoRegressiveLM(model_config).to(dtype=torch.float32)
-
-
-def _value_model_fn(model_config):
-    return ValueModel(model_config).to(dtype=torch.float32)
-
-
-def _optimizer_fn(m):
-    return torch.optim.AdamW(m.parameters(), lr=1e-4)
-
-
-def _scheduler_fn(optim):
-    return SchedulerFactory.create(
-        "cosine", optim, warmup_steps=1, lr_decay_steps=4, min_rate=0.05
-    )
 
 
 _ONLINE_STRATEGIES = [
@@ -139,10 +125,10 @@ def test_online_rollout_end_to_end(
 
     config_kwargs = dict(
         strategy=strategy,
-        model_fn=partial(_model_fn, model_config),
+        model_fn=partial(make_online_model, model_config),
         dataset=InstructionDataset(),
-        optimizer_fn=_optimizer_fn,
-        scheduler_fn=_scheduler_fn,
+        optimizer_fn=make_online_optimizer,
+        scheduler_fn=make_online_lr_scheduler,
         ckpt_dir=os.path.join(test_dir, "ckpt"),
         n_epoch=1,
         batch_per_device=2,
@@ -162,8 +148,10 @@ def test_online_rollout_end_to_end(
         collate_fn=instruction_collate_fn,
     )
     if with_critic:
-        config_kwargs["critic_model_fn"] = partial(_value_model_fn, model_config)
-        config_kwargs["critic_optimizer_fn"] = _optimizer_fn
+        config_kwargs["critic_model_fn"] = partial(
+            make_online_value_model, model_config
+        )
+        config_kwargs["critic_optimizer_fn"] = make_online_optimizer
     train_config = TrainConfig(**config_kwargs)
 
     trainer = Trainer(train_config)
@@ -233,10 +221,10 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
     dataset = InstructionDataset(repeats=10)
     train_config = TrainConfig(
         strategy="online_grpo",
-        model_fn=partial(_model_fn, model_config),
+        model_fn=partial(make_online_model, model_config),
         dataset=dataset,
-        optimizer_fn=_optimizer_fn,
-        scheduler_fn=_scheduler_fn,
+        optimizer_fn=make_online_optimizer,
+        scheduler_fn=make_online_lr_scheduler,
         ckpt_dir=os.path.join(test_dir, "ckpt"),
         n_epoch=1,
         batch_per_device=1,

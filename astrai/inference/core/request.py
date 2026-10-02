@@ -1,14 +1,12 @@
 import threading
 import time
 import uuid
-from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Deque,
     Dict,
     List,
@@ -27,7 +25,6 @@ from astrai.tokenize.tokenizer import AutoTokenizer
 if TYPE_CHECKING:
     from astrai.extension import AttentionBackend
 
-STOP = object()
 _config = InferenceConfig()
 
 
@@ -147,26 +144,6 @@ class Request:
             backend=self.backend,
         )
 
-    def mark_prefill_complete(self):
-        """Prompt KV is materialized by prefill; first output sampled but
-        not yet written to KV."""
-        self.num_computed_tokens = self.input_tokens
-
-    def advance_kv(self, n: int = 1):
-        """``n`` more positions written to KV (decode steps pass 1;
-        a prefill continuation chunk passes its window length)."""
-        self.num_computed_tokens += n
-
-    def decode_next_token(self, tokenizer: AutoTokenizer) -> str:
-        """Decode the last appended output token, buffering incomplete
-        multi-byte sequences across calls.
-
-        Lazily creates a :class:`StreamDecoder` on first use.
-        """
-        if self._decoder is None:
-            self._decoder = StreamDecoder(tokenizer)
-        return self._decoder.push(self.output_ids[-1])
-
     @property
     def next_pos(self) -> int:
         """KV position where the next decode step will write."""
@@ -186,22 +163,6 @@ class Request:
         return False
 
 
-class BatchedStreamCallback(ABC):
-    """Stream sink that receives a whole scheduler step's events in one call.
-
-    The scheduling loop dispatches once per decode step: every
-    ``(request_id, token)`` event routed to the same sink object is delivered
-    as a single list, so batch-aware consumers take their lock and wake
-    waiters once per step instead of once per token. Plain per-token
-    callbacks keep the ``Callable[[str], None]`` contract.
-    """
-
-    @abstractmethod
-    def __call__(self, events: List[Tuple[str, Any]]) -> None:
-        """Consume ``[(request_id, token), ...]`` produced by one decode step."""
-        raise NotImplementedError
-
-
 class RequestManager:
     """Thread-safe request queues and lifecycle transitions (no page ops)."""
 
@@ -218,7 +179,6 @@ class RequestManager:
 
         self.waiting: Deque[Request] = deque()
         self.running: List[Request] = []
-        self._callbacks: Dict[str, Callable[[str], None]] = {}
         self._requests: Dict[str, Request] = {}
 
         self._request_event = threading.Event()
@@ -240,7 +200,6 @@ class RequestManager:
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
         backend: Optional["AttentionBackend"] = None,
-        stream_callback: Optional[Callable[[str], None]] = None,
         request_id: Optional[str] = None,
         prompt_ids: Optional[List[int]] = None,
     ) -> str:
@@ -276,7 +235,7 @@ class RequestManager:
             backend=backend,
         )
 
-        self._register_request(request, stream_callback)
+        self._register_request(request)
         return request_id
 
     def add_requests(
@@ -289,7 +248,6 @@ class RequestManager:
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
         backend: Optional["AttentionBackend"] = None,
-        stream_callbacks: Optional[List[Optional[Callable[[str], None]]]] = None,
         request_ids: Optional[List[str]] = None,
         prompts_ids: Optional[List[List[int]]] = None,
     ) -> List[str]:
@@ -317,8 +275,6 @@ class RequestManager:
                 raise ValueError("batch tokenizer returned unexpected shape")
         if request_ids is not None and len(request_ids) != len(prompts):
             raise ValueError("request_ids must match prompts in length")
-        if stream_callbacks is not None and len(stream_callbacks) != len(prompts):
-            raise ValueError("stream_callbacks must match prompts in length")
 
         request_ids_out: List[str] = []
         requests: List[Request] = []
@@ -354,9 +310,6 @@ class RequestManager:
             requests.append(request)
             request_ids_out.append(request_id)
 
-        callbacks = (
-            stream_callbacks if stream_callbacks is not None else [None] * len(requests)
-        )
         # Validate and install the whole batch in one critical section. A
         # duplicate later in the batch must not leave an unowned prefix queued.
         with self._lock:
@@ -364,52 +317,34 @@ class RequestManager:
                 raise ValueError("duplicate request ids in batch")
             if any(rid in self._requests for rid in request_ids_out):
                 raise ValueError("duplicate live request id in batch")
-            for request, callback in zip(requests, callbacks):
+            for request in requests:
                 self.waiting.append(request)
                 self._requests[request.request_id] = request
                 self._total_requests += 1
-                if callback is not None:
-                    self._callbacks[request.request_id] = callback
                 if self._metrics is not None:
                     self._metrics.register(request.request_id)
         self._request_event.set()
         return request_ids_out
 
-    def _register_request(self, request: "Request", stream_callback=None) -> None:
+    def _register_request(self, request: "Request") -> None:
         with self._lock:
             if request.request_id in self._requests:
                 raise ValueError(f"duplicate live request id: {request.request_id}")
             self.waiting.append(request)
             self._requests[request.request_id] = request
             self._total_requests += 1
-            if stream_callback:
-                self._callbacks[request.request_id] = stream_callback
 
         if self._metrics is not None:
             self._metrics.register(request.request_id)
 
         self._request_event.set()
 
-    def cancel_request(
-        self, request_id: str, *, notify_callback: bool = True
-    ) -> Tuple[List[Request], bool]:
-        """Mark a request cancelled and return requests safe to clean immediately.
-
-        Registered stream callbacks receive the terminal ``STOP`` sentinel
-        for every live cancellation: the scheduling loop drains ABORTED
-        requests without invoking callbacks, so skipping it here would leave
-        consumers (e.g. ``GenerateResult.wait_completion``) waiting forever.
-        """
-        callback = None
+    def cancel_request(self, request_id: str) -> Tuple[List[Request], bool]:
+        """Mark a request cancelled and return requests safe to clean immediately."""
         cancelled = False
         immediate: List[Request] = []
         with self._lock:
             request = self._requests.get(request_id)
-            callback = (
-                self._callbacks.pop(request_id, None)
-                if notify_callback
-                else self._callbacks.get(request_id)
-            )
             if request is None or request.status in (
                 RequestStatus.FINISHED,
                 RequestStatus.ABORTED,
@@ -426,40 +361,7 @@ class RequestManager:
                 self._requests.pop(request_id, None)
                 immediate = [request]
 
-        if cancelled and notify_callback and callback is not None:
-            if isinstance(callback, BatchedStreamCallback):
-                callback([(request_id, STOP)])
-            else:
-                callback(STOP)
         return immediate, cancelled
-
-    def invoke_callbacks(self, events: List[Tuple[str, Any]]) -> None:
-        """Dispatch one decode step's ``(request_id, token)`` events.
-
-        Callbacks resolve under a single lock acquisition; events aimed at
-        the same batched sink are delivered as one list (one consumer-side
-        lock/notify per step), while plain per-token callbacks receive one
-        call per event.
-        """
-        grouped: Dict[int, Tuple[BatchedStreamCallback, List[Any]]] = {}
-        plain: List[Tuple[Callable[[str], None], Any]] = []
-        with self._lock:
-            for request_id, token in events:
-                cb = self._callbacks.get(request_id)
-                if cb is None:
-                    continue
-                if isinstance(cb, BatchedStreamCallback):
-                    entry = grouped.get(id(cb))
-                    if entry is None:
-                        grouped[id(cb)] = (cb, [(request_id, token)])
-                    else:
-                        entry[1].append((request_id, token))
-                else:
-                    plain.append((cb, token))
-        for cb, batch in grouped.values():
-            cb(batch)
-        for cb, token in plain:
-            cb(token)
 
     def get_stats(self) -> Dict[str, Any]:
         with self._lock:
@@ -476,33 +378,6 @@ class RequestManager:
             stats.update(self._metrics.get_stats())
         return stats
 
-    def remove_finished_requests(self, stop_ids: List[int]) -> List[Request]:
-        with self._lock:
-            finished = []
-            for request in self.running:
-                if request.status == RequestStatus.ABORTED:
-                    finished.append(request)
-                elif request.is_finished(stop_ids):
-                    request.status = RequestStatus.FINISHED
-                    finished.append(request)
-                    self._total_tokens += request.output_tokens
-
-            self.running = [
-                t
-                for t in self.running
-                if t.status not in (RequestStatus.FINISHED, RequestStatus.ABORTED)
-            ]
-            for request in finished:
-                self._requests.pop(request.request_id, None)
-                self._callbacks.pop(request.request_id, None)
-
-        if self._metrics is not None:
-            for request in finished:
-                self._metrics.mark_finished(
-                    request.request_id, request.input_tokens, request.output_tokens
-                )
-        return finished
-
     def pull_waiting(self, n: int) -> List[Request]:
         to_add: List[Request] = []
         with self._lock:
@@ -515,7 +390,6 @@ class RequestManager:
         with self._lock:
             if request.status == RequestStatus.ABORTED:
                 self._requests.pop(request.request_id, None)
-                self._callbacks.pop(request.request_id, None)
                 return False
             request.status = RequestStatus.RUNNING
             self.running.append(request)
@@ -531,7 +405,6 @@ class RequestManager:
         with self._lock:
             for request in requests:
                 self._requests.pop(request.request_id, None)
-                self._callbacks.pop(request.request_id, None)
 
     def return_to_waiting(self, requests: List[Request]):
         cancelled = []
@@ -539,7 +412,6 @@ class RequestManager:
             for request in reversed(requests):
                 if request.status == RequestStatus.ABORTED:
                     self._requests.pop(request.request_id, None)
-                    self._callbacks.pop(request.request_id, None)
                     cancelled.append(request)
                 else:
                     self.waiting.appendleft(request)
@@ -564,10 +436,6 @@ class RequestManager:
         with self._lock:
             return list(self.running)
 
-    def get_waiting_requests(self) -> List[Request]:
-        with self._lock:
-            return list(self.waiting)
-
     def get_request(self, request_id: str) -> Optional[Request]:
         with self._lock:
             return self._requests.get(request_id)
@@ -579,15 +447,7 @@ class RequestManager:
             self.running = [r for r in self.running if r is not request]
             if self._requests.get(request.request_id) is request:
                 self._requests.pop(request.request_id, None)
-            self._callbacks.pop(request.request_id, None)
             self._total_tokens += request.output_tokens
-
-    def clear_queues(self):
-        with self._lock:
-            self.waiting.clear()
-            self.running.clear()
-            self._callbacks.clear()
-            self._requests.clear()
 
     def wake(self):
         self._request_event.set()

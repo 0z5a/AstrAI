@@ -10,15 +10,19 @@ rank's gradient is already the exact single-device gradient of its chunk:
 comparisons are local, no cross-rank reduction is needed.
 """
 
+from fnmatch import fnmatch
+
 import pytest
 import torch
 import torch.distributed as dist
 
+from astrai.model.components.linear import Linear
 from astrai.model.transformer import AutoRegressiveLM
+from astrai.parallel.setup import spawn_parallel_fn
 from astrai.parallel.topology import ParallelTopology
 from astrai.parallel.tp import DEFAULT_TP_PLAN, TPState
 from tests.conftest import skip_lt2_cuda
-from tests.helpers import make_tiny_config
+from tests.helpers import make_seeded_gqa_model, make_tiny_config
 
 SEQ_LEN = 64
 BATCH = 2
@@ -36,17 +40,7 @@ _SHARD_DIMS = {
 
 
 def _build_model(device):
-    torch.manual_seed(3407)
-    cfg = make_tiny_config(
-        hidden_size=128,
-        intermediate_size=256,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=SEQ_LEN,
-    )
-    model = AutoRegressiveLM(cfg).to(device=device)
-    model.train()
-    return model
+    return make_seeded_gqa_model(device, max_position_embeddings=SEQ_LEN)
 
 
 def _reference(model, input_ids, target_ids):
@@ -123,8 +117,6 @@ def _tp_equivalence_worker():
 
 @skip_lt2_cuda
 def test_tp2_matches_single_device():
-    from astrai.parallel.setup import spawn_parallel_fn
-
     spawn_parallel_fn(_tp_equivalence_worker, world_size=2)
 
 
@@ -150,17 +142,11 @@ def _plan_validation_worker():
 
 @skip_lt2_cuda
 def test_tp_plan_validation():
-    from astrai.parallel.setup import spawn_parallel_fn
-
     spawn_parallel_fn(_plan_validation_worker, world_size=2)
 
 
 def test_default_plan_covers_standard_layout():
     """The default plan touches every projection and nothing else."""
-    from fnmatch import fnmatch
-
-    from astrai.model.components.linear import Linear
-
     model = AutoRegressiveLM(make_tiny_config())
     matched = [
         name

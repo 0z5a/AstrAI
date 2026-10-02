@@ -2,8 +2,29 @@ import pytest
 import torch
 
 from astrai.config import TrainConfig
+from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.value import ValueModel
 from astrai.trainer.schedule import SchedulerFactory
 from tests.helpers import RandomTokenDataset
+
+
+def make_online_model(model_config):
+    """Tiny float32 LM for online-rollout tests (shared by e2e/scheduling)."""
+    return AutoRegressiveLM(model_config).to(dtype=torch.float32)
+
+
+def make_online_value_model(model_config):
+    return ValueModel(model_config).to(dtype=torch.float32)
+
+
+def make_online_optimizer(m):
+    return torch.optim.AdamW(m.parameters(), lr=1e-4)
+
+
+def make_online_lr_scheduler(optim):
+    return SchedulerFactory.create(
+        "cosine", optim, warmup_steps=1, lr_decay_steps=4, min_rate=0.05
+    )
 
 
 def create_train_config(

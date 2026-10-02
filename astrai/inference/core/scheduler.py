@@ -12,7 +12,6 @@ import torch
 from astrai.config.inference_config import InferenceConfig
 from astrai.extension import ATTN_BACKEND, AttentionBackend, attn_backend, get_backend
 from astrai.inference.contracts import ModelRunnerOutput, SchedulerOutput
-from astrai.inference.core import request as request_module
 from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
 from astrai.inference.core.engine_core import EngineCore
 from astrai.inference.core.events import (
@@ -27,7 +26,6 @@ from astrai.inference.core.events import (
 )
 from astrai.inference.core.metrics import MetricsCollector
 from astrai.inference.core.request import (
-    STOP,
     GenerationResult,
     Request,
     RequestManager,
@@ -67,33 +65,6 @@ class OutputEventSink:
 
     def __call__(self, events: List[Any]) -> None:
         raise NotImplementedError
-
-
-class _CallbackBridge(OutputEventSink):
-    """Legacy callback adapter; the frontend installs a queue sink instead."""
-
-    def __init__(self, requests):
-        self._requests = requests
-        self._tokenizer = requests.tokenizer
-        self._decoders = {}
-
-    def __call__(self, events):
-        payload = []
-        for event in events:
-            if isinstance(event, TokenDelta):
-                decoder = self._decoders.get(event.request_id)
-                if decoder is None:
-                    decoder = self._decoders[event.request_id] = (
-                        request_module.StreamDecoder(self._tokenizer)
-                    )
-                text = decoder.push(event.token_id)
-                if text:
-                    payload.append((event.request_id, text))
-            elif isinstance(event, (RequestFinished, RequestError)):
-                payload.append((event.request_id, STOP))
-                self._decoders.pop(event.request_id, None)
-        if payload:
-            self._requests.invoke_callbacks(payload)
 
 
 class Scheduler:
@@ -169,7 +140,7 @@ class Scheduler:
             )
         effective_budget = token_budget or _config.max_num_batched_tokens or None
         self._stepper = SchedulerStep(self, token_budget=effective_budget)
-        self._event_sink = _CallbackBridge(self._requests)
+        self._event_sink: Optional[OutputEventSink] = None
         self._states: Dict[str, Request] = {}
         self._step_id = 0
         # Keys are (step id, request incarnation), never mutable object identity.
@@ -230,7 +201,7 @@ class Scheduler:
             self._event_sink = sink
 
     def _emit_events(self, events):
-        if not events:
+        if not events or self._event_sink is None:
             return
         try:
             self._event_sink(events)
@@ -286,15 +257,12 @@ class Scheduler:
         request = self._states.get(request_id)
         if request is None or request.terminal_emitted:
             return False
-        _, cancelled = self._requests.cancel_request(request_id, notify_callback=False)
+        _, cancelled = self._requests.cancel_request(request_id)
         if cancelled:
             self.finish(request, FINISH_CANCELLED)
             self.release_finished()
             self._requests.wake()
         return cancelled
-
-    def remove_request(self, request_id):
-        return self.cancel_request(request_id)
 
     @_with_weight_lock
     def get_stats(self):
@@ -513,9 +481,6 @@ class Scheduler:
         self._ready.clear()
         for request in self._states.values():
             request.num_computed_tokens = request.num_materialized_tokens
-
-    def _step(self, requests, return_logprobs=False):
-        return self._stepper.step(requests, return_logprobs)
 
     def run_busy_loop(self):
         return self.engine_core.run_busy_loop()

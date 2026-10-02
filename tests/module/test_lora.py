@@ -4,6 +4,7 @@ import torch
 from astrai.model import AutoRegressiveLM
 from astrai.model.components.linear import Linear
 from astrai.model.components.lora import (
+    TARGET_MODULES_FFN,
     LoRAConfig,
     LoRALinear,
     _collect_lora_info,
@@ -111,8 +112,6 @@ def test_inject_lora_default_target():
 
 def test_inject_lora_ffn():
     model = _make_model()
-    from astrai.model.components.lora import TARGET_MODULES_FFN
-
     inject_lora(model, r=4, alpha=8, target_modules=TARGET_MODULES_FFN)
     assert _get_lora_count(model) > 0
 

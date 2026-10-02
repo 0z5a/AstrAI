@@ -4,7 +4,9 @@ from copy import deepcopy
 import pytest
 import torch
 
+from astrai.model import AutoRegressiveLM
 from astrai.optim import Mano, ManoAdamW, OptimizerFactory
+from astrai.trainer.schedule import SchedulerFactory
 from tests.helpers import make_tiny_config
 
 
@@ -70,7 +72,6 @@ def test_mano_rejects_non_2d_parameters():
 
 def test_factory_registers_mano():
     assert "mano_adamw" in OptimizerFactory.list_registered()
-    from astrai.model import AutoRegressiveLM
 
     model = AutoRegressiveLM(make_tiny_config())
     optimizer = OptimizerFactory.create("mano_adamw", model, lr=3e-4)
@@ -78,8 +79,6 @@ def test_factory_registers_mano():
 
 
 def test_mano_adamw_runs_closure_once():
-    from astrai.model import AutoRegressiveLM
-
     model = AutoRegressiveLM(make_tiny_config())
     optimizer = ManoAdamW(model)
     calls = 0
@@ -95,9 +94,6 @@ def test_mano_adamw_runs_closure_once():
 
 
 def test_mano_adamw_resume_matches_uninterrupted():
-    from astrai.model import AutoRegressiveLM
-    from astrai.trainer.schedule import SchedulerFactory
-
     torch.manual_seed(7)
     model_a = AutoRegressiveLM(make_tiny_config())
     optimizer_a = ManoAdamW(model_a, lr=3e-4)

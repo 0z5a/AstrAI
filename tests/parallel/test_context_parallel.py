@@ -15,13 +15,12 @@ from pydantic import ValidationError
 from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
 from astrai.extension import ATTN_BACKEND, attn_backend
-from astrai.model.transformer import AutoRegressiveLM
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction
 from astrai.parallel.setup import spawn_parallel_fn
 from astrai.parallel.topology import ParallelTopology
 from astrai.trainer.strategy import SEQStrategy, SFTStrategy
 from tests.conftest import skip_lt2_cuda
-from tests.helpers import RandomTokenDataset, make_tiny_config
+from tests.helpers import RandomTokenDataset, make_seeded_gqa_model
 
 SEQ_LEN = 64
 BATCH = 2
@@ -31,17 +30,9 @@ def _build_gqa_model(device):
     """bf16 GQA model, head_dim 32: the ring path needs a flash/cuDNN
     SDPA kernel (CPState.shard restricts the selection), and flash
     requires a half-precision dtype."""
-    torch.manual_seed(3407)
-    cfg = make_tiny_config(
-        hidden_size=128,
-        intermediate_size=256,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=SEQ_LEN,
+    return make_seeded_gqa_model(
+        device, dtype=torch.bfloat16, max_position_embeddings=SEQ_LEN
     )
-    model = AutoRegressiveLM(cfg).to(device=device).to(dtype=torch.bfloat16)
-    model.train()  # no dropout in the model; deterministic either way
-    return model
 
 
 def _assert_shard_mechanics(cp_state, device):

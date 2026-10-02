@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.transformer import AutoRegressiveLM
-from astrai.tokenize import AutoTokenizer
+from astrai.tokenize import AutoTokenizer, ChatTemplate
 
 TINY_CONFIG = dict(
     vocab_size=1000,
@@ -57,6 +57,28 @@ def make_model(device, **cfg_overrides):
     model = AutoRegressiveLM(cfg).to(device=device)
     model.eval()
     return model, cfg
+
+
+def make_seeded_gqa_model(device, *, dtype=None, max_position_embeddings=64):
+    """Seeded GQA model for parallel-path equivalence tests.
+
+    ``dtype`` casts after the device move; the context-parallel ring path
+    needs a half-precision dtype (flash/cuDNN SDPA), the tensor-parallel
+    path stays fp32.
+    """
+    torch.manual_seed(3407)
+    cfg = make_tiny_config(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=max_position_embeddings,
+    )
+    model = AutoRegressiveLM(cfg).to(device=device)
+    if dtype is not None:
+        model = model.to(dtype=dtype)
+    model.train()
+    return model
 
 
 def build_test_tokenizer(
@@ -167,8 +189,6 @@ class FakeTokenizer:
 
     def __init__(self, *, with_chat_template=False):
         if with_chat_template:
-            from astrai.tokenize.chat_template import ChatTemplate
-
             self._chat_template = ChatTemplate.from_string(CHAT_TEMPLATE)
         else:
             self._chat_template = None

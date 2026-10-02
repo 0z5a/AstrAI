@@ -22,8 +22,6 @@ from astrai.inference.core.events import (
     TokenDelta,
 )
 from astrai.inference.core.request import (
-    STOP,
-    BatchedStreamCallback,
     GenerationResult,
     Request,
     RequestManager,
@@ -39,8 +37,6 @@ from astrai.inference.worker.model_runner import GPUModelRunner
 from astrai.inference.worker.sample import sample
 
 __all__ = [
-    "STOP",
-    "BatchedStreamCallback",
     "EngineCore",
     "EngineCoreClient",
     "GPUModelRunner",

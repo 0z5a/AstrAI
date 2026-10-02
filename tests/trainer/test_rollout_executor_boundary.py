@@ -11,13 +11,13 @@ from torch.utils.data import Dataset
 
 import astrai.parallel.executor as executor_module
 from astrai.config import TrainConfig
-from astrai.inference.core.scheduler import Scheduler
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.parallel import get_rank, spawn_parallel_fn
 from astrai.parallel.executor import DDPExecutor, FSDPExecutor, NoneExecutor
 from astrai.trainer import train_context
 from astrai.trainer.train_context import TrainContextBuilder
 from tests.helpers import FakeTokenizer, make_rollout_config
+from tests.inference.conftest import make_cpu_scheduler
 
 _DDP_TEST_WORLD_SIZE = int(os.environ.get("ASTRAI_DDP_TEST_WORLD_SIZE", "2"))
 
@@ -236,21 +236,11 @@ def test_l20_ddp_inference_view_matches_greedy_generation(tmp_path):
         inference_model = DDPExecutor().model_for_inference(wrapped)
         tokenizer = FakeTokenizer()
 
-        baseline = Scheduler(
-            model=model,
-            tokenizer=tokenizer,
-            max_batch_size=2,
-            max_seq_len=64,
-            enable_cuda_graph=False,
-            backend="torch_native",
+        baseline = make_cpu_scheduler(
+            model, tokenizer, max_batch_size=2, max_seq_len=64
         )
-        ddp_view = Scheduler(
-            model=inference_model,
-            tokenizer=tokenizer,
-            max_batch_size=2,
-            max_seq_len=64,
-            enable_cuda_graph=False,
-            backend="torch_native",
+        ddp_view = make_cpu_scheduler(
+            inference_model, tokenizer, max_batch_size=2, max_seq_len=64
         )
         prompts = [[5, 6, 7], [8, 9, 10, 11]]
 
@@ -286,13 +276,8 @@ def _multi_rank_rollout_then_train_worker():
     # forwards on each rank. This is the deadlock pattern that is unsafe when
     # the DDP wrapper itself is passed to the scheduler.
     inference_model.eval()
-    scheduler = Scheduler(
-        model=inference_model,
-        tokenizer=FakeTokenizer(),
-        max_batch_size=1,
-        max_seq_len=64,
-        enable_cuda_graph=False,
-        backend="torch_native",
+    scheduler = make_cpu_scheduler(
+        inference_model, FakeTokenizer(), max_batch_size=1, max_seq_len=64
     )
     result = scheduler.run_batch(
         [[5 + rank, 6 + rank, 7 + rank]],

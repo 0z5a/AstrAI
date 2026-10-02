@@ -21,6 +21,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import astrai.inference.core.cache as cache_facade
+import astrai.model.kv_cache as kv_cache
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MODEL_DIR = _REPO_ROOT / "astrai" / "model"
 
@@ -99,9 +102,6 @@ def test_model_package_imports_without_inference_package():
 def test_cache_facade_reexports_the_model_buffers():
     """``astrai.inference.core.cache`` stays a working facade over the buffers'
     new home — same objects, not copies."""
-    import astrai.inference.core.cache as cache_facade
-    import astrai.model.kv_cache as kv_cache
-
     assert cache_facade.KVCache is kv_cache.KVCache
     assert cache_facade.KVStorage is kv_cache.KVStorage
     assert cache_facade.ReqToTokenPool is kv_cache.ReqToTokenPool

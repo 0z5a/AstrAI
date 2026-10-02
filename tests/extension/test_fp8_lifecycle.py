@@ -43,6 +43,13 @@ from astrai.extension.autocast import (
 from astrai.extension.loader import get_module
 from tests.conftest import skip_no_fp8
 
+try:
+    from astrai.extension.kernel.quantize import K_FOLD_SLOTS
+except RuntimeError:
+    # Import-safe without the extension: K_FOLD_SLOTS is only read by
+    # kernel-level tests that skip via skip_no_fp8 when not built.
+    K_FOLD_SLOTS = None
+
 
 @pytest.fixture(autouse=True)
 def _clean_fp8_state():
@@ -206,7 +213,6 @@ def test_recipe_change_rebuilds_rings():
     dev = torch.device("cuda")
     x = torch.randn(8, 64, device=dev, dtype=torch.bfloat16)
     lin = _linear(6)
-    from astrai.extension.kernel.quantize import K_FOLD_SLOTS
 
     with fp8_autocast(enabled=True, recipe=FP8Recipe(history_len=4)):
         lin(x)

@@ -302,12 +302,6 @@ def test_allocator_failed_bulk_allocation_does_not_revoke_prefixes():
     _assert_allocator_cache_consistent(alloc, prefix)
 
 
-def test_page_pool_task_cacheable_ids_excludes_unmaterialized_tail():
-    pool = _make_paged_pool_ps64()
-    task_cache = _make_task_cache(pool)
-    assert task_cache.request_cacheable_ids("missing", [1, 2], [3, 4]) == [1, 2, 3]
-
-
 # ---- ReqToTokenPool ----
 
 

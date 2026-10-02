@@ -250,9 +250,9 @@ class BlockPool:
             out_cache_loc = ocl_buf[:b].reshape(-1)
             workspace.qo_indptr[: b + 1].copy_(inc_buf[: b + 1])
             qo_indptr = workspace.qo_indptr[: b + 1]
-            decode_o_part = getattr(workspace, "decode_o_part", None)
-            decode_ml_part = getattr(workspace, "decode_ml_part", None)
-            decode_out = getattr(workspace, "decode_out", None)
+            decode_o_part = workspace.decode_o_part
+            decode_ml_part = workspace.decode_ml_part
+            decode_out = workspace.decode_out
 
             return DecodeKVCache(
                 k_buffer=self._storage.k_buffer,
@@ -407,12 +407,6 @@ class KVCacheManager:
         rejected outright by the scheduler instead of retrying forever.
         """
         return self._strategy.can_ever_fit(n_tokens)
-
-    @staticmethod
-    def request_cacheable_ids(
-        request_id: str, prompt_ids: List[int], output_ids: List[int]
-    ):
-        return list(prompt_ids) + list(output_ids[:-1])
 
     # -- bind (assemble KVCache for the model forward) --
 

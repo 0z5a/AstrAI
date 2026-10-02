@@ -7,8 +7,11 @@ diagnostics flow end‑to‑end through the strategy layer.
 
 import pytest
 import torch
+from torch import nn
 
 from astrai.config.model_config import AutoRegressiveLMConfig
+from astrai.inference.core.cache import BlockPool, KVCacheManager
+from astrai.inference.worker.workspace import InferenceWorkspace
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.strategy import (
     SEQStrategy,
@@ -69,9 +72,6 @@ def _make_sft_moe_fixture(device):
 
 
 def test_model_forward_contract_uses_dense_training_and_packed_inference():
-    from astrai.inference.core.cache import BlockPool, KVCacheManager
-    from astrai.inference.worker.workspace import InferenceWorkspace
-
     config = AutoRegressiveLMConfig(**TINY_CONFIG)
     model = AutoRegressiveLM(config).eval()
     dense = model(torch.tensor([[1, 2, 3]]))
@@ -116,9 +116,6 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
 
 def test_forward_logits_positions_projects_only_requested_rows():
     """logits_positions gathers packed rows before the lm_head projection."""
-    from astrai.inference.core.cache import BlockPool, KVCacheManager
-    from astrai.inference.worker.workspace import InferenceWorkspace
-
     config = AutoRegressiveLMConfig(**TINY_CONFIG)
     model = AutoRegressiveLM(config).eval()
     prompts = [[1, 2, 3], [4, 5]]
@@ -219,9 +216,6 @@ def test_collect_moe_diagnostics_max_entropy():
 
 def test_moe_metrics_flow_through_wrapped_model(device):
     """DDP-like wrappers (no .config / get_moe_router_probs) still collect MoE metrics."""
-    import torch.nn as nn
-
-    from astrai.trainer.strategy import SEQStrategy
 
     class ForwardOnlyWrapper(nn.Module):
         def __init__(self, model):

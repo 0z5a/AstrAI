@@ -83,7 +83,3 @@ class SchedulerStep:
             [r for r in requests if r.status != RequestStatus.ABORTED],
             [r for r in requests if r.status == RequestStatus.ABORTED],
         )
-
-    def step_commit(self, pending):
-        """All result application, including drains, uses the same core entry."""
-        return self.scheduler.engine_core.resolve(pending)

@@ -17,11 +17,7 @@ from astrai.inference.core.events import (
     TokenDelta,
 )
 from astrai.inference.frontend.core_client import EngineCoreClient, InprocClient
-from astrai.inference.frontend.engine import (
-    GenerateResult,
-    InferenceEngine,
-    build_engine,
-)
+from astrai.inference.frontend.engine import InferenceEngine, build_engine
 from astrai.inference.frontend.input_processor import InputProcessor
 from astrai.inference.frontend.output_processor import (
     OutputProcessor,
@@ -35,7 +31,6 @@ __all__ = [
     "FINISH_REJECTED",
     "FINISH_STOP_TOKEN",
     "EngineCoreClient",
-    "GenerateResult",
     "InferenceEngine",
     "InprocClient",
     "InputProcessor",

@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from math import prod
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -108,8 +109,6 @@ def test_all(
     codes_for(item) -> (task_id, [(full_code, timeout), ...]); returns
     (task_id, n, passed) per item.
     """
-    from concurrent.futures import ProcessPoolExecutor
-
     results: List[Tuple[str, int, int]] = []
     pool = ProcessPoolExecutor(max_workers=test_workers)
     try:

@@ -12,6 +12,7 @@ import torch
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.rollout import RolloutResult
 from astrai.trainer.strategy import (
+    BaseStrategy,
     DPOStrategy,
     GRPOStrategy,
     StrategyFactory,
@@ -133,8 +134,6 @@ def test_online_strategies_support_online(device, make_fn):
 
 
 def test_base_strategy_prepare_from_rollout_raises_by_default(device):
-    from astrai.trainer.strategy import BaseStrategy
-
     class _Offline(BaseStrategy):
         def compute_loss(self, batch):
             return torch.tensor(0.0)
@@ -145,8 +144,6 @@ def test_base_strategy_prepare_from_rollout_raises_by_default(device):
 
 
 def test_base_strategy_supports_online_default_false():
-    from astrai.trainer.strategy import BaseStrategy
-
     class _Offline(BaseStrategy):
         def compute_loss(self, batch):
             return torch.tensor(0.0)

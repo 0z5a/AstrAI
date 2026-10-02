@@ -5,9 +5,12 @@ import json
 import pytest
 import safetensors.torch as st
 import torch
+import torch.nn.functional as F
 
 from astrai.config.model_config import ConfigFactory
 from astrai.model import AutoModel, AutoRegressiveLM
+from astrai.model.components.attention import GQA
+from astrai.model.components.rope import get_rotary_emb
 from astrai.serialization import (
     adapt_config,
     convert_hf_config,
@@ -385,8 +388,6 @@ def _hf_reference_attn(
     x, Wq, Wk, Wv, Wo, n_heads, n_kv, head_dim, q_norm_w=None, k_norm_w=None, eps=1e-5
 ):
     """Ground-truth HF attention: per-head RMSNorm BEFORE RoPE (half-split)."""
-    import torch.nn.functional as F
-
     b, s, dim = x.shape
     q = (x @ Wq.T).reshape(b, s, n_heads, head_dim).float()
     k = (x @ Wk.T).reshape(b, s, n_kv, head_dim).float()
@@ -404,8 +405,6 @@ def _hf_reference_attn(
 
 
 def _run_converted_gqa(x, hf_sd, cfg):
-    from astrai.model.components.attention import GQA
-    from astrai.model.components.rope import get_rotary_emb
 
     attn = GQA(
         dim=cfg.hidden_size,

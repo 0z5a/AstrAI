@@ -14,6 +14,7 @@ from astrai.extension.autocast import (
     assign_slots,
     clear_slots,
     fp8_slot_of,
+    refresh_slots,
     slot_table,
 )
 from astrai.model.components.embedding import Embedding
@@ -176,8 +177,6 @@ def test_rebind_follows_a_replaced_weight():
 
 
 def test_stale_counts_swapped_weights_and_refresh_repairs_them():
-    from astrai.extension.autocast import refresh_slots
-
     model = _Model(layers=1)
     table = assign_slots(model)
     assert table.stale() == 0
@@ -194,8 +193,6 @@ def test_stale_counts_swapped_weights_and_refresh_repairs_them():
 
 
 def test_refresh_is_a_noop_once_the_model_is_gone():
-    from astrai.extension.autocast import refresh_slots
-
     model = _Model(layers=1)
     table = assign_slots(model)
     weight = model.layers[0].mlp.up.weight

@@ -10,7 +10,6 @@ facts — it never renders text and never runs consumer code.
 import asyncio
 import gc
 import logging
-import threading
 import time
 from pathlib import Path
 from typing import (
@@ -20,7 +19,6 @@ from typing import (
     Generator,
     List,
     Optional,
-    Tuple,
     Union,
 )
 
@@ -29,11 +27,7 @@ import torch.nn as nn
 
 from astrai.extension import ATTN_BACKEND, AttentionBackend, get_backend
 from astrai.inference.core.cache.pool import BlockPool
-from astrai.inference.core.events import (
-    RequestError,
-    TokenDelta,
-)
-from astrai.inference.core.request import STOP
+from astrai.inference.core.events import RequestError, TokenDelta
 from astrai.inference.core.scheduler import Scheduler
 from astrai.inference.frontend.core_client import EngineCoreClient, InprocClient
 from astrai.inference.frontend.input_processor import InputProcessor, ProcessedInput
@@ -48,70 +42,8 @@ from astrai.tokenize import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
-# Whole-batch budget of a blocking generate() — matches the previous
-# GenerateResult.wait_completion default.
+# Whole-batch budget of a blocking generate().
 _GENERATE_TIMEOUT_S = 300.0
-
-
-class GenerateResult:
-    """Thread-safe token accumulator for incremental consumers.
-
-    Blocking ``generate`` no longer routes through it (it folds
-    completion-driven on the caller's thread), but the class stays public:
-    its ``(idx, token)`` / ``STOP`` protocol is what streaming adapters and
-    custom consumers build on.
-    """
-
-    def __init__(self, count: int = 1):
-        self._cond = threading.Condition()
-        self._event = threading.Event()
-        self.tokens: List[Tuple[int, str]] = []
-        self.results: List[str] = [""] * count
-        self._done: List[bool] = [False] * count
-        self._completed = 0
-        self._total = count
-
-    def append(self, token: str, idx: int = 0):
-        self.append_batch([(idx, token)])
-
-    def append_batch(self, items: List[Tuple[int, Any]]) -> None:
-        if not items:
-            return
-        with self._cond:
-            for idx, token in items:
-                self.tokens.append((idx, token))
-                if token is STOP:
-                    if not self._done[idx]:
-                        self._done[idx] = True
-                        self._completed += 1
-                        self._cond.notify_all()
-                else:
-                    self.results[idx] += token
-            self._event.set()
-
-    def pop_all(self) -> List[Tuple[int, str]]:
-        with self._cond:
-            out = self.tokens.copy()
-            self.tokens.clear()
-            self._event.clear()
-            return out
-
-    def wait(self, timeout: Optional[float] = None) -> bool:
-        return self._event.wait(timeout=timeout)
-
-    def wait_completion(self, timeout: float = 300.0):
-        with self._cond:
-            if not self._cond.wait_for(
-                lambda: self._completed >= self._total, timeout=timeout
-            ):
-                raise TimeoutError(
-                    f"Generation timeout after {timeout}s "
-                    f"({self._completed}/{self._total} completed)"
-                )
-
-    def get_results(self) -> List[str]:
-        with self._cond:
-            return self.results.copy()
 
 
 class InferenceEngine:
@@ -451,11 +383,6 @@ class InferenceEngine:
         """Wait for terminal events, then decode each request's tokens once."""
         bulk_decode = getattr(self.tokenizer, "_tokenizer", None) is not None
         return self._collect_blocking_events(request_ids, is_batch, bulk_decode)
-
-    def _collect_blocking_incremental(
-        self, request_ids: List[str], is_batch: bool
-    ) -> Union[str, List[str]]:
-        return self._collect_blocking_events(request_ids, is_batch, bulk_decode=False)
 
     def _collect_blocking_events(
         self, request_ids: List[str], is_batch: bool, bulk_decode: bool

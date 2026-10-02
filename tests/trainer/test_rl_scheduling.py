@@ -8,7 +8,7 @@ from functools import partial
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import Dataset
 
 import astrai.trainer.strategy as strategy_mod
@@ -19,7 +19,6 @@ from astrai.trainer.optional_extras import (
     restore_checkpoint_extras,
 )
 from astrai.trainer.rollout import BaseRewardModel, RolloutResult
-from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.strategy import (
     GRPOStrategy,
     PPOStrategy,
@@ -27,8 +26,14 @@ from astrai.trainer.strategy import (
     get_logprobs,
     move_to_device,
 )
+from astrai.trainer.train_context import TrainContext, TrainContextBuilder
 from astrai.trainer.trainer import Trainer
 from tests.helpers import CHAT_TEMPLATE
+from tests.trainer.conftest import (
+    make_online_lr_scheduler,
+    make_online_model,
+    make_online_optimizer,
+)
 
 
 class StubLM(nn.Module):
@@ -316,8 +321,6 @@ class _RefOnlyStrategy:
 
 
 def _resume_builder(tmp_path, allow_reanchor=False):
-    from astrai.trainer.train_context import TrainContext, TrainContextBuilder
-
     config = TrainConfig(
         strategy="sft",
         model_fn=lambda: nn.Linear(2, 2),
@@ -411,30 +414,14 @@ def instruction_collate_fn(batch):
     }
 
 
-def _model_fn(model_config):
-    from astrai.model.transformer import AutoRegressiveLM
-
-    return AutoRegressiveLM(model_config).to(dtype=torch.float32)
-
-
-def _optimizer_fn(m):
-    return torch.optim.AdamW(m.parameters(), lr=1e-4)
-
-
-def _scheduler_fn(optim):
-    return SchedulerFactory.create(
-        "cosine", optim, warmup_steps=1, lr_decay_steps=4, min_rate=0.05
-    )
-
-
 def _online_config(base_test_env, **overrides):
     model_config = base_test_env["transformer_config"]
     defaults = dict(
         strategy="online_grpo",
-        model_fn=partial(_model_fn, model_config),
+        model_fn=partial(make_online_model, model_config),
         dataset=InstructionDataset(),
-        optimizer_fn=_optimizer_fn,
-        scheduler_fn=_scheduler_fn,
+        optimizer_fn=make_online_optimizer,
+        scheduler_fn=make_online_lr_scheduler,
         ckpt_dir=os.path.join(base_test_env["test_dir"], "ckpt"),
         n_epoch=1,
         batch_per_device=2,

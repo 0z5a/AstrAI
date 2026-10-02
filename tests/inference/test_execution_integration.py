@@ -10,7 +10,7 @@ from astrai.inference.core.events import (
     RequestFinished,
     TokenDelta,
 )
-from astrai.inference.core.scheduler import Scheduler
+from tests.inference.conftest import make_cpu_scheduler
 
 
 @pytest.mark.parametrize("page_size", [None, 2, 4])
@@ -22,13 +22,11 @@ def test_online_batch_changes_preserve_events_and_greedy_tokens(
     cache_options = (
         {} if page_size is None else {"page_size": page_size, "kv_tokens": 64}
     )
-    scheduler = Scheduler(
+    scheduler = make_cpu_scheduler(
         model,
         test_tokenizer,
         max_batch_size=2,
         max_seq_len=24,
-        backend="torch_native",
-        enable_cuda_graph=False,
         enable_overlap=overlap,
         token_budget=3,
         **cache_options,

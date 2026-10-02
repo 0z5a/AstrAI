@@ -12,7 +12,9 @@ import torch
 from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
 from astrai.inference import GenerationResult, Scheduler
 from astrai.inference.contracts import SchedulerOutput
-from astrai.inference.core.request import STOP, BatchedStreamCallback, Request
+from astrai.inference.core.events import RequestFinished, TokenDelta
+from astrai.inference.core.request import Request
+from astrai.inference.core.scheduler import OutputEventSink
 from astrai.inference.worker.model_runner import (
     DecodeSteadyState,
     GPUModelRunner,
@@ -23,6 +25,22 @@ from astrai.inference.worker.pending import (
 )
 from astrai.model.transformer import AutoRegressiveLM
 from tests.helpers import FakeTokenizer, make_rollout_config
+
+
+class _UnwrappingTokenizer:
+    """FakeTokenizer.encode returns the batch shape ([[ids]]); add_request's
+    contract is the flat single-string shape, so unwrap it."""
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "stop_ids", inner.stop_ids)
+
+    def encode(self, prompt, **kw):
+        out = self._inner.encode(prompt, **kw)
+        return out[0] if isinstance(out[0], list) else out
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 @pytest.fixture
@@ -143,10 +161,10 @@ def test_step_splits_decode_batch_by_request_backend():
     for request in (torch_task, cuda_task):
         request.input_tokens = 1
         request.output_ids = [1]
-        request.mark_prefill_complete()
+        request.num_computed_tokens = 1
         scheduler._metrics.register(request.request_id)
 
-    produced, aborted = scheduler._step([torch_task, cuda_task])
+    produced, aborted = scheduler._stepper.step([torch_task, cuda_task])
 
     assert aborted == []
     assert produced == [torch_task, cuda_task]
@@ -175,7 +193,7 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
 
     scheduler._executor.execute_prefill = MagicMock(side_effect=prefill)
 
-    produced, aborted = scheduler._step([short, long])
+    produced, aborted = scheduler._stepper.step([short, long])
 
     assert aborted == []
     # ``produced`` is now the live set (callers drive it): same members,
@@ -987,7 +1005,7 @@ def test_submit_decode_returns_pending_without_touching_tasks(device):
         try:
             n_prefilled = len(request.output_ids)
             assert request.output_tokens == n_prefilled
-            scheduler._stepper.step_commit(pending)
+            scheduler.engine_core.resolve(pending)
             assert len(request.output_ids) == n_prefilled + 1
             assert request.output_tokens == n_prefilled + 1
         finally:
@@ -1016,71 +1034,51 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
         enable_overlap=True,
     )
 
-    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_request's
-    # contract is the flat single-string shape, so unwrap it here.
-    class _UnwrappingTokenizer:
-        def __init__(self, inner):
-            object.__setattr__(self, "_inner", inner)
-            object.__setattr__(self, "stop_ids", inner.stop_ids)
-
-        def encode(self, prompt, **kw):
-            out = self._inner.encode(prompt, **kw)
-            return out[0] if isinstance(out[0], list) else out
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
     scheduler._requests.tokenizer = _UnwrappingTokenizer(tok)
 
-    # StreamDecoder requires the Rust tokenizer's ``_tokenizer`` handle,
-    # which FakeTokenizer does not provide; the online e2e only needs
-    # per-token text events, so substitute a trivial decoder.
-    class _FakeStreamDecoder:
-        def __init__(self, tokenizer):
-            pass
-
-        def push(self, token_id):
-            return f"<{token_id}>" if token_id > 2 else ""
-
-    events: dict = {"first": [], "second": []}
+    token_counts: dict = {"first": 0, "second": 0}
     done: dict = {"first": threading.Event(), "second": threading.Event()}
+    tag_by_prompt = {"a" * 8: "first", "b" * 8: "second"}
+    sink_rids: dict = {}
 
-    def make_sink(tag):
-        class _Sink(BatchedStreamCallback):
-            def __call__(self, batch):
-                for request_id, token in batch:
-                    events[tag].append(token)
-                    if token is STOP:
-                        done[tag].set()
+    def sink(events):
+        for event in events:
+            tag = tag_by_prompt.get(
+                next(
+                    (p for p, rid in sink_rids.items() if rid == event.request_id), None
+                )
+            )
+            if tag is None:
+                return
+            if isinstance(event, TokenDelta):
+                token_counts[tag] += 1
+            elif isinstance(event, RequestFinished):
+                done[tag].set()
 
-        return _Sink()
+    scheduler.set_event_sink(sink)
 
     try:
-        with patch("astrai.inference.core.request.StreamDecoder", _FakeStreamDecoder):
-            scheduler.start()
-            scheduler.add_request(
-                "a" * 8, max_tokens=12, stream_callback=make_sink("first")
-            )
-            time.sleep(0.2)  # let the first request enter steady decode
-            scheduler.add_request(
-                "b" * 8, max_tokens=12, stream_callback=make_sink("second")
-            )
-            assert done["first"].wait(timeout=10)
-            assert done["second"].wait(timeout=10)
-            assert all(t is not STOP for t in events["first"][:-1])
-            assert all(t is not STOP for t in events["second"][:-1])
-            # STOP callbacks fire at commit, but the overlap loop may still
-            # hold the FINAL submitted step in the executor slot (the step
-            # launched past the terminal one) for one more iteration. Wait
-            # for the drain instead of racing it.
-            deadline = time.time() + 5
-            while scheduler._executor.peek_pending() is not None:
-                if time.time() > deadline:
-                    pytest.fail("overlap loop left a step pending after finish")
-                time.sleep(0.01)
-            stats = scheduler.get_stats()
-            assert stats["in_flight_tasks"] == 0
-            assert stats["kv_cache_tasks"] == 0
+        scheduler.start()
+        rid_a = scheduler.add_request("a" * 8, max_tokens=12)
+        sink_rids["a" * 8] = rid_a
+        time.sleep(0.2)  # let the first request enter steady decode
+        rid_b = scheduler.add_request("b" * 8, max_tokens=12)
+        sink_rids["b" * 8] = rid_b
+        assert done["first"].wait(timeout=10)
+        assert done["second"].wait(timeout=10)
+        assert token_counts["first"] == 12
+        assert token_counts["second"] == 12
+        # The overlap loop may still hold the FINAL submitted step in the
+        # executor slot (the step launched past the terminal one) for one
+        # more iteration. Wait for the drain instead of racing it.
+        deadline = time.time() + 5
+        while scheduler._executor.peek_pending() is not None:
+            if time.time() > deadline:
+                pytest.fail("overlap loop left a step pending after finish")
+            time.sleep(0.01)
+        stats = scheduler.get_stats()
+        assert stats["in_flight_tasks"] == 0
+        assert stats["kv_cache_tasks"] == 0
     finally:
         scheduler.stop()
 
@@ -1108,67 +1106,57 @@ def test_overlap_loop_matches_synchronous_tokens(device):
         enable_overlap=True,
     )
 
-    # FakeTokenizer.encode returns the batch shape ([[ids]]); add_request's
-    # contract is the flat single-string shape, so unwrap here (same
-    # workaround as the overlap e2e test).
-    class _UnwrappingTokenizer:
-        def __init__(self, inner):
-            object.__setattr__(self, "_inner", inner)
-            object.__setattr__(self, "stop_ids", inner.stop_ids)
-
-        def encode(self, prompt, **kw):
-            out = self._inner.encode(prompt, **kw)
-            return out[0] if isinstance(out[0], list) else out
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
     scheduler._requests.tokenizer = _UnwrappingTokenizer(tokenizer)
 
-    # StreamDecoder needs the Rust handle FakeTokenizer lacks; emit the
-    # token id itself as the "text" so the sink sees every token.
-    class _IdDecoder:
-        def __init__(self, tokenizer):
-            pass
-
-        def push(self, token_id):
-            return str(token_id)
-
-    class _TokenSink(BatchedStreamCallback):
-        def __init__(self):
-            self.events: list = []
-
-        def __call__(self, batch):
-            self.events.extend(batch)
-
     prompts = ["a" * 8, "b" * 8, "c" * 8]
-    sink = _TokenSink()
     scheduler.start()
     try:
-        # Synchronous reference: same model, same prompts, greedy.
+        # Synchronous reference: same model, same prompts, greedy.  The tiny
+        # random model may sample a stop id (FakeTokenizer: eos=2) mid-stream,
+        # so accept an early stop-token termination on either side of the
+        # comparison; what must match is the committed token stream itself.
         reference = scheduler.run_batch(
             [[ord(c) for c in p] for p in prompts], max_tokens=12, temperature=0
         )
-        assert all(len(ids) == 12 for ids in reference)
+        stop_ids = set(scheduler.stop_ids)
+        assert all(len(ids) == 12 or (ids and ids[-1] in stop_ids) for ids in reference)
 
-        with patch("astrai.inference.core.request.StreamDecoder", _IdDecoder):
-            request_ids = [
-                scheduler.add_request(
-                    p, max_tokens=12, stream_callback=sink, temperature=0
+        # Collect the committed token stream through the event sink before
+        # release_finished discards the finished requests.
+        stream: dict = {}
+        lock = threading.Lock()
+
+        def sink(events):
+            with lock:
+                for event in events:
+                    if isinstance(event, TokenDelta):
+                        stream.setdefault(event.request_id, []).append(event.token_id)
+
+        scheduler.set_event_sink(sink)
+
+        request_ids = [
+            scheduler.add_request(p, max_tokens=12, temperature=0) for p in prompts
+        ]
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            with lock:
+                done = all(
+                    len(stream.get(tid, [])) >= 12
+                    or (
+                        stream.get(tid, [None])[-1] in stop_ids
+                        and not scheduler._requests.get_request(tid)
+                    )
+                    for tid in request_ids
                 )
-                for p in prompts
-            ]
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                stops = sum(1 for _tid, tok in sink.events if tok is STOP)
-                if stops == 3:
-                    break
-                time.sleep(0.01)
+            if done:
+                break
+            time.sleep(0.01)
+        # Let the loop's release path drain fully before asserting.
+        deadline = time.time() + 5
+        while time.time() < deadline and scheduler._executor.peek_pending() is not None:
+            time.sleep(0.01)
 
-        by_task = {tid: [] for tid in request_ids}
-        for tid, token in sink.events:
-            if token is not STOP:
-                by_task[tid].append(int(token))
+        by_task = {tid: stream.get(tid, []) for tid in request_ids}
         for i, tid in enumerate(request_ids):
             assert by_task[tid] == list(reference[i]), (
                 f"request {i} overlap stream {by_task[tid]} != reference "
@@ -1222,14 +1210,8 @@ def test_stop_clears_state_when_loop_drains_normally():
 def test_admission_rejects_requests_that_can_never_fit(device):
     """The livelock guard: a prompt larger than the whole paged pool is
     terminated (FINISH_REJECTED) instead of retrying alloc forever."""
-    import torch as _torch
-
-    from astrai.inference.core.scheduler import Scheduler
-    from astrai.model.transformer import AutoRegressiveLM
-    from tests.helpers import FakeTokenizer, make_rollout_config
-
     cfg = make_rollout_config(max_position_embeddings=64)
-    model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     scheduler = Scheduler(
         model=model,
         tokenizer=FakeTokenizer(),
@@ -1240,7 +1222,6 @@ def test_admission_rejects_requests_that_can_never_fit(device):
         kv_tokens=16,  # 8 pages × 2 tokens = 16 token slots total
     )
     sink_events = []
-    from astrai.inference.core.scheduler import OutputEventSink
 
     class _Capture(OutputEventSink):
         def __call__(self, events):
@@ -1264,23 +1245,17 @@ def test_admission_rejects_requests_that_can_never_fit(device):
             pytest.fail("oversized request was never rejected")
         # And the queue drained: no spinning leftovers.
         deadline = time.time() + 5
-        while time.time() < deadline and scheduler._requests.get_waiting_requests():
+        while time.time() < deadline and scheduler._requests.waiting:
             time.sleep(0.05)
-        assert not scheduler._requests.get_waiting_requests()
+        assert not scheduler._requests.waiting
     finally:
         scheduler.stop()
 
 
 def test_paged_pool_selected_via_scheduler_kwargs(device):
     """page_size/kv_tokens reach the BlockPool: paged strategy + prefix cache."""
-    import torch as _torch
-
-    from astrai.inference.core.scheduler import Scheduler
-    from astrai.model.transformer import AutoRegressiveLM
-    from tests.helpers import FakeTokenizer, make_rollout_config
-
     cfg = make_rollout_config(max_position_embeddings=64)
-    model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     scheduler = Scheduler(
         model=model,
         tokenizer=FakeTokenizer(),
@@ -1310,16 +1285,10 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
     reference exactly.  Also asserts the budget actually split the work
     (chunked forward count > reference forward count).
     """
-    import torch as _torch
-
-    from astrai.inference.core.scheduler import Scheduler
-    from astrai.model.transformer import AutoRegressiveLM
-    from tests.helpers import FakeTokenizer, make_rollout_config
-
-    _torch.manual_seed(0)
+    torch.manual_seed(0)
 
     cfg = make_rollout_config(max_position_embeddings=64)
-    model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
 
     # Greedy over a random init can argmax the stop id and finish early,
     # which breaks the exact-length gate below on a torch build whose init
@@ -1378,16 +1347,10 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
 
 def test_chunked_prefill_budget_caps_forward_tokens(device):
     """No prefill forward under a budget carries more than budget tokens."""
-    import torch as _torch
-
-    from astrai.inference.core.scheduler import Scheduler
-    from astrai.model.transformer import AutoRegressiveLM
-    from tests.helpers import FakeTokenizer, make_rollout_config
-
-    _torch.manual_seed(0)
+    torch.manual_seed(0)
 
     cfg = make_rollout_config(max_position_embeddings=64)
-    model = AutoRegressiveLM(cfg).to(device=device, dtype=_torch.bfloat16).eval()
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     # Same deflake as the parity gate above: stopping is orthogonal to the
     # budget being tested, and a random-init argmax onto the stop id would
     # truncate the exact-length assert on some torch builds.

@@ -15,12 +15,14 @@ from astrai.serialization import Checkpoint
 from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
 from astrai.trainer.rollout import BaseRewardModel, RolloutEvaluator
 from astrai.trainer.schedule import SchedulerFactory
+from astrai.trainer.strategy import GRPOStrategy, PPOStrategy
 from astrai.trainer.train_callback import CheckpointCallback
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
 from astrai.trainer.trainer import Trainer
 from tests.helpers import (
     FakeExecutor,
     build_test_tokenizer,
+    make_frozen,
     make_model,
     make_rollout_config,
 )
@@ -286,7 +288,6 @@ def test_builder_right_sizes_rollout_pool(device, temp_dir, monkeypatch):
 def test_save_extra_persists_critic_state(device):
     model, _ = make_model(device)
     critic = ValueModel(make_rollout_config()).to(device)
-    from astrai.trainer.strategy import PPOStrategy
 
     strategy = PPOStrategy(
         model=model,
@@ -313,8 +314,6 @@ def test_save_extra_persists_critic_state(device):
 
 def test_save_extra_without_critic_has_no_value_entries(device):
     model, _ = make_model(device)
-    from astrai.trainer.strategy import GRPOStrategy
-    from tests.helpers import make_frozen
 
     strategy = GRPOStrategy(
         model=model,

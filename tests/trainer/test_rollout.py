@@ -1,5 +1,6 @@
 """Unit tests for the online rollout module."""
 
+import dataclasses
 import threading
 
 import pytest
@@ -18,8 +19,9 @@ from astrai.trainer.rollout import (
     RolloutVersionError,
     SamplingParams,
 )
+from astrai.trainer.strategy import GRPOStrategy
 from tests.conftest import skip_lt2_cuda
-from tests.helpers import FakeExecutor, FakeTokenizer, make_model
+from tests.helpers import FakeExecutor, FakeTokenizer, make_frozen, make_model
 
 
 class ConstantRewardModel(BaseRewardModel):
@@ -311,9 +313,6 @@ def test_p2p_publisher_copies_weights_and_advances_version():
 def test_online_optimizer_step_syncs_replica_atomically():
     """strategy.optimizer_step advances the replica's weights and version
     inside one commit — the cross-GPU rollout contract."""
-    from astrai.trainer.strategy import GRPOStrategy
-    from tests.helpers import make_frozen
-
     train_model, replica_model = _make_replica_pair()
     tokenizer = FakeTokenizer(with_chat_template=True)
     backend = ReplicaBackend(
@@ -704,8 +703,6 @@ def test_rollout_runner_reuse_reads_cache_inside_the_snapshot(device):
     (regression: the cache was read outside the lock, so a concurrent
     commit between the read and the lock silently handed the trainer a
     stale rollout — a lost update)."""
-    import dataclasses
-
     runner, _ = _make_runner(device, rollout_interval=100)
     batch = _make_instruction_batch(n=1)
     first, _ = runner(batch)

@@ -1,13 +1,13 @@
-"""Unit tests for GenerateResult accumulator and InferenceEngine.generate()."""
+"""Unit tests for InferenceEngine.generate() and the frontend event protocol."""
 
 import asyncio
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from astrai.extension import TorchNativeBackend, attn_backend
-from astrai.inference import STOP
 from astrai.inference.core.events import (
     FINISH_CANCELLED,
     FINISH_LENGTH,
@@ -16,11 +16,7 @@ from astrai.inference.core.events import (
     RequestFinished,
     TokenDelta,
 )
-from astrai.inference.frontend.engine import (
-    GenerateResult,
-    InferenceEngine,
-    build_engine,
-)
+from astrai.inference.frontend.engine import InferenceEngine, build_engine
 from astrai.inference.frontend.tracking import RequestTracker
 from tests.helpers import FakeTokenizer, make_model
 
@@ -36,60 +32,10 @@ def _make_engine_mocks(decode=None):
     return mock_model, mock_tokenizer
 
 
-def test_result_append_multiple_tasks():
-    r = GenerateResult(count=3)
-    r.append("a", 0)
-    r.append("b", 1)
-    r.append("c", 2)
-    assert r.results[0] == "a"
-    assert r.results[1] == "b"
-    assert r.results[2] == "c"
-
-
-def test_result_stop_marks_complete():
-    r = GenerateResult(count=2)
-    r.append("text", 0)
-    r.append(STOP, 0)
-    r.append("more", 1)
-    assert r._done[0] is True
-    assert r._done[1] is False
-    assert r._completed == 1
-
-
-def test_result_stop_does_not_double_count():
-    r = GenerateResult(count=1)
-    r.append(STOP, 0)
-    r.append(STOP, 0)
-    assert r._completed == 1
-
-
-def test_result_append_batch_updates_state_in_one_commit():
-    r = GenerateResult(count=2)
-    r.append_batch([(0, "he"), (1, "wo"), (0, "llo"), (1, "rld")])
-    r.append_batch([(0, STOP), (1, STOP)])
-    assert r.results == ["hello", "world"]
-    assert r._completed == 2
-    assert r.pop_all() == [
-        (0, "he"),
-        (1, "wo"),
-        (0, "llo"),
-        (1, "rld"),
-        (0, STOP),
-        (1, STOP),
-    ]
-
-
 def test_request_tracker_events_only_reach_registered_requests():
     """The frontend mints ids before submission, so events for unregistered
     ids are dropped by the sink (they cannot exist on the happy path);
     once registered, events land in the per-request queue in order."""
-    from astrai.inference.core.events import (
-        FINISH_LENGTH,
-        RequestFinished,
-        TokenDelta,
-    )
-    from astrai.inference.frontend.tracking import RequestTracker
-
     tracker = RequestTracker()
     done = tracker.register("t0")
     tracker.sink([TokenDelta("t0", 11, 1), TokenDelta("t0", 12, 2)])
@@ -100,66 +46,6 @@ def test_request_tracker_events_only_reach_registered_requests():
     tracker.mark_finished("t0")
     assert done.is_set()
     tracker.unregister("t0")
-
-
-def test_result_pop_all_returns_and_clears():
-    r = GenerateResult(count=2)
-    r.append("a", 0)
-    r.append("b", 1)
-    out = r.pop_all()
-    assert len(out) == 2
-    assert out[0] == (0, "a")
-    assert out[1] == (1, "b")
-    assert r.pop_all() == []
-
-
-def test_result_wait_blocks_until_data():
-    r = GenerateResult(count=1)
-
-    def delayed_append():
-        import time
-
-        time.sleep(0.05)
-        r.append("delayed", 0)
-
-    t = threading.Thread(target=delayed_append)
-    t.start()
-    ok = r.wait(timeout=5.0)
-    t.join()
-    assert ok
-    assert r.results[0] == "delayed"
-
-
-def test_result_wait_timeout():
-    r = GenerateResult(count=1)
-    ok = r.wait(timeout=0.01)
-    assert not ok
-
-
-def test_result_wait_completion_non_streaming():
-    r = GenerateResult(count=2)
-
-    def finish_later():
-        import time
-
-        time.sleep(0.05)
-        r.append(STOP, 0)
-        time.sleep(0.05)
-        r.append(STOP, 1)
-
-    t = threading.Thread(target=finish_later)
-    t.start()
-    r.wait_completion()
-    t.join()
-    assert r._completed == 2
-
-
-def test_result_get_results():
-    r = GenerateResult(count=2)
-    r.append("hello", 0)
-    r.append("world", 1)
-    results = r.get_results()
-    assert results == ["hello", "world"]
 
 
 def _drive_events(engine, events_by_id):
@@ -199,12 +85,6 @@ def test_engine_generate_non_streaming_single():
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
 
         # Drive generation from another thread: emit events after submit.
-        from astrai.inference.core.events import (
-            FINISH_LENGTH,
-            RequestFinished,
-            TokenDelta,
-        )
-
         def run():
             result = eng.generate("hello")
             return result
@@ -212,8 +92,6 @@ def test_engine_generate_non_streaming_single():
         # The events must arrive after generate() registered the request but
         # the mock scheduler never runs a loop, so a helper thread polls the
         # tracker and injects the terminal sequence.
-        import time
-
         def inject():
             deadline = time.time() + 5
             while time.time() < deadline:
@@ -252,15 +130,7 @@ def test_engine_generate_streaming_yields_token_ids():
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         gen = eng.generate("hello", stream=True)
 
-        from astrai.inference.core.events import (
-            FINISH_LENGTH,
-            RequestFinished,
-            TokenDelta,
-        )
-
         def inject():
-            import time
-
             deadline = time.time() + 5
             while time.time() < deadline:
                 if eng._tracker._sink._queues:
@@ -295,15 +165,7 @@ def test_engine_generate_non_streaming_batch():
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=2)
 
-        from astrai.inference.core.events import (
-            FINISH_LENGTH,
-            RequestFinished,
-            TokenDelta,
-        )
-
         def inject():
-            import time
-
             deadline = time.time() + 5
             while time.time() < deadline:
                 queues = eng._tracker._sink._queues
@@ -395,12 +257,9 @@ def test_generate_captures_calling_backend_context():
         engine = InferenceEngine(mock_model, mock_tokenizer)
         with attn_backend("torch_native"):
             gen = engine.generate("hello", stream=True)
+
             # Terminate via the event protocol (the mock core has no loop).
-            from astrai.inference.core.events import FINISH_LENGTH, RequestFinished
-
             def inject():
-                import time
-
                 for _ in range(500):
                     qs = engine._tracker._sink._queues
                     if qs:
@@ -465,11 +324,7 @@ def test_build_engine_passes_engine_kwargs_through():
         )
         gen = engine.generate("hi", stream=True)
 
-        from astrai.inference.core.events import FINISH_LENGTH, RequestFinished
-
         def inject():
-            import time
-
             for _ in range(500):
                 qs = engine._tracker._sink._queues
                 if qs:
