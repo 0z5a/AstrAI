@@ -9,9 +9,9 @@
 #include <utils/define.cuh>
 #include <utils/dtype.cuh>
 
-// Predicated cp.async (4-operand form) requires CUDA 11.2+.
-// Tensor-core mma.sync requires sm_80+; each element type carries its own
-// floor in MmaShapeFor::kMinArch.
+/* Predicated cp.async requires CUDA 11.2+; tensor-core mma.sync requires
+ * sm_80+. Each element type defines its architecture floor in MmaShapeFor.
+ */
 #if CUDART_VERSION < 11020
 #error "AstrAI CUDA kernels require CUDA 11.2 or later (CUDART_VERSION >= 11020)."
 #endif
@@ -19,15 +19,11 @@
 namespace astrai {
 namespace attention {
 
-// ============================================================================
-// KernelTraits — FlashAttention-v2 style compile-time configuration bundle.
-//
-// Bundles all dimension-dependent constants so device functions only need a
-// single Traits template parameter rather than scattered <KD, NC8, KT2, ...>.
-// The element type rides along (Elem = T): it selects the mma cell and the
-// smem/register element width, so one family of traits serves every
-// precision the build instantiates.
-// ============================================================================
+/* KernelTraits groups compile-time constants shared by the attention kernels.
+ * Device functions take one Traits parameter instead of separate values such
+ * as KD, NC8, and KT2. Elem selects the MMA cell and storage width, allowing
+ * each traits family to support every instantiated precision.
+ */
 template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> struct KernelTraits {
     using Elem = T_;
 
@@ -38,8 +34,9 @@ template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> s
 
     static constexpr int BR = 16; // Q rows per warp (mma M=16)
 
-    // Derived: mma tile counts from the shared mma_shape (m16n8k16 for the
-    // 16-bit types; a dtype with no tensor-core cell fails at MmaShapeFor).
+    /* Derived MMA tile counts use the shared mma_shape. Unsupported element
+     * types fail at MmaShapeFor because they have no tensor-core cell.
+     */
     static constexpr int KD = HEAD_DIM / astrai::mma_shape<Elem>::k; // Q/K k-slides
     static constexpr int NC8 = BC / 8;                               // S n-tiles (N=8)
     static constexpr int KT2 = BC / astrai::mma_shape<Elem>::k;      // P k-tiles (K=16)
@@ -47,8 +44,9 @@ template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> s
 
     static constexpr int LD = HEAD_DIM; // smem leading dim
 
-    // XOR swizzle chunk bits for ldmatrix bank-conflict avoidance.
-    // mask = log2(LD/8) bits, clamped to stay within LD.
+    /* XOR swizzle mask uses log2(LD/8) bits for ldmatrix bank-conflict
+     * avoidance, clamped to the LD range.
+     */
     static constexpr int SWIZ_MASK = (HEAD_DIM >= 64) ? 7 : (HEAD_DIM / 8 - 1);
 
     static constexpr int NUM_THREADS = WARPS * 32;
@@ -56,36 +54,32 @@ template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> s
     static constexpr int TOTAL = BC * HEAD_DIM;        // total elements per tile
 };
 
-// ---- PTX wrappers ----
-// Tensor-core mma.sync lives in the shared astrai::mma_sync template
-// (mma/mma.cuh); the element operations (pack2/unpack2/...) in
-// utils/dtype.cuh.
+/* PTX wrappers: mma.sync is defined in mma/mma.cuh; element packing
+ * operations (pack2/unpack2/...) are defined in utils/dtype.cuh.
+ */
 
 // pack two floats into one 16-bit-pair register as .b32 (mma A/B operand cell)
 template <typename T> DEVICE_FORCEINLINE unsigned pk2(float a, float b) {
     return ElemTrait<T>::pack2(a, b);
 }
 
-// ldmatrix lives in the shared template (mma/mma.cuh):
-// `astrai::ldmatrix_x2<Traits::Elem>` / `<Traits::Elem, /*Trans=*/true>` load
-// the K/V fragments with the exact register layout mma expects.
+/* ldmatrix is defined in mma/mma.cuh. Its normal and transposed template
+ * forms load K/V fragments in the register layout expected by mma.sync.
+ */
 
 // XOR swizzle for shared-memory column at 8-element chunk granularity.
 DEVICE_FORCEINLINE int swiz_col(int d, int r, int mask = 7) {
     return ((d >> 3) ^ (r & mask)) << 3 | (d & 7);
 }
 
-// cp.async primitives live in the shared template (common/pipeline.cuh):
-// `astrai::cp_async_16` (predicated), `astrai::cp_async_commit_group`,
-// `astrai::cp_async_wait_group<N>` / `_wait_all` stage the K/V tiles.
+/* cp.async primitives are defined in common/pipeline.cuh. They stage K/V
+ * tiles with predicated copies, group commits, and configurable waits.
+ */
 
-// ---------------------------------------------------------------------------
-// Q-load: load query rows directly from global memory into mma A-operand
-// register layout. One call replaces ~15 duplicated lines in each MMA kernel.
-// off_a/off_b are the two mma rows' element offsets (row-within-head times
-// q row stride); the bases differ when the PackGQA fold puts the two rows in
-// different heads. Decode passes the same base twice (rows are heads).
-// ---------------------------------------------------------------------------
+/* Load query rows from global memory into the MMA A-operand register layout.
+ * off_a/off_b are row offsets in Q; they may refer to different heads after
+ * PackGQA folding. Decode uses one base because each row represents a head.
+ */
 template <int KD, typename T>
 __device__ inline void load_q_mma_frags(const T* __restrict__ qa,
                                         const T* __restrict__ qb,
@@ -108,13 +102,10 @@ __device__ inline void load_q_mma_frags(const T* __restrict__ qa,
     }
 }
 
-// ---------------------------------------------------------------------------
-// K/V tile loader shared by the MMA kernels: stages one BC×HEAD_DIM tile
-// into the double-buffered K/V rings via predicated cp.async with the XOR
-// swizzle.  AddrFn maps (kc, d, valid) -> {k, v, valid} (KVAddr); the two
-// kernels differ only in addressing (decode: KV::decode_addr with new-K/V
-// persistence; prefill: resolve_token + kv_addr_from_token).
-// ---------------------------------------------------------------------------
+/* Stage one BC×HEAD_DIM K/V tile in shared memory using predicated cp.async
+ * and XOR swizzling. AddrFn maps (kc, d, valid) to a KVAddr. Decode and
+ * prefill provide different address policies; decode may also persist new K/V.
+ */
 template <typename Traits, typename AddrFn>
 __device__ inline void load_kv_tile(typename Traits::Elem* sK, // ring bases (STAGES * BC * LD each)
                                     typename Traits::Elem* sV,
@@ -139,13 +130,10 @@ __device__ inline void load_kv_tile(typename Traits::Elem* sK, // ring bases (ST
     astrai::cp_async_commit_group();
 }
 
-// ---------------------------------------------------------------------------
-// S = Q @ K^T  (Qa pre-loaded by the caller). Scores are RAW (unscaled): the
-// softmax consumes them in the raw space and folds scale * log2(e) into the
-// exp2 argument (FlashAttention's base change — one FFMA per element feeding
-// MUFU.EX2, and the post-mma per-element scale multiply disappears).
-// Traits provides Elem, KD, NC8, LD, and SWIZ_MASK.
-// ---------------------------------------------------------------------------
+/* Compute raw scores S = Q @ K^T from the preloaded Qa fragments. Softmax
+ * applies scale * log2(e) later, avoiding a separate per-element multiply.
+ * Traits provides Elem, KD, NC8, LD, and SWIZ_MASK.
+ */
 template <typename Traits>
 __device__ inline void mma_compute_scores(const unsigned Qa[Traits::KD][4],
                                           const typename Traits::Elem* __restrict__ sK,
@@ -167,12 +155,10 @@ __device__ inline void mma_compute_scores(const unsigned Qa[Traits::KD][4],
     }
 }
 
-// Online softmax + Oacc rescale for one K/V tile. The mask addressing and
-// the two rows' causal/valid predicates ride the MaskView struct: nine
-// positional parameters became typed fields, so a call site cannot transpose
-// a stride and an offset.
-// HasMask is a compile-time template bool: when false, the mask branch is
-// entirely dead-code-eliminated from the inner unrolled loop.
+/* Update online softmax and rescale Oacc for one K/V tile. MaskView groups
+ * mask addressing with both rows' causal/valid predicates. HasMask is a
+ * compile-time flag, so the mask path is removed when disabled.
+ */
 struct MaskView {
     const bool* __restrict__ mask;
     int b_stride, h_stride, l_stride;
@@ -228,27 +214,26 @@ __device__ inline void mma_softmax_tile(int kv0,
     float nm0 = softmax_remax(m0, rmax0, corr0, scale_log2);
     float nm1 = softmax_remax(m1, rmax1, corr1, scale_log2);
 
-    // The exp2 anchor: the new max's scaled value, with the still-empty
-    // state clamped to 0 so masked-out (-FLT_MAX) scores weigh 0 instead of
-    // exp2(0) == 1 (softmax.cuh's sentinel). One subtract feeds every
-    // element's FFMA below.
+    /* Clamp the empty state's scaled max to 0. This keeps masked scores at
+     * -FLT_MAX, so exp2 yields 0 rather than 1 for the softmax sentinel.
+     */
     float nm2_0 = softmax_scaled_max(nm0, scale_log2);
     float nm2_1 = softmax_scaled_max(nm1, scale_log2);
 
     float rsum0 = 0.0f, rsum1 = 0.0f;
 #pragma unroll
     for (int n8 = 0; n8 < Traits::NC8; n8++) {
-        // exp2f(x*s2 - nm2): the compiler contracts the product and subtract
-        // into one FFMA feeding MUFU.EX2 — the instruction saving this base
-        // change exists for (2 flops per element vs 3 before).
+        /* The compiler contracts x*s2 - nm2 into an FFMA feeding MUFU.EX2,
+         * avoiding a separate scale multiply for each score.
+         */
         float p0 = exp2f(Sacc[n8][0] * scale_log2 - nm2_0);
         float p1 = exp2f(Sacc[n8][1] * scale_log2 - nm2_0);
         float p2 = exp2f(Sacc[n8][2] * scale_log2 - nm2_1);
         float p3 = exp2f(Sacc[n8][3] * scale_log2 - nm2_1);
         Sacc[n8][0] = p0;
         Sacc[n8][1] = p1;
-        Sacc[n8][0+2] = p2;
-        Sacc[n8][0+3] = p3;
+        Sacc[n8][2] = p2;
+        Sacc[n8][3] = p3;
         rsum0 += p0 + p1;
         rsum1 += p2 + p3;
     }
@@ -259,8 +244,9 @@ __device__ inline void mma_softmax_tile(int kv0,
     l0 = l0 * corr0 + rsum0;
     l1 = l1 * corr1 + rsum1;
 
-    // Skip the O rescale when the max did not move: corr == exp2(0) == 1.0f
-    // exactly, and x * 1.0f is bit-identical to x.
+    /* Skip O rescaling when the max is unchanged: corr is exactly 1.0f, so
+     * multiplying by it would leave each value bit-identical.
+     */
     if (corr0 != 1.0f) {
 #pragma unroll
         for (int j = 0; j < Traits::DN8; j++) {
@@ -277,10 +263,9 @@ __device__ inline void mma_softmax_tile(int kv0,
     }
 }
 
-// ---------------------------------------------------------------------------
-// O += P @ V  (Sacc must contain P = attention weights after softmax).
-// Traits provides Elem, DN8, KT2, LD, and SWIZ_MASK.
-// ---------------------------------------------------------------------------
+/* Accumulate O += P @ V, where Sacc contains the post-softmax weights.
+ * Traits provides Elem, DN8, KT2, LD, and SWIZ_MASK.
+ */
 template <typename Traits>
 __device__ inline void mma_pv_accumulate(float Sacc[][4],
                                          const typename Traits::Elem* __restrict__ sV,

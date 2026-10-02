@@ -1,9 +1,11 @@
-// CUDA bindings for the stateless FP8 quantize primitives. The launcher,
-// the ring binding and the composed pass live in ``entry.cu`` (beside this
-// file, declared in api/quantize.h) so the fp8-linear composition
-// (``gemm/fp8_linear.cu``, compiled into the gemm module where the GEMM
-// dispatch state lives) shares them instead of re-deriving them; this TU is
-// only the pybind surface.
+/*
+ * CUDA bindings for the stateless FP8 quantize primitives. The launcher,
+ * the ring binding and the composed pass live in ``entry.cu`` (beside this
+ * file, declared in api/quantize.h) so the fp8-linear composition
+ * (``gemm/fp8_linear.cu``, compiled into the gemm module where the GEMM
+ * dispatch state lives) shares them instead of re-deriving them; this TU is
+ * only the pybind surface.
+ */
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cstdint>
@@ -15,13 +17,15 @@ using namespace astrai::quant;
 
 namespace {
 
-// Shared body for quantize() (RowMajor/Transposed, one output) and
-// quantize_dual() (Dual: both orientations from one read). With ring the
-// kernel runs the delayed-scaling fold (RingView, launch.cuh) and the
-// returned amax is the ring's self-cleaned persistent slot — its only
-// reducer; without ring it is a pure scale+cast and amax is None (dynamic
-// scaling measures its own). ``transposed_dtype`` (default: the row-major
-// format) recasts the transposed side independently (hybrid fwd/bwd pair).
+/*
+ * Shared body for quantize() (RowMajor/Transposed, one output) and
+ * quantize_dual() (Dual: both orientations from one read). With ring the
+ * kernel runs the delayed-scaling fold (RingView, launch.cuh) and the
+ * returned amax is the ring's self-cleaned persistent slot — its only
+ * reducer; without ring it is a pure scale+cast and amax is None (dynamic
+ * scaling measures its own). ``transposed_dtype`` (default: the row-major
+ * format) recasts the transposed side independently (hybrid fwd/bwd pair).
+ */
 py::object quantize_impl(torch::Tensor x,
                          torch::Tensor scale,
                          at::ScalarType out_dtype,
@@ -56,10 +60,12 @@ py::object quantize_impl(torch::Tensor x,
         return py::make_tuple(outs.out, outs.amax);
 }
 
-// Single-orientation quantize binding: row-major x8, or its [cols][rows]
-// transpose when transposed is set — the K-contiguous operand orientation
-// NT GEMMs want. Returns (x8|x8T, amax); amax is the fold's raw-domain amax
-// of the round when ring_state is given, else None (pure scale+cast).
+/*
+ * Single-orientation quantize binding: row-major x8, or its [cols][rows]
+ * transpose when transposed is set — the K-contiguous operand orientation
+ * NT GEMMs want. Returns (x8|x8T, amax); amax is the fold's raw-domain amax
+ * of the round when ring_state is given, else None (pure scale+cast).
+ */
 py::object quantize(torch::Tensor x,
                     torch::Tensor scale,
                     at::ScalarType dtype,
@@ -74,12 +80,14 @@ py::object quantize(torch::Tensor x,
                          pow2_margin);
 }
 
-// Dual-orientation quantize binding: one read of x produces both the
-// row-major x8 and its transpose (plus amax), for tensors consumed by GEMMs
-// in both orientations (backward g). ``transposed_dtype`` casts the
-// transposed side in a different fp8 format from one read (hybrid training:
-// E4M3 forward operand, E5M2 backward operand). Returns (x8, x8T, amax),
-// amax as above.
+/*
+ * Dual-orientation quantize binding: one read of x produces both the
+ * row-major x8 and its transpose (plus amax), for tensors consumed by GEMMs
+ * in both orientations (backward g). ``transposed_dtype`` casts the
+ * transposed side in a different fp8 format from one read (hybrid training:
+ * E4M3 forward operand, E5M2 backward operand). Returns (x8, x8T, amax),
+ * amax as above.
+ */
 py::object quantize_dual(torch::Tensor x,
                          torch::Tensor scale,
                          at::ScalarType dtype,
@@ -96,8 +104,10 @@ py::object quantize_dual(torch::Tensor x,
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // The fold-scratch extent, for policy/tests that size the ring buffer
-    // (the full layout is RingLayout, api/quantize_common.h).
+    /*
+     * The fold-scratch extent, for policy/tests that size the ring buffer
+     * (the full layout is RingLayout, api/quantize_common.h).
+     */
     m.attr("K_FOLD_SLOTS") = kFoldSlots;
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"), py::arg("dtype"),
           py::arg("transposed") = false, py::arg("ring") = py::none(), py::arg("hist_idx") = 0,

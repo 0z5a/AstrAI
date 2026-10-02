@@ -7,29 +7,43 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 import torch
 
+from astrai.config.inference_config import InferenceConfig
 from astrai.extension import (
     ATTN_BACKEND,
     AttentionBackend,
     attn_backend,
     get_backend,
 )
-from astrai.inference.cache import PagePool, TaskCacheManager
-from astrai.inference.metrics import MetricsCollector
-from astrai.inference.runtime.model_runner import GPUModelRunner
-from astrai.inference.runtime.stepper import Stepper
-from astrai.inference.task import (
+from astrai.inference.core import request as request_module
+from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
+from astrai.inference.core.events import (  # noqa: I001 module path, not the frontend package
+    FINISH_ABORTED,
+    FINISH_CANCELLED,
+    FINISH_LENGTH,
+    FINISH_REJECTED,
+    FINISH_STOP_TOKEN,
+    RequestError,
+    RequestFinished,
+    TokenDelta,
+)
+from astrai.inference.core.metrics import MetricsCollector
+from astrai.inference.core.request import (
     STOP,
     GenerationResult,
-    Task,
-    TaskManager,
-    TaskStatus,
+    Request,
+    RequestManager,
+    RequestStatus,
+    StreamDecoder,
 )
-from astrai.inference.versioning import PolicyVersionGuard
+from astrai.inference.core.stepper import SchedulerStep
+from astrai.inference.core.versioning import PolicyVersionGuard
+from astrai.inference.worker.model_runner import GPUModelRunner
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+_config = InferenceConfig()
 
 
 def _with_weight_lock(method):
@@ -41,7 +55,57 @@ def _with_weight_lock(method):
     return synchronized
 
 
-class InferenceScheduler:
+class OutputEventSink:
+    """Callable receiving one step's worth of output events.
+
+    Contract: invoked on the scheduler loop thread; implementations must
+    be fast, non-blocking and exception-safe (failures are logged and the
+    batch dropped — the loop keeps running).
+    """
+
+    def __call__(self, events: List[Any]) -> None:
+        raise NotImplementedError
+
+
+class _CallbackBridge(OutputEventSink):
+    """Default sink: maps output events onto registered stream callbacks.
+
+    Keeps the pre-event behavior for consumers that registered plain or
+    batched callbacks on the RequestManager: ``TokenDelta`` is detokenized
+    here (sink side, not the loop's emission code) and delivered as the
+    incremental text, terminal events become the ``STOP`` sentinel.  The
+    per-request decoder state lives on the bridge, mirroring where the
+    request's ``StreamDecoder`` used to live.
+    """
+
+    def __init__(self, requests: RequestManager):
+        self._requests = requests
+        self._tokenizer = requests.tokenizer
+        self._decoders: Dict[str, StreamDecoder] = {}
+
+    def __call__(self, events: List[Any]) -> None:
+        payload: List[Tuple[str, Any]] = []
+        for event in events:
+            if isinstance(event, TokenDelta):
+                decoder = self._decoders.get(event.request_id)
+                if decoder is None:
+                    # Module-attribute lookup so tests (and future
+                    # overrides) that patch ``request.StreamDecoder``
+                    # remain effective here.
+                    decoder = self._decoders[event.request_id] = (
+                        request_module.StreamDecoder(self._tokenizer)
+                    )
+                text = decoder.push(event.token_id)
+                if text:
+                    payload.append((event.request_id, text))
+            elif isinstance(event, (RequestFinished, RequestError)):
+                payload.append((event.request_id, STOP))
+                self._decoders.pop(event.request_id, None)
+        if payload:
+            self._requests.invoke_callbacks(payload)
+
+
+class Scheduler:
     """Continuous batching loop: cleanup -> refill -> prefill -> decode (all groups)."""
 
     def __init__(
@@ -52,11 +116,14 @@ class InferenceScheduler:
         max_seq_len: Optional[int] = None,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
-        cache: Optional[PagePool] = None,
+        cache: Optional[BlockPool] = None,
         enable_cuda_graph: bool = True,
         backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
         policy_version: int = 0,
         enable_overlap: bool = False,
+        page_size: Optional[int] = None,
+        kv_tokens: Optional[int] = None,
+        token_budget: Optional[int] = None,
     ):
         if (
             isinstance(policy_version, bool)
@@ -87,7 +154,15 @@ class InferenceScheduler:
         if cache is not None:
             self._cache = cache
         else:
-            self._cache = PagePool(
+            # page_size/kv_tokens select the paged strategy with prefix
+            # caching; the default stays contiguous (static partitions),
+            # which rollout-sized serving keeps as the zero-config path.
+            pool_kwargs: Dict[str, Any] = {}
+            if page_size is not None:
+                pool_kwargs["page_size"] = page_size
+            if kv_tokens is not None:
+                pool_kwargs["n_tokens"] = kv_tokens
+            self._cache = BlockPool(
                 n_layers=config.num_hidden_layers,
                 n_kv_heads=config.num_key_value_heads,
                 head_dim=head_dim,
@@ -95,13 +170,14 @@ class InferenceScheduler:
                 max_seq_len=self.max_seq_len,
                 device=self.device,
                 dtype=self.dtype,
+                **pool_kwargs,
             )
 
         self._metrics = MetricsCollector()
 
-        self._task_cache = TaskCacheManager(self._cache)
+        self._kv_manager = KVCacheManager(self._cache)
 
-        self._task_mgr = TaskManager(
+        self._requests = RequestManager(
             tokenizer=tokenizer,
             max_batch_size=max_batch_size,
             max_seq_len=self.max_seq_len,
@@ -120,40 +196,77 @@ class InferenceScheduler:
             self._executor = GPUModelRunner(
                 model=model,
                 kv_cache=self._cache,
-                task_cache=self._task_cache,
+                cache_mgr=self._kv_manager,
                 device=self.device,
                 dtype=self.dtype,
                 enable_cuda_graph=enable_cuda_graph,
             )
 
-        self._stepper = Stepper(
-            self._cache, self._task_cache, self._executor, self._metrics
+        # 0/None both mean "no chunking": whole-remaining-prompt prefills.
+        effective_budget = token_budget or _config.max_num_batched_tokens or None
+        self._stepper = SchedulerStep(
+            self._cache,
+            self._kv_manager,
+            self._executor,
+            self._metrics,
+            token_budget=effective_budget,
         )
 
         self._stop_event = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
-        # Finished tasks whose KV slots are still written by the in-flight
-        # step; freed once that step is committed (see _run_generation_loop).
-        self._retired: List[Task] = []
+        # Finished requests whose KV slots are still written by the in-flight
+        # step; freed once that step is committed (see run_busy_loop).
+        self._retired: List[Request] = []
+        # Output event sink.  The default bridge maps events onto the
+        # RequestManager's registered callbacks (legacy behavior); the
+        # engine installs a bounded-queue sink so the loop never runs
+        # consumer code.  Swappable per deployment (T1: cross-process).
+        self._event_sink = _CallbackBridge(self._requests)
         self._policy_guard = PolicyVersionGuard(
             policy_version,
             ensure_ready=self._ensure_weight_update_ready,
-            on_commit=self._task_cache.invalidate_cache,
+            on_commit=self._kv_manager.invalidate_cache,
         )
         # Synchronous generation shares the guard's generation/weight mutex.
         self._weight_lock = self._policy_guard.lock
+
+    def set_event_sink(self, sink: "OutputEventSink") -> None:
+        """Route scheduler output events to ``sink`` (idempotent swap)."""
+        self._event_sink = sink
+
+    def _emit_events(self, events: List[Any]) -> None:
+        try:
+            self._event_sink(events)
+        except Exception:
+            # A consumer failure must never take down the engine loop;
+            # the offending request's terminal event still reaches its
+            # queue via the sink's own error handling.
+            logger.exception("output event sink failed; dropping batch")
 
     @property
     def policy_version(self) -> int:
         """Version of the model weights used for subsequent generations."""
         return self._policy_guard.policy_version
 
+    @property
+    def max_batch_size(self) -> int:
+        """Executor batch capacity (fixed-shape buffer bound)."""
+        return self._requests.max_batch_size
+
+    @property
+    def model(self) -> AutoModel:
+        """The shared model object (train-serve colocated weights)."""
+        return self._executor.model
+
     def _ensure_weight_update_ready(self) -> None:
         """Check weight update preconditions. Must be called under the lock."""
         if self._loop_thread is not None and self._loop_thread.is_alive():
             raise RuntimeError("Stop the scheduler before updating model weights")
-        if self._task_mgr.get_active_tasks() or self._task_mgr.get_waiting_tasks():
-            raise RuntimeError("Cannot update model weights while tasks are queued")
+        if (
+            self._requests.get_running_requests()
+            or self._requests.get_waiting_requests()
+        ):
+            raise RuntimeError("Cannot update model weights while requests are queued")
         # Drain any submitted-but-uncommitted step: its KV writes and
         # device references must land before the world changes underneath.
         self._executor.flush_pending(self._stepper)
@@ -184,31 +297,31 @@ class InferenceScheduler:
         """Inspect state while the scheduler's policy version remains stable."""
         return self._policy_guard.with_policy_snapshot(inspect)
 
-    def add_task(self, prompt: str, **kwargs) -> str:
-        return self._task_mgr.add_task(prompt, **kwargs)
+    def add_request(self, prompt: str, **kwargs) -> str:
+        return self._requests.add_request(prompt, **kwargs)
 
-    def add_tasks(self, prompts: List[str], **kwargs) -> List[str]:
-        """Batch add with one tokenizer ``encode_batch``; see TaskManager."""
-        return self._task_mgr.add_tasks(prompts, **kwargs)
+    def add_requests(self, prompts: List[str], **kwargs) -> List[str]:
+        """Batch add; see RequestManager (ids/pre-tokenized passthrough)."""
+        return self._requests.add_requests(prompts, **kwargs)
 
-    def cancel_task(self, task_id: str) -> bool:
-        """Cancel a waiting or active task without freeing in-use KV state."""
-        immediate, cancelled = self._task_mgr.cancel_task(task_id)
-        for task in immediate:
+    def cancel_request(self, request_id: str) -> bool:
+        """Cancel a waiting or active request without freeing in-use KV state."""
+        immediate, cancelled = self._requests.cancel_request(request_id)
+        for request in immediate:
             self._metrics.mark_finished(
-                task.task_id, task.input_tokens, task.output_tokens
+                request.request_id, request.input_tokens, request.output_tokens
             )
         if cancelled:
-            self._task_mgr.wake()
+            self._requests.wake()
         return cancelled
 
-    def remove_task(self, task_id: str) -> bool:
+    def remove_request(self, request_id: str) -> bool:
         """Backward-compatible alias for cancellation."""
-        return self.cancel_task(task_id)
+        return self.cancel_request(request_id)
 
     def get_stats(self) -> Dict[str, Any]:
-        stats = self._task_mgr.get_stats()
-        stats["kv_cache_tasks"] = self._task_cache.task_count
+        stats = self._requests.get_stats()
+        stats["kv_cache_tasks"] = self._kv_manager.request_count
         stats["policy_version"] = self._policy_guard.policy_version
         return stats
 
@@ -226,81 +339,116 @@ class InferenceScheduler:
         return attn_backend(self._backend)
 
     def _step(
-        self, tasks: List[Task], return_logprobs: bool = False
-    ) -> Tuple[List[Task], List[Task]]:
-        """Advance every active task by one token; see :class:`Stepper`."""
-        return self._stepper.step(tasks, return_logprobs=return_logprobs)
+        self, requests: List[Request], return_logprobs: bool = False
+    ) -> Tuple[List[Request], List[Request]]:
+        """Advance every active request by one token; see :class:`SchedulerStep`."""
+        return self._stepper.step(requests, return_logprobs=return_logprobs)
 
-    def _run_generation_loop(self):
+    def run_busy_loop(self):
         # Set membership is O(1); the tokenizer rebuilds the list on every
-        # attribute access, and both the finished-task scan and the
-        # per-step terminal check probe it (×2 per task per step before).
-        stop_ids = frozenset(self._task_mgr.tokenizer.stop_ids)
+        # attribute access, and both the finished-request scan and the
+        # per-step terminal check probe it (×2 per request per step before).
+        stop_ids = frozenset(self._requests.tokenizer.stop_ids)
         try:
             with self._backend_context():
                 while not self._stop_event.is_set():
-                    finished = self._task_mgr.remove_finished_tasks(stop_ids)
+                    finished = self._requests.remove_finished_requests(stop_ids)
                     retired = getattr(self, "_retired", None)
                     if finished:
-                        # A finished task whose KV is still written by the
+                        # A finished request whose KV is still written by the
                         # in-flight (uncommitted) step must not free its
                         # slots yet — the slots could be reallocated and
-                        # corrupted mid-flight.  Such tasks are deferred to
+                        # corrupted mid-flight.  Such requests are deferred to
                         # the next iteration's drain (the pending step is
                         # always committed before a batch change there).
                         pending = self._executor.peek_pending()
                         inflight_ids = (
-                            set(pending.snapshot.task_ids)
+                            set(pending.snapshot.request_ids)
                             if pending is not None and not pending.committed
                             else frozenset()
                         )
-                        for task in finished:
-                            if task.status == TaskStatus.FINISHED:
-                                self._task_cache.task_record_hashes(
-                                    task.task_id,
-                                    self._task_cache.task_cacheable_ids(
-                                        task.task_id, task.prompt_ids, task.output_ids
+                        for request in finished:
+                            if request.status == RequestStatus.FINISHED:
+                                self._kv_manager.record_block_hashes(
+                                    request.request_id,
+                                    self._kv_manager.request_cacheable_ids(
+                                        request.request_id,
+                                        request.prompt_ids,
+                                        request.output_ids,
                                     )
                                     if self._cache.page_size > 1
-                                    else task.prompt_ids,
+                                    else request.prompt_ids,
                                 )
-                            if retired is not None and task.task_id in inflight_ids:
-                                retired.append(task)
+                            if (
+                                retired is not None
+                                and request.request_id in inflight_ids
+                            ):
+                                retired.append(request)
                             else:
-                                self._task_cache.task_free(task.task_id)
+                                self._kv_manager.free_slots(request.request_id)
 
                     if retired:
                         pending = self._executor.peek_pending()
                         if pending is None or pending.committed:
-                            for task in retired:
-                                self._task_cache.task_free(task.task_id)
+                            for request in retired:
+                                self._kv_manager.free_slots(request.request_id)
                             retired.clear()
 
-                    active = self._task_mgr.get_active_tasks()
-                    available = self._task_mgr.max_batch_size - len(active)
+                    active = self._requests.get_running_requests()
+                    available = self._requests.max_batch_size - len(active)
                     if available > 0:
-                        candidates = self._task_mgr.pull_candidates(available)
+                        candidates = self._requests.pull_waiting(available)
                         failed = []
-                        for task in candidates:
-                            if self._task_cache.task_alloc(
-                                task.task_id, task.prompt_ids
+                        hopeless = []
+                        for request in candidates:
+                            if not self._kv_manager.can_ever_fit(
+                                len(request.prompt_ids)
                             ):
-                                if not self._task_mgr.activate(task):
-                                    self._task_cache.task_free(task.task_id)
+                                # Larger than the whole pool even with every
+                                # cached page evicted: retrying would spin
+                                # the allocator forever (the livelock), so
+                                # terminate the request instead.
+                                hopeless.append(request)
+                                continue
+                            if self._kv_manager.alloc_slots(
+                                request.request_id, request.prompt_ids
+                            ):
+                                if not self._requests.activate(request):
+                                    self._kv_manager.free_slots(request.request_id)
                                     self._metrics.mark_finished(
-                                        task.task_id,
-                                        task.input_tokens,
-                                        task.output_tokens,
+                                        request.request_id,
+                                        request.input_tokens,
+                                        request.output_tokens,
                                     )
                                 else:
                                     # Just activated: extend the snapshot
                                     # taken above instead of re-listing the
                                     # whole active set a second time.
-                                    active.append(task)
+                                    active.append(request)
                             else:
-                                failed.append(task)
+                                failed.append(request)
+                        if hopeless:
+                            # Terminal events first (consumers unblock),
+                            # then release their queue records.
+                            self._emit_events(
+                                [
+                                    RequestFinished(
+                                        request_id=request.request_id,
+                                        finish_reason=FINISH_REJECTED,
+                                        prompt_tokens=len(request.prompt_ids),
+                                    )
+                                    for request in hopeless
+                                ]
+                            )
+                            for request in hopeless:
+                                self._metrics.mark_finished(
+                                    request.request_id,
+                                    len(request.prompt_ids),
+                                    0,
+                                )
+                            self._requests.discard_waiting(hopeless)
                         if failed:
-                            self._task_mgr.return_to_waiting(failed)
+                            self._requests.return_to_waiting(failed)
 
                     if not active:
                         # Idle path: drain any residual step and release
@@ -308,24 +456,26 @@ class InferenceScheduler:
                         # never waits with an uncommitted step in flight.
                         self._executor.flush_pending(self._stepper)
                         if retired:
-                            for task in retired:
-                                self._task_cache.task_free(task.task_id)
+                            for request in retired:
+                                self._kv_manager.free_slots(request.request_id)
                             retired.clear()
-                        if not self._task_mgr.has_work():
-                            self._task_mgr.wait_for_tasks(timeout=1.0)
+                        if not self._requests.has_requests():
+                            self._requests.wait_for_requests(timeout=1.0)
                             continue
                         # Refill was rejected (KV pressure): re-check after
                         # waiting so a slot freed elsewhere is picked up.
                         active = [
-                            task
-                            for task in self._task_mgr.get_active_tasks()
-                            if task.status != TaskStatus.ABORTED
+                            request
+                            for request in self._requests.get_running_requests()
+                            if request.status != RequestStatus.ABORTED
                         ]
 
                     # Drop any ABORTED members (status can flip during a
                     # step) before stepping.
                     active = [
-                        task for task in active if task.status != TaskStatus.ABORTED
+                        request
+                        for request in active
+                        if request.status != RequestStatus.ABORTED
                     ]
 
                     # ---- overlap pipeline (depth 2) ----
@@ -336,17 +486,17 @@ class InferenceScheduler:
                     # decode batches ride the pipeline — a changed batch
                     # (finish, join, prefill mix) drains first and falls
                     # back to the synchronous step, because the next
-                    # submit's inputs depend on committed task state.
+                    # submit's inputs depend on committed request state.
                     pending = self._executor.peek_pending()
-                    aborted: List[Task] = []
+                    aborted: List[Request] = []
                     overlap = self._enable_overlap
                     steady = (
                         overlap
                         and active
                         and pending is not None
-                        and pending.snapshot.task_ids
-                        == tuple(t.task_id for t in active)
-                        and all(t.prefill_done for t in active)
+                        and pending.snapshot.request_ids
+                        == tuple(t.request_id for t in active)
+                        and all(t.prefill_complete for t in active)
                         and self._executor.can_overlap_submit()
                     )
                     if steady:
@@ -355,7 +505,7 @@ class InferenceScheduler:
                         # slot must NOT be cleared again here — clearing it
                         # would drop the just-submitted step (its tokens then
                         # never commit; every other steady iteration lost a
-                        # token and tasks aborted at the KV cap instead of
+                        # token and requests aborted at the KV cap instead of
                         # max_tokens).
                         produced, new_pending = self._stepper.step_submit(active)
                         committed = self._stepper.step_commit(pending)
@@ -365,26 +515,53 @@ class InferenceScheduler:
                         new_pending = None
                         committed = produced
 
-                    decoded = [t for t in committed if t.status != TaskStatus.ABORTED]
+                    decoded = [
+                        t for t in committed if t.status != RequestStatus.ABORTED
+                    ]
 
-                    # One dispatch per step: batch-aware sinks take their
-                    # lock (and wake waiters) once instead of once per token.
-                    events: List[Tuple[str, Any]] = [(t.task_id, STOP) for t in aborted]
+                    # Event emission: token ids + terminal facts only.  The
+                    # loop thread never detokenizes and never runs user
+                    # callbacks — the sink decides where the events land
+                    # (bounded queue for the engine, direct callbacks for
+                    # legacy consumers, no-op when nobody listens).
+                    events: List[Any] = [
+                        RequestFinished(
+                            request_id=t.request_id,
+                            finish_reason=FINISH_ABORTED,
+                        )
+                        for t in aborted
+                    ]
                     for t in decoded:
-                        if t.status == TaskStatus.ABORTED:
+                        if t.status == RequestStatus.ABORTED:
                             continue
                         if not t.output_ids:
-                            # Defensive: a decoded task with no committed
+                            # Defensive: a decoded request with no committed
                             # token yet (cannot happen on the contract's
                             # happy path) must not crash the loop.
                             continue
-                        new_text = t.decode_new_token(self._task_mgr.tokenizer)
-                        if new_text:
-                            events.append((t.task_id, new_text))
+                        events.append(
+                            TokenDelta(
+                                request_id=t.request_id,
+                                token_id=t.output_ids[-1],
+                                sequence_no=t.output_tokens,
+                            )
+                        )
                         if t.is_finished(stop_ids):
-                            events.append((t.task_id, STOP))
+                            reason = (
+                                FINISH_STOP_TOKEN
+                                if t.output_ids[-1] in stop_ids
+                                else FINISH_LENGTH
+                            )
+                            events.append(
+                                RequestFinished(
+                                    request_id=t.request_id,
+                                    finish_reason=reason,
+                                    prompt_tokens=t.input_tokens,
+                                    completion_tokens=t.output_tokens,
+                                )
+                            )
                     if events:
-                        self._task_mgr.invoke_callbacks(events)
+                        self._emit_events(events)
 
         except Exception as e:
             self._stop_event.set()
@@ -396,38 +573,60 @@ class InferenceScheduler:
         if self._loop_thread is not None and self._loop_thread.is_alive():
             return
         self._stop_event.clear()
-        t = threading.Thread(target=self._run_generation_loop, daemon=True)
+        t = threading.Thread(target=self.run_busy_loop, daemon=True)
         t.start()
         self._loop_thread = t
 
     def stop(self):
         self._stop_event.set()
-        self._task_mgr.wake()
-        if self._loop_thread is not None:
-            self._loop_thread.join(timeout=2.0)
+        self._requests.wake()
+        thread = self._loop_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        if thread is not None and thread.is_alive():
+            # The loop did not drain in time (a stuck forward, a slow
+            # callback).  Clearing queues underneath a live loop would
+            # double-free KV slots and let a second start() race it, so
+            # leave the thread handle in place: callers can retry stop(),
+            # and start() refuses to launch a second loop while it lives.
+            logger.warning(
+                "scheduler loop did not stop within 2s; keeping thread "
+                "handle and request state — call stop() again once the "
+                "blocking work drains"
+            )
+            return
         self._loop_thread = None
         self._abort_and_clear(free_waiting=True)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def _abort_and_clear(self, free_waiting: bool):
-        """Invoke STOP callbacks, release cache slots, and clear task queues."""
-        active = self._task_mgr.get_active_tasks()
-        waiting = self._task_mgr.get_waiting_tasks()
-        for task in active:
-            self._task_mgr.invoke_callback(task.task_id, STOP)
-            self._task_cache.task_free(task.task_id)
-            self._metrics.mark_finished(
-                task.task_id, task.input_tokens, task.output_tokens
+        """Emit terminal events, release cache slots, and clear request queues."""
+        active = self._requests.get_running_requests()
+        waiting = self._requests.get_waiting_requests()
+        terminal = [
+            RequestFinished(
+                request_id=request.request_id,
+                finish_reason=FINISH_CANCELLED,
+                prompt_tokens=request.input_tokens,
+                completion_tokens=request.output_tokens,
             )
-        for task in waiting:
-            self._task_mgr.invoke_callback(task.task_id, STOP)
+            for request in (*active, *waiting)
+        ]
+        if terminal:
+            self._emit_events(terminal)
+        for request in active:
+            self._kv_manager.free_slots(request.request_id)
+            self._metrics.mark_finished(
+                request.request_id, request.input_tokens, request.output_tokens
+            )
+        for request in waiting:
             if free_waiting:
-                self._task_cache.task_free(task.task_id)
+                self._kv_manager.free_slots(request.request_id)
             self._metrics.mark_finished(
-                task.task_id, task.input_tokens, task.output_tokens
+                request.request_id, request.input_tokens, request.output_tokens
             )
-        self._task_mgr.clear_queues()
+        self._requests.clear_queues()
 
     @_with_weight_lock
     def run_batch(
@@ -467,19 +666,19 @@ class InferenceScheduler:
             otherwise generated token IDs per prompt, or token/logprob tuples
             when ``return_logprobs`` is ``True``.
         """
-        stop_ids = self._task_mgr.tokenizer.stop_ids
+        stop_ids = self._requests.tokenizer.stop_ids
         seq_cap = self.max_seq_len
         request_backend = get_backend(use_default=False)
 
-        tasks: List[Optional[Task]] = []
+        requests: List[Optional[Request]] = []
         error_reasons: List[Optional[str]] = []
         for ids in prompt_ids_list:
             if not ids:
-                tasks.append(None)
+                requests.append(None)
                 error_reasons.append("prompt_empty")
                 continue
             if len(ids) >= seq_cap:
-                tasks.append(None)
+                requests.append(None)
                 error_reasons.append("prompt_too_long")
                 continue
             t_max = max_tokens
@@ -488,11 +687,11 @@ class InferenceScheduler:
             else:
                 t_max = min(t_max, seq_cap - len(ids))
             if t_max <= 0:
-                tasks.append(None)
+                requests.append(None)
                 error_reasons.append("max_tokens_non_positive")
                 continue
-            task = Task(
-                task_id=f"batch_{uuid.uuid4().hex[:8]}",
+            request = Request(
+                request_id=f"batch_{uuid.uuid4().hex[:8]}",
                 prompt_ids=list(ids),
                 max_tokens=t_max,
                 temperature=temperature,
@@ -502,37 +701,37 @@ class InferenceScheduler:
                 rep_window=rep_window,
                 backend=request_backend,
             )
-            if not self._task_cache.task_alloc(task.task_id, task.prompt_ids):
-                tasks.append(None)
+            if not self._kv_manager.alloc_slots(request.request_id, request.prompt_ids):
+                requests.append(None)
                 error_reasons.append("kv_cache_allocation_failed")
                 continue
-            task.input_tokens = len(task.prompt_ids)
-            self._metrics.register(task.task_id)
-            tasks.append(task)
+            request.input_tokens = len(request.prompt_ids)
+            self._metrics.register(request.request_id)
+            requests.append(request)
             error_reasons.append(None)
 
         runtime_errors: Dict[str, str] = {}
         try:
-            live = [t for t in tasks if t is not None]
+            live = [t for t in requests if t is not None]
 
             with self._backend_context():
                 while live:
                     decoded, aborted = self._stepper.step(
                         live, return_logprobs=return_logprobs
                     )
-                    for task in aborted:
-                        runtime_errors[task.task_id] = "kv_cache_extension_failed"
+                    for request in aborted:
+                        runtime_errors[request.request_id] = "kv_cache_extension_failed"
                     live = [t for t in decoded if not t.is_finished(stop_ids)]
         finally:
-            for t in tasks:
+            for t in requests:
                 if t is not None:
                     self._metrics.mark_finished(
-                        t.task_id, t.input_tokens, t.output_tokens
+                        t.request_id, t.input_tokens, t.output_tokens
                     )
-                    self._task_cache.task_free(t.task_id)
+                    self._kv_manager.free_slots(t.request_id)
 
         details: List[GenerationResult] = []
-        for t, setup_error in zip(tasks, error_reasons):
+        for t, setup_error in zip(requests, error_reasons):
             if t is None:
                 details.append(
                     GenerationResult(
@@ -543,7 +742,7 @@ class InferenceScheduler:
                     )
                 )
             else:
-                runtime_error = runtime_errors.get(t.task_id)
+                runtime_error = runtime_errors.get(t.request_id)
                 stopped = bool(t.output_ids and t.output_ids[-1] in stop_ids)
                 if runtime_error:
                     finish_reason = "rejected"
@@ -597,40 +796,41 @@ class InferenceScheduler:
 
         request_backend = get_backend(use_default=False)
         seq_cap = self.max_seq_len
-        tasks: List[Optional[Task]] = []
+        requests: List[Optional[Request]] = []
         for prompt_ids, cont_ids in zip(prompt_ids_list, continuation_ids_list):
             if not prompt_ids or not cont_ids:
-                tasks.append(None)
+                requests.append(None)
                 continue
             scored_ids = list(prompt_ids) + list(cont_ids)
             if len(scored_ids) > seq_cap:
-                tasks.append(None)
+                requests.append(None)
                 continue
-            task = Task(
-                task_id=f"score_{uuid.uuid4().hex[:8]}",
+            request = Request(
+                request_id=f"score_{uuid.uuid4().hex[:8]}",
                 prompt_ids=scored_ids,
                 max_tokens=0,
                 backend=request_backend,
             )
-            task.cont_len = len(cont_ids)
-            if not self._task_cache.task_alloc(task.task_id, task.prompt_ids):
-                tasks.append(None)
+            request.cont_len = len(cont_ids)
+            if not self._kv_manager.alloc_slots(request.request_id, request.prompt_ids):
+                requests.append(None)
                 continue
-            task.input_tokens = len(task.prompt_ids)
-            tasks.append(task)
+            request.input_tokens = len(request.prompt_ids)
+            requests.append(request)
 
-        live = [t for t in tasks if t is not None]
+        live = [t for t in requests if t is not None]
         results: Dict[str, Any] = {}
         try:
             if live:
                 with self._backend_context():
                     scored = self._executor.execute_score(live, per_token=per_token)
-                for task, value in zip(live, scored):
-                    results[task.task_id] = value
+                for request, value in zip(live, scored):
+                    results[request.request_id] = value
         finally:
-            for task in live:
-                self._task_cache.task_free(task.task_id)
+            for request in live:
+                self._kv_manager.free_slots(request.request_id)
 
         return [
-            results.get(task.task_id) if task is not None else None for task in tasks
+            results.get(request.request_id) if request is not None else None
+            for request in requests
         ]

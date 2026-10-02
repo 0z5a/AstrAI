@@ -8,7 +8,7 @@ Provides:
   defaults live on the generator; validation overrides per call)
 - :class:`RolloutGenerator` — KV-cache-backed generation of grouped
   responses + decoding (no reward); delegates the generation loop to
-  :class:`~astrai.inference.scheduler.InferenceScheduler.run_batch`
+  :class:`~astrai.inference.core.scheduler.Scheduler.run_batch`
   so rollout and the production inference server share one code path
 - :class:`RolloutRunner` — orchestrates generation + scoring with a
   step-driven cache; its ``__call__`` returns ``(RolloutResult, is_fresh)``
@@ -23,13 +23,14 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 import torch
-from astrai.inference.task import GenerationResult
+from torch import Tensor
+
+from astrai.inference.core.request import GenerationResult
 from astrai.trainer.backend import RolloutBackend
 from astrai.trainer.route_trace import (
     RolloutRouteTraceBatchV0,
     RolloutRouteTraceError,
 )
-from torch import Tensor
 
 
 @dataclass(kw_only=True)

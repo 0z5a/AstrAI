@@ -1,15 +1,17 @@
 #pragma once
-// The host planning half of the GEMM dispatch: the planner chain, the
-// recipe vocabulary it decides on, and the runtime knobs (config state and
-// row tables) it reads. Split out of kernel/gemm.cuh so the per-dtype
-// kernel TUs compile the device stack and reference the planner through the
-// declarations in policy.cuh — plan_table.h's 620 lines stop being dragged
-// through nvcc once per dtype pair.
-//
-// SINGLE-INCLUSION: plan_dispatch is defined NON-inline here, so exactly ONE
-// TU per binary includes this header (gemm.cu, or a standalone harness) — a
-// second includer is a multiple-definition link error, which is the
-// enforcement. The planner is GPU-free by design and never launches.
+/*
+ * The host planning half of the GEMM dispatch: the planner chain, the
+ * recipe vocabulary it decides on, and the runtime knobs (config state and
+ * row tables) it reads. Split out of kernel/gemm.cuh so the per-dtype
+ * kernel TUs compile the device stack and reference the planner through the
+ * declarations in policy.cuh — plan_table.h's 620 lines stop being dragged
+ * through nvcc once per dtype pair.
+ *
+ * SINGLE-INCLUSION: plan_dispatch is defined NON-inline here, so exactly ONE
+ * TU per binary includes this header (gemm.cu, or a standalone harness) — a
+ * second includer is a multiple-definition link error, which is the
+ * enforcement. The planner is GPU-free by design and never launches.
+ */
 
 #include <algorithm>
 #include <cstdint>
@@ -25,12 +27,14 @@
 namespace astrai {
 namespace gemm {
 
-// Raster order: walk the dimension with more tiles fastest (CUTLASS's
-// rule; the N-side mirrored group keeps the measured width 8). M-side group
-// width is humming's L2-budget rule: keep a group's A tiles L2-resident
-// while B streams (B already resident => g=1 plain raster); otherwise
-// reserve a B-streaming fraction of L2, cap at what fits, floor at enough
-// M rows to keep every SM busy per sweep.
+/*
+ * Raster order: walk the dimension with more tiles fastest (CUTLASS's
+ * rule; the N-side mirrored group keeps the measured width 8). M-side group
+ * width is humming's L2-budget rule: keep a group's A tiles L2-resident
+ * while B streams (B already resident => g=1 plain raster); otherwise
+ * reserve a B-streaming fraction of L2, cap at what fits, floor at enough
+ * M rows to keep every SM busy per sweep.
+ */
 inline int plan_raster(const PlanQuery& q, int bm, int bn) {
     const int64_t m_tiles = (q.m + bm - 1) / bm;
     const int64_t n_tiles = (q.n + bn - 1) / bn;
@@ -48,14 +52,16 @@ inline int plan_raster(const PlanQuery& q, int bm, int bn) {
     return (int)std::max(g, (int64_t)1);
 }
 
-// ---------------------------------------------------------------------------
-// Recipe vocabulary: GemmRecipe is the runtime form of a manifest tile; row
-// tables, the model, the launchers and the binding all name tiles through it.
-// ---------------------------------------------------------------------------
+/*
+ * Recipe vocabulary: GemmRecipe is the runtime form of a manifest tile; row
+ * tables, the model, the launchers and the binding all name tiles through it.
+ */
 
-// One manifest tile -> its recipe row, priced at the caller's operand
-// widths (smem is pair-specific); the vector and scan forms share this and
-// must never disagree.
+/*
+ * One manifest tile -> its recipe row, priced at the caller's operand
+ * widths (smem is pair-specific); the vector and scan forms share this and
+ * must never disagree.
+ */
 template <typename Tile> inline GemmRecipe recipe_for_tile(int ba, int bb) {
     return GemmRecipe{(int)tile_class<Tile>(),
                       Tile::kStages,
@@ -70,8 +76,10 @@ template <typename Tile> inline GemmRecipe recipe_for_tile(int ba, int bb) {
                                       Tile::kStages, ba, bb)};
 }
 
-// Deduped on (class, stages, kK): dispatch_tile takes the first manifest
-// match, so the 16-warp small CTA behind its 32-warp twin is one candidate.
+/*
+ * Deduped on (class, stages, kK): dispatch_tile takes the first manifest
+ * match, so the 16-warp small CTA behind its 32-warp twin is one candidate.
+ */
 template <typename Tile> inline void append_recipe(std::vector<GemmRecipe>& out, int ba, int bb) {
     const GemmRecipe r = recipe_for_tile<Tile>(ba, bb);
     for (const GemmRecipe& have : out)
@@ -87,8 +95,10 @@ inline void collect_recipes(std::vector<GemmRecipe>& out, int ba, int bb) {
         Manifest{});
 }
 
-// manifest_kind -> THE one manifest type list that ladder instantiates;
-// the vocabulary builder and the scan oracle both dispatch through it.
+/*
+ * manifest_kind -> THE one manifest type list that ladder instantiates;
+ * the vocabulary builder and the scan oracle both dispatch through it.
+ */
 template <typename F> inline auto with_manifest(bool crosswise_staging, int ba, int bb, F&& fn) {
     switch (manifest_kind(crosswise_staging, ba, bb)) {
     case ManifestKind::kTwoByte:
@@ -110,11 +120,13 @@ inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging, int ba, 
     return out;
 }
 
-// The instantiation oracle: does this ladder carry a tile for (class,
-// stages, kK)? The ONE gate a row's fields must pass — a row naming a
-// non-instantiable combination matches no tile and launches nothing.
-// Scans the manifest list directly (no vector): the vector build cost
-// ~2.5us of the ~2.9us a dispatch took, the scan ~100ns (measured).
+/*
+ * The instantiation oracle: does this ladder carry a tile for (class,
+ * stages, kK)? The ONE gate a row's fields must pass — a row naming a
+ * non-instantiable combination matches no tile and launches nothing.
+ * Scans the manifest list directly (no vector): the vector build cost
+ * ~2.5us of the ~2.9us a dispatch took, the scan ~100ns (measured).
+ */
 template <typename Manifest>
 inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb, GemmRecipe& out) {
     bool found = false;
@@ -153,21 +165,23 @@ inline void log_dispatch(const PlanQuery& q, const PlanDecision& d) {
                  d.recipe.cta, d.recipe.stages, d.raster);
 }
 
-// ---------------------------------------------------------------------------
-// Planners: one plan strategy per dispatch source, composed into a chain
-// (first planner to answer wins). A new source is one class and one chain
-// entry; the mode knob (GemmConfig::planner) only picks which chain.
-// ---------------------------------------------------------------------------
+/*
+ * Planners: one plan strategy per dispatch source, composed into a chain
+ * (first planner to answer wins). A new source is one class and one chain
+ * entry; the mode knob (GemmConfig::planner) only picks which chain.
+ */
 struct GemmPlanner {
     virtual ~GemmPlanner() = default;
     virtual const char* name() const = 0;
     virtual std::optional<PlanDecision> plan(const PlanQuery& q) const = 0;
 };
 
-// Rows to a decision: band + wave gates, then the instantiation oracle,
-// then the smem ceiling — a stale row falls through to the next planner,
-// never fails a launch. Raster 0 resolves through plan_raster at the
-// recipe's geometry (a bare 0 is PLAIN raster, ~14% off on M<<N).
+/*
+ * Rows to a decision: band + wave gates, then the instantiation oracle,
+ * then the smem ceiling — a stale row falls through to the next planner,
+ * never fails a launch. Raster 0 resolves through plan_raster at the
+ * recipe's geometry (a bare 0 is PLAIN raster, ~14% off on M<<N).
+ */
 class RowSetPlanner final : public GemmPlanner {
   public:
     using RowFn = std::function<std::optional<TableRow>(const PlanQuery&)>;
@@ -195,31 +209,33 @@ class RowSetPlanner final : public GemmPlanner {
     bool respects_table_off_;
 };
 
-// The analytical planner — a port of DeepGEMM's get_best_configs with the
-// one term DeepGEMM leaves out restored.
-//
-// DeepGEMM ranks by wave COUNT; valid only when every wave costs the same,
-// which fails here — a 64x64 wave carries a quarter of a 128x128's work,
-// so wave count prefers the coarse tile. Measured over the ten production
-// cells (bench_tile_sweep.cu, 7 shapes, sm_89): fewest-wave is WORST on
-// narrow-N — at 512x1536 one-wave cells measure 49.4-51.6 TFLOPS vs 63.9
-// for two-wave (48 blocks over 92 SMs x 2 resident = a 26%-full machine);
-// wave count ranks rho -0.90 against measurement there.
-//
-// So the model ranks by the resource the ring buys — resident CTAs per SM,
-// prefetch depth — and on ties the tile's own traffic (cost_of). Two
-// buried claims that did not survive the saved sweeps: (a) the 1.13-1.38x
-// within-shape cell spread holds only from m >= 256 (at m <= 64 it reaches
-// 143-203%, the band the model decides worst); (b) "L1/L2 terms change no
-// decision" is false within a cell (per-block bytes and wave fill rank
-// rho -0.255/+0.282 vs the resource keys' +0.134/+0.169) though true
-// across cells.
-//
-// The per-CTA efficiency separating classes at a given (M, N) is the axis
-// no formula reaches — the measured-not-modeled axis the row tables own,
-// why the hybrid chain keeps rows first. kK falls out of the residency
-// rule: the kK=32 twin's 48KB ring holds two CTAs where kK=64's 96KB
-// holds one.
+/*
+ * The analytical planner — a port of DeepGEMM's get_best_configs with the
+ * one term DeepGEMM leaves out restored.
+ *
+ * DeepGEMM ranks by wave COUNT; valid only when every wave costs the same,
+ * which fails here — a 64x64 wave carries a quarter of a 128x128's work,
+ * so wave count prefers the coarse tile. Measured over the ten production
+ * cells (bench_tile_sweep.cu, 7 shapes, sm_89): fewest-wave is WORST on
+ * narrow-N — at 512x1536 one-wave cells measure 49.4-51.6 TFLOPS vs 63.9
+ * for two-wave (48 blocks over 92 SMs x 2 resident = a 26%-full machine);
+ * wave count ranks rho -0.90 against measurement there.
+ *
+ * So the model ranks by the resource the ring buys — resident CTAs per SM,
+ * prefetch depth — and on ties the tile's own traffic (cost_of). Two
+ * buried claims that did not survive the saved sweeps: (a) the 1.13-1.38x
+ * within-shape cell spread holds only from m >= 256 (at m <= 64 it reaches
+ * 143-203%, the band the model decides worst); (b) "L1/L2 terms change no
+ * decision" is false within a cell (per-block bytes and wave fill rank
+ * rho -0.255/+0.282 vs the resource keys' +0.134/+0.169) though true
+ * across cells.
+ *
+ * The per-CTA efficiency separating classes at a given (M, N) is the axis
+ * no formula reaches — the measured-not-modeled axis the row tables own,
+ * why the hybrid chain keeps rows first. kK falls out of the residency
+ * rule: the kK=32 twin's 48KB ring holds two CTAs where kK=64's 96KB
+ * holds one.
+ */
 class ModelPlanner final : public GemmPlanner {
   public:
     const char* name() const override { return "model"; }
@@ -235,8 +251,10 @@ class ModelPlanner final : public GemmPlanner {
             if (resident <= 0)
                 continue; // ring cannot be resident
             const std::int64_t cost = cost_of(r, q, resident);
-            // every width pair ranks on the cost alone; a tie keeps the
-            // candidate seen first, the manifest's own order
+            /*
+             * every width pair ranks on the cost alone; a tie keeps the
+             * candidate seen first, the manifest's own order
+             */
             if (!best || cost < best_cost) {
                 best = &r;
                 best_cost = cost;
@@ -248,12 +266,14 @@ class ModelPlanner final : public GemmPlanner {
     }
 
   private:
-    // 2026-09-16 RTX 5090 grid fits — re-fit per box. kKTileIssueBytes
-    // prices the per-k-tile overhead (barrier, mma issue, load scheduling)
-    // as output-cell-bytes per k-iteration — the term that makes kK a
-    // model axis; byte pairs take none (all kK=64, degenerates to a
-    // re-weight). kMmaArmBytesPerInstr prices the tensor-pipe arm (one mma
-    // per 16x8xkMmaK cell; mma.cuh's 256-bit A-fragment invariant).
+    /*
+     * 2026-09-16 RTX 5090 grid fits — re-fit per box. kKTileIssueBytes
+     * prices the per-k-tile overhead (barrier, mma issue, load scheduling)
+     * as output-cell-bytes per k-iteration — the term that makes kK a
+     * model axis; byte pairs take none (all kK=64, degenerates to a
+     * re-weight). kMmaArmBytesPerInstr prices the tensor-pipe arm (one mma
+     * per 16x8xkMmaK cell; mma.cuh's 256-bit A-fragment invariant).
+     */
     static constexpr std::int64_t kKTileIssueBytes = 8;
     static constexpr std::int64_t kMmaArmBytesPerInstr = 64;
 
@@ -263,22 +283,26 @@ class ModelPlanner final : public GemmPlanner {
         return std::min(q.dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
     }
 
-    // cost = max(memory bytes, mma arm) * W_eff per CTA on TMA: the arms
-    // overlap on independent hardware, so max — a non-binding arm must not
-    // tax the ranking. W_eff's resident-scaled waves apply to two-byte
-    // pairs only (byte/mixed rings are half-size, winners at resident=2;
-    // resident-blind measured ahead on all three grids, 2026-09-16).
-    // cp.async prices differently: the software ring is the only latency
-    // hiding, so residency DIVIDES the makespan instead of sharing
-    // bandwidth — the axis flips with staging.
+    /*
+     * cost = max(memory bytes, mma arm) * W_eff per CTA on TMA: the arms
+     * overlap on independent hardware, so max — a non-binding arm must not
+     * tax the ranking. W_eff's resident-scaled waves apply to two-byte
+     * pairs only (byte/mixed rings are half-size, winners at resident=2;
+     * resident-blind measured ahead on all three grids, 2026-09-16).
+     * cp.async prices differently: the software ring is the only latency
+     * hiding, so residency DIVIDES the makespan instead of sharing
+     * bandwidth — the axis flips with staging.
+     */
     static std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
         const std::int64_t blocks = q.batch * ((std::int64_t)((q.m + r.bm - 1) / r.bm) *
                                                (std::int64_t)((q.n + r.bn - 1) / r.bn));
         if (!q.tma) {
-            // cp.async (zero-constant L20 form, 2026-09-16): raw-floor
-            // residency in the denominator, k-tail priced whole. Measures
-            // 0.9552 vs the TMA form's 0.8445 on the cp.async grid, the
-            // reverse on every TMA grid.
+            /*
+             * cp.async (zero-constant L20 form, 2026-09-16): raw-floor
+             * residency in the denominator, k-tail priced whole. Measures
+             * 0.9552 vs the TMA form's 0.8445 on the cp.async grid, the
+             * reverse on every TMA grid.
+             */
             const std::int64_t operand =
                 ((q.k + r.kk - 1) / r.kk) * (std::int64_t)r.kk * (r.bm * q.ba + r.bn * q.bb);
             const std::int64_t mu = q.dev.smem_per_sm / r.smem;
@@ -303,11 +327,13 @@ class ModelPlanner final : public GemmPlanner {
     }
 };
 
-// The chain: rank order, first to answer wins; the mode picks the chain —
-// "table" (rows then degraded), "hybrid" (+model between), "model" alone.
-// Every chain ends in the degraded rows (open bands, m=0 fallback), so
-// dispatch is total. Non-inline: the static chain members are one set per
-// process.
+/*
+ * The chain: rank order, first to answer wins; the mode picks the chain —
+ * "table" (rows then degraded), "hybrid" (+model between), "model" alone.
+ * Every chain ends in the degraded rows (open bands, m=0 fallback), so
+ * dispatch is total. Non-inline: the static chain members are one set per
+ * process.
+ */
 PlanDecision plan_dispatch(const PlanQuery& q) {
     static const RowSetPlanner override_planner(
         "override",
@@ -320,9 +346,11 @@ PlanDecision plan_dispatch(const PlanQuery& q) {
     static const RowSetPlanner builtin_planner(
         "builtin",
         [](const PlanQuery& query) {
-            // Compiled-in rows are calibrated to the part they were
-            // measured on (see the GENERATED block); anywhere else the
-            // tier is inert and the model answers instead.
+            /*
+             * Compiled-in rows are calibrated to the part they were
+             * measured on (see the GENERATED block); anywhere else the
+             * tier is inert and the model answers instead.
+             */
             if (!builtin_rows_match_device(query.dev))
                 return std::optional<TableRow>{};
             int count = 0;
@@ -338,10 +366,12 @@ PlanDecision plan_dispatch(const PlanQuery& q) {
     static const RowSetPlanner degraded_planner(
         "degraded",
         [](const PlanQuery& query) {
-            // The M band alone decides: the degraded rows are open on N
-            // and K with -1 keys and carry no gate. The n of 1 stands for
-            // "some real n" — the matcher's band test is "strictly past
-            // the min", and an n of 0 sits ON the open bound.
+            /*
+             * The M band alone decides: the degraded rows are open on N
+             * and K with -1 keys and carry no gate. The n of 1 stands for
+             * "some real n" — the matcher's band test is "strictly past
+             * the min", and an n of 0 sits ON the open bound.
+             */
             PlanQuery m_only;
             m_only.m = query.m;
             m_only.n = 1;
@@ -369,12 +399,14 @@ PlanDecision plan_dispatch(const PlanQuery& q) {
             log_dispatch(q, *d);
             return *d;
         }
-    // The chain above returns for every query that has device facts
-    // (the degraded row function has the m=0 fallback and resolves for
-    // any width pair). It cannot answer only when the query carries no
-    // usable device (smem_max 0 fails the ring gate) or a non-positive
-    // dim, so this tail is the no-facts answer: the first degraded row,
-    // the historical choice for degenerate shapes.
+    /*
+     * The chain above returns for every query that has device facts
+     * (the degraded row function has the m=0 fallback and resolves for
+     * any width pair). It cannot answer only when the query carries no
+     * usable device (smem_max 0 fails the ring gate) or a non-positive
+     * dim, so this tail is the no-facts answer: the first degraded row,
+     * the historical choice for degenerate shapes.
+     */
     const TableRow& row = kDegradedPlanRows[0];
     PlanDecision d{*recipe_of((int)row.cta, row.stages, row.kk, false, 2, 2), 0, "degraded"};
     log_dispatch(q, d);

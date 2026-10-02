@@ -1,8 +1,10 @@
-// Compile:
-//   nvcc -I csrc/include -arch=sm_89 -O3 --use_fast_math --ptxas-options=-O3 \
-//        --extra-device-vectorization -Xcompiler -fopenmp \
-//        csrc/tests/attn_paged_test.cu \
-//        -o /tmp/test_paged && /tmp/test_paged
+/*
+ * Compile:
+ *   nvcc -I csrc/include -arch=sm_89 -O3 --use_fast_math --ptxas-options=-O3 \
+ *        --extra-device-vectorization -Xcompiler -fopenmp \
+ *        csrc/tests/attn_paged_test.cu \
+ *        -o /tmp/test_paged && /tmp/test_paged
+ */
 
 #include "test_utils.cuh"
 #include <cstring>
@@ -33,10 +35,12 @@ static int make_q_tile_mapping(const std::vector<int>& q_lens, int** d_batch, in
     return (int)h_batch.size();
 }
 
-// ---- CPU reference: paged decode with variable seq_lens ----
-// Q: [B, Hq, D], K/V pool: [pool_size, Hkv, D]
-// req_to_token: [num_reqs, max_ctx_len], req_pool_indices: [B]
-// kv_indptr: [B+1].  mask: [B, max_seq_len] bool (True=keep) or NULL.
+/*
+ * ---- CPU reference: paged decode with variable seq_lens ----
+ * Q: [B, Hq, D], K/V pool: [pool_size, Hkv, D]
+ * req_to_token: [num_reqs, max_ctx_len], req_pool_indices: [B]
+ * kv_indptr: [B+1].  mask: [B, max_seq_len] bool (True=keep) or NULL.
+ */
 static void cpu_paged_decode_ref(const float* Q,
                                  const float* K_pool,
                                  const float* V_pool,
@@ -84,13 +88,15 @@ static void cpu_paged_decode_ref(const float* Q,
     }
 }
 
-// ---- CPU reference: paged prefill with ragged batch ----
-// Q: [total_q, Hq, D], K/V pool: [pool_size, Hkv, D]
-// req_to_token: [num_reqs, max_ctx_len], req_pool_indices: [B]
-// kv_indptr: [B+1], qo_indptr: [B+1].
-// mask: [B, max_q_len, max_seq_len] bool (True=keep, q-local + kv-local
-//   positions) or NULL.  Used only when causal==0 to apply an arbitrary
-//   attention mask on top of the (unused) causal logic.
+/*
+ * ---- CPU reference: paged prefill with ragged batch ----
+ * Q: [total_q, Hq, D], K/V pool: [pool_size, Hkv, D]
+ * req_to_token: [num_reqs, max_ctx_len], req_pool_indices: [B]
+ * kv_indptr: [B+1], qo_indptr: [B+1].
+ * mask: [B, max_q_len, max_seq_len] bool (True=keep, q-local + kv-local
+ *   positions) or NULL.  Used only when causal==0 to apply an arbitrary
+ *   attention mask on top of the (unused) causal logic.
+ */
 static void cpu_paged_prefill_ref(const float* Q,
                                   const float* K_pool,
                                   const float* V_pool,
@@ -148,7 +154,7 @@ static void cpu_paged_prefill_ref(const float* Q,
     }
 }
 
-// ---- paged validation table (kernel vs CPU ref, abs error only) ----
+// Paged validation table (kernel vs CPU ref; absolute error)
 inline void print_paged_header() {
     printf("%-58s | %11s | %6s\n", "config", "max_err", "result");
     printf("----------------------------------------------------------------"
@@ -167,13 +173,13 @@ static float* to_floats(const bf16* src, size_t n) {
     return dst;
 }
 
-// ======================================================================
-// Shared paged test rig: owns the flat KV pool, request table, index
-// buffers and (optionally) the split partials / mask, in host mirrors +
-// device buffers; fills and uploads them, and frees everything on
-// destruction.  Q is [total_q, Hq, D] — decode passes one row per request
-// (total_q == B), ragged prefill the packed per-request rows.
-// ======================================================================
+/*
+ * Shared paged test rig: owns the flat KV pool, request table, index
+ * buffers and (optionally) the split partials / mask, in host mirrors +
+ * device buffers; fills and uploads them, and frees everything on
+ * destruction.  Q is [total_q, Hq, D] — decode passes one row per request
+ * (total_q == B), ragged prefill the packed per-request rows.
+ */
 struct PagedRig {
     int B, Hq, Hkv, D;
     int total_q = 0, max_sl = 0, max_ctx = 0, pool_size = 0, num_reqs = 0;
@@ -189,9 +195,11 @@ struct PagedRig {
     bool* d_mask = nullptr;
     float *d_op = nullptr, *d_ml = nullptr;
 
-    // Zero-value overrides pick the test defaults: ctx = max_sl + 16,
-    // pool = B * ctx, reqs = B + 4.  ragged allocates qo_indptr;
-    // split_partials the decode o_part/ml_part buffers.
+    /*
+     * Zero-value overrides pick the test defaults: ctx = max_sl + 16,
+     * pool = B * ctx, reqs = B + 4.  ragged allocates qo_indptr;
+     * split_partials the decode o_part/ml_part buffers.
+     */
     PagedRig(int B_,
              int Hq_,
              int Hkv_,
@@ -271,8 +279,10 @@ struct PagedRig {
         cudaMemcpy(d_v, h_v, kv_elems * sizeof(bf16), cudaMemcpyHostToDevice);
     }
 
-    // Scattered request table (unique slots wrapping the pool), identity
-    // pool indices, kv prefix sums (+ qo prefix sums when ragged).
+    /*
+     * Scattered request table (unique slots wrapping the pool), identity
+     * pool indices, kv prefix sums (+ qo prefix sums when ragged).
+     */
     void fill_indices() {
         h_rtt.resize((size_t)num_reqs * max_ctx);
         int next_slot = 0;
@@ -352,9 +362,9 @@ struct PagedRig {
     }
 };
 
-// ======================================================================
-// DECODE TEST
-// ======================================================================
+/*
+ * DECODE TEST
+ */
 template <int HEAD_DIM>
 static int run_decode_test(int B,
                            int Hq,
@@ -398,9 +408,9 @@ static int run_decode_test(int B,
     return fail;
 }
 
-// ======================================================================
-// DECODE WITH MASK TEST (regression: 2D mask on mixed seq_lens)
-// ======================================================================
+/*
+ * DECODE WITH MASK TEST (regression: 2D mask on mixed seq_lens)
+ */
 template <int HEAD_DIM>
 static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq, int seed) {
     srand(seed);
@@ -413,8 +423,10 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq, int seed) {
     rig.fill_data();
     rig.fill_indices();
     rig.alloc_mask(B, rig.max_sl);
-    // Keep the even positions of each request's kv range, drop the rest —
-    // exercises the HasMask path with per-request seq_len.
+    /*
+     * Keep the even positions of each request's kv range, drop the rest —
+     * exercises the HasMask path with per-request seq_len.
+     */
     for (int b = 0; b < B; b++)
         for (int k = 0; k < rig.max_sl; k++)
             rig.h_mask[b * rig.max_sl + k] = (k < seq_lens[b]) && (k % 2 == 0);
@@ -447,9 +459,9 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq, int seed) {
     return fail;
 }
 
-// ======================================================================
-// PREFILL TEST
-// ======================================================================
+/*
+ * PREFILL TEST
+ */
 template <int HEAD_DIM>
 static int run_prefill_test(int B,
                             int Hq,
@@ -497,9 +509,9 @@ static int run_prefill_test(int B,
     return fail;
 }
 
-// ======================================================================
-// PREFILL WITH MASK TEST (regression: 4D causal mask on single request)
-// ======================================================================
+/*
+ * PREFILL WITH MASK TEST (regression: 4D causal mask on single request)
+ */
 template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     srand(seed);
     std::vector<int> ql = {q_len}, kl = {q_len};
@@ -552,9 +564,9 @@ template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_
     return fail;
 }
 
-// ======================================================================
-// BENCH
-// ======================================================================
+/*
+ * BENCH
+ */
 template <int HEAD_DIM> static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
     PagedRig rig(B, Hq, Hkv, HEAD_DIM, std::vector<int>(B, 1), std::vector<int>(B, seq_len),
                  /*ragged=*/false,
@@ -567,8 +579,10 @@ template <int HEAD_DIM> static void bench_decode(int B, int Hq, int Hkv, int seq
     AttentionParams p = rig.base_params();
     p.causal_offset = 0;
     auto launch = [&]() { dispatch_paged_decode<bf16>(p, 0); };
-    // Decode: q_len=1, query is the last token → attends to all [0, seq_len).
-    // FLOPs = 2 * (QK^T + PV) = 4 * B * Hq * seq_len * D.
+    /*
+     * Decode: q_len=1, query is the last token → attends to all [0, seq_len).
+     * FLOPs = 2 * (QK^T + PV) = 4 * B * Hq * seq_len * D.
+     */
     double flops = 4.0 * B * Hq * (double)seq_len * HEAD_DIM;
     BenchResult r = bench_kernel(launch, 3, 10, flops);
 
@@ -597,12 +611,14 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     p.num_q_tiles = num_q_tiles;
 
     auto launch = [&]() { dispatch_paged_prefill<bf16>(p, 0); };
-    // FLOPs = 2 * (QK^T + PV) = 4 * effective_qk_pairs * Hq * D.
-    // Non-causal: effective = q_len * kv_len.
-    // Causal: Q row qi attends to [0, causal_off + qi + 1) where
-    //   causal_off = kv_len - q_len.  Total KV accesses per request:
-    //   sum_{qi=0}^{q_len-1} (kv_len - q_len + qi + 1)
-    //   = q_len * (kv_len - q_len) + q_len * (q_len + 1) / 2.
+    /*
+     * FLOPs = 2 * (QK^T + PV) = 4 * effective_qk_pairs * Hq * D.
+     * Non-causal: effective = q_len * kv_len.
+     * Causal: Q row qi attends to [0, causal_off + qi + 1) where
+     *   causal_off = kv_len - q_len.  Total KV accesses per request:
+     *   sum_{qi=0}^{q_len-1} (kv_len - q_len + qi + 1)
+     *   = q_len * (kv_len - q_len) + q_len * (q_len + 1) / 2.
+     */
     double eff_kv;
     if (causal) {
         eff_kv = (double)q_len * (kv_len - q_len) + (double)q_len * (q_len + 1) / 2.0;
@@ -637,8 +653,10 @@ int main() {
     fail += run_decode_test<256>(1, 2, 1, 256, 0, 9);
     fail += run_decode_test<128>(16, 32, 4, 2048, 0, 10);
     fail += run_decode_test<128>(32, 32, 4, 1024, 0, 11);
-    // Production keeps a fixed 32768-wide request table.  This forces 32
-    // splits, so seq_len > 512 gives each split multiple cp.async tiles.
+    /*
+     * Production keeps a fixed 32768-wide request table.  This forces 32
+     * splits, so seq_len > 512 gives each split multiple cp.async tiles.
+     */
     fail += run_decode_test<64>(1, 24, 4, 1100, 0, 12, 32768, 1100);
 
     // Decode with 2D mask (regression: mixed seq_lens + HasMask)

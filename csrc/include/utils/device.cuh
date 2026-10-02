@@ -1,9 +1,6 @@
-// Cross-family device vocabulary — pure CUDA, no torch, so the pure
-// kernel headers and the out-of-tree harnesses share the exact same device
-// view. Device GEOMETRY (DeviceFacts — the planner layers price recipes
-// against) is the whole of it. Capability checks specific to a family (e.g.
-// the fp8 MMA minimum SM) live with that family (quantize/common.h);
-// torch-bound tensor validation lives at the binding call sites.
+/* Pure-CUDA device facts shared by kernels and out-of-tree harnesses.
+ * Family capability checks and torch validation stay with their callers.
+ */
 
 #pragma once
 
@@ -13,31 +10,13 @@
 
 namespace astrai {
 
-// ---------------------------------------------------------------------------
 // Geometry
-// ---------------------------------------------------------------------------
 
-// Device geometry the planner layers price recipes against (queried once
-// per device and cached; benign init race — every writer stores the same
-// facts). smem_max is the PER-BLOCK opt-in ceiling — what
-// cudaFuncSetAttribute can raise dynamic shared memory to (about 1KB
-// under the per-SM figure), the feasibility bound for staged kernels;
-// consumers that fold smem residency into measured throughput scalars
-// simply do not read it. cc is the numeric compute capability (120 =
-// sm_120), the feature gate for the TMA staging path.
-//
-// smem_per_sm / regs_per_sm are the per-SM RESOURCE figures a plan's
-// residency is the minimum of (plan_table.h prices rows against them).
-// Queried rather than written down because they move with the SM generation,
-// not just the SKU — smem per SM went 100KB (Ada) to 228KB (Hopper/Blackwell
-// datacenter) while the register file stayed 64K — so a wave bound derived
-// from one part's figures is wrong on the other. On the 512-thread tiles this
-// repo instantiates it is the REGISTER FILE that binds, at two CTAs on every
-// 64K part: 64 regs x 512 threads x 2 = 65536 exactly, so the accumulator
-// alone leaves no room for a third. threads-per-SM is deliberately not a
-// field: at 1536 (Ada) or 2048 (sm_90+) threads per SM the thread ceiling for
-// a 512-thread tile (3 or 4) is never under the register floor, so the term
-// could not bind and would only be a fourth thing to keep in step.
+/*
+ * Cached device geometry used by the planner. smem_max is the per-block
+ * opt-in limit; smem_per_sm and regs_per_sm bound CTA residency. cc gates TMA.
+ * Query these values because resource limits vary by architecture.
+ */
 struct DeviceFacts {
     int sms;
     int smem_max;

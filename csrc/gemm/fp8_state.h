@@ -1,15 +1,17 @@
 #pragma once
-// The fp8 training state machine: delayed-scaling rings (double-buffered scale
-// pairs), the weight/activation cast caches, the per-weight meta registry and
-// its checkpoint snapshot — everything the composed linear keeps between calls.
-// Split out for readability only; every function is ``inline`` so all includers
-// share one registry (an anonymous namespace would give a copy per TU).
-//
-// A meta is addressed by its module's *slot* (a path, published by
-// astrai/extension/autocast.py) or by the weight's (data_ptr, shape, dtype);
-// the slot survives a replaced parameter, the address does not. Snapshots bind
-// slotted entries by name, others by registration order. Ring offsets:
-// RingLayout (api/quantize_common.h).
+/*
+ * The fp8 training state machine: delayed-scaling rings (double-buffered scale
+ * pairs), the weight/activation cast caches, the per-weight meta registry and
+ * its checkpoint snapshot — everything the composed linear keeps between calls.
+ * Split out for readability only; every function is ``inline`` so all includers
+ * share one registry (an anonymous namespace would give a copy per TU).
+ *
+ * A meta is addressed by its module's *slot* (a path, published by
+ * astrai/extension/autocast.py) or by the weight's (data_ptr, shape, dtype);
+ * the slot survives a replaced parameter, the address does not. Snapshots bind
+ * slotted entries by name, others by registration order. Ring offsets:
+ * RingLayout (api/quantize_common.h).
+ */
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/core/TensorImpl.h>
@@ -35,12 +37,14 @@ namespace fp8 {
 
 using torch::Tensor;
 
-// ---------------------------------------------------------------------------
-// Recipe constants
-// ---------------------------------------------------------------------------
+/*
+ * Recipe constants
+ */
 
-// The fp8 format range: one source for the host-side seed formula (the kernel
-// publishes with the same number, passed through QuantParams).
+/*
+ * The fp8 format range: one source for the host-side seed formula (the kernel
+ * publishes with the same number, passed through QuantParams).
+ */
 inline float fp8_max_of(at::ScalarType fmt) {
     TORCH_CHECK(fmt == at::kFloat8_e4m3fn || fmt == at::kFloat8_e5m2,
                 "fp8 linear: format must be float8_e4m3fn or float8_e5m2");
@@ -49,28 +53,34 @@ inline float fp8_max_of(at::ScalarType fmt) {
 
 inline bool is_fp8(at::ScalarType dt) { return dt == at::kFloat8_e4m3fn || dt == at::kFloat8_e5m2; }
 
-// scale = (peak / fp8_max) / 2^margin, clamped — the host mirror of the
-// kernel's publish, used only where the host owns it (seed, dynamic recipe).
+/*
+ * scale = (peak / fp8_max) / 2^margin, clamped — the host mirror of the
+ * kernel's publish, used only where the host owns it (seed, dynamic recipe).
+ */
 inline Tensor scale_from_amax(const Tensor& window_or_amax, at::ScalarType fmt, int64_t margin) {
     const Tensor peak = window_or_amax.max();
     const double pow2 = std::pow(2.0, static_cast<double>(margin));
     return (peak / fp8_max_of(fmt) / pow2).clamp_min(1e-12);
 }
 
-// Raw-domain and detached: the rings fill their history with it, and an
-// in-place op on a non-grad buffer must not drag a grad graph in.
+/*
+ * Raw-domain and detached: the rings fill their history with it, and an
+ * in-place op on a non-grad buffer must not drag a grad graph in.
+ */
 inline Tensor amax_of(const Tensor& t) {
     return t.detach().abs().amax().to(at::kFloat).clamp_min(1e-12);
 }
 
-// ---------------------------------------------------------------------------
-// Delayed-scaling rings
-// ---------------------------------------------------------------------------
+/*
+ * Delayed-scaling rings
+ */
 
-// One operand's ring with a double-buffered scale pair (offsets: RingLayout).
-// The fold reads recip[cur] and publishes into pair[1-cur], so this step's GEMMs
-// keep reading pair[cur] and the host needs no snapshot clone; advance() flips
-// cur once per fold.
+/*
+ * One operand's ring with a double-buffered scale pair (offsets: RingLayout).
+ * The fold reads recip[cur] and publishes into pair[1-cur], so this step's GEMMs
+ * keep reading pair[cur] and the host needs no snapshot clone; advance() flips
+ * cur once per fold.
+ */
 struct ScaleRing {
     Tensor state;
     Tensor hist;
@@ -117,16 +127,20 @@ struct ScaleRing {
     }
 };
 
-// The cast cache's validity key: every in-place update bumps it (optimizer
-// steps included).
+/*
+ * The cast cache's validity key: every in-place update bumps it (optimizer
+ * steps included).
+ */
 inline int64_t version_of(const Tensor& t) {
     return t.unsafeGetTensorImpl()->version_counter().current_version();
 }
 
-// Version-keyed weight cast cache: the fp8 pair plus the scale they were cast
-// with, so the GEMM always dequantizes with the very scale used. A hit also
-// skips the amax fold and the ring advance — an unchanged weight has an
-// unchanged amax, so the ring tracks optimizer steps instead of calls.
+/*
+ * Version-keyed weight cast cache: the fp8 pair plus the scale they were cast
+ * with, so the GEMM always dequantizes with the very scale used. A hit also
+ * skips the amax fold and the ring advance — an unchanged weight has an
+ * unchanged amax, so the ring tracks optimizer steps instead of calls.
+ */
 struct WeightCast {
     int64_t version = -1;
     int64_t generation = -1;
@@ -156,12 +170,14 @@ struct WeightCast {
     }
 };
 
-// One quantized activation, kept so the next consumer of the same tensor skips
-// the cast (q/k/v share an input, up/gate another). Identity is a *strong*
-// anchor plus the version counter: an activation's address is recycled almost
-// immediately, so a bare ``data_ptr`` would match a different tensor. No scale
-// snapshot — a hit reads the shared ring's current pair, so anything advancing
-// that ring between cast and consumer would decouple the two.
+/*
+ * One quantized activation, kept so the next consumer of the same tensor skips
+ * the cast (q/k/v share an input, up/gate another). Identity is a *strong*
+ * anchor plus the version counter: an activation's address is recycled almost
+ * immediately, so a bare ``data_ptr`` would match a different tensor. No scale
+ * snapshot — a hit reads the shared ring's current pair, so anything advancing
+ * that ring between cast and consumer would decouple the two.
+ */
 struct ActivationCast {
     c10::intrusive_ptr<c10::TensorImpl> anchor;
     int64_t version = -1;
@@ -188,14 +204,18 @@ struct ActivationCast {
 
 struct Fp8Meta {
     ScaleRing w;
-    // Shared with the activation cache: every consumer of one tensor must fold
-    // once and read the one published scale.
+    /*
+     * Shared with the activation cache: every consumer of one tensor must fold
+     * once and read the one published scale.
+     */
     std::shared_ptr<ScaleRing> x = std::make_shared<ScaleRing>();
     ScaleRing g;
     WeightCast cast;
-    // Weak on purpose: it keeps a dead TensorImpl's address from being recycled
-    // (so the pointer comparison stays an identity) and its expiry *is* the
-    // eviction signal — a strong ref would pin the replaced weight.
+    /*
+     * Weak on purpose: it keeps a dead TensorImpl's address from being recycled
+     * (so the pointer comparison stays an identity) and its expiry *is* the
+     * eviction signal — a strong ref would pin the replaced weight.
+     */
     void* weight_ptr = nullptr;
     c10::weak_intrusive_ptr<c10::TensorImpl> anchor;
     std::string key;            // this meta's registry key (eviction path)
@@ -205,16 +225,20 @@ struct Fp8Meta {
     int64_t margin = 0;
     bool dynamic = false;
 
-    // Slot addressing (slot addressing in autocast.py): the state belongs to the *module*, so a
-    // replaced weight parameter re-points the identity and keeps the rings.
-    // ``slot_name`` is the snapshot key, ``role`` the Python-side policy glob;
-    // all three stay empty for an unslotted meta (bare call, bench).
+    /*
+     * Slot addressing (slot addressing in autocast.py): the state belongs to the *module*, so a
+     * replaced weight parameter re-points the identity and keeps the rings.
+     * ``slot_name`` is the snapshot key, ``role`` the Python-side policy glob;
+     * all three stay empty for an unslotted meta (bare call, bench).
+     */
     int64_t slot = -1;
     std::string slot_name;
     std::string role;
 
-    // A weak pointer has no empty state and a meta always has an owner, which
-    // must be live.
+    /*
+     * A weak pointer has no empty state and a meta always has an owner, which
+     * must be live.
+     */
     explicit Fp8Meta(const Tensor& owner)
         : weight_ptr(owner.data_ptr()), anchor(owner.getIntrusivePtr()) {}
 
@@ -224,10 +248,12 @@ struct Fp8Meta {
     bool alive() const { return anchor.lock().get() != nullptr; }
 };
 
-// LRU over at most 8 entries / 64 MiB (source tensor plus both fp8 outputs).
-// Bounded because entries hold strong references, and cleared by the caller —
-// autocast exit, fp8_reset, fp8_set_act_cache(false) — so anchors never outlive
-// the region that produced them.
+/*
+ * LRU over at most 8 entries / 64 MiB (source tensor plus both fp8 outputs).
+ * Bounded because entries hold strong references, and cleared by the caller —
+ * autocast exit, fp8_reset, fp8_set_act_cache(false) — so anchors never outlive
+ * the region that produced them.
+ */
 struct ActivationCache {
     static constexpr size_t kMaxEntries = 8;
     static constexpr int64_t kMaxBytes = 64LL << 20;
@@ -319,9 +345,9 @@ struct ActivationCache {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Process-wide state: the meta registry, the generation counter, the snapshot.
-// ---------------------------------------------------------------------------
+/*
+ * Process-wide state: the meta registry, the generation counter, the snapshot.
+ */
 
 struct SlotInfo {
     std::string name; // module path — the snapshot's stable key
@@ -332,9 +358,11 @@ struct State {
     std::mutex mu;
     std::unordered_map<std::string, std::shared_ptr<Fp8Meta>> by_key;
     std::unordered_map<int64_t, std::shared_ptr<Fp8Meta>> by_slot;
-    // Slot id -> (module path, role), published once by the Python slot
-    // not training state: fp8_reset leaves it alone, a later fp8_set_slots
-    // replaces the lot.
+    /*
+     * Slot id -> (module path, role), published once by the Python slot
+     * not training state: fp8_reset leaves it alone, a later fp8_set_slots
+     * replaces the lot.
+     */
     std::unordered_map<int64_t, SlotInfo> slots;
     std::vector<std::shared_ptr<Fp8Meta>> order; // registration order (A1)
     ActivationCache act_cache;
@@ -342,9 +370,11 @@ struct State {
     std::atomic<int64_t> n_act_hit{0};
     std::atomic<int64_t> n_act_miss{0};
 
-    // Snapshot entries queued by load_state_dict, consumed by slot name or —
-    // unslotted — by (shape, dtype) in this order. Unmatched entries stay
-    // queued: a model-shape change across the checkpoint just re-seeds.
+    /*
+     * Snapshot entries queued by load_state_dict, consumed by slot name or —
+     * unslotted — by (shape, dtype) in this order. Unmatched entries stay
+     * queued: a model-shape change across the checkpoint just re-seeds.
+     */
     std::vector<py::dict> pending;
     int64_t generation = 0; // bumped by restore / reset / recipe rebuild
     // Test/bench observability.
@@ -371,9 +401,11 @@ inline std::string meta_key(const Tensor& w) {
     return key;
 }
 
-// Drop a meta from every registry view — a leftover in ``order`` would shift the
-// fallback binding of later unslotted metas. The identity checks matter: a key is
-// claimed by only one meta (first ``emplace`` wins), so never erase another's.
+/*
+ * Drop a meta from every registry view — a leftover in ``order`` would shift the
+ * fallback binding of later unslotted metas. The identity checks matter: a key is
+ * claimed by only one meta (first ``emplace`` wins), so never erase another's.
+ */
 inline void drop_meta(State& st, const std::shared_ptr<Fp8Meta>& meta) {
     auto it = st.by_key.find(meta->key);
     if (it != st.by_key.end() && it->second == meta)
@@ -386,11 +418,13 @@ inline void drop_meta(State& st, const std::shared_ptr<Fp8Meta>& meta) {
     st.order.erase(std::remove(st.order.begin(), st.order.end(), meta), st.order.end());
 }
 
-// Re-point a slot's meta at a new weight tensor, keeping the rings: TP/FSDP swap
-// the Parameter, not the module. The cast cache must still go — it keys on the
-// version counter, and a fresh parameter starts at a version its predecessor may
-// have been cast at. A kept ring means the first fold after the swap still uses
-// the previous scale (a wild magnitude change clips for one step).
+/*
+ * Re-point a slot's meta at a new weight tensor, keeping the rings: TP/FSDP swap
+ * the Parameter, not the module. The cast cache must still go — it keys on the
+ * version counter, and a fresh parameter starts at a version its predecessor may
+ * have been cast at. A kept ring means the first fold after the swap still uses
+ * the previous scale (a wild magnitude change clips for one step).
+ */
 inline void rebind_meta_locked(const std::shared_ptr<Fp8Meta>& meta, const Tensor& w) {
     State& st = state();
     auto it = st.by_key.find(meta->key);
@@ -405,8 +439,10 @@ inline void rebind_meta_locked(const std::shared_ptr<Fp8Meta>& meta, const Tenso
     st.by_key.emplace(meta->key, meta);
 }
 
-// The snapshot's dtype field uses Python's ``str(torch.dtype)`` spelling — the
-// format the checkpoint bridge established, so either side restores the other's.
+/*
+ * The snapshot's dtype field uses Python's ``str(torch.dtype)`` spelling — the
+ * format the checkpoint bridge established, so either side restores the other's.
+ */
 inline std::string torch_dtype_str(at::ScalarType t) {
     switch (t) {
     case at::kBFloat16:
@@ -442,8 +478,10 @@ inline bool dtype_str_matches(const std::string& s, at::ScalarType t) {
     return s == torch_dtype_str(t) || s == std::string(c10::toString(t));
 }
 
-// Restore one ring. False geometry = the buffer changed since the save (recipe
-// change across the checkpoint): the ring stays fresh and re-seeds on next use.
+/*
+ * Restore one ring. False geometry = the buffer changed since the save (recipe
+ * change across the checkpoint): the ring stays fresh and re-seeds on next use.
+ */
 inline void restore_ring(ScaleRing& ring, const py::object& sd, bool& geometry_ok) {
     if (sd.is_none())
         return;
@@ -460,9 +498,11 @@ inline void restore_ring(ScaleRing& ring, const py::object& sd, bool& geometry_o
     ring.initialized = py::cast<bool>(d["initialized"]);
 }
 
-// Consume queued entries: a named entry binds only to the module that owns the
-// name (so two same-shaped linears cannot swap state), unnamed ones fall back to
-// (shape, dtype) in queue order — data_ptr is meaningless across processes.
+/*
+ * Consume queued entries: a named entry binds only to the module that owns the
+ * name (so two same-shaped linears cannot swap state), unnamed ones fall back to
+ * (shape, dtype) in queue order — data_ptr is meaningless across processes.
+ */
 inline void restore_pending_locked(std::shared_ptr<Fp8Meta>& meta) {
     State& st = state();
     if (!meta->slot_name.empty()) {
@@ -482,8 +522,10 @@ inline void restore_pending_locked(std::shared_ptr<Fp8Meta>& meta) {
     }
     for (size_t i = 0; i < st.pending.size(); ++i) {
         const py::dict entry = st.pending[i];
-        // A named entry waits for its module: binding it here by shape would
-        // reintroduce exactly the cross-wiring the names exist to prevent.
+        /*
+         * A named entry waits for its module: binding it here by shape would
+         * reintroduce exactly the cross-wiring the names exist to prevent.
+         */
         if (entry.contains("slot_name") && !py::cast<std::string>(entry["slot_name"]).empty())
             continue;
         bool match = py::len(entry["shape"]) == meta->shape.size();
@@ -501,12 +543,14 @@ inline void restore_pending_locked(std::shared_ptr<Fp8Meta>& meta) {
     }
 }
 
-// Find or create a weight's rings. A slot survives a replaced weight tensor —
-// only the identity is re-pointed (rebind_meta_locked). A recipe change, or a
-// failed ownership check on the address path, rebuilds with a generation bump
-// that invalidates the cast caches; fresh rings re-seed on the next forward.
-// Without a slot the address-keyed path runs unchanged (bare calls, benches, and
-// the backward pass, which reaches its meta through the weight forward saved).
+/*
+ * Find or create a weight's rings. A slot survives a replaced weight tensor —
+ * only the identity is re-pointed (rebind_meta_locked). A recipe change, or a
+ * failed ownership check on the address path, rebuilds with a generation bump
+ * that invalidates the cast caches; fresh rings re-seed on the next forward.
+ * Without a slot the address-keyed path runs unchanged (bare calls, benches, and
+ * the backward pass, which reaches its meta through the weight forward saved).
+ */
 inline std::shared_ptr<Fp8Meta> get_meta(const Tensor& w,
                                          int64_t history_len,
                                          int64_t margin,
@@ -516,8 +560,10 @@ inline std::shared_ptr<Fp8Meta> get_meta(const Tensor& w,
                                          const std::string& role = "") {
     State& st = state();
     std::lock_guard<std::mutex> lock(st.mu);
-    // The published slot table wins; the arguments cover tests that want a name
-    // without registering one.
+    /*
+     * The published slot table wins; the arguments cover tests that want a name
+     * without registering one.
+     */
     std::string name = slot_name, role_glob = role;
     if (slot >= 0) {
         auto rit = st.slots.find(slot);

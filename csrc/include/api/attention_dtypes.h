@@ -1,10 +1,12 @@
 #pragma once
-// Attention's instantiation list — the one place that names which precisions
-// have kernels, in gemm's pair-table dialect: X(torch ScalarType, element
-// type). The entries switch on q.scalar_type() over this list and the refusal
-// below is generated from the same rows, so the supported set cannot drift.
-// Adding a precision = a row here + its ElemTrait (utils/dtype.cuh) and, for
-// tensor-core dtypes, the MmaShapeFor/MmaOp cell (mma/mma.cuh).
+/*
+ * Attention's instantiation list — the one place that names which precisions
+ * have kernels, in gemm's pair-table dialect: X(torch ScalarType, element
+ * type). The entries switch on q.scalar_type() over this list and the refusal
+ * below is generated from the same rows, so the supported set cannot drift.
+ * Adding a precision = a row here + its ElemTrait (utils/dtype.cuh) and, for
+ * tensor-core dtypes, the MmaShapeFor/MmaOp cell (mma/mma.cuh).
+ */
 
 #include <cuda_runtime.h>
 #include <string>
@@ -17,8 +19,10 @@
 namespace astrai {
 namespace attention {
 
-// Rows expand at the entries' file scope, so element types are spelled
-// namespace-qualified.
+/*
+ * Rows expand at the entries' file scope, so element types are spelled
+ * namespace-qualified.
+ */
 #define ASTRAI_ATTN_DTYPE_LIST(X) X(at::kBFloat16, astrai::bf16)
 
 // A scalar type attention has no kernel for: say which ones it does have.

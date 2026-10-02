@@ -1,8 +1,10 @@
 #pragma once
-// Quantize's caller contract: the composed one-call pass shared by
-// quantize/bindings.cu and gemm/fp8_linear.cu; the implementation,
-// quantize/entry.cu, is listed in both modules' source lists. Torch-tensor
-// level, no pybind (the gemm.h header rules).
+/*
+ * Quantize's caller contract: the composed one-call pass shared by
+ * quantize/bindings.cu and gemm/fp8_linear.cu; the implementation,
+ * quantize/entry.cu, is listed in both modules' source lists. Torch-tensor
+ * level, no pybind (the gemm.h header rules).
+ */
 
 #include <c10/util/Optional.h>
 #include <cstdint>
@@ -19,13 +21,15 @@ struct QuantizeOutputs {
     torch::Tensor amax;  // the round's raw-domain amax; undefined without a ring
 };
 
-// One quantize pass end to end: validate, allocate, launch. ``layout`` picks
-// the orientations produced; ``dtype_b`` (default: ``dtype_a``) recasts the
-// transposed side (hybrid fwd/bwd pair from one read). ``ring`` switches on
-// the delayed-scaling fold and requires ``hist_len`` (RingLayout,
-// api/quantize_common.h); ``pub_scale``/``pub_recip`` redirect where the
-// fold publishes (default: the ring's own slots). Semantics at the definition
-// (quantize/entry.cu).
+/*
+ * One quantize pass end to end: validate, allocate, launch. ``layout`` picks
+ * the orientations produced; ``dtype_b`` (default: ``dtype_a``) recasts the
+ * transposed side (hybrid fwd/bwd pair from one read). ``ring`` switches on
+ * the delayed-scaling fold and requires ``hist_len`` (RingLayout,
+ * api/quantize_common.h); ``pub_scale``/``pub_recip`` redirect where the
+ * fold publishes (default: the ring's own slots). Semantics at the definition
+ * (quantize/entry.cu).
+ */
 QuantizeOutputs run_quantize(torch::Tensor x,
                              torch::Tensor scale,
                              QuantLayout layout,

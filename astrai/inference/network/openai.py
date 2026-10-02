@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel
 
-from astrai.inference.engine import InferenceEngine
+from astrai.inference.frontend.engine import InferenceEngine
 from astrai.inference.network.protocol import (
     GenContext,
     ResponseBuilder,

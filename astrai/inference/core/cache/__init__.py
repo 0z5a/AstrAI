@@ -5,27 +5,27 @@ the model side in :mod:`astrai.model.kv_cache` — the attention layer consumes
 them directly — and are re-exported here so existing imports keep working.
 """
 
-from astrai.inference.cache.pool import PagePool, TaskCacheManager
-from astrai.inference.cache.strategy import (
+from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
+from astrai.inference.core.cache.strategy import (
     AllocationStrategy,
     Allocator,
     ContiguousStrategy,
     PagedStrategy,
     RadixCache,
-    TaskCacheState,
+    RequestCacheState,
 )
 from astrai.model.kv_cache import KVCache, KVStorage, ReqToTokenPool
 
 __all__ = [
-    "KVCache",
-    "KVStorage",
-    "ReqToTokenPool",
-    "Allocator",
-    "RadixCache",
-    "TaskCacheState",
     "AllocationStrategy",
+    "Allocator",
+    "BlockPool",
     "ContiguousStrategy",
+    "KVCache",
+    "KVCacheManager",
+    "KVStorage",
     "PagedStrategy",
-    "PagePool",
-    "TaskCacheManager",
+    "RadixCache",
+    "ReqToTokenPool",
+    "RequestCacheState",
 ]

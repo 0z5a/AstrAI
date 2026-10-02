@@ -9,7 +9,8 @@ Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 
 Interface (all functions):
     is_causal: True = causal mask; False = non-causal
-    mask:      2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool, True=keep)
+    mask:      2D [batch, kv_len], 3D [batch, q_len, kv_len], or 4D
+               [batch, n_heads, q_len, kv_len] (bool, True=keep)
 """
 
 import enum
@@ -69,7 +70,8 @@ def attn_prefill(
         q: [batch, q_len, n_heads, head_dim] (blhd, bf16)
         k: [batch, kv_len, n_kv_heads, head_dim] (blhd, bf16)
         v: [batch, kv_len, n_kv_heads, head_dim] (blhd, bf16)
-        mask: 2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool, True=keep)
+        mask: 2D [batch, kv_len], 3D [batch, q_len, kv_len], or 4D
+            [batch, n_heads, q_len, kv_len] (bool, True=keep)
         is_causal: apply causal mask
 
     Returns:

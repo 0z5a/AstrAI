@@ -1,18 +1,20 @@
-// GEMM family, typed host layer (module `gemm`): the dtype-pair registry, its
-// two lookups, and the planner's C++ face — probe, row injection, runtime
-// configuration and the tile vocabulary, all declared in api/gemm.h.
-// quant_gemm's op-entry ladder lives next door in entry.h, and this TU's
-// quant_gemm_impl (bottom) is the wrapper that instantiates it with the
-// dtype-pair lookup defined above; the lookup rides in as a template
-// parameter, so the header needs no include-order contract.
-// The pybind surface (argument marshalling, the dict shapes, the module
-// registration) lives in bindings.cu; this TU holds no py:: type.
-// torch/extension.h is here for the torch::Tensor spelling only.
-//
-// The policy instantiation space compiles one explicit instantiation per dtype
-// pair (one per .cu below), so the heavy template work runs as parallel
-// nvcc jobs. This TU keeps the dtype-pair switch; the C tests instantiate from
-// the headers instead.
+/*
+ * GEMM family, typed host layer (module `gemm`): the dtype-pair registry, its
+ * two lookups, and the planner's C++ face — probe, row injection, runtime
+ * configuration and the tile vocabulary, all declared in api/gemm.h.
+ * quant_gemm's op-entry ladder lives next door in entry.h, and this TU's
+ * quant_gemm_impl (bottom) is the wrapper that instantiates it with the
+ * dtype-pair lookup defined above; the lookup rides in as a template
+ * parameter, so the header needs no include-order contract.
+ * The pybind surface (argument marshalling, the dict shapes, the module
+ * registration) lives in bindings.cu; this TU holds no py:: type.
+ * torch/extension.h is here for the torch::Tensor spelling only.
+ *
+ * The policy instantiation space compiles one explicit instantiation per dtype
+ * pair (one per .cu below), so the heavy template work runs as parallel
+ * nvcc jobs. This TU keeps the dtype-pair switch; the C tests instantiate from
+ * the headers instead.
+ */
 
 #include <c10/core/ScalarType.h>
 #include <cstdint>
@@ -31,15 +33,17 @@ using namespace astrai::quant;
 namespace astrai {
 namespace gemm {
 
-// The dtype-pair table: one line per supported pair — (torch ScalarType,
-// element type) per operand — and the single source this TU's consumers
-// stamp: the extern template declarations below and the dispatch / probe
-// lookups further down. A pair is added once here and cannot reach one
-// consumer without the other. (The extern block used to be hand-maintained
-// beside the switch, and had already grown two bf16 x fp8 entries with no
-// instantiation TU behind them.) The CMake gemm module entry carries one
-// instantiation TU per line — kept together by hand, and a line with no TU
-// behind it fails the link loudly.
+/*
+ * The dtype-pair table: one line per supported pair — (torch ScalarType,
+ * element type) per operand — and the single source this TU's consumers
+ * stamp: the extern template declarations below and the dispatch / probe
+ * lookups further down. A pair is added once here and cannot reach one
+ * consumer without the other. (The extern block used to be hand-maintained
+ * beside the switch, and had already grown two bf16 x fp8 entries with no
+ * instantiation TU behind them.) The CMake gemm module entry carries one
+ * instantiation TU per line — kept together by hand, and a line with no TU
+ * behind it fails the link loudly.
+ */
 #define ASTRAI_GEMM_PAIRS(X)                                                                       \
     X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)                            \
     X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                                       \
@@ -47,33 +51,39 @@ namespace gemm {
     X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn, __nv_fp8_e4m3)                  \
     X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
 
-// The per-pair specializations are explicitly instantiated in their own TUs
-// (gemm_bf16_bf16.cu etc.), one nvcc job per dtype pair. These extern
-// template declarations keep the dispatch switch below from re-instantiating:
-// the address-of forms are references to the externally defined symbols only.
-// (They must sit here, outside the anonymous namespace — nvcc rejects
-// extern template declarations in an anonymous namespace.)
+/*
+ * The per-pair specializations are explicitly instantiated in their own TUs
+ * (gemm_bf16_bf16.cu etc.), one nvcc job per dtype pair. These extern
+ * template declarations keep the dispatch switch below from re-instantiating:
+ * the address-of forms are references to the externally defined symbols only.
+ * (They must sit here, outside the anonymous namespace — nvcc rejects
+ * extern template declarations in an anonymous namespace.)
+ */
 #define ASTRAI_GEMM_EXTERN(SA, TA, SB, TB) extern ASTRAI_GEMM_INSTANTIATE(TA, TB);
 ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_EXTERN)
 #undef ASTRAI_GEMM_EXTERN
 
 namespace {
 
-// The lookup key both stamped switches below pack their case labels with:
-// one u16 per pair, so every label is a compile-time constant and the switch
-// lowers to one indexed branch with no runtime-initialized state. An
-// unsupported pair raises with the actual operand dtypes in the message
-// instead of a hardcoded list that can drift.
+/*
+ * The lookup key both stamped switches below pack their case labels with:
+ * one u16 per pair, so every label is a compile-time constant and the switch
+ * lowers to one indexed branch with no runtime-initialized state. An
+ * unsupported pair raises with the actual operand dtypes in the message
+ * instead of a hardcoded list that can drift.
+ */
 using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
 
 constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
     return static_cast<uint16_t>(static_cast<uint8_t>(a)) << 8 | static_cast<uint8_t>(b);
 }
 
-// The unsupported-pair arm, one spelling for the two lookups below: the
-// switch's own default carries it, so the non-void lookups cannot fall off
-// their end. The expected-pairs text is generated from ASTRAI_GEMM_PAIRS
-// (the attention_dtypes.h pattern), so it cannot drift from the table.
+/*
+ * The unsupported-pair arm, one spelling for the two lookups below: the
+ * switch's own default carries it, so the non-void lookups cannot fall off
+ * their end. The expected-pairs text is generated from ASTRAI_GEMM_PAIRS
+ * (the attention_dtypes.h pattern), so it cannot drift from the table.
+ */
 [[noreturn]] void unsupported_pair(c10::ScalarType a, c10::ScalarType b) {
     std::string instantiated;
 #define ASTRAI_GEMM_PAIR_ROW(SA, TA, SB, TB)                                                       \
@@ -97,8 +107,10 @@ GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
 #undef GEMM_CASE
 }
 
-// Host-only functions that run the planner without a launch (the
-// autotuner's coverage check).
+/*
+ * Host-only functions that run the planner without a launch (the
+ * autotuner's coverage check).
+ */
 using GemmProbeFn = std::pair<PlanDecision, PlanQuery> (*)(
     int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
 
@@ -116,12 +128,12 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Planner introspection: the Python tooling's C++ face. The planner is
-// GPU-free by design, so the probe launches nothing. Rows reach the planner
-// through configure()'s rows channel; injected rows rank BELOW the override
-// rows (plan_table.h), keeping the override tier authoritative.
-// ---------------------------------------------------------------------------
+/*
+ * Planner introspection: the Python tooling's C++ face. The planner is
+ * GPU-free by design, so the probe launches nothing. Rows reach the planner
+ * through configure()'s rows channel; injected rows rank BELOW the override
+ * rows (plan_table.h), keeping the override tier authoritative.
+ */
 
 PlanProbe plan_probe(int64_t m,
                      int64_t n,
@@ -146,9 +158,11 @@ PlanProbe plan_probe(int64_t m,
 
 namespace {
 
-// Install one row tier from a spec (a row-file path when one opens, else
-// inline row text) and remember the spec, so the config state can hand back a
-// value that re-installs it. `label` is what a parse error reports.
+/*
+ * Install one row tier from a spec (a row-file path when one opens, else
+ * inline row text) and remember the spec, so the config state can hand back a
+ * value that re-installs it. `label` is what a parse error reports.
+ */
 int install_rows(RowSource& tier, const char* label, const std::string& source) {
     std::vector<TableRow> rows;
     if (!parse_plan_table_file(source, rows))
@@ -164,14 +178,14 @@ RowSource& row_tier(RowTier tier) {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Runtime configuration: the backing of astrai.extension.plan. Every knob is
-// tri-state — an absent patch field leaves it unchanged, an explicit value wins
-// over the one-time env seed. Rows are addressed by tier (`rows` + `tier`), the
-// all-tiers-off switch is its own field, and the staging keys are positive
-// enables: tma=false forces cp.async staging, mx=false knocks the sm_120a
-// block-scale cell out (the A/B knobs).
-// ---------------------------------------------------------------------------
+/*
+ * Runtime configuration: the backing of astrai.extension.plan. Every knob is
+ * tri-state — an absent patch field leaves it unchanged, an explicit value wins
+ * over the one-time env seed. Rows are addressed by tier (`rows` + `tier`), the
+ * all-tiers-off switch is its own field, and the staging keys are positive
+ * enables: tma=false forces cp.async staging, mx=false knocks the sm_120a
+ * block-scale cell out (the A/B knobs).
+ */
 
 GemmConfigState config_state() {
     GemmConfigState s;
@@ -217,16 +231,18 @@ GemmConfigState configure(const GemmConfigPatch& patch) {
     return config_state();
 }
 
-// The recipe vocabulary per (crosswise, operand widths) — every
-// (CTA class, stages, kK) the launch ladders instantiate for that staging
-// pair, deduped on the dispatch key, in dispatch (manifest) order. Rows are
-// (crosswise, ba, bb, cta, stages, kk, bm, bn, wm, wn, threads, smem);
-// a row's numbers spell its canonical name,
-// Tile_<bm>x<bn>x<kk>_W<wm>x<wn>_S<stages> — the bench's own spelling —
-// which is how the Python tooling joins rows with dataset recipe strings
-// without keeping a second copy of the vocabulary. (2,1) covers the mixed
-// W8A16 class, whose congruent staging runs the conservative
-// ladder too (manifest_kind's fallback); (1,2) matches no supported pair.
+/*
+ * The recipe vocabulary per (crosswise, operand widths) — every
+ * (CTA class, stages, kK) the launch ladders instantiate for that staging
+ * pair, deduped on the dispatch key, in dispatch (manifest) order. Rows are
+ * (crosswise, ba, bb, cta, stages, kk, bm, bn, wm, wn, threads, smem);
+ * a row's numbers spell its canonical name,
+ * Tile_<bm>x<bn>x<kk>_W<wm>x<wn>_S<stages> — the bench's own spelling —
+ * which is how the Python tooling joins rows with dataset recipe strings
+ * without keeping a second copy of the vocabulary. (2,1) covers the mixed
+ * W8A16 class, whose congruent staging runs the conservative
+ * ladder too (manifest_kind's fallback); (1,2) matches no supported pair.
+ */
 std::vector<std::vector<int>> tile_vocabulary() {
     const std::pair<int, int> widths[] = {{2, 2}, {2, 1}, {1, 1}};
     std::vector<std::vector<int>> out;
@@ -238,9 +254,11 @@ std::vector<std::vector<int>> tile_vocabulary() {
     return out;
 }
 
-// The TileClass spellings, in enum order — what a row's cta ordinal expands
-// to in the compiled-in tables (the GENERATED block's paste target). Owned
-// here so the sweep's C++ emitter needs no Python-side copy of the names.
+/*
+ * The TileClass spellings, in enum order — what a row's cta ordinal expands
+ * to in the compiled-in tables (the GENERATED block's paste target). Owned
+ * here so the sweep's C++ emitter needs no Python-side copy of the names.
+ */
 std::vector<const char*> tile_class_names() {
     static constexpr const char* kNames[] = {"kSmall64", "kNarrow128x64", "kBig128", "kWide128x256",
                                              "kTall64x128"};
@@ -249,14 +267,14 @@ std::vector<const char*> tile_class_names() {
     return std::vector<const char*>(kNames, kNames + sizeof(kNames) / sizeof(kNames[0]));
 }
 
-// ---------------------------------------------------------------------------
-// quant_gemm's op entry: the ladder itself lives in entry.h (one kernel for
-// every cell, the only kernel-facing export); this wrapper is the one place
-// the family's dtype-pair lookup meets it — as a template argument, so the
-// header needs neither a forward declaration of a TU-internal symbol nor an
-// include-order contract. The scale contract is stated in the header and in
-// docs/developer/kernels/gemm.md, "Scales".
-// ---------------------------------------------------------------------------
+/*
+ * quant_gemm's op entry: the ladder itself lives in entry.h (one kernel for
+ * every cell, the only kernel-facing export); this wrapper is the one place
+ * the family's dtype-pair lookup meets it — as a template argument, so the
+ * header needs neither a forward declaration of a TU-internal symbol nor an
+ * include-order contract. The scale contract is stated in the header and in
+ * docs/developer/kernels/gemm.md, "Scales".
+ */
 torch::Tensor quant_gemm_impl(torch::Tensor a,
                               torch::Tensor b,
                               c10::optional<torch::Tensor> a_scale,

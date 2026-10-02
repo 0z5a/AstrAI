@@ -2,9 +2,9 @@
 
 The executor's ``submit`` path launches the model forward, sampling and
 result relay without resolving a single device value on the host and
-without mutating any :class:`~astrai.inference.task.Task`.  Its product is
-a :class:`PendingStep` — a message-shaped handle that names the batch
-(snapshot), holds the device-resident sampled tokens and the ordered task
+without mutating any :class:`~astrai.inference.core.request.Request`.  Its product is
+a :class:`PendingExecution` — a message-shaped handle that names the batch
+(snapshot), holds the device-resident sampled tokens and the ordered request
 references, and exposes the one sanctioned host materialisation point
 (``commit``).
 
@@ -32,7 +32,7 @@ from torch import Tensor
 class BatchSnapshot:
     """Frozen identity of the batch a pending step belongs to.
 
-    ``task_ids`` preserves submit-time order; ``kv_positions`` is the
+    ``request_ids`` preserves submit-time order; ``kv_positions`` is the
     pre-forward next-write position per slot (host bookkeeping, valid
     regardless of when the commit runs).  ``policy_version`` records the
     weight version the forward ran under so a late commit can detect that
@@ -40,13 +40,13 @@ class BatchSnapshot:
     instead of corrupting state.
     """
 
-    task_ids: Tuple[str, ...]
+    request_ids: Tuple[str, ...]
     kv_positions: Tuple[int, ...]
     policy_version: int
 
 
 @dataclass
-class PendingStep:
+class PendingExecution:
     """One submitted decode step awaiting its commit.
 
     Held fields:
@@ -57,19 +57,19 @@ class PendingStep:
       posted one, else via ``tolist``.
     - ``logprobs``: optional ``[B]`` device tensor of chosen-token logprobs
       under the raw model distribution (``return_logprobs`` batches).
-    - ``tasks``: the ordered task references.  Commit validates the world
+    - ``requests``: the ordered request references.  Commit validates the world
       still matches the snapshot before touching them.
     """
 
     snapshot: BatchSnapshot
-    tasks: List[object]
+    requests: List[object]
     tokens: Tensor
     logprobs: Optional[Tensor] = None
-    # Tasks whose prompt KV this step materialised: their ``prefill_done``
+    # Tasks whose prompt KV this step materialised: their ``prefill_complete``
     # flag flips only at commit time (the first token must be appended
-    # first), so the flag never advertises a state the task has not
+    # first), so the flag never advertises a state the request has not
     # reached for consumers that read host output history.
-    prefill_task_ids: Tuple[str, ...] = ()
+    prefill_request_ids: Tuple[str, ...] = ()
     copy_event: Optional["torch.cuda.Event"] = None
     host_tokens: Optional[Tensor] = None
     host_logprobs: Optional[Tensor] = None
@@ -81,7 +81,7 @@ class PendingStep:
         Waits on the posted copy event (async path) or falls back to
         ``tolist`` (no ring / CPU).  Idempotent: the resolved payload is
         cached and returned on repeat calls, so an abort path that already
-        consumed the step cannot double-append tokens to tasks.
+        consumed the step cannot double-append tokens to requests.
         """
         if self._payload is None:
             if self.copy_event is not None and self.host_tokens is not None:
@@ -159,7 +159,7 @@ class ResultRing:
     def enabled(self) -> bool:
         return self._enabled
 
-    def post(self, pending: PendingStep) -> bool:
+    def post(self, pending: PendingExecution) -> bool:
         """Stage ``pending``'s results into a ring slot; False if refused.
 
         Refusal means the caller should keep the synchronous ``tolist``
@@ -202,7 +202,7 @@ class ResultRing:
         pending._ring = self
         return True
 
-    def release(self, pending: PendingStep) -> None:
+    def release(self, pending: PendingExecution) -> None:
         """Mark the slot a committed step occupied as reusable."""
         if not self._enabled:
             return

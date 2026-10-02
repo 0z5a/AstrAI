@@ -1,7 +1,9 @@
-// GQA prefill flash attention, contiguous K/V — the implementation
-// of the entry declared in api/attention.h (the gated_deltanet_fwd.cu
-// shape). Device-side code (kernels, launchers, dispatchers) is in
-// kernel/attention_launch.cuh + kernel/attention_split_q.cuh.
+/*
+ * GQA prefill flash attention, contiguous K/V — the implementation
+ * of the entry declared in api/attention.h (the gated_deltanet_fwd.cu
+ * shape). Device-side code (kernels, launchers, dispatchers) is in
+ * kernel/attention_launch.cuh + kernel/attention_split_q.cuh.
+ */
 
 #include "entry.h"
 #include <api/attention.h>
