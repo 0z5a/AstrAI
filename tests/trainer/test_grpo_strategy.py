@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import astrai.trainer.strategy as strategy_module
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.strategy import GRPOStrategy
 from tests.helpers import FakeExecutor, make_frozen, make_model
 

@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 import astrai.parallel.executor as executor_module
 from astrai.config import TrainConfig
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.parallel import get_rank, spawn_parallel_fn
 from astrai.parallel.executor import DDPExecutor, FSDPExecutor, NoneExecutor
 from astrai.trainer import train_context

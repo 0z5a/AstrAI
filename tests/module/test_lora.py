@@ -188,9 +188,9 @@ def test_state_dict_key_format():
     inject_lora(model, r=4, alpha=8, target_modules={"q_proj"})
 
     sd = model.state_dict()
-    assert "layers.0.attention.q_proj.weight" in sd
-    assert "layers.0.attention.q_proj.lora_A" in sd
-    assert "layers.0.attention.q_proj.lora_B" in sd
+    assert "model.layers.0.attention.q_proj.weight" in sd
+    assert "model.layers.0.attention.q_proj.lora_A" in sd
+    assert "model.layers.0.attention.q_proj.lora_B" in sd
 
 
 def test_only_lora_params_trainable():

@@ -61,6 +61,9 @@ def to_hf_keys(state_dict, head_dim=None):
     """
     out = {}
     for key, tensor in state_dict.items():
+        # the wrapper view prefixes trunk keys with "model."; the mapping
+        # below works on the trunk-relative names
+        key = key.removeprefix("model.")
         if head_dim is not None:
             name = key.split(".")
             is_qk_proj = (
@@ -199,7 +202,10 @@ def test_convert_hf_config_rejects_mismatched_head_dim():
 
 def test_looks_like_hf_state_dict():
     assert looks_like_hf_state_dict({"model.layers.0.self_attn.q_proj.weight": 1})
-    assert looks_like_hf_state_dict({"model.embed_tokens.weight": 1})
+    assert looks_like_hf_state_dict({"model.layers.0.input_layernorm.weight": 1})
+    # "model." alone no longer implies HF: AstrAI trunk keys share the prefix
+    assert not looks_like_hf_state_dict({"model.embed_tokens.weight": 1})
+    assert not looks_like_hf_state_dict({"model.layers.0.attention.q_proj.weight": 1})
     assert not looks_like_hf_state_dict({"layers.0.attention.q_proj.weight": 1})
 
 
@@ -230,7 +236,7 @@ def test_convert_hf_weights_skips_unmapped_keys():
     cfg = make_tiny_config()
     sd = {"model.rotary_emb.inv_freq": torch.zeros(4), "model.embed_tokens.weight": 1}
     converted = convert_hf_weights(sd, cfg)
-    assert "embed_tokens.weight" in converted
+    assert "model.embed_tokens.weight" in converted
     assert "model.rotary_emb.inv_freq" not in converted
 
 
@@ -417,9 +423,9 @@ def _run_converted_gqa(x, hf_sd, cfg):
     ).eval()
     converted = convert_hf_weights(hf_sd, cfg)
     local = {
-        k.removeprefix("layers.0.attention."): v
+        k.removeprefix("model.layers.0.attention."): v
         for k, v in converted.items()
-        if k.startswith("layers.0.attention.")
+        if k.startswith("model.layers.0.attention.")
     }
     attn.load_state_dict(local, strict=True)
     head_dim = cfg.hidden_size // cfg.num_attention_heads

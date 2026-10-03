@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from astrai.extension import KERNEL_NAMES, is_available
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from tests.helpers import (
     TINY_CONFIG,
     RandomTokenDataset,

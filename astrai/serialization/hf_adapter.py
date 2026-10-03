@@ -1,10 +1,10 @@
 """HuggingFace checkpoint adaptation for LLaMA-style decoder models.
 
-AstrAI stores weights with its own key names (``layers.<i>.input_norm``,
-``layers.<i>.mlp.gate``), while HuggingFace decoder-only checkpoints use
-``model.layers.<i>.input_layernorm`` / ``model.layers.<i>.mlp.gate_proj``.
-This module translates HF configs and state dicts so external checkpoints
-can be loaded directly.
+AstrAI stores trunk weights under the same ``model.*`` hierarchy HF uses
+(``model.layers.<i>.input_norm`` / ``model.layers.<i>.mlp.gate``), while
+HuggingFace decoder-only checkpoints name the components differently
+(``self_attn``, ``input_layernorm``, ``gate_proj``).  This module translates
+HF configs and state dicts so external checkpoints can be loaded directly.
 
 Supported families (LLaMA layout, dense and MoE):
 - dense FFN: llama, mistral, qwen2, gemma, gemma2, phi3
@@ -63,7 +63,11 @@ _MOE_SHARED = re.compile(
     r"(gate|up|down)_proj\.(weight|bias)$"
 )
 
-_ASTR_PREFIXES = ("embed_tokens.", "layers.", "norm.", "lm_head.")
+_ASTR_KEY = re.compile(
+    r"^(?:model\.(?:embed_tokens|norm)\."
+    r"|model\.layers\.\d+\.(?:attention|input_norm|post_attention_norm|mlp)\."
+    r"|lm_head\.)"
+)
 
 
 def _half_to_interleaved(head_dim: int) -> torch.Tensor:
@@ -82,15 +86,22 @@ def _half_to_interleaved(head_dim: int) -> torch.Tensor:
     return perm
 
 
+#: Component names only HuggingFace uses; AstrAI keys share the ``model.*``
+#: trunk prefix, so the prefix alone cannot identify an HF checkpoint.
+_HF_MARKERS = (
+    "self_attn.",
+    "input_layernorm",
+    "post_attention_layernorm",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+    "mlp.experts.",
+)
+
+
 def looks_like_hf_state_dict(state_dict: Mapping[str, Any]) -> bool:
     """Return True if *state_dict* uses HuggingFace key names."""
-    return any(
-        key.startswith("model.")
-        or "self_attn." in key
-        or "input_layernorm" in key
-        or "mlp.experts." in key
-        for key in state_dict
-    )
+    return any(marker in key for key in state_dict for marker in _HF_MARKERS)
 
 
 def _is_dense_mlp_layer(config: BaseConfig, layer_id: int) -> bool:
@@ -232,20 +243,16 @@ def convert_hf_weights(
     converted: Dict[str, torch.Tensor] = {}
     skipped: list[str] = []
     for key, tensor in state_dict.items():
-        if key.startswith(_ASTR_PREFIXES):
-            converted[key] = tensor
-            continue
-
         new_key = None
         if ffn_type == "moe":
             m = _MOE_ROUTER.match(key)
             if m:
-                new_key = f"layers.{m.group(1)}.mlp.router.weight"
+                new_key = f"model.layers.{m.group(1)}.mlp.router.weight"
             else:
                 m = _MOE_EXPERTS.match(key)
                 if m:
                     new_key = (
-                        f"layers.{m.group(1)}.mlp.routed_experts.{m.group(2)}."
+                        f"model.layers.{m.group(1)}.mlp.routed_experts.{m.group(2)}."
                         f"{m.group(3)}.{m.group(4)}"
                     )
                 else:
@@ -253,23 +260,24 @@ def convert_hf_weights(
                     if m:
                         shared_idx = m.group(2) if m.group(2) is not None else "0"
                         new_key = (
-                            f"layers.{m.group(1)}.mlp.shared_experts.{shared_idx}."
+                            f"model.layers.{m.group(1)}.mlp.shared_experts.{shared_idx}."
                             f"{m.group(3)}.{m.group(4)}"
                         )
             if new_key is None:
                 m = _DENSE_MLP.match(key)
                 if m and _is_dense_mlp_layer(config, int(m.group(1))):
-                    new_key = f"layers.{m.group(1)}.mlp.{m.group(2)}.{m.group(3)}"
+                    new_key = f"model.layers.{m.group(1)}.mlp.{m.group(2)}.{m.group(3)}"
         else:
             m = _DENSE_MLP.match(key)
             if m:
-                new_key = f"layers.{m.group(1)}.mlp.{m.group(2)}.{m.group(3)}"
+                new_key = f"model.layers.{m.group(1)}.mlp.{m.group(2)}.{m.group(3)}"
 
         if new_key is None:
             m = _ATTN.match(key)
             if m:
                 new_key = (
-                    f"layers.{m.group(1)}.attention.{m.group(2)}_proj.{m.group(3)}"
+                    f"model.layers.{m.group(1)}.attention."
+                    f"{m.group(2)}_proj.{m.group(3)}"
                 )
                 if permute_rope and m.group(2) in ("q", "k"):
                     rows = tensor.shape[0]
@@ -285,30 +293,36 @@ def convert_hf_weights(
                     perm = (blocks[:, None] + base[None, :]).flatten()
                     tensor = tensor.index_select(0, perm)
             elif (m := _Q_NORM.match(key)) is not None:
-                new_key = f"layers.{m.group(1)}.attention.q_norm.weight"
+                new_key = f"model.layers.{m.group(1)}.attention.q_norm.weight"
                 if permute_rope and tensor.shape[0] == head_dim:
                     tensor = tensor.index_select(
                         0, _half_to_interleaved(head_dim).to(tensor.device)
                     )
             elif (m := _K_NORM.match(key)) is not None:
-                new_key = f"layers.{m.group(1)}.attention.k_norm.weight"
+                new_key = f"model.layers.{m.group(1)}.attention.k_norm.weight"
                 if permute_rope and tensor.shape[0] == head_dim:
                     tensor = tensor.index_select(
                         0, _half_to_interleaved(head_dim).to(tensor.device)
                     )
             elif (m := _INPUT_NORM.match(key)) is not None:
-                new_key = f"layers.{m.group(1)}.input_norm.weight"
+                new_key = f"model.layers.{m.group(1)}.input_norm.weight"
             elif (m := _POST_NORM.match(key)) is not None:
-                new_key = f"layers.{m.group(1)}.post_attention_norm.weight"
+                new_key = f"model.layers.{m.group(1)}.post_attention_norm.weight"
             elif (m := _EMBED.match(key)) is not None:
-                new_key = "embed_tokens.weight"
+                new_key = "model.embed_tokens.weight"
             elif (m := _FINAL_NORM.match(key)) is not None:
-                new_key = "norm.weight"
+                new_key = "model.norm.weight"
             elif (m := _LM_HEAD.match(key)) is not None:
                 new_key = "lm_head.weight"
 
         if new_key is None:
-            skipped.append(key)
+            # Already-AstrAI keys pass through untouched; anything else is
+            # an unmapped HF key and is dropped with a warning.
+            if _ASTR_KEY.match(key):
+                converted[key] = tensor
+            else:
+                skipped.append(key)
+            continue
         else:
             converted[new_key] = tensor
 

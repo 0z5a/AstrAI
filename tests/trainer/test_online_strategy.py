@@ -9,7 +9,7 @@ the per-strategy ``prepare_from_rollout`` mappings for both
 import pytest
 import torch
 
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.rollout import RolloutResult
 from astrai.trainer.strategy import (
     BaseStrategy,

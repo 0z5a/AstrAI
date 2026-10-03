@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.strategy import get_logprobs
 from tests.helpers import make_tiny_config
 

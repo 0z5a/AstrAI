@@ -280,12 +280,17 @@ classDiagram
             +to(*args, **kwargs) Self
         }
 
-        class AutoRegressiveLM {
+        class TransformerModel {
             +AutoRegressiveLMConfig config
             +RotaryEmbedding rotary_embedding
             +Embedding embed_tokens
             +ModuleList layers
             +RMSNorm norm
+            +_trunk_hidden(input_ids, input_mask, kv_cache, position_ids) Tuple[Tensor, Optional]
+        }
+
+        class AutoRegressiveLM {
+            +AutoRegressiveLMConfig config
             +Linear lm_head
             +forward(input_ids, input_mask, kv_cache, position_ids) Dict[str, Tensor]
             +load_state_dict(state_dict, strict, assign)
@@ -1197,7 +1202,9 @@ classDiagram
     BaseSamplingStrategy <|-- TopKStrategy
     BaseSamplingStrategy <|-- TopPStrategy
     BaseSamplingStrategy <|-- FrequencyPenaltyStrategy
-    AutoModel <|-- AutoRegressiveLM
+    AutoModel <|-- TransformerModel
+    TransformerModel <|-- AutoRegressiveLM
+    TransformerModel <|-- ValueModel
     AutoModel <|-- EmbeddingEncoder
     BaseConfig <|-- BaseModelConfig
     BaseConfig <|-- TrainConfig
@@ -1257,9 +1264,9 @@ classDiagram
     SchedulerStep --> GPUModelRunner
     GPUModelRunner *-- InferenceWorkspace
     Scheduler *-- RequestManager
-    AutoRegressiveLM *-- DecoderBlock
-    AutoRegressiveLM *-- RotaryEmbedding
-    AutoRegressiveLM *-- Embedding
+    TransformerModel *-- DecoderBlock
+    TransformerModel *-- RotaryEmbedding
+    TransformerModel *-- Embedding
     EmbeddingEncoder *-- DecoderBlock
     EmbeddingEncoder *-- RotaryEmbedding
     EmbeddingEncoder *-- Embedding

@@ -91,7 +91,9 @@ def test_parameter_partition_is_complete_disjoint_and_role_based(
 
     assert len({id(param) for param in all_grouped}) == len(all_grouped)
     assert {id(param) for param in all_grouped} == {id(param) for param in trainable}
-    assert id(model.embed_tokens.weight) in {id(p) for p in groups.nadamw_no_decay}
+    assert id(model.model.embed_tokens.weight) in {
+        id(p) for p in groups.nadamw_no_decay
+    }
     assert id(model.lm_head.weight) in {id(p) for p in groups.nadamw_no_decay}
 
     nora_ids = {id(param) for param in groups.nora}

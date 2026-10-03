@@ -23,7 +23,7 @@ from astrai.inference.worker.pending import (
     PendingExecution,
     ResultRing,
 )
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from tests.helpers import FakeTokenizer, make_rollout_config
 
 

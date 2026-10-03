@@ -1,8 +1,8 @@
 import pytest
 import torch
 
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.components.mlp import MLP, DeepSeekMoE
-from astrai.model.transformer import AutoRegressiveLM
 from tests.helpers import TINY_CONFIG
 
 CONFIGS = [
@@ -191,7 +191,7 @@ def test_gated_deltanet_forward_backward_and_causal_prefix():
     outputs = model(input_ids)
     outputs["logits"].square().mean().backward()
 
-    layer = model.layers[0].attention
+    layer = model.model.layers[0].attention
     assert layer.q_proj.weight.grad is not None
     assert torch.isfinite(layer.q_proj.weight.grad).all()
     assert layer.beta_proj.weight.grad is not None
@@ -252,9 +252,9 @@ def test_moe_per_layer_ffn_resolution():
         }
     )
     model = AutoRegressiveLM(config)
-    assert isinstance(model.layers[0].mlp, MLP)
-    assert not isinstance(model.layers[0].mlp, DeepSeekMoE)
-    assert isinstance(model.layers[1].mlp, DeepSeekMoE)
+    assert isinstance(model.model.layers[0].mlp, MLP)
+    assert not isinstance(model.model.layers[0].mlp, DeepSeekMoE)
+    assert isinstance(model.model.layers[1].mlp, DeepSeekMoE)
 
     # decoder_sparse_step=2: every other layer is MoE
     config2 = AutoRegressiveLMConfig(
@@ -270,10 +270,10 @@ def test_moe_per_layer_ffn_resolution():
     )
     model2 = AutoRegressiveLM(config2)
     # layer 0 (id=0): (0+1)%2=1 != 0 -> MLP
-    assert isinstance(model2.layers[0].mlp, MLP)
-    assert not isinstance(model2.layers[0].mlp, DeepSeekMoE)
+    assert isinstance(model2.model.layers[0].mlp, MLP)
+    assert not isinstance(model2.model.layers[0].mlp, DeepSeekMoE)
     # layer 1 (id=1): (1+1)%2=0 -> MoE
-    assert isinstance(model2.layers[1].mlp, DeepSeekMoE)
+    assert isinstance(model2.model.layers[1].mlp, DeepSeekMoE)
 
     # decoder_sparse_step=1 (default): all layers MoE
     config3 = AutoRegressiveLMConfig(
@@ -287,7 +287,7 @@ def test_moe_per_layer_ffn_resolution():
         }
     )
     model3 = AutoRegressiveLM(config3)
-    for layer in model3.layers:
+    for layer in model3.model.layers:
         assert isinstance(layer.mlp, DeepSeekMoE)
 
 
@@ -308,7 +308,7 @@ def test_moe_custom_intermediate_shape():
         }
     )
     model = AutoRegressiveLM(config)
-    moe_layer = model.layers[0].mlp
+    moe_layer = model.model.layers[0].mlp
     assert isinstance(moe_layer, DeepSeekMoE)
     # routed experts use moe_intermediate_size
     for expert in moe_layer.routed_experts:
@@ -336,7 +336,7 @@ def test_moe_defaults_preserve_normalized_routing():
     model = AutoRegressiveLM(config)
 
     assert config.norm_topk_prob is True
-    assert model.layers[0].mlp.norm_topk_prob is True
+    assert model.model.layers[0].mlp.norm_topk_prob is True
 
 
 def test_moe_router_stats_in_output_during_training():

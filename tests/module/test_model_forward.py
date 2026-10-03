@@ -12,7 +12,7 @@ from torch import nn
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.inference.core.cache import BlockPool, KVCacheManager
 from astrai.inference.worker.workspace import InferenceWorkspace
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.strategy import (
     SEQStrategy,
     SFTStrategy,

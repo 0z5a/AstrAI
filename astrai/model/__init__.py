@@ -1,4 +1,5 @@
 from astrai.model.automodel import AutoModel
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.components.attention import GQA
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.linear import Linear
@@ -12,7 +13,7 @@ from astrai.model.components.lora import (
 from astrai.model.components.mlp import MLP, DeepSeekMoE
 from astrai.model.components.norm import RMSNorm
 from astrai.model.encoder import EmbeddingEncoder
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.transformer_model import TransformerModel
 from astrai.model.value import ValueModel
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "DecoderBlock",
     # Models
     "AutoRegressiveLM",
+    "TransformerModel",
     "EmbeddingEncoder",
     "AutoModel",
     "ValueModel",

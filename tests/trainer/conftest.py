@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from astrai.config import TrainConfig
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.value import ValueModel
 from astrai.trainer.schedule import SchedulerFactory
 from tests.helpers import RandomTokenDataset

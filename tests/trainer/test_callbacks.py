@@ -18,19 +18,19 @@ def test_gradient_checkpointing_enable_disable(test_model):
     model = test_model["model"]
     callback = GradientCheckpointingCallback(modules=[DecoderBlock])
 
-    originals = [layer.forward for layer in model.layers]
+    originals = [layer.forward for layer in model.model.layers]
 
-    for layer in model.layers:
+    for layer in model.model.layers:
         callback._enable(layer)
 
-    for i, layer in enumerate(model.layers):
+    for i, layer in enumerate(model.model.layers):
         assert hasattr(layer, "_original_forward")
         assert layer.forward is not originals[i]
 
-    for layer in model.layers:
+    for layer in model.model.layers:
         callback._disable(layer)
 
-    for layer in model.layers:
+    for layer in model.model.layers:
         assert not hasattr(layer, "_original_forward")
 
 
@@ -39,10 +39,10 @@ def test_gradient_checkpointing_empty_modules_noop(test_model):
     model = test_model["model"]
     callback = GradientCheckpointingCallback()
 
-    for layer in model.layers:
+    for layer in model.model.layers:
         callback._enable(layer)
 
-    for layer in model.layers:
+    for layer in model.model.layers:
         assert not hasattr(layer, "_original_forward")
 
 
@@ -57,7 +57,7 @@ def test_gradient_checkpointing_forward_unchanged(test_model):
     with torch.no_grad():
         ref = model(input_ids)["logits"].clone()
 
-    for layer in model.layers:
+    for layer in model.model.layers:
         callback._enable(layer)
 
     with torch.no_grad():
@@ -72,7 +72,7 @@ def test_gradient_checkpointing_backward(test_model):
     device = test_model["device"]
     callback = GradientCheckpointingCallback(modules=[DecoderBlock])
 
-    for layer in model.layers:
+    for layer in model.model.layers:
         callback._enable(layer)
 
     input_ids = torch.randint(0, 1000, (2, 32)).to(device)
@@ -88,7 +88,7 @@ def test_gradient_checkpointing_backward(test_model):
         if param.requires_grad:
             assert param.grad is not None, f"{name} gradient is None"
 
-    for layer in model.layers:
+    for layer in model.model.layers:
         callback._disable(layer)
 
     model.zero_grad()

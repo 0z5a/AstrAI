@@ -1,14 +1,12 @@
-from typing import Any, Dict, Mapping, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
-from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import RotaryEmbedding
 from astrai.model.kv_cache import KVCache
@@ -45,12 +43,25 @@ def process_attention_mask(
     return input_mask
 
 
-@ModelFactory.register("autoregressive_lm")
-class AutoRegressiveLM(AutoModel):
-    """Autoregressive language model with paged KV cache."""
+def init_module_weights(module: nn.Module):
+    if hasattr(module, "reset_parameters"):
+        module.reset_parameters()
+
+
+class TransformerModel(nn.Module):
+    """The base model every head attaches to: embed → layers → final norm.
+
+    Task wrappers (:class:`AutoRegressiveLM`, :class:`ValueModel`, …) hold
+    it as ``self.model``, mirroring HF's ``LlamaForCausalLM.model``.  The
+    checkpoint namespace splits accordingly: trunk weights live under
+    ``model.*`` and each wrapper's head sits at the top level, so a policy
+    checkpoint warm-starts any head by loading its ``model.*`` subset.  The
+    forward returns the post-norm hidden states (plus MoE aux statistics);
+    input validation stays on the wrappers, which own the calling contract.
+    """
 
     def __init__(self, config: AutoRegressiveLMConfig):
-        super().__init__(config)
+        super().__init__()
         self.config = config
         rope_dim = (
             config.qk_rope_head_dim
@@ -78,45 +89,6 @@ class AutoRegressiveLM(AutoModel):
         )
 
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size)
-
-        if self.config.tie_word_embeddings is True:
-            self.lm_head.weight = self.embed_tokens.weight
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if hasattr(module, "reset_parameters"):
-            module.reset_parameters()
-
-    def load_state_dict(self, state_dict: Mapping[str, Any], strict=True, assign=False):
-        lm_head_key = "lm_head.weight"
-        embed_key = "embed_tokens.weight"
-
-        state_dict = dict(state_dict)
-
-        if self.config.tie_word_embeddings is True:
-            # same tensor for embed and lm_head
-            if embed_key in state_dict:
-                state_dict[lm_head_key] = state_dict[embed_key]
-        else:
-            if lm_head_key not in state_dict and embed_key in state_dict:
-                # clone to avoid sharing gradients
-                state_dict[lm_head_key] = torch.clone(state_dict[embed_key])
-
-        return super().load_state_dict(state_dict, strict, assign)
-
-    def state_dict(self, destination=None, prefix="", keep_vars=False):
-        state_dict = super().state_dict(
-            destination=destination, prefix=prefix, keep_vars=keep_vars
-        )
-
-        if self.config.tie_word_embeddings is True:
-            lm_head_key = prefix + "lm_head.weight"
-            if lm_head_key in state_dict:
-                del state_dict[lm_head_key]
-
-        return state_dict
 
     def forward(
         self,
@@ -126,21 +98,7 @@ class AutoRegressiveLM(AutoModel):
         position_ids: Optional[Tensor] = None,
         fwd: Optional[str] = None,
         logits_positions: Optional[Tensor] = None,
-        skip_lm_head: bool = False,
     ) -> Dict[str, Tensor]:
-        if fwd is None:
-            if input_ids.ndim != 2:
-                raise ValueError("training input_ids must be [batch, seq_len]")
-            if kv_cache is not None:
-                raise ValueError("training forward does not accept a KV cache")
-        elif fwd in ("prefill", "decode"):
-            if input_ids.ndim != 1:
-                raise ValueError("inference input_ids must be packed [tokens]")
-            if kv_cache is None:
-                raise ValueError("inference forward requires a KV cache")
-        else:
-            raise ValueError(f"unsupported forward mode: {fwd}")
-
         x = self.embed_tokens(input_ids)
         rotary_emb = self.rotary_embedding(x, position_ids)
         # GDN supplies causality through its recurrence and needs the compact
@@ -172,13 +130,8 @@ class AutoRegressiveLM(AutoModel):
             hidden_states = self.norm(x[logits_positions])
         else:
             hidden_states = self.norm(x)
-        # skip_lm_head returns post-norm hidden states only, with logits
-        # set to None: no-grad consumers compute per-token log-probs from
-        # hidden @ lm_head.T in row chunks instead of materializing the
-        # full [batch, seq, vocab] tensor (see trainer.strategy.get_logprobs).
-        logits = None if skip_lm_head else self.lm_head(hidden_states)
 
-        output = {"logits": logits, "hidden_states": hidden_states}
+        output = {"hidden_states": hidden_states}
         if aux_losses:
             output["aux_loss"] = torch.stack(aux_losses).mean()
             output["router_stats"] = router_stats_list

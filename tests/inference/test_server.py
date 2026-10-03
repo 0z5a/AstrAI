@@ -7,7 +7,7 @@ import torch
 
 from astrai.inference import build_engine, get_app
 from astrai.inference.frontend.tracking import StreamChunk
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.serialization import save_model
 from tests.helpers import CHAT_TEMPLATE, build_test_tokenizer, make_tiny_config
 

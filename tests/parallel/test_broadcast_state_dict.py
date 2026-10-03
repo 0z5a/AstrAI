@@ -6,7 +6,7 @@ multi-rank environment without requiring multiple GPUs.
 
 import torch
 
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.parallel import get_rank, spawn_parallel_fn
 from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.strategy import GRPOStrategy

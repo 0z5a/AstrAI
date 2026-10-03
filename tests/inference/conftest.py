@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from astrai.inference import get_app
 from astrai.inference.core.scheduler import Scheduler
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from tests.helpers import FakeTokenizer, make_rollout_config
 
 

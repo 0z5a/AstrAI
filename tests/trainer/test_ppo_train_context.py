@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from astrai.config import TrainConfig
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.value import ValueModel
 from astrai.serialization import Checkpoint
 from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
@@ -93,8 +93,13 @@ def test_create_critic_warm_starts_backbone_from_policy(device, monkeypatch):
 
     policy_sd = model.state_dict()
     critic_sd = critic.state_dict()
+    # The critic is trunk + value_head: every trunk key must transfer, and
+    # the policy's lm_head is the one key it deliberately does not carry.
     for key in policy_sd:
-        assert torch.equal(critic_sd[key], policy_sd[key])
+        if key.startswith("lm_head."):
+            assert key not in critic_sd
+        else:
+            assert torch.equal(critic_sd[key], policy_sd[key])
     assert torch.count_nonzero(critic_sd["value_head.weight"]) == 0
     assert torch.count_nonzero(critic_sd["value_head.bias"]) == 0
 

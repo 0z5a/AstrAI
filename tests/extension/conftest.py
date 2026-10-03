@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 
 D = 64
 CFG = dict(

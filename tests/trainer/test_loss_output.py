@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.strategy import BaseStrategy, SEQStrategy
 from astrai.trainer.train_callback import MetricCallback
 from tests.helpers import make_tiny_config

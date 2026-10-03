@@ -16,8 +16,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.components.linear import Linear
-from astrai.model.transformer import AutoRegressiveLM
 from astrai.parallel.setup import spawn_parallel_fn
 from astrai.parallel.topology import ParallelTopology
 from astrai.parallel.tp import DEFAULT_TP_PLAN, TPState

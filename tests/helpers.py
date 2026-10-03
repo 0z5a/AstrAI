@@ -8,7 +8,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers, trainers
 from torch.utils.data import Dataset
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.tokenize import AutoTokenizer, ChatTemplate
 
 TINY_CONFIG = dict(
