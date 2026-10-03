@@ -566,12 +566,60 @@ def _run_stats(args, torch):
     return result
 
 
+def _run_muon(args, torch):
+    """Measure the unchanged single-stream Muon step on a real model."""
+    from astrai.model import AutoRegressiveLM
+    from astrai.optim.muon_adamw import MuonAdamW
+
+    torch.manual_seed(7)
+    model = AutoRegressiveLM.from_pretrained(args.model_path).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    optimizer = MuonAdamW(model, lr=1e-5, ns_steps=5)
+    torch.manual_seed(17)
+    for param in model.parameters():
+        param.grad = torch.randn_like(param)
+    for _ in range(3):
+        optimizer.step()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    samples = []
+    for _ in range(args.steps):
+        start = time.perf_counter()
+        optimizer.step()
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - start) * 1000)
+    result = {
+        "model_path": str(args.model_path),
+        "parameter_count": sum(p.numel() for p in model.parameters()),
+        "optimizer": "MuonAdamW",
+        "ns_steps": 5,
+        "dtype": "bfloat16",
+        "gradient_seed": 17,
+        "warmup_steps": 3,
+        "measured_steps": args.steps,
+        "optimizer_step": _summary(samples),
+        "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 2),
+        "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 2),
+    }
+    del model, optimizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("train", "stats"), default="train")
+    parser.add_argument("--mode", choices=("train", "stats", "muon"), default="train")
     parser.add_argument("--batch-size", type=int, default=4, help="stats mode")
     parser.add_argument("--seq-len", type=int, default=64, help="stats mode")
-    parser.add_argument("--steps", type=int, default=10, help="stats mode")
+    parser.add_argument("--steps", type=int, default=10, help="stats or muon mode")
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=Path("models/AstrAI-V1-base"),
+        help="muon mode: local pretrained model",
+    )
     parser.add_argument(
         "--config", type=Path, help="optional JSON case matrix for train mode"
     )
@@ -591,6 +639,12 @@ def main():
             parser.error("batch-size/steps must be positive and seq-len must be 1..256")
         if args.batch_size * args.seq_len > 2048:
             parser.error("stats mode is limited to 2048 tokens per step")
+        cases = None
+    elif args.mode == "muon":
+        if args.config:
+            parser.error("--config applies only to train mode")
+        if args.steps < 1:
+            parser.error("muon mode requires steps >= 1")
         cases = None
     else:
         document = (
@@ -613,9 +667,15 @@ def main():
             )
             dry_run["cases"] = cases
         else:
-            dry_run.update(
-                batch_size=args.batch_size, seq_len=args.seq_len, steps=args.steps
-            )
+            if args.mode == "muon":
+                dry_run.update(
+                    model_path=str(args.model_path),
+                    steps=args.steps,
+                )
+            else:
+                dry_run.update(
+                    batch_size=args.batch_size, seq_len=args.seq_len, steps=args.steps
+                )
         print(json.dumps(dry_run, indent=2))
         return
     gpu = _require_idle_gpu(args.gpu)
@@ -636,6 +696,8 @@ def main():
     }
     if args.mode == "stats":
         result["stats"] = _run_stats(args, torch)
+    elif args.mode == "muon":
+        result["muon"] = _run_muon(args, torch)
     else:
         result["case_source"] = str(args.config) if args.config else "built_in_smoke"
         result["cases"] = [_run_case(case, torch) for case in cases]
