@@ -46,6 +46,7 @@ class Trainer:
                 save_interval=cfg.ckpt_interval,
                 metrics=cfg.metrics,
                 val_step=cfg.val_step,
+                grad_snr_interval=cfg.grad_snr_interval,
             ),
             CallbackFactory.create("progress_bar", cfg.n_epoch),
             CallbackFactory.create("gradient_clipping", cfg.max_grad_norm),

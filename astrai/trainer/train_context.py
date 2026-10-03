@@ -73,6 +73,7 @@ class TrainContext:
     metrics: dict[str, float] = field(default_factory=dict)
     grad_norm: float | None = field(default=None)
     grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
+    grad_snr_value: float | None = field(default=None)
     val_dataloader: DataLoader | None = field(default=None)
     val_loss: float | None = field(default=None)
     #: Online-strategy validation: reward-statistics evaluator under its

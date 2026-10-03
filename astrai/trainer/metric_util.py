@@ -30,7 +30,9 @@ class GradSNRTracker:
 
     The reported value is the power ratio in decibels: ``10 * log10(SNR)``.
 
-    The tracker accumulates per-parameter EMA moments across optimizer steps.
+    The tracker accumulates a first-moment tensor and a scalar second-moment
+    sum per parameter. The aggregate SNR only needs the sum of squared
+    gradients, so a full second-moment tensor would waste model-sized memory.
     Call ``update`` after backward (before ``optimizer.step``) and read
     ``snr`` to get the aggregate SNR across all parameters.
     """
@@ -42,29 +44,40 @@ class GradSNRTracker:
         self._second: Dict[int, torch.Tensor] = {}
 
     @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        beta = self.beta
+    def update(self, model: nn.Module, *, step_span: int = 1) -> None:
+        if step_span <= 0:
+            raise ValueError("step_span must be positive")
+        # With sampled updates, preserve approximately the same EMA decay
+        # measured in optimizer steps (intermediate gradients are not observed).
+        beta = self.beta**step_span
         for param in model.parameters():
             if param.grad is None:
                 continue
             pid = id(param)
             g = param.grad.detach()
+            squared_norm = g.square().sum(dtype=torch.float32)
             if pid not in self._first:
                 self._first[pid] = g.clone()
-                self._second[pid] = g.pow(2).clone()
+                self._second[pid] = squared_norm
             else:
                 self._first[pid].mul_(beta).add_(g, alpha=1 - beta)
-                self._second[pid].mul_(beta).addcmul_(g, g, value=1 - beta)
+                self._second[pid].mul_(beta).add_(squared_norm, alpha=1 - beta)
 
     @property
     def snr(self) -> float:
         if not self._first:
             return 0.0
+        # Aggregate device scalars before crossing the device/host boundary.
+        # This is one synchronization per device, not two per parameter.
+        device_pairs = {}
+        for pid, m in self._first.items():
+            signal = m.square().sum(dtype=torch.float32)
+            noise = (self._second[pid] - signal).clamp_min(0)
+            device_pairs.setdefault(m.device, []).append(torch.stack((signal, noise)))
         total_signal = 0.0
         total_noise = 0.0
-        for m, v in zip(self._first.values(), self._second.values()):
-            signal = m.pow(2).sum().item()
-            noise = (v - m.pow(2)).clamp(min=0).sum().item()
+        for pairs in device_pairs.values():
+            signal, noise = torch.stack(pairs).sum(dim=0).tolist()
             total_signal += signal
             total_noise += noise
         snr = total_signal / (total_noise + self.eps)
@@ -88,6 +101,9 @@ def ctx_get_grad_norm(ctx):
 
 
 def ctx_get_grad_snr(ctx):
+    cached = getattr(ctx, "grad_snr_value", None)
+    if cached is not None:
+        return cached
     tracker = getattr(ctx, "grad_snr_tracker", None)
     if tracker is None:
         return None

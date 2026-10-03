@@ -509,8 +509,11 @@ def _collect_moe_diagnostics(
         # Router entropy
         entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1).mean()
 
-        # Load from the actual dispatch: one-hot sum of top-k assignments.
-        expert_counts = F.one_hot(topk_indices, num_experts).sum(dim=(0, 1)).float()
+        # Load from the actual dispatch without a [tokens, top_k, experts] tensor.
+        flat_experts = topk_indices.reshape(-1)
+        expert_counts = probs.new_zeros(num_experts).scatter_add_(
+            0, flat_experts, probs.new_ones(flat_experts.numel())
+        )
         ideal_load = expert_counts.mean()  # N*K / E
         load_ratios = expert_counts / max(float(ideal_load), 1.0)
         imbalance_mean = (load_ratios - 1.0).abs().mean()

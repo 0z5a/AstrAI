@@ -153,8 +153,12 @@ class DeepSeekMoE(nn.Module):
         aux_loss = None
         router_stats = None
         if include_aux_loss:
-            expert_load = F.one_hot(topk_indices, num_classes=E).float()
-            expert_load = expert_load.mean(dim=(0, 1))
+            # Count selected experts without materializing [tokens, top_k, experts].
+            flat_experts = topk_indices.reshape(-1)
+            expert_load = router_probs.new_zeros(E).scatter_add_(
+                0, flat_experts, router_probs.new_ones(flat_experts.numel())
+            )
+            expert_load = expert_load / flat_experts.numel()
             router_prob = router_probs.mean(dim=0)
             aux_loss = E * (expert_load * router_prob).sum()
             router_stats = {

@@ -48,6 +48,7 @@ class TrainConfig(BaseConfig):
         ckpt_interval (int): Number of optimizer steps between checkpoints. Defaults to 5000.
         lora (Optional[LoRAConfig]): LoRA config. None means full fine-tuning. Defaults to None.
         metrics (List[str]): Metrics to record during training. Defaults to ["loss", "lr", "grad_norm"].
+        grad_snr_interval (int): Update GradSNR every N optimizer steps when the metric is requested. Defaults to 1.
         random_seed (int): Random seed. Defaults to 3407.
         num_workers (int): Number of workers for dataloader. Defaults to 0.
         prefetch_factor (Optional[int]): Prefetch factor for dataloader. Defaults to None.
@@ -116,6 +117,7 @@ class TrainConfig(BaseConfig):
     lora: Optional[LoRAConfig] = None
 
     metrics: List[str] = field(default_factory=lambda: ["loss", "lr", "grad_norm"])
+    grad_snr_interval: int = 1
 
     random_seed: int = 3407
     num_workers: int = 0
@@ -235,6 +237,7 @@ class TrainConfig(BaseConfig):
         "n_epoch",
         "batch_per_device",
         "grad_accum_steps",
+        "grad_snr_interval",
         "ckpt_interval",
         "val_step",
         "rollout_interval",

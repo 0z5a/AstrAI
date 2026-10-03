@@ -303,11 +303,15 @@ class MetricCallback(TrainCallback):
         save_interval: int,
         metrics: list[str] = None,
         val_step: int = 0,
+        grad_snr_interval: int = 1,
     ):
+        if grad_snr_interval <= 0:
+            raise ValueError("grad_snr_interval must be positive")
         self.last_log_flush_step = None
         self.save_interval = save_interval
         self.metrics = metrics or ["loss", "lr"]
         self.val_step = val_step
+        self.grad_snr_interval = grad_snr_interval
         self._next_val_step = 0
 
         self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else Path.cwd() / "checkpoint"
@@ -428,7 +432,17 @@ class MetricCallback(TrainCallback):
             f.writelines(json.dumps(log) + "\n" for log in self.log_cache)
 
     def before_optimizer_step(self, context):
-        context.grad_snr_tracker.update(context.model)
+        # GradSNR keeps model-sized first-moment state. Only update it when
+        # requested and at the configured sampling interval.
+        if (
+            "grad_snr" in self.metrics
+            and context.grad_snr_tracker is not None
+            and context.optimizer_step % self.grad_snr_interval == 0
+        ):
+            context.grad_snr_tracker.update(
+                context.model, step_span=self.grad_snr_interval
+            )
+            context.grad_snr_value = context.grad_snr_tracker.snr
 
         if (
             context.val_dataloader is not None
