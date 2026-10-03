@@ -567,44 +567,71 @@ def _run_stats(args, torch):
 
 
 def _run_muon(args, torch):
-    """Measure the unchanged single-stream Muon step on a real model."""
+    """Measure single-stream Muon and optionally compare NS buffer reuse."""
     from astrai.model import AutoRegressiveLM
     from astrai.optim.muon_adamw import MuonAdamW
 
-    torch.manual_seed(7)
-    model = AutoRegressiveLM.from_pretrained(args.model_path).to(
-        device="cuda", dtype=torch.bfloat16
-    )
-    optimizer = MuonAdamW(model, lr=1e-5, ns_steps=5)
-    torch.manual_seed(17)
-    for param in model.parameters():
-        param.grad = torch.randn_like(param)
-    for _ in range(3):
-        optimizer.step()
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    samples = []
-    for _ in range(args.steps):
-        start = time.perf_counter()
-        optimizer.step()
-        torch.cuda.synchronize()
-        samples.append((time.perf_counter() - start) * 1000)
     result = {
         "model_path": str(args.model_path),
-        "parameter_count": sum(p.numel() for p in model.parameters()),
         "optimizer": "MuonAdamW",
         "ns_steps": 5,
         "dtype": "bfloat16",
         "gradient_seed": 17,
         "warmup_steps": 3,
         "measured_steps": args.steps,
-        "optimizer_step": _summary(samples),
-        "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 2),
-        "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 2),
     }
-    del model, optimizer
-    gc.collect()
-    torch.cuda.empty_cache()
+    variants = [("reference", False)]
+    if args.muon_reuse_ns_buffers:
+        variants.append(("reuse_ns_buffers", True))
+    expected = None
+    for name, reuse in variants:
+        torch.manual_seed(7)
+        model = AutoRegressiveLM.from_pretrained(args.model_path).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        kwargs = {"reuse_ns_buffers": True} if reuse else {}
+        optimizer = MuonAdamW(model, lr=1e-5, ns_steps=5, **kwargs)
+        torch.manual_seed(17)
+        for param in model.parameters():
+            param.grad = torch.randn_like(param)
+        for _ in range(3):
+            optimizer.step()
+        torch.cuda.synchronize()
+        if name == "reference" and args.muon_reuse_ns_buffers:
+            expected = {
+                key: param.detach().cpu().clone()
+                for key, param in model.named_parameters()
+            }
+        elif reuse:
+            max_abs = 0.0
+            different_elements = 0
+            for key, param in model.named_parameters():
+                current = param.detach().cpu()
+                if not torch.equal(current, expected[key]):
+                    difference = current.float() - expected[key].float()
+                    max_abs = max(max_abs, difference.abs().max().item())
+                    different_elements += torch.count_nonzero(difference).item()
+            result["update_equivalence"] = {
+                "max_abs": max_abs,
+                "different_elements": different_elements,
+            }
+            torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        samples = []
+        for _ in range(args.steps):
+            start = time.perf_counter()
+            optimizer.step()
+            torch.cuda.synchronize()
+            samples.append((time.perf_counter() - start) * 1000)
+        result[name] = {
+            "optimizer_step": _summary(samples),
+            "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 2),
+            "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 2),
+        }
+        result["parameter_count"] = sum(p.numel() for p in model.parameters())
+        del model, optimizer
+        gc.collect()
+        torch.cuda.empty_cache()
     return result
 
 
@@ -619,6 +646,11 @@ def main():
         type=Path,
         default=Path("models/AstrAI-V1-base"),
         help="muon mode: local pretrained model",
+    )
+    parser.add_argument(
+        "--muon-reuse-ns-buffers",
+        action="store_true",
+        help="muon mode: compare optional NS scratch-buffer reuse",
     )
     parser.add_argument(
         "--config", type=Path, help="optional JSON case matrix for train mode"
@@ -670,6 +702,7 @@ def main():
             if args.mode == "muon":
                 dry_run.update(
                     model_path=str(args.model_path),
+                    muon_reuse_ns_buffers=args.muon_reuse_ns_buffers,
                     steps=args.steps,
                 )
             else:

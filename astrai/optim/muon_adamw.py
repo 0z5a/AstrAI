@@ -25,6 +25,58 @@ def _scalar_lr(lr: Any) -> float:
     return lr.item() if isinstance(lr, Tensor) else lr
 
 
+def _zeropower_reuse_buffers(
+    grad: Tensor, ns_coefficients: tuple[float, float, float], ns_steps: int, eps: float
+) -> Tensor:
+    """Run torch Muon's NS recurrence with scratch tensors reused across steps."""
+    if ns_steps >= 100 or grad.ndim != 2 or len(ns_coefficients) != 3:
+        raise ValueError("invalid Muon Newton-Schulz input")
+    a, b, c = ns_coefficients
+    x = grad.bfloat16()
+    tall = grad.size(0) > grad.size(1)
+    if tall:
+        x = x.T
+    x.div_(x.norm().clamp(min=eps))
+    gram = torch.empty((x.size(0), x.size(0)), dtype=x.dtype, device=x.device)
+    gram_update = torch.empty_like(gram)
+    next_x = torch.empty_like(x)
+    for _ in range(ns_steps):
+        torch.mm(x, x.T, out=gram)
+        torch.addmm(gram, gram, gram, beta=b, alpha=c, out=gram_update)
+        torch.addmm(x, gram_update, x, beta=a, out=next_x)
+        x, next_x = next_x, x
+    return x.T if tall else x
+
+
+def _single_tensor_muon_reuse_buffers(
+    params: list[Tensor],
+    grads: list[Tensor],
+    bufs: list[Tensor],
+    *,
+    lr: float,
+    weight_decay: float,
+    momentum: float,
+    nesterov: bool,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+    adjust_lr_fn: str | None,
+    has_complex: bool,
+) -> None:
+    if has_complex:
+        raise ValueError("Complex parameters are not supported")
+    lr = _scalar_lr(lr)
+    for param, grad, buf in zip(params, grads, bufs):
+        if grad.ndim != 2:
+            raise ValueError("Param gradient must be a 2D matrix")
+        buf.lerp_(grad, 1 - momentum)
+        update = grad.lerp(buf, momentum) if nesterov else buf
+        update = _zeropower_reuse_buffers(update, ns_coefficients, ns_steps, eps)
+        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
+        param.mul_(1 - lr * weight_decay)
+        param.add_(update, alpha=-adjusted_lr)
+
+
 def _sharded_orthogonalize(update: Tensor, group: Mapping) -> Tensor:
     """Newton-Schulz for a sharded DTensor momentum update.
 
@@ -52,12 +104,15 @@ class _ShardedMuon(optim.Muon):
     silently corrupting every update (measured 2e-4-9e-4 relative error
     per step at world_size=2).
 
-    Plain (non-DTensor) params are routed through torch's own
-    ``_single_tensor_muon`` so unsharded runs stay bit-for-bit identical
-    to ``optim.Muon`` and this class carries only the DTensor delta.
+    Plain (non-DTensor) params use torch's ``_single_tensor_muon`` by default.
+    The optional scratch-buffer path keeps the same five-step NS recurrence.
     Element-wise ops (momentum lerp, weight decay, the final ``add_``)
     are DTensor-safe and run directly on the shards.
     """
+
+    def __init__(self, params, *, reuse_ns_buffers: bool = False, **kwargs):
+        super().__init__(params, **kwargs)
+        self.reuse_ns_buffers = reuse_ns_buffers
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -80,7 +135,12 @@ class _ShardedMuon(optim.Muon):
 
             if plain:
                 pp, gg, bb = (list(t) for t in zip(*plain))
-                _single_tensor_muon(
+                step_plain = (
+                    _single_tensor_muon_reuse_buffers
+                    if self.reuse_ns_buffers
+                    else _single_tensor_muon
+                )
+                step_plain(
                     pp,
                     gg,
                     bb,
@@ -121,6 +181,7 @@ class MuonAdamW(optim.Optimizer):
         nesterov: bool = True,
         ns_steps: int = 5,
         adjust_lr_fn: str = "match_rms_adamw",
+        reuse_ns_buffers: bool = False,
     ):
         defaults = {
             "lr": lr,
@@ -157,6 +218,7 @@ class MuonAdamW(optim.Optimizer):
             nesterov=nesterov,
             ns_steps=ns_steps,
             adjust_lr_fn=adjust_lr_fn,
+            reuse_ns_buffers=reuse_ns_buffers,
         )
         self.adamw = optim.AdamW(
             [{"params": other_params, "weight_decay": 0.0}],

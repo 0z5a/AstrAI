@@ -146,6 +146,13 @@ _SPECS = [
         help="Muon Newton-Schulz steps.",
     ),
     OptSpec(
+        "muon_reuse_ns_buffers",
+        "Optimizer",
+        type=bool,
+        default=False,
+        help="Reuse Muon NS scratch buffers within each matrix update.",
+    ),
+    OptSpec(
         "muon_adjust_lr",
         "Optimizer",
         choices=["original", "match_rms_adamw"],
@@ -705,6 +712,7 @@ def train(
         "momentum": kwargs.pop("muon_momentum", 0.95),
         "nesterov": kwargs.pop("muon_nesterov", True),
         "ns_steps": kwargs.pop("muon_ns_steps", 5),
+        "reuse_ns_buffers": kwargs.pop("muon_reuse_ns_buffers", False),
         "adjust_lr_fn": kwargs.pop("muon_adjust_lr", "match_rms_adamw"),
         "mano_momentum": kwargs.pop("mano_momentum", 0.95),
         "mano_nesterov": kwargs.pop("mano_nesterov", True),
@@ -746,6 +754,7 @@ def train(
                 "momentum",
                 "nesterov",
                 "ns_steps",
+                "reuse_ns_buffers",
                 "adjust_lr_fn",
             )
         }
