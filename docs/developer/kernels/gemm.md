@@ -360,6 +360,13 @@ express is the per-CTA efficiency that separates classes at a given
 (M, N) — the measured axis the row tables own, and the reason the hybrid
 chain keeps rows first.
 
+The Python extension separates configuration from tuning: `plan.py` owns
+the public config/probe/override API and the launch hook, while
+`autotune.py` owns candidate measurement, cache rows, and persistence.
+The FP8 path uses the same ownership rule: `fp8_slots.py` owns stable
+module-to-slot identities, and `autocast.py` owns region policy and
+`aten::linear` routing.
+
 **Runtime plan surface** (`astrai.extension.plan`, re-exported from
 `astrai.extension`):
 

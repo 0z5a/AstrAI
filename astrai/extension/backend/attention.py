@@ -60,7 +60,6 @@ from astrai.extension.dispatch import (
     Axes,
     ImplRecord,
     Spec,
-    axis,
     env_selection,
     get_override,
     register_env_alias,
@@ -581,6 +580,19 @@ class CudaBackend(AttentionBackend):
     def available(cls) -> bool:
         return torch.cuda.is_available() and is_available("attention")
 
+    @classmethod
+    def supports_axes(cls, ax: Axes) -> bool:
+        # The CUDA kernels take one precision per build — bf16 today, and the
+        # instantiated set lives in csrc/include/api/attention_dtypes.h.
+        return (
+            ax["fwd"] in ("prefill", "decode")
+            and ax["has_cache"]
+            and ax["ndim"] == 3
+            and ax["dtype"] == torch.bfloat16
+            and ax["head_dim"] in cls.HEAD_DIMS
+            and is_available("attention")
+        )
+
     def supports_call(
         self,
         q: Tensor,
@@ -589,19 +601,7 @@ class CudaBackend(AttentionBackend):
         is_causal: bool,
         fwd: Optional[str],
     ) -> bool:
-        # The CUDA kernels take one precision per build — bf16 today, and the
-        # instantiated set lives in csrc/include/api/attention_dtypes.h
-        # (ASTRAI_ATTN_DTYPE_LIST) — support head_dim in HEAD_DIMS, and need a
-        # KV cache (decode/prefill); everything else falls back down the
-        # priority list to torch.
-        return (
-            fwd in ("prefill", "decode")
-            and kv_cache is not None
-            and q.ndim == 3
-            and q.dtype == torch.bfloat16
-            and q.size(-1) in self.HEAD_DIMS
-            and is_available("attention")
-        )
+        return self.supports_axes(_axes(q, kv_cache, attn_mask, is_causal, fwd))
 
     @staticmethod
     def supports_graph() -> bool:
@@ -698,6 +698,17 @@ class FlashAttnBackend(AttentionBackend):
     def available(cls) -> bool:
         return flash_attn_available()
 
+    @classmethod
+    def supports_axes(cls, ax: Axes) -> bool:
+        if not flash_attn_available():
+            return False
+        if ax["dtype"] not in (torch.float16, torch.bfloat16):
+            return False
+        if ax["fwd"] is not None:
+            return ax["ndim"] == 3 and hasattr(_flash_attn, "flash_attn_varlen_func")
+        # Dense training cannot apply a custom mask; causal is a flag.
+        return not ax["has_mask"]
+
     def supports_call(
         self,
         q: Tensor,
@@ -706,17 +717,7 @@ class FlashAttnBackend(AttentionBackend):
         is_causal: bool,
         fwd: Optional[str],
     ) -> bool:
-        if not self.available():
-            return False
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            return False
-        if fwd is not None:
-            return q.ndim == 3 and hasattr(_flash_attn, "flash_attn_varlen_func")
-        # Dense (training) path: flash_attn_func cannot apply a custom
-        # mask, so only mask-free calls are supported — ``is_causal`` is
-        # a flag, not a mask.  Masked training (SFT/DPO/GRPO) must fall
-        # back to TorchNativeBackend instead of silently ignoring the mask.
-        return attn_mask is None
+        return self.supports_axes(_axes(q, kv_cache, attn_mask, is_causal, fwd))
 
     def forward(
         self,
@@ -802,8 +803,7 @@ class FlashAttnBackend(AttentionBackend):
 
 
 # Family registration over the generic dispatcher: the "attention" decision
-# table.  The Specs mirror each backend's ``supports_call`` exactly (a unit
-# test asserts they never drift).  The provider is re-evaluated per
+# table.  Each Spec calls the backend's own capability predicate.  The provider is re-evaluated per
 # resolution, so monkeypatching ``flash_attn_available`` (plus clearing
 # ``_priority_backends``) is honored, as before.
 
@@ -813,32 +813,13 @@ _CLASS_TO_NAME: Dict[type, str] = {
     TorchNativeBackend: ATTN_BACKEND.TORCH_NATIVE.value,
 }
 
-_SPEC_CUDA = (
-    axis("fwd").in_("prefill", "decode")
-    & axis("has_cache").truthy()
-    & axis("ndim").eq(3)
-    & axis("dtype").in_(torch.bfloat16)
-    & axis("head_dim").in_(*CudaBackend.HEAD_DIMS)
-    & Spec.of(lambda ax: is_available("attention"), "attention module loaded")
+_SPEC_CUDA = Spec.of(
+    CudaBackend.supports_axes,
+    "bf16 packed cache call with supported head dim and attention kernel",
 )
-
-_SPEC_FLASH = (
-    axis("dtype").in_(torch.float16, torch.bfloat16)
-    & Spec.of(lambda ax: flash_attn_available(), "flash-attn available")
-    & (
-        (
-            axis("fwd").not_none()
-            & axis("ndim").eq(3)
-            & Spec.of(
-                lambda ax: (
-                    _flash_attn is not None
-                    and hasattr(_flash_attn, "flash_attn_varlen_func")
-                ),
-                "varlen api present",
-            )
-        )
-        | (axis("fwd").none() & axis("has_mask").falsy())
-    )
+_SPEC_FLASH = Spec.of(
+    FlashAttnBackend.supports_axes,
+    "flash-attn dtype/API and compatible mask",
 )
 
 

@@ -179,11 +179,17 @@ def report_result(
     config: GqaConfig,
     case: dict[str, int],
     operations: dict[str, Callable[[], torch.Tensor]],
-    samples: dict[str, list[float]],
     io_bytes: int,
-    reference: torch.Tensor,
-    actual: torch.Tensor,
+    *,
+    warmup: int,
+    iterations: int,
+    trials: int,
 ) -> dict[str, object]:
+    samples = measure_operations(
+        operations, warmup=warmup, iterations=iterations, trials=trials
+    )
+    reference = operations["torch"]()
+    actual = operations["cuda"]()
     difference = actual.float() - reference.float()
     result: dict[str, object] = {
         "suite": suite,
@@ -199,7 +205,7 @@ def report_result(
         "estimated_io_bytes": io_bytes,
         **case,
     }
-    for name, operation in operations.items():
+    for name in operations:
         latency = summarize(samples[name])
         result[name] = {
             "effective_bandwidth_gbps": io_bytes / (latency["median_ms"] / 1000) / 1e9,
@@ -255,19 +261,16 @@ def benchmark_decode(
         return attn_decode(q, k, v, is_causal=True)
 
     operations = {"torch": torch_op, "cuda": cuda_op}
-    samples = measure_operations(
-        operations, warmup=warmup, iterations=iterations, trials=trials
-    )
     io_bytes = (2 * q.numel() + 2 * k.numel()) * q.element_size()
     return report_result(
         "decode",
         config,
         {"batch": batch, "context": context},
         operations,
-        samples,
         io_bytes,
-        torch_op(),
-        cuda_op(),
+        warmup=warmup,
+        iterations=iterations,
+        trials=trials,
     )
 
 
@@ -297,19 +300,16 @@ def benchmark_prefill(
         return attn_prefill(q, k, v, is_causal=True)
 
     operations = {"torch": torch_op, "cuda": cuda_op}
-    samples = measure_operations(
-        operations, warmup=warmup, iterations=iterations, trials=trials
-    )
     io_bytes = (2 * q.numel() + 2 * k.numel()) * q.element_size()
     return report_result(
         "prefill",
         config,
         {"batch": batch, "q_len": q_len},
         operations,
-        samples,
         io_bytes,
-        torch_op(),
-        cuda_op(),
+        warmup=warmup,
+        iterations=iterations,
+        trials=trials,
     )
 
 
@@ -385,9 +385,6 @@ def benchmark_paged_decode(
         return sdpa_call().squeeze(1)  # [B, Hq, D]
 
     operations = {"torch": torch_op, "cuda": cuda_op}
-    samples = measure_operations(
-        operations, warmup=warmup, iterations=iterations, trials=trials
-    )
     io_bytes = (
         2 * inputs.q.numel()  # q read + out write
         + 2 * sum(kv_lens) * config.hkv * config.head_dim  # k/v reads
@@ -398,10 +395,10 @@ def benchmark_paged_decode(
         config,
         {"batch": batch, "context": context},
         operations,
-        samples,
         io_bytes,
-        torch_op(),
-        cuda_op(),
+        warmup=warmup,
+        iterations=iterations,
+        trials=trials,
     )
 
 
@@ -473,9 +470,6 @@ def benchmark_paged_prefill(
         return torch.cat([out[i, :length] for i, length in enumerate(q_lens)])
 
     operations = {"torch": torch_op, "cuda": cuda_op}
-    samples = measure_operations(
-        operations, warmup=warmup, iterations=iterations, trials=trials
-    )
     io_bytes = (
         2 * inputs.q.numel() + 2 * sum(q_lens) * config.hkv * config.head_dim
     ) * inputs.q.element_size()
@@ -484,10 +478,10 @@ def benchmark_paged_prefill(
         config,
         {"batch": batch, "q_len": q_len},
         operations,
-        samples,
         io_bytes,
-        torch_op(),
-        cuda_op(),
+        warmup=warmup,
+        iterations=iterations,
+        trials=trials,
     )
 
 

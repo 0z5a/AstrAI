@@ -11,7 +11,8 @@ Public API:
       operator dispatcher (see ``astrai.extension.dispatch``)
     - ``fp8_autocast`` / ``FP8Recipe`` / ``fp8_linear_enable`` /
       ``fp8_state_dict`` — the fp8 autocast region and its checkpoint
-      bridge (see ``astrai.extension.autocast``); ``quantize_weight_int8`` /
+      bridge (see ``astrai.extension.autocast``); stable FP8 module slots
+      live in ``astrai.extension.fp8_slots``; ``quantize_weight_int8`` /
       ``quantize_act_int8`` below are the stateless int8 inference
       strategies
     - ``plan`` — the runtime GEMM plan (`plan.config` / `plan.configure` /

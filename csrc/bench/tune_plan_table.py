@@ -1275,9 +1275,7 @@ def main(
         click.echo(_run(gen_cmd).strip().splitlines()[-1])  # the "wrote N rows" line
         # Rows only over the swept M domain (see _clamp_m_domain): the
         # floor is the smallest M this run asked gen to sweep.
-        floor = min(
-            int(v) for v in (m_values or "512,2048,4096").split(",") if v.strip()
-        )
+        floor = min(parse_positive_ints(m_values or "512,2048,4096"))
         _clamp_m_domain(candidate, floor - 1)
 
         if not skip_validate:
