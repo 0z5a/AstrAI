@@ -25,6 +25,7 @@ import torch.nn.functional as F
 
 from astrai.extension import is_available, quantize_act_int8, quantize_weight_int8
 from astrai.extension.kernel.gemm import quant_gemm
+from astrai.performance import measure_operations
 
 # GEMM shapes as (N, K) weight mats; M comes from --m-values.
 GEMM_SHAPES = (
@@ -88,38 +89,6 @@ def parse_shape(value: str) -> tuple[str, int, int]:
     if rows <= 0 or cols <= 0:
         raise click.BadParameter("ROWS and COLS must be positive")
     return parts[0], rows, cols
-
-
-def time_operation(operation: Callable[[], torch.Tensor], iterations: int) -> float:
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        operation()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iterations
-
-
-def measure_operations(
-    operations: dict[str, Callable[[], torch.Tensor]],
-    *,
-    warmup: int,
-    iterations: int,
-    trials: int,
-) -> dict[str, list[float]]:
-    for operation in operations.values():
-        for _ in range(warmup):
-            operation()
-    torch.cuda.synchronize()
-
-    samples: dict[str, list[float]] = {name: [] for name in operations}
-    order = tuple(operations)
-    # A-B-C-C-B-A order balances cache, clock, and temperature drift.
-    for _ in range(trials):
-        for name in (*order, *reversed(order)):
-            samples[name].append(time_operation(operations[name], iterations))
-    return samples
 
 
 def quantize_fp8(

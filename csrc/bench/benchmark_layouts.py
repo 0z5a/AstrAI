@@ -36,6 +36,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from astrai.extension.kernel.gemm import probe, quant_gemm, set_planner  # noqa: E402
+from astrai.performance import measure_operations  # noqa: E402
 
 FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0
@@ -83,17 +84,6 @@ def build_cell(a_bf, b_bf, ta, tb, kind, ref):
         a_op, b_op, a_scale=a_scale, trans_a=ta, trans_b=tb
     )
     return op, ref
-
-
-def time_op(op, iterations: int) -> float:
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        op()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iterations
 
 
 def report(shape, order, samples, flops):
@@ -200,16 +190,10 @@ def main(m, shapes, warmup, iterations, trials, planner_ab):
             )
         del a_bf, b_bf, refs
 
-    for op in cells.values():
-        for _ in range(warmup):
-            op()
-    torch.cuda.synchronize()
-
-    samples = {key: [] for key in cells}
+    samples = measure_operations(
+        cells, warmup=warmup, iterations=iterations, trials=trials
+    )
     order = list(cells)
-    for _ in range(trials):
-        for key in (*order, *reversed(order)):
-            samples[key].append(time_op(cells[key], iterations))
 
     header = f"{'shape':14s} {'layout':6s} {'dtype':4s} {'ms':>9s} {'TFLOP/s':>9s}"
     print(header + "   [min..max]")

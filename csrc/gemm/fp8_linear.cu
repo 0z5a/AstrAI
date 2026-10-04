@@ -219,8 +219,8 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x,
         }
     }
 
+    Tensor x8;
     if (update_rings) {
-        Tensor x8;
         if (cached_activation.has_value()) {
             st.n_act_hit.fetch_add(1, std::memory_order_relaxed);
             x8 = cached_activation->x8;
@@ -239,14 +239,13 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x,
                                     meta->x);
             }
         }
-        res.out = run_gemm(x8.reshape({-1, x8.size(-1)}), w8, res.sx, res.sw, bias, true)
-                      .reshape(out_shape);
     } else {
-        const auto qx = run_quant(x, meta->x->scale_recip(), quant::QuantLayout::RowMajor, fmt_a,
-                                  c10::nullopt, c10::nullopt, 0, cfg);
-        res.out = run_gemm(qx.out.reshape({-1, qx.out.size(-1)}), w8, res.sx, res.sw, bias, true)
-                      .reshape(out_shape);
+        x8 = run_quant(x, meta->x->scale_recip(), quant::QuantLayout::RowMajor, fmt_a,
+                       c10::nullopt, c10::nullopt, 0, cfg)
+                 .out;
     }
+    res.out = run_gemm(x8.reshape({-1, x8.size(-1)}), w8, res.sx, res.sw, bias, true)
+                  .reshape(out_shape);
     return res;
 }
 

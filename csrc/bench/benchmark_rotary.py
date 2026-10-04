@@ -10,8 +10,6 @@ row exercises a distinct cos/sin gather.
 from __future__ import annotations
 
 import json
-import math
-import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +21,7 @@ import torch.nn.functional as F
 
 from astrai.extension import is_available
 from astrai.extension.kernel import rotary_emb
+from astrai.performance import measure_operations, summarize
 
 
 @dataclass(frozen=True)
@@ -59,25 +58,6 @@ def parse_case(value: str) -> RotaryCase:
     if any(field <= 0 for field in fields) or head_dim % 2:
         raise click.BadParameter("fields must be positive; HEAD_DIM even")
     return RotaryCase(name, layout, fields[0], fields[1], fields[2], fields[3])
-
-
-def time_operation(operation: Callable[[], torch.Tensor], iterations: int) -> float:
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        operation()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iterations
-
-
-def summarize(values: list[float]) -> dict[str, float]:
-    ordered = sorted(values)
-    return {
-        "median_ms": statistics.median(ordered),
-        "p90_ms": ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)],
-    }
 
 
 def torch_apply(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -125,17 +105,9 @@ def benchmark_case(
         "torch": lambda: torch_apply(x, freqs_cis),
         "cuda": lambda: rotary_emb(x, freqs_cis),
     }
-    for operation in operations.values():
-        for _ in range(warmup):
-            operation()
-    torch.cuda.synchronize()
-
-    samples: dict[str, list[float]] = {name: [] for name in operations}
-    order = tuple(operations)
-    # A-B-B-A order balances cache, clock, and temperature drift.
-    for _ in range(trials):
-        for name in (*order, *reversed(order)):
-            samples[name].append(time_operation(operations[name], iterations))
+    samples = measure_operations(
+        operations, warmup=warmup, iterations=iterations, trials=trials
+    )
 
     with torch.no_grad():
         expected = operations["torch"]().float()
