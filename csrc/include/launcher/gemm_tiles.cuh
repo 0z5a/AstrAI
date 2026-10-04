@@ -81,7 +81,7 @@ struct TmaLauncher {
  * cannot reclaim the ring routes to the narrow CTA (same math, lower
  * reuse). Narrow and small pass through. (A second substitution — the big
  * CTA downgraded to a predicated-loop twin on crosswise staging — measured
- * 9-19% SLOWER in interleaved A/B, 2026-09-16; see policy.cuh's
+ * 9-19% SLOWER in interleaved A/B, 2026-09-16; see policy/manifest.cuh's
  * GemmTileConfig note. Buried.)
  */
 template <typename ElemA,
@@ -97,7 +97,7 @@ struct CpAsyncLauncher {
     template <typename Tile> bool run() const {
         /*
          * Warp widening + reclaim chain, both unconditional (identity when
-         * the tile fits); the rule lives in policy.cuh's warp_widened_t.
+         * the tile fits); the rule lives in policy/manifest.cuh's warp_widened_t.
          */
         using Widened = warp_widened_t<ElemA, ElemB, Tile>;
         using TileT = reclaim_fallback_t<Widened, ElemA, ElemB, OutT>;

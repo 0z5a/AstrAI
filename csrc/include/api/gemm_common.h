@@ -26,7 +26,7 @@ struct ColMajor {};
 
 /*
  * Tile-geometry Shape: the shared static-shape vocabulary imported so the
- * Shape<M, N, K> CTA recipes keep their spelling (policy.cuh).
+ * Shape<M, N, K> CTA recipes keep their spelling (policy/manifest.cuh).
  */
 using astrai::Shape;
 

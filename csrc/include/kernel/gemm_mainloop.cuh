@@ -53,7 +53,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
     static_assert(!kUseTma || (!Smem::kDirectA && !Smem::kDirectB),
                   "TMA staging is congruous-only");
     /*
-     * The mma runs on the promoted MmaT (policy.cuh); a lone int8/fp8 side
+     * The mma runs on the promoted MmaT (policy/traits.cuh); a lone int8/fp8 side
      * expands in-register between smem read and mma (kDequant* marks the
      * insert, dequant.cuh). AccT rides the mma cell: fp32, int32 for s8.
      */

@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <utility>
 
+#include <launcher/plan_types.h>
 #include <kernel/gemm.cuh>
 #include <utils/device.cuh>
 #include <utils/launch.cuh>
@@ -16,7 +17,7 @@ namespace gemm {
 
 /*
  * Launchers — pure CUDA, usable from the binding and the C tests. The
- * runtime knobs live in GemmConfig (policy.cuh), owned at runtime by
+ * runtime knobs live in GemmConfig (launcher/plan_types.h), owned at runtime by
  * astrai.extension.plan.
  */
 
@@ -65,7 +66,7 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block, cudaStream_t stream
 }
 
 /*
- * Dtype-class derivation (returns policy.cuh's GemmPerfClass): the mma
+ * Dtype-class derivation (returns plan_types.h's GemmPerfClass): the mma
  * promotion rule plus operand widths (mixed bf16xfp8 lands with W8A16 —
  * same bytes, same promoted bf16 k16 mma). int8 is tested FIRST: it
  * promotes to an int8 mma, so the "not bf16 -> fp8" arm would swallow it

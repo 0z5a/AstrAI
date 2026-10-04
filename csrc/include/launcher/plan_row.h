@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdint>
 
+#include <launcher/plan_types.h>
 #include <policy.cuh>
 #include <utils/device.cuh>
 
@@ -26,7 +27,7 @@ static constexpr int kRowFieldsWavePermille = 14;
 
 /*
  * Upper bound of the perf_class field, mirroring GemmPerfClass's last
- * enumerator (kF8A8, policy.cuh — where the enum now lives).
+ * enumerator (kF8A8, launcher/plan_types.h — where the enum lives).
  */
 static constexpr int kMaxPerfClass = 3;
 
@@ -85,7 +86,7 @@ inline constexpr void plan_row_geometry(TileClass cta, int& bm, int& bn) {
 }
 
 /*
- * Everything a plan decision is priced against is PlanQuery — now policy.cuh
+ * Everything a plan decision is priced against is PlanQuery — in launcher/plan_types.h
  * (the kernel-side vocabulary), so this header compiles against types the
  * launchers already see.
  */

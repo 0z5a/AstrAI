@@ -14,7 +14,10 @@ split CUTLASS-style into one layered directory:
 | `kernel/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `fp8_cvt_traits<Fp8T>` convert + `quant_in_traits<InT>` unpack (primary templates undefined — one specialization per dtype/format) — no torch |
 | `datatype/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `api/gemm_common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes — the smem ring budgets; the MMA K extent rides `MmaShapeFor<MmaT>`), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
-| `policy.cuh` | dtype-generic `GemmTraits<ElemA, ElemB, CtaShape, WarpShape, Stages>` (tile geometry via the promoted MmaT) + `GemmTileConfig` (CUTLASS-style tile recipe: CTA/warp `Shape` types + stages) + smem budget (`GemmSmem`) + `GemmPolicy` (dtypes × layouts × one tile config — the kernel's single template parameter) + the `TileClass` dispatch key, the class→CTA-geometry table `kTileClassCta` (static_assert'd against the tiles' CTA shapes) and the `TileManifest` / `TileManifestByte` / `TileManifestCross` ladders the launch ladders index — the congruous and byte ladders compose the crosswise one through `tuple_cat_t`, so their shared tile prefix is structural rather than a copy |
+| `policy/traits.cuh` | Promoted MMA traits and shared-memory ring budget (`GemmTraits`, `GemmSmem`) |
+| `policy/manifest.cuh` | Named tile recipes, CTA classes, and staging-specific manifests |
+| `policy.cuh` | `GemmPolicy`: the kernel's composed dtype, layout, tile, staging, and output policy |
+| `launcher/plan_types.h` | Runtime config, planner query, recipe, and dispatch decision shared by launch and planning code |
 | `memory/load_async.cuh` / `load_crosswise.cuh` / `load_crosswise_packed.cuh` | Operand staging by access pattern: cp.async (congruous and 16-bit transposed) with `PrefetchCarry`; direct 8-bit crosswise LDG+PRMT with `CrosswiseCarry`; packed k-pair crosswise with `PairPackCarry` |
 | `scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `kernel/gemm_mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
@@ -274,7 +277,7 @@ recipe bundling shapes + stage depth + loop mode. `Shape` itself is the
 shared vocabulary type of `utils/shape.cuh`: the same `Shape<...>` spells
 both the CTA tile here and the staging layouts' chunk grids, so tile
 geometry and smem layout read in one notation. The production manifest in
-`policy.cuh` — the named `Tile_*` recipes; read the list there, not here,
+`policy/manifest.cuh` — the named `Tile_*` recipes; read the list there, not here,
 because copied enumerations rot — is the `TileManifest` type list the
 launch ladders dispatch over (CUTLASS builder-table style: `dispatch_tile`
 in `gemm.cuh` indexes the manifest by the plan's `TileClass` and depth bit,

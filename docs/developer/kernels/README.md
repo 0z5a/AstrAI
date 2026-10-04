@@ -305,7 +305,10 @@ csrc/
 ├── CMakeLists.txt                    # CMake build: the KERNEL_MODULES registry (module name | its source TUs) + torch/pybind11 linking
 ├── __init__.py                       # build-time marker only (keeps `csrc` a setuptools package)
 ├── include/                          # THE include root: every header, angle-bracket root-qualified (<kernel/gemm.cuh>)
-│   ├── policy.cuh                    #   cross-cutting: tile vocabulary + smem budget + GemmPolicy/manifests AND the runtime planning vocabulary (GemmRecipe/PlanQuery/GemmPerfClass/PlanDecision, GemmConfig + the three launch-side knobs)
+│   ├── policy.cuh                    #   composed GemmPolicy consumed by the kernel
+│   ├── policy/                      #   compile-time GEMM tile rules
+│   │   ├── traits.cuh              #     promoted MMA traits and shared-memory budget
+│   │   └── manifest.cuh            #     named tile recipes, CTA classes and staging ladders
 │   ├── scheduler.cuh                 #   cross-cutting: grouped/plain raster mapping
 │   ├── kernel/                       # entry __global__ and their composition (humming's rule: what the code IS, not which family owns it)
 │   │   ├── gemm.cuh                  #     GEMM cp.async and TMA device kernels
@@ -351,7 +354,8 @@ csrc/
 │       ├── gemm_launch.cuh         #     typed CUDA launch, TMA setup and planner query
 │       ├── gemm_tiles.cuh          #     manifest selection and TMA/cp.async policy resolution
 │       ├── gemm_dispatch.cuh       #     layout rewrite, typed entry and planner probe
-│       ├── planning.h                #     planner chain + recipe vocabulary; plan_dispatch defined non-inline — SINGLE-INCLUSION
+│       ├── plan_types.h              #     runtime config, query and dispatch decision
+│       ├── planning.h                #     planner chain; plan_dispatch defined non-inline — SINGLE-INCLUSION
 │       ├── plan_row.h                #     TableRow vocabulary and row matching
 │       ├── plan_table_parse.h        #     row-file and runtime-text parsing
 │       ├── plan_table_builtin.h      #     generated measured rows and degraded fallback rows

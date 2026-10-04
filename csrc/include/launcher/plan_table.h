@@ -114,7 +114,7 @@ inline void gemm_config_seed_once() {
 
 /*
  * Resolved views (unset falls to the default, never to a later env read);
- * the three launch-side knobs' resolved views are policy.cuh's.
+ * the three launch-side knobs' resolved views are plan_types.h's.
  */
 inline int gemm_planner_mode() {
     gemm_config_seed_once();

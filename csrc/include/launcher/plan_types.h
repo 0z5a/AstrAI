@@ -1,0 +1,116 @@
+#pragma once
+/* GEMM runtime config, planner query, and dispatch decision. */
+#include <atomic>
+#include <cstdint>
+
+#include <utils/device.cuh>
+
+namespace astrai {
+namespace gemm {
+
+/*
+ * Runtime planning vocabulary. Keeping it here means the per-dtype kernel
+ * TUs reference the planner through declarations only while the launch
+ * side sees the same types the planner decides on. The model and row sources
+ * remain in the host planning implementation.
+ */
+
+/*
+ * Launch-side runtime config (ops.gemm set_* / the configure binding), one
+ * tri-state atomic per switch: -1 = unset (the one-time env seed in
+ * plan_table.h decides), anything else is explicit and wins. Here rather
+ * than plan_table.h so the knobs below are defined where their callers
+ * compile.
+ */
+struct GemmConfig {
+    std::atomic<int> planner{-1};      // 0 table-only, 1 hybrid (table -> model), 2 model-only
+    std::atomic<int> log{-1};          // [gemm-plan] stderr log on/off
+    std::atomic<int> tma_disabled{-1}; // cp.async staging forced everywhere
+    std::atomic<int> mx_disabled{-1};  // sm_120a block-scale cell knocked out
+    std::atomic<int> table_off{-1};    // 1 = "-" (no override, no injected, no builtin rows)
+};
+
+inline GemmConfig& gemm_config() {
+    static GemmConfig cfg;
+    return cfg;
+}
+
+void gemm_config_seed_once(); // plan_table.h (env seed)
+
+// Dtype-class ids the plan-table rows key on.
+enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
+
+/*
+ * One launchable tile configuration, runtime form; every consumer names
+ * tiles through this.
+ */
+struct GemmRecipe {
+    int cta;     // TileClass ordinal — the row-file serialization key
+    int stages;  // ring depth
+    int kk;      // k-tile depth (the kK twins are separate recipes)
+    int bm, bn;  // CTA geometry
+    int wm, wn;  // warp tiling (the recipe name's W<x>x<y>)
+    int threads; // the manifest entry's warp tiling (first match wins)
+    int smem;    // ring bytes at this staging pair's operand widths
+};
+
+/*
+ * Everything a plan decision is priced against, assembled once per launch
+ * by plan_query.
+ */
+struct PlanQuery {
+    int64_t m = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    int64_t batch = 1;
+    int perf_class = -1; // GemmPerfClass id; -1 matches any
+    int crosswise = 0;   // direct-load operand count, see gemm_dispatch
+    int ba = 2;          // operand element bytes
+    int bb = 2;
+    int out_elem_bytes = 2; // output element bytes the model cost's output
+                            /*
+                             * term prices; 2 = the bf16 fused-linear
+                             * default (plan_query's OutT parameter — an
+                             * fp32-out caller is priced at 4, not 2)
+                             */
+    bool tma = true;        // the staging this launch will take (plan_query fills
+                            /*
+                             * it from launch_plan_impl's predicate): the planner
+                             * prices residency per variant — the sign flips with
+                             * staging (TMA shares bandwidth, cp.async's software
+                             * ring IS the latency hiding)
+                             */
+    DeviceFacts dev{};
+};
+
+/*
+ * One dispatch decision; source is the deciding planner's own name (the
+ * log line and the probe dict report it verbatim).
+ */
+struct PlanDecision {
+    GemmRecipe recipe;
+    int raster;
+    const char* source;
+};
+
+/*
+ * The knobs are inline (kernel TUs must not reach plan_table.h);
+ * plan_dispatch is planning.h's non-inline single-inclusion entry.
+ */
+PlanDecision plan_dispatch(const PlanQuery& q);
+inline bool gemm_plan_log_enabled() {
+    gemm_config_seed_once();
+    return gemm_config().log.load(std::memory_order_relaxed) > 0;
+}
+inline bool gemm_tma_staging_disabled() {
+    gemm_config_seed_once();
+    return gemm_config().tma_disabled.load(std::memory_order_relaxed) > 0;
+}
+inline bool gemm_mx_cell_disabled() {
+    gemm_config_seed_once();
+    return gemm_config().mx_disabled.load(std::memory_order_relaxed) > 0;
+}
+
+
+} // namespace gemm
+} // namespace astrai

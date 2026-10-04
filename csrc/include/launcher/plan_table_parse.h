@@ -14,7 +14,7 @@ namespace gemm {
  *   m_min m_max n_min n_max perf_class crosswise cta stages raster
  *   [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
  * '#' starts a comment; perf_class 0..3 or -1; crosswise 0..2 or -1; cta is the
- * TileClass ordinal (the policy.cuh enum order); stages 2..5 parse, but no
+ * TileClass ordinal (the policy/manifest.cuh enum order); stages 2..5 parse, but no
  * ladder instantiates a tile past s3 — plan_from_row rejects a deeper ring
  * outright, so a stale sweep row naming s4/s5 falls to the next source. The
  * trailing 'k' defaults to kTableRowK, which is what the sweep

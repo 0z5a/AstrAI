@@ -3,7 +3,7 @@
  * The host planning half of the GEMM dispatch: the planner chain, the
  * recipe vocabulary it decides on, and the runtime knobs (config state and
  * row tables) it reads. Kept in gemm.cu so the per-dtype kernel TUs
- * reference the planner through policy.cuh declarations without compiling
+ * reference the planner through plan_types.h declarations without compiling
  * its row sources or model implementation for every dtype pair.
  *
  * SINGLE-INCLUSION: plan_dispatch is defined NON-inline here, so exactly ONE
@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <launcher/plan_table.h>
+#include <launcher/plan_types.h>
 #include <policy.cuh>
 
 namespace astrai {
