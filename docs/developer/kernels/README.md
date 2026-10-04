@@ -343,9 +343,12 @@ csrc/
 │   │   ├── gemm_common.h             #     layout tags, gemm_elem_traits, gemm_mma_traits, GemmParams POD
 │   │   ├── attention_common.h        #     AttentionParams POD (cross-layer: stage headers include it)
 │   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
-│   └── launcher/                     # THE DISPATCH MACHINERY — the planner chain and the row table behind the api/ surface; both are deliberate impl-headers (they are why this directory still exists)
-│       ├── planning.h                #     the planner chain + recipe vocabulary + plan_raster; plan_dispatch defined non-inline — SINGLE-INCLUSION (one TU per binary: gemm.cu or a standalone harness)
-│       └── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded sources + GemmConfig seed
+│   └── launcher/                     # GEMM host dispatch machinery behind the api/ surface
+│       ├── planning.h                #     planner chain + recipe vocabulary; plan_dispatch defined non-inline — SINGLE-INCLUSION
+│       ├── plan_row.h                #     TableRow vocabulary and row matching
+│       ├── plan_table_parse.h        #     row-file and runtime-text parsing
+│       ├── plan_table_builtin.h      #     generated measured rows and degraded fallback rows
+│       └── plan_table.h              #     RowSource state, config seed and public include for the table pieces
 ├── attention/                        # family translation units + one bindings.cu (→ module attention; kernels/launchers/dispatch in the shared kernel/ headers)
 │   ├── entry.h                       #   attention torch→POD marshalling (pack_*_params, split-partial allocation) — TU-local impl header, quoted-include (fp8_state.h shape)
 │   ├── decode.cu                     #   → module attn_decode
@@ -410,10 +413,10 @@ whose every includer sits in one family directory lives beside them
 an implementation shared across modules becomes a .cu listed in each
 module's CMake sources (`quantize/entry.cu`, compiled into both the
 quantize and gemm modules), with only its declaration in `api/`.
-`launcher/` is therefore the dispatch machinery alone — the two deliberate
-impl-headers (`planning.h`, `plan_table.h`: the single-inclusion planner
-and the row table; splitting them would put `plan_table.h` back through
-nvcc per dtype pair) that the `api/` declarations sit in front of. A family
+`launcher/` owns GEMM host dispatch. `planning.h` is the single-inclusion
+planner (one TU per binary); `plan_table.h` keeps the mutable table state and
+includes the row matcher, parser, and builtin data headers. The dtype-pair
+instantiation units include neither planner nor table headers. A family
 gains a directory when it gains a second file; single-file families
 (`rotary_emb.cu`) stay at the top level.
 

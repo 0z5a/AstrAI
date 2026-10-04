@@ -14,7 +14,7 @@ standalone scripts had.
 
 Row tables are served at runtime through ``kernel.gemm.set_table`` (no
 rebuild, no environment variable); an emitted row file can also be pasted
-into csrc/include/launcher/plan_table.h's GENERATED block, which does require a
+into csrc/include/launcher/plan_table_builtin.h's GENERATED block, which does require a
 rebuild. The special ``model`` candidate measures every row tier off (the
 degraded rows) — the reference of the min-gain mode.
 """
@@ -679,7 +679,7 @@ def _winner(
     default="rows",
     show_default=True,
     help="rows: the row-file syntax; cpp: TileClass initializers, "
-    "grouped per class, ready to paste into plan_table.h's GENERATED block.",
+    "grouped per class, ready to paste into plan_table_builtin.h's GENERATED block.",
 )
 @click.option("--warmup", type=click.IntRange(min=1), default=10, show_default=True)
 @click.option("--iterations", type=click.IntRange(min=1), default=50, show_default=True)
