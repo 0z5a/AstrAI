@@ -1,19 +1,6 @@
-"""Dynamic discovery and loading of compiled CUDA kernel modules.
+"""Discover and lazily load compiled modules from extension.
 
-Each kernel is built by the CMake build in ``csrc/CMakeLists.txt`` into a
-``.so`` placed in ``astrai/extension/lib/`` — the module name equals the
-``.so`` name equals the pybind name (e.g. ``attn_decode``, defined via
-``TORCH_EXTENSION_NAME``). ``KERNEL_NAMES`` is discovered automatically from
-the ``.so`` files present, so adding a kernel to the CMake ``KERNELS``
-registry needs no change here.
-
-Loading is **lazy and centralized**: module names are discovered eagerly
-(cheap glob), but each ``.so`` is imported on first use via the single
-``get_module`` accessor, then cached. The wrapper modules (``kernel/*.py``) never
-touch the internals or keep their own caches — they call ``get_module(name)``
-(or ``is_available(name)`` when a torch fallback is acceptable). A kernel that
-failed to build (or is running on a CPU-only machine) is ``None`` in the cache,
-so ``is_available`` returns ``False`` and ``get_module`` raises a clear error.
+Each module is imported once; successful loads invalidate dispatch records.
 """
 
 import glob
@@ -24,15 +11,15 @@ from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
-_LIB_DIR = os.path.join(os.path.dirname(__file__), "lib")
+_LIB_DIR = os.path.dirname(os.path.dirname(__file__))
 
 
 def _discover_kernel_names() -> List[str]:
     """Return the module names of the compiled kernel ``.so`` files in lib/."""
     names: List[str] = []
-    for path in glob.glob(os.path.join(_LIB_DIR, "*.so")):
+    for path in glob.glob(os.path.join(_LIB_DIR, "_C_*.so")):
         # strip the "<soabi>.so" suffix, e.g. attn_decode.cpython-312-...so
-        names.append(os.path.basename(path).split(".", 1)[0])
+        names.append(os.path.basename(path).split(".", 1)[0].removeprefix("_C_"))
     return sorted(names)
 
 
@@ -54,10 +41,10 @@ def _try_load(name: str) -> object:
     if name not in _modules:
         try:
             _modules[name] = importlib.import_module(
-                f".lib.{name}", package=__package__
+                f"._C_{name}", package="astrai.extension"
             )
             _available[name] = True
-            from astrai.extension import dispatch
+            from astrai.extension.runtime import dispatch
 
             dispatch.invalidate()
         except ImportError:

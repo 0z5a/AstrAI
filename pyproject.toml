@@ -36,15 +36,19 @@ flash = ["flash-attn>=2.6"]
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["astrai*"]
 
 [tool.setuptools.package-data]
-"astrai.extension.lib" = ["*.so"]
+"astrai.extension" = ["_C_*.so"]
 
 [tool.setuptools.dynamic]
 version = { attr = "astrai.__version__" }
 
 [tool.ruff]
 target-version = "py312"
+
+[tool.ruff.lint.isort]
+known-first-party = ["astrai"]
 
 [tool.ruff.format]
 quote-style = "double"

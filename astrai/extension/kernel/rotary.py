@@ -10,7 +10,7 @@ Layout: x is packed [tokens, n_heads, head_dim] or dense
 
 import torch
 
-from astrai.extension.loader import get_module
+from astrai.extension.runtime.loader import get_module
 
 
 def rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:

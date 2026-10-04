@@ -9,8 +9,8 @@ import torch
 from torch import Tensor
 from torch.autograd.function import once_differentiable
 
-from astrai.extension.loader import get_module
-from astrai.extension.loader import is_available as _available
+from astrai.extension.runtime.loader import get_module
+from astrai.extension.runtime.loader import is_available as _available
 
 
 def is_available() -> bool:

@@ -367,7 +367,7 @@ The FP8 path uses the same ownership rule: `fp8_slots.py` owns stable
 module-to-slot identities, and `autocast.py` owns region policy and
 `aten::linear` routing.
 
-**Runtime plan surface** (`astrai.extension.plan`, re-exported from
+**Runtime plan surface** (`astrai.extension.policy.gemm.plan`, re-exported from
 `astrai.extension`):
 
 ```python

@@ -11,7 +11,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 
-from astrai.extension.loader import get_module
+from astrai.extension.runtime.loader import get_module
 
 logger = logging.getLogger(__name__)
 
@@ -601,7 +601,7 @@ def enable(
     tuner = GemmAutotuner(max_shapes, trigger, cache_dir)
     if not tuner.start(time_budget_s):
         return False
-    from astrai.extension.plan import set_autotuner
+    from astrai.extension.policy.gemm.plan import set_autotuner
 
     set_autotuner(tuner)
     return True

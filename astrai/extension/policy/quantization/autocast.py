@@ -1,36 +1,7 @@
-"""FP8 autocast: everything the region-scoped fp8 dispatch needs.
+"""FP8 autocast region, linear routing, and checkpoint state bridge.
 
-Region management: ``fp8_autocast`` — the torch.autocast-style context
-(reentrant, nestable, thread-local via a ``contextvars`` ContextVar) —
-plus the ``FP8Recipe`` knobs, the ``fp8_linear_enable`` out-of-region
-global switch, the lazy ``aten::linear`` CUDA/AutogradCUDA override that
-routes bf16 linears through ``gemm.fp8_linear``, and the checkpoint
-bridge (``fp8_state_dict`` / ``fp8_load_state_dict`` / ``fp8_reset``) to
-the C++ delayed-scaling rings.
-
-Slot addressing lives in ``fp8_slots.py``. The routed linear consults it
-on every call and the region repairs it on entry. The public slot names
-remain available from this module.
-
-The layering against the rest of the extension mirrors ``kernel/gemm``
-vs ``plan``: stateless kernel adapters one layer down, policy and
-dispatch here. ``quantize.py`` keeps the int8 inference strategies and
-re-exports this module's public names so existing import sites keep
-working.
-
-Usage::
-
-    from astrai.extension.autocast import fp8_autocast
-    with fp8_autocast(enabled=True, fp8_format="hybrid"):
-        logits = model(input_ids)
-    loss.backward()  # fp8 backward runs anywhere; fwd captured state on the node
-
-The context mirrors ``torch.autocast``: the active
-``(enabled, recipe, fp8_format)`` triple is thread-local, the fp8 path
-targets *training* (x/g quantized fresh every call, the weight cast reused
-until the weight's version counter moves), and the ``aten::linear``
-override installs **lazily** on the first activation — importing this
-module never touches the dispatcher. The region and kernel routing details follow below.
+The region is thread-local and installs the aten::linear override lazily.
+Stable module identities live in fp8_slots; compiled bindings remain in kernel.
 """
 
 import functools
@@ -41,7 +12,7 @@ from dataclasses import dataclass
 import torch
 from torch.library import Library
 
-from astrai.extension.fp8_slots import (
+from astrai.extension.policy.quantization.fp8_slots import (
     Fp8Slot,
     SlotTable,
     assign_slots,
@@ -51,7 +22,7 @@ from astrai.extension.fp8_slots import (
     slot_table,
     sync_slots,
 )
-from astrai.extension.loader import get_module, is_available
+from astrai.extension.runtime.loader import get_module, is_available
 
 __all__ = [
     "FP8Recipe",

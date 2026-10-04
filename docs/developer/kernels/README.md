@@ -70,7 +70,7 @@ CSRC_KERNELS=true pip install -e . --no-build-isolation
 
 # Rebuild after editing .cu/.cuh files
 CSRC_KERNELS=true python setup.py build_ext --inplace
-# Output: astrai/extension/lib/*.so
+# Output: astrai/extension/_C_*.so
 
 # Or invoke CMake directly (ASTRAI_CUDA_ARCH is required here too —
 # without an arch token this configures fine and builds nothing)
@@ -123,7 +123,7 @@ NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
 driver decompresses at module load, so the executed code is unchanged and the
 `.so` is ~4x smaller (measured per gemm TU: 8.03 MB -> 1.89 MB).
 
-Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 module (one `.so` per kernel, named `<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all registered kernel targets in parallel via `cmake --build -j N`. The target list is the **single source of truth**: the `KERNEL_MODULES` registry in `csrc/CMakeLists.txt`, one entry per module as `name|srcs...` (a module may span several TUs — gemm is split into per-dtype-pair instantiation units so the heavy template work parallelizes). Entries append conditionally: the five attention/rotary modules always, `quantize` and `gemm` only when the arch list reaches sm_89+, and nothing at all when `ASTRAI_CUDA_ARCH` is unset. `astrai/extension/loader.py` auto-discovers the compiled `.so` files, so adding a kernel means one registry entry and nothing else.
+Each kernel in `astrai/extension` is compiled as an independent pybind11 module (one `.so` per kernel, named `_C_<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all registered kernel targets in parallel via `cmake --build -j N`. The target list is the **single source of truth**: the `KERNEL_MODULES` registry in `csrc/CMakeLists.txt`, one entry per module as `name|srcs...` (a module may span several TUs — gemm is split into per-dtype-pair instantiation units so the heavy template work parallelizes). Entries append conditionally: the five attention/rotary modules always, `quantize` and `gemm` only when the arch list reaches sm_89+, and nothing at all when `ASTRAI_CUDA_ARCH` is unset. `astrai/extension/runtime/loader.py` auto-discovers the compiled `.so` files, so adding a kernel means one registry entry and nothing else.
 
 ## Python Extension Architecture
 
@@ -132,21 +132,34 @@ policy:
 
 ```text
 astrai/extension/
-├── __init__.py             # Stable public API
-├── loader.py               # Optional compiled-module discovery and loading
-├── dispatch.py             # The shared operator dispatcher (resolve/explain/set_op)
-├── plan.py                 # The GEMM plan: config / configure / override / probe / facts /
-│                           #   tiles + the runtime autotuner (policy, not marshalling)
-├── quantize.py             # FP8/int8 strategy layer (fp8_autocast, recipes, quantizers)
-├── kernel/                 # Stateless kernel wrappers — one adapter per compiled module
-│   ├── attention.py        # Stateless attention kernel wrappers
-│   ├── quantize.py         # Stateless FP8 primitive wrappers
-│   ├── gemm.py             # quant_gemm + the flat plan views (set_*/state/probe, raw shapes)
-│   └── rotary.py           # Stateless rotary kernel wrapper
-└── backend/
-    ├── attention.py        # Backend selection, KV cache I/O, and fallback
-    └── rotary.py           # Per-call CUDA/torch rotary dispatch
+├── __init__.py             # Public API and legacy module aliases
+├── runtime/                # Registry/dispatch and lazy module loading
+│   ├── dispatch.py
+│   └── loader.py
+├── backend/                # Operator strategy and fallback policy
+│   ├── attention/          # Registry plus CUDA, FlashAttention, torch backends
+│   └── rotary.py
+├── kernel/                 # Stateless compiled bindings and INT8 primitives
+│   ├── attention.py
+│   ├── cross_entropy.py
+│   ├── gdn.py
+│   ├── gemm.py
+│   ├── quantize.py
+│   └── rotary.py
+├── policy/                 # Operator-specific execution policy
+│   ├── gemm/               # Plan configuration and runtime autotuning
+│   │   ├── plan.py
+│   │   └── autotune.py
+│   └── quantization/       # FP8 region policy and stable module slots
+│       ├── autocast.py
+│       └── fp8_slots.py
+└── lib/                    # Compiled .so modules
 ```
+
+`gemm` is an operator family; `quantization` is policy shared by operators.
+Both live under `policy/` because these modules own configuration and state.
+`backend/` owns concrete execution strategies, while `kernel/` calls exact
+bindings. Legacy module paths remain aliases of the grouped modules.
 
 The dependency direction is one-way:
 
@@ -204,6 +217,16 @@ capability dispatch must use the public `attention(...)` entry point instead.
   policy layer chooses the fused op for supported inference calls and otherwise
   uses the autograd-compatible torch implementation.
 
+An operator family supplies call axes and a safe fallback. External packages
+can add implementations with `register_impl(ImplRecord(...))`; attention
+backends use `@AttentionBackendFactory.register("name")`. Each record declares
+`priority`, `modes` (`train`/`infer`), `available`, and a per-call capability.
+The family supplies `mode` in its axes. Explicit and `with op_backend(...)`
+selections raise when incapable; `ASTR_OPS` and `set_op(...)` fall through to
+the next capable implementation. Inference-only implementations cannot run
+on a training call, including when selected explicitly. Call
+`unregister_impl(family, name)` when unloading an external operator.
+
 Normal model and inference code should import the stable API from
 `astrai.extension`:
 
@@ -229,9 +252,10 @@ When extending this package:
 |--------|----------|
 | Add a pybind call for a compiled kernel | `astrai/extension/kernel/` |
 | Add argument translation required by the compiled ABI | `astrai/extension/kernel/` |
-| Add capability checks or implementation selection | `astrai/extension/backend/` |
-| Add a torch or third-party fallback | `astrai/extension/backend/` |
-| Add attention KV cache behavior | `astrai/extension/backend/attention.py` |
+| Add an implementation to an existing operator family | `register_impl(ImplRecord(...))` |
+| Add a new operator family | `register_family(...)` and its family entry point |
+| Add an attention backend | `astrai/extension/backend/attention/` and `AttentionBackendFactory.register(...)` |
+| Add attention KV cache behavior | `astrai/extension/backend/attention/` |
 | Expose a supported user-facing symbol | `astrai/extension/__init__.py` |
 
 Imports belong at module scope. Optional dependencies such as `flash_attn` may
@@ -397,7 +421,7 @@ csrc/
     └── quant_gemm_test.cu            # GEMM correctness + TFLOPS bench (includes launcher/planning.h: single-TU, torch-free)
 ```
 
-Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
+Compiled `.so` modules are placed directly in `astrai/extension/`.
 
 Three conventions the tree encodes. (1) **Stages, not families**: headers
 live under `csrc/include/<stage>/` by what they do (kernel / memory / mma /
@@ -435,6 +459,6 @@ instantiation units include neither planner nor table headers. A family
 gains a directory when it gains a second file; single-file families
 (`rotary_emb.cu`) stay at the top level.
 
-Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
+Compiled `.so` modules are placed directly in `astrai/extension/`.
 
 > Document Update Time: 2026-09-27

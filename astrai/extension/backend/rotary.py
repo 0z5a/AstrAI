@@ -14,7 +14,8 @@ from typing import Any, Dict, List
 import torch
 from torch import Tensor
 
-from astrai.extension.dispatch import (
+from astrai.extension.kernel.rotary import rotary_emb as _cuda_rotary
+from astrai.extension.runtime.dispatch import (
     ImplRecord,
     Spec,
     axis,
@@ -22,14 +23,9 @@ from astrai.extension.dispatch import (
     resolve,
     tensor_axes,
 )
-from astrai.extension.kernel.rotary import rotary_emb as _cuda_rotary
-from astrai.extension.loader import is_available
+from astrai.extension.runtime.loader import is_available
 
-_SPEC_CUDA = (
-    axis("device_cuda").truthy()
-    & axis("dtype").in_(torch.bfloat16)
-    & axis("grad_enabled").eq(False)
-)
+_SPEC_CUDA = axis("device_cuda").truthy() & axis("dtype").in_(torch.bfloat16)
 
 
 def _torch_apply(x: Tensor, freqs_cis: Tensor) -> Tensor:
@@ -52,6 +48,7 @@ def _rotary_records() -> List[ImplRecord]:
             spec=_SPEC_CUDA,
             available=lambda: is_available("rotary_emb"),
             priority=0,
+            modes=frozenset(("infer",)),
         ),
         ImplRecord(
             family="rotary",
@@ -64,7 +61,7 @@ def _rotary_records() -> List[ImplRecord]:
 
 
 def _axes(x: Tensor, freqs_cis: Tensor) -> Dict[str, Any]:
-    return tensor_axes(x)
+    return tensor_axes(x, mode="train" if torch.is_grad_enabled() else "infer")
 
 
 def _fallback_record() -> ImplRecord:

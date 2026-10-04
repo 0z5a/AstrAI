@@ -1,48 +1,12 @@
-"""CUDA kernel wrappers, operator dispatch, and backend selection.
+"""Public operators, kernel adapters, backend registry, and runtime policy.
 
-Public API:
-    - ``attention``, ``apply_rotary_emb`` — op families with safe torch
-      fallbacks (see ``astrai.extension.backend``)
-    - ``attn_decode`` / ``attn_prefill`` / ``attn_paged_decode`` /
-      ``attn_paged_prefill`` — direct attention kernel wrappers
-    - ``AttentionBackend`` / ``TorchNativeBackend`` / ``CudaBackend`` /
-      ``FlashAttnBackend`` — attention backend strategies
-    - ``resolve`` / ``explain`` / ``op_backend`` / ``set_op`` — the shared
-      operator dispatcher (see ``astrai.extension.dispatch``)
-    - ``fp8_autocast`` / ``FP8Recipe`` / ``fp8_linear_enable`` /
-      ``fp8_state_dict`` — the fp8 autocast region and its checkpoint
-      bridge (see ``astrai.extension.autocast``); stable FP8 module slots
-      live in ``astrai.extension.fp8_slots``; ``quantize_weight_int8`` /
-      ``quantize_act_int8`` below are the stateless int8 inference
-      strategies
-    - ``plan`` — the runtime GEMM plan (`plan.config` / `plan.configure` /
-      ``plan.override`` / ``plan.probe`` / ``plan.facts`` / ``plan.tiles``);
-      the flat ``set_table`` / ``set_planner`` / ``set_log`` / ``set_staging``
-      / ``state`` / ``probe`` / ``facts`` / ``tile_vocabulary`` names are the
-      same bindings in their raw dict/list shapes (see
-      ``astrai.extension.kernel.gemm``); the deprecated ``ASTR_*`` variables are
-      one-time startup seeds
-
-Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
-(blhd). Scale is always ``1/sqrt(head_dim)``. Wrapper functions call their
-compiled CUDA kernels directly; fallback is the backend's responsibility.
-Linear projections and dense-MLP SwiGLU run plain torch (``F.linear`` /
-``Linear`` / ``MLP``); the former bf16_gemm / bf16_swiglu kernels and their
-backends were removed.
+``backend`` selects implementations, ``kernel`` calls exact compiled modules,
+``dispatch`` controls priority and train/infer capability, and ``plan`` owns
+the GEMM configuration facade.
 """
 
-import torch
+import sys as _sys
 
-from astrai.extension.autocast import (
-    FP8Recipe,
-    fp8_autocast,
-    fp8_format_pair,
-    fp8_linear_enable,
-    fp8_linear_enabled,
-    fp8_load_state_dict,
-    fp8_reset,
-    fp8_state_dict,
-)
 from astrai.extension.backend import (
     ATTN_BACKEND,
     AttentionBackend,
@@ -54,23 +18,6 @@ from astrai.extension.backend import (
     attention,
     attn_backend,
     get_backend,
-)
-from astrai.extension.dispatch import (
-    Axes,
-    ExplicitSelectionError,
-    ImplRecord,
-    Resolution,
-    Spec,
-    axis,
-    explain,
-    explain_plan,
-    op_backend,
-    register_env_alias,
-    register_family,
-    resolve,
-    resolve_plan,
-    set_op,
-    tensor_axes,
 )
 from astrai.extension.kernel import (
     TensorLayout,
@@ -91,40 +38,55 @@ from astrai.extension.kernel.gemm import (
     state,
     tile_vocabulary,
 )
-from astrai.extension.loader import KERNEL_NAMES, is_available
-from astrai.extension.plan import PLANNER_MODES
+from astrai.extension.kernel.quantize import (
+    quantize_act_int8,
+    quantize_weight_int8,
+)
+from astrai.extension.policy.gemm import autotune, plan
+from astrai.extension.policy.gemm.plan import PLANNER_MODES
+from astrai.extension.policy.quantization import autocast, fp8_slots
+from astrai.extension.policy.quantization.autocast import (
+    FP8Recipe,
+    fp8_autocast,
+    fp8_format_pair,
+    fp8_linear_enable,
+    fp8_linear_enabled,
+    fp8_load_state_dict,
+    fp8_reset,
+    fp8_state_dict,
+)
+from astrai.extension.runtime import dispatch, loader
+from astrai.extension.runtime.dispatch import (
+    Axes,
+    ExplicitSelectionError,
+    ImplRecord,
+    Resolution,
+    Spec,
+    axis,
+    explain,
+    explain_plan,
+    op_backend,
+    register_env_alias,
+    register_family,
+    register_impl,
+    resolve,
+    resolve_plan,
+    set_op,
+    tensor_axes,
+    unregister_impl,
+)
+from astrai.extension.runtime.loader import KERNEL_NAMES, is_available
 
-# ---------------------------------------------------------------------------
-# INT8: stateless symmetric inference strategies
-# ---------------------------------------------------------------------------
-
-
-def quantize_weight_int8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric per-channel int8 quantization of a linear weight.
-
-    ``w`` is ``[N, K]`` (the nn.Linear convention); returns
-    ``(w8 int8 [N, K] contiguous, scale f32 [N])`` with
-    ``w ≈ w8.float() * scale[:, None]`` and ``scale = amax(N) / 127``.
-    Quantization runs in float32 regardless of the source dtype.
-    """
-    wf = w.detach().to(torch.float32)
-    scale = wf.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
-    q = torch.round(wf / scale.unsqueeze(-1)).clamp_(-127, 127)
-    return q.to(torch.int8).contiguous(), scale.contiguous()
-
-
-def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric per-row dynamic int8 quantization of activations.
-
-    ``x`` is ``[..., K]``; returns ``(q int8 with x's shape, scale f32
-    [prod(leading dims)])`` — upstream of ``quant_gemm``'s per-row a_scale
-    (the scale contract: ``docs/developer/kernels/gemm.md``, "Scales").
-    """
-    xf = x.detach().to(torch.float32)
-    x2 = xf.reshape(-1, xf.shape[-1])
-    scale = x2.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
-    q = torch.round(x2 / scale.unsqueeze(-1)).clamp_(-127, 127)
-    return q.to(torch.int8).reshape(x.shape), scale
+for _name, _module in (
+    ("dispatch", dispatch),
+    ("loader", loader),
+    ("plan", plan),
+    ("autotune", autotune),
+    ("autocast", autocast),
+    ("fp8_slots", fp8_slots),
+):
+    _sys.modules[f"{__name__}.{_name}"] = _module
+del _name, _module, _sys
 
 
 __all__ = [
@@ -169,9 +131,11 @@ __all__ = [
     "op_backend",
     "register_env_alias",
     "register_family",
+    "register_impl",
     "resolve",
     "resolve_plan",
     "tensor_axes",
+    "unregister_impl",
     "PLANNER_MODES",
     "plan",
     "facts",

@@ -37,8 +37,8 @@ import torch
 
 from astrai.extension import is_available, kernel
 from astrai.extension.kernel.gemm import quant_gemm
-from astrai.extension.loader import get_module
-from astrai.extension.plan import Tile, device_signature
+from astrai.extension.policy.gemm.plan import Tile, device_signature
+from astrai.extension.runtime.loader import get_module
 
 
 @click.group(help=__doc__)

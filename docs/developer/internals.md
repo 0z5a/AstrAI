@@ -192,13 +192,13 @@ Three-layer separation (SGLang-inspired):
 
 The extension package separates mechanism from policy:
 
-- `astrai/extension/loader.py` discovers and lazily loads the compiled kernel modules (`.so` name = module name = pybind name).
+- `astrai/extension/runtime/loader.py` discovers and lazily loads the compiled kernel modules (`.so` name = module name = pybind name).
 - `astrai/extension/kernel/` contains stateless adapters — one file per compiled kernel module — that call their kernel directly and fail when it is unavailable.
 - `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O (`dispatch.py` is the family-agnostic selection core it registers into).
 - `astrai/extension/quantize.py` holds every quantization scheme (int8 strategies, fp8 recipes and autocast); its `aten::linear` override installs lazily on the first fp8 activation, so plain imports stay dispatcher-neutral.
 - Model and inference code use the stable `astrai.extension` API instead of selecting ops directly.
 
-Attention computation is decoupled from the model via `AttentionBackend` ABC (`astrai/extension/backend/attention.py`):
+Attention computation is decoupled from the model via `AttentionBackend` ABC (`astrai/extension/backend/attention/`):
 
 - **`CudaBackend`** (default when supported): decode path uses `attn_paged_decode` with `page_size=1` (the `req_to_token` table serves as the page table, each token slot is a single-token "page"); prefill path uses the ragged-batch `attn_paged_prefill` (addresses each request via `qo_indptr` + `kv_indptr` directly against the flat pool).
 - **`FlashAttnBackend`**: optional flash-attn dispatch; inference paths gather flat K/V from the pool via `req_to_token` and call `flash_attn_varlen_func` over the ragged batch (fp16/bf16 only); dense mask-free training calls use `flash_attn_func`.

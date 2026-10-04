@@ -1,18 +1,8 @@
-"""Operator dispatch: one selection mechanism for all op families.
+"""Registry and capability-based selection for operator implementations.
 
-A family registers three things with the core: an ``axes`` extractor whose
-signature mirrors the op call and snapshots whatever decision axes *that
-family* needs, an ordered list of ``ImplRecord`` rows (name, impl object,
-capability ``Spec``, machine-level ``available``), and a fallback record.
-The core defines no axes itself — each ``Spec`` predicates over the axes
-dict produced by the family's own extractor.  Resolution: explicit/context
-selection (strict — raises when incapable) > process selection (soft —
-falls through; ``set_op``, seeded once from the deprecated ``ASTR_OPS`` /
-``ASTR_BACKEND`` variables) > first capable row > family fallback.  The
-rows are the family's decision table, printable via ``explain``.
-
-Records flagged ``faithful=False`` change numerics (e.g. fp8) and are only
-reachable through an explicit selection, never the implicit chain.
+Families provide call axes and a fallback. Implementations may be registered
+later by external packages. Explicit/context selection is strict; process
+selection is soft. Unfaithful implementations require explicit selection.
 """
 
 import contextvars
@@ -21,7 +11,7 @@ import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -29,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 Axes = Mapping[str, Any]
 Call = Tuple[Tuple, Dict[str, Any]]
+_BOTH_MODES = frozenset(("train", "infer"))
 
 
 def _fmt(value: Any) -> str:
@@ -145,6 +136,7 @@ class ImplRecord:
     available: Callable[[], bool] = lambda: True
     priority: int = 100
     faithful: bool = True
+    modes: FrozenSet[str] = _BOTH_MODES
 
 
 @dataclass
@@ -156,6 +148,7 @@ class OpFamily:
 
 
 _FAMILIES: Dict[str, OpFamily] = {}
+_EXTERNAL: Dict[str, Dict[str, ImplRecord]] = {}
 _ENV_ALIASES: Dict[str, str] = {}
 
 # Priority-sorted record lists, cached per family until invalidated: the
@@ -190,6 +183,25 @@ def register_family(
     invalidate(name)
 
 
+def register_impl(record: ImplRecord) -> None:
+    """Add a third-party implementation to an existing family."""
+    fam = _family(record.family)
+    if not record.modes or not record.modes <= _BOTH_MODES:
+        raise ValueError("modes must contain train, infer, or both")
+    if any(row.name == record.name for row in _records(fam)):
+        raise ValueError(
+            f"{record.family} implementation {record.name!r} already exists"
+        )
+    _EXTERNAL.setdefault(record.family, {})[record.name] = record
+    invalidate(record.family)
+
+
+def unregister_impl(family: str, name: str) -> None:
+    """Remove a third-party implementation."""
+    del _EXTERNAL[family][name]
+    invalidate(family)
+
+
 def invalidate(family: Optional[str] = None) -> None:
     """Drop the cached record lists — call when a provider's record set or
     a kernel module's availability changed (family=None drops all)."""
@@ -202,7 +214,10 @@ def invalidate(family: Optional[str] = None) -> None:
 def _records(fam: OpFamily) -> List[ImplRecord]:
     records = _family_records.get(fam.name)
     if records is None:
-        records = sorted(fam.provider(), key=lambda r: r.priority)
+        records = sorted(
+            [*fam.provider(), *_EXTERNAL.get(fam.name, {}).values()],
+            key=lambda r: r.priority,
+        )
         _family_records[fam.name] = records
     return records
 
@@ -255,7 +270,8 @@ def op_backend(**handles: Any):
             fam = _FAMILIES.get(family)
             if fam is None:
                 raise ValueError(f"unknown operator family {family!r}")
-            if _record_for_handle(fam, handle, _records(fam)) is None:
+            record = _record_for_handle(fam, handle, _records(fam))
+            if record is None or not record.available():
                 raise ValueError(f"Unknown {family} implementation: {handle!r}")
     tokens = [set_override(f, h) for f, h in handles.items()]
     try:
@@ -355,7 +371,33 @@ def _adhoc_record(family: str, handle: Any, args: Tuple, kwargs: Dict) -> ImplRe
         )
     else:
         spec = Spec.always()
-    return ImplRecord(family, type(handle).__name__, handle, spec)
+    return ImplRecord(
+        family,
+        type(handle).__name__,
+        handle,
+        spec,
+        available=getattr(handle, "available", lambda: True),
+        modes=frozenset(getattr(handle, "modes", _BOTH_MODES)),
+    )
+
+
+def _mode_allowed(record: ImplRecord, mode: Optional[str]) -> bool:
+    return mode in record.modes if mode is not None else record.modes == _BOTH_MODES
+
+
+def _capable(record: ImplRecord, ax: Axes) -> bool:
+    return (
+        _mode_allowed(record, ax.get("mode"))
+        and record.available()
+        and record.spec.matches(ax)
+    )
+
+
+def _fallback(fam: OpFamily, ax: Axes, origin: str) -> Resolution:
+    record = fam.fallback()
+    if not _capable(record, ax):
+        raise RuntimeError(f"No {fam.name} implementation can handle this call")
+    return Resolution(record, origin)
 
 
 def resolve(
@@ -391,7 +433,7 @@ def resolve(
                 raise ValueError(f"Unknown {family} implementation: {handle!r}")
             _warn_once(f"ASTR_OPS: {family}={handle!r} is not registered; ignoring")
         else:
-            if record.available() and record.spec.matches(ax):
+            if _capable(record, ax):
                 return Resolution(record, origin)
             if origin in ("explicit", "context"):
                 raise ExplicitSelectionError(
@@ -400,12 +442,12 @@ def resolve(
                 )
 
     if handle is None and env_overrides().get("profile") == "reference":
-        return Resolution(fam.fallback(), "profile")
+        return _fallback(fam, ax, "profile")
 
     for record in records:
-        if record.available() and record.faithful and record.spec.matches(ax):
+        if record.faithful and _capable(record, ax):
             return Resolution(record, "chain")
-    return Resolution(fam.fallback(), "fallback")
+    return _fallback(fam, ax, "fallback")
 
 
 def resolve_plan(calls: Mapping[str, Call]) -> Dict[str, Resolution]:
@@ -417,7 +459,7 @@ def resolve_plan(calls: Mapping[str, Call]) -> Dict[str, Resolution]:
 
 
 def _describe_axes(ax: Axes) -> str:
-    return " ".join(f"{key}={ax[key]}" for key in sorted(ax))
+    return " ".join(f"{key}={ax[key]}" for key in sorted(ax) if not key.startswith("_"))
 
 
 def explain(
@@ -429,7 +471,9 @@ def explain(
     records = _records(fam)
     lines = [f"[{family}] {_describe_axes(ax)}"]
     for record in records:
-        if not record.available():
+        if not _mode_allowed(record, ax.get("mode")):
+            lines.append(f"  {record.name}: SKIP mode {ax.get('mode')}")
+        elif not record.available():
             lines.append(f"  {record.name}: SKIP unavailable")
         elif not record.faithful:
             lines.append(f"  {record.name}: SKIP not faithful (explicit-only)")
@@ -440,7 +484,7 @@ def explain(
     try:
         resolution = resolve(family, *args, explicit=explicit, **kwargs)
         lines.append(f"  => {resolution.record.name} (origin={resolution.origin})")
-    except (ExplicitSelectionError, ValueError) as exc:
+    except (ExplicitSelectionError, ValueError, RuntimeError) as exc:
         lines.append(f"  => ERROR: {exc}")
     return "\n".join(lines)
 
@@ -472,9 +516,11 @@ __all__ = [
     "op_backend",
     "register_env_alias",
     "register_family",
+    "register_impl",
     "reset_override",
     "resolve",
     "resolve_plan",
     "set_override",
     "tensor_axes",
+    "unregister_impl",
 ]

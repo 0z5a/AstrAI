@@ -24,6 +24,23 @@ attn_mod = importlib.import_module("astrai.extension.backend.attention")
 rotary_mod = importlib.import_module("astrai.extension.backend.rotary")
 
 
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("dispatch", "runtime.dispatch"),
+        ("loader", "runtime.loader"),
+        ("plan", "policy.gemm.plan"),
+        ("autotune", "policy.gemm.autotune"),
+        ("autocast", "policy.quantization.autocast"),
+        ("fp8_slots", "policy.quantization.fp8_slots"),
+    ],
+)
+def test_legacy_module_path_aliases(old, new):
+    assert importlib.import_module(
+        f"astrai.extension.{old}"
+    ) is importlib.import_module(f"astrai.extension.{new}")
+
+
 @pytest.fixture
 def toy_family():
     """A toy family: alpha (restricted), beta, and an unfaithful fast row."""
@@ -89,6 +106,44 @@ def test_unfaithful_rows_are_chain_invisible(toy_family):
     assert resolution.record.obj == "beta-obj"
     with op_backend(toy="fp8"):
         assert resolve("toy", dtype=torch.float32).record.obj == "fp8-obj"
+
+
+def test_external_impl_respects_mode_and_context(toy_family):
+    record = ImplRecord(
+        "toy",
+        "external",
+        "external-obj",
+        Spec.always(),
+        priority=-1,
+        modes=frozenset(("infer",)),
+    )
+    dispatch.register_impl(record)
+    try:
+        assert resolve("toy", mode="infer").record.obj == "external-obj"
+        assert resolve("toy", mode="train").record.obj == "beta-obj"
+        with op_backend(toy="external"):
+            with pytest.raises(ExplicitSelectionError):
+                resolve("toy", mode="train")
+        with pytest.raises(ValueError, match="already exists"):
+            dispatch.register_impl(record)
+    finally:
+        dispatch.unregister_impl("toy", "external")
+
+
+def test_unavailable_external_impl_stays_registered(toy_family):
+    record = ImplRecord(
+        "toy", "offline", "offline-obj", Spec.always(), available=lambda: False
+    )
+    dispatch.register_impl(record)
+    try:
+        assert resolve("toy", dtype=torch.float32).record.name == "beta"
+        with pytest.raises(ValueError, match="Unknown toy implementation"):
+            with op_backend(toy="offline"):
+                pass
+        with pytest.raises(ValueError, match="already exists"):
+            dispatch.register_impl(record)
+    finally:
+        dispatch.unregister_impl("toy", "offline")
 
 
 def test_explicit_selection_is_strict(toy_family):
@@ -232,14 +287,59 @@ def test_attention_specs_mirror_supports_call(
     ax = attn_mod._axes(q, cache, mask, False, fwd)
 
     cuda = attn_mod._instance(attn_mod.CudaBackend)
-    assert attn_mod._SPEC_CUDA.matches(ax) == cuda.supports_call(
+    assert attn_mod.CudaBackend.supports_axes(ax) == cuda.supports_call(
         q, cache, mask, False, fwd
     )
 
     flash = attn_mod._instance(attn_mod.FlashAttnBackend)
-    assert attn_mod._SPEC_FLASH.matches(ax) == flash.supports_call(
+    assert attn_mod.FlashAttnBackend.supports_axes(ax) == flash.supports_call(
         q, cache, mask, False, fwd
     )
+
+
+def test_external_attention_backend_registration_and_mode():
+    class ExternalBackend(attn_mod.AttentionBackend):
+        priority = -1
+        modes = frozenset(("infer",))
+
+        @classmethod
+        def available(cls):
+            return True
+
+        def supports_call(self, q, kv_cache, attn_mask, is_causal, fwd):
+            return True
+
+        def forward(
+            self, q, k, v, kv_cache, layer_id, attn_mask=None, is_causal=False, fwd=None
+        ):
+            return q
+
+    attn_mod.AttentionBackendFactory.register("external_test")(ExternalBackend)
+    q = torch.zeros(1, 2, 4, 8)
+    try:
+        assert (
+            resolve("attention", q, None, None, True, "prefill").record.name
+            == "external_test"
+        )
+        with attn_mod.attn_backend("external_test"):
+            assert torch.equal(attn_mod.attention(q, q, q, fwd="prefill"), q)
+        assert (
+            resolve("attention", q, None, None, True, None).record.name
+            == "torch_native"
+        )
+        with op_backend(attention="external_test"):
+            with pytest.raises(ExplicitSelectionError):
+                resolve("attention", q, None, None, True, None)
+        dispatch.set_op("attention", "external_test")
+        assert (
+            resolve("attention", q, None, None, True, None).record.name
+            == "torch_native"
+        )
+    finally:
+        dispatch.set_op("attention", None)
+        attn_mod.AttentionBackendFactory._entries.pop("external_test")
+        attn_mod._priority_backends.cache_clear()
+        dispatch.invalidate("attention")
 
 
 def test_attention_resolution_matches_legacy_semantics():

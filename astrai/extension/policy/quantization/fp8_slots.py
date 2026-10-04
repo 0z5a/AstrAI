@@ -1,4 +1,8 @@
-"""Stable module-path identities for FP8 linear state."""
+"""Stable module-path identities for FP8 linear state.
+
+Module paths survive weight replacement and wrapper prefixes, keeping C++
+delayed-scaling history and checkpoint state bound to the right layer.
+"""
 
 import weakref
 from dataclasses import dataclass
@@ -6,44 +10,7 @@ from typing import Dict, Iterator, List, Optional
 
 import torch
 
-from astrai.extension.loader import get_module, is_available
-
-# ===========================================================================
-# Slot addressing (module identity for the per-weight C++ state)
-# ===========================================================================
-# The original module docstring, kept for the detail it carries:
-
-"""
-Slot addressing for the fp8 per-module state.
-
-The C++ op (``csrc/gemm/fp8_linear.cu``) keeps per-weight state —
-three delayed-scaling rings, the version-keyed weight-cast cache — in a
-process-wide registry. Its *original* key is the weight's
-``(data_ptr, shape, dtype)``, discovered lazily on first use, and its
-checkpoint snapshot binds entries to modules by ``(shape, dtype)`` in
-registration order. Both are address-based: two same-shaped linears are told
-apart only by the order they happened to run, and a replaced weight (TP
-sharding, FSDP, a graph-capture buffer) is a different address, so its history
-is silently thrown away.
-
-This module gives every fp8-capable module a *name* instead. It walks
-``named_modules()`` once and assigns each ``Linear`` a ``Fp8Slot``: a stable
-module path (``layers.3.attention.q_proj``) that survives weight replacement,
-plus the parsed role (``module_type``/``tensor_type``) that per-role policy
-will need. The path — not the compact ``slot_id`` — is the identity the
-snapshot binds on, so a model whose construction order changes cannot
-cross-wire state between layers.
-
-Attaching is done from the outside, the same way TP shards modules
-(``astrai/parallel/tp.py``): modules get a ``_fp8_slot`` attribute, and
-``astrai/model/**`` is not touched. The mapping from a weight tensor to its
-slot lands in ``by_weight``, keyed by ``id(weight)`` with a strong reference
-held alongside — the identity trick the C++ ``ActivationCast`` anchor uses,
-for the same reason: a recycled address must not fake a hit.
-
-Nothing here allocates device state or talks to the extension: it is a pure
-name table, so it is safe to import (and to test) without CUDA.
-"""
+from astrai.extension.runtime.loader import get_module, is_available
 
 # Module path prefixes that wrappers add. ``torch.compile`` prefixes
 # ``_orig_mod.`` (see ``astrai/parallel/executor.py``); DDP wraps in

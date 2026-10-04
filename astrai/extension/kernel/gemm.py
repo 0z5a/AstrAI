@@ -6,8 +6,8 @@ One adapter per compiled module: this file covers the ``gemm`` module's
 the planner's bindings in their raw wire shapes (the four ``csrc/bench`` tools
 parse those keys, so those spellings are contract). The plan's records, the
 ``plan`` facade and the runtime autotuner are policy and live next door in
-``astrai.extension.plan``; the fp8/int8 quantization policy in
-``astrai.extension.autocast``. The mma consumes bf16 fragments (or the native
+``astrai.extension.policy.gemm.plan``; the fp8/int8 quantization policy in
+``astrai.extension.policy.quantization.autocast``. The mma consumes bf16 fragments (or the native
 fp8 mma for symmetric fp8 pairs); int8 and fp8 operands dequantize in-register
 between the smem read and the mma — never a separate F2F pass — and
 per-operand scales fold multiplicatively into the epilogue.
@@ -26,8 +26,8 @@ from typing import Optional
 
 import torch
 
-from astrai.extension.loader import get_module
-from astrai.extension.plan import PLANNER_MODES, Rows, note_launch
+from astrai.extension.policy.gemm.plan import PLANNER_MODES, Rows, note_launch
+from astrai.extension.runtime.loader import get_module
 
 
 def quant_gemm(

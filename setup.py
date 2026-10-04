@@ -10,9 +10,9 @@ from setuptools import setup
 from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools.command.editable_wheel import editable_wheel as _editable_wheel
+from setuptools.dist import Distribution as _Distribution
 
 sys.path.insert(0, str(Path(__file__).parent))
-os.makedirs("astrai/extension/lib", exist_ok=True)
 
 
 def _should_build():
@@ -143,15 +143,17 @@ class _CMakeBuildExt(_build_ext):
         # After compilation finishes, verify mandatory CUDA kernels to confirm build succeeded.
         # CMake may report partial‑target success even if some architecture‑specific kernels are skipped.
         # Prevent editable install from reporting success when critical kernel shared objects are missing.
-        lib_dir = src / "astrai" / "extension" / "lib"
+        lib_dir = src / "astrai" / "extension"
         required = (
-            "attn_decode",
-            "attn_prefill",
-            "attn_paged_decode",
-            "attn_paged_prefill",
-            "rotary_emb",
+            ("attention", "rotary_emb", "cross_entropy", "gated_deltanet")
+            if arch
+            else ()
         )
-        missing = [name for name in required if not any(lib_dir.glob(f"{name}.*.so"))]
+        if max_arch is not None and max_arch >= 89:
+            required += ("quantize", "gemm")
+        missing = [
+            name for name in required if not any(lib_dir.glob(f"_C_{name}.*.so"))
+        ]
         if missing:
             raise RuntimeError(
                 "CUDA build completed without some required kernel modules!"
@@ -223,6 +225,13 @@ def _torch_cuda_version():
         return None
 
 
+class _BinaryDistribution(_Distribution):
+    def has_ext_modules(self):
+        return _should_build() or any(
+            Path(__file__).parent.glob("astrai/extension/_C_*.so")
+        )
+
+
 class _NullBuildExt(_build_ext):
     def build_extensions(self):
         pass
@@ -257,6 +266,7 @@ cmdclass["build"] = _Build
 cmdclass["editable_wheel"] = _EditableWheel
 
 setup(
+    distclass=_BinaryDistribution,
     ext_modules=[],
     cmdclass=cmdclass,
 )

@@ -18,15 +18,14 @@ validates and dispatches on it. ``amax`` is the delayed-scaling fold's
 raw-domain amax of the round, or ``None`` with no ``ring_state``.
 
 FP8 policy — scales, amax history, delayed scaling, the autocast region —
-lives in ``astrai.extension.autocast``; the INT8 inference strategies are
-defined in the ``astrai.extension`` package root. This module is stateless.
+lives in ``astrai.extension.policy.quantization.autocast``; the INT8 inference primitives below are stateless torch operations.
 """
 
 from typing import Optional, Tuple
 
 import torch
 
-from astrai.extension.loader import get_module
+from astrai.extension.runtime.loader import get_module
 
 
 def quantize(
@@ -120,4 +119,38 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
-__all__ = ["quantize", "quantize_dual", "K_FOLD_SLOTS"]
+def quantize_weight_int8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-channel int8 quantization of a linear weight.
+
+    ``w`` is ``[N, K]`` (the nn.Linear convention); returns
+    ``(w8 int8 [N, K] contiguous, scale f32 [N])`` with
+    ``w ≈ w8.float() * scale[:, None]`` and ``scale = amax(N) / 127``.
+    Quantization runs in float32 regardless of the source dtype.
+    """
+    wf = w.detach().to(torch.float32)
+    scale = wf.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
+    q = torch.round(wf / scale.unsqueeze(-1)).clamp_(-127, 127)
+    return q.to(torch.int8).contiguous(), scale.contiguous()
+
+
+def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-row dynamic int8 quantization of activations.
+
+    ``x`` is ``[..., K]``; returns ``(q int8 with x's shape, scale f32
+    [prod(leading dims)])`` — upstream of ``quant_gemm``'s per-row a_scale
+    (the scale contract: ``docs/developer/kernels/gemm.md``, "Scales").
+    """
+    xf = x.detach().to(torch.float32)
+    x2 = xf.reshape(-1, xf.shape[-1])
+    scale = x2.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
+    q = torch.round(x2 / scale.unsqueeze(-1)).clamp_(-127, 127)
+    return q.to(torch.int8).reshape(x.shape), scale
+
+
+__all__ = [
+    "quantize",
+    "quantize_dual",
+    "quantize_weight_int8",
+    "quantize_act_int8",
+    "K_FOLD_SLOTS",
+]

@@ -18,8 +18,8 @@ import argparse
 
 import torch
 
-from astrai.extension.autocast import fp8_autocast
 from astrai.extension.kernel.quantize import quantize, quantize_dual
+from astrai.extension.policy.quantization.autocast import fp8_autocast
 
 # astrai_1b pretrain projections: x is the m=16384 activation against
 # hidden=1536; g is the backward gradient against qkv's 6144 outputs.

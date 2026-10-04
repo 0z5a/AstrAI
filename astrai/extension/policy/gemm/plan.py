@@ -1,19 +1,7 @@
-"""The GEMM plan: one value, one writer, one scope — plus the runtime autotuner.
+"""GEMM plan configuration, probe, and launch hook.
 
-This is the gemm family's policy layer (the C++ config state calls itself
-"the backing of astrai.extension.plan"). ``plan.config`` reads the whole
-configuration as a value, ``plan.configure`` writes a patch and returns the
-new value, ``plan.override`` scopes a patch for an A/B (restoring knobs *and*
-rows, exception or not), and ``plan.probe`` / ``plan.facts`` / ``plan.tiles``
-read the planner's own answers. Records answer to both idioms — attribute
-access and the old ``d["key"]`` / ``row[3]`` / tuple unpacking.
-
-The raw-dict views of the same bindings stay in
-``astrai.extension.kernel.gemm`` (``set_table`` / ``set_planner`` / ``set_log`` /
-``set_staging`` / ``state`` / ``probe`` / ``facts`` / ``tile_vocabulary``):
-the four ``csrc/bench`` tools parse those shapes, so those spellings are
-contract. The per-launch hook remains here; the runtime autotuner implementation
-lives in ``astrai.extension.autotune``.
+The runtime autotuner lives in autotune.py; kernel/gemm.py exposes the raw
+binding shapes used by benchmark tools.
 """
 
 import os
@@ -24,7 +12,7 @@ from typing import Iterator, List, Optional, Tuple, Union
 
 import torch
 
-from astrai.extension.loader import get_module
+from astrai.extension.runtime.loader import get_module
 
 # The autotune hook: the adapter calls note_launch on every launch, so the
 # off path costs one flag check. Nothing is installed unless the deprecated
@@ -329,7 +317,7 @@ def __getattr__(name: str):  # PEP 562: the two read-only values of the surface
 
 # The tuning implementation owns candidate measurement and row persistence.
 # These names remain on the plan surface for existing callers.
-from astrai.extension.autotune import (  # noqa: E402
+from astrai.extension.policy.gemm.autotune import (  # noqa: E402
     GemmAutotuner,
     Problem,
     Row,

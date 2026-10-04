@@ -109,7 +109,7 @@ set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
 # (one explicit gemm_dispatch instantiation each), so the heavy template work
 # parallelizes). The '|' separator keeps the entry a single list element —
 # CMake lists cannot nest semicolons. `loader.py` auto-discovers the .so files
-# in astrai/extension/lib/, so this CMake registry is the single place to
+# in astrai/extension/, so this CMake registry is the single place to
 # register a new kernel.
 #
 # FP8 MMA instructions require sm_89+. Keep the target out of the build
@@ -166,7 +166,7 @@ foreach(entry IN LISTS KERNEL_MODULES)
     list(TRANSFORM _srcs PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
     add_library(${name} MODULE ${_srcs})
 
-    target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
+    target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=_C_${name})
 
     # GEMM/quantize instantiate FP8 MMA cells (kMinArch=sm_89), so filter
     # their arch lists to requested 8.9+ targets. Other kernels support
@@ -202,8 +202,9 @@ foreach(entry IN LISTS KERNEL_MODULES)
 
     set_target_properties(${name} PROPERTIES
         PREFIX ""
+        OUTPUT_NAME "_C_${name}"
         SUFFIX ".${PY_SOABI}.so"
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../astrai/extension/lib")
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../astrai/extension")
 
     # The arch-specific pass is what activates the fp8 block_scale cell
     # (MxMmaOp's family key), so listing the plain token on a consumer-

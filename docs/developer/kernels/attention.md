@@ -1,11 +1,11 @@
 # Attention
 
 > Kernel modules `csrc/attention/` (module list in the [family overview](README.md#overview)); 
-> python adapters in `astrai/extension/kernel/attention.py`, dispatch policy in `astrai/extension/backend/attention.py`.
+> python adapters in `astrai/extension/kernel/attention.py`, dispatch policy in `astrai/extension/backend/attention/`.
 
 ## Attention Backend
 
-`astrai/extension/backend/attention.py` provides the backend abstraction:
+`astrai/extension/backend/attention/` provides the backend abstraction:
 
 - **`AttentionBackend`** (ABC): single abstract `forward`; each subclass branches on `fwd` ("decode" / "prefill" / None) internally, `_check_fwd` guards unknown modes
 - **`CudaBackend`**: CUDA kernel dispatch — decode via `attn_paged_decode` (page_size=1), prefill via `attn_paged_prefill` (ragged batch, `qo_indptr` + `kv_indptr`). Default on GPU.

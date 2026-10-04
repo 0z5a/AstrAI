@@ -14,7 +14,7 @@ from typing import Optional
 
 import torch
 
-from astrai.extension.loader import get_module
+from astrai.extension.runtime.loader import get_module
 
 
 def gdn_fwd(
