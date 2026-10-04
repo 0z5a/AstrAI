@@ -132,7 +132,7 @@ using WarpGeoms = std::tuple<Geom<16, 16>,
                              Geom<128, 64>>;
 
 /*
- * The load bus rule, one spelling with load.cuh's loader: a side's chunks
+ * The load bus rule, one spelling with load_async.cuh's loader: a side's chunks
  * either divide the threads (each thread one aligned power-of-two run) or
  * under-subscribe the bus (each participating thread one chunk, the
  * surplus skips). A side that can do neither has no schedule.
@@ -168,7 +168,7 @@ constexpr bool tile_ok() {
      */
     constexpr int kWarps = kThreads / 32;
     /*
-     * load.cuh's line/run split needs a thread's 16B run inside ONE staged
+     * load_async.cuh's line/run split needs a thread's 16B run inside ONE staged
      * line (kCpt <= kChunks); fully subscribed that is "the staged extent
      * <= threads". The static_assert pair there missed it until 2026-09-16:
      * the violators (64x64x32 with a 64x64 warp, 128x256x32 with W64x128 or

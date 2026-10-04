@@ -172,7 +172,7 @@ using Tile_64x64x64_W16x32_S3 = GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>,
  * resolvers substitute it for the 8-warp entries (small_16w_t below); the
  * ladder keeps naming the 8-warp tile, and a 1-byte operand's thinner load
  * bus no longer blocks the substitution — the surplus threads take the
- * predicated skip (load.cuh) and the dequant fragments each lane owes
+ * predicated skip (load_async.cuh) and the dequant fragments each lane owes
  * halve with the 16-wide N partition.
  */
 template <typename Tile>

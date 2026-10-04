@@ -313,7 +313,9 @@ csrc/
 │   │   ├── attention_split_q.cuh     #     prefill kernel (split-Q, PackGQA head folding: h = idx % G over the global packed row index)
 │   │   └── quantize.cuh              #     quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
 │   ├── memory/                       # data movement with stage semantics
-│   │   ├── load.cuh                  #     gemm operand loaders (typed staged tiles, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
+│   │   ├── load_async.cuh            #     cp.async operand staging + PrefetchCarry (congruous and 16-bit transposed)
+│   │   ├── load_crosswise.cuh        #     direct 8-bit crosswise staging + CrosswiseCarry
+│   │   ├── load_crosswise_packed.cuh #     packed k-pair crosswise staging + PairPackCarry
 │   │   ├── pipeline.cuh              #     raw cp.async 16B emitters + mbarrier PTX sites + PipelineSync stage pipeline
 │   │   ├── tma.cuh                   #     TMA staging (sm_90+): device cp.async.bulk.tensor emitters + host tensor-map encoding + exact-match cache
 │   │   └── layout_policies.cuh       #     attention KV addressing: DenseQSchedule/PackedQSchedule, ContigKV/PagedKV

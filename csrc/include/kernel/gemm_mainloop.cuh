@@ -9,7 +9,9 @@
 #include <type_traits>
 
 #include <datatype/dequant.cuh>
-#include <memory/load.cuh>
+#include <memory/load_async.cuh>
+#include <memory/load_crosswise.cuh>
+#include <memory/load_crosswise_packed.cuh>
 #include <memory/pipeline.cuh>
 #include <memory/tma.cuh>
 #include <mma/mma.cuh>
@@ -208,7 +210,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
     /*
      * Interior-copy verdict, uniform per CTA: whole-CTA, 16B-aligned, K
      * without tail — the mainloop runs the predication-free specialized copy
-     * (load.cuh's kInterior arm). Measured interleaved 2026-09-16: the
+     * (load_async.cuh's kInterior arm). Measured interleaved 2026-09-16: the
      * specialized copy wins everywhere it applies (an earlier sm_89-era
      * 128x128 regression claim is obsolete — that tile axis is removed).
      */

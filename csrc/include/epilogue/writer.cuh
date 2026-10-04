@@ -3,7 +3,7 @@
  * Collective epilogue: fused bias, the bf16 scatter of the fp32
  * accumulators through the reclaimed operand shared memory, and the
  * coalesced copy-out. The staging swizzle is one instance of the unified
- * family (utils/swizzle.cuh) shared with the operand staging in load.cuh.
+ * family (utils/swizzle.cuh) shared with the operand staging in load_async.cuh.
  */
 
 #include <policy.cuh>
