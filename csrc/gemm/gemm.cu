@@ -24,7 +24,7 @@
 
 #include "entry.h"
 #include <api/gemm.h>
-#include <kernel/gemm.cuh>
+#include <launcher/gemm_dispatch.cuh>
 #include <launcher/planning.h>
 
 using namespace astrai;

@@ -306,7 +306,7 @@ csrc/
 │   ├── policy.cuh                    #   cross-cutting: tile vocabulary + smem budget + GemmPolicy/manifests AND the runtime planning vocabulary (GemmRecipe/PlanQuery/GemmPerfClass/PlanDecision, GemmConfig + the three launch-side knobs)
 │   ├── scheduler.cuh                 #   cross-cutting: grouped/plain raster mapping
 │   ├── kernel/                       # entry __global__ and their composition (humming's rule: what the code IS, not which family owns it)
-│   │   ├── gemm.cuh                  #     GEMM orchestrator + launch machinery (no torch; reaches the planner through policy.cuh declarations)
+│   │   ├── gemm.cuh                  #     GEMM cp.async and TMA device kernels
 │   │   ├── gemm_mainloop.cuh         #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
 │   │   ├── attention_launch.cuh      #     pure-CUDA launch vocabulary: launchers + tile-config maps + dispatch_decode/prefill(_paged) funnels, split-K math
 │   │   ├── attention_split_kv.cuh    #     decode kernel (split-KV FlashDecoding, GQA head packing) + split-combine
@@ -346,6 +346,9 @@ csrc/
 │   │   ├── attention_common.h        #     AttentionParams POD (cross-layer: stage headers include it)
 │   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
 │   └── launcher/                     # GEMM host dispatch machinery behind the api/ surface
+│       ├── gemm_launch.cuh         #     typed CUDA launch, TMA setup and planner query
+│       ├── gemm_tiles.cuh          #     manifest selection and TMA/cp.async policy resolution
+│       ├── gemm_dispatch.cuh       #     layout rewrite, typed entry and planner probe
 │       ├── planning.h                #     planner chain + recipe vocabulary; plan_dispatch defined non-inline — SINGLE-INCLUSION
 │       ├── plan_row.h                #     TableRow vocabulary and row matching
 │       ├── plan_table_parse.h        #     row-file and runtime-text parsing

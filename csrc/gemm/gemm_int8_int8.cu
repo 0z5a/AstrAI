@@ -4,7 +4,7 @@
  * the heavy template work in parallel nvcc jobs; gemm.cu addresses the
  * specialization through its extern template declarations.
  */
-#include <kernel/gemm.cuh>
+#include <launcher/gemm_dispatch.cuh>
 
 namespace astrai {
 namespace gemm {

@@ -19,7 +19,7 @@ nvcc -I csrc/include -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
 #include <type_traits>
 #include <vector>
 
-#include <kernel/gemm.cuh>
+#include <launcher/gemm_dispatch.cuh>
 #include <launcher/planning.h>
 #include <utils/define.cuh>
 #include <utils/launch.cuh>

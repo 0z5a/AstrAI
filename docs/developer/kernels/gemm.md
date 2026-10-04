@@ -19,7 +19,10 @@ split CUTLASS-style into one layered directory:
 | `scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `kernel/gemm_mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `epilogue/writer.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
-| `kernel/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_raster` over `DeviceFacts`) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
+| `kernel/gemm.cuh` | Device entry kernels for cp.async and TMA staging; they compose the mainloop and epilogue |
+| `launcher/gemm_launch.cuh` | Typed CUDA launch, TMA descriptor setup, and the `GemmParams` to `PlanQuery` conversion |
+| `launcher/gemm_tiles.cuh` | Manifest tile selection, output-reclaim fallback, and TMA/cp.async policy resolution |
+| `launcher/gemm_dispatch.cuh` | Layout canonicalization and tag routing shared by `gemm_dispatch` and `plan_probe_for`; the include used by dtype-pair instantiation units |
 | `launcher/plan_row.h` / `plan_table_parse.h` / `plan_table_builtin.h` | Row vocabulary and matching; row-file and runtime-text parsing; measured device-specific rows and the degraded fallback ladder, respectively |
 | `launcher/plan_table.h` | `RowSource` containers and runtime config seed; includes the row, parser, and builtin headers for existing callers. The planners (`RowSetPlanner`, `ModelPlanner`) live in `launcher/planning.h` |
 | `launcher/planning.h` | The planner chain: `RowSetPlanner` (rows from one `RowSource`), `ModelPlanner` (the cost-ranked analytical planner), the rank-ordered chain assembly and the crosswise-ladder / raster L2-budget rules. Single-inclusion impl header (one TU per binary) |

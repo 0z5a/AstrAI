@@ -57,7 +57,7 @@ that computes the wrong thing is not a win.
 #include <type_traits>
 #include <vector>
 
-#include <kernel/gemm.cuh>
+#include <launcher/gemm_dispatch.cuh>
 #include <launcher/planning.h>
 #include <utils/device.cuh>
 
