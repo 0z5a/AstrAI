@@ -38,8 +38,9 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 One entry the table does not spell out: `gemm/` also carries the **fp8
 training** linear — `fp8_linear.cu` (the composed forward *and* backward in
-one C++ `autograd::Function`) with its state machine `gemm/fp8_state.h` (rings,
-weight cast cache, checkpoint snapshot). Its Python entry is the strategy
+one C++ `autograd::Function`) with scale rings in `gemm/fp8_ring.h`,
+cast caches in `gemm/fp8_cache.h`, and registry/checkpoint state in
+`gemm/fp8_state.h`. Its Python entry is the strategy
 layer `astrai/extension/quantize.py` (`fp8_autocast`, recipe/format policy),
 and it ships inside the `gemm` module so the dispatch state — plan table,
 planner mode, staging switches — has exactly one owner.
@@ -365,7 +366,9 @@ csrc/
 │   ├── entry.h                       #   quant_gemm's op-entry ladder (dtype classify → device gate → scale contract → layout/shape validation → GemmParams pack → dispatch) + the empty-problem guard — TU-local impl header, quoted-include, included at the bottom of gemm.cu (the lookups it calls live there)
 │   ├── bindings.cu                   #   pybind surface: marshalling, dict shapes, PYBIND11_MODULE
 │   ├── fp8_linear.cu                 #   the fp8 training linear (fwd+bwd) as one C++ autograd::Function
-│   ├── fp8_state.h                   #   the fp8 training state machine (delayed-scaling rings, cast caches, meta registry) — a TU-local split of fp8_linear.cu, quoted-include
+│   ├── fp8_ring.h                    #   scale recipe and delayed-scaling ring
+│   ├── fp8_cache.h                   #   versioned weight cast and bounded activation cache
+│   ├── fp8_state.h                   #   process-wide meta registry, slots and checkpoint restore (TU-local implementation)
 │   └── gemm_bf16_* / gemm_*.cu       #   per-pair explicit gemm_dispatch instantiation units (one nvcc job each; plan_table-free)
 ├── quantize/                         # family translation units (→ module quantize; entry.cu also compiled into gemm to share the chain)
 │   ├── bindings.cu                   #   pybind surface only (quantize / quantize_dual)
