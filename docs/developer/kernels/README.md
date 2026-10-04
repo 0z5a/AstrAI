@@ -39,8 +39,9 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 One entry the table does not spell out: `gemm/` also carries the **fp8
 training** linear — `fp8_linear.cu` (the composed forward *and* backward in
 one C++ `autograd::Function`) with scale rings in `gemm/fp8_ring.h`,
-cast caches in `gemm/fp8_cache.h`, and registry/checkpoint state in
-`gemm/fp8_state.h`. Its Python entry is the strategy
+cast caches in `gemm/fp8_cache.h`, and registry definitions in
+`gemm/fp8_state.h`. `gemm/fp8_runtime.cu` owns the single process state,
+checkpoint interface, and Python registration. Its Python entry is the strategy
 layer `astrai/extension/quantize.py` (`fp8_autocast`, recipe/format policy),
 and it ships inside the `gemm` module so the dispatch state — plan table,
 planner mode, staging switches — has exactly one owner.
@@ -361,14 +362,16 @@ csrc/
 │   ├── prefill.cu                    #   → module attn_prefill
 │   ├── paged_decode.cu               #   → module attn_paged_decode
 │   └── paged_prefill.cu              #   → module attn_paged_prefill
-├── gemm/                             # family translation units only (→ module gemm)
+├── gemm/                             # family translation units and private headers (→ module gemm)
 │   ├── gemm.cu                       #   typed host layer: dtype-pair registry + its two lookups + the planner's C++ face + the ONE planning.h includer
 │   ├── entry.h                       #   quant_gemm's op-entry ladder (dtype classify → device gate → scale contract → layout/shape validation → GemmParams pack → dispatch) + the empty-problem guard — TU-local impl header, quoted-include, included at the bottom of gemm.cu (the lookups it calls live there)
-│   ├── bindings.cu                   #   pybind surface: marshalling, dict shapes, PYBIND11_MODULE
-│   ├── fp8_linear.cu                 #   the fp8 training linear (fwd+bwd) as one C++ autograd::Function
+│   ├── bindings.cu                   #   quant_gemm/planner pybind surface, PYBIND11_MODULE and FP8 registration
+│   ├── fp8_linear.cu                 #   fp8 training forward/backward as one C++ autograd::Function
+│   ├── fp8_linear.h                  #   internal declaration boundary shared with fp8_runtime.cu
+│   ├── fp8_runtime.cu                 #   one State instance, checkpoint/debug interface and pybind registration
 │   ├── fp8_ring.h                    #   scale recipe and delayed-scaling ring
 │   ├── fp8_cache.h                   #   versioned weight cast and bounded activation cache
-│   ├── fp8_state.h                   #   process-wide meta registry, slots and checkpoint restore (TU-local implementation)
+│   ├── fp8_state.h                   #   meta registry, slots and restore helpers used by both FP8 translation units
 │   └── gemm_bf16_* / gemm_*.cu       #   per-pair explicit gemm_dispatch instantiation units (one nvcc job each; plan_table-free)
 ├── quantize/                         # family translation units (→ module quantize; entry.cu also compiled into gemm to share the chain)
 │   ├── bindings.cu                   #   pybind surface only (quantize / quantize_dual)

@@ -137,6 +137,7 @@ if(ASTRAI_CUDA_ARCH_LIST)
             "gemm|gemm/gemm.cu
                   gemm/bindings.cu
                   gemm/fp8_linear.cu
+                  gemm/fp8_runtime.cu
                   gemm/gemm_bf16_bf16.cu
                   gemm/gemm_bf16_int8.cu
                   gemm/gemm_int8_int8.cu

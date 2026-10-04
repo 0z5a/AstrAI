@@ -57,10 +57,7 @@ struct State {
     std::atomic<int64_t> n_cast_miss{0};
 };
 
-inline State& state() {
-    static State s;
-    return s;
-}
+State& state();
 
 inline std::string meta_key(const Tensor& w) {
     std::string key = std::to_string(reinterpret_cast<uintptr_t>(w.data_ptr()));
