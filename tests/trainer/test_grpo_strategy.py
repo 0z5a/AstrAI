@@ -1,7 +1,6 @@
 import pytest
 import torch
 
-import astrai.trainer.strategy as strategy_module
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.strategy import GRPOStrategy
 from tests.helpers import FakeExecutor, make_frozen, make_model
@@ -150,7 +149,9 @@ def test_grpo_dapo_clip_higher_changes_positive_advantage_bound(
                 "router_stats": None,
             }
 
-        monkeypatch.setattr(strategy_module, "get_logprobs", fake_get_logprobs)
+        monkeypatch.setattr(
+            "astrai.trainer.strategy.ops.get_logprobs", fake_get_logprobs
+        )
         metrics = strategy.compute_loss_output(batch)["metrics"]
         return metrics["policy_loss"], metrics
 

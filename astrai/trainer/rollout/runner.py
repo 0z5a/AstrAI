@@ -1,0 +1,256 @@
+"""Score, cache, and evaluate online training rollouts."""
+
+from typing import Callable, Dict, Optional, Tuple
+
+import torch
+from torch import Tensor
+
+from astrai.trainer.rollout.generator import RolloutGenerator
+from astrai.trainer.rollout.types import (
+    BaseRewardModel,
+    RawRollout,
+    RolloutResult,
+    RolloutVersionError,
+    SamplingParams,
+    T,
+)
+
+
+class RolloutRunner:
+    """Produces :class:`RolloutResult` from a prompt batch.
+
+    Composes a :class:`RolloutGenerator` (generation + decoding) with a
+    :class:`BaseRewardModel` (scoring).  Maintains an internal cache so
+    the same batch prompt can be replayed for multiple gradient steps.
+    A new rollout is triggered every ``rollout_interval`` calls to
+    :meth:`step` (or after :meth:`clear_cache`).
+
+    The ``__call__`` contract returns a ``(RolloutResult, is_fresh)``
+    tuple — callers must use the boolean to detect a refreshed rollout
+    rather than relying on object identity.
+
+    Usage::
+
+        generator = RolloutGenerator(scheduler, tokenizer, SamplingParams(...))
+        runner = RolloutRunner(generator, reward_model, rollout_interval=512)
+        result, is_fresh = runner(prompt_batch)
+        if is_fresh:
+            ...  # e.g. sync behaviour policy
+    """
+
+    def __init__(
+        self,
+        generator: RolloutGenerator,
+        reward_model: BaseRewardModel,
+        rollout_interval: int = 512,
+        max_policy_lag: Optional[int] = None,
+    ):
+        if rollout_interval <= 0:
+            raise ValueError("rollout_interval must be positive")
+        if max_policy_lag is not None and max_policy_lag < 0:
+            raise ValueError("max_policy_lag must be non-negative or None")
+        self.generator = generator
+        self.reward_model = reward_model
+        self.rollout_interval = rollout_interval
+        self.max_policy_lag = (
+            rollout_interval - 1 if max_policy_lag is None else max_policy_lag
+        )
+
+        self._cache: Optional[RolloutResult] = None
+        self._cache_key = None
+        self._steps_since_rollout: int = 0
+
+    @property
+    def policy_version(self) -> int:
+        return self.generator.policy_version
+
+    def update_weights(self, policy_version: int) -> int:
+        """Publish the shared policy's new version to the rollout backend."""
+        return self.generator.update_weights(policy_version)
+
+    def apply_weight_update(
+        self, policy_version: Optional[int], update: Callable[[int], T]
+    ) -> T:
+        """Apply a model update and publish its version as one operation."""
+        return self.generator.apply_weight_update(policy_version, update)
+
+    def step(self):
+        """Advance the internal counter (call once per optimizer step)."""
+        self._steps_since_rollout += 1
+
+    def clear_cache(self):
+        """Force next call to re-run rollout."""
+        self._cache = None
+        self._cache_key = None
+
+    @staticmethod
+    def _batch_key(batch: Dict):
+        """Build a stable key for the prompt fields accepted by the generator."""
+
+        def freeze(value):
+            if isinstance(value, dict):
+                return tuple(sorted((key, freeze(val)) for key, val in value.items()))
+            if isinstance(value, (list, tuple)):
+                return tuple(freeze(item) for item in value)
+            return value
+
+        fields = ("messages", "instruction", "input", "output")
+        return tuple(
+            (field, freeze(batch[field])) for field in fields if field in batch
+        )
+
+    def _score(self, raw: RawRollout) -> RolloutResult:
+        rewards = _score_rewards(self.reward_model, raw)
+        device = raw.prompts.device
+        return RolloutResult(
+            prompts=raw.prompts,
+            prompt_mask=raw.prompt_mask,
+            responses=raw.responses,
+            response_mask=raw.response_mask,
+            rewards=rewards.to(device=device),
+            logprobs_old=raw.logprobs_old,
+            policy_version=raw.policy_version,
+            prompt_texts=raw.prompt_texts,
+            response_texts=raw.response_texts,
+            finish_reasons=raw.finish_reasons,
+        )
+
+    def _validate_policy_version(
+        self, result: RawRollout, *, live_version: Optional[int] = None
+    ) -> None:
+        version = result.policy_version
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise RolloutVersionError(f"rollout has invalid policy version {version!r}")
+        if live_version is None:
+            live_version = self.policy_version
+        if version > live_version:
+            raise RolloutVersionError(
+                f"rollout has future policy version {version}; "
+                f"live policy version is {live_version}"
+            )
+        lag = live_version - version
+        if lag > self.max_policy_lag:
+            raise RolloutVersionError(
+                f"rollout policy lag {lag} exceeds max_policy_lag="
+                f"{self.max_policy_lag} (rollout={version}, live={live_version})"
+            )
+
+    def __call__(self, batch: Dict[str, Tensor]) -> Tuple[RolloutResult, bool]:
+        """Return ``(cached or fresh) RolloutResult`` plus an ``is_fresh`` flag.
+
+        Triggers a new rollout when ``_steps_since_rollout >= rollout_interval``
+        or when the cache is empty. The reuse decision, its version
+        validation, and the returned object are all captured inside one
+        policy snapshot, so a concurrent commit, refresh, or cache clear
+        can never hand out an object the snapshot has already invalidated.
+        """
+        cache_key = self._batch_key(batch)
+
+        def reuse(live_version: int) -> Optional[Tuple[RolloutResult, bool]]:
+            cached = self._cache
+            if (
+                cached is None
+                or self._cache_key != cache_key
+                or self._steps_since_rollout >= self.rollout_interval
+            ):
+                return None
+            self._validate_policy_version(cached, live_version=live_version)
+            return cached, False
+
+        outcome = self.generator.with_policy_snapshot(reuse)
+        if outcome is not None:
+            return outcome
+
+        raw = self.generator.generate(batch)
+        self._validate_policy_version(raw)
+        scored = self._score(raw)
+        # Post-scoring check: reward scoring may call slow external services;
+        # surface an over-lag policy move before the commit critical section.
+        self._validate_policy_version(scored)
+
+        def commit(live_version: int) -> Tuple[RolloutResult, bool]:
+            self._validate_policy_version(scored, live_version=live_version)
+            self._cache = scored
+            self._cache_key = cache_key
+            self._steps_since_rollout = 0
+            return scored, True
+
+        # A weight update cannot land between the final version check and
+        # cache publication. Reward scoring itself intentionally remains
+        # outside the policy lock because it may call an external service.
+        return self.generator.with_policy_snapshot(commit)
+
+    def evaluate(
+        self, batch: Dict, params: Optional[SamplingParams] = None
+    ) -> RolloutResult:
+        """One-off rollout + scoring that leaves the replay cache untouched.
+
+        Used by validation on online strategies: the training cache, its
+        cadence counter, and the cache key stay intact, so evaluation
+        prompts never disturb the rollout replay schedule.  ``params``
+        overrides the generator's training sampling defaults for this
+        call only.
+        """
+        raw = self.generator.generate(batch, params)
+        self._validate_policy_version(raw)
+        scored = self._score(raw)
+        self._validate_policy_version(scored)
+        return scored
+
+
+class RolloutEvaluator:
+    """Validation-time rollout scoring with its own sampling configuration.
+
+    Unlike :meth:`RolloutRunner.evaluate` — a one-off rollout on the
+    *training* runner, still scored as an RL loss — the evaluator owns
+    its :class:`SamplingParams` outright (typically greedy, with a
+    val-specific group size) and reports reward statistics instead.  The
+    RL loss is degenerate as a validation signal under greedy decoding
+    or ``group_size == 1`` (zero group advantage), so it is not computed.
+    """
+
+    def __init__(
+        self,
+        generator: RolloutGenerator,
+        reward_model: BaseRewardModel,
+        params: SamplingParams,
+    ):
+        self.generator = generator
+        self.reward_model = reward_model
+        self.params = params
+
+    def evaluate(self, batch: Dict) -> Dict[str, float]:
+        """Generate + score one batch; return scalar validation metrics."""
+        raw = self.generator.generate(batch, self.params)
+        rewards = _score_rewards(self.reward_model, raw)
+        lengths = raw.response_mask.sum(dim=-1).to(torch.float32)
+        std = rewards.std(unbiased=False).item() if rewards.numel() > 1 else 0.0
+        metrics = {
+            "reward_mean": rewards.mean().item(),
+            "reward_std": std,
+            "reward_max": rewards.max().item(),
+            "response_len_mean": lengths.mean().item(),
+            "num_responses": float(rewards.numel()),
+        }
+        flat_reasons = [reason for group in raw.finish_reasons for reason in group]
+        if flat_reasons:
+            metrics["truncation_rate"] = sum(
+                1 for reason in flat_reasons if reason == "length"
+            ) / len(flat_reasons)
+        return metrics
+
+
+def _score_rewards(reward_model: BaseRewardModel, raw: RawRollout) -> Tensor:
+    """Score a rollout's decoded responses, validating shape and finiteness."""
+    rewards = reward_model.score(raw.prompt_texts, raw.response_texts)
+    if not isinstance(rewards, Tensor):
+        rewards = torch.as_tensor(rewards, dtype=torch.float32)
+    expected_shape = raw.responses.shape[:2]
+    if rewards.shape != expected_shape:
+        raise ValueError(
+            f"Reward model returned shape {tuple(rewards.shape)}, "
+            f"expected {tuple(expected_shape)}"
+        )
+    if not torch.isfinite(rewards).all():
+        raise ValueError("Reward model returned non-finite values")
+    return rewards

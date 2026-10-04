@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-import astrai.trainer.strategy as strategy_module
 from astrai.model.value import ValueModel
 from astrai.trainer.rollout import RolloutResult
 from astrai.trainer.strategy import (
@@ -11,6 +10,7 @@ from astrai.trainer.strategy import (
     StrategyFactory,
     compute_gae,
 )
+from astrai.trainer.strategy import ppo as strategy_module
 from tests.helpers import FakeExecutor, make_frozen, make_model, make_rollout_config
 
 

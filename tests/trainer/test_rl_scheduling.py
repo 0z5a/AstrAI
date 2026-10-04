@@ -11,7 +11,6 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 
-import astrai.trainer.strategy as strategy_mod
 from astrai.config import TrainConfig
 from astrai.serialization import Checkpoint
 from astrai.trainer.optional_extras import (
@@ -237,7 +236,9 @@ def test_rl_scheduling_fields_validated():
 def test_grad_chunked_logprobs_match_full_path(monkeypatch):
     """Values, hidden grads, and lm_head grads agree with the full-tensor
     path across chunk boundaries (fp32, tolerance = fp32 noise)."""
-    monkeypatch.setattr(strategy_mod, "_CHUNK_LOGIT_BYTES", 128)  # ~2 rows/chunk
+    monkeypatch.setattr(
+        "astrai.trainer.strategy.ops._CHUNK_LOGIT_BYTES", 128
+    )  # ~2 rows/chunk
     torch.manual_seed(3)
     model = StubLM()
     ids = torch.randint(0, 11, (3, 7))

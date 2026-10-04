@@ -9,8 +9,8 @@ agree numerically (up to bf16 GEMM tiling noise) for every reduction.
 
 import torch
 
-from astrai.trainer import strategy as strategy_module
 from astrai.trainer.strategy import get_logprobs
+from astrai.trainer.strategy import ops as strategy_module
 from tests.helpers import make_model
 
 
@@ -62,7 +62,7 @@ def test_chunked_path_engages_only_without_grad(device, monkeypatch):
         calls.append(hidden_states.shape)
         return original(hidden_states, weight, targets)
 
-    monkeypatch.setattr(strategy_module, "_chunked_token_logprobs", spy)
+    monkeypatch.setattr("astrai.trainer.strategy.ops._chunked_token_logprobs", spy)
 
     with torch.no_grad():
         get_logprobs(model, *batch, "none")

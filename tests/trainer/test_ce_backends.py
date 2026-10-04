@@ -104,7 +104,9 @@ def test_cpu_fallback_and_mask(backend):
 
 @skip_no_ce
 def test_missing_kernel_fallback(monkeypatch):
-    monkeypatch.setattr("astrai.trainer.strategy.ce_available", lambda: False)
+    monkeypatch.setattr(
+        "astrai.trainer.strategy.supervised.ce_available", lambda: False
+    )
     m, data = model("cuda"), batch("cuda")
     ref = SEQStrategy(m, "cuda").compute_loss(data)
     for backend in ("cuda_ce", "cuda_linear_ce"):
