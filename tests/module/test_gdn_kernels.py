@@ -9,6 +9,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from astrai.extension.kernel.gdn import gdn_fwd
+from astrai.extension.runtime.loader import get_module, is_available
 from astrai.model.components.attention import GDN
 from astrai.model.components.gdn_ops import _to_heads_fp32, l2norm
 
@@ -34,8 +36,6 @@ def chunk_local_cumsum(g, chunk_size=CHUNK):
 
 
 def prep_available():
-    from astrai.extension.loader import is_available
-
     return torch.cuda.is_available() and is_available("gated_deltanet")
 
 
@@ -59,8 +59,6 @@ def make_prep_layer(device):
 @pytest.mark.skipif(not prep_available(), reason="gated deltanet kernel not built")
 def test_prep_kernel_matches_the_torch_preparation(device):
     """Normalization and the gate scan, checked against the torch steps directly."""
-    from astrai.extension.kernel.gdn import gdn_fwd
-
     layer = make_prep_layer(device)
     x = torch.randn(1, 128, 256, device=device, dtype=torch.bfloat16)
     with torch.no_grad():
@@ -84,8 +82,6 @@ def test_prep_kernel_matches_the_torch_preparation(device):
 @pytest.mark.skipif(not prep_available(), reason="gated deltanet kernel not built")
 def test_prep_rejects_tensors_that_do_not_carry_the_projection_layout(device):
     """A contiguous [B, T, H, D] tensor would be read as the wrong elements."""
-    from astrai.extension.kernel.gdn import gdn_fwd
-
     layer = make_prep_layer(device)
     x = torch.randn(1, 64, 256, device=device, dtype=torch.bfloat16)
     with torch.no_grad():
@@ -103,8 +99,6 @@ def test_gated_deltanet_bwd_matches_autograd(device):
     two axes of h are distinguishable: a symmetric state hides an axis mix-up in
     the d_qe product, which is exactly the bug this test caught.
     """
-    from astrai.extension.loader import get_module
-
     torch.manual_seed(0)
     batch, heads, seq_len, dim = 2, 2, 128, 128
     chunk = 64

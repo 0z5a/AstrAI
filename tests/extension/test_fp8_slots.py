@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from astrai.extension.autocast import (
+from astrai.extension.policy.quantization.autocast import (
     Fp8Slot,
     assign_slots,
     clear_slots,

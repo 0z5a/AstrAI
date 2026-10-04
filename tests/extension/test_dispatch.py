@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import astrai.extension.dispatch as dispatch
+import astrai.extension.runtime.dispatch as dispatch
 from astrai.extension import (
     ATTN_BACKEND,
     ExplicitSelectionError,
@@ -19,26 +19,10 @@ from astrai.extension import (
     resolve_plan,
 )
 from astrai.extension.backend import apply_rotary_emb
+from astrai.extension.runtime.loader import is_available
 
 attn_mod = importlib.import_module("astrai.extension.backend.attention")
 rotary_mod = importlib.import_module("astrai.extension.backend.rotary")
-
-
-@pytest.mark.parametrize(
-    "old,new",
-    [
-        ("dispatch", "runtime.dispatch"),
-        ("loader", "runtime.loader"),
-        ("plan", "policy.gemm.plan"),
-        ("autotune", "policy.gemm.autotune"),
-        ("autocast", "policy.quantization.autocast"),
-        ("fp8_slots", "policy.quantization.fp8_slots"),
-    ],
-)
-def test_legacy_module_path_aliases(old, new):
-    assert importlib.import_module(
-        f"astrai.extension.{old}"
-    ) is importlib.import_module(f"astrai.extension.{new}")
 
 
 @pytest.fixture
@@ -359,8 +343,6 @@ class TestRotaryDispatch:
         return x, freqs
 
     def test_cuda_row_selected_under_inference_mode(self):
-        from astrai.extension.loader import is_available
-
         x, freqs = self._input()
         with torch.inference_mode():
             resolution = resolve("rotary", x, freqs)
@@ -379,8 +361,6 @@ class TestRotaryDispatch:
         assert out.shape == x.shape and out.dtype == torch.bfloat16
 
     def test_cuda_matches_torch_numerics(self):
-        from astrai.extension.loader import is_available
-
         if not is_available("rotary_emb"):
             pytest.skip("rotary kernel not built")
         x, freqs = self._input()

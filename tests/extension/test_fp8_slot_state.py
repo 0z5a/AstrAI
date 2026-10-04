@@ -10,13 +10,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from astrai.extension.autocast import (
+from astrai.extension.policy.quantization.autocast import (
     assign_slots,
     clear_slots,
     fp8_autocast,
     fp8_state_dict,
 )
-from astrai.extension.loader import get_module
+from astrai.extension.runtime.loader import get_module
 from astrai.model.components.linear import Linear
 from tests.conftest import skip_no_fp8
 

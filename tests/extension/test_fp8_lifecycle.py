@@ -33,14 +33,14 @@ import pytest
 import torch
 from torch import nn
 
-import astrai.extension.autocast as f8mod
-from astrai.extension.autocast import (
+import astrai.extension.policy.quantization.autocast as f8mod
+from astrai.extension.policy.quantization.autocast import (
     FP8Recipe,
     fp8_autocast,
     fp8_load_state_dict,
     fp8_state_dict,
 )
-from astrai.extension.loader import get_module
+from astrai.extension.runtime.loader import get_module
 from tests.conftest import skip_no_fp8
 
 try:

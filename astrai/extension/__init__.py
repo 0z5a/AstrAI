@@ -5,8 +5,6 @@
 the GEMM configuration facade.
 """
 
-import sys as _sys
-
 from astrai.extension.backend import (
     ATTN_BACKEND,
     AttentionBackend,
@@ -76,18 +74,6 @@ from astrai.extension.runtime.dispatch import (
     unregister_impl,
 )
 from astrai.extension.runtime.loader import KERNEL_NAMES, is_available
-
-for _name, _module in (
-    ("dispatch", dispatch),
-    ("loader", loader),
-    ("plan", plan),
-    ("autotune", autotune),
-    ("autocast", autocast),
-    ("fp8_slots", fp8_slots),
-):
-    _sys.modules[f"{__name__}.{_name}"] = _module
-del _name, _module, _sys
-
 
 __all__ = [
     "cross_entropy",

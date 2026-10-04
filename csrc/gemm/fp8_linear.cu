@@ -15,7 +15,7 @@
  *
  * Not here by design: the autocast region and recipe/format policy
  * (astrai/extension/quantize.py), the module slot table
- * (astrai/extension/autocast.py), and the rings / cast caches / snapshot
+ * (astrai/extension/policy/quantization/autocast.py), and the rings / cast caches / snapshot
  * (fp8_ring.h, fp8_cache.h, fp8_state.h). The state owner and checkpoint
  * interface live in fp8_runtime.cu in this module.
  */

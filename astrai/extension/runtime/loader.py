@@ -9,6 +9,8 @@ import logging
 import os
 from typing import Dict, List
 
+from astrai.extension.runtime import dispatch
+
 logger = logging.getLogger(__name__)
 
 _LIB_DIR = os.path.dirname(os.path.dirname(__file__))
@@ -44,8 +46,6 @@ def _try_load(name: str) -> object:
                 f"._C_{name}", package="astrai.extension"
             )
             _available[name] = True
-            from astrai.extension.runtime import dispatch
-
             dispatch.invalidate()
         except ImportError:
             logger.warning("kernel '%s' failed to import; marking unavailable", name)

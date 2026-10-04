@@ -55,7 +55,7 @@ PlanProbe plan_probe(int64_t m,
                      int64_t batch);
 
 /*
- * Runtime configuration (the backing of astrai.extension.plan). Every field is
+ * Runtime configuration (the backing of astrai.extension.policy.gemm.plan). Every field is
  * tri-state: absent leaves the knob unchanged, a value wins over the env seed;
  * pybind maps an absent dict key to "absent".
  */

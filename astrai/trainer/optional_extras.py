@@ -29,29 +29,18 @@ from typing import Any, Iterable, Literal, Optional
 
 import torch
 
+from astrai.extension.policy.quantization import autocast
+
 logger = logging.getLogger(__name__)
 
 
-def _fp8_mod():
-    try:
-        from astrai.extension import autocast
-    except ImportError:  # extension not built: fp8 was never in use either
-        return None
-    return autocast
-
-
 def _fp8_extra() -> dict | None:
-    mod = _fp8_mod()
-    if mod is None:
-        return None
-    sd = mod.fp8_state_dict()
+    sd = autocast.fp8_state_dict()
     return sd if sd["entries"] else None
 
 
 def _fp8_restore(sd: dict) -> None:
-    mod = _fp8_mod()
-    if mod is not None:
-        mod.fp8_load_state_dict(sd)
+    autocast.fp8_load_state_dict(sd)
 
 
 def _rng_extra() -> dict:

@@ -179,7 +179,7 @@ RowSource& row_tier(RowTier tier) {
 } // namespace
 
 /*
- * Runtime configuration: the backing of astrai.extension.plan. Every knob is
+ * Runtime configuration: the backing of astrai.extension.policy.gemm.plan. Every knob is
  * tri-state — an absent patch field leaves it unchanged, an explicit value wins
  * over the one-time env seed. Rows are addressed by tier (`rows` + `tier`), the
  * all-tiers-off switch is its own field, and the staging keys are positive

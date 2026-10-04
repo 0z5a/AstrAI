@@ -371,7 +371,7 @@ module-to-slot identities, and `autocast.py` owns region policy and
 `astrai.extension`):
 
 ```python
-from astrai.extension import plan
+from astrai.extension.policy.gemm import plan
 
 plan.config                            # the whole configuration, as a value
 plan.configure(planner="hybrid")       # "table" | "hybrid" | "model" | "" (unset)

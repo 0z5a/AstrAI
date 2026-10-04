@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import Tensor
 
+import astrai.extension.backend.attention as _attention
 from astrai.extension.runtime.dispatch import Axes
 
 from . import (
@@ -37,15 +38,11 @@ class FlashAttnBackend(AttentionBackend):
 
     @classmethod
     def available(cls) -> bool:
-        from . import flash_attn_available
-
-        return flash_attn_available()
+        return _attention.flash_attn_available()
 
     @classmethod
     def supports_axes(cls, ax: Axes) -> bool:
-        from . import flash_attn_available
-
-        if not flash_attn_available():
+        if not _attention.flash_attn_available():
             return False
         if ax["dtype"] not in (torch.float16, torch.bfloat16):
             return False

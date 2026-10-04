@@ -10,7 +10,7 @@ growth, and the per-device persistence roundtrip.
 import pytest
 import torch
 
-from astrai.extension.plan import (
+from astrai.extension.policy.gemm.plan import (
     GemmAutotuner,
     Row,
     _problem_key,

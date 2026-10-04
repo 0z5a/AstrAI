@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from astrai.extension import kernel, plan
-from astrai.extension.loader import is_available
+from astrai.extension.runtime.loader import is_available
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"),

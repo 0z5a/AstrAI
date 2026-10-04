@@ -8,7 +8,7 @@
  * config patch. Each key set is spelled exactly once — the report's keys below,
  * the patch's in `kPatchKeys` — next to the struct they mirror, because
  * csrc/bench's dispatch_grid / model_capture / diff_rows / tune_plan_table read
- * those keys and astrai.extension.plan writes them.
+ * those keys and astrai.extension.policy.gemm.plan writes them.
  */
 
 #include <torch/extension.h>
@@ -111,7 +111,7 @@ py::dict facts_dict() {
  * that is the whole contract. The dict is the point: with a positional parameter
  * list this file had to spell the same seven names three times (the converter's
  * parameters, its conversion bodies, and the registration's py::arg list) on top
- * of api/gemm.h's struct and astrai.extension.plan's ``configure`` signature.
+ * of api/gemm.h's struct and astrai.extension.policy.gemm.plan's ``configure`` signature.
  * The table below is the C++ half of that vocabulary; those other two are the
  * typed and the documented ends.
  */

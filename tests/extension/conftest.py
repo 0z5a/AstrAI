@@ -4,6 +4,8 @@ import pytest
 import torch
 
 from astrai.config.model_config import AutoRegressiveLMConfig
+from astrai.extension import kernel
+from astrai.extension.runtime.loader import is_available
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 
 D = 64
@@ -38,13 +40,10 @@ def _reset_dispatch_state():
     them leaks into the next one.
     """
     yield
-    import astrai.extension.dispatch as dispatch
+    import astrai.extension.runtime.dispatch as dispatch
 
     dispatch._selection = None
     dispatch.invalidate()
-    from astrai.extension import kernel
-    from astrai.extension.loader import is_available
-
     if is_available("gemm"):
         kernel.gemm.set_table("")
         kernel.gemm.set_planner("")  # back to the shipped default

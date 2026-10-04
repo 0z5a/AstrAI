@@ -18,7 +18,7 @@ namespace gemm {
 /*
  * Launchers — pure CUDA, usable from the binding and the C tests. The
  * runtime knobs live in GemmConfig (launcher/plan_types.h), owned at runtime by
- * astrai.extension.plan.
+ * astrai.extension.policy.gemm.plan.
  */
 
 // Grid for one Policy's tile: N x M blocks, batch on z.
