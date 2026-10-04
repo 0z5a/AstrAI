@@ -9,7 +9,7 @@ from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.linear import Linear
 from astrai.model.kv_cache import KVCache
-from astrai.model.transformer_model import TransformerModel, init_module_weights
+from astrai.model.transformer import TransformerModel, init_module_weights
 
 
 @ModelFactory.register("autoregressive_lm")
@@ -64,6 +64,7 @@ class AutoRegressiveLM(AutoModel):
         fwd: Optional[str] = None,
         logits_positions: Optional[Tensor] = None,
         skip_lm_head: bool = False,
+        return_lm_head_weight: bool = False,
     ) -> Dict[str, Tensor]:
         if fwd is None:
             if input_ids.ndim != 2:
@@ -78,6 +79,8 @@ class AutoRegressiveLM(AutoModel):
         else:
             raise ValueError(f"unsupported forward mode: {fwd}")
 
+        if return_lm_head_weight and not skip_lm_head:
+            raise ValueError("return_lm_head_weight requires skip_lm_head")
         output = self.model(
             input_ids,
             input_mask=input_mask,
@@ -93,4 +96,11 @@ class AutoRegressiveLM(AutoModel):
         output["logits"] = (
             None if skip_lm_head else self.lm_head(output["hidden_states"])
         )
+        if return_lm_head_weight:
+            # A view keeps the head reachable from DDP's forward outputs when
+            # a training strategy applies the projection outside this module.
+            output["lm_head_weight"] = self.lm_head.weight.view_as(self.lm_head.weight)
+            if self.lm_head.bias is not None:
+                output["lm_head_bias"] = self.lm_head.bias.view_as(self.lm_head.bias)
+
         return output
