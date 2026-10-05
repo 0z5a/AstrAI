@@ -115,34 +115,6 @@ def device_signature(facts: dict) -> str:
     )
 
 
-def heuristic_rows(facts: dict, vocab, width_perf: dict) -> List[Row]:
-    """Crosswise first-fit for devices with no cached rows — humming's
-    DeviceHeuristics shape: the degraded band ladder (small / narrow / big
-    by M) with the ring depth raised where the device's smem leaves room.
-    Crosswise layouts only (the builtin rows are all crosswise-0), so this
-    covers exactly the shapes that would otherwise degrade and shadows
-    nothing measured. smem per recipe comes from the vocabulary and the
-    perf column from the probe-derived ``width_perf`` mapping (the perf
-    class doubles as the width constraint: the two are 1:1), so nothing
-    here mirrors policy.cuh or gemm.cu by hand.
-    """
-    ring = {
-        (entry[3], entry[4], entry[5], entry[1], entry[2]): entry[9] for entry in vocab
-    }  # (cta, stages, kk, ba, bb) -> ring smem, from tile_vocabulary
-    rows: List[Row] = []
-    for (ba, bb), perf in sorted(width_perf.items()):
-        for crosswise in (1, 2):
-            ladder = ((0, 512, 0), (512, 3072, 1), (3072, 0, 2))
-            for m_min, m_max, cta in ladder:
-                stages = 3 if cta == 0 else 2
-                if ring.get((cta, stages, 64, ba, bb), 1 << 30) > facts["smem_max"]:
-                    stages = 2
-                if ring.get((cta, stages, 64, ba, bb), 1 << 30) > facts["smem_max"]:
-                    cta, stages = 0, 2  # the small s2 floor every part fits
-                rows.append(Row(m_min, m_max, 0, 0, perf, crosswise, cta, stages, 64))
-    return rows
-
-
 class GemmAutotuner:
     """The note() hook plus the one-time tune machinery behind it."""
 
@@ -158,12 +130,10 @@ class GemmAutotuner:
         self._active = False
         self._tiers: dict = {}  # probe answers (diagnostics)
         self._perf_of: dict = {}  # dtype pair -> perf class, from the probe
-        self._width_perf: dict = {}  # widths -> perf class, joined
         self._covered: dict = {}  # the tune decision, cached on the cheap key
         self._misses: dict = {}
         self._done: set = set()  # problems already tuned (or refused) here
         self._rows: List[Row] = []  # measured winners, newest first
-        self._base_rows: List[Row] = []  # heuristic floor under them
         self._facts: Optional[dict] = None
         self._vocab: Optional[Sequence[Sequence[int]]] = None
         self._tuned = 0
@@ -186,8 +156,7 @@ class GemmAutotuner:
         return self._mod
 
     def start(self, time_budget_s: float = 60.0) -> bool:
-        """Load the persistent cache (or the heuristic floor) and install
-        the rows. Returns False when the tuner cannot run (old extension
+        """Load and install measured rows from the persistent cache. Returns False when the tuner cannot run (old extension
         build); while an override table owns the source the tuner idles
         by design.
         """
@@ -222,26 +191,20 @@ class GemmAutotuner:
                 info = mod.plan_probe(
                     1, 1, 1, _dtype_of(dt_a), _dtype_of(dt_b), False, True, 1
                 )
-            except Exception:  # noqa: BLE001 — an unsupported pair just has no floor
+            except Exception:  # noqa: BLE001 — skip unsupported pairs
                 continue
             self._perf_of[(dt_a, dt_b)] = int(info["perf_class"])
-            self._width_perf[_WIDTHS_OF[(dt_a, dt_b)]] = int(info["perf_class"])
         cache_dir = Path(
             self._cache_dir
             or os.environ.get(ENV_CACHE_DIR, "~/.astrai/cache/gemm_plans")
         ).expanduser()
         self._cache_path = cache_dir / f"{device_signature(self._facts)}.rows"
         self._rows = self._load_rows(self._cache_path)
-        self._base_rows = heuristic_rows(self._facts, self._vocab, self._width_perf)
         self._install()
         if time_budget_s > 0:
             self._deadline = time.monotonic() + time_budget_s
         self._active = True
-        logger.info(
-            "gemm autotune on (%d cached rows, heuristic floor %d rows)",
-            len(self._rows),
-            len(self._base_rows),
-        )
+        logger.info("gemm autotune on (%d cached rows)", len(self._rows))
         return True
 
     # -- the hot-path hook ------------------------------------------------
@@ -298,14 +261,8 @@ class GemmAutotuner:
         trans_a: bool,
         trans_b: bool,
     ) -> Optional[bool]:
-        """Does anything OWN this shape? The builtin and override tables
-        do; a measured row does. The heuristic floor does NOT — it is a
-        placeholder until this shape tunes, and the probe cannot tell the
-        two apart (both install as injected rows), so the injected tier is
-        resolved by simulating the installed rows' first match: measured
-        rows sit in front, so a first match among them is coverage. None
-        means "not even a recipe exists for this pair" (treat as covered:
-        nothing to tune).
+        """Measured rows own their covered shapes. Geometry-heuristic
+        decisions remain eligible for tuning when the tuner is enabled.
         """
         info = self._probe(a, b, key, trans_a, trans_b)
         tier = str(info["source"])
@@ -315,7 +272,7 @@ class GemmAutotuner:
         if tier in ("builtin", "override", "model"):
             return True
         if tier != "injected":
-            return False  # degraded: nothing installed matches either
+            return False  # no measured row covers this shape
         for row in self._rows:  # the measured rows, in installed order
             if self._row_matches(prob, row):
                 return True
@@ -385,7 +342,7 @@ class GemmAutotuner:
         return out
 
     def _install(self) -> None:
-        self._install_rows("\n".join(r.text() for r in self._rows + self._base_rows))
+        self._install_rows("\n".join(r.text() for r in self._rows))
 
     def _install_one(self, row: Row) -> None:
         """Force one candidate: it alone in front, nothing else to shadow it."""

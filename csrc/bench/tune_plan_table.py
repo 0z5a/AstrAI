@@ -15,8 +15,8 @@ standalone scripts had.
 Row tables are served at runtime through ``kernel.gemm.set_table`` (no
 rebuild, no environment variable); an emitted row file can also be pasted
 into csrc/gemm/plan_table_builtin.cpp's GENERATED block, which does
-require a rebuild. The special ``model`` candidate measures every row tier off (the
-degraded rows) — the reference of the min-gain mode.
+require a rebuild. The legacy ``model`` recipe label measures the default
+heuristic with every row tier off, the reference of the min-gain mode.
 """
 
 from __future__ import annotations
@@ -242,7 +242,7 @@ def candidate_recipes(combo: str) -> tuple[str, ...]:
     )
 
 
-_TAG_RE = re.compile(r"\[gemm-plan\] (override|injected|builtin|model|degraded)\b")
+_TAG_RE = re.compile(r"\[gemm-plan\] (override|injected|builtin|model|heuristic)\b")
 
 
 def _last_tag(text: str) -> str:
@@ -251,7 +251,7 @@ def _last_tag(text: str) -> str:
     tags = _TAG_RE.findall(text)
     if not tags:
         return "?"
-    return "degraded (no table)" if tags[-1] == "degraded" else tags[-1]
+    return tags[-1]
 
 
 def _planned_tag(run) -> str:
@@ -375,22 +375,12 @@ def sweep(
             "the extension with CSRC_KERNELS=true first)"
         )
 
-    # Candidates are one-row tables toggled per launch through the plan API
-    # (kernel.gemm.set_table), so all candidates at a shape share its GPU
-    # clock/thermal state. The "model" candidate measures the degraded
-    # rows: it is the "this band has no table row" reference of the
-    # min-gain mode, not a planner.
+    # Compare forced rows with the default no-row heuristic in one process.
+    # Keep the serialized recipe label "model" for existing result readers.
     candidate_rows = _candidate_rows()
     tags: dict[tuple[str, str], str] = {}
-
     device = torch.device(torch.cuda.current_device())
-    # The "model" candidate measures the no-row reference: with the row
-    # tiers off, whichever planner the process runs (the shipped hybrid
-    # default answers with the analytical model; a table-pinned process
-    # with the degraded ladder).
-    no_row_source = (
-        "degraded (no table)" if kernel.gemm.state()["planner"] == "table" else "model"
-    )
+    no_row_source = "heuristic"
     torch.manual_seed(0)
     results = []
     for combo in combos:
@@ -410,14 +400,22 @@ def sweep(
                     if wanted and recipe not in wanted:
                         continue
                     if recipe == "model":
-                        # "-" = every row tier off: the no-row reference
-                        # (the model under the shipped default).
+                        kernel.gemm.set_planner("heuristic")
                         kernel.gemm.set_table("-")
                     else:
+                        kernel.gemm.set_planner("table")
                         kernel.gemm.set_table(candidate_rows[recipe])
                     expected = no_row_source if recipe == "model" else "override"
                     if (combo, recipe) not in tags:
-                        tags[(combo, recipe)] = _planned_tag(run)
+                        try:
+                            tags[(combo, recipe)] = _planned_tag(run)
+                        except RuntimeError as exc:
+                            if (
+                                "no eligible recipe" not in str(exc)
+                                or recipe == "model"
+                            ):
+                                raise
+                            tags[(combo, recipe)] = "unavailable"
                     if tags[(combo, recipe)] != expected:
                         # The planner demoted the candidate (ring, width or
                         # depth gate) and served something else: those numbers
@@ -455,6 +453,7 @@ def sweep(
                         flush=True,
                     )
     kernel.gemm.set_table("")
+    kernel.gemm.set_planner("")
     return results
 
 
@@ -482,12 +481,10 @@ def build_rows(
     n_values: set[int] = set()
     for point in results:
         expected = (
-            "degraded (no table)"
-            if point["recipe"] == "model" and point.get("planned") == "degraded"
-            else ("model" if point["recipe"] == "model" else "override")
+            {"model", "heuristic"} if point["recipe"] == "model" else {"override"}
         )
-        if "planned" in point and point["planned"] != expected:
-            continue  # demoted candidate: those numbers are the fallback's
+        if "planned" in point and point["planned"] not in expected:
+            continue  # do not attribute another recipe's timing to this candidate
         # datasets saved before 2026-09-16 spell names with a `_Fast` suffix
         recipe = point["recipe"].removesuffix("_Fast")
         _check_recipe(point["perf_class"], recipe)
@@ -692,7 +689,7 @@ def _winner(
     show_default=True,
     help="Minimum relative gain (%) a forced recipe must show over the "
     "runner-up to claim a row; smaller leads are treated as ties and keep "
-    "the degraded bands. Ignored with --full-coverage (every band gets a row, "
+    "the default heuristic. Ignored with --full-coverage (every band gets a row, "
     "ties resolve to the big>narrow>small preference).",
 )
 @click.option(
@@ -759,7 +756,9 @@ def plan_table_command(
                 click.echo(f"  {tile:44s} cta{cta} s{stages} k{kk}")
         for line in reachability_report():
             click.echo(f"  unreachable - {line}")
-        click.echo("  model  degraded bands (every row tier off), the reference")
+        click.echo(
+            "  model  default heuristic (legacy recipe label; every row tier off)"
+        )
         return
     wanted = tuple(
         part.strip() for part in (recipe_filter or "").split(",") if part.strip()
@@ -823,8 +822,8 @@ def plan_table_command(
         "# Unsupported dtype/recipe pairs are excluded before measurement.\n"
         "# The sweep times quant_gemm's fused-linear (NT) layout, so every "
         "row carries\n"
-        "# crosswise 0: TT/TN shapes miss this table and take the degraded "
-        "bands in C++.\n"
+        "# crosswise 0: TT/TN shapes miss this table and use the heuristic "
+        "in hybrid mode.\n"
         "# Generated by csrc/bench/tune_plan_table.py sweep; tune the grid then "
         "re-run.\n"
     )
@@ -849,27 +848,14 @@ def parse_holdout_shape(value: str) -> tuple[str, int, int, int]:
 
 
 def apply_table(name: str, path: str | None, hybrid: bool = False) -> None:
-    # "model" runs the analytical planner alone; "none" turns every row
-    # tier off (the degraded reference) — the aliases keep old
-    # invocations working.
-    #
-    # hybrid=True keeps the shipped planner chain instead of pinning the
-    # table-only mode: rows are installed at the override tier and the
-    # model still answers where no row matches. That is the configuration
-    # production runs, and the only mode in which a DIFF row table (rows
-    # that deliberately miss the bands the model wins) can be scored — in
-    # table-only mode a miss falls to the degraded ladder, which is a
-    # different deployment, not this one.
-    if name == "model":
-        kernel.gemm.set_planner("")
-        kernel.gemm.set_table("-" if hybrid else "")
-        return
-    kernel.gemm.set_planner("" if hybrid else "table")
-    if name == "none":
-        # Every row tier off: the degraded-bands reference.
+    # Retain explicit old-model comparison and the no-row heuristic reference.
+    # Partial tables require hybrid mode; table-only misses are errors.
+    if name in ("model", "none"):
+        kernel.gemm.set_planner("model" if name == "model" else "heuristic")
         kernel.gemm.set_table("-")
-    else:
-        kernel.gemm.set_table(path or "")
+        return
+    kernel.gemm.set_planner("hybrid" if hybrid else "table")
+    kernel.gemm.set_table(path or "")
 
 
 def validate(

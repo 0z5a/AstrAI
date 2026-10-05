@@ -73,6 +73,8 @@ py::dict probe_dict(const PlanProbe& r) {
     d["kk"] = r.kk;
     d["perf_class"] = r.perf_class;
     d["crosswise"] = r.crosswise;
+    d["tma"] = r.tma;
+    d["resources"] = r.resources;
     return d;
 }
 
@@ -130,7 +132,7 @@ void patch_planner(GemmConfigPatch& patch, const py::object& value) {
         }
         int mode = -1;
         if (!parse_planner_mode(name, mode))
-            throw std::invalid_argument("planner must be 'table', 'hybrid' or 'model', got '" +
+            throw std::invalid_argument("planner must be 'table', 'hybrid', 'model' or 'heuristic', got '" +
                                         name + "'");
         patch.planner_mode = mode;
         return;

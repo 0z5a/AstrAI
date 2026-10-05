@@ -33,20 +33,26 @@ namespace gemm {
 
 #define GEMM_EXTERN(TA, TB)                                                                    \
     extern template void gemm_dispatch<TA, TB, __nv_bfloat16, MmaSync>(                        \
-        GemmParams, cudaStream_t, bool, bool);
+        GemmParams, cudaStream_t, bool, bool);                                                        \
+    extern template std::pair<PlanDecision, PlanQuery> plan_probe_for<TA, TB, MmaSync>( \
+        int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
 ASTRAI_GEMM_PAIRS(GEMM_EXTERN)
 #undef GEMM_EXTERN
 #if ASTRAI_BUILD_TMA
 #define GEMM_EXTERN(TA, TB)                                                                    \
     extern template void gemm_dispatch<TA, TB, __nv_bfloat16, TmaMma>(                         \
-        GemmParams, cudaStream_t, bool, bool);
+        GemmParams, cudaStream_t, bool, bool);                                                        \
+    extern template std::pair<PlanDecision, PlanQuery> plan_probe_for<TA, TB, TmaMma>( \
+        int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
 ASTRAI_GEMM_PAIRS(GEMM_EXTERN)
 #undef GEMM_EXTERN
 #endif
 #if ASTRAI_BUILD_MX
 #define GEMM_EXTERN(TA, TB)                                                                    \
     extern template void gemm_dispatch<TA, TB, __nv_bfloat16, Sm120Mma>(                       \
-        GemmParams, cudaStream_t, bool, bool);
+        GemmParams, cudaStream_t, bool, bool);                                                        \
+    extern template std::pair<PlanDecision, PlanQuery> plan_probe_for<TA, TB, Sm120Mma>( \
+        int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
 ASTRAI_GEMM_FP8_PAIRS(GEMM_EXTERN)
 #undef GEMM_EXTERN
 #endif
@@ -156,8 +162,8 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
 } // namespace
 
 /*
- * Planner introspection: the Python tooling's C++ face. The planner is
- * GPU-free by design, so the probe launches nothing. Rows reach the planner
+ * Planner introspection: the Python tooling's C++ face. The heuristic reads
+ * CUDA function metadata, but the probe launches nothing. Rows reach the planner
  * through configure()'s rows channel; injected rows rank BELOW the override
  * rows (plan_table.cpp), keeping the override tier authoritative.
  */
@@ -170,6 +176,9 @@ PlanProbe plan_probe(int64_t m,
                      bool trans_a,
                      bool trans_b,
                      int64_t batch) {
+    TORCH_CHECK(m > 0 && n > 0 && k > 0,
+                "GEMM probe: M, N and K must be greater than zero (got ",
+                m, ", ", n, ", ", k, ")");
     const auto [decision, query] =
         find_gemm_probe(dt_a, dt_b)(m, n, k, batch, trans_a, trans_b, astrai::device_facts());
     PlanProbe r;
@@ -180,6 +189,19 @@ PlanProbe plan_probe(int64_t m,
     r.kk = decision.recipe.kk;
     r.perf_class = query.perf_class;
     r.crosswise = query.crosswise;
+    r.tma = query.tma;
+    if (config_state().planner == "heuristic" && query.resources) {
+        for (const auto& v : tile_vocabulary()) {
+            if (v[0] != (query.crosswise > 0) || v[1] != query.ba || v[2] != query.bb)
+                continue;
+            GemmRecipe recipe{v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]};
+            const auto resource = query.resources(recipe, query);
+            const auto& e = resource.effective;
+            r.resources.push_back({recipe.cta, recipe.stages, recipe.kk,
+                                   e.bm, e.bn, e.kk, e.wm, e.wn, e.threads,
+                                   resource.resident, resource.registers, resource.local_bytes});
+        }
+    }
     return r;
 }
 

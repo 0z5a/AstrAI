@@ -24,6 +24,8 @@ struct DeviceFacts {
     int regs_per_sm;
     int64_t l2_bytes;
     int cc = 0;
+    int ordinal = 0;
+    int threads_per_sm = 0;
 };
 
 inline DeviceFacts device_facts() {
@@ -34,6 +36,8 @@ inline DeviceFacts device_facts() {
     DeviceFacts facts = cacheable ? cached[dev] : DeviceFacts{};
     if (!facts.sms) {
         int l2 = 0, major = 0, minor = 0;
+        facts.ordinal = dev;
+        cudaDeviceGetAttribute(&facts.threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
         cudaDeviceGetAttribute(&facts.sms, cudaDevAttrMultiProcessorCount, dev);
         cudaDeviceGetAttribute(&facts.smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         cudaDeviceGetAttribute(&facts.smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor,

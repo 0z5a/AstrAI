@@ -15,7 +15,6 @@ from astrai.extension.policy.gemm.plan import (
     Row,
     _problem_key,
     device_signature,
-    heuristic_rows,
 )
 
 WIDTH_PERF = {(2, 2): 0, (2, 1): 1, (1, 1): 2}
@@ -77,7 +76,7 @@ class FakeGemm:
     # (a stale build has ``configure`` too, so the name alone proves nothing).
     CONFIG_API = 2
 
-    def __init__(self, source: str = "degraded", override_rows: int = 0):
+    def __init__(self, source: str = "heuristic", override_rows: int = 0):
         self.source = source
         self.override_rows = override_rows
         self.installs: list[str] = []
@@ -179,34 +178,7 @@ class TestProblemKey:
         assert _problem_key(a, b, False, False)[4] == 2
 
 
-class TestHeuristicRows:
-    def test_covers_crosswise_only_and_shadows_nothing(self):
-        rows = heuristic_rows(FACTS, VOCAB, WIDTH_PERF)
-        pairs = len({(e[1], e[2]) for e in VOCAB})
-        assert len(rows) == pairs * 2 * 3  # width pairs x crosswise x M bands
-        assert all(r.crosswise in (1, 2) for r in rows)
-        assert {r.perf_class for r in rows} == set(WIDTH_PERF.values())
-
-    def test_ring_feasible_and_demotes(self):
-        ring = {(e[3], e[4], e[5], e[1], e[2]): e[9] for e in VOCAB}
-        widths_of_perf = {perf: widths for widths, perf in WIDTH_PERF.items()}
-
-        def ring_of(r):
-            ba, bb = widths_of_perf[r.perf_class]
-            return ring[(r.cta, r.stages, r.kk, ba, bb)]
-
-        for r in heuristic_rows(FACTS, VOCAB, WIDTH_PERF):
-            assert ring_of(r) <= FACTS["smem_max"]
-        # A part that cannot opt in past 48KB keeps every ring inside it:
-        # the 2-byte s3 small ring (64KB) demotes to s2 while the thinner
-        # (2, 1)-width ring (48KB) legitimately keeps its depth.
-        small = heuristic_rows({**FACTS, "smem_max": 48 * 1024}, VOCAB, WIDTH_PERF)
-        for r in small:
-            assert ring_of(r) <= 48 * 1024
-        assert all(
-            r.stages == 2 for r in small if r.perf_class == 0
-        )  # the 2-byte class demoted
-
+class TestRowFormat:
     def test_row_text_is_row_file_syntax(self):
         row = Row(63, 64, 127, 128, 0, 1, 2, 3, 32)
         assert row.text() == "63 64 127 128 0 1 2 3 0 32"
@@ -221,12 +193,11 @@ class TestTuneFlow:
         assert tuner.start(time_budget_s=0)
         return tuner
 
-    def test_start_installs_heuristic_floor(self):
+    def test_start_installs_only_cached_rows(self):
         fake = FakeGemm()
         self._tuner(fake)
         assert len(fake.installs) == 1
-        pairs = len({(e[1], e[2]) for e in VOCAB})
-        assert fake.installs[0].count("\n") == pairs * 2 * 3 - 1
+        assert fake.installs[0] == ""
 
     def test_start_refuses_a_pre_patch_build(self):
         # A stale .so still has ``configure`` — it just takes keyword
@@ -258,8 +229,8 @@ class TestTuneFlow:
         tuner.note(a, b, None, None, False, True, None)
         assert len(fake.installs) == 1
 
-    def test_degraded_shape_tunes_and_persists(self, tmp_path):
-        fake = FakeGemm(source="degraded")
+    def test_heuristic_shape_tunes_and_persists(self, tmp_path):
+        fake = FakeGemm(source="heuristic")
         measured: list = []
 
         def fake_measure(key, candidates, *call_args):
@@ -267,16 +238,16 @@ class TestTuneFlow:
             return candidates[-1]  # the "winner": last candidate
 
         tuner = self._tuner(fake, fake_measure)
-        a, b = nt_operands()  # NT is crosswise 0, but the fake says degraded
+        a, b = nt_operands()  # NT is crosswise 0, but the fake says heuristic
         tuner.note(a, b, None, None, False, True, None)
-        assert measured, "the degraded shape ran a candidate sweep"
+        assert measured, "the heuristic shape ran a candidate sweep"
         # Candidates were the cw-0 two-byte recipes that fit the smem.
         assert all(c.crosswise == 0 for c in measured)
         assert all(c.perf_class == 0 for c in measured)
         assert all(c.kk in (32, 64) for c in measured)
         # start() + merged install = 2 installs.
         assert len(fake.installs) == 2
-        # The winner merged in front of the heuristic floor.
+        # The measured winner is installed without synthetic floor rows.
         winner = tuner._rows[0]
         assert winner.recipe() == measured[-1].recipe()
         assert winner.m_min == 63 and winner.m_max == 64 + 64 // 4  # grown
@@ -286,7 +257,7 @@ class TestTuneFlow:
         assert winner.text() in cache.read_text()
 
     def test_tuned_shape_does_not_retune(self):
-        fake = FakeGemm(source="degraded")
+        fake = FakeGemm(source="heuristic")
         tuner = self._tuner(fake, lambda *a: None)
         a, b = nt_operands()
         tuner.note(a, b, None, None, False, True, None)
@@ -298,14 +269,14 @@ class TestTuneFlow:
         assert len(fake.installs) == installs_after_tune
 
     def test_override_table_idles_the_tuner(self):
-        fake = FakeGemm(source="degraded", override_rows=3)
+        fake = FakeGemm(source="heuristic", override_rows=3)
         tuner = self._tuner(fake, lambda *a: pytest.fail("must not measure"))
         a, b = nt_operands()
         tuner.note(a, b, None, None, False, True, None)
         assert len(fake.installs) == 0
 
     def test_max_shapes_cap(self):
-        fake = FakeGemm(source="degraded")
+        fake = FakeGemm(source="heuristic")
         tuner = self._tuner(fake, lambda *a: None)
         tuner._tuned = tuner._max_shapes
         a, b = nt_operands()
@@ -313,7 +284,7 @@ class TestTuneFlow:
         assert len(fake.installs) == 1  # start() only
 
     def test_same_recipe_winners_merge_bands(self):
-        fake = FakeGemm(source="degraded")
+        fake = FakeGemm(source="heuristic")
         tuner = self._tuner(fake)
         first = Row(63, 64, 127, 128, 0, 0, 2, 3, 32)
         second = Row(199, 200, 127, 128, 0, 0, 2, 3, 32)
@@ -324,7 +295,7 @@ class TestTuneFlow:
         assert merged.m_min == 63 and merged.m_max == 200 + 200 // 4
 
     def test_different_recipe_prepends(self):
-        fake = FakeGemm(source="degraded")
+        fake = FakeGemm(source="heuristic")
         tuner = self._tuner(fake)
         tuner._merge(Row(63, 64, 127, 128, 0, 0, 2, 3, 32))
         tuner._merge(Row(63, 64, 127, 128, 0, 0, 0, 3, 64))
@@ -333,12 +304,12 @@ class TestTuneFlow:
         assert tuner._rows[0].cta == 0 and tuner._rows[1].cta == 2
 
     def test_cache_roundtrip(self, tmp_path):
-        fake = FakeGemm(source="degraded")
+        fake = FakeGemm(source="heuristic")
         tuner = self._tuner(fake)
         tuner._merge(Row(63, 64, 127, 128, 0, 1, 2, 3, 32))
         tuner._persist()
         fresh = GemmAutotuner()
-        fresh._mod = FakeGemm(source="degraded")
+        fresh._mod = FakeGemm(source="heuristic")
         assert fresh.start(time_budget_s=0)
         # The persisted row is the grown band _merge produced, and it comes
         # back byte-identical.

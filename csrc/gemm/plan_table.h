@@ -32,8 +32,6 @@ std::optional<TableRow> plan_injected_row(const PlanQuery& q);
 std::optional<TableRow> plan_builtin_row(const PlanQuery& q);
 bool builtin_rows_match_device(const DeviceFacts& dev);
 const TableRow* builtin_plan_table(int perf_class, int& count);
-const TableRow* degraded_plan_table(int& count);
-TableRow plan_degraded_row(int64_t m);
 int plan_resident_ctas(TileClass cta, int stages, int kk, const PlanQuery& q);
 int gemm_planner_mode();
 bool gemm_table_off();

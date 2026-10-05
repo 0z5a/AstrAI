@@ -38,7 +38,7 @@ torch::Tensor quant_gemm_impl(torch::Tensor a,
                               c10::optional<torch::Tensor> bias);
 
 /*
- * Planner introspection, GPU-free. `source` names the deciding row tier, the
+ * Planner introspection without launching or timing kernels. `source` names the deciding row tier, the
  * rest is the recipe in dispatch-key form; `crosswise` stays an int (0/1 for
  * the Python tooling).
  */
@@ -50,6 +50,10 @@ struct PlanProbe {
     int kk = 0;
     int perf_class = -1;
     int crosswise = 0;
+    bool tma = false;
+    // Heuristic metadata: key (cta, stages, kk), effective (bm, bn, kk, wm, wn,
+    // threads), resident CTAs, registers/thread, local bytes/thread.
+    std::vector<std::vector<int>> resources;
 };
 
 PlanProbe plan_probe(int64_t m,
@@ -87,7 +91,7 @@ struct GemmConfigPatch {
     // All row tiers off: the planner chain falls through to model/degraded.
     c10::optional<bool> table_off;
     /*
-     * 0/1/2 = table / hybrid / model; -1 = unset (env seed decides, hybrid
+     * 0/1/2/3 = table / hybrid / model / heuristic; -1 = unset (env seed decides, hybrid
      * unseeded).
      */
     c10::optional<int> planner_mode;

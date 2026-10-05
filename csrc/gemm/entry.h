@@ -130,6 +130,10 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     }
     const int64_t m = trans_a ? a.size(-1) : a.size(-2);
     const int64_t n = trans_b ? b.size(-2) : b.size(-1);
+    const int64_t k = trans_a ? a.size(-2) : a.size(-1);
+    TORCH_CHECK(m > 0 && n > 0 && k > 0,
+                "quant_gemm: M, N and K must be greater than zero (got ",
+                m, ", ", n, ", ", k, ")");
     auto opt_scale = [&](const c10::optional<torch::Tensor>& s, int64_t extent, const char* name,
                          bool i8_side, bool bf16_side) -> QuantScale {
         if (!s.has_value()) {
@@ -160,7 +164,6 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     int64_t a_ld, b_ld, a_bstride, b_bstride;
     const bool tag_a = resolve_operand(a, trans_a, a_ld, a_bstride, a_st);
     const bool tag_b = resolve_operand(b, trans_b, b_ld, b_bstride, b_st);
-    const int64_t k = trans_a ? a.size(-2) : a.size(-1);
     TORCH_CHECK(k == (trans_b ? b.size(-1) : b.size(-2)), "inner dim mismatch");
     TORCH_CHECK(sa.ptr == nullptr || sa.n == 0 || sa.n == m, "a_scale extent must match m");
     TORCH_CHECK(sb.ptr == nullptr || sb.n == 0 || sb.n == n, "w_scale extent must match n");
@@ -197,21 +200,6 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     p.b_batch_stride = (batch_b == 1 && batch > 1) ? 0 : b_bstride;
     p.out_batch_stride = m * n;
     p.out_ld = static_cast<int>(n);
-
-    /*
-     * Empty problems never reach a kernel. The grid is ceil(m/bm) x ceil(n/bn),
-     * so a zero extent is a zero-dimension launch — an illegal configuration
-     * that today kills the process through the launch check — while the result
-     * is empty by construction (numel 0, so the allocation's contents are
-     * unobservable). The guard sits after every check on purpose: an empty
-     * call still validates its configuration instead of silently accepting an
-     * invalid one (the DeepGEMM early_return semantics, placed late).
-     * k == 0 needs no guard: the mainloop runs zero iterations and the
-     * epilogue writes the empty sum — zero, plus bias
-     * (tests/extension/test_w8.py pins both, and the empty-m/n shapes).
-     */
-    if (m == 0 || n == 0)
-        return output;
 
     Lookup(dt_a, dt_b)(p, stream.stream(), tag_a, tag_b);
     C10_CUDA_CHECK(cudaGetLastError());

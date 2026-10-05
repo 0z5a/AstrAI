@@ -3,9 +3,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
+#include <stdexcept>
+#include <limits>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -185,36 +188,98 @@ std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
     return per_cta * w_eff;
 }
 
+// geom_cta: rank five work proxies in log space. Smaller is better.
+// This is a heuristic ordering, not a prediction of execution time.
+double heuristic_cost(const GemmRecipe& named, const PlanQuery& q, int fallback_resident) {
+    KernelResources resource{};
+    if (q.resources) {
+        resource = q.resources(named, q);
+    } else {
+        // Standalone host callers may have no typed CUDA kernel resolver.
+        resource.effective = named;
+        resource.resident = fallback_resident;
+        if (q.ba + q.bb >= 3 && named.bm == 64 && named.bn == 64 && named.kk == 64) {
+            resource.effective.wn = 16;
+            resource.effective.threads = 512;
+        }
+    }
+    if (resource.resident <= 0)
+        return std::numeric_limits<double>::infinity();
+    const auto& r = resource.effective;
+    // Integer ceil without n+d-1 overflow; cast before multiplying grid axes.
+    auto ceil_div = [](std::int64_t n, int d) { return n / d + (n % d != 0); };
+    const double steps = (double)ceil_div(q.k, r.kk);
+    const double blocks = (double)q.batch * (double)ceil_div(q.m, r.bm) *
+                          (double)ceil_div(q.n, r.bn);
+    const double resident = std::min((double)resource.resident,
+                                     std::ceil(blocks / q.dev.sms));
+    const double waves = std::ceil(blocks / (q.dev.sms * resident));
+    const double warps = r.threads / 32.0;
+    const double copy = (double)r.kk * (r.bm * q.ba + r.bn * q.bb) / 512.0;
+    const double mma = ((double)r.kk / q.mma_k) * (r.bm / 16.0) * (r.bn / 8.0) / warps;
+    const double fragments = (double)r.kk * (r.wm * q.ba + r.wn * q.bb) / 512.0;
+    const double conversions =
+        (double)r.kk * (r.wm * (q.ba < q.bb) + r.wn * (q.bb < q.ba)) / 64.0;
+    const double output = (double)q.out_elem_bytes * r.bm * r.bn / 512.0;
+    const double issue = q.tma ? 2.0 : copy;
+
+    const double lw = std::log(waves), lr = std::log(resident);
+    const double ll = std::log(steps), lp = std::log(warps);
+    // log(L*copy + output), without constructing L*copy. The exponential
+    // argument is nonpositive; underflow only discards a negligible addend.
+    const double a = ll + std::log(copy), b = std::log(output);
+    const double log_memory = std::max(a, b) + std::log1p(std::exp(-std::abs(a - b)));
+    const std::array<double, 5> arms = {
+        lw + (q.tma ? lr : 0.0) + log_memory,
+        lw + lr + ll + lp + std::log(mma),
+        lw + ll + std::log(mma + fragments + conversions),
+        lw + lr + ll + lp + std::log(fragments + conversions),
+        lw + lr + ll + std::log(2.0 * warps + issue),
+    };
+    // Per-arm normalization is common to all candidates, and the fifth root
+    // is monotone: neither changes ranking. Never multiply arms or exp(score).
+    double score = 0.0;
+    for (double arm : arms)
+        score += arm;
+    return score;
+}
+
 bool same_model_query(const PlanQuery& a, const PlanQuery& b) {
     const auto& x = a.dev;
     const auto& y = b.dev;
     return a.m == b.m && a.n == b.n && a.k == b.k && a.batch == b.batch &&
            a.perf_class == b.perf_class && a.crosswise == b.crosswise &&
            a.ba == b.ba && a.bb == b.bb && a.out_elem_bytes == b.out_elem_bytes &&
-           a.mma_k == b.mma_k && a.tma == b.tma && x.sms == y.sms && x.smem_max == y.smem_max &&
+           a.mma_k == b.mma_k && a.tma == b.tma && a.resources == b.resources &&
+           a.rank3a == b.rank3a && a.rank3b == b.rank3b && a.contiguous == b.contiguous &&
+           x.threads_per_sm == y.threads_per_sm && x.ordinal == y.ordinal && x.sms == y.sms && x.smem_max == y.smem_max &&
            x.smem_per_sm == y.smem_per_sm && x.regs_per_sm == y.regs_per_sm &&
            x.l2_bytes == y.l2_bytes && x.cc == y.cc;
 }
 
-std::optional<PlanDecision> model_plan(const PlanQuery& q) {
-    if (q.dev.sms <= 0 || q.m <= 0 || q.n <= 0 || q.k <= 0)
+std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = false) {
+    if (q.dev.sms <= 0 || q.m <= 0 || q.n <= 0 || q.k <= 0 || q.batch <= 0 || q.mma_k <= 0)
         return std::nullopt;
     struct LastModelPlan {
         PlanQuery query{};
         PlanDecision decision{};
+        bool heuristic = false;
         bool valid = false;
     };
     static thread_local LastModelPlan last;
-    if (last.valid && same_model_query(last.query, q))
+    if (last.valid && last.heuristic == heuristic && same_model_query(last.query, q))
         return last.decision;
     std::optional<GemmRecipe> best;
-    std::int64_t best_cost = 0;
+    double best_cost = 0;
     with_manifest(q.crosswise > 0, q.ba, q.bb, [&](auto manifest) {
         for_each_recipe<decltype(manifest)>(q.ba, q.bb, [&](GemmRecipe recipe) {
             const int resident = resident_of(recipe, q);
             if (resident <= 0)
                 return;
-            const std::int64_t cost = cost_of(recipe, q, resident);
+            const double cost = heuristic ? heuristic_cost(recipe, q, resident)
+                                          : (double)cost_of(recipe, q, resident);
+            if (!std::isfinite(cost))
+                return;
             if (!best || cost < best_cost) {
                 best = recipe;
                 best_cost = cost;
@@ -223,13 +288,17 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q) {
     });
     if (!best)
         return std::nullopt;
-    last = {q, {*best, plan_raster(q, best->bm, best->bn), "model"}, true};
+    last = {q,
+            {*best, plan_raster(q, best->bm, best->bn), heuristic ? "heuristic" : "model"},
+            heuristic, true};
     return last.decision;
 }
 
 PlanDecision select_plan(const PlanQuery& q) {
+    if (q.m <= 0 || q.n <= 0 || q.k <= 0)
+        throw std::invalid_argument("GEMM planner: M, N and K must be greater than zero");
     const int mode = gemm_planner_mode();
-    if (mode != 2 && !gemm_table_off()) {
+    if ((mode == 0 || mode == 1) && !gemm_table_off()) {
         if (auto d = row_plan(q, plan_override_row(q), "override"))
             return *d;
         if (auto d = row_plan(q, plan_injected_row(q), "injected"))
@@ -237,17 +306,13 @@ PlanDecision select_plan(const PlanQuery& q) {
         if (auto d = row_plan(q, plan_builtin_row(q), "builtin"))
             return *d;
     }
-    if (mode == 1 || mode == 2)
-        if (auto d = model_plan(q))
+    if (mode == 1 || mode == 2 || mode == 3)
+        if (auto d = model_plan(q, mode != 2))
             return *d;
 
-    if (auto d = row_plan(q, plan_degraded_row(q.m), "degraded"))
-        return *d;
+    throw std::runtime_error(
+        "GEMM planner: no eligible recipe for the selected mode, shape and device");
 
-    // Preserve the default for empty shapes or missing device facts.
-    const TableRow fallback = plan_degraded_row(0);
-    return {*recipe_of((int)fallback.cta, fallback.stages, fallback.kk, false, 2, 2),
-            0, "degraded"};
 }
 
 } // namespace

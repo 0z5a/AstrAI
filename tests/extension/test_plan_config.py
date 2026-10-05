@@ -44,11 +44,19 @@ def _clean_plan_state():
 
 class TestMode:
     def test_default_is_hybrid(self):
-        # The shipped default: rows when any exist, else the model. The
-        # compiled-in tables are empty, so a fresh process gets the model.
+        # The shipped default: rows when any exist, else the heuristic. The
+        # test shape has no builtin row, so a fresh process gets the heuristic.
         state = kernel.gemm.state()
         assert state["planner"] == "hybrid"
-        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "heuristic"
+        default = kernel.gemm.probe(*SHAPE)
+        with plan.override(planner="heuristic"):
+            explicit = kernel.gemm.probe(*SHAPE)
+        assert (default["cta"], default["stages"], default["kk"]) == (
+            explicit["cta"],
+            explicit["stages"],
+            explicit["kk"],
+        )
 
     def test_model_mode_skips_the_rows(self):
         kernel.gemm.set_planner("model")
@@ -56,18 +64,45 @@ class TestMode:
         assert kernel.gemm.state()["planner"] == "model"
         assert kernel.gemm.probe(*SHAPE)["source"] == "model"
 
-    def test_hybrid_prefers_rows_then_model(self):
+    def test_hybrid_prefers_rows_then_heuristic(self):
         kernel.gemm.set_planner("hybrid")
-        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "heuristic"
         kernel.gemm.set_table(ROW)  # a row now owns the shape
         assert kernel.gemm.probe(*SHAPE)["source"] == "override"
         kernel.gemm.set_table("-")  # every row tier off
-        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "heuristic"
 
     def test_model_only_ignores_the_table(self):
         kernel.gemm.set_planner("model")
         kernel.gemm.set_table(ROW)
         assert kernel.gemm.probe(*SHAPE)["source"] == "model"
+
+    def test_heuristic_skips_rows_and_does_not_reuse_model_cache(self):
+        kernel.gemm.set_table(ROW)
+        plan.configure(rows=ROW, tier="injected")
+        for mode in ("model", "heuristic", "model", "heuristic"):
+            with plan.override(planner=mode):
+                assert kernel.gemm.state()["planner"] == mode
+                assert kernel.gemm.probe(*SHAPE)["source"] == mode
+
+    @pytest.mark.parametrize("mode", ["hybrid", "table", "heuristic", "model"])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (0, 64, 32),
+            (8, 0, 32),
+            (8, 64, 0),
+            (-1, 64, 32),
+            (8, -1, 32),
+            (8, 64, -1),
+        ],
+    )
+    def test_probe_requires_positive_dimensions(self, mode, shape):
+        with plan.override(planner=mode):
+            with pytest.raises(
+                RuntimeError, match="M, N and K must be greater than zero"
+            ):
+                kernel.gemm.probe(*shape)
 
     def test_invalid_mode_rejected(self):
         with pytest.raises(ValueError):
@@ -84,19 +119,25 @@ class TestTable:
 
     def test_off_mode_kills_the_rows_only(self):
         # "-" disables override, injected and builtin alike; what answers
-        # after that is the planner mode's business: the model under the
-        # shipped hybrid default, the degraded ladder under "table".
+        # after that is the planner mode's business: the heuristic under the
+        # shipped hybrid default, a missing-row error under "table".
         kernel.gemm.set_table("-")
-        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "heuristic"
         kernel.gemm.set_planner("table")
-        assert kernel.gemm.probe(*SHAPE)["source"] == "degraded"
+        with pytest.raises(RuntimeError, match="no eligible recipe"):
+            kernel.gemm.probe(*SHAPE)
+
+    def test_table_miss_rejects_instead_of_guessing(self):
+        with plan.override(planner="table", rows=ROW, tier="override"):
+            with pytest.raises(RuntimeError, match="no eligible recipe"):
+                kernel.gemm.probe(128, 1024, 256, trans_a=True)
 
     def test_clear_restores_the_default(self):
         kernel.gemm.set_table(ROW)
         kernel.gemm.set_table("")
         assert kernel.gemm.state()["table"]["override_rows"] == 0
-        # The builtin tables ship empty, so the model answers again.
-        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
+        # This shape has no builtin row, so the heuristic answers again.
+        assert kernel.gemm.probe(*SHAPE)["source"] == "heuristic"
 
     def test_injected_rows_rank_below_override(self):
         plan.configure(rows=ROW, tier="injected")
@@ -289,6 +330,54 @@ class TestModelRule:
             )
 
 
+class TestHeuristicLaunch:
+    """Exercise actual selected kernels, including tails and layout rewrites."""
+
+    @pytest.mark.parametrize(
+        "pair",
+        [
+            (torch.bfloat16, torch.bfloat16),
+            (torch.bfloat16, torch.int8),
+            (torch.int8, torch.int8),
+            (torch.float8_e4m3fn, torch.float8_e4m3fn),
+            (torch.float8_e5m2, torch.float8_e5m2),
+        ],
+    )
+    @pytest.mark.parametrize("tma", [False, True])
+    @pytest.mark.parametrize("batch", [1, 3])
+    @pytest.mark.parametrize(
+        "trans_a,trans_b", [(False, True), (True, True), (False, False), (True, False)]
+    )
+    def test_tail_batch_and_layout_correctness(
+        self, pair, tma, batch, trans_a, trans_b
+    ):
+        if (
+            pair[0] in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and not kernel.gemm.capabilities()["fp8"]
+        ):
+            pytest.skip("FP8 kernels unavailable")
+        m, n, k = 33, 67, 80
+        prefix = () if batch == 1 else (batch,)
+        a_math = torch.randint(-2, 3, (*prefix, m, k), device="cuda").float()
+        b_math = torch.randint(-2, 3, (*prefix, k, n), device="cuda").float()
+        a = (a_math.transpose(-2, -1) if trans_a else a_math).to(pair[0]).contiguous()
+        b = (b_math.transpose(-2, -1) if trans_b else b_math).to(pair[1]).contiguous()
+        sa = None if pair[0] == torch.bfloat16 else torch.tensor([0.5], device="cuda")
+        sb = None if pair[1] == torch.bfloat16 else torch.tensor([0.25], device="cuda")
+        expected = a_math @ b_math
+        if sa is not None:
+            expected *= sa
+        if sb is not None:
+            expected *= sb
+        with plan.override(planner="heuristic", tma=tma, mx=False):
+            actual = kernel.gemm.quant_gemm(a, b, sa, sb, trans_a, trans_b)
+            info = kernel.gemm.probe(
+                m, n, k, *pair, trans_a=trans_a, trans_b=trans_b, batch=batch
+            )
+        assert info["source"] == "heuristic"
+        torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
+
+
 class TestPlanFacade:
     """The ``plan`` value API over the same bindings the flat names call."""
 
@@ -428,4 +517,37 @@ class TestCrossLanguageSpellings:
             tile.cta,
             tile.stages,
             tile.kk,
+        )
+
+
+@pytest.mark.parametrize("tma", [False, True])
+def test_heuristic_resources_match_launched_geometry(tma):
+    with plan.override(planner="heuristic", tma=tma, mx=False):
+        info = plan.probe(512, 4096, 4096)
+    resources = {row[:3]: row for row in info.resources}
+    assert resources
+    for row in resources.values():
+        _cta, _stages, _kk, bm, bn, kk, wm, wn, threads, resident, regs, local = row
+        assert threads == (bm // wm) * (bn // wn) * 32
+        assert resident >= 0 and regs >= 0 and local >= 0
+        if resident:
+            assert regs > 0
+    # The named 64x64x64 recipe is actually widened to sixteen warps.
+    small = resources[(0, 2, 64)]
+    assert small[6:9] == (16, 16, 512)
+    selected = resources[(info.cta, info.stages, info.kk)]
+    assert selected[9] > 0
+
+
+@pytest.mark.parametrize("k", [79, 80])
+def test_heuristic_probe_uses_contiguous_operand_alignment(k):
+    with plan.override(planner="heuristic", tma=True, mx=False):
+        info = plan.probe(33, 67, k)
+        if k == 79:
+            assert not info.tma
+        a = torch.randint(-2, 3, (33, k), device="cuda").bfloat16()
+        b = torch.randint(-2, 3, (67, k), device="cuda").bfloat16()
+        actual = kernel.gemm.quant_gemm(a, b)
+        torch.testing.assert_close(
+            actual, (a.float() @ b.float().T).bfloat16(), rtol=0, atol=0
         )

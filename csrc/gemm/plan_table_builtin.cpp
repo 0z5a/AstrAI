@@ -30,7 +30,7 @@ namespace gemm {
  *
  * A stale row is worse than none (2026-09-14 +33% lesson): the tier is
  * signature-guarded by kBuiltinPlanMeasuredOn — mismatch serves nothing,
- * chain runs override -> injected -> [no builtin] -> model -> degraded.
+ * default chain runs override -> injected -> [no builtin] -> heuristic.
  * Another part gets its own sweep, never these rows.
  */
 
@@ -220,7 +220,7 @@ bool builtin_rows_match_device(const DeviceFacts& dev) {
 /*
  * Builtin table for one dtype class; count receives its row count. An empty
  * table (the shipped default) returns a valid pointer and a zero count, so
- * plan_row_for matches nothing and the chain falls through to the model.
+ * plan_row_for matches nothing and the default chain falls through to the heuristic.
  */
 const TableRow* builtin_plan_table(int perf_class, int& count) {
     switch (perf_class) {
@@ -240,26 +240,6 @@ const TableRow* builtin_plan_table(int perf_class, int& count) {
         count = 0;
         return nullptr;
     }
-}
-
-/*
- * Last-resort rows for the chain's tail: the M band's dominant recipe from
- * the full-coverage sweep (small for short M, narrow mid, big past mid) —
- * a safe default, never best. Open N with -1 keys matches every shape, so
- * planning stays a total function; the fallback selector reads the
- * M band alone (the m-only query below carries the matcher's "strictly
- * past the min" caveat: an n of 0 sits ON the open bound, so a 1 stands
- * for "some real n").
- */
-static constexpr TableRow kDegradedPlanRows[] = {
-    {TileClass::kSmall64, 0, 512, 0, 0, -1, -1, 2, 0},
-    {TileClass::kNarrow128x64, 512, 3072, 0, 0, -1, -1, 2, 0},
-    {TileClass::kBig128, 3072, 0, 0, 0, -1, -1, 2, 0},
-};
-
-const TableRow* degraded_plan_table(int& count) {
-    count = sizeof(kDegradedPlanRows) / sizeof(kDegradedPlanRows[0]);
-    return kDegradedPlanRows;
 }
 
 } // namespace gemm

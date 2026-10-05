@@ -49,7 +49,8 @@ template <typename ElemA,
           typename LayoutA,
           typename LayoutB,
           typename OutT = __nv_bfloat16,
-          typename Schedule = MmaSync>
+          typename Schedule = MmaSync,
+          typename LayoutOut = RowMajor>
 PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
     PlanQuery q;
     q.m = p.m;
@@ -73,7 +74,15 @@ PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
                                   (p.batch > 1 ? p.a_batch_stride : 0) * sizeof(ElemA)) &&
             astrai::tma_aligned16(p.b_ptr, p.b_ld * sizeof(ElemB),
                                   (p.batch > 1 ? p.b_batch_stride : 0) * sizeof(ElemB));
+    q.contiguous = q.crosswise == 0 && p.a_ld == p.k && p.b_ld == p.k &&
+                   (reinterpret_cast<uintptr_t>(p.a_ptr) % 32) == 0 &&
+                   (reinterpret_cast<uintptr_t>(p.b_ptr) % 32) == 0 &&
+                   (p.batch <= 1 || ((p.a_batch_stride * sizeof(ElemA)) % 32 == 0 &&
+                                     (p.b_batch_stride * sizeof(ElemB)) % 32 == 0));
     q.dev = dev;
+    q.rank3a = p.batch > 1 && p.a_batch_stride > 0;
+    q.rank3b = p.batch > 1 && p.b_batch_stride > 0;
+    q.resources = &resources_for<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT, Schedule>;
     return q;
 }
 
@@ -83,9 +92,10 @@ template <typename ElemA,
           typename LayoutA,
           typename LayoutB,
           typename OutT = __nv_bfloat16,
-          typename Schedule = MmaSync>
+          typename Schedule = MmaSync,
+          typename LayoutOut = RowMajor>
 LaunchPlan plan_dispatch_for(const GemmParams& p) {
-    const PlanQuery q = plan_query<ElemA, ElemB, LayoutA, LayoutB, OutT, Schedule>(
+    const PlanQuery q = plan_query<ElemA, ElemB, LayoutA, LayoutB, OutT, Schedule, LayoutOut>(
         p, device_facts());
     return {plan_dispatch(q), q.tma};
 }
@@ -185,7 +195,7 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
     const auto launch = [&](auto la, auto lb, auto lout) {
         launch_plan<ElemA, ElemB, decltype(la), decltype(lb), decltype(lout), OutT, Schedule>(
             p,
-            plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb), OutT, Schedule>(p),
+            plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb), OutT, Schedule, decltype(lout)>(p),
             stream);
     };
     with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, launch);
@@ -201,11 +211,14 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
 
 #define ASTRAI_GEMM_INSTANTIATE(W, A)                                                          \
     template void gemm_dispatch<W, A, __nv_bfloat16, ASTRAI_GEMM_SCHEDULE>(                    \
-        GemmParams, cudaStream_t, bool, bool)
+        GemmParams, cudaStream_t, bool, bool);                                              \
+    template std::pair<PlanDecision, PlanQuery> plan_probe_for<W, A, ASTRAI_GEMM_SCHEDULE>( \
+        int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&)
 
 /*
  * Host-only planner probe (the autotuner's coverage check): the decision
- * gemm_dispatch would make, without a launch — the planner is GPU-free.
+ * gemm_dispatch would make, without a launch or timing. The heuristic
+ * queries compiled kernel resources on the current CUDA device.
  * The shared tag ladder (NN rewrite included) keeps a probe from
  * disagreeing with the real call's branch. Returns the decision plus the
  * query it answered.
@@ -218,19 +231,23 @@ std::pair<PlanDecision, PlanQuery> plan_probe_for(int64_t m,
                                                   bool trans_a,
                                                   bool trans_b,
                                                   const DeviceFacts& dev) {
-    GemmParams p{}; // the planner reads m/n/k/batch only
+    GemmParams p{}; // contiguous operands with aligned base addresses
     p.m = static_cast<int>(m);
     p.n = static_cast<int>(n);
     p.k = static_cast<int>(k);
     p.batch = static_cast<int>(batch);
+    p.a_ld = trans_a ? m : k;
+    p.b_ld = trans_b ? k : n;
+    p.a_batch_stride = batch > 1 ? m * k : 0;
+    p.b_batch_stride = batch > 1 ? n * k : 0;
     bool swapped = false;
     if constexpr (std::is_same_v<ElemA, ElemB>) {
         swapped = !trans_a && !trans_b;
         canonicalize_gemm(p, trans_a, trans_b); // symmetric NN -> transposed TT
     }
-    return with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, [&](auto la, auto lb, auto) {
+    return with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, [&](auto la, auto lb, auto lo) {
         PlanQuery q =
-            plan_query<ElemA, ElemB, decltype(la), decltype(lb), __nv_bfloat16, Schedule>(p, dev);
+            plan_query<ElemA, ElemB, decltype(la), decltype(lb), __nv_bfloat16, Schedule, decltype(lo)>(p, dev);
         return std::make_pair(plan_dispatch(q), std::move(q));
     });
 }

@@ -81,9 +81,8 @@ int plan_resident_ctas(TileClass cta, int stages, int kk, const PlanQuery& q) {
 
 /*
  * First matching row wins (generated tables are non-overlapping). q.k <= 0
- * is the open-K reading (degraded rows, no-depth callers); q.dev.sms <= 0
- * skips gated rows rather than guessing, and the lookup still ends at the
- * degraded rows — planning stays total.
+ * is the open-K reading for no-depth callers; q.dev.sms <= 0 skips
+ * gated rows rather than guessing. No match returns nullptr.
  */
 inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQuery& q) {
     for (int i = 0; i < count; ++i) {
@@ -357,8 +356,9 @@ inline RowSource& plan_table_injected_source() {
  * The planner-rank vocabulary, one place: the strings configure() takes
  * and config_state() returns for GemmConfig::planner.
  */
-inline constexpr const char* kPlannerModeNames[] = {"table", "hybrid", "model"};
-inline constexpr int kPlannerModeCount = 3;
+inline constexpr const char* kPlannerModeNames[] = {"table", "hybrid", "model", "heuristic"};
+inline constexpr int kPlannerModeCount =
+    sizeof(kPlannerModeNames) / sizeof(kPlannerModeNames[0]);
 bool parse_planner_mode(const std::string& name, int& out) {
     for (int i = 0; i < kPlannerModeCount; ++i)
         if (name == kPlannerModeNames[i]) {
@@ -375,7 +375,7 @@ bool parse_planner_mode(const std::string& name, int& out) {
 int gemm_planner_mode() {
     gemm_config_seed_once();
     const int v = gemm_config().planner.load(std::memory_order_relaxed);
-    return v < 0 ? 1 : v; // default: hybrid (model fills what no row owns)
+    return v < 0 ? 1 : v; // default: hybrid (heuristic fills what no row owns)
 }
 bool gemm_table_off() {
     gemm_config_seed_once();
@@ -502,15 +502,7 @@ std::optional<TableRow> plan_builtin_row(const PlanQuery& q) {
     return row ? std::optional<TableRow>(*row) : std::nullopt;
 }
 
-TableRow plan_degraded_row(int64_t m) {
-    PlanQuery m_only;
-    m_only.m = m;
-    m_only.n = 1; // Row bounds are exclusive on the lower edge.
-    int count = 0;
-    const TableRow* rows = degraded_plan_table(count);
-    const TableRow* row = plan_row_for(rows, count, m_only);
-    return row ? *row : rows[0];
-}
+
 
 } // namespace gemm
 } // namespace astrai

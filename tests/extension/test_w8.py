@@ -228,46 +228,28 @@ class TestQuantizers:
 
 
 @skip_no_kernel
-class TestQuantGemmDegenerate:
-    """Empty problems extend/contract nothing: the result is returned empty
-    instead of launching — a zero-extent grid is an illegal launch, which the
-    launch check turns into a process exit. k == 0 is the empty sum (zeros,
-    plus bias when given); both are pinned here."""
+class TestQuantGemmPositiveGeometry:
+    """Reject zero dimensions before allocation or planner selection."""
 
-    def test_empty_m(self):
-        x = torch.empty((0, 32), device="cuda", dtype=torch.bfloat16)
-        w = torch.empty((32, 64), device="cuda", dtype=torch.bfloat16)
-        out = quant_gemm(x, w, trans_b=False)
-        assert out.shape == (0, 64) and out.dtype == torch.bfloat16
+    @pytest.mark.parametrize("mode", ["hybrid", "table", "heuristic", "model"])
+    @pytest.mark.parametrize("shape", [(0, 64, 32), (8, 0, 32), (8, 64, 0)])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_zero_dimension_rejected(self, mode, shape, batched):
+        from astrai.extension import plan
 
-    def test_empty_n(self):
-        x = torch.empty((8, 32), device="cuda", dtype=torch.bfloat16)
-        w = torch.empty((0, 32), device="cuda", dtype=torch.bfloat16)
-        out = quant_gemm(x, w, trans_b=True)
-        assert out.shape == (8, 0)
+        m, n, k = shape
+        prefix = (3,) if batched else ()
+        a = torch.empty((*prefix, m, k), device="cuda", dtype=torch.bfloat16)
+        b = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
+        with plan.override(planner=mode, table_off=True):
+            with pytest.raises(
+                RuntimeError, match="M, N and K must be greater than zero"
+            ):
+                quant_gemm(a, b)
 
-    def test_empty_m_still_validates_the_scale(self):
-        x = torch.empty((0, 32), device="cuda", dtype=torch.bfloat16)
-        w = torch.empty((64, 32), device="cuda", dtype=torch.int8)
-        s = torch.ones(1, device="cuda", dtype=torch.float32)
-        out = quant_gemm(x, w, b_scale=s, trans_b=True)
-        assert out.shape == (0, 64)
-
-    def test_k_zero_is_the_empty_sum(self):
-        x = torch.empty((8, 0), device="cuda", dtype=torch.bfloat16)
-        w = torch.empty((0, 64), device="cuda", dtype=torch.bfloat16)
-        out = quant_gemm(x, w, trans_b=False)
-        assert bool((out == 0).all())
-
-    def test_k_zero_keeps_bias(self):
-        x = torch.empty((4, 0), device="cuda", dtype=torch.bfloat16)
-        w = torch.empty((0, 5), device="cuda", dtype=torch.bfloat16)
+    def test_zero_k_with_bias_rejected(self):
+        a = torch.empty((4, 0), device="cuda", dtype=torch.bfloat16)
+        b = torch.empty((5, 0), device="cuda", dtype=torch.bfloat16)
         bias = torch.arange(5, device="cuda", dtype=torch.bfloat16)
-        out = quant_gemm(x, w, bias=bias, trans_b=False)
-        assert torch.equal(out, bias.expand(4, 5))
-
-    def test_empty_batched(self):
-        x = torch.empty((3, 0, 32), device="cuda", dtype=torch.bfloat16)
-        w = torch.empty((32, 64), device="cuda", dtype=torch.bfloat16)
-        out = quant_gemm(x, w, trans_b=False)
-        assert out.shape == (3, 0, 64)
+        with pytest.raises(RuntimeError, match="M, N and K must be greater than zero"):
+            quant_gemm(a, b, bias=bias)

@@ -47,7 +47,7 @@ def note_launch(a, b, a_scale, b_scale, trans_a, trans_b, bias) -> None:
 # knobs between launches instead of rewriting the environment.
 # ---------------------------------------------------------------------------
 
-PLANNER_MODES = ("table", "hybrid", "model")
+PLANNER_MODES = ("table", "hybrid", "model", "heuristic")
 ROW_TIERS = ("override", "injected")
 
 Rows = Union[str, Path]
@@ -138,7 +138,7 @@ class PlanConfig(_Record):
 @dataclass(frozen=True)
 class Decision(_Record):
     """The dispatch decision for one problem: ``source`` names the row tier
-    (or the model / degraded end) that answered."""
+    (or the model / heuristic) that answered."""
 
     source: str
     cta: int
@@ -147,6 +147,8 @@ class Decision(_Record):
     kk: int
     perf_class: int
     crosswise: int
+    tma: bool = False
+    resources: Tuple[Tuple[int, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -293,12 +295,12 @@ def probe(
     trans_b: bool = True,
     batch: int = 1,
 ) -> Decision:
-    """The dispatch decision for one problem — GPU-free (no launch)."""
-    return Decision(
-        **get_module("gemm").plan_probe(
-            m, n, k, dt_a, dt_b, trans_a=trans_a, trans_b=trans_b, batch=batch
-        )
+    """Inspect dispatch without launching; heuristic mode queries CUDA metadata."""
+    info = get_module("gemm").plan_probe(
+        m, n, k, dt_a, dt_b, trans_a=trans_a, trans_b=trans_b, batch=batch
     )
+    info["resources"] = tuple(tuple(row) for row in info["resources"])
+    return Decision(**info)
 
 
 def tiles() -> List[Tile]:
@@ -324,7 +326,6 @@ from astrai.extension.policy.gemm.autotune import (  # noqa: E402
     _problem_key,
     device_signature,
     enable,
-    heuristic_rows,
 )
 
 __all__ = [
@@ -340,7 +341,6 @@ __all__ = [
     "Problem",
     "Row",
     "device_signature",
-    "heuristic_rows",
     "_problem_key",
     "set_autotuner",
     "note_launch",

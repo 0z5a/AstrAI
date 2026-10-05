@@ -32,8 +32,100 @@ The device policy composes element types, tile geometry, shared-memory
 layout, schedule and epilogue. Instruction wrappers own the register
 contract; `static_assert` enforces architecture and layout constraints.
 Host planning is a fixed sequence of ordinary functions: override rows,
-injected rows, measured builtin rows, model, then degraded fallback,
+injected rows, measured builtin rows, then heuristic,
 subject to the selected planner mode. No virtual planner hierarchy is needed.
+
+## Geometry heuristic (`geom_cta`)
+
+`plan.configure(planner="heuristic")` uses the same `geom_cta` rule as the
+Python replay script. Explicit heuristic mode skips measured rows; default
+`hybrid` checks rows first, then uses geom_cta. Both read compiled kernel
+metadata without timing kernels. The older `model` is explicit-only.
+
+### Formula
+
+For effective CTA tile `(BM,BN,KK)`, warp tile `(WM,WN)`, `P` threads,
+input byte widths `a,b`, and `S` SMs:
+
+```text
+w = P/32
+L = ceil(K/KK)
+G = batch*ceil(M/BM)*ceil(N/BN)
+R = min(CUDA resident-CTA limit, ceil(G/S))
+W = ceil(G/(S*R))
+
+B = KK*(BM*a + BN*b)/512                 # copy work
+I = (KK/MMA_K)*(BM/16)*(BN/8)/w           # per-warp MMA work
+H = KK*(WM*a + WN*b)/512                 # fragment loads
+D = KK*(WM*[a<b] + WN*[b<a])/64          # mixed-width conversion
+E = output_bytes*BM*BN/512
+J = 2 if TMA else B
+
+C_mem      = W*R*(L*B + E)
+C_mma      = W*R*L*w*I
+C_serial   = W*L*(I + H + D)
+C_fragment = W*R*L*w*(H + D)
+C_control  = W*R*L*(2*w + J)
+eta = R if cp.async else 1
+score = log(C_mem) - log(eta) + log(C_mma) + log(C_serial)
+      + log(C_fragment) + log(C_control)    # smaller wins
+```
+
+`MMA_K` follows compiled instruction traits; `[condition]` is 0 or 1.
+The launcher resolves warp widening and output reclaim before scoring.
+The cp.async memory discount assumes resident CTAs help hide copy latency;
+`R` is a count, not a utilization fraction or measured speedup.
+
+### Why geometric averaging and log space
+
+Conceptually, each cost is normalized by that arm's best candidate, then
+the five relative costs are geometrically averaged. This combines relative
+work without fitting a bytes-to-instruction-time conversion; changing an
+arm's units does not change the ranking. Normalization subtracts a common
+constant in log space, and the fifth root divides every score by five, so
+both are omitted. Python negates the score because its harness maximizes.
+
+Both implementations factor products into log sums, e.g.
+`log(W*R*L*w*I)=log(W)+log(R)+log(L)+log(w)+log(I)`. The memory sum uses:
+
+```text
+x = log(L) + log(B); y = log(E)
+log(L*B + E) = max(x,y) + log1p(exp(-abs(x-y)))
+```
+
+No large cost products or `exp(score)` are formed; the one exponential has
+a nonpositive argument. C++ uses `double`, Python uses double-precision
+`float`. C++ avoids `n+d-1` overflow in heuristic ceil division and casts
+grid axes before multiplication. M/N/K must be positive; nonfinite
+scores are excluded. Rounding and near ties remain possible.
+This protection applies to this score, not the older integer `model` or
+every launch calculation. Logs run on the host; decisions are cached.
+
+**Limits and validation.** These overlapping work proxies can trade one
+advantage against another bottleneck, so their geometric mean is not a
+latency prediction. Cache reuse, spills, scalar tails and crosswise loads
+are approximate; a later TMA encoding fallback is not rescored. On 36
+RTX 5090 same-process ABBA points (BF16/W8A16/W8A8, both paths, MX off),
+geom_cta had -0.34% aggregate latency and +20.1% worst-point latency versus
+`model`. Other GPUs are unvalidated. The log port passed 112 plan tests,
+69 C++/Python selection checks and 108 historical candidate selections;
+a Python-only synthetic integer-limit check kept 12 candidate scores finite.
+
+In heuristic mode, `plan.probe(...).resources` exposes rows containing
+`(cta,stages,kk)`, effective `(bm,bn,kk,wm,wn,threads)`, resident CTAs,
+registers/thread and local bytes/thread. Metadata is cached per typed kernel
+and device. Local allocation is not a dynamic spill count. Probe assumes
+contiguous aligned inputs; actual views can choose a different staging path.
+
+The replay script keeps `geom_cta`, `geom_barrier`, `ncu_spill` and the
+`model_exact` baseline. `ncu_spill` uses a local-footprint risk estimate,
+not NCU timings. Only geom_cta and model_exact have C++ counterparts:
+
+```bash
+python csrc/bench/model_capture.py results.json --staging cpasync
+python csrc/bench/model_capture.py results.json --rule geom_cta --check
+python csrc/bench/model_capture.py results.json --rule model_exact --check
+```
 
 ## Source layout
 
@@ -62,7 +154,7 @@ Headers under `csrc/include` contain declarations and device templates;
 | `launcher/gemm_dispatch.cuh` | Typed query construction, layout canonicalization, and routing shared by launch and probe |
 | `launcher/plan_types.h` | Planner query/decision types shared with the launch templates |
 | `gemm/plan_table.h` / `plan_table.cpp` | Private host row contract, parsing, row sources, configuration and row selection |
-| `gemm/plan_table_builtin.cpp` | Generated measured rows and degraded fallback rows, compiled in a separate host TU |
+| `gemm/plan_table_builtin.cpp` | Generated measured rows, compiled in a separate host TU |
 | `gemm/planning.cpp` | Recipe vocabulary, model ranking and raster selection |
 | `api/gemm.h` | The family's C++ surface — declarations only, and template-free so including it instantiates no dtype-pair kernel: `quant_gemm_impl` (the one GEMM entry), the planner face (`PlanProbe` + `plan_probe`, `GemmConfigPatch` — `rows` + `tier` (`RowTier`) + `table_off` + the mode/log/staging knobs — with the re-installable `GemmConfigState`, through `configure` / `config_state`) and the vocabulary (`tile_vocabulary` / `tile_class_names`). No Python type in a signature — the composed fp8 linear and the bindings TU call the same functions |
 | `gemm/gemm.cu` | Typed host layer: one dtype-pair visitor feeds launch and probe; the schedule visitor selects the compiled architecture variant. Holds no `py::` type |
@@ -117,12 +209,10 @@ buffer folds into the returned dispatch flag at zero copy — the kernel's
 `LayoutA`/`LayoutB` tags cover both storages, and m/n/k derive from the
 user flag only.
 
-Degenerate geometry: `k == 0` is the empty sum — zero mainloop iterations,
-so the epilogue writes zero, plus bias when given. `m == 0` / `n == 0`
-return an empty result without launching (a zero grid extent is an illegal
-launch); the guard sits at the end of the entry ladder, so an empty call
-still validates its configuration. Both are pinned in
-`tests/extension/test_w8.py` (`TestQuantGemmDegenerate`).
+Geometry requires **M > 0, N > 0, K > 0**, including batched calls.
+The operator entry and planner probe reject zero dimensions before dispatch;
+probe also rejects negative dimensions. There is no empty-output or empty-sum
+special case. Tests cover every planner mode, batches, and bias.
 
 ## Device design notes
 
@@ -324,170 +414,86 @@ unchanged.
 
 ## Planning
 
-**The row table** (`gemm/plan_table.cpp`) is the production planner's
-first resort — `plan_gemm` consults a measured row table: (M, N, K) bands
-(min exclusive, max inclusive, 0 = open), keyed per dtype class / crosswise
-count, each row naming a recipe (CTA class + ring depth; raster 0 =
-`plan_raster` with the row's geometry). The compiled-in rows are one table
-per dtype class (`kBuiltinPlanW16A16` / `W8A16` / `W8A8` / `F8A8`, selected
-by `builtin_plan_table`): the class *is* the table — a row tuned for one
-operand pair cannot fire on another (`gemm_perf_class` tests the int8 pair
-before the "not bf16 → fp8 pair" arm). `row_plan` is the single
-interpreter: geometry from the CTA class, ring depth from the row, raster 0
-= `plan_raster`, and one smem gate — a row whose ring exceeds the smem
-opt-in ceiling falls through to the degraded bands instead of a failed
-launch. A miss falls to the degraded band rows (last-resort M-band
-geometry: small ≤ 512, narrow ≤ 3072, big beyond), always matching, so
-planning is a total function. Full-coverage tables end each class with a
-catch-all row, so a miss means the table is empty or stale, not a shape
-the planner should infer.
+`gemm/planning.cpp` ranks recipes; `gemm/plan_table.cpp` owns row parsing,
+configuration and lookup. Ties keep manifest order. Decisions are cached
+per thread/query; row lookup precedes heuristic ranking, so newly installed rows
+take effect immediately. Empty tables avoid their mutex.
 
-**Row format** — one row per line:
-`m_min m_max n_min n_max perf_class crosswise cta stages raster [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]`.
-The optional `k` is the row's ring K (omitted keeps 64; a kK=32 row only
-survives a dual-2-byte pair); the optional pair is the row's K band, same
-(min, max] rule, omitted keeps it open. The trailing gates are wave
-arithmetic priced against `DeviceFacts` at lookup time: `min_ctas_per_sm`
-matches only while the row's own grid covers that many CTAs per SM, and
-`min_wave_permille` is the same idea in per-mille of a full machine —
-literal M bounds calibrated to one SM count and wave gates both exist
-because measured latency crossovers sometimes keep literal bounds and
-sometimes scale with occupancy. Compiled-in rows are pasted manually
-between the GENERATED markers of `gemm/plan_table_builtin.cpp` (the measurement
-script emits rows; a rebuild picks them up).
+| Mode | Search order (first match wins) |
+| --- | --- |
+| `table` | override → injected → builtin |
+| `hybrid` (default) | override → injected → builtin → geom_cta |
+| `model` | fitted model |
+| `heuristic` | geom_cta |
 
-**The planner chain**: override rows, injected rows, the compiled-in table,
-the analytical model, the degraded bands — first to answer wins, and the
-mode only picks which chain runs: `"table"` (rows then degraded),
-`"hybrid"` (+model between), `"model"` alone. `table_off=True` disables
-every row tier at once; every chain ends in the degraded rows (open bands,
-m=0 fallback), so dispatch is total. The shipped default is **hybrid with
-the compiled-in tables empty**, so a fresh process answers with the
-analytical model and takes measured recipes from the override tier or the
-autotuner cache; a measured row is only shipped when a device-specific
-build pastes one in. `configure(planner="")` restores the default instead
-of pinning a mode. The `ASTR_GEMM_*` environment variables are read once
-per process as a seed; explicit API calls win.
+Builtin rows are device-signature gated. `table_off=True` disables all row tiers;
+`planner=""` restores the default. `ASTR_GEMM_*` variables seed configuration
+once per process; explicit API calls override them. There is no fixed M-band
+fallback: an exhausted planner raises `no eligible recipe`. In `table` mode,
+a matching usable row is required. Nonpositive M/N/K are rejected before
+dispatch. The autotuner injects only measured cache rows; it does not seed synthetic M-band rows.
 
-**The analytical model** (`model_plan` in `gemm/planning.cpp`) is a
-port of DeepGEMM's config search (`get_best_configs`) reduced to what the
-recipe space needs. Wave count alone is not a valid ranking proxy here: a
-64×64 CTA's wave carries a quarter of a 128×128's work, so counting waves
-prefers the coarse tile regardless of fit. The model prices cost instead —
+**Rows.** One line selects a dtype class, crosswise count, CTA, stages and
+raster. Shape bands are `(min,max]`, with zero meaning open:
 
-- TMA (dual-congruous): `I_k = kk·(bm·ba + bn·bb)`,
-  `I_cta = k·(bm·ba + bn·bb)`, `O_cta = out_elem_bytes·bm·bn`.
-  The fitted mainloop arm adds `8·bm·bn·ceil(k/kk)` for non-byte pairs;
-  the MMA arm is calibrated separately. The ranking is
-  `max(I_cta + O_cta + mainloop, mma_arm) × W_eff`, where `W_eff` is
-  `ceil(blocks/(sms·resident))·resident` for two-byte pairs and
-  `ceil(blocks/sms)` otherwise. On sm_120 these coefficients came from
-  the RTX 5090 sweep. TMA residency uses the allocated ring plus the
-  1024-byte alignment pad and two 8-byte barriers per slot; a map failing
-  16-byte pointer/stride alignment is priced and launched as cp.async.
-  With `L = ceil(k/kk)`, the kernel issues `2L` TMA loads and
-  `L·(kk/k_mma)·(bm/16)·(bn/8)` warp MMA instructions per CTA.
-  `k_mma` is 16 for BF16/mixed and 32 for INT8/FP8. The fitted 8
-  and 64 are equivalent-byte weights, not hardware instruction rates;
-  the MMA arm is 64 times the instruction count above. Mixed precision
-  also dequantizes fragments, and SM120 FP8 uses a
-  block-scaled MMA instruction. The current model does not fit these
-  rates per precision class.
-- cp.async: `cost = (k-padded operand + output) × waves` with raw-floor
-  residency in the waves denominator — the software ring is the only
-  latency hiding, so residency divides the makespan instead of sharing
-  bandwidth; the axis flips with staging.
-
-On the RTX 5090, a fresh TMA sweep (5 warmups, 20 iterations, 2 trials per
-recipe) tested 12 BF16/mixed/int8 shapes and 32 int8/FP8 shapes. The
-per-class geometric mean of selected TFLOPS divided by the best measured
-recipe was (phase-ordered, suitable for ranking diagnostics only):
-
-| Formula | BF16 (4) | Mixed (4) | Int8 (4 + 16) | FP8 (16) |
-| --- | ---: | ---: | ---: | ---: |
-| Current TMA model | 0.980 | 0.994 | 0.954 / 0.985 | 0.979 |
-| `(I_cta + O_cta) · ceil(W)` | 0.892 | 0.906 | 0.900 / 0.935 | 0.928 |
-
-The traffic-only wave formula overprices occupancy as free bandwidth: resident
-CTAs can hide latency, but they still share one SM's transfer and MMA issue
-capacity. Charging each K tile's mainloop work and retaining the measured two-arm
-maximum avoids its small-tile bias. The present model still misses some
-long-K int8 and small FP8 cells; those need interleaved holdout measurements
-before changing coefficients or adding a row.
-
-Empty plan tables return without taking their mutex; the model keeps the
-last exact query and decision per thread. Table lookup still precedes the
-model, so an installed row takes effect immediately.
-
-Every width pair ranks on the cost alone; a tie keeps the candidate seen
-first (the manifest's own order). `kK` is not an independent axis — it
-falls out of residency: the kK=32 twin's smaller ring holds more CTAs per
-SM. The model carries no per-architecture constants; what it cannot
-express is the per-CTA efficiency that separates classes at a given
-(M, N) — the measured axis the row tables own, and the reason the hybrid
-chain keeps rows first.
-
-The Python extension separates configuration from tuning: `plan.py` owns
-the public config/probe/override API and the launch hook, while
-`autotune.py` owns candidate measurement, cache rows, and persistence.
-The FP8 path uses the same ownership rule: `fp8_slots.py` owns stable
-module-to-slot identities, and `autocast.py` owns region policy and
-`aten::linear` routing.
-
-**Runtime plan surface** (`astrai.extension.policy.gemm.plan`, re-exported from
-`astrai.extension`):
-
-```python
-from astrai.extension.policy.gemm import plan
-
-plan.config                            # the whole configuration, as a value
-plan.configure(planner="hybrid")       # "table" | "hybrid" | "model" | "" (unset)
-plan.configure(rows="rows.txt", tier="override")   # a row file or inline text
-plan.configure(rows="", tier="injected")           # clear that tier
-plan.configure(table_off=True)         # every row tier off at once
-plan.configure(log=True, tma=False)    # the decision log; the A/B staging switches
-plan.probe(512, 11008, 4096)           # the decision + who made it
-plan.facts                             # the DeviceFacts geometry
-plan.tiles()                           # the recipe vocabulary, with class names
-
-with plan.override(planner="model", rows="", tier="override"):
-    ...                                # restored on exit — knobs *and* rows
+```text
+m_min m_max n_min n_max perf_class crosswise cta stages raster
+    [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
 ```
 
-`configure` leaves every argument it is not given alone and returns the
-resulting value, so a saved `config` is re-installable: feeding its fields
-back restores exactly that state (each row tier carries the source spec it
-was installed from, and a plain `override(...)` block does this for you —
-including when the block raises). The flat `set_table` / `set_planner` /
-`set_log` / `set_staging` / `state` / `probe` / `facts` /
-`tile_vocabulary` names remain as the same bindings in their raw
-dict/list shapes — the `csrc/bench` tools parse those keys, so those
-spellings are contract.
+The display wraps for readability; each actual row occupies one line.
+Optional `k` is the recipe's ring K (default 64); `k_min/k_max` bound the
+problem K. Trailing gates require enough grid CTAs per SM or machine-fill
+per-mille. Raster zero invokes `plan_raster`. Unsupported recipes or rings
+above the device's shared-memory budget fall through. Builtin rows live
+between generated markers in `gemm/plan_table_builtin.cpp`; changing them
+requires a rebuild.
 
-`plan.probe` returns the decision `gemm_dispatch` would make, with the
-planner that made it: `"override"`, `"injected"`, `"builtin"`, `"model"`,
-or `"degraded"`.
+**Existing fitted model.** Available only through `planner="model"` for
+comparison; the default chain no longer uses it. It prices work as well as
+waves, since a large CTA performs more work than a small one:
 
-**Autotuning.** `kernel.gemm.enable()` installs the runtime autotuner: shapes
-no row serves tune once (candidates from `tile_vocabulary` filtered to the
-staging pair and smem ceiling, forced as one-row tables, interleaved
-CUDA-event medians over the caller's own tensors; the winner persists under
-`~/.astrai/cache/gemm_plans/<device-sig>.rows` so a new process or a
-different part re-derives nothing measured). The hook costs one flag check
-when disabled and idles while an override table owns the source. The
-offline whole-table recalibration is `csrc/bench/tune_plan_table.py run`:
-it sweeps (`sweep --full-coverage` — every combo × recipe over the M ×
-shape grid, each candidate as a one-row table toggled per launch,
-interleaved at each shape so the comparison shares one clock/thermal
-state), gates on the holdout validator (a ≥2% per-shape regression
-rejects), and installs under the same device signature. Sweep winners
-become rows: adjacent M runs with the same winner band-merge at mid-point
-edges; `--min-gain` (default 1%) keeps only rows above a minimum gain.
-Problem K is not a row range key (recipe `kk` selects the ring depth): a K/batch conflict at one
-(M, N) resolves to the best-TFLOPS point. The sweep times the fused-linear
-(NT) layout, so generated rows carry crosswise 0 — non-NT shapes (TT, TN,
-the mixed dual-row-major NN case) miss into the degraded bands, where the
-NN swap path covers the dual-row-major case.
+- cp.async: `(K-padded operand bytes + output bytes) * waves`, using raw
+  shared-memory-floor residency in the wave denominator.
+- TMA: `max(operand + output + mainloop, MMA_arm) * W_eff`. Mainloop cost
+  is `8*BM*BN*ceil(K/KK)` for non-byte pairs, zero for byte pairs; MMA cost
+  is 64 times the warp MMA instruction count. `W_eff` is resident-scaled
+  waves for two-byte pairs, otherwise `ceil(blocks/SMs)`. The coefficients
+  are RTX 5090 fitted equivalent-byte weights, not hardware rates.
+
+TMA residency includes ring padding/barriers. Pointer or stride alignment
+failures use cp.async. A smaller KK can improve residency but also adds loop
+iterations; neither occupancy nor wave count alone predicts performance.
+
+**Python API.** `plan.py` owns configuration and probe; `autotune.py` owns
+measurements, cache rows and persistence. FP8 slots and autocast routing are
+owned separately by `fp8_slots.py` and `autocast.py`.
+
+```python
+from astrai.extension import plan
+
+plan.configure(planner="heuristic")
+plan.configure(rows="rows.txt", tier="override")  # file or inline rows
+plan.configure(rows="", tier="injected")         # clear one tier
+plan.configure(log=True, tma=False)
+plan.probe(512, 11008, 4096)  # decision and source
+plan.config; plan.facts; plan.tiles()
+with plan.override(planner="model", rows="", tier="override"):
+    ...  # restores configuration and rows, including on exceptions
+```
+
+Unspecified configuration fields stay unchanged. Raw binding names such as
+`set_table`, `set_planner`, `set_staging`, `state`, `probe`, `facts` and
+`tile_vocabulary` retain their dict/list contracts for benchmark tooling.
+
+**Autotuning.** `kernel.gemm.enable()` enables candidate timing on caller
+tensors and persists winning rows under
+`~/.astrai/cache/gemm_plans/<device-sig>.rows`; an override row suppresses
+tuning. Offline `csrc/bench/tune_plan_table.py run` uses interleaved sweeps,
+a holdout gate (reject ≥2% per-shape regression), and row-band merging
+(`--min-gain` defaults to 1%). The sweep covers fused-linear NT layout;
+other layouts need separate validation. Generated K/batch conflicts at the
+same `(M,N)` currently resolve to the best-TFLOPS point.
 
 ## Not implemented
 

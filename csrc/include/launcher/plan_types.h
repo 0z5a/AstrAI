@@ -9,7 +9,7 @@ namespace astrai {
 namespace gemm {
 
 struct GemmConfig {
-    std::atomic<int> planner{-1};      // 0 table-only, 1 hybrid (table -> model), 2 model-only
+    std::atomic<int> planner{-1};      // 0 table, 1 hybrid, 2 fitted model, 3 geometry heuristic
     std::atomic<int> log{-1};          // [gemm-plan] stderr log on/off
     std::atomic<int> tma_disabled{-1}; // cp.async staging forced everywhere
     std::atomic<int> mx_disabled{-1};  // sm_120a block-scale cell knocked out
@@ -36,6 +36,13 @@ struct GemmRecipe {
     int smem;    // ring bytes at this staging pair's operand widths
 };
 
+struct KernelResources {
+    GemmRecipe effective{}; // after warp widening and output-reclaim substitution
+    int resident = 0;       // CUDA occupancy limit, not observed execution occupancy
+    int registers = 0;
+    int local_bytes = 0;
+};
+
 struct PlanQuery {
     int64_t m = 0;
     int64_t n = 0;
@@ -49,6 +56,9 @@ struct PlanQuery {
     int mma_k = 16;        // promoted MMA instruction K extent
     bool tma = true;        // effective staging selected for this launch
     DeviceFacts dev{};
+    bool rank3a = false, rank3b = false;
+    bool contiguous = false; // congruous rows and sector-aligned base pointers
+    KernelResources (*resources)(const GemmRecipe&, const PlanQuery&) = nullptr;
 };
 
 struct PlanDecision {
