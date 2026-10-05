@@ -14,6 +14,7 @@
 #include <memory/load_crosswise_packed.cuh>
 #include <memory/pipeline.cuh>
 #include <memory/tma.cuh>
+#include <mma/ldmatrix.cuh>
 #include <mma/mma.cuh>
 #include <policy.cuh>
 #include <utils/define.cuh>
@@ -23,16 +24,7 @@
 namespace astrai {
 namespace gemm {
 
-/*
- * TMA producer context: operand descriptors, ring-slot mbarriers, batch
- * coordinate bits. 2*depth bars — full[0..D): count 1, tripped by the elected
- * thread's expect_tx + the TMA's transaction bytes; empty[D..2D): count =
- * CTA threads, tripped when every consumer finished the slot. The CUTLASS
- * PipelineTmaAsync handshake replaces the per-k-tile __syncthreads: warps
- * skew freely, the producer's overwrite gate is the empty barrier alone.
- * Operand rank is a template bit (strided = 3, broadcast = 2) so the 2D/3D
- * issue pick compiles away.
- */
+/* TMA full barriers mark ready copies; empty barriers protect slots until consumers finish. */
 template <bool kRank3A = false, bool kRank3B = false> struct GemmTmaContext {
     const void* map_a = nullptr;
     const void* map_b = nullptr;
@@ -100,15 +92,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
     static constexpr int kARing = Smem::kRingDepth;
     static constexpr int kBRing = Smem::kRingDepth;
 
-    /*
-     * Staging layouts, cute-style: composition(Swizzle, Layout<Shape,
-     * Stride>) over the row-major 16B-chunk grid (utils/swizzle.cuh), one
-     * instance shared by loaders, fragment reads and the lane-offset mirrors
-     * below. Canonical [rows][kK] serves congruous + 8-bit crosswise (TMA
-     * SWIZZLE_128B / SWIZZLE_64B); trans [kK][rows] the 16-bit crosswise
-     * cp.async + ldmatrix.trans (XOR by k-row bits, capped at 8 — the LDSM
-     * row budget).
-     */
+    /* Staging layout types also define the fragment address calculations. */
     static constexpr int kChunksA = kK / (16 / (int)sizeof(ElemA));
     static constexpr int kChunksB = kK / (16 / (int)sizeof(ElemB));
     static constexpr int kChunksAT = kBlockM / (16 / (int)sizeof(ElemA));
@@ -126,13 +110,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
         Swizzle < log2_const<kChunksBT<8 ? kChunksBT : 8>::value, log2_const<kChunksBT>::value>{},
         Layout<Shape<kK, kChunksBT>, Stride<kChunksBT, 1>>{}));
 
-    /*
-     * The k-pair packed grid (8-bit crosswise): staged as 16-bit (row,
-     * k-pair) units — packed row j carries the contract pair (2j, 2j+1) — so
-     * the 16-bit reader's ldmatrix.trans contract applies unchanged (16
-     * packed rows = one mma k-segment). Staged bytes = the canonical tile's,
-     * so the ring carve and reclaim budget are untouched.
-     */
+    /* Packed crosswise bytes use the 16-bit transposed fragment mapping. */
     static constexpr int kPackChunksA = kBlockM / 8; // 16B chunks per row
     static constexpr int kPackChunksB = kBlockN / 8;
     using SmemLayoutAPack =
@@ -156,14 +134,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
     static constexpr bool kPackA = kDirectA && !kDequantA && kPackOkA;
     static constexpr bool kPackB = kDirectB && !kDequantB && kPackOkB;
 
-    /*
-     * One ring type per operand (utils/tensor.cuh): the staged-layout
-     * instance each path addresses — trans when 16-bit crosswise staging is
-     * active, canonical otherwise (congruous, 8-bit crosswise and dequant
-     * readers all use it). Both stagings hold the same element count, so one
-     * ring stride serves either; the rings carry slot rotation, byte budgets
-     * and the typed tile view — consumers read them off the type.
-     */
+    /* Ring types bind the staging layout, element type, and pointer. */
     using StagedLayoutA =
         std::conditional_t<kPackA,
                            SmemLayoutAPack,
@@ -207,13 +178,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
     const int a_row0; // + mt * 16 in the loop
     const int b_row0; // + nt * 8
     const int64_t tile_count;
-    /*
-     * Interior-copy verdict, uniform per CTA: whole-CTA, 16B-aligned, K
-     * without tail — the mainloop runs the predication-free specialized copy
-     * (load_async.cuh's kInterior arm). Measured interleaved 2026-09-16: the
-     * specialized copy wins everywhere it applies (an earlier sm_89-era
-     * 128x128 regression claim is obsolete — that tile axis is removed).
-     */
+    /* Aligned interior tiles use unpredicated copies. */
     const bool use_interior_copy;
 
     __device__ GemmCollectiveMainloop(char* smem,
@@ -239,17 +204,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
                             ((reinterpret_cast<uintptr_t>(b) | (uint64_t)b_ld) & 15) == 0 &&
                             (k % kK) == 0) {}
 
-    /*
-     * Stage-load one k-tile; each operand picks its loader by staging class
-     * (tiles arrive typed by the ring's staged layout, so a mismatched
-     * loader/tile pairing is a compile error). kInterior = predication-free
-     * interior copy (async phase only — trans qualifies, it is cp.async).
-     * kSyncPhase = the synchronous direct loads (8-bit crosswise only), run
-     * right after barrier 1 so LDG latency + PRMT transpose overlap the MMA
-     * phase instead of stalling the inter-barrier window; false = async
-     * loads (kInterior applies; the generic loop runs them after the MMA
-     * phase).
-     */
+    /* cp.async handles aligned operands; crosswise bytes use direct LDG and register packing. */
     template <bool kInterior = false, bool kSyncPhase = false>
     DEVICE_FORCEINLINE void load_stage(TileA a_tile, TileB b_tile, int64_t k_base) const {
         if constexpr (kSyncPhase) {
@@ -304,14 +259,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
                                   x * (int)sizeof(ElemB), (int)(block_n * kBlockN), tma.z);
     }
 
-    /*
-     * Prime the pipeline: kStages committed groups, one per slot. Commits
-     * are unconditional — short-K skipped stages commit empty groups, so the
-     * group sequence stays tile-indexed and the steady-state wait needs no
-     * runtime dispatch. TMA arms only stages that carry a copy: an expect_tx
-     * barrier with no transaction never trips, so short-K slots are never
-     * waited on.
-     */
+    /* Prime kStages groups, including empty groups, to keep wait indexing stable. */
     template <bool kRank3A = false, bool kRank3B = false>
     DEVICE_FORCEINLINE void prologue(const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         if constexpr (kUseTma) {
@@ -341,28 +289,13 @@ template <typename Policy> struct GemmCollectiveMainloop {
         }
     }
 
-    /*
-     * Steady-state mainloop, specialized on kInterior: interior copy runs
-     * predication-free with loop-carried pointers, generic keeps full
-     * predication. kTma swaps the discipline: per-thread cp.async chunks +
-     * wait_group/syncthreads fence become one elected-thread TMA issue and an
-     * mbarrier phase wait (the CTA barrier stays the slot-release guarantee:
-     * every thread finished reading tile i-1 before i+kStages overwrites).
-     */
+    /* Overlap loads with MMA; TMA uses full/empty barriers. */
     template <bool kInterior, bool kTma = false, bool kRank3A = false, bool kRank3B = false>
     DEVICE_FORCEINLINE void run_loop(AccTensor& acc,
                                      const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         const astrai::PipelineSync<kStages> pipe;
         const int lane = tid & 31;
-        /*
-         * Fast-path write carries: one per congruous operand (crosswise gets
-         * the no-op type), targeting the first prefetched tile (kStages).
-         * Read carries: the LDSM base with the lane offset folded in,
-         * advanced one stage per iteration with an equality wrap — replaces
-         * the per-tile (tile % ring) * stage_bytes recomputation (a
-         * UIMAD.WIDE magic-division ladder in SASS). Carries ride the rings,
-         * so each carries its staging geometry.
-         */
+        /* Carry staged load and read pointers across k tiles. */
         PrefetchCarry<!kSyncA && !kTma, RingA, kCtaThreads, kTransA> carry_a(
             ring_a, a, a_ld, block_m * kBlockM, tid, kStages);
         PrefetchCarry<!kSyncB && !kTma, RingB, kCtaThreads, kTransB> carry_b(
@@ -395,13 +328,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
              * this fires; the tail's unconditional empty commits keep it true.
              */
             const bool prefetch = tile_index + kStages < tile_count;
-            /*
-             * Steady-state wait: TMA waits the slot's full barrier (phase
-             * flips once per sweep) — no CTA-wide barrier; each warp releases
-             * its slot below after its last fragment read, the producer's
-             * overwrite gate is the empty barrier alone. cp.async drains its
-             * group ladder then joins the CTA (the join doubles as release).
-             */
+            /* TMA waits full slots; cp.async joins the CTA before slot reuse. */
             if constexpr (kTma) {
                 astrai::mbarrier_wait_parity(tma.full((int)(tile_index % kARing)),
                                              static_cast<uint32_t>((tile_index / kARing) & 1));
@@ -444,13 +371,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
                                                : (b_addr ^ (unsigned)(s * kSegXorB));
             }
 
-            /*
-             * kNt ldmatrix.x2 (B) + kMt ldmatrix.x4 (A) feed kMt*kNt*2
-             * mma.sync per k_seg — 0.5 loads per MMA. B fragments double-
-             * buffer across k_segs; kPairB folds two adjacent nt fragments
-             * into one x4 (b4_lane_off). Fragment arrays hold typed cells:
-             * loads fill, mma consumes by reference.
-             */
+            /* Prefetch B fragments by K segment and pair adjacent N cells where valid. */
             typename MmaOp::BFrag b_frag[2][kNt];
             BFragPair b_frag4[2][kNt / 2];
             /*
@@ -465,14 +386,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
                 if (k_seg + 1 < kSegs)
                     load_b_frags_at(b_frag[bnext], b_frag4[bnext], b_tile, k_seg + 1,
                                     b_seg[k_seg + 1], lane);
-                /*
-                 * Software-pipelined A fragments: row mt+1's ldmatrix.x4 issues
-                 * before row mt's MMAs so LDS latency hides behind tensor-pipe
-                 * work (costs 4 registers). Trans tiles advance the m window by
-                 * XOR, canonical by the 16-row stride. Dequant A (W8A8) fills
-                 * ALL m-row fragments upfront — the pipelined ldmatrix would
-                 * clobber converted fragments with raw 2-byte-layout data.
-                 */
+                /* Load the next A fragment ahead; dequantized A needs all row fragments first. */
                 typename MmaOp::AFrag a_frag[kMt + 1];
                 if constexpr (kDequantA) {
                     const auto a_tile = astrai::stage_of(ring_a, tile_index);
@@ -586,19 +500,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
         }
     };
 
-    /*
-     * Per-lane ldmatrix fragment addressing (base-pair scheme, mirrored from
-     * the cuBLAS SASS; derivation in the design notes): one base register per
-     * operand per k_seg, every fragment offset an LDSM immediate — zero
-     * address arithmetic inside the MMA phase. Offsets are stage-relative
-     * BYTES (the *_lane primitives take raw smem byte addresses; element math
-     * scaled by sizeof(ElemT)). The swizzle chunk term comes from the declared
-     * staging layouts — the same instances the tiles apply, so the mirror
-     * cannot drift. Canonical and trans are one formula per staging,
-     * parameterized by layout/ElemT/extent; the wrappers below pick lane bits
-     * and base row (A's fragment row carries +8-row and +1-chunk halves, B
-     * uses the +8-row bit as its chunk half).
-     */
+    /* Lane offsets derive from staging layouts and feed ldmatrix byte addresses. */
     template <typename SmemLayoutT, typename ElemT>
     static DEVICE_FORCEINLINE unsigned canonical_lane_off(int64_t row, int chunk_half, int lane) {
         constexpr int kChunkShift = log2_const<16 / sizeof(ElemT)>::value;
@@ -608,14 +510,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
                                      sizeof(ElemT));
     }
 
-    /*
-     * Trans-tile addressing (crosswise 16-bit): the LDSM row is a k line, the
-     * 16B chunk a non-contract-dim window, chunks swizzled by k-row bits.
-     * ldmatrix.trans lane contract: lanes 0-7 k rows 0-7, 8-15 k rows 8-15
-     * (second k half), 16-31 (x4) one column chunk (the +8 half); x2 ignores
-     * 16-31. kMtXor/kNtXor: one m/n-tile step in 16B chunks (XOR, not add);
-     * kTransSeg*: one mma k-segment = kMmaK k rows.
-     */
+    /* Crosswise 16-bit fragments use K rows and XOR-swizzled M/N windows. */
     template <typename SmemLayoutT, typename ElemT>
     static DEVICE_FORCEINLINE unsigned trans_lane_off(int krow, int col, int block_extent) {
         const unsigned lswz =
@@ -639,22 +534,14 @@ template <typename Policy> struct GemmCollectiveMainloop {
         // ldmatrix (non-dequant) B addressing: byte offsets in ElemB units.
         return canonical_lane_off<SmemLayoutB, ElemB>(b_row0 + (lane & 7), (lane >> 3) & 1, lane);
     }
-    /*
-     * x4-paired B loads: one ldmatrix.x4 feeds two adjacent nt fragments.
-     * Lane contract: lanes 0-7 rows n0..n7 chunk c, 8-15 rows n0..n7 chunk
-     * c+1, 16-23 rows n8..n15 chunk c, 24-31 n8..n15 chunk c+1. The +8-row
-     * step never reaches the swizzle source bits for kK <= 64; kK=128
-     * swizzles row[2:0] where +8 flips bits, so that config keeps x2 loads.
-     * Fragment step constants in BYTES: kSegXor{A,B} = one mma k-segment of
-     * the operand's STORAGE type (32B for every ldmatrix-fed dtype), i.e.
-     * two 16B chunks; mixed pairs keep a step per side; dequant sides never
-     * consume theirs.
-     */
+    /* Paired B x4 needs a positive swizzle row shift; K=128 byte tiles use x2. */
     static constexpr unsigned kMtStep = 16u * kK * sizeof(ElemA); // m-tile row step
     static constexpr unsigned kNtStep = 8u * kK * sizeof(ElemB);  // n-tile row step
     static constexpr unsigned kSegXorA = (unsigned)Traits::kMmaK * sizeof(ElemA);
     static constexpr unsigned kSegXorB = (unsigned)Traits::kMmaK * sizeof(ElemB);
-    static constexpr bool kPairB = !kDequantB && !kPackB && kK * sizeof(ElemB) / 16 <= 4;
+    static constexpr bool kPairB = !kDequantB && !kPackB && SmemLayoutB::kRowShift > 0;
+    static_assert(!kPairB || kK * sizeof(ElemB) <= 64,
+                  "paired B x4 is unsupported for the kK=128 byte layout");
     static_assert(!kPairB || kNt % 2 == 0, "B pairing needs even kNt");
     static_assert(!kPairB || !kTransB, "2-byte crosswise B never pairs (chunk budget)");
     static constexpr unsigned kPairStep = 16u * kK * sizeof(ElemB); // nt-pair row step
@@ -696,13 +583,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
             (lane & 7) + (((lane >> 3) & 1) << 3), b_row0, kBlockN);
     }
 
-    /*
-     * Dequantized A fragments (W8A8 activation side): lane l's m16n8k16 A
-     * fragment (q = l>>2, c2 = (l&3)*2) holds tile
-     * [m = a_row0 + mt*16 + q (+8)][k = k_seg*16 + c2 (+8)] in register order
-     * (m, m+8, k+8, m+8&k+8) — matching the ldmatrix x4 order the non-dequant
-     * path produces. Both u16 reads of one row stay in one swizzle chunk.
-     */
+    /* Convert packed INT8 A pairs to BF16 in ldmatrix register order. */
     DEVICE_FORCEINLINE void
     load_a_frags_at(typename MmaOp::AFrag& frag, TileA stage, int k_seg, int mt, int lane) const {
         const int q = lane >> 2, c2 = (lane & 3) * 2;
@@ -741,13 +622,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
         }
     }
 
-    /*
-     * Dequantized B fragments (weight side): lane l's m16n8k16 B fragment
-     * (quad q = l>>2, r = l&3) holds tile[n = b_row0 + nt*8 + q]
-     * [k = k_seg*16 + {2r, 2r+1, 2r+8, 2r+9}] as two packed pairs — both u16
-     * reads land in one 16B swizzle chunk, so staged-tile addressing works;
-     * the LOP3 expansion (dequant.cuh) is exact for int8.
-     */
+    /* Convert packed INT8 B pairs to BF16 in ldmatrix register order. */
     DEVICE_FORCEINLINE void load_b_frags_at(typename MmaOp::BFrag (&frag2)[kNt],
                                             BFragPair (&frag4)[kNt / 2],
                                             TileB stage,

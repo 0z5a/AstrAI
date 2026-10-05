@@ -3,15 +3,47 @@
 > Part of the [operator docs](README.md); required reading before changing
 > the tile vocabulary, the planners, or the fp8 recipes.
 
-The `quantize` family accelerates bf16 linear layers by
-quantizing to FP8 and running tensor-core GEMMs (**requires sm_89+**; fp8
-`mma.sync.m16n8k32` only exists on Ada/Hopper). The GEMM device code is
-split CUTLASS-style into one layered directory:
+AstrAI implements its own CUDA/PTX primitives and templates; CUTLASS is a
+design reference, with no build or runtime dependency. BF16 and INT8 GEMM
+start at SM80; native FP8 MMA starts at SM89.
+
+## Architecture and dispatch
+
+| Compiled target | Available GEMM paths |
+|---|---|
+| SM80–SM88 | `mma.sync`, cp.async; BF16, INT8 and mixed BF16/INT8 |
+| SM89 | Above plus FP8 e4m3/e5m2 MMA |
+| SM90–SM110 | Above plus TMA staging with warp MMA |
+| SM120 | Warp MMA and TMA; `120a` / `120f` additionally enable block-scaled FP8 MMA |
+
+WGMMA and tcgen05/TMEM mainloops are not implemented. SM90/SM100 support
+uses the shared warp MMA core; it does not imply native peak performance.
+
+`ASTRAI_CUDA_ARCH="80;89;90;100;120a"` selects exact compiler targets.
+CMake validates them with nvcc and generates the capability manifest.
+Each schedule has distinct template types and object files; runtime dispatch
+intersects the current device with the compiled images. Generic PTX permits
+forward JIT, `a` targets require the exact architecture, and `f` targets stay
+within their family. An SM80-only build therefore uses cp.async even on a
+5090. `kernel.gemm.capabilities()` reports the compiled paths available on
+the current device; `set_staging()` can disable TMA or MX independently.
+
+The device policy composes element types, tile geometry, shared-memory
+layout, schedule and epilogue. Instruction wrappers own the register
+contract; `static_assert` enforces architecture and layout constraints.
+Host planning is a fixed sequence of ordinary functions: override rows,
+injected rows, measured builtin rows, model, then degraded fallback,
+subject to the selected planner mode. No virtual planner hierarchy is needed.
+
+## Source layout
+
+Headers under `csrc/include` contain declarations and device templates;
+`csrc/gemm` contains host implementations, bindings and explicit instantiations.
 
 | File | Role |
 |------|------|
 | `api/quantize_common.h` | capability helpers (`sm_at_least`, `kMinSmForFp8`) + `QuantLayout` + `QuantParams` POD — raw `__nv_fp8_*` element types, no format enum, no torch |
-| `kernel/quantize.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `fp8_cvt_traits<Fp8T>` convert + `quant_in_traits<InT>` unpack (primary templates undefined — one specialization per dtype/format) — no torch |
+| `kernel/quantize/kernel.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `fp8_cvt_traits<Fp8T>` convert + `quant_in_traits<InT>` unpack (primary templates undefined — one specialization per dtype/format) — no torch |
 | `datatype/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
 | `api/gemm_common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes — the smem ring budgets; the MMA K extent rides `MmaShapeFor<MmaT>`), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
 | `policy/traits.cuh` | Promoted MMA traits and shared-memory ring budget (`GemmTraits`, `GemmSmem`) |
@@ -20,15 +52,15 @@ split CUTLASS-style into one layered directory:
 | `launcher/plan_types.h` | Runtime config, planner query, recipe, and dispatch decision shared by launch and planning code |
 | `memory/load_async.cuh` / `load_crosswise.cuh` / `load_crosswise_packed.cuh` | Operand staging by access pattern: cp.async (congruous and 16-bit transposed) with `PrefetchCarry`; direct 8-bit crosswise LDG+PRMT with `CrosswiseCarry`; packed k-pair crosswise with `PairPackCarry` |
 | `scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
-| `kernel/gemm_mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
+| `kernel/gemm/sm80.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `epilogue/writer.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
-| `kernel/gemm.cuh` | Device entry kernels for cp.async and TMA staging; they compose the mainloop and epilogue |
+| `kernel/gemm/kernel.cuh` | Device entry kernels for cp.async and TMA staging; they compose the mainloop and epilogue |
 | `launcher/gemm_launch.cuh` | Typed CUDA launch, TMA descriptor setup, and the `GemmParams` to `PlanQuery` conversion |
 | `launcher/gemm_tiles.cuh` | Manifest tile selection, output-reclaim fallback, and TMA/cp.async policy resolution |
 | `launcher/gemm_dispatch.cuh` | Layout canonicalization and tag routing shared by `gemm_dispatch` and `plan_probe_for`; the include used by dtype-pair instantiation units |
 | `launcher/plan_row.h` / `plan_table_parse.h` / `plan_table_builtin.h` | Row vocabulary and matching; row-file and runtime-text parsing; measured device-specific rows and the degraded fallback ladder, respectively |
-| `launcher/plan_table.h` | `RowSource` containers and runtime config seed; includes the row, parser, and builtin headers for existing callers. The planners (`RowSetPlanner`, `ModelPlanner`) live in `launcher/planning.h` |
-| `launcher/planning.h` | The planner chain: `RowSetPlanner` (rows from one `RowSource`), `ModelPlanner` (the cost-ranked analytical planner), the rank-ordered chain assembly and the crosswise-ladder / raster L2-budget rules. Single-inclusion impl header (one TU per binary) |
+| `launcher/plan_table.h` | Thread-safe row sources and resolved planner settings |
+| `launcher/planning.h` / `gemm/planning.cpp` | Planner declarations / host implementation: recipe enumeration, row validation, model ranking and raster |
 | `api/gemm.h` | The family's C++ surface — declarations only, and template-free so including it instantiates no dtype-pair kernel: `quant_gemm_impl` (the one GEMM entry), the planner face (`PlanProbe` + `plan_probe`, `GemmConfigPatch` — `rows` + `tier` (`RowTier`) + `table_off` + the mode/log/staging knobs — with the re-installable `GemmConfigState`, through `configure` / `config_state`) and the vocabulary (`tile_vocabulary` / `tile_class_names`). No Python type in a signature — the composed fp8 linear and the bindings TU call the same functions |
 | `gemm/gemm.cu` | The typed host layer: the dtype-pair registry (`ASTRAI_GEMM_PAIRS`, one entry feeding both the `gemm_dispatch` and the `plan_probe_for` lookup; one extern-template declaration per pair, which is what keeps this TU from re-instantiating them) plus the `api/gemm.h` implementations. Holds no `py::` type |
 | `gemm/fp8_linear.cu` | Composed fp8 training linear (forward and backward) in one C++ `autograd::Function` |
@@ -280,7 +312,7 @@ geometry and smem layout read in one notation. The production manifest in
 `policy/manifest.cuh` — the named `Tile_*` recipes; read the list there, not here,
 because copied enumerations rot — is the `TileManifest` type list the
 launch ladders dispatch over (CUTLASS builder-table style: `dispatch_tile`
-in `gemm.cuh` indexes the manifest by the plan's `TileClass` and depth bit,
+in `launcher/gemm_tiles.cuh` indexes the manifest by the plan's `TileClass` and depth bit,
 both ladder-agnostic); a new geometry is one alias plus one manifest entry
 and one planner branch, never a re-spelled per-site ladder. Device
 collectives only read the derived `Traits::kBlockM/kBlockN/...` constants,
@@ -334,7 +366,7 @@ build pastes one in. `configure(planner="")` restores the default instead
 of pinning a mode. The `ASTR_GEMM_*` environment variables are read once
 per process as a seed; explicit API calls win.
 
-**The analytical model** (`ModelPlanner` in `launcher/planning.h`) is a
+**The analytical model** (`model_plan` in `gemm/planning.cpp`) is a
 port of DeepGEMM's config search (`get_best_configs`) reduced to what the
 recipe space needs. Wave count alone is not a valid ranking proxy here: a
 64×64 CTA's wave carries a quarter of a 128×128's work, so counting waves
@@ -343,7 +375,7 @@ prefers the coarse tile regardless of fit. The model prices cost instead —
 - TMA (dual-congruous): `cost = max(operand + output + issue, mma_arm) × W_eff`
   per CTA, with `operand = k·(bm·ba + bn·bb)` (bytes per operand, `ba`/`bb`
   the per-element byte widths), `output = out_elem_bytes·bm·bn`, `issue`
-  the per-k-tile issue overhead priced only for byte pairs, and
+  the per-k-tile issue overhead priced for non-byte pairs, and
   `mma_arm` the tensor-pipe arm. `W_eff = waves × resident` for dual-2-byte
   pairs, plain `ceil(blocks/sms)` otherwise. The arms overlap on
   independent hardware, so a non-binding arm must not tax the ranking.
@@ -416,7 +448,7 @@ state), gates on the holdout validator (a ≥2% per-shape regression
 rejects), and installs under the same device signature. Sweep winners
 become rows: adjacent M runs with the same winner band-merge at mid-point
 edges; `--min-gain` (default 1%) keeps only rows above a minimum gain.
-K is not a row key (the ring K is fixed at 64): a K/batch conflict at one
+Problem K is not a row range key (recipe `kk` selects the ring depth): a K/batch conflict at one
 (M, N) resolves to the best-TFLOPS point. The sweep times the fused-linear
 (NT) layout, so generated rows carry crosswise 0 — non-NT shapes (TT, TN,
 the mixed dual-row-major NN case) miss into the degraded bands, where the

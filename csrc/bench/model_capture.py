@@ -134,13 +134,13 @@ def rules() -> dict:
     model's own byte-pair floor does."""
 
     def shipped(p, q):
-        # gemm.cuh ModelPlanner, mirrored term for term. Two staging forms
+        # planning.cpp model_plan, mirrored term for term. Two staging forms
         # (the residency sign flips with staging — 2026-09-16):
         # - cp.async (q["tma"] false): zero-constant L20 form — raw-floor
         #   residency in the wave denominator, the k-tail priced whole.
         # - TMA: per_cta = max(operand + output + k-tile issue, mma arm),
         #   the issue pricing kK at 8 output-cell-bytes per k-iteration
-        #   (byte pairs none — all-kK=64 ladder), the mma arm at 64 bytes
+        #   (byte pairs none), the mma arm at 64 bytes
         #   per instruction; W_eff = waves*resident on two-byte pairs,
         #   ceil(blocks/sms) resident-blind on byte and mixed. Every pair
         #   ranks on the cost alone.

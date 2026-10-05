@@ -78,10 +78,12 @@ struct QuantScale {
     int n = 0;
 };
 
-QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent, const char* name) {
+QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent, const char* name,
+                               const c10::Device& device) {
     TORCH_CHECK(s.defined(), name, " is required");
     TORCH_CHECK(s.is_cuda() && s.scalar_type() == torch::kFloat32 && s.is_contiguous(), name,
                 " must be a contiguous CUDA float32 tensor");
+    TORCH_CHECK(s.device() == device, name, " must be on the same device as operands");
     TORCH_CHECK(s.numel() == 1 || s.numel() == extent, name,
                 " must hold 1 element (per-tensor) or ", extent, " (per-row/per-channel)");
     return {s.data_ptr<float>(), s.numel() == 1 ? 0 : (int)extent};
@@ -110,6 +112,10 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
                                 bool trans_a,
                                 bool trans_b,
                                 c10::optional<torch::Tensor> bias) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "CUDA tensors required");
+    TORCH_CHECK((a.dim() == 2 || a.dim() == 3) && (b.dim() == 2 || b.dim() == 3),
+                "a and b must be 2D or 3D (batched)");
+    TORCH_CHECK(a.device() == b.device(), "a and b must share device");
     const auto dt_a = a.scalar_type(), dt_b = b.scalar_type();
     const bool i8a = dt_a == torch::kChar, i8b = dt_b == torch::kChar;
     const bool f8a = dt_a == torch::kFloat8_e4m3fn || dt_a == torch::kFloat8_e5m2;
@@ -132,15 +138,11 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
         }
         TORCH_CHECK(!bf16_side, "quant_gemm: ", name,
                     " given for a bf16 operand (nothing to dequant)");
-        return resolve_quant_scale(*s, extent, name);
+        return resolve_quant_scale(*s, extent, name, a.device());
     };
     const QuantScale sa = opt_scale(a_scale, m, "a_scale", i8a, b16a);
     const QuantScale sb = opt_scale(b_scale, n, "b_scale", i8b, b16b);
 
-    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK((a.dim() == 2 || a.dim() == 3) && (b.dim() == 2 || b.dim() == 3),
-                "a and b must be 2D or 3D (batched)");
-    TORCH_CHECK(a.device() == b.device(), "a and b must share device");
     torch::Tensor bias_t;
     if (bias.has_value())
         bias_t = *bias;
@@ -183,6 +185,8 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     if (bias_t.defined() && bias_t.numel() > 0) {
         TORCH_CHECK(bias_t.is_cuda() && bias_t.scalar_type() == torch::kBFloat16,
                     "quantized gemm bias must be a CUDA bf16 tensor");
+        TORCH_CHECK(bias_t.device() == a.device(),
+                    "quantized gemm bias must be on the same device as operands");
         TORCH_CHECK(bias_t.dim() == 1 && bias_t.size(0) == n,
                     "quantized gemm bias must be 1D of length n=", n);
         TORCH_CHECK(bias_t.is_contiguous(), "bias must be contiguous");

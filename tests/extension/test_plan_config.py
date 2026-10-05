@@ -136,6 +136,11 @@ class TestCompiledInTables:
                 assert src == "builtin"
             else:
                 assert src != "builtin"
+        if measured_here:
+            tuned = kernel.gemm.probe(768, 6144, 1536, torch.int8, torch.int8)
+            assert (tuned["source"], tuned["kk"]) == ("builtin", 128)
+            outside = kernel.gemm.probe(1536, 6144, 1536, torch.int8, torch.int8)
+            assert outside["kk"] != 128
         # Bands the model already wins stay the model's even where the
         # rows are live (the diff only claims measured >=2% wins).
         assert kernel.gemm.probe(512, 11008, 4096)["source"] != "override"
@@ -175,7 +180,7 @@ class TestProbe:
             )
             assert cta in (0, 1, 2, 3, 4)
             assert stages in (2, 3)
-            assert kk in (32, 64)
+            assert kk in (32, 64, 128)
             assert bm in (64, 128) and bn in (64, 128, 256)
             # the warp tiling spells the recipe name's W<x>x<y>, and the
             # threads count follows it ((bm/wm)*(bn/wn)*32)
@@ -214,14 +219,14 @@ class TestModelRule:
         (2048, 28672, 8192),
     )
 
-    # gemm.cuh kKTileIssueBytes / kMmaArmBytesPerInstr — keep in sync
+    # planning.cpp kKTileIssueBytes / kMmaArmBytesPerInstr — keep in sync
     # (both fitted on the 2026-09-16 grid, RTX 5090, bf16 out).
     K_TILE_ISSUE_BYTES = 8
     MMA_ARM_BYTES_PER_INSTR = 64
 
     @classmethod
     def _cost(cls, entry, m, n, k, facts):
-        """cost_of mirrored from gemm.cuh, or None when the ring is not
+        """cost_of mirrored from planning.cpp, or None when the ring is not
         resident on this device at all — the only way to assert the rule
         from Python. Both staging forms: the planner branches on the
         device's cc (TMA needs sm_90+), so on an sm_89 part (L20/4090)
@@ -233,7 +238,7 @@ class TestModelRule:
             return None
         blocks = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
         output = 2 * bm * bn
-        if facts["cc"] < 90:  # cp.async staging: raw-floor residency divides
+        if not kernel.gemm.capabilities()["tma"]:  # effective compiled staging
             operand = ((k + kk - 1) // kk) * kk * (bm * 2 + bn * 2)
             mu = facts["smem_per_sm"] // smem
             slots = facts["sms"] * mu

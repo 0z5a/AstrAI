@@ -5,7 +5,7 @@ per-row / per-channel scales, fp32 output) + a per-combination TFLOPS table
 over llama-linear shapes through the production NT route.
 
 nvcc -I csrc/include -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
-    -o /tmp/quant_gemm_test && /tmp/quant_gemm_test
+    csrc/gemm/planning.cpp -o /tmp/quant_gemm_test && /tmp/quant_gemm_test
 */
 
 #include "test_utils.cuh"

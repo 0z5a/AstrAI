@@ -12,6 +12,8 @@
 !csrc/CMakeLists.txt
 
 !csrc/**/*.cu
+!csrc/**/*.cpp
+!csrc/**/*.cmake
 !csrc/**/*.h
 !csrc/**/*.cuh
 

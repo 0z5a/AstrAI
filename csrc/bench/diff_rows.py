@@ -13,7 +13,7 @@ compared with each other in one phase is fine — that is what the sweep grid
 is for); this script then compares that winner against the model's own
 dispatch with alternating arms, and keeps the point only when the winner is
 >= --min-gain faster. Points the model's own structural rules own (the
-byte-pair m<=8 floor, see ModelPlanner in gemm.cuh) are neutralised to ties
+byte-pair m<=8 floor, see model_plan in planning.cpp) are neutralised to ties
 so no row can override a rule with noise.
 
     python csrc/bench/diff_rows.py --sweep-json /tmp/sweep.json \
@@ -50,7 +50,7 @@ def _load_tune():
 
 tpt = _load_tune()
 
-# The byte-pair floor the model owns (ModelPlanner in gemm.cuh): m <= 8 on a
+# The byte-pair floor the model owns (model_plan in planning.cpp): m <= 8 on a
 # 1-byte x 1-byte pair is bandwidth-floor-bound, every candidate measured
 # identical, so a row there would only override the rule with noise.
 FLOOR_MMAX = 8

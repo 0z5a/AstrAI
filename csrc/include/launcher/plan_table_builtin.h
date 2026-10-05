@@ -101,7 +101,9 @@ static constexpr std::array<TableRow, 23> kBuiltinPlanW8A16 = {{
     {TileClass::kNarrow128x64, 384, 768, 19840, 0, 1, 0, 2, 0, 32},
     {TileClass::kBig128, 768, 0, 19840, 0, 1, 0, 3, 0, 64},
 }};
-static constexpr std::array<TableRow, 29> kBuiltinPlanW8A8 = {{
+static constexpr std::array<TableRow, 30> kBuiltinPlanW8A8 = {{
+    // SM120 W8A8: larger K tile wins at mid-M, wide-N (CUDA Graph ABBA).
+    {TileClass::kBig128, 512, 1024, 5120, 8192, 2, 0, 2, 0, 128, 1023, 2048},
     /*
      * The narrow-N pathology of the W16A16/W8A16 rows above, same band and
      * same winner: the 128x128 kk64 row below measured 1.56-1.74x off at n=256,
@@ -244,7 +246,7 @@ inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) 
  * Last-resort rows for the chain's tail: the M band's dominant recipe from
  * the full-coverage sweep (small for short M, narrow mid, big past mid) —
  * a safe default, never best. Open N with -1 keys matches every shape, so
- * planning stays a total function; the RowSetPlanner over them reads the
+ * planning stays a total function; the fallback selector reads the
  * M band alone (the m-only query below carries the matcher's "strictly
  * past the min" caveat: an n of 0 sits ON the open bound, so a 1 stands
  * for "some real n").

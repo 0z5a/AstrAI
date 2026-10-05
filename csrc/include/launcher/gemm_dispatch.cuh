@@ -86,7 +86,8 @@ auto with_layout_tags(bool trans_a, bool trans_b, bool swapped, F&& fn) {
  * instantiates the dual-row-major shape directly (A congruous, B
  * crosswise).
  */
-template <typename ElemA, typename ElemB = ElemA, typename OutT = __nv_bfloat16>
+template <typename ElemA, typename ElemB = ElemA, typename OutT = __nv_bfloat16,
+          typename Schedule = MmaSync>
 void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
     constexpr bool kSymmetric = std::is_same_v<ElemA, ElemB>;
     bool swapped = false;
@@ -100,8 +101,8 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
      * The tags ride empty tag instances; decltype recovers the types.
      */
     const auto launch = [&](auto la, auto lb, auto lout) {
-        launch_plan<ElemA, ElemB, decltype(la), decltype(lb), decltype(lout), OutT>(
-            p, plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb), OutT>(p), stream);
+        launch_plan<ElemA, ElemB, decltype(la), decltype(lb), decltype(lout), OutT, Schedule>(
+            p, plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb), OutT, Schedule>(p), stream);
     };
     with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, launch);
 }
@@ -110,8 +111,12 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
  * Explicit-instantiation spelling shared by the per-pair TUs (bare) and
  * gemm.cu's extern block: one place names the signature.
  */
-#define ASTRAI_GEMM_INSTANTIATE(W, A)                                                              \
-    template void gemm_dispatch<W, A>(GemmParams, cudaStream_t, bool, bool)
+#ifndef ASTRAI_GEMM_SCHEDULE
+#define ASTRAI_GEMM_SCHEDULE MmaSync
+#endif
+
+#define ASTRAI_GEMM_INSTANTIATE(W, A)                                                           \
+    template void gemm_dispatch<W, A, __nv_bfloat16, ASTRAI_GEMM_SCHEDULE>(GemmParams, cudaStream_t, bool, bool)
 
 /*
  * Host-only planner probe (the autotuner's coverage check): the decision
@@ -120,7 +125,7 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
  * disagreeing with the real call's branch. Returns the decision plus the
  * query it answered.
  */
-template <typename ElemA, typename ElemB>
+template <typename ElemA, typename ElemB, typename Schedule = MmaSync>
 std::pair<PlanDecision, PlanQuery> plan_probe_for(int64_t m,
                                                   int64_t n,
                                                   int64_t k,
@@ -139,7 +144,7 @@ std::pair<PlanDecision, PlanQuery> plan_probe_for(int64_t m,
         canonicalize_gemm(p, trans_a, trans_b); // symmetric NN -> transposed TT
     }
     return with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, [&](auto la, auto lb, auto) {
-        PlanQuery q = plan_query<ElemA, ElemB, decltype(la), decltype(lb)>(p, dev);
+        PlanQuery q = plan_query<ElemA, ElemB, decltype(la), decltype(lb), __nv_bfloat16, Schedule>(p, dev);
         return std::make_pair(plan_dispatch(q), std::move(q));
     });
 }

@@ -28,7 +28,7 @@ namespace attention {
 // A scalar type attention has no kernel for: say which ones it does have.
 inline void attn_dtype_unsupported(at::ScalarType st) {
     std::string instantiated;
-#define ASTRAI_ATTN_DTYPE_NAME_ROW(tag, type)                                                      \
+#define ASTRAI_ATTN_DTYPE_NAME_ROW(tag, type)                                                   \
     instantiated += std::string(instantiated.empty() ? "" : ", ") + c10::toString(tag);
     ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_NAME_ROW)
 #undef ASTRAI_ATTN_DTYPE_NAME_ROW
@@ -36,13 +36,13 @@ inline void attn_dtype_unsupported(at::ScalarType st) {
                 " (instantiated: ", instantiated, ")");
 }
 
-// Dtype dispatch over the list; wrappers live in kernel/attention_launch.cuh (fn templates cannot be template-template args).
+// Dtype dispatch over the list; wrappers live in kernel/attention/launch.cuh (fn templates cannot be template-template args).
 template <template <typename> class DispatchFn, typename ParamsT>
 inline void attn_dtype_dispatch(at::ScalarType st, ParamsT& p, cudaStream_t stream) {
     switch (st) {
-#define ASTRAI_ATTN_DTYPE_ROW(tag, type)                                                           \
-    case tag:                                                                                      \
-        DispatchFn<type>::run(p, stream);                                                          \
+#define ASTRAI_ATTN_DTYPE_ROW(tag, type)                                                        \
+    case tag:                                                                                   \
+        DispatchFn<type>::run(p, stream);                                                       \
         break;
         ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
 #undef ASTRAI_ATTN_DTYPE_ROW

@@ -15,8 +15,10 @@ template <typename ElemA_,
           bool StreamOut_ = false,
           bool UseTma_ = false,
           bool UseMxMma_ = false,
-          bool StoreWriteThrough_ = false>
+          bool StoreWriteThrough_ = false,
+          typename Schedule_ = MmaSync>
 struct GemmPolicy {
+    using Schedule = Schedule_;
     using Tile = Tile_;
     using Traits = GemmTraits<ElemA_,
                               ElemB_,

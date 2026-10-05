@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from astrai.extension import quantize_act_int8, quantize_weight_int8
+from astrai.extension import plan, quantize_act_int8, quantize_weight_int8
 from astrai.extension.kernel.gemm import quant_gemm
 from tests.conftest import skip_no_kernel
 
@@ -69,10 +69,10 @@ class TestQuantGemm:
 
     def test_w8a16_per_tensor_scale(self, m, n, k):
         x, w = _rand(m, n, k)
-        w8, _, w_ref = _quant_weight(w)
+        w8, _, _ = _quant_weight(w)
         s = (w.float().abs().amax() / 127.0).reshape(1).float()
         out = quant_gemm(x, w8, b_scale=s)
-        # w_ref carries per-channel scales; rebuild with the scalar instead
+        # Rebuild the reference with the scalar scale.
         w_pt = (w8.float() * s.item()).to(torch.bfloat16)
         ref = F.linear(x, w_pt)
         torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
@@ -118,6 +118,26 @@ class TestQuantGemm:
 
 
 @skip_no_kernel
+@pytest.mark.parametrize(
+    ("trans_a", "trans_b"), [(False, True), (True, True), (False, False), (True, False)]
+)
+@pytest.mark.parametrize("k", [127, 128, 129])
+def test_w8a8_k128_swizzle_and_tail(trans_a, trans_b, k):
+    m, n = 65, 129
+    x = torch.randint(-128, 128, (m, k), device="cuda", dtype=torch.int8)
+    w = torch.randint(-128, 128, (n, k), device="cuda", dtype=torch.int8)
+    xs = torch.ones(m, device="cuda")
+    ws = torch.ones(n, device="cuda")
+    a = x.T.contiguous() if trans_a else x
+    b = w if trans_b else w.T.contiguous()
+    with plan.override(rows="0 0 0 0 2 -1 2 2 0 128"):
+        selected = plan.probe(m, n, k, torch.int8, torch.int8, trans_a, trans_b)
+        assert (selected.source, selected.kk) == ("override", 128)
+        out = quant_gemm(a, b, xs, ws, trans_a, trans_b)
+    ref = ((x.float() @ w.float().T) * xs[:, None] * ws[None, :]).to(torch.bfloat16)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
 class TestQuantGemmValidation:
     def test_unsupported_dtype_pair_rejected(self):
         x = torch.randn(8, 8, device="cuda", dtype=torch.float16)
@@ -154,6 +174,25 @@ class TestQuantGemmValidation:
         bad = torch.ones(8, device="cuda", dtype=torch.float16)
         with pytest.raises(RuntimeError, match="float32"):
             quant_gemm(x, w8, b_scale=bad)
+
+    def test_rank_rejected_before_shape_access(self):
+        x = torch.ones(8, device="cuda", dtype=torch.bfloat16)
+        w = torch.ones(8, 8, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(RuntimeError, match="2D or 3D"):
+            quant_gemm(x, w)
+
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+    def test_scale_and_bias_must_share_operand_device(self):
+        x = torch.ones(8, 8, device="cuda:0", dtype=torch.bfloat16)
+        w8 = torch.ones(8, 8, device="cuda:0", dtype=torch.int8)
+        other_scale = torch.ones(8, device="cuda:1")
+        with pytest.raises(RuntimeError, match="same device"):
+            quant_gemm(x, w8, b_scale=other_scale)
+
+        w = torch.ones(8, 8, device="cuda:0", dtype=torch.bfloat16)
+        other_bias = torch.ones(8, device="cuda:1", dtype=torch.bfloat16)
+        with pytest.raises(RuntimeError, match="same device"):
+            quant_gemm(x, w, bias=other_bias)
 
     def test_cpu_rejected(self):
         x = torch.randn(8, 16).to(torch.bfloat16)

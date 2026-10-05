@@ -46,7 +46,7 @@ inline const char* plan_row_error(const TableRow& row, int fields) {
     if (row.m_min < 0 || row.n_min < 0)
         return "band min < 0";
     if (!row_k_supported(row.kk))
-        return "k (want 32 or 64)";
+        return "k (want 32, 64 or 128)";
     if (!row_band_ok(row.m_min, row.m_max))
         return "m band (max < min)";
     if (!row_band_ok(row.n_min, row.n_max))

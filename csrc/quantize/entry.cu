@@ -22,7 +22,7 @@
 
 #include <api/fp8_checks.h>
 #include <api/quantize.h>
-#include <kernel/quantize.cuh>
+#include <kernel/quantize/kernel.cuh>
 #include <utils/dtype.cuh>
 #include <api/quantize_common.h>
 
@@ -35,9 +35,9 @@ namespace quant {
  * what the kernel takes as a template parameter. The refusal below is
  * generated from the same rows, so the supported set cannot drift.
  */
-#define ASTRAI_QUANT_IN_DTYPES(X)                                                                  \
-    X(torch::kBFloat16, bf16)                                                                      \
-    X(torch::kHalf, fp16)                                                                          \
+#define ASTRAI_QUANT_IN_DTYPES(X)                                                               \
+    X(torch::kBFloat16, bf16)                                                                   \
+    X(torch::kHalf, fp16)                                                                       \
     X(torch::kFloat32, float)
 
 namespace {
@@ -48,7 +48,7 @@ namespace {
  */
 [[noreturn]] void unsupported_quant_input(at::ScalarType st) {
     std::string instantiated;
-#define ASTRAI_QUANT_NAME_ROW(S, T)                                                                \
+#define ASTRAI_QUANT_NAME_ROW(S, T)                                                             \
     instantiated += std::string(instantiated.empty() ? "" : ", ") + toString(S);
     ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_NAME_ROW)
 #undef ASTRAI_QUANT_NAME_ROW
@@ -64,9 +64,9 @@ namespace {
 template <typename Fp8TA, typename Fp8TB>
 void launch_for_dtype(const torch::Tensor& x, const QuantParams& p, cudaStream_t stream) {
     switch (x.scalar_type()) {
-#define ASTRAI_QUANT_CASE(S, T)                                                                    \
-    case S:                                                                                        \
-        launch_fp8_quantize<Fp8TA, T, Fp8TB>(p, stream);                                           \
+#define ASTRAI_QUANT_CASE(S, T)                                                                 \
+    case S:                                                                                     \
+        launch_fp8_quantize<Fp8TA, T, Fp8TB>(p, stream);                                        \
         break;
         ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_CASE)
 #undef ASTRAI_QUANT_CASE
@@ -183,7 +183,8 @@ QuantizeOutputs run_quantize(torch::Tensor x,
     TORCH_CHECK(scale.is_cuda() && scale.device() == x.device() &&
                     scale.scalar_type() == torch::kFloat32 && scale.numel() == 1,
                 "scale must be a CUDA float32 scalar on the input device");
-    check_fp8_device(x.device().index());
+    TORCH_CHECK(at::cuda::getDeviceProperties(x.device().index())->major >= 8,
+                "quantize requires compute capability 8.0+");
     const at::cuda::OptionalCUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     auto input = x.contiguous();

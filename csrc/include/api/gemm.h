@@ -17,6 +17,13 @@
 namespace astrai {
 namespace gemm {
 
+struct GemmCapabilities {
+    int cc;
+    bool mma, fp8, tma, mx;
+    const char* targets;
+};
+GemmCapabilities capabilities();
+
 /*
  * The single quantized-GEMM entry (one kernel per cell); semantics, validation
  * and dispatch at the definition in gemm.cu. pybind's quant_gemm is a thin

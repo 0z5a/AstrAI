@@ -119,6 +119,11 @@ def probe(
     )
 
 
+def capabilities() -> dict:
+    """Compiled GEMM implementations available on the current CUDA device."""
+    return get_module("gemm").capabilities()
+
+
 def facts() -> dict:
     """The device facts the planner prices against (SMs, smem, L2, cc)."""
     return get_module("gemm").device_facts_info()
@@ -142,5 +147,6 @@ __all__ = [
     "state",
     "probe",
     "facts",
+    "capabilities",
     "tile_vocabulary",
 ]

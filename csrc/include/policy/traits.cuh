@@ -10,6 +10,16 @@
 namespace astrai {
 namespace gemm {
 
+struct MmaSync {
+    static constexpr bool kTma = false, kMx = false;
+};
+struct TmaMma {
+    static constexpr bool kTma = true, kMx = false;
+};
+struct Sm120Mma {
+    static constexpr bool kTma = true, kMx = true;
+};
+
 /*
  * Compile-time tile configuration (CTA tile + warp tiling + pipeline depth).
  * ElemA/ElemB are independent operand types; the MMA runs on the promoted
@@ -40,6 +50,7 @@ struct GemmTraits {
         std::conditional_t<kMxCell,
                            astrai::MxMmaOp<MmaT>,
                            astrai::MmaOp<MmaT, MmaT, typename astrai::MmaShapeFor<MmaT>::type>>;
+    static_assert(!UseMx || kMxCell, "block-scaled MMA requires a symmetric FP8 pair");
     using AccT = typename MmaOp::AccT;
     using ElemTraitsA = gemm_elem_traits<ElemA_>;
     using ElemTraitsB = gemm_elem_traits<ElemB_>;

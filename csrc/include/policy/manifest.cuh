@@ -45,7 +45,7 @@ using Tile_64x64x64_W16x32_S3 = GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>,
  * them a wash against s2..s3 (within 1-2% at this tile) and no compiled-in
  * row reaches past s3. The planner rejects stages > 3 outright, so a stale
  * row file naming one falls to the next source instead of silently
- * launching nothing (RowSetPlanner in launcher/planning.h).
+ * launching nothing (row_plan in gemm/planning.cpp).
  * 16 warps per CTA on the small geometry (16x16 warp tiles, 512 threads):
  * the 8-warp small tile starves the tensor pipe on two-byte operands —
  * measured 1.36-1.66x for this twin on 11 of 13 shapes (NT and both
@@ -82,6 +82,7 @@ using Tile_128x128x32_W32x32_S2 = GemmTileConfig<Shape<128, 128, 32>, Shape<32, 
  * opt-in ceiling) against 74KB for a 1-byte one.
  */
 using Tile_128x256x64_W64x32_S2 = GemmTileConfig<Shape<128, 256, 64>, Shape<64, 32>, 2>;
+using Tile_128x128x128_W64x32_S2 = GemmTileConfig<Shape<128, 128, 128>, Shape<64, 32>, 2>;
 
 /*
  * CTA class of a tile config, derived from its CTA geometry — one axis of
@@ -185,14 +186,15 @@ using TileManifest = tuple_cat_t<TileManifestCross,
                                             Tile_64x128x32_W32x32_S3>>;
 
 /*
- * Byte ladder adds 128x256x64 S2 and 128x128x32 S3. Exclude crosswise kK=32
+ * Byte ladder adds wide-N, kK=128 and kK=32 big tiles. Exclude crosswise kK=32
  * narrow: half-bus loads measured 8-34% slower than kK=64, and the planner
  * mis-picked it on unseen bands. S3's 32KB ring reclaims its output; S2's
  * 24KB ring requires direct-store epilogue. 16-warp small remains resolver-only.
  */
 using TileManifestByte =
     tuple_cat_t<TileManifestCross,
-                std::tuple<Tile_128x256x64_W64x32_S2, Tile_128x128x32_W64x32_S3>>;
+                std::tuple<Tile_128x256x64_W64x32_S2, Tile_128x128x128_W64x32_S2,
+                           Tile_128x128x32_W64x32_S3>>;
 
 /*
  * How many operands take that direct path (0 = dual-congruous NT). The

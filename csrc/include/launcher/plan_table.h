@@ -14,16 +14,7 @@
 namespace astrai {
 namespace gemm {
 
-/*
- * One row tier's backing store: mutex-guarded, replaced wholesale (never
- * mutated in place), lookups copy the row out under the lock — a concurrent
- * install cannot dangle a pointer a launched plan holds. Two instances:
- * override (the configure rows channel, outranks everything) and injected
- * (the autotuner's measured winners; ranked below the env file, which is
- * the experimenter's). `source` is the install spec, kept so the config
- * state can re-install exactly (re-emitting parsed rows would lose the
- * gates the text format cannot express).
- */
+// Row tiers copy lookup results under a mutex; installs replace the whole table.
 class RowSource {
   public:
     void set_from(std::string source, std::vector<TableRow> rows) {
@@ -80,39 +71,6 @@ inline bool parse_planner_mode(const std::string& name, int& out) {
 }
 
 /*
- * Legacy ASTR_GEMM_* env vars, read once on first touch; configure() writes
- * the atomics directly and bypasses this.
- */
-inline void gemm_config_seed_once() {
-    static const bool seeded = [] {
-        GemmConfig& c = gemm_config();
-        auto env = [](const char* name) {
-            const char* e = std::getenv(name);
-            return e == nullptr ? std::string() : std::string(e);
-        };
-        if (const std::string v = env("ASTR_GEMM_MODEL"); !v.empty())
-            c.planner = std::atoi(v.c_str());
-        if (const std::string v = env("ASTR_GEMM_PLAN"); !v.empty() && v != "0")
-            c.log = 1;
-        if (env("ASTR_GEMM_NO_TMA") == "1")
-            c.tma_disabled = 1;
-        if (env("ASTR_GEMM_NO_MX") == "1")
-            c.mx_disabled = 1;
-        if (const std::string v = env("ASTR_GEMM_TABLE"); !v.empty()) {
-            if (v == "-") {
-                c.table_off = 1;
-            } else {
-                std::vector<TableRow> rows;
-                if (parse_plan_table_file(v, rows))
-                    plan_table_override_source().set_from(v, std::move(rows));
-            }
-        }
-        return true;
-    }();
-    (void)seeded;
-}
-
-/*
  * Resolved views (unset falls to the default, never to a later env read);
  * the three launch-side knobs' resolved views are plan_types.h's.
  */
@@ -125,7 +83,6 @@ inline bool gemm_table_off() {
     gemm_config_seed_once();
     return gemm_config().table_off.load(std::memory_order_relaxed) > 0;
 }
-
 
 } // namespace gemm
 } // namespace astrai

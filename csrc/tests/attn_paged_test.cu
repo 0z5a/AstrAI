@@ -8,7 +8,7 @@
 
 #include "test_utils.cuh"
 #include <cstring>
-#include <kernel/attention_launch.cuh>
+#include <kernel/attention/launch.cuh>
 #include <vector>
 
 using namespace astrai::attention;

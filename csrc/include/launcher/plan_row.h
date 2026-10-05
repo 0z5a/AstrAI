@@ -35,7 +35,7 @@ static constexpr int kMaxPerfClass = 3;
  * The k-tile depths the manifests carry; any other depth matches no tile
  * and launches nothing, so it is rejected.
  */
-inline constexpr bool row_k_supported(int kk) { return kk == 32 || kk == 64; }
+inline constexpr bool row_k_supported(int kk) { return kk == 32 || kk == 64 || kk == 128; }
 
 /*
  * Ring depths a row may name. Enumerated, not a range, so a gap cannot pass

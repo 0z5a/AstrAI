@@ -125,7 +125,7 @@ class _CMakeBuildExt(_build_ext):
         if arch:
             if max_arch is not None and max_arch < 89:
                 warnings.warn(
-                    f"FP8 operator disabled: CUDA compute capability {arch} "
+                    f"Native FP8 GEMM disabled: CUDA compute capability {arch} "
                     "requires 89 or newer.",
                     stacklevel=2,
                 )
@@ -149,7 +149,7 @@ class _CMakeBuildExt(_build_ext):
             if arch
             else ()
         )
-        if max_arch is not None and max_arch >= 89:
+        if max_arch is not None and max_arch >= 80:
             required += ("quantize", "gemm")
         missing = [
             name for name in required if not any(lib_dir.glob(f"_C_{name}.*.so"))

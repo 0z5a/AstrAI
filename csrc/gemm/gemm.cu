@@ -24,7 +24,9 @@
 
 #include "entry.h"
 #include <api/gemm.h>
+#include <gemm_build.h>
 #include <launcher/gemm_dispatch.cuh>
+#include <launcher/plan_table.h>
 #include <launcher/planning.h>
 
 using namespace astrai;
@@ -33,35 +35,45 @@ using namespace astrai::quant;
 namespace astrai {
 namespace gemm {
 
-/*
- * The dtype-pair table: one line per supported pair — (torch ScalarType,
- * element type) per operand — and the single source this TU's consumers
- * stamp: the extern template declarations below and the dispatch / probe
- * lookups further down. A pair is added once here and cannot reach one
- * consumer without the other. (The extern block used to be hand-maintained
- * beside the switch, and had already grown two bf16 x fp8 entries with no
- * instantiation TU behind them.) The CMake gemm module entry carries one
- * instantiation TU per line — kept together by hand, and a line with no TU
- * behind it fails the link loudly.
- */
-#define ASTRAI_GEMM_PAIRS(X)                                                                       \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)                            \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                                       \
-    X(torch::kChar, int8_t, torch::kChar, int8_t)                                                  \
-    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn, __nv_fp8_e4m3)                  \
-    X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
+#define ASTRAI_GEMM_BASE_PAIRS(X)                                                               \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)                         \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                                    \
+    X(torch::kChar, int8_t, torch::kChar, int8_t)
 
-/*
- * The per-pair specializations are explicitly instantiated in their own TUs
- * (gemm_bf16_bf16.cu etc.), one nvcc job per dtype pair. These extern
- * template declarations keep the dispatch switch below from re-instantiating:
- * the address-of forms are references to the externally defined symbols only.
- * (They must sit here, outside the anonymous namespace — nvcc rejects
- * extern template declarations in an anonymous namespace.)
- */
-#define ASTRAI_GEMM_EXTERN(SA, TA, SB, TB) extern ASTRAI_GEMM_INSTANTIATE(TA, TB);
-ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_EXTERN)
-#undef ASTRAI_GEMM_EXTERN
+#if ASTRAI_BUILD_FP8
+#define ASTRAI_GEMM_FP8_PAIRS(X)                                                                \
+    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn, __nv_fp8_e4m3)               \
+    X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
+#else
+#define ASTRAI_GEMM_FP8_PAIRS(X)
+#endif
+#define ASTRAI_GEMM_PAIRS(X) ASTRAI_GEMM_BASE_PAIRS(X) ASTRAI_GEMM_FP8_PAIRS(X)
+
+#define GEMM_EXTERN(SA, TA, SB, TB)                                                             \
+    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, MmaSync>(                         \
+        GemmParams, cudaStream_t, bool, bool);
+ASTRAI_GEMM_PAIRS(GEMM_EXTERN)
+#undef GEMM_EXTERN
+#if ASTRAI_BUILD_TMA
+#define GEMM_EXTERN(SA, TA, SB, TB)                                                             \
+    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, TmaMma>(                          \
+        GemmParams, cudaStream_t, bool, bool);
+ASTRAI_GEMM_PAIRS(GEMM_EXTERN)
+#undef GEMM_EXTERN
+#endif
+#if ASTRAI_BUILD_MX
+#define GEMM_EXTERN(SA, TA, SB, TB)                                                             \
+    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, Sm120Mma>(                        \
+        GemmParams, cudaStream_t, bool, bool);
+ASTRAI_GEMM_FP8_PAIRS(GEMM_EXTERN)
+#undef GEMM_EXTERN
+#endif
+
+GemmCapabilities capabilities() {
+    const int cc = device_facts().cc;
+    return {cc, supports(build::kBase, cc), supports(build::kFp8, cc),
+            supports(build::kTma, cc), supports(build::kMx, cc), build::kTargets};
+}
 
 namespace {
 
@@ -86,8 +98,8 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
  */
 [[noreturn]] void unsupported_pair(c10::ScalarType a, c10::ScalarType b) {
     std::string instantiated;
-#define ASTRAI_GEMM_PAIR_ROW(SA, TA, SB, TB)                                                       \
-    instantiated +=                                                                                \
+#define ASTRAI_GEMM_PAIR_ROW(SA, TA, SB, TB)                                                    \
+    instantiated +=                                                                             \
         std::string(instantiated.empty() ? "" : ", ") + toString(SA) + " x " + toString(SB);
     ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_PAIR_ROW)
 #undef ASTRAI_GEMM_PAIR_ROW
@@ -95,10 +107,38 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
                 " (instantiated: ", instantiated, ")");
 }
 
+/* All kernel variants have distinct schedule types and architecture images. */
+template <typename A, typename B, typename F>
+auto with_schedule(F&& fn) {
+    constexpr bool fp8 = sizeof(A) == 1 && !std::is_same_v<A, int8_t>;
+    const GemmCapabilities caps = capabilities();
+    TORCH_CHECK(fp8 ? caps.fp8 : caps.mma,
+                "GEMM kernels were not built for this device/dtype (SM", caps.cc,
+                ", compiled targets: ", caps.targets, ")");
+#if ASTRAI_BUILD_MX
+    if constexpr (fp8) {
+        if (caps.mx && !gemm_mx_cell_disabled())
+            return fn(Sm120Mma{});
+    }
+#endif
+#if ASTRAI_BUILD_TMA
+    if (caps.tma && !gemm_tma_staging_disabled())
+        return fn(TmaMma{});
+#endif
+    return fn(MmaSync{});
+}
+
+template <typename A, typename B>
+GemmDispatchFn selected_dispatch() {
+    return with_schedule<A, B>([](auto schedule) -> GemmDispatchFn {
+        return &gemm_dispatch<A, B, __nv_bfloat16, decltype(schedule)>;
+    });
+}
+
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
-#define GEMM_CASE(SA, TA, SB, TB)                                                                  \
-    case pack_dtypes(SA, SB):                                                                      \
-        return &gemm_dispatch<TA, TB>;
+#define GEMM_CASE(SA, TA, SB, TB)                                                               \
+    case pack_dtypes(SA, SB):                                                                   \
+        return selected_dispatch<TA, TB>();
     switch (pack_dtypes(a, b)) {
         ASTRAI_GEMM_PAIRS(GEMM_CASE)
     default:
@@ -114,10 +154,17 @@ GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
 using GemmProbeFn = std::pair<PlanDecision, PlanQuery> (*)(
     int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
 
+template <typename A, typename B>
+GemmProbeFn selected_probe() {
+    return with_schedule<A, B>([](auto schedule) -> GemmProbeFn {
+        return &plan_probe_for<A, B, decltype(schedule)>;
+    });
+}
+
 GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
-#define PROBE_CASE(SA, TA, SB, TB)                                                                 \
-    case pack_dtypes(SA, SB):                                                                      \
-        return &plan_probe_for<TA, TB>;
+#define PROBE_CASE(SA, TA, SB, TB)                                                              \
+    case pack_dtypes(SA, SB):                                                                   \
+        return selected_probe<TA, TB>();
     switch (pack_dtypes(a, b)) {
         ASTRAI_GEMM_PAIRS(PROBE_CASE)
     default:

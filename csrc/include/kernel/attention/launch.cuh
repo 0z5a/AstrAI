@@ -16,8 +16,8 @@
 #include <cuda_runtime.h>
 
 #include <api/attention_common.h>
-#include <kernel/attention_split_kv.cuh>
-#include <kernel/attention_split_q.cuh>
+#include <kernel/attention/split_kv.cuh>
+#include <kernel/attention/split_q.cuh>
 #include <memory/layout_policies.cuh>
 #include <utils/launch.cuh>
 
@@ -101,19 +101,19 @@ inline int decode_wave_capacity(Kernel kernel, int threads) {
  *   DISPATCH_CAUSAL_MASK(is_causal, has_mask,
  *                        launcher<KV>::template launch, HEAD_DIM, p, stream);
  */
-#define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...)                               \
-    do {                                                                                           \
-        if (is_causal) {                                                                           \
-            if (has_mask)                                                                          \
-                FN<HEAD_DIM, true, true>(__VA_ARGS__);                                             \
-            else                                                                                   \
-                FN<HEAD_DIM, true, false>(__VA_ARGS__);                                            \
-        } else {                                                                                   \
-            if (has_mask)                                                                          \
-                FN<HEAD_DIM, false, true>(__VA_ARGS__);                                            \
-            else                                                                                   \
-                FN<HEAD_DIM, false, false>(__VA_ARGS__);                                           \
-        }                                                                                          \
+#define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...)                            \
+    do {                                                                                        \
+        if (is_causal) {                                                                        \
+            if (has_mask)                                                                       \
+                FN<HEAD_DIM, true, true>(__VA_ARGS__);                                          \
+            else                                                                                \
+                FN<HEAD_DIM, true, false>(__VA_ARGS__);                                         \
+        } else {                                                                                \
+            if (has_mask)                                                                       \
+                FN<HEAD_DIM, false, true>(__VA_ARGS__);                                         \
+            else                                                                                \
+                FN<HEAD_DIM, false, false>(__VA_ARGS__);                                        \
+        }                                                                                       \
     } while (0)
 
 /*
@@ -233,9 +233,9 @@ static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream)
 template <typename Fn>
 static inline void dispatch_head_dim(AttentionParams& p, cudaStream_t stream) {
     switch (p.head_dim) {
-#define ASTRAI_HEAD_DIM_CASE(D)                                                                    \
-    case D:                                                                                        \
-        Fn::template run<D>(p, stream);                                                            \
+#define ASTRAI_HEAD_DIM_CASE(D)                                                                 \
+    case D:                                                                                     \
+        Fn::template run<D>(p, stream);                                                         \
         break;
         ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
 #undef ASTRAI_HEAD_DIM_CASE

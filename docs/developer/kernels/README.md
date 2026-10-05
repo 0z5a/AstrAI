@@ -328,19 +328,23 @@ nvcc -I csrc/include -arch=sm_120 -O3 --use_fast_math \
 csrc/
 ├── CMakeLists.txt                    # CMake build: the KERNEL_MODULES registry (module name | its source TUs) + torch/pybind11 linking
 ├── __init__.py                       # build-time marker only (keeps `csrc` a setuptools package)
-├── include/                          # THE include root: every header, angle-bracket root-qualified (<kernel/gemm.cuh>)
+├── include/                          # THE include root: every header, angle-bracket root-qualified (<kernel/gemm/kernel.cuh>)
 │   ├── policy.cuh                    #   composed GemmPolicy consumed by the kernel
 │   ├── policy/                      #   compile-time GEMM tile rules
 │   │   ├── traits.cuh              #     promoted MMA traits and shared-memory budget
 │   │   └── manifest.cuh            #     named tile recipes, CTA classes and staging ladders
 │   ├── scheduler.cuh                 #   cross-cutting: grouped/plain raster mapping
-│   ├── kernel/                       # entry __global__ and their composition (humming's rule: what the code IS, not which family owns it)
-│   │   ├── gemm.cuh                  #     GEMM cp.async and TMA device kernels
-│   │   ├── gemm_mainloop.cuh         #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
-│   │   ├── attention_launch.cuh      #     pure-CUDA launch vocabulary: launchers + tile-config maps + dispatch_decode/prefill(_paged) funnels, split-K math
-│   │   ├── attention_split_kv.cuh    #     decode kernel (split-KV FlashDecoding, GQA head packing) + split-combine
-│   │   ├── attention_split_q.cuh     #     prefill kernel (split-Q, PackGQA head folding: h = idx % G over the global packed row index)
-│   │   └── quantize.cuh              #     quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
+│   ├── kernel/                       # device kernels and launch helpers, grouped by operator
+│   │   ├── attention/
+│   │   │   ├── mma.cuh               # attention fragments and softmax helpers
+│   │   │   ├── split_kv.cuh          # decode and split-combine kernels
+│   │   │   ├── split_q.cuh           # prefill kernel
+│   │   │   └── launch.cuh            # attention launch and dispatch
+│   │   ├── gemm/
+│   │   │   ├── sm80.cuh              # staged mma.sync mainloop
+│   │   │   └── kernel.cuh            # cp.async and TMA entry kernels
+│   │   └── quantize/
+│   │       └── kernel.cuh            # vectorized and transpose kernels
 │   ├── memory/                       # data movement with stage semantics
 │   │   ├── load_async.cuh            #     cp.async operand staging + PrefetchCarry (congruous and 16-bit transposed)
 │   │   ├── load_crosswise.cuh        #     direct 8-bit crosswise staging + CrosswiseCarry
@@ -349,8 +353,10 @@ csrc/
 │   │   ├── tma.cuh                   #     TMA staging (sm_90+): device cp.async.bulk.tensor emitters + host tensor-map encoding + exact-match cache
 │   │   └── layout_policies.cuh       #     attention KV addressing: DenseQSchedule/PackedQSchedule, ContigKV/PagedKV
 │   ├── mma/                          # tensor-core backends and fragment helpers
-│   │   ├── mma.cuh                   #     shared mma_sync<InT> + shapes + ldmatrix cores + typed fragment cells
-│   │   └── utils.cuh                 #     attention's ldmatrix/pack helpers + online-softmax tile path
+│   │   ├── mma.cuh                   #     common typed fragment contract
+│   │   ├── sm80.cuh / sm89.cuh       #     own BF16/INT8 and FP8 warp MMA instructions
+│   │   ├── sm120.cuh                 #     block-scaled FP8 MMA instructions
+│   │   └── ldmatrix.cuh              #     shared fragment loads
 │   ├── epilogue/                     # moving/merging/writing results out
 │   │   └── writer.cuh                #     gemm fused bias + scale folding + bf16/fp32 smem scatter + copy-out
 │   ├── arith/                        # value transforms on register fragments
@@ -370,7 +376,7 @@ csrc/
 │   │   ├── attention_dtypes.h        #     attention ASTRAI_ATTN_DTYPE_LIST + generated unsupported-dtype refusal
 │   │   ├── gated_deltanet.h          #     the family's two entry declarations (astrai::gdn)
 │   │   ├── quantize.h                #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
-│   │   ├── fp8_checks.h              #     fp8 capability gate (check_fp8_device; shared by quantize + gemm)
+│   │   ├── fp8_checks.h              #     fp8 capability gate (check_fp8_device; native FP8 GEMM)
 │   │   ├── gemm_common.h             #     layout tags, gemm_elem_traits, gemm_mma_traits, GemmParams POD
 │   │   ├── attention_common.h        #     AttentionParams POD (cross-layer: stage headers include it)
 │   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
@@ -379,7 +385,7 @@ csrc/
 │       ├── gemm_tiles.cuh          #     manifest selection and TMA/cp.async policy resolution
 │       ├── gemm_dispatch.cuh       #     layout rewrite, typed entry and planner probe
 │       ├── plan_types.h              #     runtime config, query and dispatch decision
-│       ├── planning.h                #     planner chain; plan_dispatch defined non-inline — SINGLE-INCLUSION
+│       ├── planning.h                #     host planner declarations, implemented in gemm/planning.cpp
 │       ├── plan_row.h                #     TableRow vocabulary and row matching
 │       ├── plan_table_parse.h        #     row-file and runtime-text parsing
 │       ├── plan_table_builtin.h      #     generated measured rows and degraded fallback rows
@@ -391,7 +397,7 @@ csrc/
 │   ├── paged_decode.cu               #   → module attn_paged_decode
 │   └── paged_prefill.cu              #   → module attn_paged_prefill
 ├── gemm/                             # family translation units and private headers (→ module gemm)
-│   ├── gemm.cu                       #   typed host layer: dtype-pair registry + its two lookups + the planner's C++ face + the ONE planning.h includer
+│   ├── gemm.cu                       #   typed host layer: dtype-pair registry + its two lookups + the planner's C++ face
 │   ├── entry.h                       #   quant_gemm's op-entry ladder (dtype classify → device gate → scale contract → layout/shape validation → GemmParams pack → dispatch) + the empty-problem guard — TU-local impl header, quoted-include, included at the bottom of gemm.cu (the lookups it calls live there)
 │   ├── bindings.cu                   #   quant_gemm/planner pybind surface, PYBIND11_MODULE and FP8 registration
 │   ├── fp8_linear.cu                 #   fp8 training forward/backward as one C++ autograd::Function
@@ -400,7 +406,8 @@ csrc/
 │   ├── fp8_ring.h                    #   scale recipe and delayed-scaling ring
 │   ├── fp8_cache.h                   #   versioned weight cast and bounded activation cache
 │   ├── fp8_state.h                   #   meta registry, slots and restore helpers used by both FP8 translation units
-│   └── gemm_bf16_* / gemm_*.cu       #   per-pair explicit gemm_dispatch instantiation units (one nvcc job each; plan_table-free)
+│   ├── planning.cpp                 #   host row selection, model ranking, raster and environment seed
+│   └── gemm_*.cu                  #   per-pair explicit instantiations, compiled per schedule
 ├── quantize/                         # family translation units (→ module quantize; entry.cu also compiled into gemm to share the chain)
 │   ├── bindings.cu                   #   pybind surface only (quantize / quantize_dual)
 │   └── entry.cu                      #   the entry implementation: run_quantize + ring binding + dtype dispatch (ASTRAI_QUANT_IN_DTYPES lives here)
@@ -418,15 +425,15 @@ csrc/
     ├── test_utils.cuh                # shared test utilities (now_ms, f2bf, bf2f, randf) — harness-local, outside the include root
     ├── attn_test.cu                  # decode + prefill kernels
     ├── attn_paged_test.cu            # paged decode/prefill kernels
-    └── quant_gemm_test.cu            # GEMM correctness + TFLOPS bench (includes launcher/planning.h: single-TU, torch-free)
+    └── quant_gemm_test.cu            # GEMM correctness + TFLOPS bench (links gemm/planning.cpp; torch-free)
 ```
 
 Compiled `.so` modules are placed directly in `astrai/extension/`.
 
 Three conventions the tree encodes. (1) **Stages, not families**: headers
 live under `csrc/include/<stage>/` by what they do (kernel / memory / mma /
-epilogue / arith / datatype / utils), the family directories hold only
-translation units, and `api/` is the caller contract — declarations, the
+epilogue / arith / datatype / utils); `kernel/` groups its headers by
+operator, while the `csrc/<operator>/` directories hold translation units, and `api/` is the caller contract — declarations, the
 supported-set lists and the capability gates; it is the only directory
 whose headers may touch torch, which is what keeps the standalone
 `csrc/tests/*.cu` harnesses torch-free. The gemm→quantize include edges
@@ -437,7 +444,7 @@ purpose: each carries its own `nvcc` line so a correctness test runs
 without torch; the `bench/` python tools are the reproduce path for the
 numbers in the operator docs and workspace `notes/`. (3) **One include
 root, `csrc/include`, every project include angle-bracket and
-root-qualified** (`<kernel/gemm.cuh>`, `<policy.cuh>`); quoted includes are
+root-qualified** (`<kernel/gemm/kernel.cuh>`, `<policy.cuh>`); quoted includes are
 the toolchain's plus the harness-local `test_utils.cuh`. A quoted project
 path would resolve through the includer's own directory first and silently
 change meaning on a move — the three same-named `common.h` are now
@@ -452,8 +459,9 @@ whose every includer sits in one family directory lives beside them
 an implementation shared across modules becomes a .cu listed in each
 module's CMake sources (`quantize/entry.cu`, compiled into both the
 quantize and gemm modules), with only its declaration in `api/`.
-`launcher/` owns GEMM host dispatch. `planning.h` is the single-inclusion
-planner (one TU per binary); `plan_table.h` keeps the mutable table state and
+`launcher/` owns GEMM host dispatch. `planning.h` declares the planner;
+`gemm/planning.cpp` provides its host implementation, linked once per binary;
+`plan_table.h` keeps the mutable table state and
 includes the row matcher, parser, and builtin data headers. The dtype-pair
 instantiation units include neither planner nor table headers. A family
 gains a directory when it gains a second file; single-file families
@@ -461,4 +469,4 @@ gains a directory when it gains a second file; single-file families
 
 Compiled `.so` modules are placed directly in `astrai/extension/`.
 
-> Document Update Time: 2026-09-27
+> Document Update Time: 2026-10-05

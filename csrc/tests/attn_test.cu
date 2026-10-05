@@ -8,7 +8,7 @@ nvcc -I csrc/include -arch=sm_89 -O3 \
 */
 
 #include "test_utils.cuh"
-#include <kernel/attention_launch.cuh>
+#include <kernel/attention/launch.cuh>
 
 using namespace astrai::attention;
 

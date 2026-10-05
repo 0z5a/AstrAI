@@ -8,7 +8,7 @@
 #include <utility>
 
 #include <launcher/plan_types.h>
-#include <kernel/gemm.cuh>
+#include <kernel/gemm/kernel.cuh>
 #include <utils/device.cuh>
 #include <utils/launch.cuh>
 
@@ -105,7 +105,8 @@ template <typename ElemA,
           typename ElemB,
           typename LayoutA,
           typename LayoutB,
-          typename OutT = __nv_bfloat16>
+          typename OutT = __nv_bfloat16,
+          typename Schedule = MmaSync>
 PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
     PlanQuery q;
     q.m = p.m;
@@ -118,13 +119,14 @@ PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
     q.bb = (int)sizeof(ElemB);
     q.out_elem_bytes = (int)sizeof(OutT);
     /*
-     * The staging the launch that follows will take — launch_plan_impl's
+     * The staging the launch that follows will take — launch_plan's
      * predicate minus the descriptor-encodable runtime check: TMA only for
      * the dual-congruous layout pair with descriptor-encodable dtypes on
      * sm_90+ without the kill switch, cp.async otherwise.
      */
-    q.tma = crosswise_of<LayoutA, LayoutB>() == 0 && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2 &&
-            dev.cc >= 90 && !gemm_tma_staging_disabled();
+    q.tma = Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 &&
+            sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2 && dev.cc >= 90 &&
+            !gemm_tma_staging_disabled();
     q.dev = dev;
     return q;
 }
@@ -137,9 +139,10 @@ template <typename ElemA,
           typename ElemB,
           typename LayoutA,
           typename LayoutB,
-          typename OutT = __nv_bfloat16>
+          typename OutT = __nv_bfloat16,
+          typename Schedule = MmaSync>
 PlanDecision plan_dispatch_for(const GemmParams& p) {
-    return plan_dispatch(plan_query<ElemA, ElemB, LayoutA, LayoutB, OutT>(p, device_facts()));
+    return plan_dispatch(plan_query<ElemA, ElemB, LayoutA, LayoutB, OutT, Schedule>(p, device_facts()));
 }
 template <typename Policy> void launch_policy(GemmParams p, cudaStream_t stream) {
     using Traits = typename Policy::Traits;

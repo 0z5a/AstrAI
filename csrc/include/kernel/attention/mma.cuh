@@ -5,6 +5,7 @@
 
 #include <arith/softmax.cuh>
 #include <memory/pipeline.cuh>
+#include <mma/ldmatrix.cuh>
 #include <mma/mma.cuh>
 #include <utils/define.cuh>
 #include <utils/dtype.cuh>
