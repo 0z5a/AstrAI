@@ -1,13 +1,14 @@
 #pragma once
 /*
- * Collective mainloop: smem stage rings, stage loads (congruous cp.async /
- * crosswise LDG+PRMT), per-lane ldmatrix addressing, software-pipelined
+ * Collective mainloop: smem stage rings, cp.async/TMA stage loads,
+ * crosswise LDG+PRMT, per-lane ldmatrix addressing, software-pipelined
  * mma.sync. Addressing scheme + fast-loop peel rationale:
  * docs/developer/kernels/gemm.md.
  */
 
 #include <type_traits>
 
+#include <api/gemm_common.h>
 #include <datatype/dequant.cuh>
 #include <memory/load_async.cuh>
 #include <memory/load_crosswise.cuh>
@@ -18,7 +19,6 @@
 #include <mma/mma.cuh>
 #include <policy.cuh>
 #include <utils/define.cuh>
-#include <api/gemm_common.h>
 #include <utils/tensor.cuh>
 
 namespace astrai {

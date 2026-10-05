@@ -4,7 +4,7 @@
 
 #include <api/gemm_common.h>
 #include <epilogue/writer.cuh>
-#include <kernel/gemm/sm80.cuh>
+#include <kernel/gemm/mainloop.cuh>
 #include <memory/pipeline.cuh>
 #include <policy.cuh>
 #include <scheduler.cuh>

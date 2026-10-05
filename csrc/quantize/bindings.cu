@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <torch/extension.h>
 
+#include <api/dtype.h>
 #include <api/quantize.h>
 
 using namespace astrai::quant;
@@ -34,7 +35,7 @@ py::object quantize_impl(torch::Tensor x,
                          py::object ring,
                          int64_t hist_idx,
                          py::object hist_len,
-                         double fp8_max,
+                         py::object fp8_max,
                          double pow2_margin) {
     c10::optional<at::ScalarType> t_dtype = c10::nullopt;
     if (!transposed_dtype.is_none())
@@ -48,9 +49,13 @@ py::object quantize_impl(torch::Tensor x,
         TORCH_CHECK(t.defined(), "ring_state must be a defined tensor");
         ring_state = t;
     }
+    const double format_max = out_dtype == astrai::scalar_type_v<astrai::fp8_e5m2>
+                                  ? astrai::ElemTrait<astrai::fp8_e5m2>::kFiniteMax
+                                  : astrai::ElemTrait<astrai::fp8_e4m3>::kFiniteMax;
+    const double max = fp8_max.is_none() ? format_max : fp8_max.cast<double>();
     const QuantizeOutputs outs =
-        run_quantize(x, scale, layout, out_dtype, t_dtype, ring_state, hist_idx, fp8_max,
-                     pow2_margin, c10::nullopt, c10::nullopt, ring_hist_len);
+        run_quantize(x, scale, layout, out_dtype, t_dtype, ring_state, hist_idx, max, pow2_margin,
+                     c10::nullopt, c10::nullopt, ring_hist_len);
 
     if (layout == QuantLayout::Dual)
         return py::make_tuple(outs.out, outs.out_t, outs.amax);
@@ -73,7 +78,7 @@ py::object quantize(torch::Tensor x,
                     py::object ring,
                     int64_t hist_idx,
                     py::object hist_len,
-                    double fp8_max,
+                    py::object fp8_max,
                     double pow2_margin) {
     const QuantLayout layout = transposed ? QuantLayout::Transposed : QuantLayout::RowMajor;
     return quantize_impl(x, scale, dtype, layout, py::none(), ring, hist_idx, hist_len, fp8_max,
@@ -95,7 +100,7 @@ py::object quantize_dual(torch::Tensor x,
                          py::object ring,
                          int64_t hist_idx,
                          py::object hist_len,
-                         double fp8_max,
+                         py::object fp8_max,
                          double pow2_margin) {
     return quantize_impl(x, scale, dtype, QuantLayout::Dual, transposed_dtype, ring, hist_idx,
                          hist_len, fp8_max, pow2_margin);
@@ -111,12 +116,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("K_FOLD_SLOTS") = kFoldSlots;
     m.def("quantize", &quantize, py::arg("x"), py::arg("scale"), py::arg("dtype"),
           py::arg("transposed") = false, py::arg("ring") = py::none(), py::arg("hist_idx") = 0,
-          py::arg("hist_len") = py::none(), py::arg("fp8_max") = 448.0,
+          py::arg("hist_len") = py::none(), py::arg("fp8_max") = py::none(),
           py::arg("pow2_margin") = 1.0,
           "Scaled cast to fp8/int8; returns (x8|x8T, amax) — amax None without a ring");
     m.def("quantize_dual", &quantize_dual, py::arg("x"), py::arg("scale"), py::arg("dtype"),
           py::arg("transposed_dtype") = py::none(), py::arg("ring") = py::none(),
-          py::arg("hist_idx") = 0, py::arg("hist_len") = py::none(), py::arg("fp8_max") = 448.0,
-          py::arg("pow2_margin") = 1.0,
+          py::arg("hist_idx") = 0, py::arg("hist_len") = py::none(),
+          py::arg("fp8_max") = py::none(), py::arg("pow2_margin") = 1.0,
           "One read produces both orientations: returns (x8, x8T, amax)");
 }

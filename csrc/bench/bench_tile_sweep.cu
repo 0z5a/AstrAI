@@ -411,7 +411,7 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
             row.why = "output exceeds the reclaimed ring";
         } else {
             using Policy =
-                GemmPolicy<EA, EB, RowMajor, ColMajor, Tile, RowMajor, OutT, false, false>;
+                GemmPolicy<EA, EB, RowMajor, ColMajor, Tile, RowMajor, OutT>;
             if (Policy::kSmemBytes > dev.smem_max) {
                 row.why = "ring over the smem opt-in ceiling";
             } else {

@@ -54,7 +54,7 @@ Headers under `csrc/include` contain declarations and device templates;
 | `launcher/plan_types.h` | Runtime config, planner query, recipe, and dispatch decision shared by launch and planning code |
 | `memory/load_async.cuh` / `load_crosswise.cuh` / `load_crosswise_packed.cuh` | Operand staging by access pattern: cp.async (congruous and 16-bit transposed) with `PrefetchCarry`; direct 8-bit crosswise LDG+PRMT with `CrosswiseCarry`; packed k-pair crosswise with `PairPackCarry` |
 | `scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
-| `kernel/gemm/sm80.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
+| `kernel/gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `epilogue/writer.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `kernel/gemm/kernel.cuh` | Device entry kernels for cp.async and TMA staging; they compose the mainloop and epilogue |
 | `launcher/gemm_launch.cuh` | Typed CUDA launch, TMA descriptor setup, and the `GemmParams` to `PlanQuery` conversion |

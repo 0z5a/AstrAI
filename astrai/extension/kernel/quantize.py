@@ -36,7 +36,7 @@ def quantize(
     ring_state: Optional[torch.Tensor] = None,
     hist_idx: int = 0,
     hist_len: Optional[int] = None,
-    fp8_max: float = 448.0,
+    fp8_max: Optional[float] = None,
     pow2_margin: float = 1.0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Float (bf16/fp16/fp32) -> FP8 quantize (scale-then-cast).
@@ -53,6 +53,7 @@ def quantize(
     ``hist[hist_idx]``, publishes the next scale — plus its correctly rounded
     reciprocal, the slot the next call reads as its multiplier — as
     ``max(hist) / fp8_max / pow2_margin``, and reports that round's amax.
+    By default, ``fp8_max`` follows ``fmt`` (E4M3 or E5M2).
     A ring also needs ``hist_len``; the window is not recoverable from
     ``numel`` (the composed ring's trailing pair overshoots).
 
@@ -81,7 +82,7 @@ def quantize_dual(
     ring_state: Optional[torch.Tensor] = None,
     hist_idx: int = 0,
     hist_len: Optional[int] = None,
-    fp8_max: float = 448.0,
+    fp8_max: Optional[float] = None,
     pow2_margin: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Dual-orientation quantize: one read of ``x`` produces both the

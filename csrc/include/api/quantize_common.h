@@ -110,7 +110,7 @@ struct QuantParams {
     unsigned int* __restrict__ done = nullptr;  // block-completion counter
     int hist_len = 0;
     int hist_idx = 0;
-    float fp8_max = 448.0f; // scale = max(hist) / fp8_max / pow2_margin
+    float fp8_max = 0.0f; // set when a delayed-scaling ring is bound
     float pow2_margin = 1.0f;
 
     // The tiled kernel views the buffer as [rows][cols] row-major.

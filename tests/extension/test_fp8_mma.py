@@ -582,7 +582,6 @@ def test_quantize_ring_fold_matches_host_update(fmt, fmax, margin):
         ring_state=ring,
         hist_idx=idx,
         hist_len=n,
-        fp8_max=fmax,
         pow2_margin=pow2m,
     )
     assert torch.equal(x8.view(torch.uint8), x8_ref.view(torch.uint8))
@@ -624,7 +623,6 @@ def test_quantize_ring_fold_tall_dual_grid(fmt, fmax):
         ring_state=ring,
         hist_idx=idx,
         hist_len=n,
-        fp8_max=fmax,
         pow2_margin=1.0,
     )
     assert torch.equal(d8.view(torch.uint8), x8_ref.view(torch.uint8))

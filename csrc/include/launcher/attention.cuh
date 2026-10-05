@@ -10,6 +10,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -67,27 +68,29 @@ inline int compute_num_splits(int base_blocks,
 }
 
 /*
- * Wave capacity = SM count x blocks resident per SM, for one decode kernel
- * instantiation. Residency depends on the kernel's shared memory and
- * register footprint, so it is queried from the occupancy API rather than
- * assumed. The query and the device-property reads are not free and decode
- * launches per token, so the answer is memoized per instantiation (the
- * lambda runs once).
+ * Cache wave capacity per kernel instantiation and device. Head dims and mask
+ * variants can have different register footprints.
  */
-template <typename Kernel>
-inline int decode_wave_capacity(Kernel kernel, int threads) {
-    static int capacity = [kernel, threads] {
-        int per_sm = 0, device = 0;
-        cudaGetDevice(&device);
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, device);
-        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, 0) !=
-                cudaSuccess ||
-            per_sm < 1)
-            per_sm = 1;
-        int c = prop.multiProcessorCount * per_sm;
-        return c > 0 ? c : 1;
-    }();
+template <auto Kernel, int Threads> inline int decode_wave_capacity() {
+    static std::atomic<int> cached[64] = {};
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+        return 1;
+    const bool cacheable = device >= 0 && device < 64;
+    if (cacheable) {
+        const int value = cached[device].load(std::memory_order_relaxed);
+        if (value)
+            return value;
+    }
+    int sms = 0, per_sm = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+        return 1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, Kernel, Threads, 0) != cudaSuccess ||
+        per_sm < 1)
+        per_sm = 1;
+    const int capacity = std::max(1, sms * per_sm);
+    if (cacheable)
+        cached[device].store(capacity, std::memory_order_relaxed);
     return capacity;
 }
 
@@ -98,19 +101,19 @@ inline int decode_wave_capacity(Kernel kernel, int threads) {
  *   DISPATCH_CAUSAL_MASK(is_causal, has_mask,
  *                        launcher<KV>::template launch, HEAD_DIM, p, stream);
  */
-#define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...)                           \
-    do {                                                                                       \
-        if (is_causal) {                                                                       \
-            if (has_mask)                                                                      \
-                FN<HEAD_DIM, true, true>(__VA_ARGS__);                                         \
-            else                                                                               \
-                FN<HEAD_DIM, true, false>(__VA_ARGS__);                                        \
-        } else {                                                                               \
-            if (has_mask)                                                                      \
-                FN<HEAD_DIM, false, true>(__VA_ARGS__);                                        \
-            else                                                                               \
-                FN<HEAD_DIM, false, false>(__VA_ARGS__);                                       \
-        }                                                                                      \
+#define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...)                               \
+    do {                                                                                           \
+        if (is_causal) {                                                                           \
+            if (has_mask)                                                                          \
+                FN<HEAD_DIM, true, true>(__VA_ARGS__);                                             \
+            else                                                                                   \
+                FN<HEAD_DIM, true, false>(__VA_ARGS__);                                            \
+        } else {                                                                                   \
+            if (has_mask)                                                                          \
+                FN<HEAD_DIM, false, true>(__VA_ARGS__);                                            \
+            else                                                                                   \
+                FN<HEAD_DIM, false, false>(__VA_ARGS__);                                           \
+        }                                                                                          \
     } while (0)
 
 /*
@@ -178,8 +181,8 @@ template <typename KV> struct DecodeLauncher {
         using Traits = KernelTraits<HEAD_DIM, BC, 1, 2, typename KV::Elem>;
         p.num_splits = compute_num_splits(
             p.batch * p.kv_head * num_passes, tiles_total,
-            decode_wave_capacity(attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask>,
-                                 32),
+            decode_wave_capacity<attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask>,
+                                 32>(),
             2);
         dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
         attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask><<<grid, 32, 0, stream>>>(p);
@@ -228,10 +231,10 @@ static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream)
 template <typename Fn>
 static inline void dispatch_head_dim(AttentionParams& p, cudaStream_t stream) {
     switch (p.head_dim) {
-#define ASTRAI_HEAD_DIM_CASE(D)                                                                \
-    case D:                                                                                    \
+#define ASTRAI_HEAD_DIM_CASE(D)                                                                    \
+    case D:                                                                                        \
         return Fn::template run<D>(p, stream);
-    ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
+        ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
 #undef ASTRAI_HEAD_DIM_CASE
     }
     throw std::runtime_error(head_dim_error(p.head_dim));

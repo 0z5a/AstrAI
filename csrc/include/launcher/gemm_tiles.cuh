@@ -53,8 +53,14 @@ using reclaim_fallback_t = std::conditional_t<
                        Tile_64x64x64_W16x32_S2>>;
 
 /* Resolve each manifest tile to one policy. TMA can reject a descriptor and fall back. */
-template <bool UseTma, typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
-          typename LayoutOut, typename OutT, typename Schedule>
+template <bool UseTma,
+          typename ElemA,
+          typename ElemB,
+          typename LayoutA,
+          typename LayoutB,
+          typename LayoutOut,
+          typename OutT,
+          typename Schedule>
 struct TileLauncher {
     const GemmParams& p;
     cudaStream_t stream;
@@ -62,8 +68,8 @@ struct TileLauncher {
     template <typename Tile> bool run() const {
         using Widened = warp_widened_t<ElemA, ElemB, Tile>;
         using TileT = reclaim_fallback_t<Widened, ElemA, ElemB, OutT>;
-        using Policy = GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT, LayoutOut, OutT,
-                                  false, UseTma, Schedule::kMx, false, Schedule>;
+        using Options = PlannedGemmOptions<Schedule, UseTma>;
+        using Policy = GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT, LayoutOut, OutT, Options>;
         if constexpr (UseTma)
             return launch_policy_tma<Policy>(p, stream);
         else {
@@ -102,11 +108,13 @@ void launch_plan(GemmParams p, const PlanDecision& d, cudaStream_t stream) {
     if constexpr (Schedule::kTma && kCongruous && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
         if (!gemm_tma_staging_disabled() && astrai::device_facts().cc >= 90 &&
             dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
-                d, TileLauncher<true, ElemA, ElemB, RowMajor, ColMajor, LayoutOut, OutT, Schedule>{p, stream}))
+                d, TileLauncher<true, ElemA, ElemB, RowMajor, ColMajor, LayoutOut, OutT, Schedule>{
+                       p, stream}))
             return;
     }
     dispatch_tile<manifest_for<ElemA, ElemB, LayoutA, LayoutB>>(
-        d, TileLauncher<false, ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT, Schedule>{p, stream});
+        d,
+        TileLauncher<false, ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT, Schedule>{p, stream});
 }
 
 } // namespace gemm
