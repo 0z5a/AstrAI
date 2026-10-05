@@ -81,9 +81,9 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D, int cau
         setup_scratch(p, sc);
         p.o_part = sc.o_part;
         p.ml_part = sc.ml_part;
-        dispatch_decode<bf16>(p, 0);
+        AttnDispatchDecode<bf16>::run(p, 0);
     } else {
-        dispatch_prefill<bf16>(p, 0);
+        AttnDispatchPrefill<bf16>::run(p, 0);
     }
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
@@ -178,8 +178,9 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D, int causa
     double flops = 4.0 * B * Hq * (double)ql * kl * D;
     if (causal)
         flops *= 0.5;
-    BenchResult r = decode ? bench_kernel([&] { dispatch_decode<bf16>(p, 0); }, 3, 10, flops)
-                           : bench_kernel([&] { dispatch_prefill<bf16>(p, 0); }, 3, 10, flops);
+    BenchResult r =
+        decode ? bench_kernel([&] { AttnDispatchDecode<bf16>::run(p, 0); }, 3, 10, flops)
+               : bench_kernel([&] { AttnDispatchPrefill<bf16>::run(p, 0); }, 3, 10, flops);
 
     char cfg[64];
     snprintf(cfg, sizeof(cfg), "B=%2d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d causal=%d", B, Hq, Hk, ql, kl,

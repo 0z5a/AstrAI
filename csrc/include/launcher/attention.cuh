@@ -95,28 +95,6 @@ template <auto Kernel, int Threads> inline int decode_wave_capacity() {
 }
 
 /*
- * Dispatch IsCausal × HasMask. FN is a function template
- * <int HEAD_DIM, bool IsCausal, bool HasMask>; HEAD_DIM forwards first so
- * callers spell it once:
- *   DISPATCH_CAUSAL_MASK(is_causal, has_mask,
- *                        launcher<KV>::template launch, HEAD_DIM, p, stream);
- */
-#define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...)                               \
-    do {                                                                                           \
-        if (is_causal) {                                                                           \
-            if (has_mask)                                                                          \
-                FN<HEAD_DIM, true, true>(__VA_ARGS__);                                             \
-            else                                                                                   \
-                FN<HEAD_DIM, true, false>(__VA_ARGS__);                                            \
-        } else {                                                                                   \
-            if (has_mask)                                                                          \
-                FN<HEAD_DIM, false, true>(__VA_ARGS__);                                            \
-            else                                                                                   \
-                FN<HEAD_DIM, false, false>(__VA_ARGS__);                                           \
-        }                                                                                          \
-    } while (0)
-
-/*
  * Kernel-family launchers. Every supported target is sm_80+, so the
  * tensor-core kernels are the only implementations; both families expose
  * the same static launch<HEAD_DIM, IsCausal, HasMask> interface.
@@ -190,6 +168,17 @@ template <typename KV> struct DecodeLauncher {
     }
 };
 
+template <int HEAD_DIM, typename Launcher>
+inline void dispatch_causal_mask(bool causal, bool mask, AttentionParams& p, cudaStream_t stream) {
+    if (causal && mask)
+        return Launcher::template launch<HEAD_DIM, true, true>(p, stream);
+    if (causal)
+        return Launcher::template launch<HEAD_DIM, true, false>(p, stream);
+    if (mask)
+        return Launcher::template launch<HEAD_DIM, false, true>(p, stream);
+    return Launcher::template launch<HEAD_DIM, false, false>(p, stream);
+}
+
 /*
  * Family dispatchers — shared between the production .cu entries and the
  * standalone torch-free harnesses, which compile them directly (a .o link
@@ -205,7 +194,7 @@ static inline void dispatch_prefill_impl(AttentionParams& p, cudaStream_t stream
     bool has_mask = (p.use_mask && p.mask);
 
     using Launcher = PrefillLauncher<QSchedule, KV>;
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask, Launcher::template launch, HEAD_DIM, p, stream);
+    dispatch_causal_mask<HEAD_DIM, Launcher>(is_causal, has_mask, p, stream);
 }
 
 /*
@@ -218,7 +207,7 @@ static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream)
     bool has_mask = (p.use_mask && p.mask);
 
     using Launcher = DecodeLauncher<KV>;
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask, Launcher::template launch, HEAD_DIM, p, stream);
+    dispatch_causal_mask<HEAD_DIM, Launcher>(is_causal, has_mask, p, stream);
 
     attn_decode_combine_kernel<KV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
     ASTRAI_LAUNCH_CHECK();
@@ -226,78 +215,42 @@ static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream)
 
 /*
  * One table-driven head-dim dispatch per family: the caller passes a
- * Fn type exposing run<HEAD_DIM>(p, stream). Each family binds its policy.
+ * Fn type exposing run_dim<HEAD_DIM>(p, stream).
  */
 template <typename Fn>
 static inline void dispatch_head_dim(AttentionParams& p, cudaStream_t stream) {
     switch (p.head_dim) {
 #define ASTRAI_HEAD_DIM_CASE(D)                                                                    \
     case D:                                                                                        \
-        return Fn::template run<D>(p, stream);
+        return Fn::template run_dim<D>(p, stream);
         ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
 #undef ASTRAI_HEAD_DIM_CASE
     }
     throw std::runtime_error(head_dim_error(p.head_dim));
 }
 
-// Family bindings: one thin Fn per entry, naming its policy pair.
-template <typename T> struct DispatchPrefill {
-    template <int HEAD_DIM> static void run(AttentionParams& p, cudaStream_t stream) {
-        dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, HEAD_DIM>(p, stream);
+template <typename QSchedule, typename KV> struct PrefillDispatch {
+    template <int HEAD_DIM> static void run_dim(AttentionParams& p, cudaStream_t stream) {
+        dispatch_prefill_impl<QSchedule, KV, HEAD_DIM>(p, stream);
     }
-};
-template <typename T> struct DispatchPagedPrefill {
-    template <int HEAD_DIM> static void run(AttentionParams& p, cudaStream_t stream) {
-        dispatch_prefill_impl<PackedQSchedule, PagedKV<T>, HEAD_DIM>(p, stream);
-    }
-};
-template <typename T> struct DispatchDecode {
-    template <int HEAD_DIM> static void run(AttentionParams& p, cudaStream_t stream) {
-        dispatch_decode_impl<ContigKV<T>, HEAD_DIM>(p, stream);
-    }
-};
-template <typename T> struct DispatchPagedDecode {
-    template <int HEAD_DIM> static void run(AttentionParams& p, cudaStream_t stream) {
-        dispatch_decode_impl<PagedKV<T>, HEAD_DIM>(p, stream);
+    static void run(AttentionParams& p, cudaStream_t stream) {
+        dispatch_head_dim<PrefillDispatch>(p, stream);
     }
 };
 
-template <typename T> static inline void dispatch_prefill(AttentionParams& p, cudaStream_t stream) {
-    dispatch_head_dim<DispatchPrefill<T>>(p, stream);
-}
-template <typename T>
-static inline void dispatch_paged_prefill(AttentionParams& p, cudaStream_t stream) {
-    dispatch_head_dim<DispatchPagedPrefill<T>>(p, stream);
-}
-template <typename T> static inline void dispatch_decode(AttentionParams& p, cudaStream_t stream) {
-    dispatch_head_dim<DispatchDecode<T>>(p, stream);
-}
-template <typename T>
-static inline void dispatch_paged_decode(AttentionParams& p, cudaStream_t stream) {
-    dispatch_head_dim<DispatchPagedDecode<T>>(p, stream);
-}
+template <typename KV> struct DecodeDispatch {
+    template <int HEAD_DIM> static void run_dim(AttentionParams& p, cudaStream_t stream) {
+        dispatch_decode_impl<KV, HEAD_DIM>(p, stream);
+    }
+    static void run(AttentionParams& p, cudaStream_t stream) {
+        dispatch_head_dim<DecodeDispatch>(p, stream);
+    }
+};
 
-/*
- * Per-family wrappers: a class template per entry (function templates
- * cannot be template-template arguments), each forwarding to the free
- * dispatch function above.
- */
-template <typename T> struct AttnDispatchDecode {
-    static void run(AttentionParams& p, cudaStream_t stream) { dispatch_decode<T>(p, stream); }
-};
-template <typename T> struct AttnDispatchPrefill {
-    static void run(AttentionParams& p, cudaStream_t stream) { dispatch_prefill<T>(p, stream); }
-};
-template <typename T> struct AttnDispatchPagedDecode {
-    static void run(AttentionParams& p, cudaStream_t stream) {
-        dispatch_paged_decode<T>(p, stream);
-    }
-};
-template <typename T> struct AttnDispatchPagedPrefill {
-    static void run(AttentionParams& p, cudaStream_t stream) {
-        dispatch_paged_prefill<T>(p, stream);
-    }
-};
+template <typename T> using AttnDispatchPrefill = PrefillDispatch<DenseQSchedule, ContigKV<T>>;
+template <typename T> using AttnDispatchPagedPrefill = PrefillDispatch<PackedQSchedule, PagedKV<T>>;
+template <typename T> using AttnDispatchDecode = DecodeDispatch<ContigKV<T>>;
+template <typename T> using AttnDispatchPagedDecode = DecodeDispatch<PagedKV<T>>;
 
 } // namespace attention
 } // namespace astrai

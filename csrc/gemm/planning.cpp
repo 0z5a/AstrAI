@@ -151,12 +151,7 @@ constexpr std::int64_t kMainloopBytesPerCellTile = 8;
 constexpr std::int64_t kMmaArmBytesPerInstr = 64;
 
 int resident_of(const GemmRecipe& r, const PlanQuery& q) {
-    if (q.dev.smem_per_sm <= 0 || q.dev.regs_per_sm <= 0)
-        return 0;
-    const int smem = q.tma ? tma_smem_bytes(r.smem, r.stages) : r.smem;
-    if (smem > q.dev.smem_max)
-        return 0;
-    return std::min(q.dev.smem_per_sm / smem, min_ctas_for_ring(r.smem));
+    return plan_resident_ctas(static_cast<TileClass>(r.cta), r.stages, r.kk, q);
 }
 
 // TMA overlaps copy and compute; cp.async hides copy latency through residency.
