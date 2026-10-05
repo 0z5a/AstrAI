@@ -52,8 +52,8 @@ struct GemmTraits {
                            astrai::MmaOp<MmaT, MmaT, typename astrai::MmaShapeFor<MmaT>::type>>;
     static_assert(!UseMx || kMxCell, "block-scaled MMA requires a symmetric FP8 pair");
     using AccT = typename MmaOp::AccT;
-    using ElemTraitsA = gemm_elem_traits<ElemA_>;
-    using ElemTraitsB = gemm_elem_traits<ElemB_>;
+    using ElemTraitsA = astrai::ElemTrait<ElemA_>;
+    using ElemTraitsB = astrai::ElemTrait<ElemB_>;
 
     using CtaShape = CtaShape_;
     using WarpShape = WarpShape_;

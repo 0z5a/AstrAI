@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "entry.h"
+#include <api/dtype.h>
 #include <api/gemm.h>
 #include <gemm_build.h>
 #include <launcher/gemm_dispatch.cuh>
@@ -35,35 +36,35 @@ using namespace astrai::quant;
 namespace astrai {
 namespace gemm {
 
-#define ASTRAI_GEMM_BASE_PAIRS(X)                                                               \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)                         \
-    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                                    \
-    X(torch::kChar, int8_t, torch::kChar, int8_t)
+#define ASTRAI_GEMM_BASE_PAIRS(X)                                                              \
+    X(bf16, bf16)                                                                              \
+    X(bf16, int8_t)                                                                            \
+    X(int8_t, int8_t)
 
 #if ASTRAI_BUILD_FP8
-#define ASTRAI_GEMM_FP8_PAIRS(X)                                                                \
-    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn, __nv_fp8_e4m3)               \
-    X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
+#define ASTRAI_GEMM_FP8_PAIRS(X)                                                               \
+    X(fp8_e4m3, fp8_e4m3)                                                                      \
+    X(fp8_e5m2, fp8_e5m2)
 #else
 #define ASTRAI_GEMM_FP8_PAIRS(X)
 #endif
 #define ASTRAI_GEMM_PAIRS(X) ASTRAI_GEMM_BASE_PAIRS(X) ASTRAI_GEMM_FP8_PAIRS(X)
 
-#define GEMM_EXTERN(SA, TA, SB, TB)                                                             \
-    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, MmaSync>(                         \
+#define GEMM_EXTERN(TA, TB)                                                                    \
+    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, MmaSync>(                        \
         GemmParams, cudaStream_t, bool, bool);
 ASTRAI_GEMM_PAIRS(GEMM_EXTERN)
 #undef GEMM_EXTERN
 #if ASTRAI_BUILD_TMA
-#define GEMM_EXTERN(SA, TA, SB, TB)                                                             \
-    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, TmaMma>(                          \
+#define GEMM_EXTERN(TA, TB)                                                                    \
+    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, TmaMma>(                         \
         GemmParams, cudaStream_t, bool, bool);
 ASTRAI_GEMM_PAIRS(GEMM_EXTERN)
 #undef GEMM_EXTERN
 #endif
 #if ASTRAI_BUILD_MX
-#define GEMM_EXTERN(SA, TA, SB, TB)                                                             \
-    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, Sm120Mma>(                        \
+#define GEMM_EXTERN(TA, TB)                                                                    \
+    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, Sm120Mma>(                       \
         GemmParams, cudaStream_t, bool, bool);
 ASTRAI_GEMM_FP8_PAIRS(GEMM_EXTERN)
 #undef GEMM_EXTERN
@@ -92,19 +93,17 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
 
 /*
  * The unsupported-pair arm, one spelling for the two lookups below: the
- * switch's own default carries it, so the non-void lookups cannot fall off
- * their end. The expected-pairs text is generated from ASTRAI_GEMM_PAIRS
- * (the attention_dtypes.h pattern), so it cannot drift from the table.
+ * error text is generated from ASTRAI_GEMM_PAIRS, matching both lookups.
  */
-[[noreturn]] void unsupported_pair(c10::ScalarType a, c10::ScalarType b) {
+std::string unsupported_pair_message(c10::ScalarType a, c10::ScalarType b) {
     std::string instantiated;
-#define ASTRAI_GEMM_PAIR_ROW(SA, TA, SB, TB)                                                    \
-    instantiated +=                                                                             \
-        std::string(instantiated.empty() ? "" : ", ") + toString(SA) + " x " + toString(SB);
+#define ASTRAI_GEMM_PAIR_ROW(TA, TB)                                                           \
+    instantiated += std::string(instantiated.empty() ? "" : ", ") +                            \
+                    toString(scalar_type_v<TA>) + " x " + toString(scalar_type_v<TB>);
     ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_PAIR_ROW)
 #undef ASTRAI_GEMM_PAIR_ROW
-    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(a), " x ", toString(b),
-                " (instantiated: ", instantiated, ")");
+    return std::string("unsupported operand dtype pair ") + toString(a) + " x " +
+           toString(b) + " (instantiated: " + instantiated + ")";
 }
 
 /* All kernel variants have distinct schedule types and architecture images. */
@@ -136,14 +135,13 @@ GemmDispatchFn selected_dispatch() {
 }
 
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
-#define GEMM_CASE(SA, TA, SB, TB)                                                               \
-    case pack_dtypes(SA, SB):                                                                   \
+#define GEMM_CASE(TA, TB)                                                                      \
+    case pack_dtypes(scalar_type_v<TA>, scalar_type_v<TB>):                                    \
         return selected_dispatch<TA, TB>();
     switch (pack_dtypes(a, b)) {
-        ASTRAI_GEMM_PAIRS(GEMM_CASE)
-    default:
-        unsupported_pair(a, b);
+    ASTRAI_GEMM_PAIRS(GEMM_CASE)
     }
+    throw std::runtime_error(unsupported_pair_message(a, b));
 #undef GEMM_CASE
 }
 
@@ -162,14 +160,13 @@ GemmProbeFn selected_probe() {
 }
 
 GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
-#define PROBE_CASE(SA, TA, SB, TB)                                                              \
-    case pack_dtypes(SA, SB):                                                                   \
+#define PROBE_CASE(TA, TB)                                                                     \
+    case pack_dtypes(scalar_type_v<TA>, scalar_type_v<TB>):                                    \
         return selected_probe<TA, TB>();
     switch (pack_dtypes(a, b)) {
-        ASTRAI_GEMM_PAIRS(PROBE_CASE)
-    default:
-        unsupported_pair(a, b);
+    ASTRAI_GEMM_PAIRS(PROBE_CASE)
     }
+    throw std::runtime_error(unsupported_pair_message(a, b));
 #undef PROBE_CASE
 }
 

@@ -43,9 +43,11 @@ Headers under `csrc/include` contain declarations and device templates;
 | File | Role |
 |------|------|
 | `api/quantize_common.h` | capability helpers (`sm_at_least`, `kMinSmForFp8`) + `QuantLayout` + `QuantParams` POD — raw `__nv_fp8_*` element types, no format enum, no torch |
-| `kernel/quantize/kernel.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `fp8_cvt_traits<Fp8T>` convert + `quant_in_traits<InT>` unpack (primary templates undefined — one specialization per dtype/format) — no torch |
+| `datatype/element.cuh` | shared CUDA element traits: storage, native pair conversion, FP8 limits |
+| `api/dtype.h` | CUDA element type to PyTorch `ScalarType` mapping at the host boundary |
+| `kernel/quantize/kernel.cuh` | pure-CUDA device code: vectorized `fp8_quantize_kernel` + 64×32-tile transpose kernel (out_layout 0/1/2, Dual orientation a template param), `ElemTrait<T>` conversion and pair unpack from `datatype/element.cuh` — no torch |
 | `datatype/dequant.cuh` | in-register dequantization functors (`DequantPair<SrcT, MmaT>`): the exact int8→bf16 expansion quantized-GEMM operands fold between the smem read and the mma |
-| `api/gemm_common.h` | dtype-neutral GEMM family declarations: layout tags, `gemm_elem_traits<T>` (kBytes — the smem ring budgets; the MMA K extent rides `MmaShapeFor<MmaT>`), `gemm_mma_traits<ElemA, ElemB>` (MmaT promotion + per-operand kDequantA/B), `GemmParams` POD |
+| `api/gemm_common.h` | GEMM layout tags, `gemm_mma_traits<ElemA, ElemB>` (compute promotion and dequant flags), `GemmParams` POD |
 | `policy/traits.cuh` | Promoted MMA traits and shared-memory ring budget (`GemmTraits`, `GemmSmem`) |
 | `policy/manifest.cuh` | Named tile recipes, CTA classes, and staging-specific manifests |
 | `policy.cuh` | `GemmPolicy`: the kernel's composed dtype, layout, tile, staging, and output policy |

@@ -362,22 +362,23 @@ csrc/
 │   ├── arith/                        # value transforms on register fragments
 │   │   ├── softmax.cuh               #     shared online-softmax recurrence (scalar kernels, MMA tile, split-KV combine)
 │   │   └── reduce.cuh                #     plus/maximum functors, warp_reduce/group_reduce, atomic_max_float
-│   ├── datatype/                     # dtype traits and dequant primitives (stage-agnostic)
+│   ├── datatype/                     # shared element traits and dequant primitives
+│   │   ├── element.cuh               #     storage sizes, native pair conversions, FP8 formats
 │   │   └── dequant.cuh               #     in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
 │   ├── utils/                        # stage-agnostic tools — the sink of the include graph
 │   │   ├── define.cuh                #     HOST/DEVICE_FORCEINLINE — the shared function-qualifier macros
 │   │   ├── device.cuh                #     DeviceFacts geometry query (sms / smem opt-in / L2)
-│   │   ├── dtype.cuh                 #     element-type words (aliases + ElemTrait, torch at::ScalarType naming)
 │   │   ├── launch.cuh                #     launch-and-check macros, pure C
 │   │   └── shape.cuh / swizzle.cuh / tensor.cuh   # static geometry / staging swizzle / Tensor<Engine, Layout>
 │   ├── api/                          # THE CALLER CONTRACT — declarations, the supported-set lists, the capability gates and the cross-layer family PODs; the only directory whose headers may touch torch/ATen/c10/Python (files named BY FAMILY: <family>*.h = that family's surface)
+│   │   ├── dtype.h                   #     element type -> PyTorch ScalarType
 │   │   ├── gemm.h                    #     gemm C++ surface (declarations only, no py:: type)
 │   │   ├── attention.h               #     attention entry declarations (astrai::attention)
 │   │   ├── attention_dtypes.h        #     attention ASTRAI_ATTN_DTYPE_LIST + generated unsupported-dtype refusal
 │   │   ├── gated_deltanet.h          #     the family's two entry declarations (astrai::gdn)
 │   │   ├── quantize.h                #     quantize declaration surface: QuantizeOutputs + run_quantize (the implementation is quantize/entry.cu)
 │   │   ├── fp8_checks.h              #     fp8 capability gate (check_fp8_device; native FP8 GEMM)
-│   │   ├── gemm_common.h             #     layout tags, gemm_elem_traits, gemm_mma_traits, GemmParams POD
+│   │   ├── gemm_common.h             #     layout tags, ElemTrait, gemm_mma_traits, GemmParams POD
 │   │   ├── attention_common.h        #     AttentionParams POD (cross-layer: stage headers include it)
 │   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
 │   └── launcher/                     # GEMM host dispatch machinery behind the api/ surface

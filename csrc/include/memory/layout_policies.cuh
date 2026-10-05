@@ -2,7 +2,7 @@
 #include <cuda_bf16.h>
 #include <api/attention_common.h>
 #include <utils/define.cuh>
-#include <utils/dtype.cuh>
+#include <datatype/element.cuh>
 
 /*
  * Q scheduling is independent of K/V storage. DenseQSchedule/PackedQSchedule

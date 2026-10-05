@@ -4,16 +4,15 @@
  * maps, and the four family dispatchers. Pure CUDA, no torch: the standalone
  * harnesses compile the exact code the production dispatch runs, and each
  * production .cu is then exactly one torch-facing function. Kernel bodies
- * live in kernel/attention_split_{q,kv}.cuh.
+ * live in kernel/attention/split_{q,kv}.cuh.
  */
 
 #pragma once
 
-#include <cstdio>
-#include <cstdlib>
-
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 
 #include <api/attention_common.h>
 #include <kernel/attention/split_kv.cuh>
@@ -25,7 +24,7 @@ namespace astrai {
 namespace attention {
 
 /*
- * The one list of instantiated head dims — the dispatch switch, the fatal
+ * The one list of instantiated head dims — the dispatch switch, the error
  * message and (drift-asserted) the Python backend's HEAD_DIMS all read it.
  */
 #define ASTRAI_ATTN_HEAD_DIMS(X) X(32) X(64) X(128) X(256)
@@ -34,15 +33,13 @@ namespace attention {
  * A head dim no kernel was instantiated for — the launch discipline: never
  * run a kernel that was not built for the shape.
  */
-[[noreturn]] inline void head_dim_fatal(int head_dim) {
-    std::fprintf(
-        stderr,
-        "ASTRAI: attention: head_dim %d has no kernel instantiation (instantiated:", head_dim);
-#define ASTRAI_HEAD_DIM_ROW(D) std::fprintf(stderr, " %d", D);
+inline std::string head_dim_error(int head_dim) {
+    std::string message = "ASTRAI: attention: head_dim " + std::to_string(head_dim) +
+                          " has no kernel instantiation (instantiated:";
+#define ASTRAI_HEAD_DIM_ROW(D) message += " " + std::to_string(D);
     ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_ROW)
 #undef ASTRAI_HEAD_DIM_ROW
-    std::fprintf(stderr, ")\n");
-    std::exit(EXIT_FAILURE);
+    return message + ")";
 }
 
 /*
@@ -101,19 +98,19 @@ inline int decode_wave_capacity(Kernel kernel, int threads) {
  *   DISPATCH_CAUSAL_MASK(is_causal, has_mask,
  *                        launcher<KV>::template launch, HEAD_DIM, p, stream);
  */
-#define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...)                            \
-    do {                                                                                        \
-        if (is_causal) {                                                                        \
-            if (has_mask)                                                                       \
-                FN<HEAD_DIM, true, true>(__VA_ARGS__);                                          \
-            else                                                                                \
-                FN<HEAD_DIM, true, false>(__VA_ARGS__);                                         \
-        } else {                                                                                \
-            if (has_mask)                                                                       \
-                FN<HEAD_DIM, false, true>(__VA_ARGS__);                                         \
-            else                                                                                \
-                FN<HEAD_DIM, false, false>(__VA_ARGS__);                                        \
-        }                                                                                       \
+#define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...)                           \
+    do {                                                                                       \
+        if (is_causal) {                                                                       \
+            if (has_mask)                                                                      \
+                FN<HEAD_DIM, true, true>(__VA_ARGS__);                                         \
+            else                                                                               \
+                FN<HEAD_DIM, true, false>(__VA_ARGS__);                                        \
+        } else {                                                                               \
+            if (has_mask)                                                                      \
+                FN<HEAD_DIM, false, true>(__VA_ARGS__);                                        \
+            else                                                                               \
+                FN<HEAD_DIM, false, false>(__VA_ARGS__);                                       \
+        }                                                                                      \
     } while (0)
 
 /*
@@ -226,22 +223,18 @@ static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream)
 
 /*
  * One table-driven head-dim dispatch per family: the caller passes a
- * Fn object exposing template <int HEAD_DIM> operator()(AttentionParams&,
- * cudaStream_t); the switch stamps one call per list row. The four family
- * entries below differ only in the policy pair they bind.
+ * Fn type exposing run<HEAD_DIM>(p, stream). Each family binds its policy.
  */
 template <typename Fn>
 static inline void dispatch_head_dim(AttentionParams& p, cudaStream_t stream) {
     switch (p.head_dim) {
-#define ASTRAI_HEAD_DIM_CASE(D)                                                                 \
-    case D:                                                                                     \
-        Fn::template run<D>(p, stream);                                                         \
-        break;
-        ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
+#define ASTRAI_HEAD_DIM_CASE(D)                                                                \
+    case D:                                                                                    \
+        return Fn::template run<D>(p, stream);
+    ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
 #undef ASTRAI_HEAD_DIM_CASE
-    default:
-        head_dim_fatal(p.head_dim);
     }
+    throw std::runtime_error(head_dim_error(p.head_dim));
 }
 
 // Family bindings: one thin Fn per entry, naming its policy pair.

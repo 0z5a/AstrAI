@@ -100,6 +100,14 @@ def test_quantize_input_dtypes(in_dtype, fmt):
 
 
 @skip_no_fp8
+def test_quantize_rejects_nonfloat_input():
+    x = torch.zeros(8, 8, device="cuda", dtype=torch.int8)
+    scale = torch.ones(1, device="cuda")
+    with pytest.raises(RuntimeError, match="quantize has no kernel for"):
+        quantize(x, scale, torch.float8_e4m3fn)
+
+
+@skip_no_fp8
 def test_quantize_e5m2_format():
     x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
     x8, amax = quantize(x, torch.tensor([10.0], device="cuda"), torch.float8_e5m2)

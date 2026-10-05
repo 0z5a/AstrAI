@@ -17,28 +17,28 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Optional.h>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <torch/extension.h>
 
+#include <api/dtype.h>
 #include <api/fp8_checks.h>
 #include <api/quantize.h>
-#include <kernel/quantize/kernel.cuh>
-#include <utils/dtype.cuh>
 #include <api/quantize_common.h>
+#include <datatype/element.cuh>
+#include <kernel/quantize/kernel.cuh>
 
 namespace astrai {
 namespace quant {
 
 /*
- * Quantize's instantiation list, the attention_dtypes.h shape: torch's own
- * ScalarType names the input dtype at the boundary, the C++ element type is
- * what the kernel takes as a template parameter. The refusal below is
- * generated from the same rows, so the supported set cannot drift.
+ * Supported input element types; ScalarTypeOf<T> supplies the PyTorch
+ * boundary value. The refusal and dispatch use these same rows.
  */
-#define ASTRAI_QUANT_IN_DTYPES(X)                                                               \
-    X(torch::kBFloat16, bf16)                                                                   \
-    X(torch::kHalf, fp16)                                                                       \
-    X(torch::kFloat32, float)
+#define ASTRAI_QUANT_IN_DTYPES(X)                                                              \
+    X(bf16)                                                                                    \
+    X(fp16)                                                                                    \
+    X(float)
 
 namespace {
 
@@ -46,33 +46,31 @@ namespace {
  * A scalar type quantize has no kernel for: say which ones it does have,
  * read off the list above (the attention_dtypes.h pattern).
  */
-[[noreturn]] void unsupported_quant_input(at::ScalarType st) {
+std::string unsupported_quant_input_message(at::ScalarType st) {
     std::string instantiated;
-#define ASTRAI_QUANT_NAME_ROW(S, T)                                                             \
-    instantiated += std::string(instantiated.empty() ? "" : ", ") + toString(S);
+#define ASTRAI_QUANT_NAME_ROW(T)                                                               \
+    instantiated += std::string(instantiated.empty() ? "" : ", ") +                            \
+                    toString(scalar_type_v<T>);
     ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_NAME_ROW)
 #undef ASTRAI_QUANT_NAME_ROW
-    TORCH_CHECK(false, "quantize has no kernel for ", toString(st),
-                " (instantiated: ", instantiated, ")");
+    return std::string("quantize has no kernel for ") + toString(st) +
+           " (instantiated: " + instantiated + ")";
 }
 
 /*
  * Dtype dispatch over the merged quantize launcher: one case per row above
- * for a (possibly mixed) fp8 output pair; the default is unreachable (the
- * entry gate above) but stays a hard error — never a silent re-route.
+ * for a (possibly mixed) fp8 output pair. Unsupported inputs throw.
  */
 template <typename Fp8TA, typename Fp8TB>
 void launch_for_dtype(const torch::Tensor& x, const QuantParams& p, cudaStream_t stream) {
     switch (x.scalar_type()) {
-#define ASTRAI_QUANT_CASE(S, T)                                                                 \
-    case S:                                                                                     \
-        launch_fp8_quantize<Fp8TA, T, Fp8TB>(p, stream);                                        \
-        break;
-        ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_CASE)
+#define ASTRAI_QUANT_CASE(T)                                                                   \
+    case scalar_type_v<T>:                                                                     \
+        return launch_fp8_quantize<Fp8TA, T, Fp8TB>(p, stream);
+    ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_CASE)
 #undef ASTRAI_QUANT_CASE
-    default:
-        unsupported_quant_input(x.scalar_type());
     }
+    throw std::runtime_error(unsupported_quant_input_message(x.scalar_type()));
 }
 
 /*
@@ -166,11 +164,12 @@ QuantizeOutputs run_quantize(torch::Tensor x,
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
     {
         bool supported = false;
-#define ASTRAI_QUANT_SUPPORTED_ROW(S, T) supported = supported || x.scalar_type() == S;
+#define ASTRAI_QUANT_SUPPORTED_ROW(T)                                                          \
+    supported = supported || x.scalar_type() == scalar_type_v<T>;
         ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_SUPPORTED_ROW)
 #undef ASTRAI_QUANT_SUPPORTED_ROW
         if (!supported)
-            unsupported_quant_input(x.scalar_type());
+            throw std::runtime_error(unsupported_quant_input_message(x.scalar_type()));
     }
     const at::ScalarType out_dtype = dtype_a;
     const at::ScalarType t_dtype = dtype_b.has_value() ? *dtype_b : dtype_a;

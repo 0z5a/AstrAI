@@ -8,7 +8,7 @@
 #include <mma/ldmatrix.cuh>
 #include <mma/mma.cuh>
 #include <utils/define.cuh>
-#include <utils/dtype.cuh>
+#include <datatype/element.cuh>
 
 /* Predicated cp.async requires CUDA 11.2+; tensor-core mma.sync requires
  * sm_80+. Each element type defines its architecture floor in MmaShapeFor.
@@ -56,7 +56,7 @@ template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> s
 };
 
 /* PTX wrappers: mma.sync is defined in mma/mma.cuh; element packing
- * operations (pack2/unpack2/...) are defined in utils/dtype.cuh.
+ * operations (pack2/unpack2/...) are defined in datatype/element.cuh.
  */
 
 // pack two floats into one 16-bit-pair register as .b32 (mma A/B operand cell)

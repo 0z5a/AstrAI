@@ -6,45 +6,20 @@
  * family (utils/swizzle.cuh) shared with the operand staging in load_async.cuh.
  */
 
+#include <api/gemm_common.h>
+#include <datatype/element.cuh>
 #include <policy.cuh>
 #include <utils/define.cuh>
-#include <api/gemm_common.h>
 #include <utils/swizzle.cuh>
 #include <utils/tensor.cuh>
 
 namespace astrai {
 namespace gemm {
 
-/*
- * Output-element packing facts for the staging tile: elements per 16B
- * chunk, pair packing for the vectorized scatter, and the scalar
- * conversion. bf16 is the fused-linear default; fp32 keeps the fp32
- * accumulators unrounded (training dX/dW style outputs).
- */
-template <typename OutT> struct OutElem;
-
-template <> struct OutElem<__nv_bfloat16> {
-    using T2 = __nv_bfloat162;
-    static constexpr int kChunkElems = 8; // per 16B chunk
-    static constexpr int kChunkShift = 3;
-    static DEVICE_FORCEINLINE __nv_bfloat162 pack2(float a, float b) {
-        return __floats2bfloat162_rn(a, b);
-    }
-    static DEVICE_FORCEINLINE __nv_bfloat16 cvt(float a) { return __float2bfloat16_rn(a); }
-};
-
-template <> struct OutElem<float> {
-    using T2 = float2;
-    static constexpr int kChunkElems = 4;
-    static constexpr int kChunkShift = 2;
-    static DEVICE_FORCEINLINE float2 pack2(float a, float b) { return make_float2(a, b); }
-    static DEVICE_FORCEINLINE float cvt(float a) { return a; }
-};
-
 template <typename Policy> struct GemmCollectiveEpilogue {
     using Traits = typename Policy::Traits;
     using OutT = typename Policy::OutT;
-    using OE = OutElem<OutT>;
+    using OE = ElemTrait<OutT>;
     /*
      * The mainloop's accumulator element: fp32 for the float mma families,
      * int32 for the native s8 pair — the scale/bias folding below applies
@@ -74,9 +49,11 @@ template <typename Policy> struct GemmCollectiveEpilogue {
      * (Swizzle, Layout<Shape, Stride>) over the chunk grid; a custom
      * instance (the row field XORs straight onto the chunk field).
      */
+    static constexpr int kChunkElems = 16 / OE::kBytes;
+    static constexpr int kChunkShift = log2_const<kChunkElems>::value;
     static constexpr int kRowElems = t_out ? kBlockM : kBlockN;
     static constexpr int kRowRows = t_out ? kBlockN : kBlockM;
-    static constexpr int kRowChunks = kRowElems / OE::kChunkElems;
+    static constexpr int kRowChunks = kRowElems / kChunkElems;
     static constexpr int kRowBits = log2_const<kRowChunks>::value;
     using OutLayout =
         decltype(composition(Swizzle<kRowBits, kRowBits>{},
@@ -110,7 +87,7 @@ template <typename Policy> struct GemmCollectiveEpilogue {
      * two, keeping the XOR swizzle well-defined.
      */
     DEVICE_FORCEINLINE OutT* out_chunk(int r, int c) const {
-        return out_tile(r, c << OE::kChunkShift);
+        return out_tile(r, c << kChunkShift);
     }
     DEVICE_FORCEINLINE OutT* out_elem(int r, int v) const { return out_tile(r, v); }
 
@@ -152,15 +129,15 @@ template <typename Policy> struct GemmCollectiveEpilogue {
                      * g+8 of the m16n8 output, columns tig*2/tig*2+1 inside
                      * one 16B chunk.
                      */
-                    const int off = col & (OE::kChunkElems - 1); // in-chunk elems
-                    *reinterpret_cast<typename OE::T2*>(out_chunk(r0, col >> OE::kChunkShift) +
-                                                        off) =
-                        OE::pack2((float)cell[0] * output_scale * rfac * c0 + b0,
-                                  (float)cell[1] * output_scale * rfac * c1 + b1);
-                    *reinterpret_cast<typename OE::T2*>(out_chunk(r0 + 8, col >> OE::kChunkShift) +
-                                                        off) =
-                        OE::pack2((float)cell[2] * output_scale * rfac8 * c0 + b0,
-                                  (float)cell[3] * output_scale * rfac8 * c1 + b1);
+                    const int off = col & (kChunkElems - 1);
+                    auto* out0 = out_chunk(r0, col >> kChunkShift) + off;
+                    auto* out8 = out_chunk(r0 + 8, col >> kChunkShift) + off;
+                    *reinterpret_cast<typename OE::Pair*>(out0) =
+                        OE::pack_pair((float)cell[0] * output_scale * rfac * c0 + b0,
+                                      (float)cell[1] * output_scale * rfac * c1 + b1);
+                    *reinterpret_cast<typename OE::Pair*>(out8) =
+                        OE::pack_pair((float)cell[2] * output_scale * rfac8 * c0 + b0,
+                                      (float)cell[3] * output_scale * rfac8 * c1 + b1);
                 }
             }
         } else {
@@ -186,11 +163,14 @@ template <typename Policy> struct GemmCollectiveEpilogue {
                     const float b = bias_at(grow, m), b8 = bias_at(grow8, m);
                     const float c = col_factor(grow, m), c8 = col_factor(grow8, m);
                     const auto& cell = *acc(mt, nt);
-                    *out_elem(col, r0) = OE::cvt((float)cell[0] * output_scale * r0f * c + b);
-                    *out_elem(col + 1, r0) = OE::cvt((float)cell[1] * output_scale * r1f * c + b);
-                    *out_elem(col, r0 + 8) = OE::cvt((float)cell[2] * output_scale * r0f * c8 + b8);
+                    *out_elem(col, r0) =
+                        OE::from_float((float)cell[0] * output_scale * r0f * c + b);
+                    *out_elem(col + 1, r0) =
+                        OE::from_float((float)cell[1] * output_scale * r1f * c + b);
+                    *out_elem(col, r0 + 8) =
+                        OE::from_float((float)cell[2] * output_scale * r0f * c8 + b8);
                     *out_elem(col + 1, r0 + 8) =
-                        OE::cvt((float)cell[3] * output_scale * r1f * c8 + b8);
+                        OE::from_float((float)cell[3] * output_scale * r1f * c8 + b8);
                 }
             }
         }
@@ -204,7 +184,7 @@ template <typename Policy> struct GemmCollectiveEpilogue {
      */
     DEVICE_FORCEINLINE void store(OutT* out) const {
         constexpr int kTotalChunks =
-            kBlockM * (kBlockN / OE::kChunkElems); // == kBlockN * (kBlockM/chunk)
+            kBlockM * (kBlockN / kChunkElems); // == kBlockN * (kBlockM/chunk)
         const int64_t row0_global = block_m * kBlockM;
         const int64_t col0_global = block_n * kBlockN;
         for (int idx = threadIdx.x; idx < kTotalChunks; idx += kCtaThreads) {
@@ -212,15 +192,15 @@ template <typename Policy> struct GemmCollectiveEpilogue {
             const int c = idx % row_chunks;
             const uint4 v = *reinterpret_cast<const uint4*>(out_chunk(r, c));
             const int64_t row = t_out ? (int64_t)block_n * kBlockN + r : row0_global + r;
-            const int64_t col = t_out ? row0_global + (int64_t)c * OE::kChunkElems
-                                      : col0_global + (int64_t)c * OE::kChunkElems;
+            const int64_t col = t_out ? row0_global + (int64_t)c * kChunkElems
+                                      : col0_global + (int64_t)c * kChunkElems;
             const int64_t rows_total = t_out ? n : m;
             const int64_t row_stride = out_ld;
 
             if (row >= rows_total)
                 break; // rows are consecutive: nothing left
             auto* dst = out + row * row_stride + col;
-            if (col + OE::kChunkElems <= row_stride &&
+            if (col + kChunkElems <= row_stride &&
                 (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
                 if constexpr (Policy::kStoreWriteThrough) {
                     /*
@@ -247,7 +227,7 @@ template <typename Policy> struct GemmCollectiveEpilogue {
                  * elements that survive the row edge.
                  */
                 const OutT* elems = reinterpret_cast<const OutT*>(&v);
-                for (int e = 0; e < OE::kChunkElems && col + e < row_stride; ++e)
+                for (int e = 0; e < kChunkElems && col + e < row_stride; ++e)
                     dst[e] = elems[e];
             }
         }

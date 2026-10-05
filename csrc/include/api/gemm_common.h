@@ -1,20 +1,16 @@
 #pragma once
 
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
 #include <type_traits>
 
-#include <utils/dtype.cuh>
+#include <datatype/element.cuh>
 #include <utils/shape.cuh>
 
 /*
  * GEMM-family POD/traits header — dtype-neutral: layout tags, element traits
  * and the unified parameter POD shared by every element-type specialization.
- * The element types themselves (and their storage facts) come from the shared
- * vocabulary in utils/dtype.cuh, so a precision is named once for the whole
- * kernel tree. Torch-free: these headers are what a host or device pass sees
- * before any binding does.
+ * Element storage and conversion live in datatype/element.cuh. This
+ * header stays torch-free for both host and device callers.
  */
 
 namespace astrai {
@@ -29,18 +25,6 @@ struct ColMajor {};
  * Shape<M, N, K> CTA recipes keep their spelling (policy/manifest.cuh).
  */
 using astrai::Shape;
-
-/*
- * Element-type traits: the family-local spelling of the shared vocabulary's
- * ElemTrait (utils/dtype.cuh), which carries the per-dtype storage facts the
- * smem layers price rings from (kBytes). The MMA K extent rides
- * MmaShapeFor<MmaT> (mma/mma.cuh) — it keys on the COMPUTE type, so a
- * dequantized operand's storage K (32) is never conflated with the promoted
- * cell's (16); dequant insertion factors ride gemm_mma_traits. An element type
- * the vocabulary does not know is a compile error at the use site, never a
- * silent fallback.
- */
-template <typename T> using gemm_elem_traits = astrai::ElemTrait<T>;
 
 /*
  * MMA compute type per operand pair — the tensor-core input type both

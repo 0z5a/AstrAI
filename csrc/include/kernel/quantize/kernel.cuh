@@ -3,81 +3,17 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <type_traits>
 
+#include <api/quantize_common.h>
 #include <arith/reduce.cuh>
+#include <datatype/element.cuh>
 #include <utils/define.cuh>
 #include <utils/launch.cuh>
-#include <api/quantize_common.h>
 
 namespace astrai {
 namespace quant {
-/* Input traits provide scalar widening and native pair loads. */
-template <typename InT> struct quant_in_traits;
-
-namespace detail {
-
-// Native 2-lane widen: the single per-dtype intrinsic fact.
-DEVICE_FORCEINLINE float2 widen(__nv_bfloat162 v) { return __bfloat1622float2(v); }
-DEVICE_FORCEINLINE float2 widen(__half2 v) { return __half22float2(v); }
-
-/* Shared 16-bit pair-load body; only the native widen varies by dtype. */
-template <typename InT, typename PairT> struct pair_in_traits {
-    using native_pair = PairT;
-    static DEVICE_FORCEINLINE void load_pair(const InT* p, float* f) {
-        const float2 v = widen(*reinterpret_cast<const PairT*>(p));
-        f[0] = v.x;
-        f[1] = v.y;
-    }
-};
-
-} // namespace detail
-
-template <>
-struct quant_in_traits<__nv_bfloat16> : detail::pair_in_traits<__nv_bfloat16, __nv_bfloat162> {
-    static DEVICE_FORCEINLINE float to_float(__nv_bfloat16 v) { return __bfloat162float(v); }
-};
-
-template <> struct quant_in_traits<__half> : detail::pair_in_traits<__half, __half2> {
-    static DEVICE_FORCEINLINE float to_float(__half v) { return __half2float(v); }
-};
-
-template <> struct quant_in_traits<float> {
-    using native_pair = float2;
-    static DEVICE_FORCEINLINE float to_float(float v) { return v; }
-    static DEVICE_FORCEINLINE void load_pair(const float* p, float* f) {
-        f[0] = p[0];
-        f[1] = p[1];
-    }
-};
-
-/* FP8 traits provide round-to-nearest-even, saturating scalar and pair conversions. */
-namespace detail {
-
-/* Shared pair conversion; only the FP8 format differs. */
-template <__nv_fp8_interpretation_t Fmt> struct Fp8PackPair {
-    static DEVICE_FORCEINLINE unsigned pack(float a, float b) {
-        return static_cast<unsigned>(
-            __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, Fmt));
-    }
-};
-
-} // namespace detail
-
-template <typename Fp8T> struct fp8_cvt_traits;
-
-template <> struct fp8_cvt_traits<__nv_fp8_e4m3> : detail::Fp8PackPair<__NV_E4M3> {
-    static DEVICE_FORCEINLINE uint8_t cvt(float v) { return __nv_fp8_e4m3(v).__x; }
-};
-
-template <> struct fp8_cvt_traits<__nv_fp8_e5m2> : detail::Fp8PackPair<__NV_E5M2> {
-    static DEVICE_FORCEINLINE uint8_t cvt(float v) { return __nv_fp8_e5m2(v).__x; }
-};
-
 /* Must match the launcher's y-dimension and publish_amax's per-warp slots. */
 inline constexpr int kQuantWarps = 8;
 
@@ -134,9 +70,9 @@ template <typename Fp8TA, typename Fp8TB> struct dual_cvt {
     static constexpr bool kMixed = !std::is_same_v<Fp8TA, Fp8TB>;
 
     static DEVICE_FORCEINLINE void store(uint8_t (*q)[2], uint8_t (*q2)[2], int j, int k, float v) {
-        q[j][k] = fp8_cvt_traits<Fp8TA>::cvt(v);
+        q[j][k] = ElemTrait<Fp8TA>::cvt_byte(v);
         if constexpr (kMixed)
-            q2[j][k] = fp8_cvt_traits<Fp8TB>::cvt(v);
+            q2[j][k] = ElemTrait<Fp8TB>::cvt_byte(v);
     }
 
     static DEVICE_FORCEINLINE void zero(uint8_t (*q)[2], uint8_t (*q2)[2], int j) {
@@ -174,7 +110,7 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
     uint8_t q2[4][2]; // live only when the two orientations differ in format
     float local_amax = 0.0f;
     constexpr int kPairAlign = 2 * (int)sizeof(InT);
-    using PairT = typename quant_in_traits<InT>::native_pair;
+    using PairT = typename ElemTrait<InT>::Pair;
     const bool full_tile = r0 + kTileR <= p.rows && c0 + kTileC <= p.cols &&
                            (reinterpret_cast<uintptr_t>(x) & (kPairAlign - 1)) == 0 &&
                            ((p.cols & 1) == 0);
@@ -187,7 +123,7 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             float f[2];
-            quant_in_traits<InT>::load_pair(reinterpret_cast<const InT*>(&raws[j]), f);
+            astrai::load_pair<InT>(reinterpret_cast<const InT*>(&raws[j]), f);
             local_amax = fmaxf(local_amax, fmaxf(fabsf(f[0]), fabsf(f[1])));
             Cvt::store(q, q2, j, 0, f[0] * mult);
             Cvt::store(q, q2, j, 1, f[1] * mult);
@@ -200,18 +136,18 @@ __global__ void fp8_quantize_strided_kernel(QuantParams p) {
                 const InT* a = x + (int64_t)(r + j) * p.cols + c;
                 if (c + 1 < p.cols && (reinterpret_cast<uintptr_t>(a) & (kPairAlign - 1)) == 0) {
                     float f[2];
-                    quant_in_traits<InT>::load_pair(a, f);
+                    astrai::load_pair<InT>(a, f);
 #pragma unroll
                     for (int k = 0; k < 2; ++k) {
                         local_amax = fmaxf(local_amax, fabsf(f[k]));
                         Cvt::store(q, q2, j, k, f[k] * mult);
                     }
                 } else {
-                    const float v0 = quant_in_traits<InT>::to_float(a[0]);
+                    const float v0 = ElemTrait<InT>::to_float(a[0]);
                     local_amax = fmaxf(local_amax, fabsf(v0));
                     Cvt::store(q, q2, j, 0, v0 * mult);
                     if (c + 1 < p.cols) {
-                        const float v1 = quant_in_traits<InT>::to_float(a[1]);
+                        const float v1 = ElemTrait<InT>::to_float(a[1]);
                         local_amax = fmaxf(local_amax, fabsf(v1));
                         Cvt::store(q, q2, j, 1, v1 * mult);
                     }

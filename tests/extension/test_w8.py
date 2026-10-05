@@ -138,6 +138,7 @@ def test_w8a8_k128_swizzle_and_tail(trans_a, trans_b, k):
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
+@skip_no_kernel
 class TestQuantGemmValidation:
     def test_unsupported_dtype_pair_rejected(self):
         x = torch.randn(8, 8, device="cuda", dtype=torch.float16)
@@ -194,6 +195,8 @@ class TestQuantGemmValidation:
         with pytest.raises(RuntimeError, match="same device"):
             quant_gemm(x, w, bias=other_bias)
 
+
+class TestQuantGemmCPUValidation:
     def test_cpu_rejected(self):
         x = torch.randn(8, 16).to(torch.bfloat16)
         w8 = torch.zeros(8, 16, dtype=torch.int8)

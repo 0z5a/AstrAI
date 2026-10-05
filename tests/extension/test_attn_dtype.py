@@ -95,3 +95,11 @@ def test_other_dtype_rejected(entry, dtype):
         RuntimeError, match=r"has no kernel for .*\(instantiated: BFloat16\)"
     ):
         ENTRIES[entry](dtype)
+
+
+@skip_no_kernel
+def test_uninstantiated_head_dim_raises():
+    q = torch.zeros(1, 1, N_HEADS, 96, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(1, KV_LEN, N_KV_HEADS, 96, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="head_dim 96 has no kernel instantiation"):
+        attn_decode(q, k, k)
