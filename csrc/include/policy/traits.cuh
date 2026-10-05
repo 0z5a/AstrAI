@@ -110,6 +110,10 @@ constexpr int ring_smem_bytes(int bm, int bn, int k, int stages, int ba, int bb)
  */
 constexpr int min_ctas_for_ring(int bytes) { return bytes <= 48 * 1024 ? 2 : 1; }
 
+constexpr int tma_smem_bytes(int ring, int stages) {
+    return ring + 1024 + 2 * (stages + 1) * 8;
+}
+
 /* Crosswise staging uses ColMajor A or RowMajor B; the other layouts stage as-is. */
 template <typename Layout> constexpr bool direct_a() { return std::is_same_v<Layout, ColMajor>; }
 template <typename Layout> constexpr bool direct_b() { return std::is_same_v<Layout, RowMajor>; }

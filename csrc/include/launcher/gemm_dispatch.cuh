@@ -1,12 +1,94 @@
 #pragma once
-/* Public typed GEMM dispatch and planner probe definitions. */
+/* Typed GEMM query, layout routing, dispatch, and probe. */
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <type_traits>
 #include <utility>
 
 #include <launcher/gemm_tiles.cuh>
+#include <memory/tma.cuh>
+#include <mma/mma.cuh>
+#include <utils/device.cuh>
 
 namespace astrai {
 namespace gemm {
+
+/*
+ * Dtype-class derivation (returns plan_types.h's GemmPerfClass): the mma
+ * promotion rule plus operand widths (mixed bf16xfp8 lands with W8A16 —
+ * same bytes, same promoted bf16 k16 mma). int8 is tested FIRST: it
+ * promotes to an int8 mma, so the "not bf16 -> fp8" arm would swallow it
+ * and every W8A8 row would be unreachable.
+ */
+template <typename ElemA, typename ElemB> constexpr GemmPerfClass gemm_perf_class() {
+    using MmaT = typename gemm_mma_traits<ElemA, ElemB>::MmaT;
+    if constexpr (std::is_same_v<ElemA, int8_t> && std::is_same_v<ElemB, int8_t>) {
+        return GemmPerfClass::kW8A8;
+    } else if constexpr (!std::is_same_v<MmaT, __nv_bfloat16>) {
+        return GemmPerfClass::kF8A8; // native fp8 symmetric pair
+    } else if constexpr (std::is_same_v<ElemA, __nv_bfloat16> &&
+                         std::is_same_v<ElemB, __nv_bfloat16>) {
+        return GemmPerfClass::kW16A16;
+    } else {
+        return GemmPerfClass::kW8A16;
+    }
+}
+
+static_assert(gemm_perf_class<int8_t, int8_t>() == GemmPerfClass::kW8A8,
+              "int8 x int8 is its own class (see the ordering note above)");
+static_assert(gemm_perf_class<__nv_fp8_e4m3, __nv_fp8_e4m3>() == GemmPerfClass::kF8A8,
+              "fp8 x fp8 keys the F8A8 table");
+static_assert(gemm_perf_class<__nv_bfloat16, __nv_bfloat16>() == GemmPerfClass::kW16A16,
+              "bf16 x bf16 keys the W16A16 table");
+static_assert(gemm_perf_class<__nv_bfloat16, int8_t>() == GemmPerfClass::kW8A16,
+              "a quantized weight against bf16 activations keys W8A16");
+
+/* Derive the query from typed operands and the launch geometry. */
+template <typename ElemA,
+          typename ElemB,
+          typename LayoutA,
+          typename LayoutB,
+          typename OutT = __nv_bfloat16,
+          typename Schedule = MmaSync>
+PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
+    PlanQuery q;
+    q.m = p.m;
+    q.n = p.n;
+    q.k = p.k;
+    q.batch = p.batch;
+    q.perf_class = (int)gemm_perf_class<ElemA, ElemB>();
+    q.crosswise = crosswise_of<LayoutA, LayoutB>();
+    q.ba = (int)sizeof(ElemA);
+    q.bb = (int)sizeof(ElemB);
+    q.out_elem_bytes = (int)sizeof(OutT);
+    using MmaT = typename gemm_mma_traits<ElemA, ElemB>::MmaT;
+    using MmaShape = typename astrai::MmaShapeFor<MmaT>::type;
+    q.mma_k = MmaShape::kK;
+    // Match the descriptor's alignment check before pricing TMA residency.
+    // Driver encode can still reject a map; the launcher then falls back.
+    q.tma = Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 &&
+            sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2 && dev.cc >= 90 &&
+            !gemm_tma_staging_disabled() &&
+            astrai::tma_aligned16(p.a_ptr, p.a_ld * sizeof(ElemA),
+                                  (p.batch > 1 ? p.a_batch_stride : 0) * sizeof(ElemA)) &&
+            astrai::tma_aligned16(p.b_ptr, p.b_ld * sizeof(ElemB),
+                                  (p.batch > 1 ? p.b_batch_stride : 0) * sizeof(ElemB));
+    q.dev = dev;
+    return q;
+}
+
+/* Carry the effective staging decision into the typed launch. */
+template <typename ElemA,
+          typename ElemB,
+          typename LayoutA,
+          typename LayoutB,
+          typename OutT = __nv_bfloat16,
+          typename Schedule = MmaSync>
+LaunchPlan plan_dispatch_for(const GemmParams& p) {
+    const PlanQuery q = plan_query<ElemA, ElemB, LayoutA, LayoutB, OutT, Schedule>(
+        p, device_facts());
+    return {plan_dispatch(q), q.tma};
+}
 
 /*
  * Pure problem rewrite: dual-N-contiguous (NN) has no instantiation — it
@@ -102,7 +184,9 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
      */
     const auto launch = [&](auto la, auto lb, auto lout) {
         launch_plan<ElemA, ElemB, decltype(la), decltype(lb), decltype(lout), OutT, Schedule>(
-            p, plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb), OutT, Schedule>(p), stream);
+            p,
+            plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb), OutT, Schedule>(p),
+            stream);
     };
     with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, launch);
 }
@@ -115,8 +199,9 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
 #define ASTRAI_GEMM_SCHEDULE MmaSync
 #endif
 
-#define ASTRAI_GEMM_INSTANTIATE(W, A)                                                           \
-    template void gemm_dispatch<W, A, __nv_bfloat16, ASTRAI_GEMM_SCHEDULE>(GemmParams, cudaStream_t, bool, bool)
+#define ASTRAI_GEMM_INSTANTIATE(W, A)                                                          \
+    template void gemm_dispatch<W, A, __nv_bfloat16, ASTRAI_GEMM_SCHEDULE>(                    \
+        GemmParams, cudaStream_t, bool, bool)
 
 /*
  * Host-only planner probe (the autotuner's coverage check): the decision
@@ -144,7 +229,8 @@ std::pair<PlanDecision, PlanQuery> plan_probe_for(int64_t m,
         canonicalize_gemm(p, trans_a, trans_b); // symmetric NN -> transposed TT
     }
     return with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, [&](auto la, auto lb, auto) {
-        PlanQuery q = plan_query<ElemA, ElemB, decltype(la), decltype(lb), __nv_bfloat16, Schedule>(p, dev);
+        PlanQuery q =
+            plan_query<ElemA, ElemB, decltype(la), decltype(lb), __nv_bfloat16, Schedule>(p, dev);
         return std::make_pair(plan_dispatch(q), std::move(q));
     });
 }

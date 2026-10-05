@@ -1,5 +1,7 @@
 """Exercise compiled GEMM schedules with independent runtime switches."""
 
+import re
+
 import pytest
 import torch
 
@@ -37,3 +39,24 @@ def test_compiled_schedule_switches(dtype, staging, k, capfd):
     assert (" mx " in launches[-1]) == (fp8 and mx and caps["mx"])
     # Odd K cannot form the TMA descriptors, so it must use cp.async.
     assert (" tma " in launches[-1]) == (tma and caps["tma"] and k == 128)
+
+
+@skip_no_kernel
+def test_unaligned_base_uses_cpasync_plan(capfd):
+    m, n, k = 65, 129, 128
+    storage = torch.randint(-2, 3, (m * k + 1,), device="cuda").to(torch.bfloat16)
+    a = storage[1:].view(m, k)
+    b = torch.randint(-2, 3, (n, k), device="cuda").to(torch.bfloat16)
+    with plan.override(planner="model", tma=False):
+        cp = kernel.gemm.probe(m, n, k)
+    with plan.override(planner="model", tma=True, log=True):
+        output = kernel.gemm.quant_gemm(a, b)
+        torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output, (a.float() @ b.float().T).to(torch.bfloat16), atol=0, rtol=0
+    )
+    log = capfd.readouterr().err
+    chosen = re.search(r"\[gemm-plan\] model .* -> cta(\d+) s(\d+)", log)
+    assert chosen is not None
+    assert tuple(map(int, chosen.groups())) == (cp["cta"], cp["stages"])
+    assert " tma " not in log

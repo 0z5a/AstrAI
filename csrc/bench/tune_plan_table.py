@@ -14,8 +14,8 @@ standalone scripts had.
 
 Row tables are served at runtime through ``kernel.gemm.set_table`` (no
 rebuild, no environment variable); an emitted row file can also be pasted
-into csrc/include/launcher/plan_table_builtin.h's GENERATED block, which does require a
-rebuild. The special ``model`` candidate measures every row tier off (the
+into csrc/gemm/plan_table_builtin.cpp's GENERATED block, which does
+require a rebuild. The special ``model`` candidate measures every row tier off (the
 degraded rows) — the reference of the min-gain mode.
 """
 
@@ -72,7 +72,7 @@ PERF_CLASS: dict[str, int] = {
 # A recipe is one tile: its CTA class, its ring depth and its k-tile depth,
 # written as a row file's (cta, stages, kK) — which is exactly the dispatch
 # key dispatch_tile matches on. The vocabulary is single-sourced from the
-# compiled binding (kernel.gemm.tile_vocabulary -> gemm.cuh gemm_recipes_for):
+# compiled binding (kernel.gemm.tile_vocabulary -> planning.cpp manifests):
 # the extension returns, per staging pair, every dispatch key the ladders
 # carry in dispatch (manifest) order, deduped by its own first-match rule —
 # the same rule dispatch_tile applies — so this file cannot disagree with
@@ -199,13 +199,11 @@ def reachability_report() -> list[str]:
     return []
 
 
-# Ring feasibility mirror (policy.cuh ring_smem_bytes vs the device's
-# smem opt-in ceiling): over-budget recipes cannot launch and would be
-# silently measured as the model/degraded — filter them out per combo.
+# Mirror planner feasibility: TMA adds alignment pad and mbarriers to the ring.
+# An over-budget recipe would silently fall back to cp.async during a sweep.
 # class -> CTA (M, N), the inverse of the same map that names the ordinals
 # (policy.cuh's kTileClassCta is the C++ home for these numbers).
 CTA_GEOM: dict[int, tuple[int, int]] = {v: k for k, v in _CLASS_OF.items()}
-SMEM_OPTIN = 101376  # MaxSharedMemoryPerBlockOptin: 99KB on sm_89 and sm_120
 _DTYPE_BYTES = {
     torch.bfloat16: 2,
     torch.int8: 1,
@@ -230,14 +228,18 @@ def candidate_recipes(combo: str) -> tuple[str, ...]:
     against the smem opt-in ceiling. What this gets wrong, the tag probe
     catches rather than records."""
     ba, bb = BYTES[combo]
-    return tuple(
-        recipe
-        for recipe in REACHABLE[ladder_for_widths(ba, bb)]
-        if ring_smem_bytes(
-            RECIPES[recipe][1], RECIPES[recipe][0], RECIPES[recipe][2], ba, bb
-        )
-        <= SMEM_OPTIN
-    ) + ("model",)
+    facts = kernel.gemm.facts()
+    tma = facts["cc"] >= 90 and kernel.gemm.state()["staging"]["tma"]
+
+    def fits(recipe: str) -> bool:
+        cta, stages, kk = RECIPES[recipe]
+        ring = ring_smem_bytes(stages, cta, kk, ba, bb)
+        staged = ring + 1024 + 16 * (stages + 1) if tma else ring
+        return staged <= facts["smem_max"]
+
+    return tuple(r for r in REACHABLE[ladder_for_widths(ba, bb)] if fits(r)) + (
+        "model",
+    )
 
 
 _TAG_RE = re.compile(r"\[gemm-plan\] (override|injected|builtin|model|degraded)\b")
@@ -548,13 +550,12 @@ def build_rows(
 
 
 def emit_cpp_rows(rows: list[str]) -> str:
-    """The same rows as plan_table.h initializers, grouped per class.
+    """The same rows as TableRow initializers, grouped per class.
 
     Field order is TableRow's own (cta first, then the bands), the cta
     ordinal expands through the binding's class-name table (C++ owns the
     spellings), and each group is labelled with its builtin array so the
-    paste is a straight replacement. The header's static_asserts then check
-    the class keying, which a hand-edited ordinal would silently get wrong.
+    paste is a straight replacement. The planner checks each class ordinal before storing a row.
     """
     names = get_module("gemm").tile_class_names()
     by_class: dict[int, list[str]] = {}
@@ -679,7 +680,7 @@ def _winner(
     default="rows",
     show_default=True,
     help="rows: the row-file syntax; cpp: TileClass initializers, "
-    "grouped per class, ready to paste into plan_table_builtin.h's GENERATED block.",
+    "grouped per class, ready to paste into plan_table_builtin.cpp's GENERATED block.",
 )
 @click.option("--warmup", type=click.IntRange(min=1), default=10, show_default=True)
 @click.option("--iterations", type=click.IntRange(min=1), default=50, show_default=True)

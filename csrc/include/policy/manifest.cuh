@@ -115,7 +115,7 @@ using warp_widened_t =
 /*
  * CTA geometry per dispatch class — the inverse of tile_class, and the one
  * home for the class -> (M, N) numbers the host plan table prices rows with
- * (plan_row_geometry in launcher/plan_row.h). Indexed by TileClass, enum order.
+ * (plan_row_geometry in gemm/plan_table.cpp). Indexed by TileClass, enum order.
  */
 inline constexpr int kTileClassCta[][2] = {
     {64, 64},   // kSmall64

@@ -15,7 +15,8 @@ Compiled standalone (no CMake target), like the C tests:
 
     nvcc -I csrc/include -I csrc/tests -arch=sm_89 -std=c++20 -O3 \
         csrc/bench/bench_tile_sweep.cu csrc/gemm/planning.cpp \
-+        -o /tmp/tile_sweep && /tmp/tile_sweep
+        csrc/gemm/plan_table.cpp -o /tmp/tile_sweep && /tmp/tile_sweep
+    # also build and sweep the int8 candidate set (~2x compile):
     # also build and sweep the int8 candidate set (~2x compile):
     nvcc ... -DASTRAI_SWEEP_INT8=1 ... --dtype both
 
@@ -59,7 +60,6 @@ that computes the wrong thing is not a win.
 #include <vector>
 
 #include <launcher/gemm_dispatch.cuh>
-#include <launcher/planning.h>
 #include <utils/device.cuh>
 
 using namespace astrai;
@@ -534,7 +534,7 @@ void report_shape(const char* cfg,
      * pair the candidates above are built with; the plan derives its own
      * perf class, widths and crosswise count from those same tags.
      */
-    const PlanDecision plan = plan_dispatch_for<EA, EB, RowMajor, ColMajor>(p);
+    const PlanDecision plan = plan_dispatch_for<EA, EB, RowMajor, ColMajor>(p).decision;
     const int pi = planned_candidate_index<EA, EB>(plan);
     /*
      * Rows may be filtered (--only), so look the planned index up rather

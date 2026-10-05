@@ -202,9 +202,9 @@ class TestModelRule:
     the (resident, stages) prefix measured a net loss there — the stages
     tier preferred the S3 twin in the cells where S2 measured faster — and
     kK now has a term of its own, so what residency was right about is
-    recovered by the cost. The cost is (operand + output + issue) bytes
-    times waves times resident, where the issue term prices every
-    k-iteration at a fixed charge per accumulator cell (a deeper kK
+    recovered by the cost. The cost is (operand + output + mainloop) equivalent bytes
+    times waves times resident. The fitted mainloop term prices each
+    k-iteration per accumulator cell (a deeper kK
     amortises it). This pins the planner to that cost and checks the pick
     attains its minimum. The mixed-pair residency gate and the byte-pair
     form are covered by model_capture's --check fidelity gate, which walks
@@ -219,9 +219,9 @@ class TestModelRule:
         (2048, 28672, 8192),
     )
 
-    # planning.cpp kKTileIssueBytes / kMmaArmBytesPerInstr — keep in sync
+    # planning.cpp kMainloopBytesPerCellTile / kMmaArmBytesPerInstr
     # (both fitted on the 2026-09-16 grid, RTX 5090, bf16 out).
-    K_TILE_ISSUE_BYTES = 8
+    MAINLOOP_BYTES_PER_CELL_TILE = 8
     MMA_ARM_BYTES_PER_INSTR = 64
 
     @classmethod
@@ -233,21 +233,24 @@ class TestModelRule:
         the zero-constant cp.async form is the one under test.
         """
         _cw, _ba, _bb, _cta, _stages, kk, bm, bn, _wm, _wn, _threads, smem = entry
-        resident = min(facts["smem_per_sm"] // smem, 2 if smem <= 48 * 1024 else 1)
-        if resident <= 0:
+        tma = kernel.gemm.capabilities()["tma"]
+        staged = smem + 1024 + 16 * (_stages + 1) if tma else smem
+        resident = min(facts["smem_per_sm"] // staged, 2 if smem <= 48 * 1024 else 1)
+        if resident <= 0 or staged > facts["smem_max"]:
             return None
         blocks = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
         output = 2 * bm * bn
-        if not kernel.gemm.capabilities()["tma"]:  # effective compiled staging
+        if not tma:  # effective compiled staging
             operand = ((k + kk - 1) // kk) * kk * (bm * 2 + bn * 2)
             mu = facts["smem_per_sm"] // smem
             slots = facts["sms"] * mu
             waves = (blocks + slots - 1) // slots if slots > 0 else 1
             return (operand + output) * waves
         operand = k * (bm * 2 + bn * 2)
-        issue = cls.K_TILE_ISSUE_BYTES * bm * bn * ((k + kk - 1) // kk)
-        mma_arm = cls.MMA_ARM_BYTES_PER_INSTR * bm * bn * k // (128 * 16)
-        per_cta = max(operand + output + issue, mma_arm)
+        loop_penalty = cls.MAINLOOP_BYTES_PER_CELL_TILE * bm * bn * ((k + kk - 1) // kk)
+        mma_instructions = ((k + kk - 1) // kk) * (kk // 16) * (bm // 16) * (bn // 8)
+        mma_arm = cls.MMA_ARM_BYTES_PER_INSTR * mma_instructions
+        per_cta = max(operand + output + loop_penalty, mma_arm)
         slots = facts["sms"] * resident
         waves = (blocks + slots - 1) // slots if slots > 0 else 1
         return per_cta * waves * resident

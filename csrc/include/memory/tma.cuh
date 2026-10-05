@@ -128,6 +128,10 @@ tma_load(const void* map, uint64_t* bar, void* smem_dst, int x, int y, int z) {
  * inner extent is then exactly the swizzle span (128B for 2-byte
  * elements, 64B for 1-byte), the constraint SWIZZLE_* imposes.
  */
+inline bool tma_aligned16(const void* ptr, int64_t stride, int64_t batch_stride) {
+    return ((reinterpret_cast<uintptr_t>(ptr) | stride | batch_stride) & 15) == 0;
+}
+
 struct TmaMapSpec {
     const void* ptr = nullptr;
     uint64_t dim0 = 0;         // contract extent, bytes (K * elem size)
@@ -140,8 +144,7 @@ struct TmaMapSpec {
     int swizzle_bits = 0;      // 3 = SWIZZLE_128B (2B elems), 2 = SWIZZLE_64B (1B)
 
     bool aligned16() const {
-        return ((reinterpret_cast<uintptr_t>(ptr) | stride1 | (batch > 1 ? batch_stride : 0)) &
-                15) == 0;
+        return tma_aligned16(ptr, stride1, batch > 1 ? batch_stride : 0);
     }
 };
 

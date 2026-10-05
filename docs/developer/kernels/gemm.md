@@ -51,20 +51,21 @@ Headers under `csrc/include` contain declarations and device templates;
 | `policy/traits.cuh` | Promoted MMA traits and shared-memory ring budget (`GemmTraits`, `GemmSmem`) |
 | `policy/manifest.cuh` | Named tile recipes, CTA classes, and staging-specific manifests |
 | `policy.cuh` | `GemmPolicy`: the kernel's composed dtype, layout, tile, staging, and output policy |
-| `launcher/plan_types.h` | Runtime config, planner query, recipe, and dispatch decision shared by launch and planning code |
+| `launcher/plan_types.h` | Runtime config, planner query, decision, and the selected staging carried into launch |
 | `memory/load_async.cuh` / `load_crosswise.cuh` / `load_crosswise_packed.cuh` | Operand staging by access pattern: cp.async (congruous and 16-bit transposed) with `PrefetchCarry`; direct 8-bit crosswise LDG+PRMT with `CrosswiseCarry`; packed k-pair crosswise with `PairPackCarry` |
 | `scheduler.cuh` | CTA id → (block_m, block_n) grouped/plain raster (runtime `raster` knob) |
 | `kernel/gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `epilogue/writer.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `kernel/gemm/kernel.cuh` | Device entry kernels for cp.async and TMA staging; they compose the mainloop and epilogue |
-| `launcher/gemm_launch.cuh` | Typed CUDA launch, TMA descriptor setup, and the `GemmParams` to `PlanQuery` conversion |
-| `launcher/gemm_tiles.cuh` | Manifest tile selection, output-reclaim fallback, and TMA/cp.async policy resolution |
-| `launcher/gemm_dispatch.cuh` | Layout canonicalization and tag routing shared by `gemm_dispatch` and `plan_probe_for`; the include used by dtype-pair instantiation units |
-| `launcher/plan_row.h` / `plan_table_parse.h` / `plan_table_builtin.h` | Row vocabulary and matching; row-file and runtime-text parsing; measured device-specific rows and the degraded fallback ladder, respectively |
-| `launcher/plan_table.h` | Thread-safe row sources and resolved planner settings |
-| `launcher/planning.h` / `gemm/planning.cpp` | Planner declarations / host implementation: recipe enumeration, row validation, model ranking and raster |
+| `launcher/gemm_launch.cuh` | Typed CUDA launch and TMA descriptor setup |
+| `launcher/gemm_tiles.cuh` | Manifest tile selection, output-reclaim fallback, and launch from the resolved staging decision |
+| `launcher/gemm_dispatch.cuh` | Typed query construction, layout canonicalization, and routing shared by launch and probe |
+| `launcher/plan_types.h` | Planner query/decision types shared with the launch templates |
+| `gemm/plan_table.h` / `plan_table.cpp` | Private host row contract, parsing, row sources, configuration and row selection |
+| `gemm/plan_table_builtin.cpp` | Generated measured rows and degraded fallback rows, compiled in a separate host TU |
+| `gemm/planning.cpp` | Recipe vocabulary, model ranking and raster selection |
 | `api/gemm.h` | The family's C++ surface — declarations only, and template-free so including it instantiates no dtype-pair kernel: `quant_gemm_impl` (the one GEMM entry), the planner face (`PlanProbe` + `plan_probe`, `GemmConfigPatch` — `rows` + `tier` (`RowTier`) + `table_off` + the mode/log/staging knobs — with the re-installable `GemmConfigState`, through `configure` / `config_state`) and the vocabulary (`tile_vocabulary` / `tile_class_names`). No Python type in a signature — the composed fp8 linear and the bindings TU call the same functions |
-| `gemm/gemm.cu` | The typed host layer: the dtype-pair registry (`ASTRAI_GEMM_PAIRS`, one entry feeding both the `gemm_dispatch` and the `plan_probe_for` lookup; one extern-template declaration per pair, which is what keeps this TU from re-instantiating them) plus the `api/gemm.h` implementations. Holds no `py::` type |
+| `gemm/gemm.cu` | Typed host layer: one dtype-pair visitor feeds launch and probe; the schedule visitor selects the compiled architecture variant. Holds no `py::` type |
 | `gemm/fp8_linear.cu` | Composed fp8 training linear (forward and backward) in one C++ `autograd::Function` |
 | `gemm/fp8_runtime.cu` / `fp8_linear.h` | Single `State` owner, checkpoint/debug and pybind interface; internal declarations connecting the runtime to the autograd entry |
 | `gemm/fp8_ring.h` / `fp8_cache.h` / `fp8_state.h` | Delayed-scaling ring and recipe; weight/activation cast caches; meta registry and restore helpers |
@@ -323,7 +324,7 @@ unchanged.
 
 ## Planning
 
-**The row table** (`launcher/plan_table.h`) is the production planner's
+**The row table** (`gemm/plan_table.cpp`) is the production planner's
 first resort — `plan_gemm` consults a measured row table: (M, N, K) bands
 (min exclusive, max inclusive, 0 = open), keyed per dtype class / crosswise
 count, each row naming a recipe (CTA class + ring depth; raster 0 =
@@ -331,7 +332,7 @@ count, each row naming a recipe (CTA class + ring depth; raster 0 =
 per dtype class (`kBuiltinPlanW16A16` / `W8A16` / `W8A8` / `F8A8`, selected
 by `builtin_plan_table`): the class *is* the table — a row tuned for one
 operand pair cannot fire on another (`gemm_perf_class` tests the int8 pair
-before the "not bf16 → fp8 pair" arm). `plan_from_row` is the single
+before the "not bf16 → fp8 pair" arm). `row_plan` is the single
 interpreter: geometry from the CTA class, ring depth from the row, raster 0
 = `plan_raster`, and one smem gate — a row whose ring exceeds the smem
 opt-in ceiling falls through to the degraded bands instead of a failed
@@ -352,8 +353,8 @@ matches only while the row's own grid covers that many CTAs per SM, and
 literal M bounds calibrated to one SM count and wave gates both exist
 because measured latency crossovers sometimes keep literal bounds and
 sometimes scale with occupancy. Compiled-in rows are pasted manually
-between the GENERATED markers of `launcher/plan_table.h` (the measurement
-script only emits the row file; a rebuild picks it up).
+between the GENERATED markers of `gemm/plan_table_builtin.cpp` (the measurement
+script emits rows; a rebuild picks them up).
 
 **The planner chain**: override rows, injected rows, the compiled-in table,
 the analytical model, the degraded bands — first to answer wins, and the
@@ -374,17 +375,49 @@ recipe space needs. Wave count alone is not a valid ranking proxy here: a
 64×64 CTA's wave carries a quarter of a 128×128's work, so counting waves
 prefers the coarse tile regardless of fit. The model prices cost instead —
 
-- TMA (dual-congruous): `cost = max(operand + output + issue, mma_arm) × W_eff`
-  per CTA, with `operand = k·(bm·ba + bn·bb)` (bytes per operand, `ba`/`bb`
-  the per-element byte widths), `output = out_elem_bytes·bm·bn`, `issue`
-  the per-k-tile issue overhead priced for non-byte pairs, and
-  `mma_arm` the tensor-pipe arm. `W_eff = waves × resident` for dual-2-byte
-  pairs, plain `ceil(blocks/sms)` otherwise. The arms overlap on
-  independent hardware, so a non-binding arm must not tax the ranking.
+- TMA (dual-congruous): `I_k = kk·(bm·ba + bn·bb)`,
+  `I_cta = k·(bm·ba + bn·bb)`, `O_cta = out_elem_bytes·bm·bn`.
+  The fitted mainloop arm adds `8·bm·bn·ceil(k/kk)` for non-byte pairs;
+  the MMA arm is calibrated separately. The ranking is
+  `max(I_cta + O_cta + mainloop, mma_arm) × W_eff`, where `W_eff` is
+  `ceil(blocks/(sms·resident))·resident` for two-byte pairs and
+  `ceil(blocks/sms)` otherwise. On sm_120 these coefficients came from
+  the RTX 5090 sweep. TMA residency uses the allocated ring plus the
+  1024-byte alignment pad and two 8-byte barriers per slot; a map failing
+  16-byte pointer/stride alignment is priced and launched as cp.async.
+  With `L = ceil(k/kk)`, the kernel issues `2L` TMA loads and
+  `L·(kk/k_mma)·(bm/16)·(bn/8)` warp MMA instructions per CTA.
+  `k_mma` is 16 for BF16/mixed and 32 for INT8/FP8. The fitted 8
+  and 64 are equivalent-byte weights, not hardware instruction rates;
+  the MMA arm is 64 times the instruction count above. Mixed precision
+  also dequantizes fragments, and SM120 FP8 uses a
+  block-scaled MMA instruction. The current model does not fit these
+  rates per precision class.
 - cp.async: `cost = (k-padded operand + output) × waves` with raw-floor
   residency in the waves denominator — the software ring is the only
   latency hiding, so residency divides the makespan instead of sharing
   bandwidth; the axis flips with staging.
+
+On the RTX 5090, a fresh TMA sweep (5 warmups, 20 iterations, 2 trials per
+recipe) tested 12 BF16/mixed/int8 shapes and 32 int8/FP8 shapes. The
+per-class geometric mean of selected TFLOPS divided by the best measured
+recipe was (phase-ordered, suitable for ranking diagnostics only):
+
+| Formula | BF16 (4) | Mixed (4) | Int8 (4 + 16) | FP8 (16) |
+| --- | ---: | ---: | ---: | ---: |
+| Current TMA model | 0.980 | 0.994 | 0.954 / 0.985 | 0.979 |
+| `(I_cta + O_cta) · ceil(W)` | 0.892 | 0.906 | 0.900 / 0.935 | 0.928 |
+
+The traffic-only wave formula overprices occupancy as free bandwidth: resident
+CTAs can hide latency, but they still share one SM's transfer and MMA issue
+capacity. Charging each K tile's mainloop work and retaining the measured two-arm
+maximum avoids its small-tile bias. The present model still misses some
+long-K int8 and small FP8 cells; those need interleaved holdout measurements
+before changing coefficients or adding a row.
+
+Empty plan tables return without taking their mutex; the model keeps the
+last exact query and decision per thread. Table lookup still precedes the
+model, so an installed row takes effect immediately.
 
 Every width pair ranks on the cost alone; a tie keeps the candidate seen
 first (the manifest's own order). `kK` is not an independent axis — it

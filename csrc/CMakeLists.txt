@@ -39,7 +39,14 @@ function(astrai_compile_target target)
     target_link_libraries(${target} PRIVATE ${TORCH_LIBS})
     target_compile_options(${target} PRIVATE
         "$<$<COMPILE_LANGUAGE:CXX>:-O3;-funroll-loops>"
-        "$<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr;--use_fast_math;--ptxas-options=-O3,-v;--extra-device-vectorization;-Xfatbin;--compress-all;--threads=4>")
+        "$<$<COMPILE_LANGUAGE:CUDA>:-O3>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-O3,-v>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:--extra-device-vectorization>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:--compress-all>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:--threads=4>")
 endfunction()
 
 if(NOT ASTRAI_CUDA_ARCH_LIST)
@@ -57,6 +64,7 @@ set(KERNEL_MODULES
         gated_deltanet/gated_deltanet_bwd.cu gated_deltanet/bindings.cu"
     "quantize|quantize/bindings.cu quantize/entry.cu"
     "gemm|gemm/gemm.cu gemm/bindings.cu gemm/planning.cpp
+        gemm/plan_table.cpp gemm/plan_table_builtin.cpp
         gemm/fp8_linear.cu gemm/fp8_runtime.cu quantize/entry.cu")
 
 foreach(entry IN LISTS KERNEL_MODULES)

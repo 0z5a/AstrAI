@@ -1,7 +1,7 @@
-#pragma once
-#include <array>
+/* Compiled-in GEMM tuning rows; generated arrays stay private to this TU. */
+#include "plan_table.h"
 
-#include <launcher/plan_row.h>
+#include <array>
 
 namespace astrai {
 namespace gemm {
@@ -205,7 +205,7 @@ static constexpr DeviceFacts kBuiltinPlanMeasuredOn = {
     /*sms=*/170, /*smem_max=*/101376, /*smem_per_sm=*/102400,
     /*regs_per_sm=*/65536, /*l2_bytes=*/100663296, /*cc=*/120};
 
-inline bool builtin_rows_match_device(const DeviceFacts& dev) {
+bool builtin_rows_match_device(const DeviceFacts& dev) {
     const DeviceFacts& m = kBuiltinPlanMeasuredOn;
     return dev.cc == m.cc && dev.sms == m.sms && dev.smem_max == m.smem_max &&
            dev.smem_per_sm == m.smem_per_sm && dev.regs_per_sm == m.regs_per_sm &&
@@ -222,7 +222,7 @@ inline bool builtin_rows_match_device(const DeviceFacts& dev) {
  * table (the shipped default) returns a valid pointer and a zero count, so
  * plan_row_for matches nothing and the chain falls through to the model.
  */
-inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) {
+const TableRow* builtin_plan_table(int perf_class, int& count) {
     switch (perf_class) {
     case 0:
         count = (int)kBuiltinPlanW16A16.size();
@@ -257,6 +257,10 @@ static constexpr TableRow kDegradedPlanRows[] = {
     {TileClass::kBig128, 3072, 0, 0, 0, -1, -1, 2, 0},
 };
 
+const TableRow* degraded_plan_table(int& count) {
+    count = sizeof(kDegradedPlanRows) / sizeof(kDegradedPlanRows[0]);
+    return kDegradedPlanRows;
+}
 
 } // namespace gemm
 } // namespace astrai

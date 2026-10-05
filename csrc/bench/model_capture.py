@@ -85,23 +85,22 @@ def geometry(name: str) -> dict:
     }
 
 
-def priced(name: str, m: int, n: int, k: int, ba: int, bb: int, dev: dict) -> dict:
+def priced(
+    name: str, m: int, n: int, k: int, ba: int, bb: int, dev: dict, tma: bool
+) -> dict:
     g = geometry(name)
     # widening: 2-byte operand, small CTA, kk=64 (policy.cuh warp_widened_t)
     widened = ba + bb >= 3 and g["bm"] == 64 and g["bn"] == 64 and g["kk"] == 64
     threads = 512 if widened else g["threads"]
     ring = (g["stages"] + 1) * g["kk"] * (g["bm"] * ba + g["bn"] * bb)
     # policy.cuh: min_ctas_for_ring is bytes <= 48KB ? 2 : 1 — residency is
-    # smem-capped ONLY (no thread term). An earlier version of this file
+    # charged the TMA pad/barriers and otherwise smem-capped ONLY (no thread term). An earlier version of this file
     # added its own thread cap and simulated picks the kernel never makes,
     # which is how a rule that scored +2.6pp here regressed 8 cells
     # end-to-end. Fidelity is now checked against the binding (--check).
-    resident = min(dev["smem"] // ring, 2 if ring <= 48 * 1024 else 1)
-    # Feasibility is the ring's, not a floor on residency: the C++'s
-    # plan_resident_ctas returns 0 (not 1) for a ring past the opt-in
-    # ceiling, and a rule that prices it anyway simulates a launch the
-    # binding never makes. The rule loop skips ok=false.
-    ok = resident > 0 and ring <= dev["smem_max"]
+    staged = ring + 1024 + 16 * (g["stages"] + 1) if tma else ring
+    resident = min(dev["smem"] // staged, 2 if ring <= 48 * 1024 else 1)
+    ok = resident > 0 and staged <= dev["smem_max"]
     blocks = ((m + g["bm"] - 1) // g["bm"]) * ((n + g["bn"] - 1) // g["bn"])
     waves = max(
         1,
@@ -153,7 +152,8 @@ def rules() -> dict:
             waves = (p["blocks"] + slots - 1) // slots if slots else 1
             return (-(operand + 2 * p["fat"]) * waves,)
         mem = p["b2"] + 2 * p["fat"] + (0 if byte else 8.0 * p["fat"] * p["kiters"])
-        mma = 64 * p["fat"] * q["k"] // (128 * (32 if byte else 16))
+        mma_k = 32 if byte else 16
+        mma = 64 * p["kiters"] * (p["kk"] // mma_k) * (p["bm"] // 16) * (p["bn"] // 8)
         if q["ba"] == 2 and q["bb"] == 2:
             weff = p["waves"] * p["resident"]
         else:
@@ -198,6 +198,23 @@ def rules() -> dict:
 
     return {
         "model_exact": shipped,
+        # TMA traffic-only hypothesis: one CTA's padded input and output
+        # bytes, multiplied by actual resident-scaled waves.
+        "tma_wave": lambda p, q: (
+            -(
+                p["kiters"] * p["kk"] * (p["bm"] * q["ba"] + p["bn"] * q["bb"])
+                + 2 * p["fat"]
+            )
+            * p["waves"],
+        ),
+        "tma_wave_issue": lambda p, q: (
+            -(
+                p["kiters"] * p["kk"] * (p["bm"] * q["ba"] + p["bn"] * q["bb"])
+                + 2 * p["fat"]
+                + 8 * p["fat"] * p["kiters"]
+            )
+            * p["waves"],
+        ),
         # the pre-floor ranking, to size the floor rule's contribution
         "resource": lambda p, q: (p["resident"], p["stages"]),
         # cost alone for every pair: what DeepGEMM's formula collapses to
@@ -294,7 +311,7 @@ def main(results_json, rule, class_filter, check, staging):
         best = max(over[r] for r in cands)
         ba, bb = tpt.BYTES[combo]
         ctx = {"m": m, "n": n, "k": k, "ba": ba, "bb": bb, "tma": use_tma}
-        feats = {r: priced(r, m, n, k, ba, bb, dev) for r in cands}
+        feats = {r: priced(r, m, n, k, ba, bb, dev, use_tma) for r in cands}
         # order_for mirrors dispatch_tile's first-match tie-break
         order = tpt.order_for(perf_class)[:-1]
         for name in names:
@@ -340,7 +357,7 @@ def main(results_json, rule, class_filter, check, staging):
             # measured reported every cell where the model picks a tile the
             # dataset predates as a mismatch (meas_w16a16 has no tall entry).
             cands = list(tpt.REACHABLE[tpt.ladder_for_widths(ba, bb)])
-            feats = {r: priced(r, m, n, k, ba, bb, dev) for r in cands}
+            feats = {r: priced(r, m, n, k, ba, bb, dev, use_tma) for r in cands}
             order = tpt.order_for(perf_class)[:-1]
             for name in names:
                 key = table[name]

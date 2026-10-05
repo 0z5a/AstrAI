@@ -125,6 +125,7 @@ struct GemmConfigState {
 // Apply `patch` and return the resulting state in one call.
 GemmConfigState configure(const GemmConfigPatch& patch);
 GemmConfigState config_state();
+bool parse_planner_mode(const std::string& name, int& out);
 
 /*
  * The dispatch vocabulary, for the Python tooling and the sweep's C++ emitter

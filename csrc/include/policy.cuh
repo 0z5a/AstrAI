@@ -63,16 +63,12 @@ struct GemmPolicy {
     static_assert(!Options_::kUseTma || (sizeof(ElemA_) <= 2 && sizeof(ElemB_) <= 2),
                   "TMA staging covers the 1-/2-byte congruous dtypes");
     using Smem = GemmSmem<Traits, LayoutA_, LayoutB_>;
-    /*
-     * TMA budgets the 1024B ring-base alignment pad plus the full/empty
-     * mbarrier pair per ring slot (tma.cuh); the residency hint stays
-     * ring-based.
-     */
-    static constexpr int kTmaExtra = Options_::kUseTma ? 1024 + 2 * (Tile_::kStages + 1) * 8 : 0;
+    // The planner and launcher share the same TMA pad/barrier budget.
     // Flattened for __launch_bounds__, which takes no dependent type names.
     static constexpr int kCtaThreads = Traits::kCtaThreads;
     static constexpr int kMinCtas = Smem::kMinCtas;
-    static constexpr int kSmemBytes = Smem::kBytes + kTmaExtra;
+    static constexpr int kSmemBytes =
+        Options_::kUseTma ? tma_smem_bytes(Smem::kBytes, Tile_::kStages) : Smem::kBytes;
 };
 
 } // namespace gemm

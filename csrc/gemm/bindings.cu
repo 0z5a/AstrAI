@@ -19,7 +19,6 @@
 
 #include "fp8_linear.h"
 #include <api/gemm.h>
-#include <launcher/plan_table.h>
 #include <utils/device.cuh>
 
 namespace astrai {

@@ -46,6 +46,7 @@ struct PlanQuery {
     int ba = 2;          // operand element bytes
     int bb = 2;
     int out_elem_bytes = 2; // bf16 output by default
+    int mma_k = 16;        // promoted MMA instruction K extent
     bool tma = true;        // effective staging selected for this launch
     DeviceFacts dev{};
 };
@@ -56,6 +57,12 @@ struct PlanDecision {
     const char* source;
 };
 
+struct LaunchPlan {
+    PlanDecision decision;
+    bool tma;
+};
+
+int plan_raster(const PlanQuery& q, int bm, int bn);
 PlanDecision plan_dispatch(const PlanQuery& q);
 inline bool gemm_plan_log_enabled() {
     gemm_config_seed_once();

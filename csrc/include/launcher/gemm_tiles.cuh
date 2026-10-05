@@ -92,22 +92,17 @@ template <typename ElemA,
           typename LayoutOut = RowMajor,
           typename OutT = __nv_bfloat16,
           typename Schedule = MmaSync>
-void launch_plan(GemmParams p, const PlanDecision& d, cudaStream_t stream) {
+void launch_plan(GemmParams p, const LaunchPlan& selected, cudaStream_t stream) {
+    const PlanDecision& d = selected.decision;
     p.raster = d.raster;
     /*
      * Dual-congruous (crosswise 0): the only layout pair TMA can describe —
      * both operands staged as-is, so the descriptors are encodable.
      */
     constexpr bool kCongruous = crosswise_of<LayoutA, LayoutB>() == 0;
-    /*
-     * TMA staging first when the layout pair and dtypes allow it (the
-     * planner's stage/tile decisions are shared): sm_90+ device, no
-     * kill switch, and every descriptor encodable — else the cp.async
-     * twin below runs unchanged.
-     */
+    /* The query resolved staging gates; descriptor encode may still reject TMA. */
     if constexpr (Schedule::kTma && kCongruous && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
-        if (!gemm_tma_staging_disabled() && astrai::device_facts().cc >= 90 &&
-            dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
+        if (selected.tma && dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
                 d, TileLauncher<true, ElemA, ElemB, RowMajor, ColMajor, LayoutOut, OutT, Schedule>{
                        p, stream}))
             return;

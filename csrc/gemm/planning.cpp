@@ -1,52 +1,22 @@
-/* GEMM host planning: recipe enumeration, row selection, and model ranking. */
-#include <launcher/planning.h>
+/* GEMM host planning, config, and recipe vocabulary. */
+#include <launcher/plan_types.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <optional>
-#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
-#include <launcher/plan_table.h>
+#include "plan_table.h"
+
+#include <api/gemm.h>
 #include <policy/manifest.cuh>
 
 namespace astrai {
 namespace gemm {
-
-// Read legacy ASTR_GEMM_* defaults once; configure() can override them.
-void gemm_config_seed_once() {
-    static const bool seeded = [] {
-        GemmConfig& c = gemm_config();
-        auto env = [](const char* name) {
-            const char* e = std::getenv(name);
-            return e == nullptr ? std::string() : std::string(e);
-        };
-        if (const std::string v = env("ASTR_GEMM_MODEL"); !v.empty())
-            c.planner = std::atoi(v.c_str());
-        if (const std::string v = env("ASTR_GEMM_PLAN"); !v.empty() && v != "0")
-            c.log = 1;
-        if (env("ASTR_GEMM_NO_TMA") == "1")
-            c.tma_disabled = 1;
-        if (env("ASTR_GEMM_NO_MX") == "1")
-            c.mx_disabled = 1;
-        if (const std::string v = env("ASTR_GEMM_TABLE"); !v.empty()) {
-            if (v == "-") {
-                c.table_off = 1;
-            } else {
-                std::vector<TableRow> rows;
-                if (parse_plan_table_file(v, rows))
-                    plan_table_override_source().set_from(v, std::move(rows));
-            }
-        }
-        return true;
-    }();
-    (void)seeded;
-}
 
 // Raster the longer grid dimension; keep M-side operand tiles inside the L2 budget.
 int plan_raster(const PlanQuery& q, int bm, int bn) {
@@ -121,16 +91,6 @@ template <typename F> inline auto with_manifest(bool crosswise_staging, int ba, 
 
 } // namespace
 
-// Every recipe the ladders instantiate for one staging pair.
-std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging, int ba, int bb) {
-    std::vector<GemmRecipe> out;
-    with_manifest(crosswise_staging, ba, bb, [&](auto manifest) {
-        for_each_recipe<decltype(manifest)>(ba, bb,
-                                            [&](GemmRecipe recipe) { out.push_back(recipe); });
-    });
-    return out;
-}
-
 // A row is eligible only if its exact (class, stages, K) recipe was instantiated.
 namespace {
 
@@ -179,30 +139,24 @@ std::optional<PlanDecision> row_plan(const PlanQuery& q, std::optional<TableRow>
         return std::nullopt;
     const auto recipe = recipe_of((int)row->cta, row->stages, row->kk,
                                   q.crosswise > 0, q.ba, q.bb);
-    if (!recipe || recipe->smem > q.dev.smem_max)
+    if (!recipe || plan_resident_ctas(row->cta, row->stages, row->kk, q) <= 0)
         return std::nullopt;
     return PlanDecision{*recipe,
                         row->raster != 0 ? row->raster : plan_raster(q, recipe->bm, recipe->bn),
                         source};
 }
 
-std::optional<TableRow> builtin_row(const PlanQuery& q) {
-    if (!builtin_rows_match_device(q.dev))
-        return std::nullopt;
-    int count = 0;
-    const TableRow* rows = builtin_plan_table(q.perf_class, count);
-    const TableRow* row = rows ? plan_row_for(rows, count, q) : nullptr;
-    return row ? std::optional<TableRow>(*row) : std::nullopt;
-}
-
-// Calibrated on RTX 5090: tile issue and MMA issue costs, in equivalent bytes.
-constexpr std::int64_t kKTileIssueBytes = 8;
+// RTX 5090 fitted mainloop and MMA costs in equivalent bytes, not TMA instruction counts.
+constexpr std::int64_t kMainloopBytesPerCellTile = 8;
 constexpr std::int64_t kMmaArmBytesPerInstr = 64;
 
 int resident_of(const GemmRecipe& r, const PlanQuery& q) {
     if (q.dev.smem_per_sm <= 0 || q.dev.regs_per_sm <= 0)
         return 0;
-    return std::min(q.dev.smem_per_sm / r.smem, min_ctas_for_ring(r.smem));
+    const int smem = q.tma ? tma_smem_bytes(r.smem, r.stages) : r.smem;
+    if (smem > q.dev.smem_max)
+        return 0;
+    return std::min(q.dev.smem_per_sm / smem, min_ctas_for_ring(r.smem));
 }
 
 // TMA overlaps copy and compute; cp.async hides copy latency through residency.
@@ -222,12 +176,13 @@ std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
     const bool byte_pair = q.ba == 1 && q.bb == 1;
     const std::int64_t operand = (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
     const std::int64_t output = (std::int64_t)q.out_elem_bytes * r.bm * r.bn;
-    const std::int64_t issue =
-        byte_pair ? 0
-                  : kKTileIssueBytes * (std::int64_t)r.bm * r.bn * ((q.k + r.kk - 1) / r.kk);
-    const std::int64_t mma_arm =
-        kMmaArmBytesPerInstr * (std::int64_t)r.bm * r.bn * q.k / (128 * (byte_pair ? 32 : 16));
-    const std::int64_t per_cta = std::max(operand + output + issue, mma_arm);
+    const std::int64_t k_tiles = (q.k + r.kk - 1) / r.kk;
+    const std::int64_t loop_penalty =
+        byte_pair ? 0 : kMainloopBytesPerCellTile * (std::int64_t)r.bm * r.bn * k_tiles;
+    const std::int64_t mma_instructions =
+        k_tiles * (r.kk / q.mma_k) * (r.bm / 16) * (r.bn / 8);
+    const std::int64_t mma_arm = kMmaArmBytesPerInstr * mma_instructions;
+    const std::int64_t per_cta = std::max(operand + output + loop_penalty, mma_arm);
     const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
     const std::int64_t waves = slots > 0 ? (blocks + slots - 1) / slots : 1;
     const std::int64_t w_eff =
@@ -235,9 +190,28 @@ std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
     return per_cta * w_eff;
 }
 
+bool same_model_query(const PlanQuery& a, const PlanQuery& b) {
+    const auto& x = a.dev;
+    const auto& y = b.dev;
+    return a.m == b.m && a.n == b.n && a.k == b.k && a.batch == b.batch &&
+           a.perf_class == b.perf_class && a.crosswise == b.crosswise &&
+           a.ba == b.ba && a.bb == b.bb && a.out_elem_bytes == b.out_elem_bytes &&
+           a.mma_k == b.mma_k && a.tma == b.tma && x.sms == y.sms && x.smem_max == y.smem_max &&
+           x.smem_per_sm == y.smem_per_sm && x.regs_per_sm == y.regs_per_sm &&
+           x.l2_bytes == y.l2_bytes && x.cc == y.cc;
+}
+
 std::optional<PlanDecision> model_plan(const PlanQuery& q) {
     if (q.dev.sms <= 0 || q.m <= 0 || q.n <= 0 || q.k <= 0)
         return std::nullopt;
+    struct LastModelPlan {
+        PlanQuery query{};
+        PlanDecision decision{};
+        bool valid = false;
+    };
+    static thread_local LastModelPlan last;
+    if (last.valid && same_model_query(last.query, q))
+        return last.decision;
     std::optional<GemmRecipe> best;
     std::int64_t best_cost = 0;
     with_manifest(q.crosswise > 0, q.ba, q.bb, [&](auto manifest) {
@@ -254,33 +228,29 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q) {
     });
     if (!best)
         return std::nullopt;
-    return PlanDecision{*best, plan_raster(q, best->bm, best->bn), "model"};
+    last = {q, {*best, plan_raster(q, best->bm, best->bn), "model"}, true};
+    return last.decision;
 }
 
 PlanDecision select_plan(const PlanQuery& q) {
     const int mode = gemm_planner_mode();
     if (mode != 2 && !gemm_table_off()) {
-        if (auto d = row_plan(q, plan_table_override_source().lookup(q), "override"))
+        if (auto d = row_plan(q, plan_override_row(q), "override"))
             return *d;
-        if (auto d = row_plan(q, plan_table_injected_source().lookup(q), "injected"))
+        if (auto d = row_plan(q, plan_injected_row(q), "injected"))
             return *d;
-        if (auto d = row_plan(q, builtin_row(q), "builtin"))
+        if (auto d = row_plan(q, plan_builtin_row(q), "builtin"))
             return *d;
     }
     if (mode == 1 || mode == 2)
         if (auto d = model_plan(q))
             return *d;
 
-    // Degraded rows use only M; n=1 passes their exclusive lower bound.
-    PlanQuery m_only;
-    m_only.m = q.m;
-    m_only.n = 1;
-    const TableRow* row = plan_row_for(kDegradedPlanRows, 3, m_only);
-    if (auto d = row_plan(q, row ? *row : kDegradedPlanRows[0], "degraded"))
+    if (auto d = row_plan(q, plan_degraded_row(q.m), "degraded"))
         return *d;
 
     // Preserve the default for empty shapes or missing device facts.
-    const TableRow& fallback = kDegradedPlanRows[0];
+    const TableRow fallback = plan_degraded_row(0);
     return {*recipe_of((int)fallback.cta, fallback.stages, fallback.kk, false, 2, 2),
             0, "degraded"};
 }
@@ -291,6 +261,30 @@ PlanDecision plan_dispatch(const PlanQuery& q) {
     const PlanDecision decision = select_plan(q);
     log_dispatch(q, decision);
     return decision;
+}
+
+/* Export instantiated recipes in manifest order for the tuner. */
+std::vector<std::vector<int>> tile_vocabulary() {
+    const std::pair<int, int> widths[] = {{2, 2}, {2, 1}, {1, 1}};
+    std::vector<std::vector<int>> out;
+    for (int crosswise = 0; crosswise <= 1; ++crosswise)
+        for (const auto& [ba, bb] : widths)
+            with_manifest(crosswise != 0, ba, bb, [&](auto manifest) {
+                for_each_recipe<decltype(manifest)>(ba, bb, [&](const GemmRecipe& r) {
+                    out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk, r.bm, r.bn,
+                                   r.wm, r.wn, r.threads, r.smem});
+                });
+            });
+    return out;
+}
+
+/* Names for serialized CTA classes, in enum order. */
+std::vector<const char*> tile_class_names() {
+    static constexpr const char* kNames[] = {"kSmall64", "kNarrow128x64", "kBig128", "kWide128x256",
+                                             "kTall64x128"};
+    static_assert((int)TileClass::kTall64x128 == (int)(sizeof(kNames) / sizeof(kNames[0])) - 1,
+                  "kNames is indexed by TileClass: keep it in enum order");
+    return std::vector<const char*>(kNames, kNames + sizeof(kNames) / sizeof(kNames[0]));
 }
 
 } // namespace gemm
