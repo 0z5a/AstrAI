@@ -422,8 +422,8 @@ take effect immediately. Empty tables avoid their mutex.
 | Mode | Search order (first match wins) |
 | --- | --- |
 | `table` | override → injected → builtin |
-| `hybrid` (default) | override → injected → builtin → geom_cta |
-| `model` | fitted model |
+| `hybrid` | override → injected → builtin → geom_cta |
+| `model` (default) | legacy model with RTX 5090 calibrated cost coefficients |
 | `heuristic` | geom_cta |
 
 Builtin rows are device-signature gated. `table_off=True` disables all row tiers;

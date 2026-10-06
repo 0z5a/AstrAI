@@ -43,14 +43,13 @@ def _clean_plan_state():
 
 
 class TestMode:
-    def test_default_is_hybrid(self):
-        # The shipped default: rows when any exist, else the heuristic. The
-        # test shape has no builtin row, so a fresh process gets the heuristic.
+    def test_default_is_model(self):
+        # The shipped default uses the legacy model directly.
         state = kernel.gemm.state()
-        assert state["planner"] == "hybrid"
-        assert kernel.gemm.probe(*SHAPE)["source"] == "heuristic"
+        assert state["planner"] == "model"
+        assert kernel.gemm.probe(*SHAPE)["source"] == "model"
         default = kernel.gemm.probe(*SHAPE)
-        with plan.override(planner="heuristic"):
+        with plan.override(planner="model"):
             explicit = kernel.gemm.probe(*SHAPE)
         assert (default["cta"], default["stages"], default["kk"]) == (
             explicit["cta"],

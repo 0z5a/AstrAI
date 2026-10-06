@@ -80,10 +80,10 @@ def recipe_name(probe: dict, names: list[str]) -> str:
 @click.option("--combos", default=",".join(COMBOS), show_default=True)
 @click.option(
     "--planner",
-    default="hybrid",
+    default="model",
     show_default=True,
     type=click.Choice(("hybrid", "model", "table")),
-    help="Which chain to map (the shipped default is hybrid).",
+    help="Which chain to map (the shipped default is model).",
 )
 @click.option("--csv", "csv_path", default=None, type=click.Path(path_type=Path))
 def main(

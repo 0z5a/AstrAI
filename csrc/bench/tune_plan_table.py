@@ -31,6 +31,7 @@ import tempfile
 import time
 from datetime import date
 from pathlib import Path
+from typing import Optional
 
 import click
 import torch
@@ -319,6 +320,20 @@ def parse_positive_ints(value: str) -> tuple[int, ...]:
             raise click.BadParameter(f"bad range {value!r}: want START:END:STEP")
         return tuple(range(start, stop + 1, step))
     return tuple(int(part) for part in parts)
+
+
+def parse_gpu_ids(value: Optional[str]) -> Optional[tuple[int, ...]]:
+    if value is None or not value.strip():
+        return None
+    try:
+        ids = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise click.BadParameter("GPU ids must be comma-separated integers") from exc
+    if not ids or any(gpu < 0 for gpu in ids):
+        raise click.BadParameter("GPU ids must be non-negative")
+    if len(set(ids)) != len(ids):
+        raise click.BadParameter("GPU ids must be unique")
+    return ids
 
 
 def parse_shape(value: str) -> tuple[str, int, int]:
@@ -626,6 +641,145 @@ def _winner(
     return winner
 
 
+def _sweep_parallel(
+    m_values: tuple[int, ...],
+    shapes: list[tuple[str, int, int]],
+    combos: tuple[str, ...],
+    batch: int,
+    warmup: int,
+    iterations: int,
+    trials: int,
+    wanted: tuple[str, ...],
+    gpu_ids: tuple[int, ...],
+    output: Path,
+) -> list[dict]:
+    output = output.resolve()
+    if not torch.cuda.is_available():
+        raise click.ClickException("CUDA is required")
+    visible_count = torch.cuda.device_count()
+    invalid = [gpu for gpu in gpu_ids if gpu >= visible_count]
+    if invalid:
+        raise click.ClickException(
+            f"GPU ids {invalid} are outside the {visible_count} visible CUDA devices"
+        )
+    if len(gpu_ids) > len(m_values):
+        raise click.ClickException(
+            "the number of GPUs cannot exceed the number of M values"
+        )
+
+    old_device = torch.cuda.current_device()
+    signatures = []
+    try:
+        for gpu in gpu_ids:
+            torch.cuda.set_device(gpu)
+            signatures.append(kernel.gemm.facts())
+    finally:
+        torch.cuda.set_device(old_device)
+    if any(facts != signatures[0] for facts in signatures[1:]):
+        raise click.ClickException(
+            "--gpus requires identical device facts so all shards share one plan"
+        )
+
+    # Balance approximate work by M while keeping each M's full N x K grid
+    # on one GPU. build_rows aggregates over K for each (dtype, M, N).
+    m_shards: list[list[int]] = [[] for _ in gpu_ids]
+    shard_costs = [0] * len(gpu_ids)
+    for m in sorted(m_values, reverse=True):
+        shard = min(
+            range(len(gpu_ids)),
+            key=lambda index: (shard_costs[index], len(m_shards[index]), index),
+        )
+        m_shards[shard].append(m)
+        shard_costs[shard] += m
+    for shard in m_shards:
+        shard.sort()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shard_dir = output.parent / f"{output.stem}.shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_tokens = (
+        [part.strip() for part in parent_visible.split(",")]
+        if parent_visible
+        else [str(index) for index in range(visible_count)]
+    )
+    script_path = str(Path(__file__).resolve())
+    workers = []
+    for gpu, shard_m in zip(gpu_ids, m_shards):
+        shard_json = shard_dir / f"gpu{gpu}.json"
+        shard_rows = shard_dir / f"gpu{gpu}.rows"
+        shard_log = shard_dir / f"gpu{gpu}.log"
+        command = [
+            sys.executable,
+            script_path,
+            "sweep",
+            "--m-values",
+            ",".join(str(value) for value in shard_m),
+            "--batch",
+            str(batch),
+            "--combos",
+            ",".join(combos),
+            "--output",
+            str(shard_rows),
+            "--warmup",
+            str(warmup),
+            "--iterations",
+            str(iterations),
+            "--trials",
+            str(trials),
+            "--save-results",
+            str(shard_json),
+        ]
+        for name, n, k in shapes:
+            command.extend(("--shapes", f"{name}:{n}:{k}"))
+        if wanted:
+            command.extend(("--recipes", ",".join(wanted)))
+        environment = os.environ.copy()
+        environment["CUDA_VISIBLE_DEVICES"] = visible_tokens[gpu]
+        with shard_log.open("w") as log_file:
+            process = subprocess.Popen(
+                command,
+                cwd=Path(__file__).resolve().parents[2],
+                env=environment,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+        workers.append((gpu, process, shard_json, shard_log))
+        click.echo(
+            f"launched GPU {gpu}: M={shard_m[0]}..{shard_m[-1]} "
+            f"({len(shard_m)} values); log {shard_log}",
+        )
+
+    while True:
+        failures = [
+            (gpu, process.returncode, log)
+            for gpu, process, _json, log in workers
+            if process.poll() not in (None, 0)
+        ]
+        if failures:
+            for _gpu, process, _json, _log in workers:
+                if process.poll() is None:
+                    process.terminate()
+            for _gpu, process, _json, _log in workers:
+                process.wait()
+            details = ", ".join(
+                f"GPU {gpu} exit={code} log={log}" for gpu, code, log in failures
+            )
+            raise click.ClickException(f"parallel sweep worker failed: {details}")
+        if all(process.poll() is not None for _gpu, process, _json, _log in workers):
+            break
+        time.sleep(2)
+
+    results: list[dict] = []
+    for gpu, _process, shard_json, shard_log in workers:
+        if not shard_json.is_file():
+            raise click.ClickException(
+                f"GPU {gpu} finished without results; inspect {shard_log}"
+            )
+        results.extend(json.loads(shard_json.read_text()))
+    return results
+
+
 @cli.command("sweep")
 @click.option(
     "-m",
@@ -722,6 +876,14 @@ def _winner(
     "(default: every reachable one). --list-recipes prints the names.",
 )
 @click.option(
+    "--gpus",
+    "gpu_ids",
+    type=str,
+    default=None,
+    callback=lambda _c, _p, value: parse_gpu_ids(value),
+    help="Comma-separated visible CUDA device indices; runs one worker per GPU.",
+)
+@click.option(
     "--list-recipes",
     is_flag=True,
     default=False,
@@ -745,6 +907,7 @@ def plan_table_command(
     save_results: Path | None,
     results_json: Path | None,
     recipe_filter: str | None,
+    gpu_ids: Optional[tuple[int, ...]],
     list_recipes: bool,
 ) -> None:
     """Sweep every candidate recipe (interleaved) at the M x shape grid."""
@@ -799,9 +962,23 @@ def plan_table_command(
                 f"# {combo}: {len(cands)} candidates -> "
                 + ", ".join(short_name(c) for c in cands)
             )
-        results = sweep(
-            m_values, shapes, combos, batch, warmup, iterations, trials, wanted
-        )
+        if gpu_ids:
+            results = _sweep_parallel(
+                m_values,
+                shapes,
+                combos,
+                batch,
+                warmup,
+                iterations,
+                trials,
+                wanted,
+                gpu_ids,
+                output,
+            )
+        else:
+            results = sweep(
+                m_values, shapes, combos, batch, warmup, iterations, trials, wanted
+            )
         if save_results is not None:
             save_results.write_text(json.dumps(results))
             click.echo(f"saved measurements to {save_results}")
@@ -1174,6 +1351,9 @@ def _install(rows_path: Path, out_dir: Path, sig: str, argv: list[str]) -> Path:
 )
 @click.option("--combos", default=None, help="Comma list passthrough to sweep.")
 @click.option(
+    "--gpus", default=None, help="Visible CUDA device indices passthrough to sweep."
+)
+@click.option(
     "--batch", default=1, show_default=True, help="Passthrough to both stages."
 )
 @click.option(
@@ -1207,6 +1387,7 @@ def main(
     n_values: str | None,
     k_values: str | None,
     combos: str | None,
+    gpus: Optional[str],
     batch: int,
     warmup: int | None,
     iterations: int | None,
@@ -1254,6 +1435,8 @@ def main(
             gen_cmd += ["--k-values", k_values]
         if combos:
             gen_cmd += ["--combos", combos]
+        if gpus:
+            gen_cmd += ["--gpus", gpus]
         gen_cmd += timing
         click.echo(_run(gen_cmd).strip().splitlines()[-1])  # the "wrote N rows" line
         # Rows only over the swept M domain (see _clamp_m_domain): the

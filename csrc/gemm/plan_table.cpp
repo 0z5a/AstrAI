@@ -375,7 +375,7 @@ bool parse_planner_mode(const std::string& name, int& out) {
 int gemm_planner_mode() {
     gemm_config_seed_once();
     const int v = gemm_config().planner.load(std::memory_order_relaxed);
-    return v < 0 ? 1 : v; // default: hybrid (heuristic fills what no row owns)
+    return v < 0 ? 2 : v; // default: legacy model
 }
 bool gemm_table_off() {
     gemm_config_seed_once();
