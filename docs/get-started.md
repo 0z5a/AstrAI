@@ -267,7 +267,7 @@ docker compose up -d
 | Multi-GPU DDP / FSDP | [Distributed Guide](guides/distributed.md) |
 | System architecture | [Architecture](developer/architecture.md) |
 | Data pipeline internals | [Data Flow](developer/dataflow.md) |
-| YAML-driven containerized serving | [Docker Serving](developer/docker-serving.md) |
-| YAML-driven containerized training | [Docker Training](developer/docker-training.md) |
+| YAML-driven containerized serving | [Docker Serving](developer/docker/serving.md) |
+| YAML-driven containerized training | [Docker Training](developer/docker/training.md) |
 
 > Document Update Time: 2026-08-22

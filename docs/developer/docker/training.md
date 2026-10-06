@@ -121,7 +121,10 @@ that hits the problem:
 
 ```bash
 nvidia-smi topo -m    # check P2P support between exactly the selected GPUs
-NCCL_DEBUG=INFO       # confirm NCCL transport errors before disabling them
+# For diagnostics, temporarily add NCCL_DEBUG: "INFO" under this job's
+# runtime.environment, start the job, then inspect its container logs:
+bash scripts/train.sh start [CONFIG]
+bash scripts/train.sh logs [CONFIG]
 ```
 
 See `docs/guides/distributed.md` for what each troubleshooting variable
@@ -211,4 +214,4 @@ the Docker timeout expires.
 6. Scope `runtime.environment` to the job YAML that needs it; do not copy NCCL
    workarounds into every config.
 
-> Document Update Time: 2026-08-29
+> Document Update Time: 2026-10-06

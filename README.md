@@ -239,9 +239,9 @@ See [Inference Guide](docs/guides/inference.md) for SSE streaming format, error 
 | [Architecture](./docs/developer/architecture.md) | System architecture, class diagram & design patterns |
 | [Data Flow](./docs/developer/dataflow.md) | Data pipeline, storage backends & dataset architecture |
 | [Internals](./docs/developer/internals.md) | Training internals: loss formulas, callback lifecycle, KV cache |
-| [CUDA Kernels](./docs/developer/cuda_kernels.md) | Custom CUDA attention kernels & benchmarks |
-| [Docker Serving](./docs/developer/docker-serving.md) | YAML-driven containerized serving (`serve.yaml`, `serve.sh`) |
-| [Docker Training](./docs/developer/docker-training.md) | YAML-driven containerized training (`train.yaml`, `train.sh`) |
+| [CUDA Kernels](./docs/developer/kernels/README.md) | Custom CUDA attention kernels & benchmarks |
+| [Docker Serving](./docs/developer/docker/serving.md) | YAML-driven containerized serving (`serve.yaml`, `serve.sh`) |
+| [Docker Training](./docs/developer/docker/training.md) | YAML-driven containerized training (`train.yaml`, `train.sh`) |
 
 ### Contributing
 

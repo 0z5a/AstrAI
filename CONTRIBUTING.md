@@ -59,32 +59,46 @@ bash scripts/pre_commit.sh --skip-deps
 
 ## Commit Style
 
-```
-type: short description (~50 chars)
+Use this layout. Keep the subject, each body bullet, the benchmark description,
+and each benchmark result on a single physical line.
 
-- bullet point body (each ~60 chars)
+```text
+type: short description
+
+- first change
+- second change
 ```
 
-- **Type** must be one of: `fix`, `feat`, `chore`, `docs`, `refactor`, `perf`, `test`, `style`, `ci`, `build`, `revert`.
-- **Subject line** ends with no period.
-- **Body** uses bullet points starting with `-`, one bullet per line, no wrapping.
-- No `(scope)` parentheses.
-- Performance-affecting changes (`perf`, and `refactor`/`feat` that move numbers) must add a `Benchmark:` section: one line stating the environment (GPU, dtype, model, relevant switches, measurement method), then one `-` bullet per data point in the form `old -> new unit (ratio, +-%)`.
+- The subject starts with one allowed type and a colon: fix, feat, chore, docs,
+  refactor, perf, test, style, ci, build, or revert.
+- Keep the subject near 50 characters and at most 72 characters. Do not add a
+  scope in parentheses or a final period.
+- Put exactly one blank line between the subject and the first body line.
+- Write body items as dash bullets, one item per line. Do not wrap a bullet onto
+  another line and do not leave blank lines between bullets.
+- Keep each body bullet at or below 72 characters. Shorten or split longer
+  items into additional bullets.
+- For performance-affecting changes (perf, or refactor/feat that change
+  measured performance), include a Benchmark section after the change bullets.
+  Separate it from the preceding bullets with one blank line.
+- Write Benchmark: and the environment/measurement method on one line. Follow
+  it immediately with one dash bullet per data point; keep those bullets
+  consecutive and use old -> new unit (ratio, +-%) format.
 
 ### Example: regular commit
 
-```
+```text
 fix: keep async rollouts version-consistent
 
 - serialize shared-model optimizer updates with generation
-- reject future or over-lagged rollout results after asynchronous scoring
+- reject future or over-lagged results after async scoring
 - close cache publication races
 - persist policy versions in online checkpoints
 ```
 
-### Example: performance commit with Benchmark section
+### Example: performance commit
 
-```
+```text
 refactor: standardize packed 3d inference
 
 - keep training attention on dense 4d tensors
@@ -92,12 +106,12 @@ refactor: standardize packed 3d inference
 - extend CUDA rotary embedding to packed 3d inputs
 - adapt torch, CUDA and FlashAttention backend dispatch
 
-Benchmark: NVIDIA L20, BF16, 1B model, paged KV cache, CUDA Graph, prompt 512, generation 128 (median of 3 alternating runs)
+Benchmark: NVIDIA L20, BF16 1B, paged KV and CUDA Graph, prompt 512/gen 128
 - batch 1: 234.5 -> 242.6 tok/s (1.034x, +3.4%)
 - batch 8: 1243.1 -> 1286.6 tok/s (1.035x, +3.5%)
 ```
 
-Both examples are real commits from this repository (`git show` them to verify formatting).
+Both examples are real commits from this repository; inspect them with git show.
 
 ## Common Issues
 

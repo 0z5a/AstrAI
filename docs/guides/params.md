@@ -253,7 +253,7 @@ server:
   max_seq_len: null
 ```
 `serve.yaml` also carries a `runtime:` section for the Docker wrapper; see
-[Docker Serving](../developer/docker-serving.md).
+[Docker Serving](../developer/docker/serving.md).
 
 See [Inference Guide](inference.md) for HTTP API documentation.
 

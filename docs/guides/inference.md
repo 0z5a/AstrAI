@@ -229,7 +229,7 @@ python scripts/tools/server.py --config serve.yaml --port 9000  # CLI wins
 
 In Docker, `scripts/serve.sh` drives the same YAML (a `runtime:` section
 controls ports/GPU/mounts); see
-[Docker Serving](../developer/docker-serving.md).
+[Docker Serving](../developer/docker/serving.md).
 
 ## HTTP API
 
