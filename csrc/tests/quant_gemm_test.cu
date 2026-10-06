@@ -77,9 +77,9 @@ __global__ static void naive_gemm_ref(const ElemA* a,
     const float sc = b_col_scale ? b_col_scale[j] : 1.0f;
     const float sa = a_row_scale ? a_row_scale[i] : 1.0f;
     float acc = 0.f;
-    for (int kk = 0; kk < k; ++kk) {
-        float av = a_rm ? elem2f(a[i * a_ld + kk]) : elem2f(a[kk * a_ld + i]);
-        float bv = b_rm ? elem2f(b[kk * b_ld + j]) : elem2f(b[j * b_ld + kk]);
+    for (int k_idx = 0; k_idx < k; ++k_idx) {
+        float av = a_rm ? elem2f(a[i * a_ld + k_idx]) : elem2f(a[k_idx * a_ld + i]);
+        float bv = b_rm ? elem2f(b[k_idx * b_ld + j]) : elem2f(b[j * b_ld + k_idx]);
         acc += av * bv * sc * sa;
     }
     out[i * n + j] = acc;

@@ -45,19 +45,19 @@ namespace {
 template <typename Tile> inline GemmRecipe recipe_for_tile(int ba, int bb) {
     return GemmRecipe{(int)tile_class<Tile>(),
                       Tile::kStages,
-                      (int)Tile::CtaShape::kK,
+                      (int)Tile::kTile,
                       Tile::CtaShape::kM,
                       Tile::CtaShape::kN,
                       Tile::WarpShape::kM,
                       Tile::WarpShape::kN,
                       (Tile::CtaShape::kM / Tile::WarpShape::kM) *
                           (Tile::CtaShape::kN / Tile::WarpShape::kN) * 32,
-                      ring_smem_bytes(Tile::CtaShape::kM, Tile::CtaShape::kN, Tile::CtaShape::kK,
+                      ring_smem_bytes(Tile::CtaShape::kM, Tile::CtaShape::kN, Tile::kTile,
                                       Tile::kStages, ba, bb)};
 }
 
 template <typename Tile> constexpr int recipe_key() {
-    return (int)tile_class<Tile>() | (Tile::kStages << 8) | ((int)Tile::CtaShape::kK << 16);
+    return (int)tile_class<Tile>() | (Tile::kStages << 8) | ((int)Tile::kTile << 16);
 }
 
 template <typename Manifest> constexpr bool unique_recipe_keys() {
@@ -94,17 +94,17 @@ template <typename F> inline auto with_manifest(bool crosswise_staging, int ba, 
 
 } // namespace
 
-// A row is eligible only if its exact (class, stages, K) recipe was instantiated.
+// A row is eligible only if its exact (class, k_stages, K) recipe was instantiated.
 namespace {
 
 template <typename Manifest>
-inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb, GemmRecipe& out) {
+inline bool recipe_scan(int cta, int k_stages, int k_tile, int ba, int bb, GemmRecipe& out) {
     bool found = false;
     auto consider = [&](auto tile) {
         using T = decltype(tile);
         if (found)
             return;
-        if ((int)tile_class<T>() != cta || (int)T::kStages != stages || (int)T::CtaShape::kK != kk)
+        if ((int)tile_class<T>() != cta || (int)T::kStages != k_stages || (int)T::kTile != k_tile)
             return;
         out = recipe_for_tile<T>(ba, bb);
         found = true;
@@ -114,10 +114,10 @@ inline bool recipe_scan(int cta, int stages, int kk, int ba, int bb, GemmRecipe&
 }
 
 inline std::optional<GemmRecipe>
-recipe_of(int cta, int stages, int kk, bool crosswise, int ba, int bb) {
+recipe_of(int cta, int k_stages, int k_tile, bool crosswise, int ba, int bb) {
     GemmRecipe out{};
     const bool found = with_manifest(crosswise, ba, bb, [&](auto manifest) {
-        return recipe_scan<decltype(manifest)>(cta, stages, kk, ba, bb, out);
+        return recipe_scan<decltype(manifest)>(cta, k_stages, k_tile, ba, bb, out);
     });
     if (!found)
         return std::nullopt;
@@ -132,7 +132,7 @@ inline void log_dispatch(const PlanQuery& q, const PlanDecision& d) {
                  "[gemm-plan] %s m%lld n%lld k%lld b=%d -> cta%d s%d "
                  "raster %d\n",
                  d.source, (long long)q.m, (long long)q.n, (long long)q.k, (int)q.batch,
-                 d.recipe.cta, d.recipe.stages, d.raster);
+                 d.recipe.cta, d.recipe.k_stages, d.raster);
 }
 
 // Validate table recipes against the compiled manifest and device limits.
@@ -140,9 +140,9 @@ std::optional<PlanDecision> row_plan(const PlanQuery& q, std::optional<TableRow>
                                      const char* source) {
     if (!row)
         return std::nullopt;
-    const auto recipe = recipe_of((int)row->cta, row->stages, row->kk,
+    const auto recipe = recipe_of((int)row->cta, row->k_stages, row->k_tile,
                                   q.crosswise > 0, q.ba, q.bb);
-    if (!recipe || plan_resident_ctas(row->cta, row->stages, row->kk, q) <= 0)
+    if (!recipe || plan_resident_ctas(row->cta, row->k_stages, row->k_tile, q) <= 0)
         return std::nullopt;
     return PlanDecision{*recipe,
                         row->raster != 0 ? row->raster : plan_raster(q, recipe->bm, recipe->bn),
@@ -154,7 +154,7 @@ constexpr std::int64_t kMainloopBytesPerCellTile = 8;
 constexpr std::int64_t kMmaArmBytesPerInstr = 64;
 
 int resident_of(const GemmRecipe& r, const PlanQuery& q) {
-    return plan_resident_ctas(static_cast<TileClass>(r.cta), r.stages, r.kk, q);
+    return plan_resident_ctas(static_cast<TileClass>(r.cta), r.k_stages, r.k_tile, q);
 }
 
 // TMA overlaps copy and compute; cp.async hides copy latency through residency.
@@ -165,7 +165,7 @@ std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
     if (!q.tma) {
         // Price complete K tiles and divide waves by resident CTA capacity.
         const std::int64_t operand =
-            ((q.k + r.kk - 1) / r.kk) * (std::int64_t)r.kk * (r.bm * q.ba + r.bn * q.bb);
+            ((q.k + r.k_tile - 1) / r.k_tile) * (std::int64_t)r.k_tile * (r.bm * q.ba + r.bn * q.bb);
         const std::int64_t mu = q.dev.smem_per_sm / r.smem;
         const std::int64_t slots = (std::int64_t)q.dev.sms * mu;
         const std::int64_t waves = slots > 0 ? (blocks + slots - 1) / slots : 1;
@@ -174,11 +174,11 @@ std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
     const bool byte_pair = q.ba == 1 && q.bb == 1;
     const std::int64_t operand = (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
     const std::int64_t output = (std::int64_t)q.out_elem_bytes * r.bm * r.bn;
-    const std::int64_t k_tiles = (q.k + r.kk - 1) / r.kk;
+    const std::int64_t k_tiles = (q.k + r.k_tile - 1) / r.k_tile;
     const std::int64_t loop_penalty =
         byte_pair ? 0 : kMainloopBytesPerCellTile * (std::int64_t)r.bm * r.bn * k_tiles;
     const std::int64_t mma_instructions =
-        k_tiles * (r.kk / q.mma_k) * (r.bm / 16) * (r.bn / 8);
+        k_tiles * (r.k_tile / q.mma_k) * (r.bm / 16) * (r.bn / 8);
     const std::int64_t mma_arm = kMmaArmBytesPerInstr * mma_instructions;
     const std::int64_t per_cta = std::max(operand + output + loop_penalty, mma_arm);
     const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
@@ -198,7 +198,7 @@ double heuristic_cost(const GemmRecipe& named, const PlanQuery& q, int fallback_
         // Standalone host callers may have no typed CUDA kernel resolver.
         resource.effective = named;
         resource.resident = fallback_resident;
-        if (q.ba + q.bb >= 3 && named.bm == 64 && named.bn == 64 && named.kk == 64) {
+        if (q.ba + q.bb >= 3 && named.bm == 64 && named.bn == 64 && named.k_tile == 64) {
             resource.effective.wn = 16;
             resource.effective.threads = 512;
         }
@@ -208,18 +208,18 @@ double heuristic_cost(const GemmRecipe& named, const PlanQuery& q, int fallback_
     const auto& r = resource.effective;
     // Integer ceil without n+d-1 overflow; cast before multiplying grid axes.
     auto ceil_div = [](std::int64_t n, int d) { return n / d + (n % d != 0); };
-    const double steps = (double)ceil_div(q.k, r.kk);
+    const double steps = (double)ceil_div(q.k, r.k_tile);
     const double blocks = (double)q.batch * (double)ceil_div(q.m, r.bm) *
                           (double)ceil_div(q.n, r.bn);
     const double resident = std::min((double)resource.resident,
                                      std::ceil(blocks / q.dev.sms));
     const double waves = std::ceil(blocks / (q.dev.sms * resident));
     const double warps = r.threads / 32.0;
-    const double copy = (double)r.kk * (r.bm * q.ba + r.bn * q.bb) / 512.0;
-    const double mma = ((double)r.kk / q.mma_k) * (r.bm / 16.0) * (r.bn / 8.0) / warps;
-    const double fragments = (double)r.kk * (r.wm * q.ba + r.wn * q.bb) / 512.0;
+    const double copy = (double)r.k_tile * (r.bm * q.ba + r.bn * q.bb) / 512.0;
+    const double mma = ((double)r.k_tile / q.mma_k) * (r.bm / 16.0) * (r.bn / 8.0) / warps;
+    const double fragments = (double)r.k_tile * (r.wm * q.ba + r.wn * q.bb) / 512.0;
     const double conversions =
-        (double)r.kk * (r.wm * (q.ba < q.bb) + r.wn * (q.bb < q.ba)) / 64.0;
+        (double)r.k_tile * (r.wm * (q.ba < q.bb) + r.wn * (q.bb < q.ba)) / 64.0;
     const double output = (double)q.out_elem_bytes * r.bm * r.bn / 512.0;
     const double issue = q.tma ? 2.0 : copy;
 
@@ -270,16 +270,25 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = fals
     if (last.valid && last.heuristic == heuristic && same_model_query(last.query, q))
         return last.decision;
     std::optional<GemmRecipe> best;
+    std::optional<GemmRecipe> short_k_best;
     double best_cost = 0;
+    double short_k_cost = 0;
+    int shallow_k_stages = std::numeric_limits<int>::max();
     with_manifest(q.crosswise > 0, q.ba, q.bb, [&](auto manifest) {
         for_each_recipe<decltype(manifest)>(q.ba, q.bb, [&](GemmRecipe recipe) {
             const int resident = resident_of(recipe, q);
             if (resident <= 0)
                 return;
+            if (recipe.k_tile == 64)
+                shallow_k_stages = std::min(shallow_k_stages, recipe.k_stages);
             const double cost = heuristic ? heuristic_cost(recipe, q, resident)
                                           : (double)cost_of(recipe, q, resident);
             if (!std::isfinite(cost))
                 return;
+            if (!heuristic && recipe.k_tile == 32 && (!short_k_best || cost < short_k_cost)) {
+                short_k_best = recipe;
+                short_k_cost = cost;
+            }
             if (!best || cost < best_cost) {
                 best = recipe;
                 best_cost = cost;
@@ -288,6 +297,16 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = fals
     });
     if (!best)
         return std::nullopt;
+    // Before the shallowest compiled 64-deep pipeline reaches steady state,
+    // its prologue and ring footprint may outweigh the shorter K-tile. Limit this
+    // measured RTX 5090 BF16 correction to the contiguous NT, batch-one domain;
+    // other devices and paths retain the legacy ranking until they have sweeps.
+    if (!heuristic && q.dev.cc == 120 && q.dev.sms == 170 &&
+        q.dev.smem_per_sm == 100 * 1024 && q.tma && q.contiguous && q.batch == 1 &&
+        q.ba == 2 && q.bb == 2 && q.out_elem_bytes == 2 && q.m >= 128 && q.n >= 128 &&
+        q.k >= 128 && short_k_best && shallow_k_stages != std::numeric_limits<int>::max() &&
+        q.k <= (std::int64_t)shallow_k_stages * best->k_tile)
+        best = short_k_best;
     last = {q,
             {*best, plan_raster(q, best->bm, best->bn), heuristic ? "heuristic" : "model"},
             heuristic, true};
@@ -331,7 +350,7 @@ std::vector<std::vector<int>> tile_vocabulary() {
         for (const auto& [ba, bb] : widths)
             with_manifest(crosswise != 0, ba, bb, [&](auto manifest) {
                 for_each_recipe<decltype(manifest)>(ba, bb, [&](const GemmRecipe& r) {
-                    out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk, r.bm, r.bn,
+                    out.push_back({crosswise, ba, bb, r.cta, r.k_stages, r.k_tile, r.bm, r.bn,
                                    r.wm, r.wn, r.threads, r.smem});
                 });
             });

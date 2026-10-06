@@ -57,7 +57,7 @@ Rows = Union[str, Path]
 # The plan surface: one value (``plan.config``), one writer
 # (``plan.configure``), one scope (``plan.override``) — over the same bindings
 # the legacy ``set_*`` / ``state`` / ``probe`` / ``facts`` functions call.
-# Those keep returning the raw wire dict/list (the four csrc/bench tools parse
+# Those keep returning the raw wire dict/list (the csrc/bench tools parse
 # those keys); the records here are for new code and stay answerable to the
 # old idioms — attribute access, ``d["key"]``, ``row[3]`` and 12-tuple
 # unpacking all work — so a call site migrates one line at a time.
@@ -142,9 +142,9 @@ class Decision(_Record):
 
     source: str
     cta: int
-    stages: int
+    k_stages: int
     raster: int
-    kk: int
+    k_tile: int
     perf_class: int
     crosswise: int
     tma: bool = False
@@ -172,8 +172,8 @@ class Tile(_Record):
     ba: int
     bb: int
     cta: int
-    stages: int
-    kk: int
+    k_stages: int
+    k_tile: int
     bm: int
     bn: int
     wm: int
@@ -187,7 +187,7 @@ class Tile(_Record):
 
     @property
     def name(self) -> str:
-        return f"Tile_{self.bm}x{self.bn}x{self.kk}_W{self.wm}x{self.wn}_S{self.stages}"
+        return f"Tile_{self.bm}x{self.bn}x{self.k_tile}_W{self.wm}x{self.wn}_S{self.k_stages}"
 
 
 _TILE_NAMES: Optional[Tuple[str, ...]] = None

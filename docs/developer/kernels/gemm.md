@@ -112,7 +112,7 @@ geom_cta had -0.34% aggregate latency and +20.1% worst-point latency versus
 a Python-only synthetic integer-limit check kept 12 candidate scores finite.
 
 In heuristic mode, `plan.probe(...).resources` exposes rows containing
-`(cta,stages,kk)`, effective `(bm,bn,kk,wm,wn,threads)`, resident CTAs,
+`(cta,k_stages,k_tile)`, effective `(bm,bn,k_tile,wm,wn,threads)`, resident CTAs,
 registers/thread and local bytes/thread. Metadata is cached per typed kernel
 and device. Local allocation is not a dynamic spill count. Probe assumes
 contiguous aligned inputs; actual views can choose a different staging path.
@@ -433,16 +433,16 @@ fallback: an exhausted planner raises `no eligible recipe`. In `table` mode,
 a matching usable row is required. Nonpositive M/N/K are rejected before
 dispatch. The autotuner injects only measured cache rows; it does not seed synthetic M-band rows.
 
-**Rows.** One line selects a dtype class, crosswise count, CTA, stages and
+**Rows.** One line selects a dtype class, crosswise count, CTA, k_stages and
 raster. Shape bands are `(min,max]`, with zero meaning open:
 
 ```text
-m_min m_max n_min n_max perf_class crosswise cta stages raster
+m_min m_max n_min n_max perf_class crosswise cta k_stages raster
     [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
 ```
 
 The display wraps for readability; each actual row occupies one line.
-Optional `k` is the recipe's ring K (default 64); `k_min/k_max` bound the
+Optional `k_tile` is the recipe's ring K (default 64); `k_min/k_max` bound the
 problem K. Trailing gates require enough grid CTAs per SM or machine-fill
 per-mille. Raster zero invokes `plan_raster`. Unsupported recipes or rings
 above the device's shared-memory budget fall through. Builtin rows live

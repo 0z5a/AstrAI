@@ -15,15 +15,16 @@ namespace gemm {
  * The crosswise big-CTA downgrade tested 9-19% slower on sm_120 (TT, cp.async;
  * 2026-09-16), and the planner never selects that downgrade.
  */
-template <typename CtaShape_, typename WarpShape_, int Stages_> struct GemmTileConfig {
+template <typename CtaShape_, typename WarpShape_, int PipelineStages_> struct GemmTileConfig {
     using CtaShape = CtaShape_;
     using WarpShape = WarpShape_;
-    static constexpr int kStages = Stages_;
+    static constexpr int kTile = CtaShape_::kK;
+    static constexpr int kStages = PipelineStages_;
 };
 
 /*
- * Tile recipes, named Tile_<cta M>x<N>x<kK>_W<warp M>x<N>_S<stages>: the
- * CTA Shape, the warp Shape and the ring depth, in the order GemmTileConfig
+ * Tile recipes, named Tile_<cta M>x<N>x<kK>_W<warp M>x<N>_S<k_stages>: the
+ * CTA Shape, the warp Shape and the pipeline depth, in the order GemmTileConfig
  * carries them.
  *
  * kK is capped at 128/elem_bytes by the staging swizzle: ComposedLayout
@@ -43,7 +44,7 @@ using Tile_64x64x64_W16x32_S3 = GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>,
 /*
  * Deep-ring s4/s5 twins of this geometry were removed: the sweep measured
  * them a wash against s2..s3 (within 1-2% at this tile) and no compiled-in
- * row reaches past s3. The planner rejects stages > 3 outright, so a stale
+ * row reaches past s3. The planner rejects k_stages > 3 outright, so a stale
  * row file naming one falls to the next source instead of silently
  * launching nothing (row_plan in gemm/planning.cpp).
  * 16 warps per CTA on the small geometry (16x16 warp tiles, 512 threads):
@@ -169,7 +170,7 @@ using TileManifestCross = std::tuple<Tile_128x128x64_W64x32_S2,
                                      Tile_64x64x64_W16x32_S3>;
 
 /*
- * Ordered recipes selected by CTA class, stages, and kK; first match wins.
+ * Ordered recipes selected by CTA class, k_stages, and kK; first match wins.
  * Width-specific ladders enforce load-divisibility and output-reclaim limits.
  * Byte omits big kK=32 S2 (24KB ring < 32KB output) and 16-warp small;
  * two-byte omits 128x256 (its ring fits only byte operands). Big entries use

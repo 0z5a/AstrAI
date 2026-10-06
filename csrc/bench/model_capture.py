@@ -62,10 +62,10 @@ def device_facts() -> dict:
 
 def geometry(name: str) -> dict:
     m = tpt._FACTS_RE.fullmatch(name)
-    bm, bn, kk, wm, wn, stages = m.groups()
-    bm, bn, kk, wm, wn, stages = map(int, (bm, bn, kk, wm, wn, stages))
+    bm, bn, k_tile, wm, wn, k_stages = m.groups()
+    bm, bn, k_tile, wm, wn, k_stages = map(int, (bm, bn, k_tile, wm, wn, k_stages))
     # The 16-warp widening (warp_widened_t) doubles the load threads of a
-    # small kk=64 tile on any pair with a 2-byte operand; a byte pair keeps
+    # small k_tile=64 tile on any pair with a 2-byte operand; a byte pair keeps
     # the 8-warp form. The rules below must see the widened shape or they
     # mis-price every small 2-byte candidate (that mistake cost the first
     # bytes-rule prototype its class-1 capture).
@@ -73,8 +73,8 @@ def geometry(name: str) -> dict:
     return {
         "bm": bm,
         "bn": bn,
-        "kk": kk,
-        "stages": stages,
+        "k_tile": k_tile,
+        "k_stages": k_stages,
         "threads": threads,
         "wm": wm,
         "wn": wn,
@@ -93,16 +93,16 @@ def priced(
     batch: int = 1,
 ) -> dict:
     g = geometry(name)
-    # widening: 2-byte operand, small CTA, kk=64 (policy.cuh warp_widened_t)
-    widened = ba + bb >= 3 and g["bm"] == 64 and g["bn"] == 64 and g["kk"] == 64
+    # widening: 2-byte operand, small CTA, k_tile=64 (policy.cuh warp_widened_t)
+    widened = ba + bb >= 3 and g["bm"] == 64 and g["bn"] == 64 and g["k_tile"] == 64
     threads = 512 if widened else g["threads"]
-    ring = (g["stages"] + 1) * g["kk"] * (g["bm"] * ba + g["bn"] * bb)
+    ring = (g["k_stages"] + 1) * g["k_tile"] * (g["bm"] * ba + g["bn"] * bb)
     # policy.cuh: min_ctas_for_ring is bytes <= 48KB ? 2 : 1 — residency is
     # charged the TMA pad/barriers and otherwise smem-capped ONLY (no thread term). An earlier version of this file
     # added its own thread cap and simulated picks the kernel never makes,
     # which is how a rule that scored +2.6pp here regressed 8 cells
     # end-to-end. Fidelity is now checked against the binding (--check).
-    staged = ring + 1024 + 16 * (g["stages"] + 1) if tma else ring
+    staged = ring + 1024 + 16 * (g["k_stages"] + 1) if tma else ring
     resident = min(dev["smem"] // staged, 2 if ring <= 48 * 1024 else 1)
     ok = resident > 0 and staged <= dev["smem_max"]
     blocks = batch * ((m + g["bm"] - 1) // g["bm"]) * ((n + g["bn"] - 1) // g["bn"])
@@ -127,7 +127,7 @@ def priced(
         # problem's total is this times blocks)
         "b2": k * (g["bm"] * ba + g["bn"] * bb),
         "fat": g["bm"] * g["bn"],
-        "kiters": (k + g["kk"] - 1) // g["kk"],
+        "kiters": (k + g["k_tile"] - 1) // g["k_tile"],
     }
 
 
@@ -161,14 +161,18 @@ def rules() -> dict:
         byte = q["ba"] == 1 and q["bb"] == 1
         dev = device_facts()
         if not q.get("tma", True):
-            operand = p["kiters"] * p["kk"] * (p["bm"] * q["ba"] + p["bn"] * q["bb"])
+            operand = (
+                p["kiters"] * p["k_tile"] * (p["bm"] * q["ba"] + p["bn"] * q["bb"])
+            )
             mu = dev["smem"] // p["ring"]
             slots = dev["sms"] * mu
             waves = (p["blocks"] + slots - 1) // slots if slots else 1
             return (-(operand + 2 * p["fat"]) * waves,)
         mem = p["b2"] + 2 * p["fat"] + (0 if byte else 8.0 * p["fat"] * p["kiters"])
         mma_k = 32 if byte else 16
-        mma = 64 * p["kiters"] * (p["kk"] // mma_k) * (p["bm"] // 16) * (p["bn"] // 8)
+        mma = (
+            64 * p["kiters"] * (p["k_tile"] // mma_k) * (p["bm"] // 16) * (p["bn"] // 8)
+        )
         if q["ba"] == 2 and q["bb"] == 2:
             weff = p["waves"] * p["resident"]
         else:
@@ -176,23 +180,23 @@ def rules() -> dict:
         return (-max(mem, mma) * weff,)
 
     def work(p, q):
-        row = q["resources"].get((p["cta"], p["stages"], p["kk"]))
+        row = q["resources"].get((p["cta"], p["k_stages"], p["k_tile"]))
         if row is None or row[9] <= 0:
             return None
-        _, _, _, bm, bn, kk, wm, wn, threads, resident, _, local = row
+        _, _, _, bm, bn, k_tile, wm, wn, threads, resident, _, local = row
         ba, bb = q["ba"], q["bb"]
         blocks = q["batch"] * ((q["m"] + bm - 1) // bm) * ((q["n"] + bn - 1) // bn)
-        steps = (q["k"] + kk - 1) // kk
+        steps = (q["k"] + k_tile - 1) // k_tile
         warps = threads / 32.0
         mma_k = 32 if ba == bb == 1 else 16
-        copy = kk * (bm * ba + bn * bb) / 512.0
-        mma = (kk / mma_k) * (bm / 16) * (bn / 8) / warps
-        frag = kk * (wm * ba + wn * bb) / 512.0
-        conv = kk * (wm * (ba < bb) + wn * (bb < ba)) / 64.0
+        copy = k_tile * (bm * ba + bn * bb) / 512.0
+        mma = (k_tile / mma_k) * (bm / 16) * (bn / 8) / warps
+        frag = k_tile * (wm * ba + wn * bb) / 512.0
+        conv = k_tile * (wm * (ba < bb) + wn * (bb < ba)) / 64.0
         return dict(
             bm=bm,
             bn=bn,
-            kk=kk,
+            k_tile=k_tile,
             threads=threads,
             resident=resident,
             local=local,
@@ -238,10 +242,10 @@ def rules() -> dict:
         resident = v["resident"]
         waves = math.ceil(v["blocks"] / (q["dev"]["sms"] * resident))
         ba, bb = q["ba"], q["bb"]
-        ca = max(1.0, v["bm"] * v["kk"] * ba / (16 * v["threads"]))
-        cb = max(1.0, v["bn"] * v["kk"] * bb / (16 * v["threads"]))
+        ca = max(1.0, v["bm"] * v["k_tile"] * ba / (16 * v["threads"]))
+        cb = max(1.0, v["bn"] * v["k_tile"] * bb / (16 * v["threads"]))
         transfer = (
-            v["kk"]
+            v["k_tile"]
             * (
                 v["bm"] * ba * (1 if q["tma"] else min(ca, 2))
                 + v["bn"] * bb * (1 if q["tma"] else min(cb, 2))
@@ -359,7 +363,7 @@ def main(results_json, rule, class_filter, check, staging):
                 mx=False,
             ):
                 info = kernel.gemm.probe(m, n, k, da, db, batch=batch)
-            real = (info["cta"], info["stages"], info["kk"])
+            real = (info["cta"], info["k_stages"], info["k_tile"])
             got = tpt.RECIPES[picks[rule]] if picks[rule] else None
             checked += 1
             if got != real:

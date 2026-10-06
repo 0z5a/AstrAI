@@ -39,15 +39,15 @@ static constexpr int kMaxPerfClass = 3;
  * The k-tile depths the manifests carry; any other depth matches no tile
  * and launches nothing, so it is rejected.
  */
-inline constexpr bool row_k_supported(int kk) { return kk == 32 || kk == 64 || kk == 128; }
+inline constexpr bool row_k_supported(int k_tile) { return k_tile == 32 || k_tile == 64 || k_tile == 128; }
 
 /*
- * Ring depths a row may name. Enumerated, not a range, so a gap cannot pass
+ * Pipeline depths a row may name. Enumerated, not a range, so a gap cannot pass
  * as "inside 2..5": s4/s5 stay parseable for old sweep files, but no ladder
  * instantiates past s3 (the s4/s5 twins were a measured wash, removed).
  */
-inline constexpr bool row_stages_supported(int stages) {
-    return stages == 2 || stages == 3 || stages == 4 || stages == 5;
+inline constexpr bool row_stages_supported(int k_stages) {
+    return k_stages == 2 || k_stages == 3 || k_stages == 4 || k_stages == 5;
 }
 /*
  * CTA geometry of one class, off kTileClassCta (self-asserted against the
@@ -66,14 +66,14 @@ inline constexpr void plan_row_geometry(TileClass cta, int& bm, int& bn) {
  * gate early, never late. Exact for the 512-thread tiles where the register
  * file binds (64 regs x 512 x 2 = 64K) — the only gated ring today.
  */
-int plan_resident_ctas(TileClass cta, int stages, int kk, const PlanQuery& q) {
+int plan_resident_ctas(TileClass cta, int k_stages, int k_tile, const PlanQuery& q) {
     const DeviceFacts& dev = q.dev;
     if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0)
         return 0;
     int bm = 0, bn = 0;
     plan_row_geometry(cta, bm, bn);
-    const int ring = ring_smem_bytes(bm, bn, kk, stages, q.ba, q.bb);
-    const int smem = q.tma ? tma_smem_bytes(ring, stages) : ring;
+    const int ring = ring_smem_bytes(bm, bn, k_tile, k_stages, q.ba, q.bb);
+    const int smem = q.tma ? tma_smem_bytes(ring, k_stages) : ring;
     if (smem > dev.smem_max)
         return 0;
     return std::min(dev.smem_per_sm / smem, min_ctas_for_ring(ring));
@@ -126,7 +126,7 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQ
             if (r.min_ctas_per_sm > 0 && grid < (int64_t)r.min_ctas_per_sm * q.dev.sms)
                 continue;
             if (r.min_wave_permille > 0) {
-                const int resident = plan_resident_ctas(r.cta, r.stages, r.kk, q);
+                const int resident = plan_resident_ctas(r.cta, r.k_stages, r.k_tile, q);
                 if (resident <= 0)
                     continue;
                 if (grid * 1000 < (int64_t)r.min_wave_permille * q.dev.sms * resident)
@@ -142,13 +142,13 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQ
 
 /*
  * Row file format: one row per line, whitespace-separated
- *   m_min m_max n_min n_max perf_class crosswise cta stages raster
- *   [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
+ *   m_min m_max n_min n_max perf_class crosswise cta k_stages raster
+ *   [k_tile [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
  * '#' starts a comment; perf_class 0..3 or -1; crosswise 0..2 or -1; cta is the
- * TileClass ordinal (the policy/manifest.cuh enum order); stages 2..5 parse, but no
+ * TileClass ordinal (the policy/manifest.cuh enum order); k_stages 2..5 parse, but no
  * ladder instantiates a tile past s3 — plan_from_row rejects a deeper ring
  * outright, so a stale sweep row naming s4/s5 falls to the next source. The
- * trailing 'k' defaults to kTableRowK, which is what the sweep
+ * trailing 'k_tile' defaults to kTableRowK, which is what the sweep
  * scripts leave off.
  * The trailing forms are additive — a row that omits them behaves exactly as
  * it did before they existed, which is what keeps hand-edited tuning files and
@@ -176,7 +176,7 @@ inline const char* plan_row_error(const TableRow& row, int fields) {
         return "field count";
     if (row.m_min < 0 || row.n_min < 0)
         return "band min < 0";
-    if (!row_k_supported(row.kk))
+    if (!row_k_supported(row.k_tile))
         return "k (want 32, 64 or 128)";
     if (!row_band_ok(row.m_min, row.m_max))
         return "m band (max < min)";
@@ -194,8 +194,8 @@ inline const char* plan_row_error(const TableRow& row, int fields) {
         return "perf_class";
     if (!in_range(row.crosswise, -1, 2))
         return "crosswise (-1..2)";
-    if (!row_stages_supported(row.stages))
-        return "stages (want 2..5)";
+    if (!row_stages_supported(row.k_stages))
+        return "k_stages (want 2..5)";
     return nullptr;
 }
 
@@ -215,19 +215,19 @@ parse_plan_table_line(char* line, const char* label, int lineno, std::vector<Tab
     if (char* hash = std::strchr(line, '#'); hash != nullptr)
         *hash = '\0';
     long long m_min, m_max, n_min, n_max;
-    int perf_class, crosswise, cta, stages, raster;
+    int perf_class, crosswise, cta, k_stages, raster;
     /*
      * sscanf leaves a variable alone when its conversion fails, so a row
      * that omits the trailing fields keeps the defaults here: the legacy
      * and k-less field counts need no repair pass.
      */
-    int kk = kTableRowK;
+    int k_tile = kTableRowK;
     long long k_min = 0, k_max = 0;
     int min_ctas_per_sm = 0;
     int min_wave_permille = 0;
     const int got =
         std::sscanf(line, " %lld %lld %lld %lld %d %d %d %d %d %d %lld %lld %d %d", &m_min, &m_max,
-                    &n_min, &n_max, &perf_class, &crosswise, &cta, &stages, &raster, &kk, &k_min,
+                    &n_min, &n_max, &perf_class, &crosswise, &cta, &k_stages, &raster, &k_tile, &k_min,
                     &k_max, &min_ctas_per_sm, &min_wave_permille);
     if (got == EOF)
         return; // blank or comment-only line
@@ -250,9 +250,9 @@ parse_plan_table_line(char* line, const char* label, int lineno, std::vector<Tab
                        n_max,
                        perf_class,
                        crosswise,
-                       stages,
+                       k_stages,
                        raster,
-                       kk,
+                       k_tile,
                        k_min,
                        k_max,
                        min_ctas_per_sm,

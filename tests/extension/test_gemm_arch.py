@@ -58,5 +58,5 @@ def test_unaligned_base_uses_cpasync_plan(capfd):
     log = capfd.readouterr().err
     chosen = re.search(r"\[gemm-plan\] model .* -> cta(\d+) s(\d+)", log)
     assert chosen is not None
-    assert tuple(map(int, chosen.groups())) == (cp["cta"], cp["stages"])
+    assert tuple(map(int, chosen.groups())) == (cp["cta"], cp["k_stages"])
     assert " tma " not in log

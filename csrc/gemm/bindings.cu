@@ -7,7 +7,7 @@
  * Dictionaries are the wire here, in both directions: the state report and the
  * config patch. Each key set is spelled exactly once — the report's keys below,
  * the patch's in `kPatchKeys` — next to the struct they mirror, because
- * csrc/bench's dispatch_grid / model_capture / diff_rows / tune_plan_table read
+ * csrc/bench's dispatch_grid / model_capture / tune_plan_table read
  * those keys and astrai.extension.policy.gemm.plan writes them.
  */
 
@@ -68,9 +68,9 @@ py::dict probe_dict(const PlanProbe& r) {
     py::dict d;
     d["source"] = r.source;
     d["cta"] = r.cta;
-    d["stages"] = r.stages;
+    d["k_stages"] = r.k_stages;
+    d["k_tile"] = r.k_tile;
     d["raster"] = r.raster;
-    d["kk"] = r.kk;
     d["perf_class"] = r.perf_class;
     d["crosswise"] = r.crosswise;
     d["tma"] = r.tma;

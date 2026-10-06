@@ -21,7 +21,7 @@ pytestmark = [
 ]
 
 SHAPE = (512, 11008, 4096)  # the wide-N band the analytical model wins
-ROW = "511 513 8191 0 0 0 1 3 0 64"  # narrow CTA, 3 stages, kK 64
+ROW = "511 513 8191 0 0 0 1 3 0 64"  # narrow CTA, 3 pipeline stages, k_tile 64
 
 
 @pytest.fixture(autouse=True)
@@ -51,10 +51,10 @@ class TestMode:
         default = kernel.gemm.probe(*SHAPE)
         with plan.override(planner="model"):
             explicit = kernel.gemm.probe(*SHAPE)
-        assert (default["cta"], default["stages"], default["kk"]) == (
+        assert (default["cta"], default["k_stages"], default["k_tile"]) == (
             explicit["cta"],
-            explicit["stages"],
-            explicit["kk"],
+            explicit["k_stages"],
+            explicit["k_tile"],
         )
 
     def test_model_mode_skips_the_rows(self):
@@ -110,13 +110,15 @@ class TestMode:
 
 class TestTable:
     def test_override_rows_take_the_shape(self):
+        kernel.gemm.set_planner("hybrid")
         installed = kernel.gemm.set_table(ROW)
         assert installed == 1
         info = kernel.gemm.probe(*SHAPE)
         assert info["source"] == "override"
-        assert (info["cta"], info["stages"], info["kk"]) == (1, 3, 64)
+        assert (info["cta"], info["k_stages"], info["k_tile"]) == (1, 3, 64)
 
     def test_off_mode_kills_the_rows_only(self):
+        kernel.gemm.set_planner("hybrid")
         # "-" disables override, injected and builtin alike; what answers
         # after that is the planner mode's business: the heuristic under the
         # shipped hybrid default, a missing-row error under "table".
@@ -132,6 +134,7 @@ class TestTable:
                 kernel.gemm.probe(128, 1024, 256, trans_a=True)
 
     def test_clear_restores_the_default(self):
+        kernel.gemm.set_planner("hybrid")
         kernel.gemm.set_table(ROW)
         kernel.gemm.set_table("")
         assert kernel.gemm.state()["table"]["override_rows"] == 0
@@ -139,6 +142,7 @@ class TestTable:
         assert kernel.gemm.probe(*SHAPE)["source"] == "heuristic"
 
     def test_injected_rows_rank_below_override(self):
+        kernel.gemm.set_planner("hybrid")
         plan.configure(rows=ROW, tier="injected")
         assert kernel.gemm.state()["table"]["injected_rows"] == 1
         assert kernel.gemm.probe(*SHAPE)["source"] == "injected"
@@ -157,6 +161,7 @@ class TestStaging:
 
 class TestCompiledInTables:
     def test_rows_ship_device_guarded(self):
+        kernel.gemm.set_planner("hybrid")
         # Compiled-in rows are the measured diff of the model's errors for
         # ONE device (the GENERATED block's provenance); the tier is
         # signature-guarded, so it serves exactly there. On any other part
@@ -178,15 +183,29 @@ class TestCompiledInTables:
                 assert src != "builtin"
         if measured_here:
             tuned = kernel.gemm.probe(768, 6144, 1536, torch.int8, torch.int8)
-            assert (tuned["source"], tuned["kk"]) == ("builtin", 128)
+            assert (tuned["source"], tuned["k_tile"]) == ("builtin", 128)
             outside = kernel.gemm.probe(1536, 6144, 1536, torch.int8, torch.int8)
-            assert outside["kk"] != 128
+            assert outside["k_tile"] != 128
         # Bands the model already wins stay the model's even where the
         # rows are live (the diff only claims measured >=2% wins).
         assert kernel.gemm.probe(512, 11008, 4096)["source"] != "override"
 
 
 class TestProbe:
+    def test_k_tile_and_k_stages_names(self):
+        raw = kernel.gemm.probe(*SHAPE)
+        assert raw["k_tile"] in (32, 64, 128)
+        assert raw["k_stages"] in (2, 3)
+        assert "kk" not in raw and "stages" not in raw
+
+        decision = plan.probe(*SHAPE)
+        assert decision.k_tile == raw["k_tile"]
+        assert decision.k_stages == raw["k_stages"]
+
+        tile = plan.tiles()[0]
+        assert tile.k_tile in (32, 64, 128)
+        assert tile.k_stages in (2, 3)
+
     def test_reports_the_query_key(self):
         info = kernel.gemm.probe(*SHAPE)
         assert info["perf_class"] == 0  # bf16 x bf16
@@ -201,8 +220,8 @@ class TestProbe:
                 ba,
                 bb,
                 cta,
-                stages,
-                kk,
+                k_stages,
+                k_tile,
                 bm,
                 bn,
                 wm,
@@ -219,8 +238,8 @@ class TestProbe:
                 (1, 1, 1),
             )
             assert cta in (0, 1, 2, 3, 4)
-            assert stages in (2, 3)
-            assert kk in (32, 64, 128)
+            assert k_stages in (2, 3)
+            assert k_tile in (32, 64, 128)
             assert bm in (64, 128) and bn in (64, 128, 256)
             # the warp tiling spells the recipe name's W<x>x<y>, and the
             # threads count follows it ((bm/wm)*(bn/wn)*32)
@@ -239,7 +258,7 @@ class TestModelRule:
     recipe so it holds on any device.
 
     Two-byte pairs rank on the cost alone (2026-09-16 full-grid re-fit):
-    the (resident, stages) prefix measured a net loss there — the stages
+    the (resident, k_stages) prefix measured a net loss there — the k_stages
     tier preferred the S3 twin in the cells where S2 measured faster — and
     kK now has a term of its own, so what residency was right about is
     recovered by the cost. The cost is (operand + output + mainloop) equivalent bytes
@@ -272,23 +291,27 @@ class TestModelRule:
         device's cc (TMA needs sm_90+), so on an sm_89 part (L20/4090)
         the zero-constant cp.async form is the one under test.
         """
-        _cw, _ba, _bb, _cta, _stages, kk, bm, bn, _wm, _wn, _threads, smem = entry
+        _cw, _ba, _bb, _cta, _k_stages, k_tile, bm, bn, _wm, _wn, _threads, smem = entry
         tma = kernel.gemm.capabilities()["tma"]
-        staged = smem + 1024 + 16 * (_stages + 1) if tma else smem
+        staged = smem + 1024 + 16 * (_k_stages + 1) if tma else smem
         resident = min(facts["smem_per_sm"] // staged, 2 if smem <= 48 * 1024 else 1)
         if resident <= 0 or staged > facts["smem_max"]:
             return None
         blocks = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
         output = 2 * bm * bn
         if not tma:  # effective compiled staging
-            operand = ((k + kk - 1) // kk) * kk * (bm * 2 + bn * 2)
+            operand = ((k + k_tile - 1) // k_tile) * k_tile * (bm * 2 + bn * 2)
             mu = facts["smem_per_sm"] // smem
             slots = facts["sms"] * mu
             waves = (blocks + slots - 1) // slots if slots > 0 else 1
             return (operand + output) * waves
         operand = k * (bm * 2 + bn * 2)
-        loop_penalty = cls.MAINLOOP_BYTES_PER_CELL_TILE * bm * bn * ((k + kk - 1) // kk)
-        mma_instructions = ((k + kk - 1) // kk) * (kk // 16) * (bm // 16) * (bn // 8)
+        loop_penalty = (
+            cls.MAINLOOP_BYTES_PER_CELL_TILE * bm * bn * ((k + k_tile - 1) // k_tile)
+        )
+        mma_instructions = (
+            ((k + k_tile - 1) // k_tile) * (k_tile // 16) * (bm // 16) * (bn // 8)
+        )
         mma_arm = cls.MMA_ARM_BYTES_PER_INSTR * mma_instructions
         per_cta = max(operand + output + loop_penalty, mma_arm)
         slots = facts["sms"] * resident
@@ -321,7 +344,7 @@ class TestModelRule:
 
             info = kernel.gemm.probe(*shape)
             assert info["source"] == "model", shape
-            picked = (info["cta"], info["stages"], info["kk"])
+            picked = (info["cta"], info["k_stages"], info["k_tile"])
             assert picked in by_recipe, f"{shape}: {picked} is not a candidate"
             assert by_recipe[picked] == min(by_recipe.values()), (
                 f"{shape}: picked {picked} with cost {by_recipe[picked]}, "
@@ -410,7 +433,7 @@ class TestPlanFacade:
         plan.configure(planner="model", log=True)
         after = plan.configure(planner="", log=False)
         assert after.planner_mode == -1 and after.log is False
-        assert after.planner == "hybrid"  # unset resolves to the shipped default
+        assert after.planner == "model"  # unset resolves to the shipped default
 
     def test_override_restores_knobs_and_rows(self):
         kernel.gemm.set_table(ROW)  # a tier the block must bring back
@@ -448,6 +471,7 @@ class TestPlanFacade:
         assert restored == saved
 
     def test_rows_address_the_tier(self):
+        plan.configure(planner="hybrid")
         # The injected tier sits below the override one, so the same row
         # reports a different source depending on which is installed.
         plan.configure(rows=ROW, tier="injected")
@@ -467,10 +491,10 @@ class TestPlanFacade:
         assert len(tiles) == len(raw)
         first = tiles[0]
         assert first[3] == first.cta  # row[3] still the CTA class
-        crosswise, ba, bb, cta, stages, kk, bm, bn, wm, wn, threads, smem = first
+        crosswise, ba, bb, cta, k_stages, k_tile, bm, bn, wm, wn, threads, smem = first
         assert (crosswise, ba, bb, cta) == tuple(raw[0][:4])
         assert first.cta_name and first.name.startswith("Tile_")
-        assert first.name.endswith(f"_S{stages}")
+        assert first.name.endswith(f"_S{k_stages}")
 
 
 class TestCrossLanguageSpellings:
@@ -484,8 +508,8 @@ class TestCrossLanguageSpellings:
     def test_tile_name_spells_the_record(self):
         for tile in plan.tiles():
             assert tile.name == (
-                f"Tile_{tile.bm}x{tile.bn}x{tile.kk}"
-                f"_W{tile.wm}x{tile.wn}_S{tile.stages}"
+                f"Tile_{tile.bm}x{tile.bn}x{tile.k_tile}"
+                f"_W{tile.wm}x{tile.wn}_S{tile.k_stages}"
             ), tile
 
     def test_tile_name_reads_back_as_its_recipe(self):
@@ -495,27 +519,28 @@ class TestCrossLanguageSpellings:
             assert tuple(int(part) for part in m.groups()) == (
                 tile.bm,
                 tile.bn,
-                tile.kk,
+                tile.k_tile,
                 tile.wm,
                 tile.wn,
-                tile.stages,
+                tile.k_stages,
             ), tile
 
     def test_row_text_means_the_same_to_the_planner(self):
+        kernel.gemm.set_planner("hybrid")
         # A row spelled in Python must make the C++ planner pick exactly that
         # recipe: install it, ask who serves the band, and check the answer
         # echoes the numbers the text carried (the record keeps the spelling
         # in step with the vocabulary, so the row is legal by construction).
         tile = next(t for t in plan.tiles() if (t.crosswise, t.ba, t.bb) == (0, 2, 2))
         kernel.gemm.set_table(
-            f"511 513 8191 0 0 0 {tile.cta} {tile.stages} 0 {tile.kk}"
+            f"511 513 8191 0 0 0 {tile.cta} {tile.k_stages} 0 {tile.k_tile}"
         )
         picked = plan.probe(*SHAPE)
         assert picked.source == "override"
-        assert (picked.cta, picked.stages, picked.kk) == (
+        assert (picked.cta, picked.k_stages, picked.k_tile) == (
             tile.cta,
-            tile.stages,
-            tile.kk,
+            tile.k_stages,
+            tile.k_tile,
         )
 
 
@@ -526,7 +551,20 @@ def test_heuristic_resources_match_launched_geometry(tma):
     resources = {row[:3]: row for row in info.resources}
     assert resources
     for row in resources.values():
-        _cta, _stages, _kk, bm, bn, kk, wm, wn, threads, resident, regs, local = row
+        (
+            _cta,
+            _k_stages,
+            _k_tile,
+            bm,
+            bn,
+            k_tile,
+            wm,
+            wn,
+            threads,
+            resident,
+            regs,
+            local,
+        ) = row
         assert threads == (bm // wm) * (bn // wn) * 32
         assert resident >= 0 and regs >= 0 and local >= 0
         if resident:
@@ -534,7 +572,7 @@ def test_heuristic_resources_match_launched_geometry(tma):
     # The named 64x64x64 recipe is actually widened to sixteen warps.
     small = resources[(0, 2, 64)]
     assert small[6:9] == (16, 16, 512)
-    selected = resources[(info.cta, info.stages, info.kk)]
+    selected = resources[(info.cta, info.k_stages, info.k_tile)]
     assert selected[9] > 0
 
 

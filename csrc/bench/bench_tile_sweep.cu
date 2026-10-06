@@ -1,14 +1,11 @@
 /*
 Tile-parameter sweep for the gemm family.
 
-Production dispatch keys a tile on (CTA class, ring depth) only —
-dispatch_tile matches tile_class<Tile>() == plan.cta && kStages ==
-plan.stages — so the other tile parameters (CTA geometry, warp shape,
-k-tile depth, the fast predication-free loop, the ring depth's interaction
-with crosswise staging) have never been measured: the manifest is an
-assumption, not a result. This bench instantiates tile configurations
-directly and times them, bypassing plan_gemm, so the whole parameter space is
-reachable. Candidates are organised one parameter at a time around the three
+Production dispatch keys a tile on (CTA class, k_stages, k_tile).
+The remaining parameters, including warp shape and copy path, are fixed by
+the manifest or resolver rather than selected by the planner. This bench
+instantiates tile configurations directly and times them, bypassing
+plan_gemm, so the whole parameter space is reachable. Candidates are organised one parameter at a time around the three
 production classes, so a win is attributable to a single axis.
 
 Compiled standalone (no CMake target), like the C tests:
@@ -16,7 +13,6 @@ Compiled standalone (no CMake target), like the C tests:
     nvcc -I csrc/include -I csrc/tests -arch=sm_89 -std=c++20 -O3 \
         csrc/bench/bench_tile_sweep.cu csrc/gemm/planning.cpp \
         csrc/gemm/plan_table.cpp -o /tmp/tile_sweep && /tmp/tile_sweep
-    # also build and sweep the int8 candidate set (~2x compile):
     # also build and sweep the int8 candidate set (~2x compile):
     nvcc ... -DASTRAI_SWEEP_INT8=1 ... --dtype both
 
@@ -283,7 +279,7 @@ template <typename Tile> std::string tile_name() {
     char buf[64];
     std::snprintf(buf, sizeof buf, "Tile_%lldx%lldx%lld_W%lldx%lld_S%d",
                   (long long)Tile::CtaShape::kM, (long long)Tile::CtaShape::kN,
-                  (long long)Tile::CtaShape::kK, (long long)Tile::WarpShape::kM,
+                  (long long)Tile::kTile, (long long)Tile::WarpShape::kM,
                   (long long)Tile::WarpShape::kN, (int)Tile::kStages);
     return std::string(buf);
 }
@@ -392,7 +388,7 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
         row.prod = Space<EA, EB>::template is_prod<Tile>();
 
         constexpr int kRing = ring_smem_bytes((int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN,
-                                              (int)Tile::CtaShape::kK, (int)Tile::kStages,
+                                              (int)Tile::kTile, (int)Tile::kStages,
                                               (int)sizeof(EA), (int)sizeof(EB));
         /*
          * The epilogue reclaims the operand rings for the output tile; a
@@ -494,14 +490,14 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
  * The production-manifest entry a decision names. The full grid carries
  * several warp twins per CTA class, and the manifest itself splits one class
  * across warp shapes (big kk32 s2 is the 16-warp twin, s3 the 8-warp), so
- * (cta class, stages) alone matches two entries — the plan's kk decides.
+ * (cta class, k_stages) alone matches two entries — the plan's k_tile decides.
  */
 template <typename EA, typename EB> int planned_candidate_index(const PlanDecision& d) {
     int found = -1;
     for_each_candidate(typename Space<EA, EB>::Tiles{}, [&]<typename Tile>(int index) {
         if constexpr (Space<EA, EB>::template is_prod<Tile>()) {
             if (found < 0 && tile_class<Tile>() == static_cast<TileClass>(d.recipe.cta) &&
-                Tile::kStages == d.recipe.stages && (int)Tile::CtaShape::kK == d.recipe.kk)
+                Tile::kStages == d.recipe.k_stages && (int)Tile::kTile == d.recipe.k_tile)
                 found = index;
         }
     });
@@ -600,7 +596,7 @@ template <typename EA, typename EB> void list_space(const char* tag) {
         constexpr int kThreads = (Tile::CtaShape::kM / Tile::WarpShape::kM) *
                                  (Tile::CtaShape::kN / Tile::WarpShape::kN) * 32;
         constexpr int kRing = ring_smem_bytes((int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN,
-                                              (int)Tile::CtaShape::kK, (int)Tile::kStages,
+                                              (int)Tile::kTile, (int)Tile::kStages,
                                               (int)sizeof(EA), (int)sizeof(EB));
         std::printf("%s,%s,%d,%d,%d\n", tag, tile_name<Tile>().c_str(),
                     Space<EA, EB>::template is_prod<Tile>() ? 1 : 0, kThreads, kRing);

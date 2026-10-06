@@ -1,16 +1,17 @@
-"""Plan-table tuning pipeline: sweep candidates, validate holdouts, install.
+"""Plan-table tuning pipeline: sweep, diff, validate, install.
 
-One CLI, three stages (each subcommand is what one of the old standalone
-scripts did):
+One CLI for measuring and installing plan rows:
 
     sweep     measure every candidate recipe per shape and emit a row file
+    diff      remeasure sweep winners against the model with interleaved A/B
     validate  interleaved holdout comparison of candidate tables
     run       sweep -> validate -> install into the autotuner cache (the
               default flow; ``--skip-validate`` sweeps and installs only)
 
-Stages run as separate processes (``run`` re-invokes this file), so each
-stage gets its own GPU clock/thermal state — the isolation the three
-standalone scripts had.
+The ``diff`` command takes sweep winners but remeasures each against the
+model with alternating arms. Sweep latencies are phase-ordered and cannot
+justify an installed row on their own. ``run`` re-invokes this file for its
+stages, so they keep separate GPU clock and thermal states.
 
 Row tables are served at runtime through ``kernel.gemm.set_table`` (no
 rebuild, no environment variable); an emitted row file can also be pasted
@@ -71,7 +72,7 @@ PERF_CLASS: dict[str, int] = {
 # The candidate vocabulary, read from the launch ladders.
 #
 # A recipe is one tile: its CTA class, its ring depth and its k-tile depth,
-# written as a row file's (cta, stages, kK) — which is exactly the dispatch
+# written as a row file's (cta, k_stages, k_tile) — which is exactly the dispatch
 # key dispatch_tile matches on. The vocabulary is single-sourced from the
 # compiled binding (kernel.gemm.tile_vocabulary -> planning.cpp manifests):
 # the extension returns, per staging pair, every dispatch key the ladders
@@ -102,10 +103,10 @@ _SHARED = (
 
 
 def tile_facts(name: str) -> tuple[int, int, int]:
-    """A tile's dispatch key: (cta class, stages, ring K)."""
-    m, n, k, _wm, _wn, stages = _FACTS_RE.fullmatch(name).groups()
+    """A tile's dispatch key: (cta class, k_stages, k_tile)."""
+    m, n, k, _wm, _wn, k_stages = _FACTS_RE.fullmatch(name).groups()
     try:
-        return _CLASS_OF[(int(m), int(n))], int(stages), int(k)
+        return _CLASS_OF[(int(m), int(n))], int(k_stages), int(k)
     except KeyError as exc:  # a geometry TileClass does not name
         raise RuntimeError(
             f"{name}: CTA geometry absent from the tile_vocabulary binding "
@@ -127,7 +128,7 @@ def _binding_vocabulary():
     class_of: dict[tuple[int, int], int] = {}
     for row in kernel.gemm.tile_vocabulary():
         tile = Tile(*row)  # a record that still unpacks like its row
-        cw, ba, bb, cta, _stages, _kk, bm, bn, _wm, _wn, _threads, _smem = tile
+        cw, ba, bb, cta, _k_stages, _k_tile, bm, bn, _wm, _wn, _threads, _smem = tile
         name = tile.name
         ladder = (
             "TileManifestCross"
@@ -216,9 +217,9 @@ BYTES: dict[str, tuple[int, int]] = {
 }
 
 
-def ring_smem_bytes(stages: int, cta: int, kk: int, ba: int, bb: int) -> int:
+def ring_smem_bytes(k_stages: int, cta: int, k_tile: int, ba: int, bb: int) -> int:
     bm, bn = CTA_GEOM[cta]
-    return (stages + 1) * kk * (bm * ba + bn * bb)
+    return (k_stages + 1) * k_tile * (bm * ba + bn * bb)
 
 
 def candidate_recipes(combo: str) -> tuple[str, ...]:
@@ -233,9 +234,9 @@ def candidate_recipes(combo: str) -> tuple[str, ...]:
     tma = facts["cc"] >= 90 and kernel.gemm.state()["staging"]["tma"]
 
     def fits(recipe: str) -> bool:
-        cta, stages, kk = RECIPES[recipe]
-        ring = ring_smem_bytes(stages, cta, kk, ba, bb)
-        staged = ring + 1024 + 16 * (stages + 1) if tma else ring
+        cta, k_stages, k_tile = RECIPES[recipe]
+        ring = ring_smem_bytes(k_stages, cta, k_tile, ba, bb)
+        staged = ring + 1024 + 16 * (k_stages + 1) if tma else ring
         return staged <= facts["smem_max"]
 
     return tuple(r for r in REACHABLE[ladder_for_widths(ba, bb)] if fits(r)) + (
@@ -295,12 +296,12 @@ def _check_recipe(perf_class: int, recipe: str) -> None:
 
 def _candidate_rows() -> dict[str, str]:
     """One synthetic open row per candidate, as inline row text — the
-    recipe's (cta, stages, kK) on -1/-1 keys, so the row is the only plan
+    recipe's (cta, k_stages, k_tile) on -1/-1 keys, so the row is the only plan
     source and the planner gates it on the ring and the operand widths,
     exactly like an emitted row."""
     return {
-        recipe: f"0 0 0 0 -1 -1 {cta} {stages} 0 {kk}"
-        for recipe, (cta, stages, kk) in RECIPES.items()
+        recipe: f"0 0 0 0 -1 -1 {cta} {k_stages} 0 {k_tile}"
+        for recipe, (cta, k_stages, k_tile) in RECIPES.items()
     }
 
 
@@ -539,10 +540,10 @@ def build_rows(
                     recipe = recipes[run_start]
                     if recipe != "model":
                         m_min, m_max = m_bands[run_start][0], m_bands[i - 1][1]
-                        cta, stages, kk = RECIPES[recipe]
+                        cta, k_stages, k_tile = RECIPES[recipe]
                         rows.append(
                             f"{m_min} {m_max} {n_min} {n_max} {perf_class} 0 "
-                            f"{cta} {stages} 0 {kk}"
+                            f"{cta} {k_stages} 0 {k_tile}"
                         )
                     run_start = i
         if full_coverage:
@@ -553,8 +554,8 @@ def build_rows(
             # corner's winner beats the grid's most common (small-shape
             # biased) winner.
             corner = _best_forced(aggregate, (perf_class, sorted_m[-1], sorted_n[-1]))
-            cta, stages, kk = RECIPES[corner]
-            rows.append(f"0 0 0 0 {perf_class} 0 {cta} {stages} 0 {kk}")
+            cta, k_stages, k_tile = RECIPES[corner]
+            rows.append(f"0 0 0 0 {perf_class} 0 {cta} {k_stages} 0 {k_tile}")
     # A band row that already spans everything (the grid's own merge) makes the
     # catch-all identical; identical rows are one decision, and the old
     # compactor that used to drop them is gone.
@@ -572,12 +573,12 @@ def emit_cpp_rows(rows: list[str]) -> str:
     names = get_module("gemm").tile_class_names()
     by_class: dict[int, list[str]] = {}
     for line in rows:
-        m_min, m_max, n_min, n_max, perf, crosswise, cta, stages, _raster, kk = (
+        m_min, m_max, n_min, n_max, perf, crosswise, cta, k_stages, _raster, k_tile = (
             line.split()
         )
         by_class.setdefault(int(perf), []).append(
             f"    {{TileClass::{names[int(cta)]}, {m_min}, {m_max}, "
-            f"{n_min}, {n_max}, {perf}, {crosswise}, {stages}, 0, {kk}}},"
+            f"{n_min}, {n_max}, {perf}, {crosswise}, {k_stages}, 0, {k_tile}}},"
         )
     classes = ("W16A16", "W8A16", "W8A8", "F8A8")
     out = ["// Generated by csrc/bench/tune_plan_table.py sweep --emit cpp."]
@@ -915,8 +916,8 @@ def plan_table_command(
         for ladder, tiles in REACHABLE.items():
             click.echo(f"{ladder}:")
             for tile in tiles:
-                cta, stages, kk = RECIPES[tile]
-                click.echo(f"  {tile:44s} cta{cta} s{stages} k{kk}")
+                cta, k_stages, k_tile = RECIPES[tile]
+                click.echo(f"  {tile:44s} cta{cta} s{k_stages} k{k_tile}")
         for line in reachability_report():
             click.echo(f"  unreachable - {line}")
         click.echo(
@@ -990,12 +991,12 @@ def plan_table_command(
     )
     header = (
         "# AOT dispatch rows: m_min m_max n_min n_max perf_class crosswise "
-        "cta stages raster [k]\n"
+        "cta k_stages raster [k_tile]\n"
         "# (min, max] bands, 0 = open; perf_class 0..3 (W16A16/W8A16/W8A8/"
         "F8A8); crosswise 0 = NT; cta 0 small64 / 1 narrow128x64 / 2 big128 / "
         "3 wide128x256; raster 0 "
         "= auto.\n"
-        "# k is the row's ring K (32, 64 or 128; omitted means 64).\n"
+        "# k_tile is the row's ring K (32, 64 or 128; omitted means 64).\n"
         "# Unsupported dtype/recipe pairs are excluded before measurement.\n"
         "# The sweep times quant_gemm's fused-linear (NT) layout, so every "
         "row carries\n"
@@ -1506,6 +1507,169 @@ def main(
         f'serve without rebuild: kernel.gemm.set_table("{dest}")\n'
         "(the runtime autotuner picks it up as its cache automatically)"
     )
+
+
+# The byte-pair floor the model owns (model_plan in planning.cpp): m <= 8 on a
+# 1-byte x 1-byte pair is bandwidth-floor-bound, every candidate measured
+# identical, so a row there would only override the rule with noise.
+FLOOR_MMAX = 8
+
+
+@cli.command("diff")
+@click.option("--sweep-json", required=True, type=click.Path(path_type=Path))
+@click.option("--output", required=True, type=click.Path(path_type=Path))
+@click.option(
+    "--emit",
+    type=click.Choice(("rows", "cpp")),
+    default="rows",
+    help="cpp emits std::array initializers for the GENERATED block.",
+)
+@click.option("--shapes", "shape_values", multiple=True, help="NAME:N:K")
+@click.option(
+    "-m",
+    "--m-values",
+    default="1,8,16,32,64,128,256,512,1024,2048,4096",
+    callback=lambda _c, _p, v: parse_positive_ints(v),
+    help="M grid: START:END:STEP (end inclusive) or a comma list.",
+)
+@click.option(
+    "-n",
+    "--n-values",
+    default=None,
+    callback=lambda _c, _p, v: parse_positive_ints(v) if v else None,
+    help="N grid; with -k, the product grid instead of --shapes.",
+)
+@click.option(
+    "-k",
+    "--k-values",
+    default=None,
+    callback=lambda _c, _p, v: parse_positive_ints(v) if v else None,
+    help="K grid; with -n, the product grid instead of --shapes.",
+)
+@click.option("--combos", default=",".join(COMBOS))
+@click.option(
+    "--min-gain",
+    type=click.FloatRange(min=0.0),
+    default=2.0,
+    help="Relative gain (%) the winner must show over the model.",
+)
+@click.option("--warmup", type=click.IntRange(min=1), default=4)
+@click.option("--iterations", type=click.IntRange(min=1), default=20)
+@click.option("--trials", type=click.IntRange(min=1), default=4)
+def diff_command(
+    sweep_json,
+    output,
+    emit,
+    shape_values,
+    m_values,
+    n_values,
+    k_values,
+    combos,
+    min_gain,
+    warmup,
+    iterations,
+    trials,
+):
+    """Emit rows from an interleaved winner-versus-model comparison."""
+    winners: dict[tuple[str, int, int, int], tuple[str, float]] = {}
+    for point in json.loads(sweep_json.read_text()):
+        if point["recipe"] == "model":
+            continue
+        key = (point["combo"], point["n"], point["k"], point["m"])
+        # datasets saved before 2026-09-16 spell names with a `_Fast` suffix
+        recipe = point["recipe"].removesuffix("_Fast")
+        if key not in winners or point["tflops"] > winners[key][1]:
+            winners[key] = (recipe, point["tflops"])
+
+    combos = tuple(c for c in combos.split(",") if c)
+    shapes = [parse_shape(v) for v in shape_values]
+    if n_values or k_values:
+        if not (n_values and k_values):
+            raise click.BadParameter(
+                "-n and -k go together — the grid is their product"
+            )
+        shapes += [(f"n{n}k{k}", n, k) for n in n_values for k in k_values]
+    if not shapes:
+        raise click.BadParameter("give --shapes NAME:N:K and/or the -n/-k grid")
+    device = torch.device(torch.cuda.current_device())
+    torch.manual_seed(0)
+
+    results: list[dict] = []
+    for combo in combos:
+        act_dtype, weight_dtype = COMBOS[combo]
+        a_scale = make_scale(act_dtype, device)
+        b_scale = make_scale(weight_dtype, device)
+        for _name, n, k in shapes:
+            weight = (torch.rand(n, k, device=device) * 0.2 - 0.1).to(weight_dtype)
+            for m in m_values:
+                key = (combo, n, k, m)
+                if key not in winners:
+                    continue
+                recipe = winners[key][0]
+                acts = (torch.rand(m, k, device=device) * 0.2 - 0.1).to(act_dtype)
+                row = _candidate_rows()[recipe]
+
+                def run(acts=acts, weight=weight, a_scale=a_scale, b_scale=b_scale):
+                    return quant_gemm(acts, weight, a_scale, b_scale)
+
+                best = {"model": float("inf"), recipe: float("inf")}
+                for trial in range(trials):
+                    order = ("model", recipe) if trial % 2 == 0 else (recipe, "model")
+                    for arm in order:
+                        kernel.gemm.set_table("" if arm == "model" else row)
+                        for _ in range(warmup):
+                            run()
+                        torch.cuda.synchronize()
+                        start = time.perf_counter()
+                        for _ in range(iterations):
+                            run()
+                        torch.cuda.synchronize()
+                        best[arm] = min(
+                            best[arm], (time.perf_counter() - start) / iterations
+                        )
+                flops = 2.0 * m * n * k
+                ba, bb = BYTES[combo]
+                floor = ba == 1 and bb == 1 and m <= FLOOR_MMAX
+                model_tf = flops / best["model"]
+                winner_tf = model_tf if floor else flops / best[recipe]
+                for arm, tflops, planned in (
+                    (recipe, winner_tf, "override"),
+                    ("model", model_tf, "model"),
+                ):
+                    results.append(
+                        {
+                            "combo": combo,
+                            "perf_class": PERF_CLASS[combo],
+                            "m": m,
+                            "n": n,
+                            "k": k,
+                            "batch": 1,
+                            "recipe": arm,
+                            "planned": planned,
+                            "ms": best["model"] if arm == "model" else best[recipe],
+                            "tflops": tflops,
+                        }
+                    )
+                gain = best["model"] / best[recipe]
+                flag = (
+                    " floor"
+                    if floor
+                    else (" KEEP" if gain >= 1 + min_gain / 100 else "")
+                )
+                print(
+                    f"{combo:13s} {_name:10s} m{m:5d} {recipe[5:]:26s} "
+                    f"model {model_tf:7.1f} winner {flops / best[recipe]:7.1f} "
+                    f"x{gain:.3f}{flag}",
+                    flush=True,
+                )
+    kernel.gemm.set_table("")
+
+    rows = build_rows(results, min_gain=min_gain / 100.0, full_coverage=False)
+    if emit == "cpp":
+        output.write_text(emit_cpp_rows(rows))
+    else:
+        output.write_text("\n".join(rows) + "\n")
+    click.echo(f"wrote {len(rows)} rows to {output} ({emit})")
 
 
 if __name__ == "__main__":

@@ -10,8 +10,8 @@ namespace astrai {
 namespace gemm {
 
 /*
- * Manifest dispatch (CUTLASS builder-table style): (CTA class, ring depth,
- * k-tile depth) selects one manifest entry; the resolver maps it to a Policy
+ * Manifest dispatch (CUTLASS builder-table style): (CTA class,
+ * k_stages, k_tile) selects one manifest entry; the resolver maps it to a Policy
  * and launches.
  */
 template <typename Manifest, typename Resolver>
@@ -19,8 +19,8 @@ bool dispatch_tile(const PlanDecision& d, const Resolver& resolve) {
     return std::apply(
         [&d, &resolve](auto... tiles) {
             return (... || (tile_class<decltype(tiles)>() == static_cast<TileClass>(d.recipe.cta) &&
-                            decltype(tiles)::kStages == d.recipe.stages &&
-                            (int)decltype(tiles)::CtaShape::kK == d.recipe.kk &&
+                            decltype(tiles)::kStages == d.recipe.k_stages &&
+                            (int)decltype(tiles)::kTile == d.recipe.k_tile &&
                             resolve.template run<decltype(tiles)>()));
         },
         Manifest{});
@@ -33,7 +33,7 @@ bool dispatch_tile(const PlanDecision& d, const Resolver& resolve) {
  */
 template <typename Tile>
 using narrow_fallback_t = std::conditional_t<
-    Tile::CtaShape::kK == 32,
+    Tile::kTile == 32,
     Tile_128x64x32_W32x32_S2,
     std::conditional_t<(Tile::kStages >= 3), Tile_128x64x64_W32x32_S3, Tile_128x64x64_W32x32_S2>>;
 
@@ -133,7 +133,7 @@ struct ResourceResolver {
             result = kernel_resources<gemm_kernel<Policy>, Policy>(q);
         }
         result.effective = {
-            static_cast<int>(tile_class<TileT>()), TileT::kStages, TileT::CtaShape::kK,
+            static_cast<int>(tile_class<TileT>()), TileT::kStages, TileT::kTile,
             TileT::CtaShape::kM, TileT::CtaShape::kN,
             TileT::WarpShape::kM, TileT::WarpShape::kN,
             Policy::Traits::kCtaThreads, Policy::kSmemBytes};
@@ -163,7 +163,7 @@ KernelResources resources_for(const GemmRecipe& r, const PlanQuery& q) {
 
 /*
  * Plan -> Policy: dispatch_tile picks the manifest entry, the launcher
- * applies the ladder's substitutions; stages >= 3 selects the deep-ring
+ * applies the ladder's substitutions; k_stages >= 3 selects the deep-ring
  * sibling. Params by value — the raster decision lands in the copy the
  * kernel receives. The schedule selects the MMA cell.
  */

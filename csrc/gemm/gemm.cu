@@ -184,9 +184,9 @@ PlanProbe plan_probe(int64_t m,
     PlanProbe r;
     r.source = decision.source;
     r.cta = decision.recipe.cta;
-    r.stages = decision.recipe.stages;
+    r.k_stages = decision.recipe.k_stages;
     r.raster = decision.raster;
-    r.kk = decision.recipe.kk;
+    r.k_tile = decision.recipe.k_tile;
     r.perf_class = query.perf_class;
     r.crosswise = query.crosswise;
     r.tma = query.tma;
@@ -197,8 +197,8 @@ PlanProbe plan_probe(int64_t m,
             GemmRecipe recipe{v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]};
             const auto resource = query.resources(recipe, query);
             const auto& e = resource.effective;
-            r.resources.push_back({recipe.cta, recipe.stages, recipe.kk,
-                                   e.bm, e.bn, e.kk, e.wm, e.wn, e.threads,
+            r.resources.push_back({recipe.cta, recipe.k_stages, recipe.k_tile,
+                                   e.bm, e.bn, e.k_tile, e.wm, e.wn, e.threads,
                                    resource.resident, resource.registers, resource.local_bytes});
         }
     }

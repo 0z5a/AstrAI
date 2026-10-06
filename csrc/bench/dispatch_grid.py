@@ -15,7 +15,7 @@ decisions are wanted (e.g. diffing two planner modes or two tables).
 
 The measurement side stays what it always was: the product-grid sweep
 (tune_plan_table.py sweep -m/-n/-k), then interleaved A/B for anything that
-ships (diff_rows.py). A dense grid here nominates band boundaries; it proves
+ships (tune_plan_table.py diff). A dense grid here nominates band boundaries; it proves
 nothing about performance.
 """
 
@@ -49,7 +49,7 @@ def parse_range(value: str) -> list[int]:
 
 
 def recipe_name(probe: dict, names: list[str]) -> str:
-    return f"{names[probe['cta']][1:]}_s{probe['stages']}_kk{probe['kk']}"
+    return f"{names[probe['cta']][1:]}_s{probe['k_stages']}_k_tile{probe['k_tile']}"
 
 
 @click.command()

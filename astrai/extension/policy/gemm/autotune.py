@@ -92,19 +92,19 @@ class Row:
     perf_class: int
     crosswise: int
     cta: int
-    stages: int
-    kk: int
+    k_stages: int
+    k_tile: int
 
     def text(self) -> str:
         # raster 0 = plan_raster at launch (the aspect heuristic owns it).
         return (
             f"{self.m_min} {self.m_max} {self.n_min} {self.n_max}"
             f" {self.perf_class} {self.crosswise} {self.cta}"
-            f" {self.stages} 0 {self.kk}"
+            f" {self.k_stages} 0 {self.k_tile}"
         )
 
     def recipe(self) -> Tuple[int, int, int]:
-        return (self.cta, self.stages, self.kk)
+        return (self.cta, self.k_stages, self.k_tile)
 
 
 def device_signature(facts: dict) -> str:
@@ -319,7 +319,7 @@ class GemmAutotuner:
             return out
         perf = self._perf_of[(str(dt_a), str(dt_b))]  # cached by _coverage
         for entry in self._vocab or ():
-            cw, vba, vbb, cta, stages, kk, _, _, _, smem = entry
+            cw, vba, vbb, cta, k_stages, k_tile, _, _, _, smem = entry
             if cw != (1 if crosswise else 0):
                 continue
             if (vba, vbb) != widths:
@@ -335,8 +335,8 @@ class GemmAutotuner:
                     perf if perf is not None else -1,
                     crosswise,
                     cta,
-                    stages,
-                    kk,
+                    k_stages,
+                    k_tile,
                 )
             )
         return out
@@ -459,8 +459,8 @@ class GemmAutotuner:
             winner.perf_class,
             winner.crosswise,
             winner.cta,
-            winner.stages,
-            winner.kk,
+            winner.k_stages,
+            winner.k_tile,
         )
         for i, row in enumerate(self._rows):
             same_key = (
@@ -480,8 +480,8 @@ class GemmAutotuner:
                     row.perf_class,
                     row.crosswise,
                     row.cta,
-                    row.stages,
-                    row.kk,
+                    row.k_stages,
+                    row.k_tile,
                 )
                 return
         self._rows.insert(0, grown)  # newest measurement first (first match)
@@ -499,14 +499,27 @@ class GemmAutotuner:
             if len(fields) != 10:
                 logger.warning("%s: skipping row with %d fields", path, len(fields))
                 continue
-            # File field order: ... cta stages RASTER kk. The tuner always
+            # File field order: ... cta k_stages RASTER k_tile. The tuner always
             # emits auto-raster (0); anything else is a hand edit it does
             # not round-trip, so it is dropped with a note rather than
             # silently reinterpreted.
-            m_min, m_max, n_min, n_max, perf, cw, cta, stages, raster, kk = fields
+            (
+                m_min,
+                m_max,
+                n_min,
+                n_max,
+                perf,
+                cw,
+                cta,
+                k_stages,
+                raster,
+                k_tile,
+            ) = fields
             if raster != 0:
                 logger.warning("%s: dropping hand-set raster %d", path, raster)
-            rows.append(Row(m_min, m_max, n_min, n_max, perf, cw, cta, stages, kk))
+            rows.append(
+                Row(m_min, m_max, n_min, n_max, perf, cw, cta, k_stages, k_tile)
+            )
         return rows
 
     def _persist(self) -> None:
@@ -516,7 +529,7 @@ class GemmAutotuner:
             f"# gemm plan rows for {device_signature(self._facts)}\n"
             f"# measured winners only (runtime top-up); field order is the\n"
             f"# row-file order: m_min m_max n_min n_max perf crosswise cta\n"
-            f"# stages raster kk — raster column omitted below (always auto)\n"
+            f"# k_stages raster k_tile — raster column omitted below (always auto)\n"
         )
         self._cache_path.write_text(
             header + "\n".join(r.text() for r in self._rows) + "\n"

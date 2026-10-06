@@ -45,13 +45,13 @@ torch::Tensor quant_gemm_impl(torch::Tensor a,
 struct PlanProbe {
     std::string source;
     int cta = 0;
-    int stages = 0;
+    int k_stages = 0;
     int raster = 0;
-    int kk = 0;
+    int k_tile = 0;
     int perf_class = -1;
     int crosswise = 0;
     bool tma = false;
-    // Heuristic metadata: key (cta, stages, kk), effective (bm, bn, kk, wm, wn,
+    // Heuristic metadata: key (cta, k_stages, k_tile), effective (bm, bn, k_tile, wm, wn,
     // threads), resident CTAs, registers/thread, local bytes/thread.
     std::vector<std::vector<int>> resources;
 };
@@ -83,7 +83,7 @@ enum class RowTier : int {
 struct GemmConfigPatch {
     /*
      * Row-file path or inline rows (one per line:
-     * m_min m_max n_min n_max perf_class crosswise cta stages raster [kk]);
+     * m_min m_max n_min n_max perf_class crosswise cta k_stages raster [k_tile]);
      * the addressed tier is replaced wholesale, empty string clears it.
      */
     c10::optional<std::string> rows;
@@ -138,9 +138,9 @@ bool parse_planner_mode(const std::string& name, int& out);
 
 /*
  * Every ladder's recipes, deduped on the dispatch key, in dispatch order. A
- * row is (crosswise, ba, bb, cta, stages, kk, bm, bn, wm, wn, threads, smem);
+ * row is (crosswise, ba, bb, cta, k_stages, k_tile, bm, bn, wm, wn, threads, smem);
  * its numbers spell the canonical name
- * Tile_<bm>x<bn>x<kk>_W<wm>x<wn>_S<stages> — the Python tooling's join key.
+ * Tile_<bm>x<bn>x<k_tile>_W<wm>x<wn>_S<k_stages> — the Python tooling's join key.
  */
 std::vector<std::vector<int>> tile_vocabulary();
 

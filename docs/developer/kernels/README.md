@@ -414,17 +414,25 @@ csrc/
 ├── rotary_emb.cu                     # rotary embedding (kernel + binding in one file) → module rotary_emb
 ├── bench/                            # measurement + dispatch-analysis tooling, run from the repo root as `python csrc/bench/<tool>.py`
 │   ├── bench_tile_sweep.cu           #   cell-level tile/warp/kK sweep; standalone nvcc line in its header (no CMake target)
-│   ├── benchmark_*.py                #   attention / layouts / logprobs / quant_gemm / quantize / rotary / gdn_ops benchmarks
-│   ├── diff_rows.py                  #   plan rows as the measured DIFF of the model, interleaved A/B — the row-emission gate
+│   ├── benchmark_gemm.py             #   GEMM dtype and operand-layout comparisons (dtypes / layouts)
+│   ├── benchmark_*.py                #   attention / logprobs / quantize / rotary / gdn_ops benchmarks
 │   ├── dispatch_grid.py              #   map the dispatch logic over a dense (m, n, k) grid, host-only
 │   ├── model_capture.py              #   offline capture harness: score a planner rule against saved measurements
 │   ├── sass_digest.py                #   the zero-behavior-refactor gate (per-symbol SASS digest; --normalize-anon for move-only refactors)
-│   └── tune_plan_table.py            #   plan-table pipeline: sweep candidates / validate holdouts / install rows
+│   └── tune_plan_table.py            #   plan-table pipeline: sweep / diff / validate / install rows
 └── tests/
     ├── test_utils.cuh                # shared test utilities (now_ms, f2bf, bf2f, randf) — harness-local, outside the include root
     ├── attn_test.cu                  # decode + prefill kernels
     ├── attn_paged_test.cu            # paged decode/prefill kernels
     └── quant_gemm_test.cu            # GEMM correctness + TFLOPS bench (links gemm/planning.cpp and plan_table.cpp)
+```
+
+GEMM benchmark entry points:
+
+```bash
+.venv/bin/python csrc/bench/benchmark_gemm.py dtypes --help
+.venv/bin/python csrc/bench/benchmark_gemm.py layouts --help
+.venv/bin/python csrc/bench/tune_plan_table.py diff --help
 ```
 
 Compiled `.so` modules are placed directly in `astrai/extension/`.

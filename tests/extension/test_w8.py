@@ -130,9 +130,9 @@ def test_w8a8_k128_swizzle_and_tail(trans_a, trans_b, k):
     ws = torch.ones(n, device="cuda")
     a = x.T.contiguous() if trans_a else x
     b = w if trans_b else w.T.contiguous()
-    with plan.override(rows="0 0 0 0 2 -1 2 2 0 128"):
+    with plan.override(planner="hybrid", rows="0 0 0 0 2 -1 2 2 0 128"):
         selected = plan.probe(m, n, k, torch.int8, torch.int8, trans_a, trans_b)
-        assert (selected.source, selected.kk) == ("override", 128)
+        assert (selected.source, selected.k_tile) == ("override", 128)
         out = quant_gemm(a, b, xs, ws, trans_a, trans_b)
     ref = ((x.float() @ w.float().T) * xs[:, None] * ws[None, :]).to(torch.bfloat16)
     torch.testing.assert_close(out, ref, atol=0, rtol=0)

@@ -27,9 +27,9 @@ void gemm_config_seed_once(); // planning.cpp: environment defaults
 enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
 
 struct GemmRecipe {
-    int cta;     // TileClass ordinal — the row-file serialization key
-    int stages;  // ring depth
-    int kk;      // k-tile depth (the kK twins are separate recipes)
+    int cta;      // TileClass ordinal — the row-file serialization key
+    int k_stages; // prefetched K tiles; ring has one extra slot
+    int k_tile;   // K elements held in one pipeline stage
     int bm, bn;  // CTA geometry
     int wm, wn;  // warp tiling (the recipe name's W<x>x<y>)
     int threads; // the manifest entry's warp tiling (first match wins)

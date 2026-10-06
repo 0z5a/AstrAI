@@ -30,11 +30,11 @@ FACTS = {
 
 
 # The cross-section of tile_vocabulary rows the fake serves, in the
-# binding's 10-field form (cw, ba, bb, cta, stages, kk, bm, bn, threads,
+# binding's 10-field form (cw, ba, bb, cta, k_stages, k_tile, bm, bn, threads,
 # smem). smem follows policy.cuh's ring formula so the feasibility paths
 # behave like the real vocabulary.
-def _ring(bm, bn, kk, stages, ba, bb):
-    return (stages + 1) * kk * (bm * ba + bn * bb)
+def _ring(bm, bn, k_tile, k_stages, ba, bb):
+    return (k_stages + 1) * k_tile * (bm * ba + bn * bb)
 
 
 _GEOMETRY = {0: (64, 64), 1: (128, 64), 2: (128, 128), 3: (128, 256), 4: (64, 128)}
@@ -45,15 +45,15 @@ VOCAB = [
         ba,
         bb,
         cta,
-        stages,
-        kk,
+        k_stages,
+        k_tile,
         *_GEOMETRY[cta],
         256,
-        _ring(*_GEOMETRY[cta], kk, stages, ba, bb),
+        _ring(*_GEOMETRY[cta], k_tile, k_stages, ba, bb),
     ]
     for cw in (0, 1)
     for ba, bb in ((2, 2), (2, 1), (1, 1))
-    for cta, stages, kk in (
+    for cta, k_stages, k_tile in (
         (0, 2, 64),
         (0, 3, 64),
         (1, 2, 64),
@@ -63,7 +63,7 @@ VOCAB = [
         (0, 2, 32),
         (2, 2, 32),
     )
-    if not (kk == 32 and (ba, bb) == (1, 1))  # kK=32 rides the congruous ladder
+    if not (k_tile == 32 and (ba, bb) == (1, 1))  # kK=32 rides the congruous ladder
 ] + [
     [0, 1, 1, 3, 2, 64, *_GEOMETRY[3], 256, _ring(*_GEOMETRY[3], 64, 2, 1, 1)],
 ]
@@ -112,9 +112,9 @@ class FakeGemm:
         return {
             "source": self.source,
             "cta": 0,
-            "stages": 2,
+            "k_stages": 2,
             "raster": 0,
-            "kk": 64,
+            "k_tile": 64,
             "perf_class": self._PERF.get((dt_a, dt_b), 0),
             "crosswise": 0,
         }
@@ -244,7 +244,7 @@ class TestTuneFlow:
         # Candidates were the cw-0 two-byte recipes that fit the smem.
         assert all(c.crosswise == 0 for c in measured)
         assert all(c.perf_class == 0 for c in measured)
-        assert all(c.kk in (32, 64) for c in measured)
+        assert all(c.k_tile in (32, 64) for c in measured)
         # start() + merged install = 2 installs.
         assert len(fake.installs) == 2
         # The measured winner is installed without synthetic floor rows.

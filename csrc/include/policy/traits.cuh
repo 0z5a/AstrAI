@@ -32,7 +32,7 @@ template <typename ElemA_,
           typename ElemB_,
           typename CtaShape_,
           typename WarpShape_,
-          int Stages,
+          int PipelineStages,
           bool UseMx = false>
 struct GemmTraits {
     using ElemA = ElemA_;
@@ -59,8 +59,8 @@ struct GemmTraits {
     using WarpShape = WarpShape_;
     static constexpr int kBlockM = CtaShape_::kM;
     static constexpr int kBlockN = CtaShape_::kN;
-    static constexpr int kK = CtaShape_::kK;
-    static constexpr int kStages = Stages;
+    static constexpr int kTile = CtaShape_::kK;
+    static constexpr int kStages = PipelineStages;
     static constexpr int kWarpM = WarpShape_::kM;
     static constexpr int kWarpN = WarpShape_::kN;
 
@@ -99,8 +99,8 @@ struct GemmTraits {
  * reclaim check and the host planner's recipe feasibility gate:
  * every operand ring holds kStages+1 buffers of k * (bm*ba + bn*bb) bytes.
  */
-constexpr int ring_smem_bytes(int bm, int bn, int k, int stages, int ba, int bb) {
-    return (stages + 1) * k * (bm * ba + bn * bb);
+constexpr int ring_smem_bytes(int bm, int bn, int k, int k_stages, int ba, int bb) {
+    return (k_stages + 1) * k * (bm * ba + bn * bb);
 }
 
 /*
@@ -110,8 +110,8 @@ constexpr int ring_smem_bytes(int bm, int bn, int k, int stages, int ba, int bb)
  */
 constexpr int min_ctas_for_ring(int bytes) { return bytes <= 48 * 1024 ? 2 : 1; }
 
-constexpr int tma_smem_bytes(int ring, int stages) {
-    return ring + 1024 + 2 * (stages + 1) * 8;
+constexpr int tma_smem_bytes(int ring, int k_stages) {
+    return ring + 1024 + 2 * (k_stages + 1) * 8;
 }
 
 /* Crosswise staging uses ColMajor A or RowMajor B; the other layouts stage as-is. */
@@ -126,7 +126,7 @@ template <typename Traits, typename LayoutA, typename LayoutB> struct GemmSmem {
     static constexpr int kRingDepth = Traits::kStages + 1;
     static constexpr int kBytes = ring_smem_bytes(Traits::kBlockM,
                                                   Traits::kBlockN,
-                                                  Traits::kK,
+                                                  Traits::kTile,
                                                   Traits::kStages,
                                                   Traits::kElemBytesA,
                                                   Traits::kElemBytesB);

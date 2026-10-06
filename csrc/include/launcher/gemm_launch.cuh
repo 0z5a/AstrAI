@@ -28,7 +28,7 @@ inline void log_gemm_plan(const GemmParams& p,
                           const dim3& grid,
                           int bm,
                           int bn,
-                          int stages,
+                          int k_stages,
                           int smem,
                           bool tma,
                           bool mx = false) {
@@ -37,7 +37,7 @@ inline void log_gemm_plan(const GemmParams& p,
     std::fprintf(stderr,
                  "[gemm-plan] %lldx%lldx%lld b=%d -> tile %dx%d s%d%s%s "
                  "grid %dx%dx%d raster %d smem %d\n",
-                 (long long)p.m, (long long)p.n, (long long)p.k, p.batch, bm, bn, stages,
+                 (long long)p.m, (long long)p.n, (long long)p.k, p.batch, bm, bn, k_stages,
                  tma ? " tma" : "", mx ? " mx" : "", grid.x, grid.y, grid.z, p.raster, smem);
 }
 

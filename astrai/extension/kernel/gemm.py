@@ -3,7 +3,7 @@
 One adapter per compiled module: this file covers the ``gemm`` module's
 ``quant_gemm`` binding — stateless, called directly — plus the flat
 ``set_*`` / ``state`` / ``probe`` / ``facts`` / ``tile_vocabulary`` views over
-the planner's bindings in their raw wire shapes (the four ``csrc/bench`` tools
+the planner's bindings in their raw wire shapes (the ``csrc/bench`` tools
 parse those keys, so those spellings are contract). The plan's records, the
 ``plan`` facade and the runtime autotuner are policy and live next door in
 ``astrai.extension.policy.gemm.plan``; the fp8/int8 quantization policy in
@@ -60,8 +60,8 @@ def set_table(rows: Rows) -> int:
     """Install the override plan rows (the experiment tier).
 
     ``rows`` is a row-file path, inline row text (one row per line,
-    ``m_min m_max n_min n_max perf_class crosswise cta stages raster
-    [kk]``), ``"-"`` to disable every row tier, or ``""`` to clear the
+    ``m_min m_max n_min n_max perf_class crosswise cta k_stages raster
+    [k_tile]``), ``"-"`` to disable every row tier, or ``""`` to clear the
     override rows and fall back to injected + builtin. Returns the number
     of rows installed.
     """
@@ -130,7 +130,7 @@ def facts() -> dict:
 
 
 def tile_vocabulary() -> list:
-    """Every (crosswise, ba, bb, cta, stages, kk) recipe the ladders
+    """Every (crosswise, ba, bb, cta, k_stages, k_tile) recipe the ladders
     instantiate — the sweep candidate space."""
     return get_module("gemm").tile_vocabulary()
 
