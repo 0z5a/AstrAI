@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from astrai.trainer.metric_util import GradSNRTracker
+from astrai.trainer.callbacks.metric_util import GradSNRTracker
 
 
 def test_grad_snr_is_reported_in_decibels():

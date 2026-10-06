@@ -33,7 +33,7 @@ from astrai.serialization import (
     looks_like_hf_state_dict,
 )
 from astrai.tokenize import AutoTokenizer
-from astrai.trainer.metric_util import GradSNRTracker
+from astrai.trainer.callbacks.metric_util import GradSNRTracker
 from astrai.trainer.optional_extras import (
     component_extra_keys,
     load_component_extra,

@@ -4,11 +4,11 @@ import torch
 
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.serialization import Checkpoint
-from astrai.trainer.train_callback import (
+from astrai.trainer.callbacks import (
     GradientCheckpointingCallback,
     TrainCallback,
-    _copy_tokenizer_files,
 )
+from astrai.trainer.callbacks.checkpoint import _copy_tokenizer_files
 from astrai.trainer.trainer import Trainer
 from tests.helpers import RandomTokenDataset, load_checkpoint_meta
 

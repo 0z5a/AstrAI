@@ -4,8 +4,8 @@ import pytest
 import torch
 
 from astrai.model.autoregressive_lm import AutoRegressiveLM
+from astrai.trainer.callbacks import MetricCallback
 from astrai.trainer.strategy import BaseStrategy, SEQStrategy
-from astrai.trainer.train_callback import MetricCallback
 from tests.helpers import make_tiny_config
 
 

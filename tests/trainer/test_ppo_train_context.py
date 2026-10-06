@@ -13,10 +13,10 @@ from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.value import ValueModel
 from astrai.serialization import Checkpoint
 from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
+from astrai.trainer.callbacks import CheckpointCallback
 from astrai.trainer.rollout import BaseRewardModel, RolloutEvaluator
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.strategy import GRPOStrategy, PPOStrategy
-from astrai.trainer.train_callback import CheckpointCallback
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
 from astrai.trainer.trainer import Trainer
 from tests.helpers import (

@@ -8,6 +8,7 @@ when adding new features.
 astrai/trainer/
   trainer.py             training loop
   train_context.py       public context and builder entry point
+  callbacks/             callback protocol and training lifecycle hooks
   strategy/
     __init__.py          public strategy imports
     ops.py               tensor and loss helpers
@@ -39,8 +40,8 @@ paths. New code should import the implementation module directly when it
 needs to patch internal helpers.
 
 Each objective owns its loss and algorithm-specific state. Shared tensor
-operations belong in `strategy/ops.py`; model creation, checkpoint restore and
-data loading remain in `train_context.py`, while rollout wiring belongs in
-`rollout/setup.py`. Avoid adding another
+operations belong in `strategy/ops.py`; model creation and checkpoint restore
+remain in `train_context.py`, including dataset splitting and distributed
+loader construction; rollout wiring belongs in `rollout/setup.py`. Avoid adding another
 conditional objective branch to the context builder when it can be expressed
 as a registered strategy or a small assembly helper.

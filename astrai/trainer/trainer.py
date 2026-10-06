@@ -9,7 +9,7 @@ from astrai.signal_handler import (
     register_signal_handlers,
     unregister_signal_handlers,
 )
-from astrai.trainer.train_callback import (
+from astrai.trainer.callbacks import (
     CallbackFactory,
     TrainCallback,
 )

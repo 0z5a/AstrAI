@@ -489,7 +489,7 @@ def test_moe_router_selects_experts_from_fp32_probabilities():
 
 def test_moe_routing_replays_across_forward_recompute_and_reload(tmp_path):
     """Actual expert dispatch stays stable across online-RL replay boundaries."""
-    from astrai.trainer.train_callback import GradientCheckpointingCallback
+    from astrai.trainer.callbacks import GradientCheckpointingCallback
 
     kwargs = {
         "dim": 8,
