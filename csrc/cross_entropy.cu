@@ -43,7 +43,7 @@ template <bool Maximum> __device__ float reduce(float value) {
 }
 
 template <typename scalar_t>
-__global__ void forward_rows(scalar_t* logits,
+__global__ void forward_rows_online(scalar_t* logits,
                              const int64_t* targets,
                              float* maxima,
                              float* log_sums,
@@ -61,21 +61,36 @@ __global__ void forward_rows(scalar_t* logits,
         }
         return;
     }
-    float maximum = -INFINITY;
-    for (int64_t col = threadIdx.x; col < vocab; col += kThreads) {
-        maximum = combine<true>(maximum, float(values[col]));
+    // Each lane maintains a stable normalizer for its strided vocabulary slice.
+    // One exponential and a predicated select avoid a divergent new-maximum branch.
+    float lane_maximum = -INFINITY;
+    float lane_sum = 0.0f, lane_shifted_sum = 0.0f;
+    int64_t lane_count = 0;
+    if (threadIdx.x < vocab) {
+        lane_maximum = float(values[threadIdx.x]);
+        lane_sum = 1.0f;
+        lane_count = 1;
     }
-    maximum = reduce<true>(maximum);
-    float sum = 0.0f, shifted_sum = 0.0f;
-    for (int64_t col = threadIdx.x; col < vocab; col += kThreads) {
-        const float shifted = float(values[col]) - maximum;
-        sum += expf(shifted);
+    for (int64_t col = threadIdx.x + kThreads; col < vocab; col += kThreads) {
+        const float value = float(values[col]);
+        const float difference = value - lane_maximum;
+        const float factor = expf(-fabsf(difference));
+        const bool higher = value > lane_maximum;
+        lane_sum = higher ? fmaf(lane_sum, factor, 1.0f) : lane_sum + factor;
         if (smoothing != 0.0f) {
-            shifted_sum += shifted;
+            lane_shifted_sum += higher ? -float(lane_count) * difference : difference;
         }
+        lane_maximum = combine<true>(lane_maximum, value);
+        ++lane_count;
     }
+    const float maximum = reduce<true>(lane_maximum);
+    const float sum = lane_count ? lane_sum * expf(lane_maximum - maximum) : 0.0f;
     const float log_sum = logf(reduce<false>(sum));
+    float shifted_sum = 0.0f;
     if (smoothing != 0.0f) {
+        if (lane_count) {
+            shifted_sum = lane_shifted_sum + float(lane_count) * (lane_maximum - maximum);
+        }
         shifted_sum = reduce<false>(shifted_sum);
     }
     if (threadIdx.x == 0) {
@@ -132,12 +147,13 @@ void launch_forward(const torch::Tensor& logits,
                     int64_t ignore_index,
                     double smoothing) {
     const auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int64_t rows = logits.size(0);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::kHalf, at::kBFloat16, logits.scalar_type(), "ce_forward", [&] {
-            forward_rows<scalar_t><<<logits.size(0), kThreads, 0, stream>>>(
-                logits.data_ptr<scalar_t>(), targets.data_ptr<int64_t>(), maxima.data_ptr<float>(),
-                log_sums.data_ptr<float>(), losses.data_ptr<float>(), logits.size(1), ignore_index,
-                smoothing);
+            forward_rows_online<scalar_t><<<rows, kThreads, 0, stream>>>(
+                logits.data_ptr<scalar_t>(), targets.data_ptr<int64_t>(),
+                maxima.data_ptr<float>(), log_sums.data_ptr<float>(), losses.data_ptr<float>(),
+                logits.size(1), ignore_index, smoothing);
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
