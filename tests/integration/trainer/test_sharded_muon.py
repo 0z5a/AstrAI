@@ -118,10 +118,9 @@ def _worker(rank, world, rendezvous, output):
         # Unsupported logical rank must fail before momentum/parameter mutation.
         param = nn.Parameter(distribute_tensor(torch.ones(2, 3, 4), mesh, [Shard(0)]))
         param.grad = distribute_tensor(torch.ones(2, 3, 4), mesh, [Shard(0)])
-        optimizer = _ShardedMuon([param])
         before = param.full_tensor().clone()
-        with pytest.raises(ValueError, match="2D logical matrix"):
-            optimizer.step()
+        with pytest.raises(ValueError, match="2D"):
+            _ShardedMuon([param])
         torch.testing.assert_close(param.full_tensor(), before, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
