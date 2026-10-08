@@ -8,6 +8,7 @@ import torch
 from astrai.trainer.backend import ColocatedBackend, ReplicaBackend
 from astrai.trainer.rollout import RolloutGenerator, SamplingParams
 from tests.support.inference import make_cpu_model, make_cpu_scheduler
+from tests.support.models import make_model
 from tests.support.tokenizers import FakeTokenizer
 
 
@@ -202,3 +203,36 @@ def test_replica_backend_passes_overlap_option(monkeypatch):
         enable_cuda_graph=False,
     )
     assert captured["enable_overlap"] is True
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_explicit_head_dimension_real_kv_matches_full_forward(overlap):
+    torch.manual_seed(731)
+    model, _ = make_model(
+        "cpu",
+        hidden_size=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        use_qk_norm=True,
+    )
+    tokenizer = FakeTokenizer()
+    tokenizer.stop_ids = []
+    prompts = [[3, 7, 8], [9, 11, 12, 13]]
+    expected = []
+    with torch.no_grad():
+        for prompt in prompts:
+            ids = list(prompt)
+            for _ in range(4):
+                logits = model(torch.tensor([ids]))["logits"][0, -1]
+                ids.append(logits.argmax().item())
+            expected.append(ids[len(prompt) :])
+    scheduler = make_cpu_scheduler(
+        model, tokenizer, max_batch_size=2, enable_overlap=overlap
+    )
+    try:
+        actual = scheduler.run_batch(prompts, max_tokens=4, temperature=0)
+        assert actual == expected
+        _assert_drained(scheduler)
+    finally:
+        scheduler.stop()
