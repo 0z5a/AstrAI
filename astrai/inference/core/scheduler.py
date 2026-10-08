@@ -111,7 +111,8 @@ class Scheduler:
             cache = BlockPool(
                 n_layers=config.num_hidden_layers,
                 n_kv_heads=config.num_key_value_heads,
-                head_dim=config.hidden_size // config.num_attention_heads,
+                head_dim=getattr(config, "head_dim", None)
+                or config.hidden_size // config.num_attention_heads,
                 max_batch_size=max_batch_size,
                 max_seq_len=self.max_seq_len,
                 device=self.device,
