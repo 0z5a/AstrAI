@@ -375,3 +375,15 @@ def test_grpo_requires_explicit_update_microbatch_config(tmp_path):
         _config(tmp_path, strategy="seq", rl_microbatch_prompts=1)
     with pytest.raises(ValueError, match="rl_microbatch_prompts"):
         _config(tmp_path, rl_microbatch_prompts=0)
+
+
+def test_builder_uses_the_models_actual_gradient_reducer_group(tmp_path):
+    cfg = _config(tmp_path)
+    builder = TrainContextBuilder(cfg)
+    builder._topology = ParallelTopology(1)
+    model = _actor()
+    reducer_group = object()
+    model.process_group = reducer_group
+    context = TrainContext(config=cfg, model=model, executor=BaseExecutor())
+    builder._create_strategy(context, context.executor)
+    assert context.strategy.loss_process_group is reducer_group

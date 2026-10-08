@@ -493,7 +493,9 @@ class TrainContextBuilder:
         kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)
         if cfg.strategy in ("grpo", "online_grpo"):
             kwargs.setdefault("rl_microbatch_prompts", cfg.rl_microbatch_prompts)
-            kwargs["loss_process_group"] = self._topology.dp_group
+            kwargs["loss_process_group"] = getattr(
+                context.model, "process_group", self._topology.dp_group
+            )
         kwargs.setdefault("gradient_chunked_logprobs", cfg.gradient_chunked_logprobs)
         if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"):
             kwargs["ref_model"] = create_ref_model(
