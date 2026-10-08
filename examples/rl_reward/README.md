@@ -108,6 +108,9 @@ rank, and topology changes fail explicitly. The data-loader iterator has its
 own generator so creating a fresh iterator does not advance rollout RNG; this
 separates its [base-seed draw](https://docs.pytorch.org/docs/main/data.html#randomness-in-multi-process-data-loading)
 from policy sampling. Verifier source hashes are also checked on resume.
+Synchronous batch request IDs also preserve response-row order through the
+prefill sort; independent random IDs would reassign the restored sampling
+stream even when the RNG state itself matches.
 An attempt-specific manifest and JSONL files preserve earlier results. Repeated
 evaluation after resume has the same seed/version/prompt/response identity and
 must be deduplicated when computing intervals.
