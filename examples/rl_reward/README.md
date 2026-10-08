@@ -41,6 +41,15 @@ explicit preparation steps. The runner rejects duplicate tasks across splits,
 invalid labels and prompts exceeding the cap. Train size must be divisible by
 `WORLD_SIZE * batch_per_device` until tail update windows are supported.
 
+`python -m examples.rl_reward.prepare_data --help` prepares splits on the
+assigned CPU test machine from local Parquet files with declared SHA256 hashes
+and immutable dataset revision. It requires `pyarrow==21.0.0`. Countdown
+permutations and GSM8K whitespace variants are deduplicated globally before
+selection; conflicting labels fail. A fixed hash order selects exact declared
+sizes, and the original GSM8K test source remains held out. Preparation checks
+every selected native chat prompt against the frozen cap and emits split hashes
+and IDs. It fails if deduplication leaves too few records.
+
 Countdown record:
 
 ```json
