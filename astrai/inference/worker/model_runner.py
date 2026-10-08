@@ -276,7 +276,10 @@ class GPUModelRunner:
         # during capture.
         config = model.config
         max_q_heads = config.num_attention_heads
-        head_dim = config.hidden_size // config.num_attention_heads
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
         backend = get_backend()
         self._graph_supported = backend.supports_graph() and (
             CudaBackend.available() and head_dim in CudaBackend.HEAD_DIMS
