@@ -215,8 +215,8 @@ Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
 submit/commit loop for complete batches, on both colocated and replica
 backends. It reuses the serving driver's device token relay and pinned copy
 slots. Batch request IDs preserve input order so the prefill row sort cannot
-randomly reassign sampling draws to responses. It also reuses
-frequency penalties, batch-identity changes, KV extension failures
+randomly reassign sampling draws to responses. Frequency penalties,
+batch-identity changes, KV extension failures
 and token limits use its drain/replan rules. All requests finish and resources
 drain before a rollout returns or a policy update can publish. CPU uses
 synchronous tensor commits and provides no hardware overlap.
