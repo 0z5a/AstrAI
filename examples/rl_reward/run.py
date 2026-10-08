@@ -81,6 +81,8 @@ class Recipe:
     save_token_traces: bool = True
     learner_microbatch_prompts: int | None = None
     overlap_collection: bool = False
+    request_seeded_sampling: bool = False
+    enable_thinking: bool | None = None
 
     def validate(self):
         for name in (
@@ -126,6 +128,12 @@ class Recipe:
             raise ValueError("seed must be an integer and save_token_traces a boolean")
         if type(self.overlap_collection) is not bool:
             raise ValueError("overlap_collection must be a boolean")
+        if type(self.request_seeded_sampling) is not bool:
+            raise ValueError("request_seeded_sampling must be a boolean")
+        if self.request_seeded_sampling and not 0 <= self.seed < 2**63:
+            raise ValueError("request-local sampling requires seed in [0, 2**63-1]")
+        if self.enable_thinking is not None and type(self.enable_thinking) is not bool:
+            raise ValueError("enable_thinking must be a boolean or None")
         if self.learner_microbatch_prompts is not None and (
             type(self.learner_microbatch_prompts) is not int
             or self.learner_microbatch_prompts < 1
@@ -168,6 +176,14 @@ def command_output(args):
 
 def model_factory(config, dtype):
     return AutoRegressiveLM(ConfigFactory.load(config)).to(dtype=getattr(torch, dtype))
+
+
+def configure_prompt(tokenizer, recipe):
+    if recipe.enable_thinking is not None:
+        template = getattr(tokenizer, "_chat_template", None)
+        if template is None:
+            raise ValueError("enable_thinking requires a loaded chat template")
+        template.default_variables["enable_thinking"] = recipe.enable_thinking
 
 
 def optimizer_factory(model, name, options):
@@ -321,6 +337,7 @@ class Monitor:
         if context.strategy.policy_version >= self.recipe.updates:
             raise ValueError("checkpoint already reached the frozen update budget")
         generator = context.strategy._rollout_runner.generator
+        configure_prompt(generator.tokenizer, self.recipe)
         generate = generator.generate
 
         def timed_generate(*args, **kwargs):
@@ -537,6 +554,12 @@ def build_training(recipe, splits, records_by_prompt, data_hashes, started):
             "R1",
             recipe.overlap_collection,
         ),
+        (
+            "rollout_seed",
+            recipe.seed,
+            "R1",
+            recipe.request_seeded_sampling,
+        ),
     ):
         if needed:
             if field_name not in TrainConfig.__dataclass_fields__:
@@ -630,6 +653,7 @@ def main():
                 "HF reward runs require the shared pretrained-loading correction (A1)"
             )
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    configure_prompt(tokenizer, recipe)
     paths = {"train": recipe.train_file, "dev": recipe.dev_file}
     if recipe.test_file:
         paths["test"] = recipe.test_file
@@ -640,6 +664,11 @@ def main():
     root = Path(recipe.output_dir)
     root.mkdir(parents=True, exist_ok=True)
     rank = int(os.environ.get("RANK", "0"))
+    request_rng = "shared_torch_multinomial"
+    if recipe.request_seeded_sampling:
+        from astrai.inference.sampling_rng import REQUEST_RNG_VERSION
+
+        request_rng = REQUEST_RNG_VERSION
     manifest = {
         "recipe": public_recipe(recipe),
         "dataset_sha256": data_hashes,
@@ -676,7 +705,11 @@ def main():
             "top_p": 1.0,
             "top_k": 0,
             "frequency_penalty": 0.0,
+            "request_rng": request_rng,
+            "request_seed": recipe.seed if recipe.request_seeded_sampling else None,
         },
+        "prompt_template_variables": {"enable_thinking": recipe.enable_thinking},
+        "tokenizer_stop_ids": tokenizer.stop_ids,
         "evaluation": {
             "temperature": 0.0,
             "top_p": 1.0,
