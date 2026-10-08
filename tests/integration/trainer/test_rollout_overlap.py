@@ -210,7 +210,6 @@ def test_explicit_head_dimension_real_kv_matches_full_forward(overlap):
     torch.manual_seed(731)
     model, _ = make_model(
         "cpu",
-        hidden_size=16,
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=8,
