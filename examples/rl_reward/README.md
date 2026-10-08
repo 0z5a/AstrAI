@@ -94,6 +94,11 @@ Checkpoints are saved at complete-round boundaries after the data cursor
 advances. They retain actor, optimizer/scheduler, the original frozen reference,
 registered RNG state and runner recipe/data identity. Resume checks the frozen
 recipe and data hashes and restores RNG after reference/backend construction.
+Each learner's RNG is gathered into the checkpoint and restored to that same
+rank, and topology changes fail explicitly. The data-loader iterator has its
+own generator so creating a fresh iterator does not advance rollout RNG; this
+separates its [base-seed draw](https://docs.pytorch.org/docs/main/data.html#randomness-in-multi-process-data-loading)
+from policy sampling. Verifier source hashes are also checked on resume.
 An attempt-specific manifest and JSONL files preserve earlier results. Repeated
 evaluation after resume has the same seed/version/prompt/response identity and
 must be deduplicated when computing intervals.

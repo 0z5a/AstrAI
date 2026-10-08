@@ -30,7 +30,7 @@ from astrai.serialization import adapt_config, load_json
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer import Trainer
 from astrai.trainer.callbacks.checkpoint import CheckpointCallback
-from astrai.trainer.optional_extras import restore_checkpoint_extras
+from astrai.trainer.optional_extras import checkpoint_extras, restore_checkpoint_extras
 from astrai.trainer.rollout import SamplingParams
 from examples.rl_reward.data import (
     PromptDataset,
@@ -194,9 +194,18 @@ def save_runner_extra(context):
         "recipe": asdict(monitor.recipe),
         "data_hashes": monitor.data_hashes,
         "verifier_sha256": sha256_file(Path(__file__).with_name("rewards.py")),
+        "rng_by_rank": context.kwargs["reward_rng_by_rank"],
         "elapsed_seconds": monitor.elapsed(),
     }
     return extra
+
+
+def restore_runner_rng(states, rank, world_size):
+    if not isinstance(states, list) or len(states) != world_size:
+        raise ValueError(
+            "resume requires one RNG snapshot per learner rank and the same topology"
+        )
+    restore_checkpoint_extras({"rng_state": states[rank]})
 
 
 class RewardCheckpoint(CheckpointCallback):
@@ -204,6 +213,18 @@ class RewardCheckpoint(CheckpointCallback):
 
     def after_optimizer_step(self, context):
         pass
+
+    def _save_checkpoint(self, context):
+        if next(context.model.parameters()).is_cuda:
+            torch.cuda.synchronize()
+        local_rng = checkpoint_extras()["rng_state"]
+        if dist.is_initialized():
+            states = [None] * context.world_size
+            dist.all_gather_object(states, local_rng)
+        else:
+            states = [local_rng]
+        context.kwargs["reward_rng_by_rank"] = states
+        super()._save_checkpoint(context)
 
     def on_batch_end(self, context):
         if context.optimizer_step - self.last_ckpt_step >= self.interval:
@@ -257,6 +278,11 @@ class Monitor:
         self.context = context
         context.kwargs["reward_monitor"] = self
         context.strategy._rollout_runner.reward_model.monitor = self
+        # A resumed mid-epoch loader creates a new iterator. Its base-seed
+        # draw must not advance the restored rollout sampling RNG.
+        context.dataloader.generator = torch.Generator().manual_seed(
+            self.recipe.seed + context.rank
+        )
         if context.checkpoint:
             state = context.checkpoint.extra.get("reward_runner")
             if (
@@ -272,7 +298,9 @@ class Monitor:
             self.elapsed_before = state["elapsed_seconds"]
             # Builder-created reference/backend objects may consume random
             # draws after its initial restore; restore at the ready boundary.
-            restore_checkpoint_extras(context.checkpoint.extra)
+            restore_runner_rng(
+                state.get("rng_by_rank"), context.rank, context.world_size
+            )
         else:
             random.seed(self.recipe.seed + context.rank)
             torch.manual_seed(self.recipe.seed + context.rank)
@@ -302,6 +330,7 @@ class Monitor:
             "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
             "slurm_nodes": os.environ.get("SLURM_JOB_NODELIST"),
             "policy_version": context.strategy.policy_version,
+            "dataloader_rng": "isolated CPU generator",
             "pretrained": getattr(context, "pretrained_metadata", {}),
         }
         if self.recipe.device_type == "cuda":

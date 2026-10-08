@@ -13,13 +13,14 @@ import torch
 import yaml
 
 from astrai.model import AutoRegressiveLM
+from astrai.trainer.optional_extras import checkpoint_extras
 from examples.rl_reward.data import load_splits
 from examples.rl_reward.rewards import (
     TaskReward,
     countdown_score,
     gsm8k_score,
 )
-from examples.rl_reward.run import Recipe, build_training
+from examples.rl_reward.run import Recipe, build_training, restore_runner_rng
 from tests.support.models import make_tiny_config
 from tests.support.tokenizers import CHAT_TEMPLATE, build_test_tokenizer
 
@@ -81,6 +82,19 @@ def test_reward_keeps_every_failed_response_and_rejects_incomplete_groups():
         reward.score(["prompt", "prompt"], [["invalid"], []])
     with pytest.raises(ValueError, match="absent"):
         reward.score(["unknown"], [["invalid"]])
+
+
+def test_resume_selects_each_learner_rng_and_rejects_topology_changes():
+    states, expected = [], []
+    for seed in (23, 71):
+        torch.manual_seed(seed)
+        states.append(checkpoint_extras()["rng_state"])
+        expected.append(torch.rand(5))
+    for rank in (0, 1):
+        restore_runner_rng(states, rank, 2)
+        torch.testing.assert_close(torch.rand(5), expected[rank], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="same topology"):
+        restore_runner_rng(states, 0, 3)
 
 
 def _write_jsonl(path, records):
