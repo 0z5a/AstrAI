@@ -552,9 +552,13 @@ class Scheduler:
             live = [r for r in requests if r is not None]
             with self._backend_context():
                 while live:
-                    decoded, aborted = self._stepper.step(
-                        live, return_logprobs=return_logprobs
-                    )
+                    if self._enable_overlap:
+                        self.engine_core.tick(live, return_logprobs=return_logprobs)
+                        decoded, aborted = live, []
+                    else:
+                        decoded, aborted = self._stepper.step(
+                            live, return_logprobs=return_logprobs
+                        )
                     for request in aborted:
                         self.finish(
                             request,
@@ -569,8 +573,13 @@ class Scheduler:
                         for r in decoded
                         if not r.terminal_emitted and not r.is_finished(self.stop_ids)
                     ]
+        except BaseException:
+            # Fence failed overlapped work before retiring requests/KV.
+            self.engine_core.fence()
+            raise
         finally:
-            self.engine_core.drain()
+            if not self.engine_core._shutdown_failed:
+                self.engine_core.drain()
             for request in requests:
                 if request is not None and not request.terminal_emitted:
                     self.finish(

@@ -84,6 +84,7 @@ def configure_rollout(
                 max_batch_size=max_batch_size,
                 max_seq_len=max_seq_len,
                 policy_version=policy_version,
+                enable_overlap=getattr(cfg, "rollout_enable_overlap", False),
             )
         )
 
@@ -106,6 +107,7 @@ def configure_rollout(
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             policy_version=policy_version,
+            enable_overlap=getattr(cfg, "rollout_enable_overlap", False),
         )
 
     batch_capacity = group_size * max(1, cfg.batch_per_device)
