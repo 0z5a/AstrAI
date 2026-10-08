@@ -1,4 +1,4 @@
-# Getting Started
+# Quick Start
 
 This guide walks you through installing AstrAI, downloading a model, running inference, preprocessing data, and launching your first training job.
 
