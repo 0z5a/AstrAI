@@ -1,36 +1,32 @@
-# Memory-efficient cross entropy
+# Cross-entropy kernels
 
-The default remains Torch. Pretraining (`seq`) and SFT accept these strategy
-options through the existing `TrainConfig.strategy_kwargs` field:
+`cuda_ce` keeps logits in the model dtype and reduces cross-entropy in FP32
+without materializing FP32 logits or log-softmax tensors. The optional
+`cuda_linear_ce` path computes a bias-free LM head and cross-entropy from
+hidden states in row chunks. User-facing selection and fallback behavior
+are documented in the [training guide](../../guides/training.md#cross-entropy-backends).
 
-```yaml
-strategy_kwargs:
-  loss_backend: cuda_ce
-```
+## Contract
 
-`cuda_ce` retains model-dtype logits and computes CE reductions in FP32 without
-materializing full FP32 logits or log-softmax tensors. This is the first option
-to measure on RTX 5090. CPU and unavailable-extension runs use Torch.
+For valid token positions `V`, both CUDA paths return the sum of
+cross-entropy terms, `sum(t in V, CE(logits[t], target[t]))`. The trainer
+handles valid-token normalization, accumulation, and distributed scaling.
+The linear path uses `logits[t] = hidden[t] @ weight.T` for a bias-free
+head. Label smoothing and `ignore_index=-100` follow the Torch path.
 
-For a bias-free `AutoRegressiveLM` head, an additional experimental option is:
-
-```yaml
-strategy_kwargs:
-  loss_backend: cuda_linear_ce
-  loss_chunk_size: 512
-```
+## Implementation
 
 The strategy computes the head and CE from the model's hidden states and an
 LM-head weight view returned by the model. The view keeps the head visible to
 DDP's forward-output traversal, including `find_unused_parameters=True`, while
 the model remains independent of targets and loss configuration. Forward
 generates logits one row chunk at a time and saves only per-row normalization
-statistics. Backward recomputes vocabulary tiles, replaces each private tile with scaled logits gradients, and
-reduces all tokens in one GEMM per weight-gradient tile. This avoids a full
+statistics. Backward recomputes vocabulary tiles, replaces each private tile with
+scaled logits gradients, and reduces all tokens in one GEMM per weight-gradient tile. This avoids a full
 FP32 head-gradient buffer and repeated BF16 accumulation across token chunks.
 The smaller hidden-gradient buffer accumulates across vocabulary tiles in FP32.
-GEMMs use ATen/cuBLAS; CE and gradient generation use native CUDA kernels. There is
-no Liger, Triton or CUTLASS runtime dependency.
+GEMMs use ATen/cuBLAS; CE and gradient generation use native CUDA kernels.
+There is no Liger, Triton or CUTLASS runtime dependency.
 
 ## Semantics and limits
 
@@ -86,7 +82,7 @@ Forward includes loss work; chunked backward includes logits recomputation.
 Compare complete steps, not the backward column alone. The speed
 gate is at most 1% median and 2% p95 regression plus reduced allocated peak.
 Numerical tests are a separate gate. Passing these short tests does not establish
-long-run convergence equivalence; no backend is enabled by default by this PR.
+long-run convergence equivalence; both backends remain opt-in.
 
 For a separate numerical audit, pass `--deterministic`. It sets
 `CUBLAS_WORKSPACE_CONFIG=:4096:8` and enables deterministic Torch algorithms.
