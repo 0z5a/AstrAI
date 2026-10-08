@@ -118,9 +118,14 @@ must be deduplicated when computing intervals.
 ## Results and timing
 
 `run_manifest.rank*.json` records declared revisions, actual model/data hashes,
-tokenizer/mapping files, source SHA/diff, sampling and learner settings. Runtime
-records add actual Python/Torch/CUDA, rank, host, allocation ID, device and
-pretrained provenance. `dependencies.rank*.txt` freezes installed packages.
+tokenizer/mapping files, source SHA/diff hash, sampling and learner settings.
+Private paths are redacted. Runtime environment records include only Python,
+necessary dependency/CUDA versions and H100 count; they omit host, scheduler,
+hardware identity and memory capacity. Pretrained metadata uses a closed
+allowlist of hashes/counts. Dependency files list versions without editable
+paths or direct URLs. Exact recipe paths remain in private checkpoints for
+resume. New outputs are created with user-only permissions. Publish only
+reviewed experiment records, never raw launcher stderr or checkpoint metadata.
 
 `rollout_results` and `eval_results` retain every response score, format status,
 finish reason and logical ID. Optional `token_traces/*.pt` retain token IDs,

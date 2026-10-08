@@ -7,7 +7,6 @@ import math
 import os
 import platform
 import random
-import socket
 import subprocess
 import sys
 import time
@@ -37,6 +36,12 @@ from examples.rl_reward.data import (
     collate_prompts,
     load_splits,
     sha256_file,
+)
+from examples.rl_reward.publication import (
+    content_digest,
+    dependency_versions,
+    public_pretrained,
+    public_recipe,
 )
 from examples.rl_reward.rewards import VERIFIER_VERSION, TaskReward
 
@@ -332,19 +337,25 @@ class Monitor:
         runtime = {
             "rank": context.rank,
             "world_size": context.world_size,
-            "hostname": socket.gethostname(),
             "python": platform.python_version(),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
-            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-            "slurm_nodes": os.environ.get("SLURM_JOB_NODELIST"),
             "policy_version": context.strategy.policy_version,
             "dataloader_rng": "isolated CPU generator",
-            "pretrained": getattr(context, "pretrained_metadata", {}),
+            "pretrained": public_pretrained(
+                getattr(context, "pretrained_metadata", {})
+            ),
         }
-        if self.recipe.device_type == "cuda":
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            runtime.update(gpu_name=props.name, gpu_memory_bytes=props.total_memory)
+        h100 = torch.tensor(
+            int(
+                self.recipe.device_type == "cuda"
+                and "H100" in torch.cuda.get_device_name(torch.cuda.current_device())
+            ),
+            device=next(context.model.parameters()).device,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(h100)
+        runtime["h100_count"] = h100.item()
         self.write("runtime", runtime)
         self.memory("post_load")
         self.evaluate("dev")
@@ -599,6 +610,9 @@ def build_training(recipe, splits, records_by_prompt, data_hashes, started):
 
 
 def main():
+    # Checkpoints retain exact private paths for resume. Never make their
+    # directory or newly-created logs readable outside the launching user.
+    os.umask(0o077)
     started = time.perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
@@ -627,7 +641,7 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
     rank = int(os.environ.get("RANK", "0"))
     manifest = {
-        "recipe": asdict(recipe),
+        "recipe": public_recipe(recipe),
         "dataset_sha256": data_hashes,
         "split_ids": {
             split: [record["id"] for record in records]
@@ -638,15 +652,17 @@ def main():
         "git_head": command_output(
             ["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"]
         ),
-        "git_diff": command_output(
-            [
-                "git",
-                "-C",
-                str(Path(__file__).resolve().parents[2]),
-                "diff",
-                "--binary",
-                "HEAD",
-            ]
+        "git_diff_sha256": content_digest(
+            command_output(
+                [
+                    "git",
+                    "-C",
+                    str(Path(__file__).resolve().parents[2]),
+                    "diff",
+                    "--binary",
+                    "HEAD",
+                ]
+            )
         ),
         "python": platform.python_version(),
         "torch": torch.__version__,
@@ -681,7 +697,10 @@ def main():
             "rl_microbatch_prompts": recipe.learner_microbatch_prompts,
         },
         "collector": {"enable_overlap": recipe.overlap_collection},
-        "resume_checkpoint": str(args.resume) if args.resume else None,
+        "resume_checkpoint_present": args.resume is not None,
+        "resume_checkpoint_manifest_sha256": sha256_file(args.resume / "manifest.json")
+        if args.resume and (args.resume / "manifest.json").is_file()
+        else None,
         "created_unix": time.time(),
     }
     name = (
@@ -692,7 +711,9 @@ def main():
     with (root / name).open("x") as stream:
         json.dump(manifest, stream, indent=2)
     (root / f"dependencies.rank{rank}.txt").write_text(
-        command_output([os.sys.executable, "-m", "pip", "freeze", "--all"])
+        "".join(
+            f"{name}=={version}\n" for name, version in dependency_versions().items()
+        )
     )
     trainer = build_training(recipe, splits, records_by_prompt, data_hashes, started)
     trainer.train(
