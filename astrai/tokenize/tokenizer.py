@@ -43,6 +43,7 @@ class AutoTokenizer:
         tokenizer_file = path / "tokenizer.json"
         config_file = path / "tokenizer_config.json"
         self._tokenizer = Tokenizer.from_file(str(tokenizer_file))
+        self._stop_token_ids = None
 
         if config_file.exists():
             with open(config_file, "r", encoding="utf-8") as f:
@@ -74,6 +75,7 @@ class AutoTokenizer:
                                 ids = [ids]
                             if not isinstance(ids, list) or any(
                                 type(i) is not int
+                                or not 0 <= i < 2**32
                                 or self._tokenizer.id_to_token(i) is None
                                 for i in ids
                             ):
@@ -85,7 +87,9 @@ class AutoTokenizer:
             if "stop_token_ids" in config:
                 ids = config["stop_token_ids"]
                 if not isinstance(ids, list) or any(
-                    type(i) is not int or self._tokenizer.id_to_token(i) is None
+                    type(i) is not int
+                    or not 0 <= i < 2**32
+                    or self._tokenizer.id_to_token(i) is None
                     for i in ids
                 ):
                     raise ValueError("invalid declared stop_token_ids")
