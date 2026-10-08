@@ -167,6 +167,7 @@ def _prepare_run(tmp_path, updates=3):
     [
         ("learner_microbatch_prompts", 1, "rl_microbatch_prompts", "A2"),
         ("overlap_collection", True, "rollout_enable_overlap", "R1"),
+        ("request_seeded_sampling", True, "rollout_seed", "R1"),
     ],
 )
 def test_recipe_feature_prerequisites(tmp_path, option, value, field, required):
@@ -180,7 +181,9 @@ def test_recipe_feature_prerequisites(tmp_path, option, value, field, required):
     )
     if field in TrainConfig.__dataclass_fields__:
         trainer = build_training(recipe, splits, prompts, {}, time.perf_counter())
-        assert getattr(trainer.train_config, field) == value
+        assert getattr(trainer.train_config, field) == (
+            recipe.seed if field == "rollout_seed" else value
+        )
     else:
         with pytest.raises(RuntimeError, match=required):
             build_training(recipe, splits, prompts, {}, time.perf_counter())
@@ -207,15 +210,18 @@ def test_torchrun_world_size_and_tail_validation(tmp_path, monkeypatch):
 @pytest.mark.slow
 @pytest.mark.parametrize("features", [False, True])
 def test_reward_example_fresh_process_resume_matches_continuation(tmp_path, features):
-    if features and not {"rl_microbatch_prompts", "rollout_enable_overlap"}.issubset(
-        TrainConfig.__dataclass_fields__
-    ):
+    if features and not {
+        "rl_microbatch_prompts",
+        "rollout_enable_overlap",
+        "rollout_seed",
+    }.issubset(TrainConfig.__dataclass_fields__):
         pytest.skip("combined microbatch/overlap resume requires A2 and R1")
     recipe, _ = _prepare_run(tmp_path)
     if features:
         recipe.batch_per_device = 2
         recipe.learner_microbatch_prompts = 1
         recipe.overlap_collection = True
+        recipe.request_seeded_sampling = True
     recipe_file = tmp_path / "recipe.yaml"
     recipe_file.write_text(yaml.safe_dump(recipe.__dict__))
     repo = Path(__file__).resolve().parents[3]
@@ -276,6 +282,7 @@ def test_reward_example_fresh_process_resume_matches_continuation(tmp_path, feat
             assert runtime["h100_count"] == 0
     if features:
         assert manifest["collector"]["enable_overlap"] is True
+        assert manifest["sampling"]["request_seed"] == recipe.seed
         assert manifest["learner"]["rl_microbatch_prompts"] == 1
         meta = json.loads(
             (root / "checkpoints" / final_checkpoint / "meta.json").read_text()

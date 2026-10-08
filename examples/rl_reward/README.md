@@ -23,6 +23,15 @@ feature before its implementation is present fails at startup. Keep these
 settings fixed across resume, and compare performance arms with the same
 global objective and workload.
 
+After integrating R1, `request_seeded_sampling: true` binds sampling to the
+seed, tokenized prompt, response index and policy version. Each output position
+uses its own draw, so variable EOS, row reordering and discarded overlap work
+do not advance another request's RNG. Both performance arms must use the same
+sampler. The default remains shared multinomial sampling. `enable_thinking`
+sets that chat-template variable consistently for data validation and rollout;
+leave it unset for templates without that option. HF terminal tokens require
+the A1 tokenizer correction. EOS remains enabled in formal qualification.
+
 ## Data and rewards
 
 Provide immutable JSONL train/dev files with globally unique `id` values. An

@@ -11,6 +11,41 @@ PRIVATE_RECIPE_FIELDS = {
     "test_file",
     "output_dir",
 }
+PUBLIC_RECIPE_FIELDS = {
+    "model_path",
+    "model_repo",
+    "model_revision",
+    "train_file",
+    "dev_file",
+    "dataset_repo",
+    "dataset_revision",
+    "output_dir",
+    "task",
+    "optimizer",
+    "optimizer_kwargs",
+    "updates",
+    "seed",
+    "batch_per_device",
+    "group_size",
+    "prompt_cap",
+    "response_cap",
+    "eval_interval",
+    "eval_batch_size",
+    "checkpoint_interval",
+    "kl_coef",
+    "clip_eps",
+    "loss_aggregation",
+    "dtype",
+    "device_type",
+    "reward_target",
+    "noninferiority_margin",
+    "test_file",
+    "save_token_traces",
+    "learner_microbatch_prompts",
+    "overlap_collection",
+    "request_seeded_sampling",
+    "enable_thinking",
+}
 DEPENDENCIES = (
     "torch",
     "numpy",
@@ -32,6 +67,7 @@ def public_recipe(recipe):
         if key in PRIVATE_RECIPE_FIELDS
         else value
         for key, value in asdict(recipe).items()
+        if key in PUBLIC_RECIPE_FIELDS
     }
 
 
