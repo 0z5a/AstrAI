@@ -323,7 +323,7 @@ def test_trainer_round_tail_empty_and_checkpoint_counts(tmp_path, monkeypatch):
         state_dict=checkpoint.state_dict,
         config=checkpoint.config,
         consumed_samples=5,
-        meta=checkpoint.meta,
+        meta={**checkpoint.meta, "consumed_samples": 5},
     )
     tail.save(tmp_path / "tail")
     builder = TrainContextBuilder(cfg).with_param_path(
