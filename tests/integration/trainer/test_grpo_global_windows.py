@@ -221,7 +221,9 @@ def _config(tmp_path, **extra):
         model_fn=_actor,
         dataset=torch.utils.data.TensorDataset(torch.arange(6)),
         optimizer_fn=lambda m: torch.optim.AdamW(m.parameters(), lr=0.001),
-        scheduler_fn=None,
+        scheduler_fn=lambda optimizer: torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda step: 1.0
+        ),
         device_type="cpu",
         dp_mode="none",
         batch_per_device=3,
@@ -238,7 +240,9 @@ def test_trainer_round_tail_empty_and_checkpoint_counts(tmp_path, monkeypatch):
         tmp_path, rl_microbatch_prompts=1, rl_minibatch_prompts=2, rl_update_epochs=2
     )
     executor = BaseExecutor()
-    model, optimizer, _ = executor.prepare(_actor, cfg.optimizer_fn)
+    model, optimizer, scheduler = executor.prepare(
+        _actor, cfg.optimizer_fn, cfg.scheduler_fn
+    )
     full = _batch(model, 6, 4)
     full["masks"].fill_(True)
     batches = [
@@ -262,6 +266,7 @@ def test_trainer_round_tail_empty_and_checkpoint_counts(tmp_path, monkeypatch):
     context = TrainContext(
         model=model,
         optimizer=optimizer,
+        scheduler=scheduler,
         executor=executor,
         config=cfg,
         strategy=strategy,
@@ -302,6 +307,7 @@ def test_trainer_round_tail_empty_and_checkpoint_counts(tmp_path, monkeypatch):
     assert probe.steps == list(range(1, 7))
     assert probe.rounds == [(4, 3), (6, 5), (6, 6)]
     assert context.metrics["empty_update"] == 1
+    assert context.scheduler.scheduler.last_epoch == 6
     for key, value in model.state_dict().items():
         torch.testing.assert_close(value, probe.before_empty[key], rtol=0, atol=0)
     for key, value in context.optimizer.state_dict()["state"].items():
