@@ -262,34 +262,43 @@ class TrainContextBuilder:
                     ),
                 )
             checkpoint = Checkpoint.load_any(self._param_path)
-            if checkpoint is None:
+            if checkpoint is None and (mapping is not None or self._resume):
                 raise FileNotFoundError(
                     f"No pretrained policy weights found in {self._param_path}"
                 )
-            if checkpoint.config:
-                checkpoint.config = adapt_config(checkpoint.config, self._param_path)
-            if checkpoint.state_dict:
-                checkpoint.state_dict = prepare_pretrained_weights(
-                    checkpoint.state_dict,
-                    ConfigFactory.load(checkpoint.config or state.model_config),
-                    mapping=mapping,
-                    strict=self._resume or not cfg.allow_partial_pretrained,
-                )
-            checkpoint.state_dict = strip_compile_prefix(checkpoint.state_dict)
-            state.state_dict = checkpoint.state_dict
-            state.model_config = checkpoint.config or state.model_config
-            if self._resume:
-                state.pretrained_metadata = dict(
-                    checkpoint.meta.get("pretrained", state.pretrained_metadata)
-                )
-                state.epoch = checkpoint.epoch
-                per_step = (
-                    cfg.batch_per_device * self._topology.dp_size * cfg.grad_accum_steps
-                )
-                state.consumed_samples = (
-                    checkpoint.consumed_samples // per_step * per_step
-                )
-                state.checkpoint = checkpoint
+            if checkpoint is not None:
+                if checkpoint.config:
+                    checkpoint.config = adapt_config(
+                        checkpoint.config, self._param_path
+                    )
+                if checkpoint.state_dict:
+                    checkpoint.state_dict = prepare_pretrained_weights(
+                        checkpoint.state_dict,
+                        ConfigFactory.load(checkpoint.config or state.model_config),
+                        mapping=mapping,
+                        strict=self._resume or not cfg.allow_partial_pretrained,
+                    )
+                checkpoint.state_dict = strip_compile_prefix(checkpoint.state_dict)
+                state.state_dict = checkpoint.state_dict
+                state.model_config = checkpoint.config or state.model_config
+                if self._resume:
+                    state.pretrained_metadata = dict(
+                        checkpoint.meta.get("pretrained", state.pretrained_metadata)
+                    )
+                    state.epoch = checkpoint.epoch
+                    per_step = (
+                        cfg.batch_per_device
+                        * self._topology.dp_size
+                        * cfg.grad_accum_steps
+                    )
+                    state.consumed_samples = (
+                        checkpoint.consumed_samples // per_step * per_step
+                    )
+                    state.checkpoint = checkpoint
+            else:
+                # param_path also supplies a tokenizer for factory-initialized
+                # native policies; no checkpoint was requested in this mode.
+                state.pretrained_metadata = {}
         if not state.model_config:
             model = cfg.model_fn()
             if hasattr(model, "config"):

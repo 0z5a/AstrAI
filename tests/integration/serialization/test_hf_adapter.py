@@ -862,11 +862,23 @@ def test_unmapped_hf_weights_require_an_explicit_exclusion(tmp_path, monkeypatch
             load()
 
 
-def test_pretrained_training_requires_weight_files(tmp_path, monkeypatch):
+def test_hf_pretrained_training_requires_weight_files(tmp_path, monkeypatch):
     cfg = make_tiny_config()
-    (tmp_path / "config.json").write_text(json.dumps(cfg.to_dict()))
+    (tmp_path / "config.json").write_text(json.dumps(LLAMA_RAW))
+    _write_mapping(tmp_path)
     with pytest.raises(FileNotFoundError, match="No pretrained policy weights"):
         _load_training_policy(tmp_path, cfg, monkeypatch)
+
+
+def test_native_factory_initialization_without_weights(tmp_path, monkeypatch):
+    cfg = make_tiny_config()
+    (tmp_path / "config.json").write_text(json.dumps(cfg.to_dict()))
+    context = _load_training_policy(tmp_path, cfg, monkeypatch)
+    assert context.model is not None
+    assert context.optimizer is not None
+    assert not context.pretrained_metadata
+    with pytest.raises(FileNotFoundError, match="No pretrained policy weights"):
+        _load_training_policy(tmp_path, cfg, monkeypatch, resume=True)
 
 
 def test_linear_attention_hf_weights_are_detected():

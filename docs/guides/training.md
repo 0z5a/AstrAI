@@ -348,6 +348,10 @@ default. Checkpoint metadata records the available source revision, mapping
 SHA-256, explicit exclusions, and adapter initialization; an unavailable source
 revision is recorded as `null`.
 
+For factory-initialized native training, `param_path` may supply only the native
+config/tokenizer directory. A directory declaring an HF mapping must contain
+policy weights, and resume always requires checkpoint weights.
+
 ## Training CLI
 
 ```bash
