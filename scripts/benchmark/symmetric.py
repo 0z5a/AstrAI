@@ -3,7 +3,7 @@
 Like the GEMM tile sweep, candidates bypass automatic planning, are checked
 against Torch, and are measured in interleaved order. CUDA Graph replay removes
 Python dispatch gaps. Exported rows can be passed to policy.newton_schulz.configure.
-Native heuristic scores rank geometry; paired timings evaluate their selection.
+Native model and legacy geometry scores rank candidates; paired timings evaluate both.
 """
 
 import argparse
@@ -155,22 +155,34 @@ def sweep(
         addend=beta != 0,
         device=x.device.index,
     )
-    validate_plan(
-        heuristic,
-        available,
+    geometry = kernel_plan(
         operation,
-        input_layout,
-        properties.shared_memory_per_block_optin,
+        *shape,
+        batch_size=batch_size,
+        input_layout=input_layout,
+        output_layout=output_layout,
+        addend=beta != 0,
+        device=x.device.index,
+        mode="geometry",
     )
+    for choice in (heuristic, geometry):
+        validate_plan(
+            choice,
+            available,
+            operation,
+            input_layout,
+            properties.shared_memory_per_block_optin,
+        )
     baseline_graph = capture(baseline)
     candidates = []
     for tile in available:
         candidate_rasters = [1] if operation == "syrk" else list(dict.fromkeys(rasters))
-        if (
-            heuristic.get("tile") == tile["name"]
-            and heuristic["raster"] not in candidate_rasters
-        ):
-            candidate_rasters.append(heuristic["raster"])
+        for choice in (heuristic, geometry):
+            if (
+                choice.get("tile") == tile["name"]
+                and choice["raster"] not in candidate_rasters
+            ):
+                candidate_rasters.append(choice["raster"])
         for raster in candidate_rasters:
             record = dict(
                 tile=tile["name"],
@@ -179,6 +191,10 @@ def sweep(
                 heuristic_selected=(
                     heuristic.get("tile") == tile["name"]
                     and heuristic.get("raster") == raster
+                ),
+                geometry_selected=(
+                    geometry.get("tile") == tile["name"]
+                    and geometry.get("raster") == raster
                 ),
             )
             if input_layout not in tile["input_layouts"]:
@@ -238,8 +254,11 @@ def sweep(
         speedup=best_speedup,
     )
     selected = next((row for row in valid if row["heuristic_selected"]), None)
+    geometry_selected = next((row for row in valid if row["geometry_selected"]), None)
     if heuristic and selected is None:
-        raise RuntimeError(f"heuristic candidate was not measured: {heuristic}")
+        raise RuntimeError(f"model candidate was not measured: {heuristic}")
+    if geometry and geometry_selected is None:
+        raise RuntimeError(f"geometry candidate was not measured: {geometry}")
     major, minor = torch.cuda.get_device_capability(x.device)
     measured = dict(
         operation=operation,
@@ -262,6 +281,12 @@ def sweep(
         beta=beta,
         candidates=candidates,
         heuristic=heuristic,
+        geometry=geometry,
+        geometry_measurement=(
+            comparison(geometry_selected, best_speedup)
+            if geometry_selected is not None
+            else None
+        ),
         heuristic_measurement=(
             comparison(selected, best_speedup) if selected is not None else None
         ),
@@ -334,6 +359,7 @@ def main() -> None:
                         if key != "candidates"
                     },
                     heuristic_measurement=row["heuristic_measurement"],
+                    geometry_measurement=row["geometry_measurement"],
                     best=row["best"],
                     torch_regret_vs_best_pct=row["torch_regret_vs_best_pct"],
                 )
@@ -345,7 +371,7 @@ def main() -> None:
         method="interleaved ABBA CUDA Graph, ten calls per replay",
         comparison="paired Torch speedup; best includes Torch",
         regret="relative slowdown in percent; versus Torch can be negative",
-        heuristic_score="geometry ranking proxy, not a latency prediction",
+        heuristic_score="wave-weighted work, not a latency prediction",
         dtype="bfloat16",
         rows=rows,
     )

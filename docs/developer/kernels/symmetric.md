@@ -59,12 +59,12 @@ flowchart LR
 The C++ module has three translation units: \`bindings.cu\` owns the pybind
 surface, \`entry.cu\` validates tensors and packs GEMM parameters, and
 \`kernels.cu\` owns the typed kernels, launch dispatch and their resource
-planner. Their declarations are private to \`symmetric/entry.h\`.
+planner. Their declarations are private to \`newton_schulz/entry.h\`.
 
 The kernel adapter forwards execution arguments and exposes candidate and plan
 metadata. The backend owns validation, operator registration and fallback. The
-policy owns measured-first hybrid dispatch; the optimizer has no tile, layout
-or shape-specific conditions.
+policy owns optional measured-row overrides and native planner selection; the
+optimizer has no tile, layout or shape-specific conditions.
 `op_backend(syrk="torch", symm="torch")` forces Torch through the shared
 operator registry. Explicit CUDA selection and the adapter allow candidate
 measurement without using automatic planning.
@@ -92,14 +92,14 @@ The two triangles use independent bounds so partial edge tiles remain correct.
 
 Plans are keyed by operation, compute capability, matrix dimensions,
 active addend, input/output layouts and batch size (default 1). Default dispatch
-first uses an exact measured row, including a row that selects Torch. An unlisted
-legal BF16 shape or batch size uses the shared GEMM geometry planner. Unsupported
-inputs, disabled runtime settings and geometries with no eligible compiled
-candidate retain Torch. Planning performs no online benchmark and does not
-claim that a heuristic CUDA choice is faster than Torch.
+uses the native NS resource cost model, with no built-in measured or Torch rows.
+Optional user-supplied rows take priority. Unsupported inputs, disabled runtime
+settings and geometries with no eligible compiled candidate retain Torch.
+Planning performs no online benchmark and does not claim that a heuristic
+CUDA choice is faster than Torch.
 
 Replacing rows with `configure(rows)` defaults to table-only dispatch: missing
-keys select Torch. Pass `heuristic=True` to retain geometry fallback. Calling
+keys select Torch. Pass `heuristic=True` to retain native model fallback. Calling
 `configure()` reads the table without changing either mode;
 `configure(heuristic=True)` changes only the fallback mode. Invalid rows leave
 both settings intact. `override(rows)` is table-only by default, and restores
@@ -107,11 +107,11 @@ both the previous rows and fallback mode on exit, including after an exception.
 
 ```python
 import json
-from astrai.extension.policy import symmetric as policy
+from astrai.extension.policy import newton_schulz as policy
 
 with open("symmetric-plan.json") as file:
     rows = json.load(file)
-policy.configure(rows, heuristic=True)  # measured rows, then geometry fallback
+policy.configure(rows, heuristic=True)  # measured rows, then native model fallback
 print(policy.probe("symm", X, output=out, addend=True))
 
 with policy.override(rows):  # temporarily use only these measured rows
@@ -120,7 +120,7 @@ with policy.override(rows):  # temporarily use only these measured rows
 # policy.configure([]) disables automatic CUDA selection.
 ```
 
-Builtin choices are cached by matrix metadata, alignment, runtime settings,
+Automatic choices are cached by matrix metadata, alignment, runtime settings,
 registry revision and policy revision. The cache owns callables rather than
 tensors and is bounded. Changing rows or the fallback mode, or restoring a
 scoped plan, refreshes selection. Context/process overrides and external
@@ -128,11 +128,10 @@ implementations bypass this cache, preserving per-call predicates. Device
 capability is cached separately; reduction and deterministic settings remain
 part of each decision.
 
-## Geometry planning
+## Native cost planning
 
 Symmetric operations reuse `geometry_cost` and `geometry_raster` from
-`include/launcher/gemm_cost.h`. The cost ranks five relative work proxies in
-log space; lower scores are preferred:
+`include/launcher/gemm_cost.h`. The legacy geometry cost ranks five relative work proxies in log space; lower scores are preferred:
 
 | Proxy | Work represented |
 | --- | --- |
@@ -149,7 +148,7 @@ thread count, shared-memory allocation and compiler-reported registers;
 register and local-memory counts are also exposed for inspection. Resource
 metadata is cached per typed kernel and device. It is queried without launching
 or timing a candidate. Scores are relative ranking values, not absolute time
-predictions or a comparison against Torch latency. The geometry planner ranks
+predictions or a comparison against Torch latency. The native model ranks
 eligible shared-GEMM candidates; the separate WMMA candidate remains available
 for explicit calls and measured rows.
 
@@ -170,17 +169,25 @@ input `[m, n]`. For `Q = ceil(n / block_m) * ceil(m / block_n)`, it launches
 cells rather than padded tile areas. Batch size increases the grid and changes
 occupancy waves; it does not multiply the average bytes per CTA. Input/output
 layouts select their actual kernel variant and resource usage, while SYMM
-uses the shared raster heuristic.
+selects a raster using the operand footprint relative to device L2;
+`mode="geometry"` retains the previous raster rule.
 
-`kernel.newton_schulz.plan` inspects this geometry decision from integer metadata;
+`kernel.newton_schulz.plan` inspects the default model decision from integer metadata;
 it does not consult measured rows. It returns the selected tile/raster and
-ranked candidates, with `score`, `blocks`, `resident_ctas`, `registers`,
-`local_bytes` and `shared_memory`. An empty dictionary means no recipe is
+ranked candidates, with `source`, `score`, `geometry_score`, `model_score`,
+CTA blocks and waves, K steps, MMA/load/epilogue work, and register, shared and
+local-memory resources. The model uses the compiled kernel's register and shared
+memory limits to determine resident CTAs. It ranks wave-weighted input,
+epilogue and one read/write of allocated local memory per thread; local memory
+is a cost, not a disqualification. Equal work favors fewer K iterations.
+SYRK triangular blocks and valid epilogue cells are counted directly. Use
+`mode="geometry"` to inspect the previous ordering and raster; the result
+shape and existing fields are the same. An empty dictionary means no recipe is
 eligible. Returned dictionaries are independent copies of cached metadata.
-For automatic dispatch including measured rows, use `policy.probe` instead.
+For automatic dispatch including optional configured rows, use `policy.probe` instead.
 
 ```python
-from astrai.extension.kernel import symmetric as kernel
+from astrai.extension.kernel import newton_schulz as kernel
 
 metadata = kernel.plan(
     "symm", rows=ROWS, cols=COLS, batch_size=BATCH_SIZE,
@@ -201,8 +208,8 @@ ABBA order. Each Graph replay contains ten calls. Candidates with excessive
 shared memory or unsupported input layouts are reported as skipped. Incorrect
 results fail the sweep.
 Only candidates beating Torch by the configured margin become CUDA plan rows.
-The report also marks the geometry-selected candidate and records its paired
-measurement, so a relative score can be checked against observed timings.
+The report marks both model- and geometry-selected candidates and records
+their paired measurements, so relative costs can be checked against timings.
 
 ```bash
 python scripts/benchmark/symmetric.py --operation syrk --list
@@ -221,3 +228,5 @@ Replace angle-bracket placeholders before running these commands. Sweep files
 are measurement artifacts rather than checked-in benchmark data.
 A faster individual kernel must also pass the complete recurrence benchmark
 before selecting it for optimizer use.
+A shape-held-out [cost-model validation report](../../reports/ns-dispatch-cost-2026-10-08.md)
+records one measured device and the architecture compile coverage.

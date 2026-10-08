@@ -1,9 +1,4 @@
-"""Measured and geometry plans for Newton-Schulz matrix operations, independent of optimizers.
-
-Exact measured rows take precedence over the generic geometry heuristic. Sweep
-results can replace the table without rebuilding CUDA kernels. Plan keys describe
-operation, device capability and matrix metadata; no model names participate.
-"""
+"""Optional measured plans and native Newton-Schulz matrix planning."""
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -25,215 +20,6 @@ class Plan:
 
 
 Key = Tuple[str, int, int, int, bool, str, str, int]
-# Seeded by interleaved CUDA-event measurements; configure() can replace them.
-_DEFAULT_ROWS = [
-    {
-        "operation": "syrk",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 1536,
-        "addend": False,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "64x64x32_W16x32_S2",
-        "raster": 1,
-    },
-    {
-        "operation": "syrk",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 6912,
-        "addend": False,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "64x64x32_W16x32_S3",
-        "raster": 1,
-    },
-    {
-        "operation": "syrk",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 1536,
-        "addend": True,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "64x64x32_W16x32_S2",
-        "raster": 1,
-    },
-    {
-        "operation": "symm",
-        "cc": 120,
-        "rows": 256,
-        "cols": 1536,
-        "addend": True,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "32x32x32_W16x16_S2",
-        "raster": 0,
-    },
-    {
-        "operation": "symm",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 6912,
-        "addend": True,
-        "input_layout": "row",
-        "output_layout": "column",
-        "backend": "cuda",
-        "tile": "128x128x32_W32x32_S2",
-        "raster": -2,
-    },
-    {
-        "operation": "syrk",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 1536,
-        "addend": False,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "128x128x32_W32x32_S2",
-        "raster": 1,
-        "batch_size": 4,
-    },
-    {
-        "operation": "syrk",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 6912,
-        "addend": False,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "128x128x32_W32x32_S2",
-        "raster": 1,
-        "batch_size": 4,
-    },
-    {
-        "operation": "syrk",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 1536,
-        "addend": True,
-        "batch_size": 4,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "128x128x32_W32x32_S2",
-        "raster": 1,
-    },
-    {
-        "operation": "symm",
-        "cc": 120,
-        "rows": 256,
-        "cols": 1536,
-        "addend": True,
-        "batch_size": 4,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "64x64x32_W16x32_S2",
-        "raster": 0,
-    },
-    {
-        "operation": "symm",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 6912,
-        "addend": True,
-        "batch_size": 4,
-        "input_layout": "row",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "128x128x32_W32x32_S2",
-        "raster": -2,
-    },
-    {
-        "operation": "symm",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 6912,
-        "addend": True,
-        "batch_size": 4,
-        "input_layout": "column",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "128x128x32_W32x32_S2",
-        "raster": -2,
-    },
-    {
-        "operation": "symm",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 6912,
-        "addend": True,
-        "batch_size": 4,
-        "input_layout": "row",
-        "output_layout": "column",
-        "backend": "cuda",
-        "tile": "128x128x32_W32x32_S2",
-        "raster": -1,
-    },
-    {
-        "operation": "syrk",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 6912,
-        "addend": False,
-        "batch_size": 1,
-        "input_layout": "column",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "64x64x64_W16x16_S2",
-        "raster": 1,
-    },
-    {
-        "operation": "syrk",
-        "cc": 120,
-        "rows": 1536,
-        "cols": 6912,
-        "addend": False,
-        "batch_size": 4,
-        "input_layout": "column",
-        "output_layout": "row",
-        "backend": "cuda",
-        "tile": "128x128x64_W64x32_S2",
-        "raster": 1,
-    },
-]
-
-# Exact Torch winners from the same tile sweep; no global size threshold.
-_DEFAULT_ROWS += [
-    {
-        "operation": operation,
-        "cc": 120,
-        "rows": rows,
-        "cols": cols,
-        "addend": addend,
-        "batch_size": batch,
-        "input_layout": input_layout,
-        "output_layout": "row",
-        "backend": "torch",
-    }
-    for operation, rows, cols, addend, batch, input_layout in (
-        ("syrk", 192, 384, False, 4, "row"),
-        ("syrk", 192, 192, True, 4, "row"),
-        ("syrk", 256, 256, False, 4, "row"),
-        ("syrk", 256, 256, True, 4, "row"),
-        ("syrk", 256, 1536, False, 4, "row"),
-        ("symm", 1536, 1536, True, 4, "row"),
-        ("syrk", 256, 256, False, 1, "row"),
-        ("syrk", 256, 256, True, 1, "row"),
-        ("syrk", 256, 1536, False, 1, "row"),
-        ("symm", 1536, 1536, True, 1, "row"),
-        ("symm", 1536, 6912, True, 1, "row"),
-        ("symm", 1536, 6912, True, 1, "column"),
-    )
-]
 
 
 def _key(row: Mapping[str, Any]) -> Key:
@@ -251,11 +37,8 @@ def _key(row: Mapping[str, Any]) -> Key:
 
 _revision = 0
 _heuristic = True
-_rows: List[Dict[str, Any]] = [dict(row) for row in _DEFAULT_ROWS]
-_plans: Dict[Key, Plan] = {
-    _key(row): Plan(row["backend"], row.get("tile"), row.get("raster", 1))
-    for row in _rows
-}
+_rows: List[Dict[str, Any]] = []
+_plans: Dict[Key, Plan] = {}
 
 
 def configure(
@@ -268,7 +51,7 @@ def configure(
     Every row has operation, cc, rows, cols and backend. Optional fields include
     addend, tile, raster, input/output layout and batch_size (default 1).
     Replacing rows defaults to table-only dispatch; heuristic=True enables
-    geometry fallback for missing keys. A matching Torch row always wins.
+    native model fallback for missing keys. A matching Torch row always wins.
     With no arguments, the current table and dispatch mode are unchanged.
     Duplicate keys are errors, and failed validation leaves both modes intact.
     """
@@ -419,7 +202,7 @@ def probe(
     input_layout: Optional[str] = None,
     output_layout: Optional[str] = None,
 ) -> Plan:
-    """Inspect a measured or geometry decision without launching a kernel."""
+    """Inspect a measured or modeled decision without launching a kernel."""
     if operation not in ("syrk", "symm"):
         raise ValueError("operation must be syrk or symm")
     if not supports(x) or (output is not None and not supports(output)):

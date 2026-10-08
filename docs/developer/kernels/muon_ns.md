@@ -22,13 +22,14 @@ operator overrides retain the Python iteration fallback.
 
 The NS backend resolves the three [symmetric operations](symmetric.md) once
 before its loop, using separate dispatch decisions for the Gram matrix,
-polynomial and final update. Default automatic dispatch prefers exact measured
-rows, then uses the shared GEMM geometry planner for unlisted legal BF16
-shapes, layouts and batch sizes. Unsupported inputs retain Torch operations.
-Geometry planning uses actual kernel resources and corrected triangular, batch
-and partial-tile traffic; its five relative work proxies do not predict absolute
+polynomial and final update. Default automatic dispatch uses the native NS
+resource cost model for legal BF16 shapes, layouts and batch sizes. Optional
+user-supplied plan rows override it. Unsupported inputs retain Torch operations.
+Native planning uses actual kernel residency and wave-weighted input,
+epilogue and local-memory traffic. It counts triangular SYRK blocks and
+partial-tile output traffic; its relative work does not predict absolute
 execution time. It performs no online benchmark. See the
-[dispatch and planning contract](symmetric.md#geometry-planning).
+[dispatch and planning contract](symmetric.md#native-cost-planning).
 
 ```python
 from astrai.extension import newton_schulz
@@ -111,8 +112,8 @@ includes dispatch gaps. Header shape counts produce a weighted NS estimate.
 This excludes momentum, parameter updates, AdamW and model forward/backward,
 so it is not an end-to-end training speedup. Plan files may combine unique
 rows from the SYRK and SYMM sweeps. Supplying a plan makes the benchmark
-use table-only dispatch; without a supplied plan it evaluates the default
-measured-first hybrid policy. Inspect `kernel.newton_schulz.plan` to see geometry
+use table-only dispatch; without a supplied plan it evaluates the native
+cost model. Inspect `kernel.newton_schulz.plan` to see model
 candidates without running the benchmark, or `policy.newton_schulz.probe` to see
 the automatic decision for an existing tensor.
 
@@ -148,7 +149,7 @@ recurrence using the same five coefficient triples, produced relative L2 errors 
 input. Both exceed the accuracy gate, so this approach remains excluded.
 
 Column-major Gram plans are measured separately for each batch size. Missing
-legal keys use geometry fallback in hybrid mode, while table-only mode retains
+legal keys use native model fallback in hybrid mode, while table-only mode retains
 Torch for missing keys. Batch size changes dispatch metadata and scheduling
 waves without changing the recurrence. Candidate tile or pipeline changes
 require measurement before becoming exact measured rows.

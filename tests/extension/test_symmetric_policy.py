@@ -230,6 +230,9 @@ def test_native_adapter_caches_metadata_and_returns_independent_candidates(monke
         assert requests == [query]
         kernel.plan(*query[:-1], device=0)
         assert len(requests) == 2
+        kernel.plan(*query, mode="geometry")
+        assert requests[-1] == (*query, "geometry")
+        assert len(requests) == 3
     finally:
         kernel._plan.cache_clear()
 
@@ -308,6 +311,20 @@ def _assert_native_geometry(operation, x, output, addend):
     decision = plan.probe(operation, x, output=output, addend=addend)
     assert decision == plan.Plan("cuda", metadata["tile"], metadata["raster"])
     assert metadata["score"] == min(row["score"] for row in metadata["candidates"])
+    assert metadata["source"] == "model"
+    previous = kernel.plan(
+        operation,
+        rows,
+        cols,
+        batch,
+        input_layout,
+        output_layout,
+        addend,
+        x.device.index,
+        mode="geometry",
+    )
+    assert previous["source"] == "geometry"
+    assert previous["score"] == previous["geometry_score"]
     vocabulary = {tile["name"]: tile for tile in kernel.tiles(operation)}
     device = torch.cuda.get_device_properties(x.device)
     tails = []
@@ -318,6 +335,23 @@ def _assert_native_geometry(operation, x, output, addend):
         assert candidate["resident_ctas"] > 0
         assert candidate["registers"] > 0
         assert candidate["local_bytes"] >= 0
+        assert candidate["k_steps"] > 0
+        assert candidate["waves"] > 0
+        assert candidate["load_bytes"] > 0
+        assert candidate["mma_instructions"] > 0
+        assert candidate["epilogue_bytes"] > 0
+        assert candidate["local_traffic_bytes"] == (
+            2 * candidate["local_bytes"] * tile["threads"]
+        )
+        assert candidate["model_score"] == pytest.approx(
+            candidate["waves"]
+            * (
+                candidate["load_bytes"]
+                + candidate["epilogue_bytes"]
+                + candidate["local_traffic_bytes"]
+            )
+        )
+        assert math.isfinite(candidate["geometry_score"])
         assert 0 < candidate["shared_memory"] <= device.shared_memory_per_block_optin
         if operation == "syrk":
             assert tile["block_m"] == tile["block_n"]

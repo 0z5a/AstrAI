@@ -29,10 +29,20 @@ def _plan(
     output_layout: str,
     addend: bool,
     device: int,
+    mode: str,
 ) -> Dict[str, Any]:
-    return get_module("newton_schulz").plan(
-        operation, rows, cols, batch_size, input_layout, output_layout, addend, device
+    args = (
+        operation,
+        rows,
+        cols,
+        batch_size,
+        input_layout,
+        output_layout,
+        addend,
+        device,
     )
+    module = get_module("newton_schulz")
+    return module.plan(*args) if mode == "model" else module.plan(*args, mode)
 
 
 def plan(
@@ -44,11 +54,13 @@ def plan(
     output_layout: str = "row",
     addend: bool = False,
     device: int = 0,
+    mode: str = "model",
 ) -> Dict[str, Any]:
-    """Inspect a cached geometry decision without allocating or launching tensors.
+    """Inspect a cached native tile decision without allocating or launching tensors.
 
     Device ordinals and matrix metadata fully determine a decision. Returned
-    resource and candidate dictionaries are independent copies of cached data.
+    Resource and candidate dictionaries are independent copies of cached data.
+    Mode is "model" by default; "geometry" reproduces the previous ranking.
     An empty result means no compiled recipe is eligible.
     """
     return deepcopy(
@@ -61,6 +73,7 @@ def plan(
             output_layout,
             addend,
             device,
+            mode,
         )
     )
 
@@ -75,14 +88,8 @@ def syrk_out(
     tile: Optional[str] = None,
 ) -> None:
     """Write alpha * X X.T + beta * C; C must be fully symmetric."""
-    get_module("newton_schulz").syrk_out(
-        x,
-        output,
-        addend,
-        alpha,
-        beta,
-        tile or ("64x64x32_W16x32_S2" if x.is_contiguous() else "64x64x64_W16x32_S2"),
-    )
+    options = {} if tile is None else {"tile": tile}
+    get_module("newton_schulz").syrk_out(x, output, addend, alpha, beta, **options)
 
 
 def symm_out(
@@ -97,8 +104,11 @@ def symm_out(
     raster: int = 1,
 ) -> None:
     """Write alpha * S X + beta * C; S must be fully symmetric."""
+    options = {"raster": raster}
+    if tile is not None:
+        options["tile"] = tile
     get_module("newton_schulz").symm_out(
-        symmetric, x, output, addend, alpha, beta, tile or "64x64x32_W16x32_S2", raster
+        symmetric, x, output, addend, alpha, beta, **options
     )
 
 

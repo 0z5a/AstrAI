@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "entry.h"
+#include "cost.h"
 
 namespace {
 
@@ -234,7 +235,7 @@ bool dispatch_layout(const std::string& tile, GemmParams p,
 // register counts and shared-memory allocation. No timing or launch is used.
 template <bool RankK, bool ColumnInput, bool ColumnOutput, size_t I = 0>
 void append_plans(std::vector<std::pair<double, py::dict>>& rows,
-                  const PlanQuery& q, bool addend) {
+                  const PlanQuery& q, bool addend, const std::string& mode) {
     if constexpr (I < std::tuple_size_v<Tiles>) {
         using Tile = std::tuple_element_t<I, Tiles>;
         if constexpr (!std::is_same_v<Tile, NarrowSymmTile> &&
@@ -251,7 +252,7 @@ void append_plans(std::vector<std::pair<double, py::dict>>& rows,
             const double mt = std::ceil((double)q.m / r.bm);
             const double nt = std::ceil((double)q.n / r.bn);
             if (!RankK && mt > 65535)
-                return append_plans<RankK, ColumnInput, ColumnOutput, I + 1>(rows, q, addend);
+                return append_plans<RankK, ColumnInput, ColumnOutput, I + 1>(rows, q, addend, mode);
             const double blocks = q.batch * (RankK ? mt * (mt + 1) / 2 : mt * nt);
             // Average valid epilogue traffic, including partial edge tiles.
             // Diagonal CTAs read a complete valid square before mirroring.
@@ -264,13 +265,27 @@ void append_plans(std::vector<std::pair<double, py::dict>>& rows,
                     cells += ((double)q.m * q.n + diagonal) / 2;
                 } else cells *= 2;
             }
-            const double score = geometry_cost(r, q, resource.resident, blocks,
-                (double)q.out_elem_bytes * cells / grid);
+            const auto cost = astrai::newton_schulz::cost_of(
+                r, q, resource, blocks, (double)q.out_elem_bytes * cells / grid);
+            const double score = mode == "model" ? cost.model : cost.geometry;
             if (std::isfinite(score)) {
                 py::dict row;
                 row["tile"] = tile_name<Tile>();
-                row["raster"] = RankK ? 1 : std::clamp(geometry_raster(q, r.bm, r.bn), -32, 32);
+                const double operands = static_cast<double>(q.k) *
+                    (static_cast<double>(q.m) * q.ba + static_cast<double>(q.n) * q.bb);
+                const bool cache_resident = operands <= 0.7 * q.dev.l2_bytes;
+                row["raster"] = RankK ? 1 : (mode == "model" && cache_resident ? 0 :
+                    std::clamp(geometry_raster(q, r.bm, r.bn), -32, 32));
                 row["score"] = score; row["blocks"] = blocks;
+                row["source"] = mode;
+                row["geometry_score"] = cost.geometry;
+                row["model_score"] = cost.model;
+                row["waves"] = cost.waves;
+                row["k_steps"] = cost.k_steps;
+                row["load_bytes"] = cost.load_bytes;
+                row["mma_instructions"] = cost.mma_instructions;
+                row["epilogue_bytes"] = cost.epilogue_bytes;
+                row["local_traffic_bytes"] = cost.local_traffic_bytes;
                 row["resident_ctas"] = resource.resident;
                 row["registers"] = resource.registers;
                 row["local_bytes"] = resource.local_bytes;
@@ -278,15 +293,18 @@ void append_plans(std::vector<std::pair<double, py::dict>>& rows,
                 rows.emplace_back(score, std::move(row));
             }
         }
-        append_plans<RankK, ColumnInput, ColumnOutput, I + 1>(rows, q, addend);
+        append_plans<RankK, ColumnInput, ColumnOutput, I + 1>(rows, q, addend, mode);
     }
 }
 
 py::dict plan_impl(std::string operation, int64_t rows, int64_t cols, int64_t batch_size,
-              std::string input_layout, std::string output_layout, bool addend, int device) {
+              std::string input_layout, std::string output_layout, bool addend, int device,
+              std::string mode) {
     TORCH_CHECK(operation == "syrk" || operation == "symm", "operation must be syrk or symm");
     TORCH_CHECK((input_layout == "row" || input_layout == "column") &&
                 (output_layout == "row" || output_layout == "column"), "invalid matrix layout");
+    TORCH_CHECK(mode == "model" || mode == "geometry",
+                "planner mode must be model or geometry");
     // Match the public BF16 domain, with overflow-safe product limits.
     const int64_t limit = std::numeric_limits<int>::max();
     if (rows < 64 || cols < 64 || rows % 64 || cols % 64 ||
@@ -307,18 +325,25 @@ py::dict plan_impl(std::string operation, int64_t rows, int64_t cols, int64_t ba
     std::vector<std::pair<double, py::dict>> ranked;
     const bool column_input = input_layout == "column", column_output = output_layout == "column";
     if (operation == "syrk") {
-        if (column_input) append_plans<true, true, false>(ranked, q, addend);
-        else append_plans<true, false, false>(ranked, q, addend);
+        if (column_input) append_plans<true, true, false>(ranked, q, addend, mode);
+        else append_plans<true, false, false>(ranked, q, addend, mode);
     } else if (column_input) {
-        if (column_output) append_plans<false, true, true>(ranked, q, addend);
-        else append_plans<false, true, false>(ranked, q, addend);
+        if (column_output) append_plans<false, true, true>(ranked, q, addend, mode);
+        else append_plans<false, true, false>(ranked, q, addend, mode);
     } else {
-        if (column_output) append_plans<false, false, true>(ranked, q, addend);
-        else append_plans<false, false, false>(ranked, q, addend);
+        if (column_output) append_plans<false, false, true>(ranked, q, addend, mode);
+        else append_plans<false, false, false>(ranked, q, addend, mode);
     }
     if (ranked.empty()) return py::dict();
     std::stable_sort(ranked.begin(), ranked.end(),
-        [](const auto& a, const auto& b) { return a.first < b.first; });
+        [&mode](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first < b.first;
+            // Equal byte work favors fewer K-loop iterations without a
+            // tuned loop penalty. Geometry mode keeps its original tie order.
+            return mode == "model" &&
+                   py::cast<double>(a.second["k_steps"]) <
+                   py::cast<double>(b.second["k_steps"]);
+        });
     py::dict result = ranked.front().second.attr("copy")();
     py::list candidates;
     for (const auto& entry : ranked) candidates.append(entry.second);
@@ -374,9 +399,10 @@ void launch_symm(gemm::GemmParams p, const c10::optional<torch::Tensor>& addend,
 }
 
 py::dict plan(std::string operation, int64_t rows, int64_t cols, int64_t batch_size,
-              std::string input_layout, std::string output_layout, bool addend, int device) {
+              std::string input_layout, std::string output_layout, bool addend, int device,
+              std::string mode) {
     return plan_impl(operation, rows, cols, batch_size, input_layout, output_layout,
-                     addend, device);
+                     addend, device, mode);
 }
 
 py::list tiles(std::string operation) {
