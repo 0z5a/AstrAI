@@ -214,7 +214,9 @@ Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
 `rollout_enable_overlap=True` enables the native collector's depth-two
 submit/commit loop for complete batches, on both colocated and replica
 backends. It reuses the serving driver's device token relay and pinned copy
-slots; frequency penalties, batch-identity changes, KV extension failures
+slots. Batch request IDs preserve input order so the prefill row sort cannot
+randomly reassign sampling draws to responses. It also reuses
+frequency penalties, batch-identity changes, KV extension failures
 and token limits use its drain/replan rules. All requests finish and resources
 drain before a rollout returns or a policy update can publish. CPU uses
 synchronous tensor commits and provides no hardware overlap.
