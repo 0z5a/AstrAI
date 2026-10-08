@@ -18,11 +18,12 @@ from tests.support.tokenizers import FakeTokenizer
 )
 @pytest.mark.parametrize("concurrency", [32, 64, 128, 256])
 @pytest.mark.parametrize("graphs", [False, True])
-def test_grouped_overlap_gpu_parity_and_dispatch(tmp_path, concurrency, graphs):
+@pytest.mark.parametrize("seeded", [False, True])
+def test_grouped_overlap_gpu_parity_and_dispatch(tmp_path, concurrency, graphs, seeded):
     torch.manual_seed(3407)
     source = make_cpu_model().to(device="cuda", dtype=torch.bfloat16)
     tokenizer = FakeTokenizer(with_chat_template=True)
-    tokenizer.stop_ids = []
+    tokenizer.stop_ids = list(range(64)) if seeded else []
     group = 4
     outputs, evidence = [], []
     for overlap in (False, True):
@@ -40,7 +41,12 @@ def test_grouped_overlap_gpu_parity_and_dispatch(tmp_path, concurrency, graphs):
             ColocatedBackend(scheduler),
             tokenizer,
             SamplingParams(
-                group_size=group, max_tokens=8, temperature=1, top_p=1, top_k=0
+                group_size=group,
+                max_tokens=8,
+                temperature=1,
+                top_p=1,
+                top_k=0,
+                seed=118 if seeded else None,
             ),
         )
         batch = {
@@ -81,6 +87,10 @@ def test_grouped_overlap_gpu_parity_and_dispatch(tmp_path, concurrency, graphs):
                     "overlap": overlap,
                     "graphs": graphs,
                     "concurrency": concurrency,
+                    "request_seeded": seeded,
+                    "stop_responses": sum(
+                        reason == "stop" for row in raw.finish_reasons for reason in row
+                    ),
                     "collection_seconds": elapsed,
                     "output_tokens": raw.response_mask.sum().item(),
                     "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -100,4 +110,10 @@ def test_grouped_overlap_gpu_parity_and_dispatch(tmp_path, concurrency, graphs):
     )
     assert outputs[0].finish_reasons == outputs[1].finish_reasons
     assert outputs[0].policy_version == outputs[1].policy_version == 0
+    if seeded:
+        lengths = outputs[0].response_mask.sum(-1)
+        assert lengths.min() < lengths.max()
+        assert any(
+            reason == "stop" for row in outputs[0].finish_reasons for reason in row
+        )
     (tmp_path / "collector-evidence.json").write_text(json.dumps(evidence, indent=2))

@@ -308,6 +308,11 @@ _SPECS = [
         help="Use the native submit/commit rollout pipeline.",
     ),
     OptSpec(
+        "rollout_seed",
+        "Algorithm",
+        help="Seed sampling independently per prompt, version and response.",
+    ),
+    OptSpec(
         "rollout_max_policy_lag",
         "Algorithm",
         help="Maximum accepted rollout/live policy-version gap.",
@@ -685,6 +690,7 @@ def train(
 
     rollout_interval = kwargs.pop("rollout_interval", 512)
     rollout_enable_overlap = kwargs.pop("rollout_enable_overlap", False)
+    rollout_seed = kwargs.pop("rollout_seed", None)
     rollout_max_policy_lag = kwargs.pop("rollout_max_policy_lag", None)
     rollout_temperature = kwargs.pop("rollout_temperature", 0.7)
     rollout_top_k = kwargs.pop("rollout_top_k", 0)
@@ -866,6 +872,7 @@ def train(
         collate_fn=collate_fn,
         rollout_interval=rollout_interval,
         rollout_enable_overlap=rollout_enable_overlap,
+        rollout_seed=rollout_seed,
         rollout_max_policy_lag=rollout_max_policy_lag,
         rollout_temperature=rollout_temperature,
         rollout_top_k=rollout_top_k,

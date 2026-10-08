@@ -33,6 +33,7 @@ from astrai.inference.core.request import (
 )
 from astrai.inference.core.stepper import SchedulerStep
 from astrai.inference.core.versioning import PolicyVersionGuard
+from astrai.inference.sampling_rng import validate_seed
 from astrai.inference.worker.model_runner import GPUModelRunner
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
@@ -509,7 +510,13 @@ class Scheduler:
         rep_window: int = 64,
         return_logprobs: bool = False,
         return_details: bool = False,
+        request_seeds: Optional[List[int]] = None,
     ) -> List[Any]:
+        if request_seeds is not None:
+            if len(request_seeds) != len(prompt_ids_list):
+                raise ValueError("one sampling seed is required per request")
+            for seed in request_seeds:
+                validate_seed(seed)
         self._stop_ids = frozenset(self._requests.tokenizer.stop_ids)
         requests, errors = [], []
         backend = get_backend(use_default=False)
@@ -539,6 +546,9 @@ class Scheduler:
                     frequency_penalty,
                     rep_window,
                     backend,
+                    sampling_seed=request_seeds[index]
+                    if request_seeds is not None
+                    else None,
                 )
                 if not self._kv_manager.alloc_slots(
                     request.request_id, request.prompt_ids

@@ -5,6 +5,7 @@ from copy import deepcopy
 import pytest
 import torch
 
+from astrai.inference.sampling_rng import request_seed, sampling_uniform
 from astrai.trainer.backend import ColocatedBackend, ReplicaBackend
 from astrai.trainer.rollout import RolloutGenerator, SamplingParams
 from tests.support.inference import make_cpu_model, make_cpu_scheduler
@@ -235,3 +236,85 @@ def test_explicit_head_dimension_real_kv_matches_full_forward(overlap):
         _assert_drained(scheduler)
     finally:
         scheduler.stop()
+
+
+@pytest.mark.parametrize("group", [2, 4, 8])
+@pytest.mark.parametrize("budget", [None, 16])
+def test_request_seeded_variable_eos_survives_overlap_compaction_and_reordering(
+    group, budget, monkeypatch
+):
+    torch.manual_seed(3407)
+    source = make_cpu_model()
+    tokenizer = FakeTokenizer(with_chat_template=True)
+    tokenizer.stop_ids = list(range(64))
+    prompts = ["a", "abcd", "xyz", "longer"]
+    results, lengths = [], []
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("seeded requests must not consume shared RNG")
+
+    monkeypatch.setattr(torch, "multinomial", forbidden)
+    for overlap, order in (
+        (False, [0, 1, 2, 3]),
+        (True, [3, 1, 0, 2]),
+    ):
+        scheduler = make_cpu_scheduler(
+            deepcopy(source),
+            tokenizer,
+            max_batch_size=group * 4,
+            enable_overlap=overlap,
+            max_seq_len=64,
+            token_budget=budget,
+        )
+        generator = RolloutGenerator(
+            ColocatedBackend(scheduler),
+            tokenizer,
+            SamplingParams(group_size=group, max_tokens=12, seed=118),
+        )
+        try:
+            raw = generator.generate({"instruction": [prompts[i] for i in order]})
+            result = {}
+            for row, index in enumerate(order):
+                result[index] = []
+                for response in range(group):
+                    mask = raw.response_mask[row, response]
+                    n = mask.sum().item()
+                    lengths.append(n)
+                    result[index].append(
+                        (
+                            raw.responses[row, response][mask].tolist(),
+                            raw.logprobs_old[row, response][mask].tolist(),
+                            raw.finish_reasons[row][response],
+                        )
+                    )
+            results.append(result)
+            _assert_drained(scheduler)
+        finally:
+            scheduler.stop()
+    assert min(lengths) < max(lengths)
+    assert any(item[2] == "stop" for group in results[0].values() for item in group)
+    for index in range(4):
+        for baseline, candidate in zip(results[0][index], results[1][index]):
+            assert baseline[0] == candidate[0]
+            assert baseline[2] == candidate[2]
+            torch.testing.assert_close(
+                torch.tensor(baseline[1]),
+                torch.tensor(candidate[1]),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+
+
+def test_sampling_seed_and_position_are_stable_without_request_identity():
+    seed = request_seed(118, 7, [1, 2, 3], 0)
+    assert seed != request_seed(118, 7, [1, 2, 3], 1)
+    assert seed != request_seed(118, 8, [1, 2, 3], 0)
+    draws = [sampling_uniform(seed, position) for position in range(256)]
+    assert all(0 < draw < 1 for draw in draws)
+    assert len(set(draws)) == 256
+    assert draws == [sampling_uniform(seed, position) for position in range(256)]
+    assert 0.4 < sum(draws) / len(draws) < 0.6
+    with pytest.raises(ValueError, match="seed"):
+        sampling_uniform(True, 0)
+    with pytest.raises(ValueError, match="position"):
+        sampling_uniform(seed, -1)

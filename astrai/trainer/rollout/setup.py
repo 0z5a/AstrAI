@@ -127,6 +127,7 @@ def configure_rollout(
             temperature=cfg.rollout_temperature,
             top_k=cfg.rollout_top_k,
             top_p=cfg.rollout_top_p,
+            seed=getattr(cfg, "rollout_seed", None),
         ),
         output_device=train_device,
     )
