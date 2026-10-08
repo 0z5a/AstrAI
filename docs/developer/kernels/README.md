@@ -15,6 +15,7 @@ maps to one family of translation units under `csrc/` (headers live in the `csrc
 | `attn_prefill` | `attention/prefill.cu` | GQA prefill attention (split-Q) |
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
+| `symmetric` | `symmetric.cu` | Generic BF16 SYRK/SYMM with measured tile dispatch |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
 | `quantize` | `quantize/bindings.cu` + `quantize/entry.cu` | FP8 quantization kernels (sm_89+) |
 | `gemm` | `gemm/gemm.cu` + per-dtype-pair `gemm_*.cu` | dtype-generic tensor-core GEMM binding + one explicit `gemm_dispatch` instantiation per dtype pair (fp8 / W8A16 / W8A8 / W16A16, sm_89+) |
@@ -30,6 +31,8 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 | Operator | Doc | Kernel module | Python entry |
 |---|---|---|---|
+| SYRK / SYMM | [symmetric.md](symmetric.md) | `csrc/symmetric/` | `astrai/extension/backend/symmetric.py`; adapter `astrai/extension/kernel/symmetric.py` |
+| Muon Newton-Schulz | [muon_ns.md](muon_ns.md) | SYRK/SYMM or Torch | `astrai/extension/backend/newton_schulz.py` |
 | Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (bindings + entry; headers: `csrc/include/`) | `astrai/extension/kernel/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
 | GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/kernel/gemm.py` |
 | Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (module `attention`; headers: `csrc/include/`) | `astrai/extension/kernel/attention.py`; dispatch `astrai/extension/backend/attention.py` |
@@ -407,6 +410,11 @@ csrc/
 │   ├── plan_table.h                 #   private row contract shared by the host planner TUs
 │   ├── gemm_*.cu                    #   per-pair explicit instantiations, compiled per schedule
 │   └── plan_table_builtin.cpp      #   generated measured and degraded rows
+├── symmetric/                        # BF16 SYRK/SYMM (→ module symmetric)
+│   ├── bindings.cu                   #   pybind surface
+│   ├── entry.cu                      #   tensor validation and GEMM parameter packing
+│   ├── entry.h                       #   private host/launcher declarations
+│   └── kernels.cu                    #   typed CUDA kernels, launch dispatch and resource planning
 ├── quantize/                         # family translation units (→ module quantize; entry.cu also compiled into gemm to share the chain)
 │   ├── bindings.cu                   #   pybind surface only (quantize / quantize_dual)
 │   └── entry.cu                      #   the entry implementation: run_quantize + ring binding + dtype dispatch (ASTRAI_QUANT_IN_DTYPES lives here)
