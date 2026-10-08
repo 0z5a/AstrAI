@@ -16,6 +16,11 @@ from astrai.config import TrainConfig
 from astrai.model import AutoRegressiveLM
 from astrai.trainer.optional_extras import checkpoint_extras
 from examples.rl_reward.data import load_splits
+from examples.rl_reward.publication import (
+    dependency_versions,
+    public_pretrained,
+    public_recipe,
+)
 from examples.rl_reward.rewards import (
     TaskReward,
     countdown_score,
@@ -254,6 +259,21 @@ def test_reward_example_fresh_process_resume_matches_continuation(tmp_path, feat
     manifest = json.loads((root / "run_manifest.rank0.json").read_text())
     assert manifest["evaluation"]["effective_batch_size"] == 2 * recipe.batch_per_device
     assert "betas" in manifest["recipe"]["optimizer_kwargs"]
+    for key in ("model_path", "train_file", "dev_file", "output_dir"):
+        assert manifest["recipe"][key] == "<private>"
+    assert "git_diff" not in manifest and len(manifest["git_diff_sha256"]) == 64
+    assert "resume_checkpoint" not in manifest
+    for path in root.glob("runtime.*.jsonl"):
+        for line in path.read_text().splitlines():
+            runtime = json.loads(line)
+            assert not {
+                "hostname",
+                "slurm_job_id",
+                "slurm_nodes",
+                "gpu_name",
+                "gpu_memory_bytes",
+            }.intersection(runtime)
+            assert runtime["h100_count"] == 0
     if features:
         assert manifest["collector"]["enable_overlap"] is True
         assert manifest["learner"]["rl_microbatch_prompts"] == 1
@@ -262,3 +282,27 @@ def test_reward_example_fresh_process_resume_matches_continuation(tmp_path, feat
         )
         assert meta["optimizer_steps"] == meta["policy_version"] == 3
         assert meta["consumed_samples"] == 6
+
+
+def test_public_records_drop_environment_identity_and_unknown_provenance(tmp_path):
+    recipe, _ = _prepare_run(tmp_path)
+    recipe.model_path = "/private-infrastructure-marker/staged/model"
+    recipe.output_dir = "/private-infrastructure-marker/results"
+    record = public_recipe(recipe)
+    assert "private-infrastructure-marker" not in json.dumps(record)
+    assert record["model_revision"] == recipe.model_revision
+    assert record["seed"] == recipe.seed
+    provenance = public_pretrained(
+        {
+            "source_path": "/private-infrastructure-marker",
+            "model_source": "private-infrastructure-marker",
+            "unrecognized_future_field": "private-infrastructure-marker",
+            "mapping_sha256": "a" * 64,
+            "loaded_tensor_count": 17,
+        }
+    )
+    assert provenance == {"mapping_sha256": "a" * 64, "loaded_tensor_count": 17}
+    assert all(
+        "/" not in value and " @ " not in value
+        for value in dependency_versions().values()
+    )
