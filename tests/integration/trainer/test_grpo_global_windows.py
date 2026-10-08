@@ -377,7 +377,8 @@ def test_grpo_requires_explicit_update_microbatch_config(tmp_path):
         _config(tmp_path, rl_microbatch_prompts=0)
 
 
-def test_builder_uses_the_models_actual_gradient_reducer_group(tmp_path):
+def test_builder_uses_the_models_actual_gradient_reducer_group(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_DEVICE", "cpu")
     cfg = _config(tmp_path)
     builder = TrainContextBuilder(cfg)
     builder._topology = ParallelTopology(1)
