@@ -1,12 +1,13 @@
 """Generic symmetric BLAS contracts, dispatch and every compiled tile."""
 
+from importlib import import_module
+
 import pytest
 import torch
 
-from astrai.extension.backend import symmetric as backend
-from astrai.extension.backend.symmetric import select, symm_out, syrk_out
-from astrai.extension.kernel.symmetric import is_available, tiles
-from astrai.extension.policy import symmetric as plan
+from astrai.extension.backend.newton_schulz import select, symm_out, syrk_out
+from astrai.extension.kernel.newton_schulz import is_available, tiles
+from astrai.extension.policy import newton_schulz as plan
 from astrai.extension.runtime.dispatch import (
     ExplicitSelectionError,
     ImplRecord,
@@ -16,6 +17,8 @@ from astrai.extension.runtime.dispatch import (
     set_op,
     unregister_impl,
 )
+
+backend = import_module("astrai.extension.backend.newton_schulz")
 
 CUDA_AVAILABLE = torch.cuda.is_available() and is_available()
 

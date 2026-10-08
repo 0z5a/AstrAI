@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from astrai.extension.backend.symmetric import symm_out, syrk_out
-from astrai.extension.kernel import symmetric as cuda
-from astrai.extension.policy import symmetric as plan
+from astrai.extension.backend.newton_schulz import symm_out, syrk_out
+from astrai.extension.kernel import newton_schulz as cuda
+from astrai.extension.policy import newton_schulz as plan
 from astrai.extension.runtime.dispatch import ExplicitSelectionError
 
 CUDA_AVAILABLE = torch.cuda.is_available() and cuda.is_available()

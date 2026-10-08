@@ -2,7 +2,7 @@
 
 Like the GEMM tile sweep, candidates bypass automatic planning, are checked
 against Torch, and are measured in interleaved order. CUDA Graph replay removes
-Python dispatch gaps. Exported rows can be passed to policy.symmetric.configure.
+Python dispatch gaps. Exported rows can be passed to policy.newton_schulz.configure.
 Native heuristic scores rank geometry; paired timings evaluate their selection.
 """
 
@@ -15,13 +15,13 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 
-from astrai.extension.kernel.symmetric import (
+from astrai.extension.kernel.newton_schulz import (
     is_available,
     symm_out,
     syrk_out,
     tiles,
 )
-from astrai.extension.kernel.symmetric import (
+from astrai.extension.kernel.newton_schulz import (
     plan as kernel_plan,
 )
 

@@ -45,12 +45,12 @@ BLAS-style formulas, not a complete BLAS interface with side/uplo/trans flags.
 ```mermaid
 flowchart LR
     Optimizer --> NS[backend.newton_schulz]
-    NS --> Ops[backend.symmetric]
+    NS --> Ops[backend.newton_schulz]
     Ops --> Registry[runtime.dispatch]
-    Registry --> Policy[policy.symmetric]
+    Registry --> Policy[policy.newton_schulz]
     Registry --> Torch[Torch fallback]
-    Registry --> Adapter[kernel.symmetric]
-    Adapter --> CUDA[symmetric module]
+    Registry --> Adapter[kernel.newton_schulz]
+    Adapter --> CUDA[Newton-Schulz module]
     CUDA --> Mainloop[GemmCollectiveMainloop]
     CUDA --> Epilogue[GemmCollectiveEpilogue]
     CUDA --> Scheduler[GemmTileScheduler]
@@ -78,7 +78,7 @@ FP32 accumulators before BF16 rounding. Batch launches reuse the existing
 `GemmParams` batch strides and `grid.z`; matrices never share accumulators.
 
 Tile candidates reuse the complete `TileManifest` from
-`include/policy/manifest.cuh`. `kernel.symmetric.tiles(operation)` reports
+`include/policy/manifest.cuh`. `kernel.newton_schulz.tiles(operation)` reports
 CTA/warp dimensions, K depth, stages, thread count, shared memory and supported
 input layouts. SYRK filters for square CTA geometry; its column-major
 candidates also follow the GEMM crosswise K-depth constraint. The WMMA
@@ -172,7 +172,7 @@ occupancy waves; it does not multiply the average bytes per CTA. Input/output
 layouts select their actual kernel variant and resource usage, while SYMM
 uses the shared raster heuristic.
 
-`kernel.symmetric.plan` inspects this geometry decision from integer metadata;
+`kernel.newton_schulz.plan` inspects this geometry decision from integer metadata;
 it does not consult measured rows. It returns the selected tile/raster and
 ranked candidates, with `score`, `blocks`, `resident_ctas`, `registers`,
 `local_bytes` and `shared_memory`. An empty dictionary means no recipe is

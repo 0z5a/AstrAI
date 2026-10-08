@@ -12,10 +12,9 @@ from safetensors import safe_open
 from torch import nn
 from torch.optim._muon import _zeropower_via_newtonschulz
 
-from astrai.extension.backend.newton_schulz import _use_row_work, newton_schulz
-from astrai.extension.backend.symmetric import select
-from astrai.extension.kernel.symmetric import is_available, tiles
-from astrai.extension.policy.symmetric import configure, layout, probe
+from astrai.extension.backend.newton_schulz import _use_row_work, newton_schulz, select
+from astrai.extension.kernel.newton_schulz import is_available, tiles
+from astrai.extension.policy.newton_schulz import configure, layout, probe
 from astrai.optim.muon_adamw import MuonAdamW
 
 COEFFICIENTS = (3.4445, -4.775, 2.0315)

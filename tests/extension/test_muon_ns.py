@@ -1,15 +1,17 @@
 """Numerics, layout selection, and Graph replay for Muon's NS kernels."""
 
+from importlib import import_module
+
 import pytest
 import torch
 
 from astrai.extension.backend.newton_schulz import newton_schulz
-from astrai.extension.kernel.symmetric import (
+from astrai.extension.kernel.newton_schulz import (
     is_available,
     symm_out,
     syrk_out,
 )
-from astrai.extension.policy import symmetric as plan
+from astrai.extension.policy import newton_schulz as plan
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_available(),
@@ -144,3 +146,28 @@ def test_layout_transition_preserves_normalized_input_for_each_step_count(steps)
     assert torch.equal(gradient, normalized)
     relative = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert relative.item() <= 0.01
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_native_iteration_matches_python_dispatch(monkeypatch, batch_size):
+    module = import_module("astrai.extension.backend.newton_schulz")
+    shape = (256, 1536) if batch_size == 1 else (batch_size, 256, 1536)
+    torch.manual_seed(149)
+    source = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    called = []
+    native_iterate = module.cuda.iterate
+
+    def traced(*args):
+        called.append(True)
+        return native_iterate(*args)
+
+    monkeypatch.setattr(module.cuda, "iterate", traced)
+    fused_input = source.clone()
+    fused = module.newton_schulz(fused_input, COEFFICIENTS, 5, backend="auto")
+    assert called
+
+    monkeypatch.setattr(module, "_choice", lambda operation, selected: None)
+    reference_input = source.clone()
+    reference = module.newton_schulz(reference_input, COEFFICIENTS, 5, backend="auto")
+    assert torch.equal(fused_input, reference_input)
+    assert torch.equal(fused, reference)

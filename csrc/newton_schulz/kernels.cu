@@ -357,7 +357,7 @@ py::list tiles_impl(std::string operation) {
 
 } // namespace
 
-namespace astrai::symmetric {
+namespace astrai::newton_schulz::symmetric {
 
 void launch_syrk(gemm::GemmParams p, const c10::optional<torch::Tensor>& addend,
                  float alpha, float beta, const std::string& tile,
@@ -383,4 +383,4 @@ py::list tiles(std::string operation) {
     return tiles_impl(operation);
 }
 
-} // namespace astrai::symmetric
+} // namespace astrai::newton_schulz::symmetric

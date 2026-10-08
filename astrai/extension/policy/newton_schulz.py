@@ -1,4 +1,4 @@
-"""Measured and geometry plans for symmetric operations, independent of optimizers.
+"""Measured and geometry plans for Newton-Schulz matrix operations, independent of optimizers.
 
 Exact measured rows take precedence over the generic geometry heuristic. Sweep
 results can replace the table without rebuilding CUDA kernels. Plan keys describe
@@ -13,8 +13,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 import torch
 from torch import Tensor
 
-from astrai.extension.kernel.symmetric import is_available, tiles
-from astrai.extension.kernel.symmetric import plan as heuristic_plan
+from astrai.extension.kernel.newton_schulz import is_available, tiles
+from astrai.extension.kernel.newton_schulz import plan as heuristic_plan
 
 
 @dataclass(frozen=True)

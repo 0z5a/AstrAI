@@ -7,8 +7,8 @@ import torch
 from torch import nn
 
 from astrai.extension.backend.newton_schulz import newton_schulz
-from astrai.extension.kernel.symmetric import is_available
-from astrai.extension.policy import symmetric as plan
+from astrai.extension.kernel.newton_schulz import is_available
+from astrai.extension.policy import newton_schulz as plan
 from astrai.optim.muon_adamw import MuonAdamW
 
 CUDA_AVAILABLE = torch.cuda.is_available() and is_available()

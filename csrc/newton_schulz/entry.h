@@ -6,8 +6,21 @@
 
 #include <cstdint>
 #include <string>
+#include <tuple>
+#include <vector>
 
-namespace astrai::symmetric {
+namespace astrai::newton_schulz {
+
+using Choice = std::tuple<bool, std::string, int>;
+
+torch::Tensor iterate(
+    torch::Tensor x, torch::Tensor gram, torch::Tensor polynomial,
+    torch::Tensor work, torch::Tensor spare, c10::optional<torch::Tensor> final,
+    int steps, float a, float b, float c, std::vector<Choice> choices);
+
+} // namespace astrai::newton_schulz
+
+namespace astrai::newton_schulz::symmetric {
 
 void syrk_out(torch::Tensor x, torch::Tensor output,
               c10::optional<torch::Tensor> addend, float alpha, float beta,
@@ -27,4 +40,4 @@ void launch_symm(gemm::GemmParams p, const c10::optional<torch::Tensor>& addend,
                  float alpha, float beta, const std::string& tile,
                  bool column_input, bool column_output, cudaStream_t stream);
 
-} // namespace astrai::symmetric
+} // namespace astrai::newton_schulz::symmetric

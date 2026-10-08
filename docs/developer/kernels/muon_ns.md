@@ -13,6 +13,13 @@ The reusable `backend.newton_schulz.newton_schulz` function owns this recurrence
 its scratch buffers and layout selection. It accepts coefficients,
 iteration count and epsilon from the caller. Muon owns momentum, Nesterov,
 weight decay, learning-rate adjustment and parameter routing, then calls NS.
+The native `csrc/newton_schulz/` family contains the SYRK and SYMM kernels
+and a C++ iteration entry point. Python still selects plans and allocates
+scratch; `kernel.newton_schulz.iterate` launches all selected stages in one
+extension call. Each matrix product remains a separate GPU kernel because
+successive iterations depend on fully materialized BF16 results. External
+operator overrides retain the Python iteration fallback.
+
 The NS backend resolves the three [symmetric operations](symmetric.md) once
 before its loop, using separate dispatch decisions for the Gram matrix,
 polynomial and final update. Default automatic dispatch prefers exact measured
@@ -31,7 +38,7 @@ result = newton_schulz(matrix, (3.4445, -4.775, 2.0315), steps=5, backend="auto"
 
 `backend="torch"` remains the NS function default. Enable automatic symmetric
 operations for Muon with `MuonAdamW(..., use_ns_kernels=True)` or the training
-option `muon_ns_kernels=True`. `policy.symmetric.configure(rows)` limits
+option `muon_ns_kernels=True`. `policy.newton_schulz.configure(rows)` limits
 automatic CUDA selection to those rows unless `heuristic=True` is supplied; a
 matching Torch row always wins. A scoped `override` restores both its previous
 table and heuristic setting, including after an exception. The separate
@@ -47,7 +54,7 @@ scratch, the first update writes that layout directly; the final update writes
 the caller's orientation directly. A measured column-work case keeps column
 layout across all iterations instead. Layout changes need no standalone
 transpose kernel or layout-packing copy. Inputs outside the CUDA contract retain Torch. The CUDA module exposes
-SYRK, SYMM, candidate enumeration and metadata-only `kernel.symmetric.plan`
+SYRK, SYMM, candidate enumeration and metadata-only `kernel.newton_schulz.plan`
 inspection. The optimizer does not own tile selection or plan scores.
 
 ## Batched updates
@@ -105,8 +112,8 @@ This excludes momentum, parameter updates, AdamW and model forward/backward,
 so it is not an end-to-end training speedup. Plan files may combine unique
 rows from the SYRK and SYMM sweeps. Supplying a plan makes the benchmark
 use table-only dispatch; without a supplied plan it evaluates the default
-measured-first hybrid policy. Inspect `kernel.symmetric.plan` to see geometry
-candidates without running the benchmark, or `policy.symmetric.probe` to see
+measured-first hybrid policy. Inspect `kernel.newton_schulz.plan` to see geometry
+candidates without running the benchmark, or `policy.newton_schulz.probe` to see
 the automatic decision for an existing tensor.
 
 `--profile-stages` records GPU event time for each of the five SYRK,

@@ -31,7 +31,7 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 | Operator | Doc | Kernel module | Python entry |
 |---|---|---|---|
-| SYRK / SYMM | [symmetric.md](symmetric.md) | `csrc/symmetric/` | `astrai/extension/backend/symmetric.py`; adapter `astrai/extension/kernel/symmetric.py` |
+| SYRK / SYMM | [symmetric.md](symmetric.md) | `csrc/newton_schulz/` | `astrai/extension/backend/newton_schulz.py`; adapter `astrai/extension/kernel/newton_schulz.py` |
 | Muon Newton-Schulz | [muon_ns.md](muon_ns.md) | SYRK/SYMM or Torch | `astrai/extension/backend/newton_schulz.py` |
 | Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (bindings + entry; headers: `csrc/include/`) | `astrai/extension/kernel/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
 | GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/kernel/gemm.py` |

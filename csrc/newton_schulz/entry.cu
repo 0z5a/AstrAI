@@ -1,3 +1,7 @@
+#include <ATen/ops/addmm.h>
+#include <ATen/ops/baddbmm.h>
+#include <ATen/ops/bmm.h>
+#include <ATen/ops/mm.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -8,7 +12,69 @@
 #include <cstdint>
 #include <limits>
 
-namespace astrai::symmetric {
+namespace astrai::newton_schulz {
+namespace {
+
+void syrk(const Choice& choice, const torch::Tensor& x, torch::Tensor& output,
+          const c10::optional<torch::Tensor>& addend = c10::nullopt,
+          float alpha = 1.0f, float beta = 0.0f) {
+    if (std::get<0>(choice)) {
+        symmetric::syrk_out(x, output, addend, alpha, beta, std::get<1>(choice));
+        return;
+    }
+    const auto transposed = x.transpose(-2, -1);
+    if (beta == 0.0f) {
+        if (x.dim() == 2) at::mm_out(output, x, transposed);
+        else at::bmm_out(output, x, transposed);
+        if (alpha != 1.0f) output.mul_(alpha);
+    } else if (x.dim() == 2) {
+        at::addmm_out(output, *addend, x, transposed, beta, alpha);
+    } else {
+        at::baddbmm_out(output, *addend, x, transposed, beta, alpha);
+    }
+}
+
+void symm(const Choice& choice, const torch::Tensor& symmetric_matrix,
+          const torch::Tensor& x, torch::Tensor& output, float beta) {
+    if (std::get<0>(choice)) {
+        symmetric::symm_out(symmetric_matrix, x, output, x, 1.0f, beta,
+                            std::get<1>(choice), std::get<2>(choice));
+    } else if (x.dim() == 2) {
+        at::addmm_out(output, x, symmetric_matrix, x, beta, 1.0f);
+    } else {
+        at::baddbmm_out(output, x, symmetric_matrix, x, beta, 1.0f);
+    }
+}
+
+} // namespace
+
+torch::Tensor iterate(
+    torch::Tensor x, torch::Tensor gram, torch::Tensor polynomial,
+    torch::Tensor work, torch::Tensor spare, c10::optional<torch::Tensor> final,
+    int steps, float a, float b, float c, std::vector<Choice> choices) {
+    TORCH_CHECK(steps > 0 && steps < 100 && choices.size() == 6,
+                "invalid Newton-Schulz iteration plan");
+    TORCH_CHECK(std::isfinite(a) && std::isfinite(b) && std::isfinite(c),
+                "Newton-Schulz coefficients must be finite");
+    for (int iteration = 0; iteration < steps; ++iteration) {
+        syrk(choices[iteration == 0 ? 0 : 1], x, gram);
+        syrk(choices[2], gram, polynomial, gram, c, b);
+        auto output = final.has_value() && iteration == steps - 1
+                          ? *final
+                          : iteration % 2 == 0 ? work : spare;
+        const auto& choice = choices[iteration == 0 ? 3 : final.has_value() &&
+                                                           iteration == steps - 1
+                                                       ? 5
+                                                       : 4];
+        symm(choice, polynomial, x, output, a);
+        x = output;
+    }
+    return x;
+}
+
+} // namespace astrai::newton_schulz
+
+namespace astrai::newton_schulz::symmetric {
 namespace {
 
 bool dense_matrix(const torch::Tensor& x) {
@@ -121,4 +187,4 @@ void symm_out(torch::Tensor symmetric, torch::Tensor x, torch::Tensor output,
 }
 
 
-} // namespace astrai::symmetric
+} // namespace astrai::newton_schulz::symmetric

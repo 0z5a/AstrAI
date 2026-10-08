@@ -1,8 +1,8 @@
-"""CUDA adapters for symmetric BLAS operations."""
+"""CUDA adapters for Newton-Schulz matrix operations and iteration."""
 
 from copy import deepcopy
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from torch import Tensor
 
@@ -11,12 +11,12 @@ from astrai.extension.runtime.loader import is_available as _available
 
 
 def is_available() -> bool:
-    return _available("symmetric")
+    return _available("newton_schulz")
 
 
 def tiles(operation: str) -> List[Dict[str, Any]]:
     """Enumerate compiled GEMM recipes available to a symmetric operation."""
-    return get_module("symmetric").tiles(operation)
+    return get_module("newton_schulz").tiles(operation)
 
 
 @lru_cache(maxsize=256)
@@ -30,7 +30,7 @@ def _plan(
     addend: bool,
     device: int,
 ) -> Dict[str, Any]:
-    return get_module("symmetric").plan(
+    return get_module("newton_schulz").plan(
         operation, rows, cols, batch_size, input_layout, output_layout, addend, device
     )
 
@@ -75,7 +75,7 @@ def syrk_out(
     tile: Optional[str] = None,
 ) -> None:
     """Write alpha * X X.T + beta * C; C must be fully symmetric."""
-    get_module("symmetric").syrk_out(
+    get_module("newton_schulz").syrk_out(
         x,
         output,
         addend,
@@ -97,6 +97,25 @@ def symm_out(
     raster: int = 1,
 ) -> None:
     """Write alpha * S X + beta * C; S must be fully symmetric."""
-    get_module("symmetric").symm_out(
+    get_module("newton_schulz").symm_out(
         symmetric, x, output, addend, alpha, beta, tile or "64x64x32_W16x32_S2", raster
+    )
+
+
+def iterate(
+    x: Tensor,
+    gram: Tensor,
+    polynomial: Tensor,
+    work: Tensor,
+    spare: Tensor,
+    final: Optional[Tensor],
+    steps: int,
+    a: float,
+    b: float,
+    c: float,
+    choices: Tuple[Tuple[bool, str, int], ...],
+) -> Tensor:
+    """Launch the selected SYRK and SYMM stages of an NS recurrence."""
+    return get_module("newton_schulz").iterate(
+        x, gram, polynomial, work, spare, final, steps, a, b, c, choices
     )

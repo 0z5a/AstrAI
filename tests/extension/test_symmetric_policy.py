@@ -1,16 +1,18 @@
 """Symmetric planning priority, metadata caching and CUDA execution contracts."""
 
 import math
+from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from astrai.extension.backend import symmetric as backend
-from astrai.extension.backend.symmetric import select, symm_out, syrk_out
-from astrai.extension.kernel import symmetric as kernel
-from astrai.extension.policy import symmetric as plan
+from astrai.extension.backend.newton_schulz import select, symm_out, syrk_out
+from astrai.extension.kernel import newton_schulz as kernel
+from astrai.extension.policy import newton_schulz as plan
 from astrai.extension.runtime.dispatch import op_backend
+
+backend = import_module("astrai.extension.backend.newton_schulz")
 
 
 class MatrixMetadata:
