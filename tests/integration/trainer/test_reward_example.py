@@ -12,6 +12,7 @@ import safetensors.torch as st
 import torch
 import yaml
 
+from astrai.config import TrainConfig
 from astrai.model import AutoRegressiveLM
 from astrai.trainer.optional_extras import checkpoint_extras
 from examples.rl_reward.data import load_splits
@@ -154,6 +155,30 @@ def _prepare_run(tmp_path, updates=3):
         device_type="cpu",
     )
     return recipe, tokenizer
+
+
+@pytest.mark.parametrize(
+    "option,value,field,required",
+    [
+        ("learner_microbatch_prompts", 1, "rl_microbatch_prompts", "A2"),
+        ("overlap_collection", True, "rollout_enable_overlap", "R1"),
+    ],
+)
+def test_recipe_feature_prerequisites(tmp_path, option, value, field, required):
+    recipe, tokenizer = _prepare_run(tmp_path)
+    setattr(recipe, option, value)
+    splits, prompts = load_splits(
+        {"train": recipe.train_file, "dev": recipe.dev_file},
+        recipe.task,
+        tokenizer,
+        recipe.prompt_cap,
+    )
+    if field in TrainConfig.__dataclass_fields__:
+        trainer = build_training(recipe, splits, prompts, {}, time.perf_counter())
+        assert getattr(trainer.train_config, field) == value
+    else:
+        with pytest.raises(RuntimeError, match=required):
+            build_training(recipe, splits, prompts, {}, time.perf_counter())
 
 
 def test_torchrun_world_size_and_tail_validation(tmp_path, monkeypatch):

@@ -14,6 +14,15 @@ update normalization correction (A2); this example does not supply that change.
 FSDP, role-separated rollout, adaptive loops and new model adapters are separate
 feature gates.
 
+After integrating A2, `learner_microbatch_prompts` selects complete prompt
+groups per forward/backward without changing the collected global batch or
+number of optimizer updates. After integrating R1, `overlap_collection: true`
+selects the native submit/commit collector; `false` is the synchronous control.
+These choices are recorded in the frozen recipe and manifest. Requesting a
+feature before its implementation is present fails at startup. Keep these
+settings fixed across resume, and compare performance arms with the same
+global objective and workload.
+
 ## Data and rewards
 
 Provide immutable JSONL train/dev files with globally unique `id` values. An

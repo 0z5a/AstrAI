@@ -33,3 +33,5 @@ loss_aggregation: token
 reward_target: null  # Freeze after an independent baseline pilot.
 noninferiority_margin: 0.02
 save_token_traces: true
+learner_microbatch_prompts: null  # Set only with the A2 implementation.
+overlap_collection: false  # True requires the R1 implementation.

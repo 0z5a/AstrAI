@@ -74,6 +74,8 @@ class Recipe:
     noninferiority_margin: float = 0.02
     test_file: str | None = None
     save_token_traces: bool = True
+    learner_microbatch_prompts: int | None = None
+    overlap_collection: bool = False
 
     def validate(self):
         for name in (
@@ -117,6 +119,13 @@ class Recipe:
             raise ValueError("training group_size must be at least 2")
         if type(self.seed) is not int or type(self.save_token_traces) is not bool:
             raise ValueError("seed must be an integer and save_token_traces a boolean")
+        if type(self.overlap_collection) is not bool:
+            raise ValueError("overlap_collection must be a boolean")
+        if self.learner_microbatch_prompts is not None and (
+            type(self.learner_microbatch_prompts) is not int
+            or self.learner_microbatch_prompts < 1
+        ):
+            raise ValueError("learner_microbatch_prompts must be positive or None")
         if not math.isfinite(self.kl_coef) or self.kl_coef < 0:
             raise ValueError("kl_coef must be finite and nonnegative")
         if not math.isfinite(self.clip_eps) or not 0 <= self.clip_eps < 1:
@@ -503,6 +512,27 @@ class Monitor:
 def build_training(recipe, splits, records_by_prompt, data_hashes, started):
     recipe.validate()
     resolve_optimizer(recipe)
+    features = {}
+    for field_name, value, required, needed in (
+        (
+            "rl_microbatch_prompts",
+            recipe.learner_microbatch_prompts,
+            "A2",
+            recipe.learner_microbatch_prompts is not None,
+        ),
+        (
+            "rollout_enable_overlap",
+            recipe.overlap_collection,
+            "R1",
+            recipe.overlap_collection,
+        ),
+    ):
+        if needed:
+            if field_name not in TrainConfig.__dataclass_fields__:
+                raise RuntimeError(
+                    f"recipe requires the {required} implementation: {field_name}"
+                )
+            features[field_name] = value
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world < 1:
         raise ValueError("WORLD_SIZE must be positive")
@@ -520,6 +550,7 @@ def build_training(recipe, splits, records_by_prompt, data_hashes, started):
         raise ValueError("prompt and response caps exceed the model context")
     monitor = Monitor(recipe, splits, data_hashes, started)
     train_config = TrainConfig(
+        **features,
         model_fn=partial(model_factory, config.to_dict(), recipe.dtype),
         strategy="online_grpo",
         dataset=PromptDataset(splits["train"]),
@@ -647,7 +678,9 @@ def main():
             "grad_accum_steps": 1,
             "rl_update_epochs": 1,
             "rl_minibatch_prompts": None,
+            "rl_microbatch_prompts": recipe.learner_microbatch_prompts,
         },
+        "collector": {"enable_overlap": recipe.overlap_collection},
         "resume_checkpoint": str(args.resume) if args.resume else None,
         "created_unix": time.time(),
     }
