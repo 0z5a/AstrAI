@@ -121,7 +121,7 @@ class GRPOStrategy(BaseStrategy):
 
     def _response_count(self, mask):
         if self.loss_aggregation == "token":
-            return mask.sum().to(dtype=torch.int64)
+            return mask.sum(dtype=torch.int64)
         return (mask.sum(dim=-1) > 0).sum().to(dtype=torch.int64)
 
     @staticmethod
