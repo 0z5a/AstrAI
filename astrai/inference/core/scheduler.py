@@ -512,7 +512,8 @@ class Scheduler:
         self._stop_ids = frozenset(self._requests.tokenizer.stop_ids)
         requests, errors = [], []
         backend = get_backend(use_default=False)
-        for ids in prompt_ids_list:
+        batch_id = uuid.uuid4().hex
+        for index, ids in enumerate(prompt_ids_list):
             error = None
             if not ids:
                 error = "prompt_empty"
@@ -528,7 +529,7 @@ class Scheduler:
             request = None
             if error is None:
                 request = Request(
-                    f"batch_{uuid.uuid4().hex}",
+                    f"batch_{batch_id}_{index:08d}",
                     ids,
                     limit,
                     temperature,
@@ -552,9 +553,13 @@ class Scheduler:
             live = [r for r in requests if r is not None]
             with self._backend_context():
                 while live:
-                    decoded, aborted = self._stepper.step(
-                        live, return_logprobs=return_logprobs
-                    )
+                    if self._enable_overlap:
+                        self.engine_core.tick(live, return_logprobs=return_logprobs)
+                        decoded, aborted = live, []
+                    else:
+                        decoded, aborted = self._stepper.step(
+                            live, return_logprobs=return_logprobs
+                        )
                     for request in aborted:
                         self.finish(
                             request,
@@ -569,8 +574,13 @@ class Scheduler:
                         for r in decoded
                         if not r.terminal_emitted and not r.is_finished(self.stop_ids)
                     ]
+        except BaseException:
+            # Fence failed overlapped work before retiring requests/KV.
+            self.engine_core.fence()
+            raise
         finally:
-            self.engine_core.drain()
+            if not self.engine_core._shutdown_failed:
+                self.engine_core.drain()
             for request in requests:
                 if request is not None and not request.terminal_emitted:
                     self.finish(
