@@ -60,7 +60,7 @@ def test_hf_generation_multiple_eos_survives_save_reload(tmp_path):
     assert restored.pad_token_id == 1
 
 
-@pytest.mark.parametrize("ids", [[True], [9999], "3"])
+@pytest.mark.parametrize("ids", [[True], [-1], [2**100], [9999], "3"])
 def test_hf_rejects_invalid_terminal_token_declarations(tmp_path, ids):
     _write_tokenizer(tmp_path, generation={"eos_token_id": ids})
     with pytest.raises(ValueError, match="EOS"):
