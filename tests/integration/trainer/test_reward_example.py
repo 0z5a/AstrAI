@@ -200,8 +200,17 @@ def test_torchrun_world_size_and_tail_validation(tmp_path, monkeypatch):
 
 
 @pytest.mark.slow
-def test_reward_example_fresh_process_resume_matches_continuation(tmp_path):
+@pytest.mark.parametrize("features", [False, True])
+def test_reward_example_fresh_process_resume_matches_continuation(tmp_path, features):
+    if features and not {"rl_microbatch_prompts", "rollout_enable_overlap"}.issubset(
+        TrainConfig.__dataclass_fields__
+    ):
+        pytest.skip("combined microbatch/overlap resume requires A2 and R1")
     recipe, _ = _prepare_run(tmp_path)
+    if features:
+        recipe.batch_per_device = 2
+        recipe.learner_microbatch_prompts = 1
+        recipe.overlap_collection = True
     recipe_file = tmp_path / "recipe.yaml"
     recipe_file.write_text(yaml.safe_dump(recipe.__dict__))
     repo = Path(__file__).resolve().parents[3]
@@ -221,12 +230,13 @@ def test_reward_example_fresh_process_resume_matches_continuation(tmp_path):
 
     run()
     root = Path(recipe.output_dir)
+    final_checkpoint = "epoch_2_step_3" if features else "epoch_1_step_3"
     original = st.load_file(
-        str(root / "checkpoints" / "epoch_1_step_3" / "model.safetensors")
+        str(root / "checkpoints" / final_checkpoint / "model.safetensors")
     )
     run(root / "checkpoints" / "epoch_0_step_1")
     resumed = st.load_file(
-        str(root / "checkpoints" / "epoch_1_step_3" / "model.safetensors")
+        str(root / "checkpoints" / final_checkpoint / "model.safetensors")
     )
     assert original.keys() == resumed.keys()
     for key in original:
@@ -238,9 +248,17 @@ def test_reward_example_fresh_process_resume_matches_continuation(tmp_path):
     ]
     assert {row["policy_version"] for row in rows} == {1, 2, 3}
     assert all(row["optimizer_step"] == row["policy_version"] for row in rows)
-    assert all(row["groups"] == 1 for row in rows)
+    assert all(row["groups"] == recipe.batch_per_device for row in rows)
     assert len(list(root.glob("resume_manifest.*.json"))) == 1
     assert list((root / "token_traces").glob("*.pt"))
     manifest = json.loads((root / "run_manifest.rank0.json").read_text())
-    assert manifest["evaluation"]["effective_batch_size"] == 2
+    assert manifest["evaluation"]["effective_batch_size"] == 2 * recipe.batch_per_device
     assert "betas" in manifest["recipe"]["optimizer_kwargs"]
+    if features:
+        assert manifest["collector"]["enable_overlap"] is True
+        assert manifest["learner"]["rl_microbatch_prompts"] == 1
+        meta = json.loads(
+            (root / "checkpoints" / final_checkpoint / "meta.json").read_text()
+        )
+        assert meta["optimizer_steps"] == meta["policy_version"] == 3
+        assert meta["consumed_samples"] == 6
