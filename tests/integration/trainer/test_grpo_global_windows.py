@@ -219,8 +219,9 @@ def _config(tmp_path, **extra):
     values = dict(
         strategy="grpo",
         model_fn=_actor,
-        dataset=list(range(6)),
+        dataset=torch.utils.data.TensorDataset(torch.arange(6)),
         optimizer_fn=lambda m: torch.optim.AdamW(m.parameters(), lr=0.001),
+        scheduler_fn=None,
         device_type="cpu",
         dp_mode="none",
         batch_per_device=3,
