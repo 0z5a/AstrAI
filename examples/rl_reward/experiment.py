@@ -45,6 +45,13 @@ def require_run_identity(root, recipe, source_head):
     actual = manifest(root)
     if actual["git_head"] != source_head or actual["recipe"] != public_recipe(recipe):
         raise ValueError("run source or frozen recipe differs from the controller")
+    runtimes = read_rows(root, "runtime")
+    if (
+        actual["learner"]["dp_size"] != 8
+        or not runtimes
+        or any(row["h100_count"] != 8 for row in runtimes)
+    ):
+        raise ValueError("formal run did not execute the declared eight-H100 workload")
     return actual
 
 
@@ -334,6 +341,10 @@ def paired(settings, template, *, launch_runs=True):
                 "allocation_cost_verified": verified_cost,
                 "end_to_end_timing_verified": startup is not None,
             }
+            if verified_cost:
+                pair[arm]["allocated_h100_hours"] = (
+                    cost["allocation_seconds"] * 8 / 3600
+                )
             if receipt["budget_completed"]:
                 scores[arm].append(
                     final_prompt_scores(

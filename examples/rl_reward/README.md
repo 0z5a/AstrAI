@@ -166,5 +166,45 @@ end-to-end speedup evidence.
 Use the raw dev points for reward-vs-step and reward-vs-wall-time plots, retaining
 all seeds, truncation, failures and unreached targets. Fixed-work performance
 arms must share correctness fixes, data, model, optimizer, sampling, trace
-logging and resource accounting. A multi-seed quality/performance result remains
-an experimental deliverable beyond this runner.
+logging and resource accounting. Formal quality/performance still requires
+actual assigned-resource measurements.
+
+`python -m examples.rl_reward.qualify_collector --config /private/recipe.yaml
+--output /private/new-qualification` runs the official CUDA collector matrix:
+C32/64/128/256, group size eight, three fixed seeds, overlap on/off, and CUDA
+graphs on/off. It retains every response, EOS token, truncation and reward,
+checks complete masks and raw-logprob replay, compares paired tokens/rewards,
+and verifies execution/KV cleanup and actual graph capture. Constant-length
+episodes without observed variable EOS fail qualification. This checks the
+collector; it does not establish RL learning.
+
+`python -m examples.rl_reward.experiment pilot --settings /private/settings.json`
+runs an independent 25-update control pilot and freezes the target before any
+paired run. The pilot must improve dev reward by at least 0.02 and observe
+nonzero group advantages. The target is initial reward plus half the pilot's
+best dev improvement. `paired` runs all three predeclared seeds in both arms,
+retaining the complete 400/1000-update budgets and failures. `assess` reuses
+those outcomes after allocation receipts arrive; it launches no new training.
+
+Private controller settings supply `template_recipe`, `output_dir`,
+`source_head`, `launcher_argv` with literal `{script}`/`{recipe}` arguments,
+`baseline_microbatch_prompts`, `candidate_microbatch_prompts`,
+`allocated_h100_count: 8`, `allocation_owner_authorized: true`, and
+`gpu_gate_receipts`. The owner supplies normalized PASS receipts for
+`official_loader`, `native_cuda_protocol`, `official_collector`, and
+`smoke_resume_8_h100`, covering the frozen source and the formal 1.7B checkpoint.
+The controller validates actual runtime H100/DP counts, resolved optimizer
+settings, data/checkpoint hashes and protocol freeze order. Launch arguments,
+process IDs and raw stderr are private. A rank-zero startup marker records
+launcher/import cost before runner elapsed time, without publishing identity.
+
+Allocation receipts under `allocation_receipts/<arm>.seed<seed>.json` must
+declare `VERIFIED_BY_LAUNCH_OWNER`, matching `case`/`source_head`,
+`allocated_h100_count: 8` and complete `allocation_seconds`. The decision
+requires every seed to complete and reach the frozen target, verified startup
+and allocation accounting, mean time-to-reward ratio at most 0.8, and held-out
+quality lower confidence bound at least -0.02. Quality uses 10,000 hierarchical
+paired seed/prompt bootstrap draws and retains all binary failures. Missing
+seeds, nonfinite values, targets already met at initialization and unverified
+allocation cost cannot pass. CPU fixtures for these checks are not reward-curve
+or GPU-performance evidence.
