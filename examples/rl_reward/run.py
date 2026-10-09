@@ -637,6 +637,11 @@ def main():
     # directory or newly-created logs readable outside the launching user.
     os.umask(0o077)
     started = time.perf_counter()
+    if (
+        os.environ.get("ASTRAI_RECORD_CONTROLLER_TIMING") == "1"
+        and int(os.environ.get("RANK", "0")) == 0
+    ):
+        print("ASTRAI_RUNNER_MAIN_STARTED", flush=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--resume", type=Path)

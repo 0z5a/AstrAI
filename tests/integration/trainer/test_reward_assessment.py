@@ -22,6 +22,7 @@ def _pairs():
             "budget_completed": True,
             "exit_code": 0,
             "allocation_cost_verified": True,
+            "end_to_end_timing_verified": True,
             "dev_points": deepcopy(points),
         }
         candidate = deepcopy(baseline)
