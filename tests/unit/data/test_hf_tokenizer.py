@@ -6,6 +6,7 @@ import pytest
 from tokenizers import Tokenizer, models
 
 from astrai.tokenize import AutoTokenizer
+from astrai.trainer.callbacks.checkpoint import _copy_tokenizer_files
 
 
 def _write_tokenizer(root, *, eos="<eos>", generation=None):
@@ -58,6 +59,17 @@ def test_hf_generation_multiple_eos_survives_save_reload(tmp_path):
     restored = AutoTokenizer.from_pretrained(target)
     assert restored.stop_ids == [3, 4]
     assert restored.pad_token_id == 1
+
+
+def test_checkpoint_keeps_every_hf_generation_terminal_token(tmp_path):
+    _write_tokenizer(tmp_path, generation={"eos_token_id": [3, 4]})
+    original = AutoTokenizer.from_pretrained(tmp_path)
+    target = tmp_path / "checkpoint"
+    target.mkdir()
+    _copy_tokenizer_files(str(tmp_path), str(target))
+    restored = AutoTokenizer.from_pretrained(target)
+    assert restored.stop_ids == original.stop_ids == [3, 4]
+    assert restored.pad_token_id == original.pad_token_id
 
 
 @pytest.mark.parametrize("ids", [[True], [-1], [2**100], [9999], "3"])
