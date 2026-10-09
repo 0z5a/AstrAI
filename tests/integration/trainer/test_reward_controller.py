@@ -2,8 +2,6 @@
 
 import json
 import sys
-from pathlib import Path
-from types import SimpleNamespace
 
 from examples.rl_reward.experiment import launch
 from examples.rl_reward.run import Recipe
