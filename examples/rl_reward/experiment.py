@@ -62,7 +62,7 @@ def completed(root, updates):
     )
 
 
-def launch(settings, recipe, case):
+def launch(settings, recipe, case, *, resume=None):
     root = Path(settings["output_dir"])
     private = root / "private"
     private.mkdir(exist_ok=True, mode=0o700)
@@ -79,6 +79,8 @@ def launch(settings, recipe, case):
     if not all(key in template for key in substitutions):
         raise ValueError("launcher must contain {script} and {recipe} arguments")
     argv = [substitutions.get(item, item) for item in template]
+    if resume is not None:
+        argv.extend(["--resume", str(resume)])
     started = time.perf_counter()
     startup_seconds = None
     with (private / f"{case}.log").open("x") as log:
