@@ -1,0 +1,77 @@
+name: Frozen reward data
+
+on:
+  push:
+    branches: [test/rl-first-batch-integration]
+
+permissions:
+  contents: read
+
+jobs:
+  data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CUDA_VISIBLE_DEVICES: ''
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install frozen preparation dependencies
+        run: python -m pip install . pyarrow==21.0.0
+      - name: Download immutable public tokenizer and source data
+        run: |
+          python - <<'PY'
+          import hashlib, pathlib, urllib.request
+          root = pathlib.Path('frozen-assets')
+          model = 'Qwen/Qwen3-0.6B'
+          model_revision = 'c1899de289a04d12100db370d81485cdf75e47ca'
+          files = (
+            (f'https://huggingface.co/{model}/resolve/{model_revision}/config.json', 'tokenizer/config.json', '660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd'),
+            (f'https://huggingface.co/{model}/resolve/{model_revision}/generation_config.json', 'tokenizer/generation_config.json', '2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2'),
+            (f'https://huggingface.co/{model}/resolve/{model_revision}/tokenizer.json', 'tokenizer/tokenizer.json', 'aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4'),
+            (f'https://huggingface.co/{model}/resolve/{model_revision}/tokenizer_config.json', 'tokenizer/tokenizer_config.json', 'd5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101'),
+            ('https://huggingface.co/datasets/Jiayi-Pan/Countdown-Tasks-3to4/resolve/408f70d177020686d34a56bba5952feb45aaaee4/data/train-00000-of-00001.parquet', 'countdown.parquet', 'a1b37bea0f439c858b11b908daa682e521f13f9592f1866b08650f58b730d126'),
+            ('https://huggingface.co/datasets/openai/gsm8k/resolve/740312add88f781978c0658806c59bc2815b9866/main/train-00000-of-00001.parquet', 'gsm8k-train.parquet', 'ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d'),
+            ('https://huggingface.co/datasets/openai/gsm8k/resolve/740312add88f781978c0658806c59bc2815b9866/main/test-00000-of-00001.parquet', 'gsm8k-test.parquet', 'ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59'),
+          )
+          for url, relative, expected in files:
+              target = root / relative
+              target.parent.mkdir(parents=True, exist_ok=True)
+              with urllib.request.urlopen(url, timeout=120) as response:
+                  value = response.read()
+              assert hashlib.sha256(value).hexdigest() == expected
+              target.write_bytes(value)
+          print('FROZEN_PUBLIC_ASSETS_HASH_VERIFIED')
+          PY
+      - name: Prepare exact deduplicated Countdown splits
+        run: |
+          python -m examples.rl_reward.prepare_data --task countdown \
+            --dataset-repo Jiayi-Pan/Countdown-Tasks-3to4 \
+            --dataset-revision 408f70d177020686d34a56bba5952feb45aaaee4 \
+            --train-source frozen-assets/countdown.parquet \
+            --train-sha256 a1b37bea0f439c858b11b908daa682e521f13f9592f1866b08650f58b730d126 \
+            --train-size 16384 --dev-size 1024 --test-size 1024 \
+            --model-dir frozen-assets/tokenizer --prompt-cap 1024 \
+            --no-enable-thinking --output frozen-data/countdown
+      - name: Prepare exact deduplicated GSM8K splits
+        run: |
+          python -m examples.rl_reward.prepare_data --task gsm8k \
+            --dataset-repo openai/gsm8k \
+            --dataset-revision 740312add88f781978c0658806c59bc2815b9866 \
+            --train-source frozen-assets/gsm8k-train.parquet \
+            --train-sha256 ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d \
+            --test-source frozen-assets/gsm8k-test.parquet \
+            --test-sha256 ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59 \
+            --train-size 6400 --dev-size 1024 --test-size 1024 \
+            --model-dir frozen-assets/tokenizer --prompt-cap 1024 \
+            --no-enable-thinking --output frozen-data/gsm8k
+      - name: Keep frozen experiment inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: frozen-official-reward-data
+          path: frozen-data/
+          retention-days: 30
