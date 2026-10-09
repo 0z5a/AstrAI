@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -120,6 +121,25 @@ def main():
         raise ValueError(
             "smoke requires the official formal model and request-local sampling"
         )
+    if (
+        template.model_revision != "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+        or template.device_type != "cuda"
+        or template.dtype != "bfloat16"
+    ):
+        raise ValueError(
+            "smoke checkpoint, dtype and device must match formal qualification"
+        )
+    if not torch.cuda.is_available() or "H100" not in torch.cuda.get_device_name(0):
+        raise RuntimeError("smoke requires an assigned H100 test resource")
+    actual_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if actual_head != settings["source_head"]:
+        raise ValueError("smoke checkout does not match the frozen source")
     root = Path(settings["output_dir"])
     if not root.is_absolute() or root.exists():
         raise ValueError("smoke output must be a new absolute private directory")
