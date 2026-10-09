@@ -180,6 +180,10 @@ def decide(pairs, *, target, quality_interval, margin=0.02, time_ratio_limit=0.8
         ratio = candidate / baseline
         if ratio > time_ratio_limit:
             reasons.append("time_to_reward_ratio_above_frozen_limit")
+    for pair in pairs:
+        for arm in ("baseline", "candidate"):
+            if not pair[arm].get("end_to_end_timing_verified", False):
+                reasons.append(f"{arm}:seed={pair['seed']}:launcher_timing_unverified")
     if quality_interval["paired_seeds"] != 3 or quality_interval["lower_95"] < -margin:
         reasons.append("heldout_quality_noninferiority_not_proven")
     return {
